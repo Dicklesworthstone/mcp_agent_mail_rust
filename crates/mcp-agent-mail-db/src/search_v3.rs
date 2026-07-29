@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
 use crate::search_filter_compiler::compile_filters;
@@ -19,7 +19,7 @@ use tantivy::Order;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{AllQuery, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::{Index, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, ReloadPolicy, Term};
 
 use crate::DbConn;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
@@ -53,9 +53,8 @@ impl TantivyBridge {
         };
 
         register_tokenizer(&index);
-        let doc_count = index
-            .reader()
-            .map_or(0, |reader| reader.searcher().num_docs());
+        let doc_count =
+            manual_index_reader(&index).map_or(0, |reader| reader.searcher().num_docs());
         let index_size_bytes = measure_index_dir_bytes(index_dir);
         global_metrics()
             .search
@@ -171,6 +170,13 @@ impl TantivyBridge {
             fetch_limit = fetch_limit.saturating_mul(2).min(max_fetch_limit);
         }
     }
+}
+
+fn manual_index_reader(index: &Index) -> tantivy::Result<IndexReader> {
+    index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
 }
 
 fn measure_index_dir_bytes(index_dir: &Path) -> u64 {
@@ -364,9 +370,14 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
 // ── Global bridge (lazy singleton) ──────────────────────────────────────
 
 static BRIDGE: OnceLock<RwLock<Option<Arc<TantivyBridge>>>> = OnceLock::new();
+static TANTIVY_WRITER_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn bridge_slot() -> &'static RwLock<Option<Arc<TantivyBridge>>> {
     BRIDGE.get_or_init(|| RwLock::new(None))
+}
+
+fn tantivy_writer_guard() -> &'static Mutex<()> {
+    TANTIVY_WRITER_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 fn same_index_dir(lhs: &Path, rhs: &Path) -> bool {
@@ -554,10 +565,8 @@ fn upsert_indexable_message(
 fn refresh_index_health_metrics(bridge: &TantivyBridge) {
     static LAST_MEASURED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-    let doc_count = bridge
-        .index()
-        .reader()
-        .map_or(0, |reader| reader.searcher().num_docs());
+    let doc_count =
+        manual_index_reader(bridge.index()).map_or(0, |reader| reader.searcher().num_docs());
 
     // Only perform the expensive recursive filesystem scan occasionally
     // to avoid blocking the synchronous message send path.
@@ -607,6 +616,10 @@ const BACKFILL_STATE_SCHEMA_VERSION: u32 = 1;
 struct BackfillDbFingerprint {
     len_bytes: u64,
     modified_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inode: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -646,6 +659,13 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
         return None;
     }
     let metadata = std::fs::metadata(db_path).ok()?;
+    #[cfg(unix)]
+    let (device_id, inode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let (device_id, inode) = (None, None);
     let modified_micros = metadata
         .modified()
         .ok()
@@ -655,6 +675,8 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
     Some(BackfillDbFingerprint {
         len_bytes: metadata.len(),
         modified_micros,
+        device_id,
+        inode,
     })
 }
 
@@ -716,7 +738,9 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     // mixed aggregate/non-aggregate projections in one SELECT.
     // Also avoid wrapping MAX() with COALESCE() because FrankensQLite's current
     // aggregate planner can classify that shape as mixed aggregate/non-aggregate.
-    let rows = match conn.query_sync(
+    let rows = match query_sync_with_lock_retry(
+        conn,
+        "backfill message stats",
         "SELECT \
              (SELECT COUNT(*) FROM messages) AS count, \
              (SELECT MAX(id) FROM messages) AS max_id",
@@ -742,7 +766,12 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
 }
 
 fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
-    let max_id_rows = match conn.query_sync("SELECT MAX(id) AS max_id FROM messages", &[]) {
+    let max_id_rows = match query_sync_with_lock_retry(
+        conn,
+        "backfill watermark max-id",
+        "SELECT MAX(id) AS max_id FROM messages",
+        &[],
+    ) {
         Ok(rows) => rows,
         Err(e) if sqlite_error_is_missing_table(&e.to_string(), "messages") => {
             return Ok(MessageWatermark::default());
@@ -755,20 +784,21 @@ fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String>
         .and_then(|v| u64::try_from(v.max(0)).ok())
         .unwrap_or(0);
 
-    let sequence = conn
-        .query_sync(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'messages' LIMIT 1",
-            &[],
-        )
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<i64>("seq").ok())
-        })
-        .and_then(|v| u64::try_from(v.max(0)).ok())
-        // Fallback for legacy/malformed sqlite_sequence: max_id still gives a
-        // monotonic watermark for append-only message IDs.
-        .unwrap_or(max_id);
+    let sequence = query_sync_with_lock_retry(
+        conn,
+        "backfill watermark sequence",
+        "SELECT seq FROM sqlite_sequence WHERE name = 'messages' LIMIT 1",
+        &[],
+    )
+    .ok()
+    .and_then(|rows| {
+        rows.first()
+            .and_then(|row| row.get_named::<i64>("seq").ok())
+    })
+    .and_then(|v| u64::try_from(v.max(0)).ok())
+    // Fallback for legacy/malformed sqlite_sequence: max_id still gives a
+    // monotonic watermark for append-only message IDs.
+    .unwrap_or(max_id);
 
     Ok(MessageWatermark { sequence, max_id })
 }
@@ -780,8 +810,102 @@ fn sqlite_error_is_missing_table(message: &str, table: &str) -> bool {
         || lower.contains(&format!("no such table: main.{table}"))
 }
 
+/// Retry budget for search-bridge bootstrap SQLite operations (br-5u3w5).
+///
+/// Deliberately larger than the pool's hot-path schedule
+/// (`SQLITE_LOCK_MAX_RETRIES` = 3, ~175ms total): the bootstrap is a
+/// startup/background path where bounded waiting is vastly cheaper than
+/// hard-failing the whole lexical bridge. Under sustained slow-fsync writer
+/// pressure (the L3 mixed-load reproducer) the engine returns a FAIL-FAST
+/// "database is busy" verdict that `busy_timeout` does not absorb, and the
+/// contended window lasts as long as the in-process write burst — observed
+/// at multiple seconds. The full schedule (~13s) is sized to outlast such a
+/// burst; it is only ever consumed while the mailbox is saturated during
+/// first-search bootstrap.
+const BOOTSTRAP_LOCK_MAX_RETRIES: usize = 12;
+
+/// Exponential backoff for [`with_bootstrap_lock_retry`]:
+/// 25/50/100/200/400/800/1600ms then capped at 2s — ≈13s total across all
+/// [`BOOTSTRAP_LOCK_MAX_RETRIES`] retries.
+fn bootstrap_lock_retry_delay(retry_index: usize) -> std::time::Duration {
+    let exponent = u32::try_from(retry_index.min(6)).unwrap_or(6);
+    std::time::Duration::from_millis(25_u64.saturating_mul(1_u64 << exponent))
+        .min(std::time::Duration::from_secs(2))
+}
+
+/// Run a search-bridge bootstrap/backfill SQLite operation with bounded
+/// lock/busy retry (br-5u3w5).
+///
+/// The bootstrap opens its own bespoke connection while live workers hammer
+/// the same WAL mailbox; on slow-fsync storage both the open and its reads
+/// can surface `SQLITE_BUSY` ("database is busy"), and without retry the
+/// whole lexical-bridge bootstrap failed hard (~1-in-5 runs of the L3
+/// mixed-load reproducer). Errors that are not lock/busy-classified
+/// (including missing-table probes) are returned unchanged so caller-side
+/// classification keeps working.
+fn with_bootstrap_lock_retry<T, E: std::fmt::Display>(
+    operation: &str,
+    mut op: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut retries = 0_usize;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                let message = err.to_string();
+                if !crate::error::is_lock_error(&message) || retries >= BOOTSTRAP_LOCK_MAX_RETRIES {
+                    return Err(err);
+                }
+                let delay = bootstrap_lock_retry_delay(retries);
+                tracing::warn!(
+                    operation,
+                    error = %message,
+                    retry = retries + 1,
+                    max_retries = BOOTSTRAP_LOCK_MAX_RETRIES,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    "search backfill operation hit lock/busy error; retrying"
+                );
+                std::thread::sleep(delay);
+                retries += 1;
+            }
+        }
+    }
+}
+
+fn query_sync_with_lock_retry(
+    conn: &DbConn,
+    operation: &str,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::error::Error> {
+    with_bootstrap_lock_retry(operation, || conn.query_sync(sql, params))
+}
+
+/// Open the bespoke backfill connection with bounded lock retry, and give it
+/// the engine-level busy waiting the rest of the db layer applies to its
+/// FrankenSQLite connections (br-5u3w5). Without a `busy_timeout` this
+/// connection surfaced writer contention as an immediate "database is busy"
+/// hard failure.
+fn open_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, String> {
+    let conn = crate::guard_db_conn(
+        with_bootstrap_lock_retry("backfill open", || DbConn::open_file(db_path))
+            .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
+        "search backfill connection",
+    );
+    with_bootstrap_lock_retry("backfill busy_timeout pragma", || {
+        conn.execute_raw("PRAGMA busy_timeout = 10000;")
+    })
+    .map_err(|e| format!("backfill: busy_timeout pragma failed: {e}"))?;
+    Ok(conn)
+}
+
 fn backfill_table_exists(conn: &DbConn, table: &str) -> Result<bool, String> {
-    match conn.query_sync(&format!("SELECT 1 FROM {table} LIMIT 1"), &[]) {
+    match query_sync_with_lock_retry(
+        conn,
+        "backfill table probe",
+        &format!("SELECT 1 FROM {table} LIMIT 1"),
+        &[],
+    ) {
         Ok(_) => Ok(true),
         Err(e) if sqlite_error_is_missing_table(&e.to_string(), table) => Ok(false),
         Err(e) => Err(format!("backfill table probe failed for {table}: {e}")),
@@ -789,8 +913,7 @@ fn backfill_table_exists(conn: &DbConn, table: &str) -> Result<bool, String> {
 }
 
 fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, String> {
-    let rows = conn
-        .query_sync(sql, &[])
+    let rows = query_sync_with_lock_retry(conn, "backfill id/text map", sql, &[])
         .map_err(|e| format!("backfill map query failed: {e}"))?;
     let mut out = HashMap::with_capacity(rows.len());
     for row in rows {
@@ -802,12 +925,13 @@ fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, S
 }
 
 fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String> {
-    let rows = conn
-        .query_sync(
-            "SELECT COUNT(*) AS count FROM messages WHERE id > ?",
-            &[Value::BigInt(start_after_id)],
-        )
-        .map_err(|e| format!("backfill tail-count query failed: {e}"))?;
+    let rows = query_sync_with_lock_retry(
+        conn,
+        "backfill tail count",
+        "SELECT COUNT(*) AS count FROM messages WHERE id > ?",
+        &[Value::BigInt(start_after_id)],
+    )
+    .map_err(|e| format!("backfill tail-count query failed: {e}"))?;
     let count_i64 = rows
         .first()
         .and_then(|row| row.get_named::<i64>("count").ok())
@@ -817,9 +941,7 @@ fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String
 }
 
 fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, String> {
-    let reader = bridge
-        .index()
-        .reader()
+    let reader = manual_index_reader(bridge.index())
         .map_err(|e| format!("backfill index reader error: {e}"))?;
     let searcher = reader.searcher();
     let handles = bridge.handles();
@@ -836,13 +958,13 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
             max_id: 0,
         });
     }
-    let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher
+    let top_docs: Vec<(Option<u64>, tantivy::DocAddress)> = searcher
         .search(
             &message_query,
             &TopDocs::with_limit(1).order_by_fast_field::<u64>("id", Order::Desc),
         )
         .map_err(|e| format!("backfill index max-id query failed: {e}"))?;
-    let max_id = top_docs.first().map_or(0, |(id, _)| *id);
+    let max_id = top_docs.first().and_then(|(id, _)| *id).unwrap_or(0);
 
     Ok(MessageStats {
         count: u64::try_from(count).unwrap_or(u64::MAX),
@@ -889,7 +1011,7 @@ fn choose_backfill_plan(
 
 /// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
 /// for writers. In concurrent environments, this can fail. We retry a few times
-/// with exponential backoff to handle concurrent index updates.
+/// with exponential backoff to handle writers from older binaries or external tools.
 fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWriter, String> {
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
@@ -908,6 +1030,17 @@ fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWri
     }
 }
 
+fn with_tantivy_writer<T>(
+    index: &tantivy::Index,
+    operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = tantivy_writer_guard()
+        .lock()
+        .map_err(|e| format!("Tantivy writer guard poisoned: {e}"))?;
+    let mut writer = acquire_writer_with_retry(index)?;
+    operation(&mut writer)
+}
+
 /// Index a single message into the global Tantivy bridge.
 ///
 /// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
@@ -921,12 +1054,13 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     };
 
     let handles = bridge.handles();
-    let mut writer = acquire_writer_with_retry(bridge.index())?;
-    upsert_indexable_message(&writer, handles, msg)?;
-
-    writer
-        .commit()
-        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+    with_tantivy_writer(bridge.index(), |writer| {
+        upsert_indexable_message(writer, handles, msg)?;
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
+        Ok(())
+    })?;
 
     refresh_index_health_metrics(&bridge);
 
@@ -952,15 +1086,15 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
     };
 
     let handles = bridge.handles();
-    let mut writer = acquire_writer_with_retry(bridge.index())?;
-
-    for msg in messages {
-        upsert_indexable_message(&writer, handles, msg)?;
-    }
-
-    writer
-        .commit()
-        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+    with_tantivy_writer(bridge.index(), |writer| {
+        for msg in messages {
+            upsert_indexable_message(writer, handles, msg)?;
+        }
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
+        Ok(())
+    })?;
 
     refresh_index_health_metrics(&bridge);
 
@@ -1028,25 +1162,23 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         ));
     }
 
-    let conn = crate::guard_db_conn(
-        DbConn::open_file(db_path)
-            .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
-        "search backfill connection",
-    );
+    // br-5u3w5: the bespoke bootstrap open races live pool connections on the
+    // same WAL mailbox and can surface "database is busy" — retry it on the
+    // bootstrap budget instead of failing the whole bootstrap.
+    let mut conn = open_backfill_conn(db_path)?;
 
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
         if index_stats.count > 0 {
-            let mut writer: tantivy::IndexWriter<TantivyDocument> = bridge
-                .index()
-                .writer(15_000_000)
-                .map_err(|e| format!("Tantivy writer error: {e}"))?;
-            writer
-                .delete_all_documents()
-                .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
-            writer
-                .commit()
-                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+            with_tantivy_writer(bridge.index(), |writer| {
+                writer
+                    .delete_all_documents()
+                    .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
+                writer
+                    .commit()
+                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
+                Ok(())
+            })?;
             crate::search_service::invalidate_search_cache(
                 crate::search_cache::InvalidationTrigger::IndexUpdate,
             );
@@ -1063,6 +1195,19 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         && state.message_watermark == message_watermark
         && state.index_meta_fingerprint == current_index_fingerprint
     {
+        if let Some(fingerprint) = db_fingerprint
+            && state.db_fingerprint != fingerprint
+        {
+            write_backfill_state(
+                &bridge,
+                db_path,
+                fingerprint,
+                state.db_stats,
+                state.message_watermark,
+                current_index_fingerprint,
+                state.index_stats,
+            );
+        }
         tracing::info!(
             message_seq = message_watermark.sequence,
             message_max_id = message_watermark.max_id,
@@ -1102,16 +1247,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         return Ok((0, usize::try_from(db_stats.count).unwrap_or(usize::MAX)));
     }
 
-    let mut writer = bridge
-        .index()
-        .writer(15_000_000)
-        .map_err(|e| format!("Tantivy writer error: {e}"))?;
     let handles = bridge.handles();
-    if matches!(plan, BackfillPlan::FullRebuild) {
-        writer
-            .delete_all_documents()
-            .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
-    }
 
     // Paged reads avoid loading the full mailbox into memory during startup.
     // Keep this query JOIN-free to avoid parity-cert fallback overhead on
@@ -1129,64 +1265,111 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         BackfillPlan::Incremental { start_after_id } => start_after_id,
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
-    let mut pending_batches = 0_usize;
-    let mut total_indexed = 0_usize;
-    loop {
-        let rows = conn
-            .query_sync(
-                sql,
-                &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
-            )
-            .map_err(|e| format!("backfill: query failed: {e}"))?;
-        if rows.is_empty() {
-            break;
+    let total_indexed = with_tantivy_writer(bridge.index(), |writer| {
+        if matches!(plan, BackfillPlan::FullRebuild) {
+            writer
+                .delete_all_documents()
+                .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
         }
 
-        for row in &rows {
-            let project_id = row.get_as::<i64>(1).unwrap_or(0);
-            let sender_id = row.get_as::<i64>(2).unwrap_or(0);
-            let project_slug = project_slug_map
-                .get(&project_id)
-                .cloned()
-                .unwrap_or_default();
-            let sender_name = sender_name_map
-                .get(&sender_id)
-                .cloned()
-                .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
-            let msg = IndexableMessage {
-                id: row.get_as::<i64>(0).unwrap_or(0),
-                project_id,
-                project_slug,
-                sender_name,
-                subject: row.get_as::<String>(3).unwrap_or_default(),
-                body_md: row.get_as::<String>(4).unwrap_or_default(),
-                thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
-                importance: row
-                    .get_as::<String>(6)
-                    .unwrap_or_else(|_| "normal".to_string()),
-                created_ts: row.get_as::<i64>(7).unwrap_or(0),
+        let mut pending_batches = 0_usize;
+        let mut total_indexed = 0_usize;
+        loop {
+            // br-5u3w5: the page scan runs while live workers keep
+            // committing, and the engine's busy verdict here is FAIL-FAST —
+            // it is not absorbed by busy_timeout and was observed to stay
+            // pinned to one connection's admission state for a whole
+            // multi-second write burst (every instant retry on the same
+            // connection failed identically). Retry on the bootstrap budget
+            // and re-open the connection between attempts so each retry
+            // re-admits with a fresh snapshot instead of re-asking a stuck
+            // one.
+            let mut scan_retries = 0_usize;
+            let rows = loop {
+                match conn.query_sync(
+                    sql,
+                    &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
+                ) {
+                    Ok(rows) => break rows,
+                    Err(err) => {
+                        let message = err.to_string();
+                        if !crate::error::is_lock_error(&message)
+                            || scan_retries >= BOOTSTRAP_LOCK_MAX_RETRIES
+                        {
+                            return Err(format!("backfill: query failed: {err}"));
+                        }
+                        let delay = bootstrap_lock_retry_delay(scan_retries);
+                        tracing::warn!(
+                            error = %message,
+                            retry = scan_retries + 1,
+                            max_retries = BOOTSTRAP_LOCK_MAX_RETRIES,
+                            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                            "backfill page scan hit lock/busy error; retrying on a fresh connection"
+                        );
+                        std::thread::sleep(delay);
+                        match open_backfill_conn(db_path) {
+                            Ok(fresh) => conn = fresh,
+                            Err(open_error) => tracing::warn!(
+                                error = %open_error,
+                                "backfill page scan could not re-open a fresh connection; retrying on the existing one"
+                            ),
+                        }
+                        scan_retries += 1;
+                    }
+                }
             };
-            add_indexable_message(&writer, handles, &msg)?;
-            total_indexed += 1;
-            if msg.id > last_id {
-                last_id = msg.id;
+            if rows.is_empty() {
+                break;
+            }
+
+            for row in &rows {
+                let project_id = row.get_as::<i64>(1).unwrap_or(0);
+                let sender_id = row.get_as::<i64>(2).unwrap_or(0);
+                let project_slug = project_slug_map
+                    .get(&project_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let sender_name = sender_name_map
+                    .get(&sender_id)
+                    .cloned()
+                    .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
+                let msg = IndexableMessage {
+                    id: row.get_as::<i64>(0).unwrap_or(0),
+                    project_id,
+                    project_slug,
+                    sender_name,
+                    subject: row.get_as::<String>(3).unwrap_or_default(),
+                    body_md: row.get_as::<String>(4).unwrap_or_default(),
+                    thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
+                    importance: row
+                        .get_as::<String>(6)
+                        .unwrap_or_else(|_| "normal".to_string()),
+                    created_ts: row.get_as::<i64>(7).unwrap_or(0),
+                };
+                add_indexable_message(writer, handles, &msg)?;
+                total_indexed += 1;
+                if msg.id > last_id {
+                    last_id = msg.id;
+                }
+            }
+
+            pending_batches += 1;
+            if pending_batches >= COMMIT_EVERY_BATCHES {
+                writer
+                    .commit()
+                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
+                pending_batches = 0;
             }
         }
 
-        pending_batches += 1;
-        if pending_batches >= COMMIT_EVERY_BATCHES {
+        if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0)
+        {
             writer
                 .commit()
                 .map_err(|e| format!("Tantivy commit error: {e}"))?;
-            pending_batches = 0;
         }
-    }
-
-    if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0) {
-        writer
-            .commit()
-            .map_err(|e| format!("Tantivy commit error: {e}"))?;
-    }
+        Ok(total_indexed)
+    })?;
 
     refresh_index_health_metrics(&bridge);
     crate::search_service::invalidate_search_cache(
@@ -1235,7 +1418,7 @@ mod tests {
 
     static BRIDGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     use crate::search_planner::{DocKind, SearchQuery as PlannerQuery};
-    use tantivy::doc;
+    use tantivy::{TantivyDocument, doc};
 
     fn setup_bridge_with_docs() -> TantivyBridge {
         let bridge = TantivyBridge::in_memory();

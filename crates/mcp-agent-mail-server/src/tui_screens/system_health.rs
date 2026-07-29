@@ -11,8 +11,9 @@
 //! - View mode toggle: text diagnostics (default) vs widget dashboard
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -28,11 +29,18 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{
+    AtcCanaryReportSummary, Config, load_latest_atc_canary_report, metrics::HistogramSnapshot,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::tui_bridge::{
-    ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState, query_params_explain_empty_state,
+    BootArchivePreflightSnapshot, ConfigSnapshot, ScreenDiagnosticSnapshot, TuiLoopHeartbeatKind,
+    TuiLoopHeartbeatSnapshot, TuiScreenRefreshSnapshot, TuiSharedState,
+    query_params_explain_empty_state,
 };
+use crate::tui_events::MailEvent;
 use crate::tui_widgets::{
     AnomalyCard, AnomalySeverity, MetricTile, MetricTrend, ReservationGauge, WidgetState,
 };
@@ -47,6 +55,14 @@ const WORKER_SLEEP: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: usize = 8 * 1024;
 const SCREEN_DIAGNOSTIC_PREVIEW_LIMIT: usize = 3;
 const ATC_STALE_HEARTBEAT_SECS: i64 = 5 * 60;
+const LOOP_HEARTBEAT_STALE_MICROS: i64 = 10 * 1_000_000;
+const LOOP_HEARTBEAT_RENDER_GAP_WARN_MICROS: u64 = 1_000_000;
+const LOOP_HEARTBEAT_DB_POLL_GAP_WARN_MICROS: u64 = 6_000_000;
+const RECOMMENDATION_EXPIRING_RESERVATION_US: i64 = 5 * 60 * 1_000_000;
+const GIT_REF_INTEGRITY_VISIBLE_PROJECTS: usize = 3;
+const HEALTH_SWEEP_DATA_DIR_NAME: &str = "mcp-agent-mail";
+const GIT_REF_SWEEP_CURSOR_FILE_NAME: &str = "sweep_cursor.json";
+const GIT_REF_SWEEP_DISMISSALS_FILE_NAME: &str = "sweep_dismissals.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Level {
@@ -95,6 +111,159 @@ fn level_styled_line(
     ])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitSegfaultRetryToastSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitSegfaultRetryToast {
+    pub severity: GitSegfaultRetryToastSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct GitSegfaultRetryToastState {
+    first_warning_emitted: bool,
+    window_started_at: Option<Instant>,
+    window_count: u32,
+    window_warning_emitted: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GitSegfaultRetryBadge {
+    retry_count: u32,
+    exhausted_count: u32,
+}
+
+fn git_segfault_first_warning_text(repo_slug: &str) -> String {
+    format!(
+        "git 2.51.0 segfault retried on {repo_slug}. Set AM_GIT_BINARY or upgrade git to stop seeing this."
+    )
+}
+
+fn git_segfault_window_warning_text() -> &'static str {
+    "git 2.51.0 segfault retries reached 30 in 5min — production impact likely. Investigate."
+}
+
+fn git_segfault_exhausted_error_text(repo_slug: &str) -> String {
+    format!(
+        "git 2.51.0 retry EXHAUSTED on {repo_slug}. Operations failing. Set AM_GIT_BINARY immediately."
+    )
+}
+
+fn git_segfault_retry_badge_text(retry_count: u32, exhausted_count: u32) -> String {
+    if exhausted_count > 0 {
+        format!("git segfault retries: {retry_count} (EXHAUSTED {exhausted_count})")
+    } else if retry_count >= 30 {
+        format!("git segfault retries: {retry_count} (HIGH)")
+    } else {
+        format!("git segfault retries: {retry_count}")
+    }
+}
+
+fn git_segfault_retry_badge_level(retry_count: u32, exhausted_count: u32) -> Level {
+    if exhausted_count > 0 {
+        Level::Fail
+    } else if retry_count >= 30 {
+        Level::Warn
+    } else {
+        Level::Ok
+    }
+}
+
+fn git_segfault_retry_event(event: &MailEvent) -> Option<(&str, bool)> {
+    let MailEvent::GitSegfaultRetry {
+        repo_slug,
+        exhausted,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some((repo_slug.as_str(), *exhausted))
+}
+
+fn update_git_segfault_window(state: &mut GitSegfaultRetryToastState, now: Instant) -> u32 {
+    const WINDOW: Duration = Duration::from_secs(5 * 60);
+    match state.window_started_at {
+        Some(started_at) if now.duration_since(started_at) < WINDOW => {
+            state.window_count = state.window_count.saturating_add(1);
+        }
+        _ => {
+            state.window_started_at = Some(now);
+            state.window_count = 1;
+            state.window_warning_emitted = false;
+        }
+    }
+    state.window_count
+}
+
+pub(crate) fn git_segfault_retry_toast_handler(
+    state: &mut GitSegfaultRetryToastState,
+    event: &MailEvent,
+    now: Instant,
+    toasts_enabled: bool,
+    category_enabled: bool,
+) -> Vec<GitSegfaultRetryToast> {
+    let Some((repo_slug, exhausted)) = git_segfault_retry_event(event) else {
+        return Vec::new();
+    };
+
+    let window_count = update_git_segfault_window(state, now);
+    if !toasts_enabled || !category_enabled {
+        return Vec::new();
+    }
+
+    let mut toasts = Vec::new();
+    if exhausted {
+        toasts.push(GitSegfaultRetryToast {
+            severity: GitSegfaultRetryToastSeverity::Error,
+            message: git_segfault_exhausted_error_text(repo_slug),
+        });
+        return toasts;
+    }
+
+    if !state.first_warning_emitted {
+        state.first_warning_emitted = true;
+        toasts.push(GitSegfaultRetryToast {
+            severity: GitSegfaultRetryToastSeverity::Warning,
+            message: git_segfault_first_warning_text(repo_slug),
+        });
+    }
+
+    if window_count >= 30 && !state.window_warning_emitted {
+        state.window_warning_emitted = true;
+        toasts.push(GitSegfaultRetryToast {
+            severity: GitSegfaultRetryToastSeverity::Warning,
+            message: git_segfault_window_warning_text().to_string(),
+        });
+    }
+
+    toasts
+}
+
+impl GitSegfaultRetryBadge {
+    fn ingest(&mut self, event: &MailEvent) {
+        let Some((_, exhausted)) = git_segfault_retry_event(event) else {
+            return;
+        };
+        self.retry_count = self.retry_count.saturating_add(1);
+        if exhausted {
+            self.exhausted_count = self.exhausted_count.saturating_add(1);
+        }
+    }
+
+    fn text(self) -> String {
+        git_segfault_retry_badge_text(self.retry_count, self.exhausted_count)
+    }
+
+    fn level(self) -> Level {
+        git_segfault_retry_badge_level(self.retry_count, self.exhausted_count)
+    }
+}
+
 /// Human-readable HTTP status description.
 fn format_http_status(status: u16) -> String {
     match status {
@@ -140,6 +309,167 @@ fn screen_diag_level(diag: &ScreenDiagnosticSnapshot) -> Level {
 fn format_diag_timestamp_micros(timestamp_micros: i64) -> String {
     DateTime::<Utc>::from_timestamp_micros(timestamp_micros)
         .map_or_else(|| timestamp_micros.to_string(), |ts| ts.to_rfc3339())
+}
+
+fn loop_heartbeat_age_micros(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> Option<i64> {
+    (snapshot.last_tick_micros > 0)
+        .then(|| now_micros.saturating_sub(snapshot.last_tick_micros).max(0))
+}
+
+const fn loop_heartbeat_is_periodic(kind: TuiLoopHeartbeatKind) -> bool {
+    matches!(
+        kind,
+        TuiLoopHeartbeatKind::Render | TuiLoopHeartbeatKind::DbPoll
+    )
+}
+
+const fn loop_heartbeat_gap_warn_micros(kind: TuiLoopHeartbeatKind) -> Option<u64> {
+    match kind {
+        TuiLoopHeartbeatKind::Render => Some(LOOP_HEARTBEAT_RENDER_GAP_WARN_MICROS),
+        TuiLoopHeartbeatKind::DbPoll => Some(LOOP_HEARTBEAT_DB_POLL_GAP_WARN_MICROS),
+        TuiLoopHeartbeatKind::Input
+        | TuiLoopHeartbeatKind::McpApi
+        | TuiLoopHeartbeatKind::CommitCoalescer => None,
+    }
+}
+
+fn loop_heartbeat_is_stale(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> bool {
+    loop_heartbeat_is_periodic(snapshot.kind)
+        && loop_heartbeat_age_micros(snapshot, now_micros)
+            .is_some_and(|age| age >= LOOP_HEARTBEAT_STALE_MICROS)
+}
+
+fn loop_heartbeat_level(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> Level {
+    if snapshot.consecutive_failures > 0 {
+        return Level::Fail;
+    }
+
+    if snapshot.ticks_total == 0 {
+        return if loop_heartbeat_is_periodic(snapshot.kind) {
+            Level::Warn
+        } else {
+            Level::Ok
+        };
+    }
+
+    let gap_warn = loop_heartbeat_gap_warn_micros(snapshot.kind)
+        .is_some_and(|threshold| snapshot.last_gap_micros >= threshold);
+    if loop_heartbeat_is_stale(snapshot, now_micros) || gap_warn {
+        return Level::Warn;
+    }
+
+    Level::Ok
+}
+
+fn format_loop_heartbeat_detail(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> String {
+    let age = loop_heartbeat_age_micros(snapshot, now_micros)
+        .map_or_else(|| "--".to_string(), |age| format!("{}s", age / 1_000_000));
+    let last_tick = if snapshot.last_tick_micros > 0 {
+        format_diag_timestamp_micros(snapshot.last_tick_micros)
+    } else {
+        "--".to_string()
+    };
+    let last_success = if snapshot.last_success_micros > 0 {
+        format_diag_timestamp_micros(snapshot.last_success_micros)
+    } else {
+        "--".to_string()
+    };
+
+    format!(
+        "ticks={} successes={} failures={} consecutive_failures={} age={} gap={}ms success_duration={}ms last_tick={} last_success={}",
+        snapshot.ticks_total,
+        snapshot.successes_total,
+        snapshot.failures_total,
+        snapshot.consecutive_failures,
+        age,
+        snapshot.last_gap_micros / 1_000,
+        snapshot.last_success_duration_micros / 1_000,
+        last_tick,
+        last_success,
+    )
+}
+
+fn loop_heartbeat_json(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> Value {
+    let age_micros = loop_heartbeat_age_micros(snapshot, now_micros);
+    let level = loop_heartbeat_level(snapshot, now_micros);
+    json!({
+        "kind": snapshot.kind.as_str(),
+        "level": level.label(),
+        "periodic": loop_heartbeat_is_periodic(snapshot.kind),
+        "observed": snapshot.ticks_total > 0,
+        "stale": loop_heartbeat_is_stale(snapshot, now_micros),
+        "age_micros": age_micros,
+        "last_tick_micros": snapshot.last_tick_micros,
+        "last_success_micros": snapshot.last_success_micros,
+        "last_failure_micros": snapshot.last_failure_micros,
+        "last_gap_micros": snapshot.last_gap_micros,
+        "last_success_duration_micros": snapshot.last_success_duration_micros,
+        "ticks_total": snapshot.ticks_total,
+        "successes_total": snapshot.successes_total,
+        "failures_total": snapshot.failures_total,
+        "consecutive_failures": snapshot.consecutive_failures,
+    })
+}
+
+fn screen_refresh_age_micros(at_micros: i64, now_micros: i64) -> Option<i64> {
+    if at_micros <= 0 {
+        return None;
+    }
+    Some(now_micros.saturating_sub(at_micros).max(0))
+}
+
+fn format_screen_refresh_detail(snapshot: &TuiScreenRefreshSnapshot, now_micros: i64) -> String {
+    let tick_age = screen_refresh_age_micros(snapshot.last_tick_micros, now_micros)
+        .map_or_else(|| "--".to_string(), |age| format!("{}s", age / 1_000_000));
+    let refresh_age = screen_refresh_age_micros(snapshot.last_refresh_micros, now_micros)
+        .map_or_else(|| "--".to_string(), |age| format!("{}s", age / 1_000_000));
+    let last_refresh = if snapshot.last_refresh_micros > 0 {
+        format_diag_timestamp_micros(snapshot.last_refresh_micros)
+    } else {
+        "--".to_string()
+    };
+    format!(
+        "ticks={} refreshes={} tick_age={} refresh_age={} last_refresh={}",
+        snapshot.ticks_total, snapshot.refreshes_total, tick_age, refresh_age, last_refresh,
+    )
+}
+
+fn screen_refresh_json(snapshot: &TuiScreenRefreshSnapshot, now_micros: i64) -> Value {
+    json!({
+        "screen": snapshot.screen.as_slug(),
+        "observed": snapshot.ticks_total > 0,
+        "last_tick_micros": snapshot.last_tick_micros,
+        "last_refresh_micros": snapshot.last_refresh_micros,
+        "last_tick_age_micros": screen_refresh_age_micros(snapshot.last_tick_micros, now_micros),
+        "last_refresh_age_micros": screen_refresh_age_micros(
+            snapshot.last_refresh_micros,
+            now_micros,
+        ),
+        "ticks_total": snapshot.ticks_total,
+        "refreshes_total": snapshot.refreshes_total,
+    })
+}
+
+fn histogram_snapshot_json(snapshot: &HistogramSnapshot) -> Value {
+    json!({
+        "count": snapshot.count,
+        "sum": snapshot.sum,
+        "min": snapshot.min,
+        "max": snapshot.max,
+        "p50": snapshot.p50,
+        "p95": snapshot.p95,
+        "p99": snapshot.p99,
+    })
+}
+
+fn format_latency_histogram(snapshot: &HistogramSnapshot) -> String {
+    if snapshot.count == 0 {
+        return "count=0".to_string();
+    }
+    format!(
+        "count={} p50={}us p95={}us p99={}us max={}us",
+        snapshot.count, snapshot.p50, snapshot.p95, snapshot.p99, snapshot.max,
+    )
 }
 
 fn atc_tick_age_secs(snapshot: &crate::AtcOperatorSnapshot) -> Option<i64> {
@@ -230,6 +560,16 @@ struct ProbeLine {
     remediation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct OperatorRecommendationCard {
+    severity: AnomalySeverity,
+    confidence: f64,
+    action: String,
+    reason: String,
+    evidence: String,
+    safe_command: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ProbeAuthKind {
     #[default]
@@ -256,6 +596,390 @@ struct PathProbe {
     error: Option<String>,
 }
 
+/// Project input for the Git ref-integrity health sweep.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct GitRefIntegrityProjectTarget {
+    slug: String,
+    path: PathBuf,
+}
+
+impl GitRefIntegrityProjectTarget {
+    #[must_use]
+    pub fn new(slug: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            slug: slug.into(),
+            path: path.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct GitRefIntegrityProjectSummary {
+    slug: String,
+    last_sweep_ts: Option<DateTime<Utc>>,
+    finding_count: usize,
+    protected_count: usize,
+    safe_to_prune_count: usize,
+    ask_user_count: usize,
+    classification: Level,
+    error: Option<String>,
+}
+
+impl GitRefIntegrityProjectSummary {
+    #[must_use]
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
+    #[must_use]
+    pub const fn finding_count(&self) -> usize {
+        self.finding_count
+    }
+
+    #[must_use]
+    pub const fn protected_count(&self) -> usize {
+        self.protected_count
+    }
+
+    #[must_use]
+    pub const fn safe_to_prune_count(&self) -> usize {
+        self.safe_to_prune_count
+    }
+
+    #[must_use]
+    pub const fn ask_user_count(&self) -> usize {
+        self.ask_user_count
+    }
+
+    #[must_use]
+    pub const fn classification_label(&self) -> &'static str {
+        self.classification.label()
+    }
+
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct GitRefIntegritySweepState {
+    enabled: bool,
+    interval_seconds: u64,
+    batch_size: usize,
+    cursor_index: usize,
+    next_cursor_index: usize,
+    total_projects: usize,
+    projects_scanned: usize,
+    total_findings: usize,
+    checked_at: Option<DateTime<Utc>>,
+    am_git_binary_set: bool,
+    projects: Vec<GitRefIntegrityProjectSummary>,
+}
+
+impl GitRefIntegritySweepState {
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn interval_seconds(&self) -> u64 {
+        self.interval_seconds
+    }
+
+    #[must_use]
+    pub const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    #[must_use]
+    pub const fn cursor_index(&self) -> usize {
+        self.cursor_index
+    }
+
+    #[must_use]
+    pub const fn next_cursor_index(&self) -> usize {
+        self.next_cursor_index
+    }
+
+    #[must_use]
+    pub const fn total_projects(&self) -> usize {
+        self.total_projects
+    }
+
+    #[must_use]
+    pub const fn projects_scanned(&self) -> usize {
+        self.projects_scanned
+    }
+
+    #[must_use]
+    pub const fn total_findings(&self) -> usize {
+        self.total_findings
+    }
+
+    #[must_use]
+    pub fn checked_at(&self) -> Option<DateTime<Utc>> {
+        self.checked_at
+    }
+
+    #[must_use]
+    pub fn level_label(&self) -> &'static str {
+        self.level().label()
+    }
+
+    #[must_use]
+    pub fn projects(&self) -> &[GitRefIntegrityProjectSummary] {
+        &self.projects
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+struct GitRefSweepCursorFile {
+    cursor_index: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GitRefSweepDismissalsFile {
+    #[serde(default)]
+    dismissed: Vec<GitRefSweepDismissalEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[doc(hidden)]
+pub struct GitRefSweepDismissalEntry {
+    project_slug: String,
+    ref_kind: String,
+}
+
+impl GitRefSweepDismissalEntry {
+    #[must_use]
+    pub fn new(project_slug: impl Into<String>, ref_kind: impl Into<String>) -> Self {
+        Self {
+            project_slug: project_slug.into(),
+            ref_kind: ref_kind.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn project_slug(&self) -> &str {
+        &self.project_slug
+    }
+
+    #[must_use]
+    pub fn ref_kind(&self) -> &str {
+        &self.ref_kind
+    }
+}
+
+impl GitRefIntegritySweepState {
+    fn level(&self) -> Level {
+        if !self.enabled {
+            return Level::Warn;
+        }
+        let mut idx = 0;
+        while idx < self.projects.len() {
+            if self.projects[idx].classification == Level::Fail {
+                return Level::Fail;
+            }
+            idx += 1;
+        }
+        if self.total_findings > 0 {
+            Level::Warn
+        } else {
+            Level::Ok
+        }
+    }
+
+    #[must_use]
+    pub fn banner(&self) -> Option<String> {
+        if !self.enabled || self.total_findings == 0 || self.am_git_binary_set {
+            return None;
+        }
+        let affected_projects = self
+            .projects
+            .iter()
+            .filter(|project| project.finding_count > 0)
+            .count();
+        Some(format!(
+            "registered projects have {} orphan refs across {} projects. Run: am doctor fix-orphan-refs --all --dry-run",
+            self.total_findings, affected_projects
+        ))
+    }
+}
+
+fn git_ref_integrity_project_summary_json(project: &GitRefIntegrityProjectSummary) -> Value {
+    json!({
+        "slug": project.slug(),
+        "last_sweep_at_us": project.last_sweep_ts.map(|ts| ts.timestamp_micros()),
+        "finding_count": project.finding_count(),
+        "protected_count": project.protected_count(),
+        "safe_to_prune_count": project.safe_to_prune_count(),
+        "ask_user_count": project.ask_user_count(),
+        "classification": project.classification_label(),
+        "error": project.error(),
+    })
+}
+
+fn boot_archive_preflight_json(snapshot: Option<&BootArchivePreflightSnapshot>) -> Value {
+    let Some(snapshot) = snapshot else {
+        return Value::Null;
+    };
+
+    json!({
+        "mode": snapshot.mode,
+        "root": snapshot.root.as_str(),
+        "started_at": snapshot.started_at.as_str(),
+        "completed_at": snapshot.completed_at.as_str(),
+        "duration_ms": snapshot.duration_ms,
+        "total_projects": snapshot.total_projects,
+        "findings_count": snapshot.findings_count,
+        "auto_repaired_count": snapshot.auto_repaired_count,
+        "should_abort": snapshot.should_abort,
+        "level": boot_archive_preflight_level(Some(snapshot)).label(),
+        "findings": snapshot
+            .findings
+            .iter()
+            .map(|finding| {
+                json!({
+                    "project": finding.project.as_str(),
+                    "kind": finding.kind,
+                    "detail": finding.detail.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn boot_archive_preflight_level(snapshot: Option<&BootArchivePreflightSnapshot>) -> Level {
+    let Some(snapshot) = snapshot else {
+        return Level::Warn;
+    };
+    if snapshot.should_abort {
+        Level::Fail
+    } else if snapshot.findings_count > 0 {
+        Level::Warn
+    } else {
+        Level::Ok
+    }
+}
+
+fn boot_archive_preflight_affected_projects(snapshot: &BootArchivePreflightSnapshot) -> usize {
+    let mut projects = snapshot
+        .findings
+        .iter()
+        .map(|finding| finding.project.as_str())
+        .collect::<Vec<_>>();
+    projects.sort_unstable();
+    projects.dedup();
+    projects.len()
+}
+
+fn boot_archive_preflight_remediation(snapshot: &BootArchivePreflightSnapshot) -> Option<String> {
+    if snapshot.findings_count == 0 {
+        return None;
+    }
+    Some(format!(
+        "archive has {} boot finding(s) across {} project candidate(s). Run: am doctor fix-orphan-refs --all --dry-run",
+        snapshot.findings_count,
+        boot_archive_preflight_affected_projects(snapshot),
+    ))
+}
+
+/// Build the optional System Health payload for supported `/mail/ws-state`
+/// polling consumers.
+#[must_use]
+pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
+    let env_cfg = Config::from_env();
+    let am_git_binary_set = std::env::var_os("AM_GIT_BINARY").is_some();
+    let db_snapshot = state.db_stats_snapshot();
+    let targets = db_snapshot
+        .as_ref()
+        .map_or_else(Vec::new, git_ref_integrity_targets_from_snapshot);
+    let dismissals = load_git_ref_sweep_dismissals(&git_ref_sweep_dismissals_path());
+    let sweep = git_ref_integrity_sweep(
+        &targets,
+        0,
+        env_cfg.health_sweep_batch,
+        env_cfg.health_sweep_enabled,
+        env_cfg.health_sweep_interval_seconds,
+        am_git_binary_set,
+        &dismissals,
+        Utc::now(),
+    );
+    let boot_archive_preflight = state.boot_archive_preflight_snapshot();
+    let now_micros = mcp_agent_mail_db::now_micros();
+    let loop_heartbeats = state.loop_heartbeats_snapshot();
+    let screen_refreshes = state.screen_refresh_snapshots();
+    let query_tracker_snapshot = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
+    let metrics_snapshot = mcp_agent_mail_core::global_metrics().snapshot();
+
+    json!({
+        "boot_archive_preflight": boot_archive_preflight_json(boot_archive_preflight.as_ref()),
+        "loop_heartbeats": loop_heartbeats
+            .iter()
+            .map(|snapshot| loop_heartbeat_json(snapshot, now_micros))
+            .collect::<Vec<_>>(),
+        "screen_refreshes": screen_refreshes
+            .iter()
+            .map(|snapshot| screen_refresh_json(snapshot, now_micros))
+            .collect::<Vec<_>>(),
+        "db_latency_histograms": {
+            "query_latency_us": histogram_snapshot_json(&query_tracker_snapshot.latency_us),
+            "pool_acquire_latency_us": histogram_snapshot_json(&metrics_snapshot.db.pool_acquire_latency_us),
+        },
+        "db_connection_hygiene": {
+            // I3 (br-bvq1x.9.3): SQLite connections dropped without an explicit
+            // close() (a rising count is connection-lifecycle debt).
+            "drop_close_total": metrics_snapshot.db.drop_close_total,
+            // I5 (br-bvq1x.9.5): commit-coalescer worker liveness (null until a
+            // coalescer starts). alive < expected => a worker died, stalling
+            // git archive durability.
+            "commit_coalescer_workers": mcp_agent_mail_storage::commit_coalescer_worker_liveness()
+                .map(|liveness| json!({
+                    "expected": liveness.expected,
+                    "alive": liveness.alive,
+                    "dead": liveness.dead_workers(),
+                })),
+        },
+        "git_ref_integrity": {
+            "enabled": sweep.enabled(),
+            "interval_seconds": sweep.interval_seconds(),
+            "batch_size": sweep.batch_size(),
+            "cursor_index": sweep.cursor_index(),
+            "next_cursor_index": sweep.next_cursor_index(),
+            "total_projects": sweep.total_projects(),
+            "projects_scanned": sweep.projects_scanned(),
+            "total_findings": sweep.total_findings(),
+            "checked_at_us": sweep.checked_at().map(|ts| ts.timestamp_micros()),
+            "level": sweep.level_label(),
+            "am_git_binary_set": am_git_binary_set,
+            "banner": sweep.banner(),
+            "banner_suppressed_by_am_git_binary": am_git_binary_set
+                && sweep.total_findings() > 0
+                && sweep.banner().is_none(),
+            "projects": sweep
+                .projects()
+                .iter()
+                .map(git_ref_integrity_project_summary_json)
+                .collect::<Vec<_>>(),
+        }
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 struct DiagnosticsSnapshot {
     checked_at: Option<DateTime<Utc>>,
@@ -272,9 +996,19 @@ struct DiagnosticsSnapshot {
     tcp_error: Option<String>,
     path_probes: Vec<PathProbe>,
     lines: Vec<ProbeLine>,
+    operator_recommendations: Vec<OperatorRecommendationCard>,
     atc: crate::AtcOperatorSnapshot,
+    atc_canary: Option<AtcCanaryReportSummary>,
     agent_attention_count: usize,
     agent_attention_summary: String,
+    /// I3 (br-bvq1x.9.3): SQLite connections dropped without an explicit
+    /// `close()` (snapshot of the global `db.drop_close_total` counter).
+    drop_close_total: u64,
+    /// I5 (br-bvq1x.9.5): commit-coalescer worker liveness, or `None` when no
+    /// coalescer is running (so a healthy boot never false-alarms).
+    coalescer_worker_liveness: Option<mcp_agent_mail_storage::CommitCoalescerWorkerLiveness>,
+    git_ref_integrity: GitRefIntegritySweepState,
+    boot_archive_preflight: Option<BootArchivePreflightSnapshot>,
     /// Tailscale remote-access URL with token, if Tailscale is active.
     remote_url: Option<String>,
 }
@@ -313,6 +1047,8 @@ pub struct SystemHealthScreen {
     /// Generation snapshot from last tick (for dirty-state gating).
     #[allow(dead_code)] // reserved for future tick() gating
     last_data_gen: super::DataGeneration,
+    git_segfault_last_seq: u64,
+    git_segfault_badge: GitSegfaultRetryBadge,
 }
 
 fn system_health_worker_spawn_failure_message(error: &std::io::Error) -> String {
@@ -334,6 +1070,7 @@ fn diagnostics_worker_spawn_failure_snapshot(
         token_present: env_cfg.http_bearer_token.is_some(),
         token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
         atc: crate::atc_operator_snapshot(),
+        atc_canary: load_latest_atc_canary_report(&env_cfg.storage_root),
         ..Default::default()
     };
 
@@ -371,6 +1108,7 @@ impl SystemHealthScreen {
             let refresh_for_failure = Arc::clone(&refresh_requested);
             thread::Builder::new()
                 .name("am-system-health".to_string())
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || {
                     diagnostics_worker_loop(
                         &state_for_spawn,
@@ -413,6 +1151,8 @@ impl SystemHealthScreen {
             last_detail_max_scroll: std::cell::Cell::new(0),
             anomaly_cursor: 0,
             last_data_gen: super::DataGeneration::stale(),
+            git_segfault_last_seq: state.event_ring_stats().next_seq.saturating_sub(1),
+            git_segfault_badge: GitSegfaultRetryBadge::default(),
         }
     }
 
@@ -599,14 +1339,25 @@ impl SystemHealthScreen {
             Span::styled(
                 {
                     let (observed_label, observed_micros) = atc_budget_observed(&snap.atc);
+                    let overruns = if snap.atc.budget_overruns_consecutive > 0 {
+                        format!(
+                            "  overruns={}x (worst {}us)",
+                            snap.atc.budget_overruns_consecutive,
+                            snap.atc.worst_tick_overrun_micros
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{observed_label}={}us / {}us  p95≈{}us",
+                        "{observed_label}={}us / {}us  p95≈{}us{overruns}",
                         observed_micros,
                         snap.atc.last_tick_budget_micros,
                         atc_tick_p95_micros(&snap.atc)
                     )
                 },
-                if snap.atc.last_tick_budget_exceeded {
+                if crate::atc_budget_watchdog_tripped(snap.atc.budget_overruns_consecutive) {
+                    crate::tui_theme::text_error(&tp)
+                } else if snap.atc.last_tick_budget_exceeded {
                     crate::tui_theme::text_warning(&tp)
                 } else {
                     value_style
@@ -708,6 +1459,33 @@ impl SystemHealthScreen {
                 hint_style,
             ),
         ]));
+        if let Some(canary) = &snap.atc_canary {
+            let atc_rows = canary
+                .atc_rows
+                .map_or_else(|| "--".to_string(), |rows| rows.to_string());
+            let live_p95 = canary
+                .live_p95_ms
+                .map_or_else(|| "--".to_string(), |p95| format!("{p95:.2}ms"));
+            let canary_style = if canary.verdict == "canary_passed" {
+                crate::tui_theme::text_success(&tp)
+            } else {
+                crate::tui_theme::text_warning(&tp)
+            };
+            lines.push(Line::from_spans([
+                Span::styled("Canary:   ", label_style),
+                Span::styled(
+                    format!(
+                        "verdict={}  quick_check={}  atc_rows={}  live_p95={}",
+                        canary.verdict, canary.quick_check, atc_rows, live_p95
+                    ),
+                    canary_style,
+                ),
+            ]));
+            lines.push(Line::from_spans([
+                Span::styled("Artifact: ", label_style),
+                Span::styled(canary.artifact_path.clone(), hint_style),
+            ]));
+        }
         if let Some(decision) = snap.atc.recent_decisions.first() {
             lines.push(Line::from_spans([
                 Span::styled("Decision:  ", label_style),
@@ -785,6 +1563,105 @@ impl SystemHealthScreen {
         }
 
         lines.push(Line::raw(String::new()));
+        lines.push(Line::from_spans([Span::styled(
+            "\u{2500}\u{2500} Git ref integrity \u{2500}\u{2500}",
+            section_style,
+        )]));
+        let segfault_badge = self.git_segfault_badge;
+        lines.push(level_styled_line(
+            segfault_badge.level(),
+            &tp,
+            "Git retry guard".to_string(),
+            segfault_badge.text(),
+        ));
+        let boot_level = boot_archive_preflight_level(snap.boot_archive_preflight.as_ref());
+        let boot_detail = snap.boot_archive_preflight.as_ref().map_or_else(
+            || "not observed for this process".to_string(),
+            |boot| {
+                format!(
+                    "mode={} projects={} findings={} repaired={} duration={}ms completed={}",
+                    boot.mode,
+                    boot.total_projects,
+                    boot.findings_count,
+                    boot.auto_repaired_count,
+                    boot.duration_ms,
+                    boot.completed_at
+                )
+            },
+        );
+        lines.push(level_styled_line(
+            boot_level,
+            &tp,
+            "Last boot check".to_string(),
+            boot_detail,
+        ));
+        if let Some(boot) = snap.boot_archive_preflight.as_ref()
+            && let Some(remediation) = boot_archive_preflight_remediation(boot)
+        {
+            lines.push(Line::from_spans([
+                Span::styled("       ", accent_style),
+                Span::styled(remediation, crate::tui_theme::text_warning(&tp)),
+            ]));
+        }
+        let git_sweep = &snap.git_ref_integrity;
+        let git_level = git_sweep.level();
+        lines.push(level_styled_line(
+            git_level,
+            &tp,
+            "Health sweep".to_string(),
+            format!(
+                "enabled={} batch={} interval={}s scanned={}/{} findings={} next_cursor={}",
+                git_sweep.enabled,
+                git_sweep.batch_size,
+                git_sweep.interval_seconds,
+                git_sweep.projects_scanned,
+                git_sweep.total_projects,
+                git_sweep.total_findings,
+                git_sweep.next_cursor_index
+            ),
+        ));
+        if let Some(banner) = git_sweep.banner() {
+            lines.push(Line::from_spans([
+                Span::styled("       Run: ", accent_style),
+                Span::styled(banner, crate::tui_theme::text_warning(&tp)),
+            ]));
+        }
+        if git_sweep.projects.is_empty() {
+            lines.push(Line::from_spans([
+                Span::styled("       Rows: ", accent_style),
+                Span::styled("no project sweep data yet".to_string(), hint_style),
+            ]));
+        } else {
+            for project in git_sweep
+                .projects
+                .iter()
+                .take(GIT_REF_INTEGRITY_VISIBLE_PROJECTS)
+            {
+                let checked = project
+                    .last_sweep_ts
+                    .map_or_else(|| "--".to_string(), |ts| ts.to_rfc3339());
+                let detail = project.error.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "findings={} protected={} safe={} ask={} checked={checked}",
+                            project.finding_count,
+                            project.protected_count,
+                            project.safe_to_prune_count,
+                            project.ask_user_count
+                        )
+                    },
+                    |error| format!("error={error} checked={checked}"),
+                );
+                lines.push(level_styled_line(
+                    project.classification,
+                    &tp,
+                    project.slug.clone(),
+                    detail,
+                ));
+            }
+        }
+
+        lines.push(Line::raw(String::new()));
 
         // ── Connection Diagnostics Section ──
         lines.push(Line::from_spans([Span::styled(
@@ -859,6 +1736,68 @@ impl SystemHealthScreen {
             }
         }
 
+        let loop_heartbeats = state.loop_heartbeats_snapshot();
+        if !loop_heartbeats.is_empty() {
+            let now_micros = mcp_agent_mail_db::now_micros();
+            lines.push(Line::raw(String::new()));
+            lines.push(Line::from_spans([Span::styled(
+                "\u{2500}\u{2500} Loop Heartbeats \u{2500}\u{2500}",
+                section_style,
+            )]));
+            for heartbeat in &loop_heartbeats {
+                let level = loop_heartbeat_level(heartbeat, now_micros);
+                lines.push(level_styled_line(
+                    level,
+                    &tp,
+                    heartbeat.kind.as_str().to_string(),
+                    format_loop_heartbeat_detail(heartbeat, now_micros),
+                ));
+            }
+        }
+
+        let screen_refreshes = state.screen_refresh_snapshots();
+        if screen_refreshes.iter().any(|s| s.ticks_total > 0) {
+            let now_micros = mcp_agent_mail_db::now_micros();
+            lines.push(Line::raw(String::new()));
+            lines.push(Line::from_spans([Span::styled(
+                "\u{2500}\u{2500} Screen Data Refresh \u{2500}\u{2500}",
+                section_style,
+            )]));
+            // Informational only: background screens legitimately refresh on a
+            // slower cadence, so this surface never escalates overall health.
+            for refresh in &screen_refreshes {
+                if refresh.ticks_total == 0 {
+                    continue;
+                }
+                lines.push(level_styled_line(
+                    Level::Ok,
+                    &tp,
+                    refresh.screen.as_slug().to_string(),
+                    format_screen_refresh_detail(refresh, now_micros),
+                ));
+            }
+        }
+
+        let query_tracker_snapshot = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
+        let metrics_snapshot = mcp_agent_mail_core::global_metrics().snapshot();
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::from_spans([Span::styled(
+            "\u{2500}\u{2500} DB Query Latency \u{2500}\u{2500}",
+            section_style,
+        )]));
+        lines.push(level_styled_line(
+            Level::Ok,
+            &tp,
+            "queries".to_string(),
+            format_latency_histogram(&query_tracker_snapshot.latency_us),
+        ));
+        lines.push(level_styled_line(
+            Level::Ok,
+            &tp,
+            "pool_acquire".to_string(),
+            format_latency_histogram(&metrics_snapshot.db.pool_acquire_latency_us),
+        ));
+
         let recent_diagnostics =
             recent_system_health_diagnostics(state, SCREEN_DIAGNOSTIC_PREVIEW_LIMIT);
         if !recent_diagnostics.is_empty() {
@@ -891,8 +1830,7 @@ impl SystemHealthScreen {
             }
         }
 
-        lines.push(Line::raw(String::new()));
-        lines.push(Line::from_spans([
+        let footer_line = Line::from_spans([
             Span::styled("r", action_key_style),
             Span::styled(" Refresh  ", hint_style),
             Span::styled("v", action_key_style),
@@ -901,7 +1839,18 @@ impl SystemHealthScreen {
             Span::styled(" Open Mail UI  ", hint_style),
             Span::styled("y", action_key_style),
             Span::styled(" Copy Mail UI", hint_style),
-        ]));
+        ]);
+        let visible_line_count = usize::from(area.height.saturating_sub(2));
+        if visible_line_count > 0 {
+            let reserved_footer_lines = if visible_line_count >= 2 { 2 } else { 1 };
+            if lines.len().saturating_add(reserved_footer_lines) > visible_line_count {
+                lines.truncate(visible_line_count.saturating_sub(reserved_footer_lines));
+            }
+            if reserved_footer_lines == 2 {
+                lines.push(Line::raw(String::new()));
+            }
+        }
+        lines.push(footer_line);
 
         let block = Block::default()
             .title("System Health")
@@ -998,17 +1947,25 @@ impl SystemHealthScreen {
 
                 self.render_metric_tiles(frame, tiles_area, state, &snap);
                 if gauge_h >= 2 {
-                    let left_w = gauge_area.width / 2;
+                    let left_w = gauge_area.width / 3;
+                    let mid_w = gauge_area.width / 3;
                     let event_area =
                         Rect::new(gauge_area.x, gauge_area.y, left_w, gauge_area.height);
                     let atc_area = Rect::new(
                         gauge_area.x + left_w,
                         gauge_area.y,
-                        gauge_area.width.saturating_sub(left_w),
+                        mid_w,
+                        gauge_area.height,
+                    );
+                    let git_area = Rect::new(
+                        gauge_area.x + left_w + mid_w,
+                        gauge_area.y,
+                        gauge_area.width.saturating_sub(left_w + mid_w),
                         gauge_area.height,
                     );
                     self.render_event_ring_gauge(frame, event_area, state);
                     self.render_atc_health_widget(frame, atc_area, &snap);
+                    self.render_git_ref_integrity_widget(frame, git_area, &snap);
                 }
                 if cards_h >= 3 {
                     self.render_anomaly_cards(frame, cards_area, &snap);
@@ -1210,6 +2167,15 @@ impl SystemHealthScreen {
             .iter()
             .filter(|agent| agent.state != "alive")
             .count();
+        let canary_label = snap.atc_canary.as_ref().map_or_else(
+            || "none".to_string(),
+            |canary| {
+                let rows = canary
+                    .atc_rows
+                    .map_or_else(|| "--".to_string(), |rows| rows.to_string());
+                format!("{} rows={}", canary.verdict, rows)
+            },
+        );
         tracing::debug!(
             event = "tui.system_health.atc_widget_rendered",
             writes_total = snap.atc.observability.experiences_written_total,
@@ -1219,7 +2185,7 @@ impl SystemHealthScreen {
         );
 
         let body = format!(
-            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={}\nattention={} worst={}",
+            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} attention={} sweep_p95={}us kill={} safe={} open={} canary={} worst={}",
             tick_age,
             tick_p95,
             atc_tick_is_stale(&snap.atc),
@@ -1228,7 +2194,7 @@ impl SystemHealthScreen {
             atc_retention_status(&snap.atc),
             snap.atc.observability.experiences_written_total,
             snap.atc.observability.experiences_resolved_total,
-            strata_summary,
+            snap.agent_attention_count,
             sweep_p95,
             if snap.atc.kill_switch_enabled {
                 "on"
@@ -1236,7 +2202,8 @@ impl SystemHealthScreen {
                 "off"
             },
             if snap.atc.safe_mode { "on" } else { "off" },
-            snap.agent_attention_count,
+            strata_summary,
+            canary_label,
             snap.agent_attention_summary,
         );
         Paragraph::new(body)
@@ -1244,6 +2211,84 @@ impl SystemHealthScreen {
                 Block::default()
                     .title(" ATC Health ")
                     .border_type(BorderType::Rounded)
+                    .borders(ftui::widgets::borders::Borders::ALL),
+            )
+            .render(area, frame);
+    }
+
+    #[allow(clippy::unused_self)]
+    fn render_git_ref_integrity_widget(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        snap: &DiagnosticsSnapshot,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+
+        let sweep = &snap.git_ref_integrity;
+        let level = sweep.level();
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let border_style = level.style(&tp);
+        let checked = sweep
+            .checked_at
+            .map_or_else(|| "--".to_string(), |ts| ts.to_rfc3339());
+        let top_project = sweep
+            .projects
+            .iter()
+            .find(|project| project.finding_count > 0 || project.error.is_some())
+            .or_else(|| sweep.projects.first());
+        let project_summary = top_project.map_or_else(
+            || "project=none".to_string(),
+            |project| {
+                project.error.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "project={} findings={} class={}",
+                            project.slug,
+                            project.finding_count,
+                            project.classification.label()
+                        )
+                    },
+                    |error| format!("project={} error={error}", project.slug),
+                )
+            },
+        );
+        let banner = sweep.banner().unwrap_or_else(|| {
+            if sweep.am_git_binary_set {
+                "banner suppressed by AM_GIT_BINARY".to_string()
+            } else {
+                "no orphan-ref banner".to_string()
+            }
+        });
+        let boot_summary = snap.boot_archive_preflight.as_ref().map_or_else(
+            || "boot=not observed".to_string(),
+            |boot| {
+                format!(
+                    "boot={} projects={} findings={} repaired={}",
+                    boot.mode, boot.total_projects, boot.findings_count, boot.auto_repaired_count
+                )
+            },
+        );
+        let body = format!(
+            "state={} batch={} interval={}s cursor={}->{} scanned={}/{}\nfindings={} checked={checked}\n{boot_summary}\n{project_summary}\n{banner}",
+            if sweep.enabled { "enabled" } else { "disabled" },
+            sweep.batch_size,
+            sweep.interval_seconds,
+            sweep.cursor_index,
+            sweep.next_cursor_index,
+            sweep.projects_scanned,
+            sweep.total_projects,
+            sweep.total_findings,
+        );
+
+        Paragraph::new(body)
+            .block(
+                Block::default()
+                    .title(" Git ref integrity ")
+                    .border_type(BorderType::Rounded)
+                    .border_style(border_style)
                     .borders(ftui::widgets::borders::Borders::ALL),
             )
             .render(area, frame);
@@ -1263,6 +2308,7 @@ impl SystemHealthScreen {
             confidence: f64,
             title: String,
             rationale: Option<String>,
+            next_steps: Vec<String>,
         }
 
         let mut findings: Vec<FindingCard> = Vec::new();
@@ -1272,6 +2318,31 @@ impl SystemHealthScreen {
                 confidence: 0.95,
                 title: "TCP connection failed".to_string(),
                 rationale: Some(err.clone()),
+                next_steps: Vec::new(),
+            });
+        }
+        if let Some(boot) = snap.boot_archive_preflight.as_ref()
+            && let Some(remediation) = boot_archive_preflight_remediation(boot)
+        {
+            findings.push(FindingCard {
+                severity: if boot.should_abort {
+                    AnomalySeverity::High
+                } else {
+                    AnomalySeverity::Medium
+                },
+                confidence: 0.95,
+                title: "Boot archive check findings".to_string(),
+                rationale: Some(remediation),
+                next_steps: vec!["am doctor fix-orphan-refs --all --dry-run".to_string()],
+            });
+        }
+        if let Some(banner) = snap.git_ref_integrity.banner() {
+            findings.push(FindingCard {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.9,
+                title: "Git ref integrity findings".to_string(),
+                rationale: Some(banner),
+                next_steps: Vec::new(),
             });
         }
         for line in &snap.lines {
@@ -1285,6 +2356,19 @@ impl SystemHealthScreen {
                 confidence: 0.8,
                 title: line.detail.clone(),
                 rationale: line.remediation.clone(),
+                next_steps: Vec::new(),
+            });
+        }
+        for recommendation in &snap.operator_recommendations {
+            findings.push(FindingCard {
+                severity: recommendation.severity,
+                confidence: recommendation.confidence,
+                title: format!("Recommended: {}", recommendation.action),
+                rationale: Some(recommendation.reason.clone()),
+                next_steps: vec![
+                    format!("Run: {}", recommendation.safe_command),
+                    format!("Evidence: {}", recommendation.evidence),
+                ],
             });
         }
 
@@ -1357,6 +2441,7 @@ impl SystemHealthScreen {
                     confidence: 0.6,
                     title: format!("{hidden} more findings"),
                     rationale: Some("Enlarge this pane to view all diagnostics.".to_string()),
+                    next_steps: Vec::new(),
                 });
                 cards
             }
@@ -1378,6 +2463,14 @@ impl SystemHealthScreen {
                 AnomalyCard::new(card_data.severity, card_data.confidence, &card_data.title);
             if let Some(rationale) = card_data.rationale.as_deref() {
                 card = card.rationale(rationale);
+            }
+            let next_step_refs = card_data
+                .next_steps
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if !next_step_refs.is_empty() {
+                card = card.next_steps(&next_step_refs);
             }
             card.render(card_area, frame);
             y_offset = y_offset.saturating_add(current_h);
@@ -1485,7 +2578,15 @@ impl SystemHealthScreen {
         block.render(area, frame);
 
         let snap = self.snapshot();
-        if snap.lines.is_empty() && snap.tcp_error.is_none() {
+        if snap.lines.is_empty()
+            && snap.tcp_error.is_none()
+            && snap.git_ref_integrity.total_findings == 0
+            && snap
+                .git_ref_integrity
+                .projects
+                .iter()
+                .all(|project| project.error.is_none())
+        {
             crate::tui_panel_helpers::render_empty_state(
                 frame,
                 inner,
@@ -1499,6 +2600,43 @@ impl SystemHealthScreen {
         let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
         if let Some(err) = &snap.tcp_error {
             lines.push(("[CRIT] TCP".into(), err.clone(), Some(tp.severity_critical)));
+        }
+        if let Some(boot) = snap.boot_archive_preflight.as_ref()
+            && let Some(remediation) = boot_archive_preflight_remediation(boot)
+        {
+            lines.push((
+                "[WARN] Boot check".into(),
+                remediation,
+                Some(if boot.should_abort {
+                    tp.severity_critical
+                } else {
+                    tp.severity_warn
+                }),
+            ));
+        }
+        if let Some(banner) = snap.git_ref_integrity.banner() {
+            lines.push(("[WARN] Git refs".into(), banner, Some(tp.severity_warn)));
+        }
+        for project in snap
+            .git_ref_integrity
+            .projects
+            .iter()
+            .filter(|project| project.finding_count > 0 || project.error.is_some())
+        {
+            let color = match project.classification {
+                Level::Ok => tp.severity_ok,
+                Level::Warn => tp.severity_warn,
+                Level::Fail => tp.severity_error,
+            };
+            let detail = project.error.as_ref().map_or_else(
+                || format!("{} orphan ref(s)", project.finding_count),
+                Clone::clone,
+            );
+            lines.push((
+                format!("[{}] {}", project.classification.label(), project.slug),
+                detail,
+                Some(color),
+            ));
         }
         for probe_line in &snap.lines {
             let color = match probe_line.level {
@@ -1683,6 +2821,13 @@ impl MailScreen for SystemHealthScreen {
         }
     }
 
+    fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
+        for event in state.events_since_limited(self.git_segfault_last_seq, 256) {
+            self.git_segfault_last_seq = self.git_segfault_last_seq.max(event.seq());
+            self.git_segfault_badge.ingest(&event);
+        }
+    }
+
     fn keybindings(&self) -> Vec<HelpEntry> {
         vec![
             HelpEntry {
@@ -1737,6 +2882,10 @@ fn format_uptime(d: Duration) -> String {
 
 fn critical_finding_count(snap: &DiagnosticsSnapshot) -> usize {
     usize::from(snap.tcp_error.is_some())
+        + usize::from(snap.git_ref_integrity.level() == Level::Fail)
+        + usize::from(
+            boot_archive_preflight_level(snap.boot_archive_preflight.as_ref()) == Level::Fail,
+        )
         + snap
             .lines
             .iter()
@@ -1826,6 +2975,11 @@ fn diagnostics_worker_loop(
     // Cache Tailscale IP to avoid spawning a subprocess every diagnostics cycle.
     let mut cached_tailscale_ip: Option<String> = crate::detect_tailscale_ip();
     let mut tailscale_checked_at = Instant::now();
+    let mut git_ref_integrity = GitRefIntegritySweepState::default();
+    let git_ref_cursor_path = git_ref_sweep_cursor_path();
+    let git_ref_dismissals_path = git_ref_sweep_dismissals_path();
+    let mut git_ref_cursor_index = load_git_ref_sweep_cursor(&git_ref_cursor_path);
+    let mut next_git_ref_sweep_due = Instant::now();
 
     let mut next_due = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -1838,7 +2992,37 @@ fn diagnostics_worker_loop(
                 cached_tailscale_ip = crate::detect_tailscale_ip();
                 tailscale_checked_at = now;
             }
-            let snap = run_diagnostics(state, cached_tailscale_ip.as_deref());
+            let run_git_ref_sweep = refresh || now >= next_git_ref_sweep_due;
+            let git_ref_dismissals = if run_git_ref_sweep {
+                load_git_ref_sweep_dismissals(&git_ref_dismissals_path)
+            } else {
+                Vec::new()
+            };
+            let snap = run_diagnostics(
+                state,
+                cached_tailscale_ip.as_deref(),
+                &mut git_ref_integrity,
+                &mut git_ref_cursor_index,
+                &git_ref_dismissals,
+                run_git_ref_sweep,
+            );
+            if run_git_ref_sweep {
+                next_git_ref_sweep_due = Instant::now()
+                    + Duration::from_secs(snap.git_ref_integrity.interval_seconds.max(1));
+                if snap.git_ref_integrity.enabled
+                    && let Err(error) = save_git_ref_sweep_cursor(
+                        &git_ref_cursor_path,
+                        snap.git_ref_integrity.next_cursor_index,
+                    )
+                {
+                    tracing::warn!(
+                        target: "mcp_agent_mail::health_sweep",
+                        path = %git_ref_cursor_path.display(),
+                        error = %error,
+                        "git_ref_integrity_cursor_save_failed"
+                    );
+                }
+            }
             emit_screen_diagnostic(state, &snap);
             if let Ok(mut guard) = snapshot.lock() {
                 *guard = snap;
@@ -1895,7 +3079,121 @@ fn emit_screen_diagnostic(state: &TuiSharedState, snap: &DiagnosticsSnapshot) {
     });
 }
 
-fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> DiagnosticsSnapshot {
+fn build_system_health_recommendations(
+    db_snapshot: Option<&crate::tui_events::DbStatSnapshot>,
+    snap: &DiagnosticsSnapshot,
+) -> Vec<OperatorRecommendationCard> {
+    let mut recommendations = Vec::new();
+
+    if let Some(error) = &snap.tcp_error {
+        recommendations.push(OperatorRecommendationCard {
+            severity: AnomalySeverity::Critical,
+            confidence: 0.95,
+            action: "Inspect MCP endpoint reachability".to_string(),
+            reason: error.clone(),
+            evidence: format!("system-health://tcp?endpoint={}", snap.endpoint),
+            safe_command: "am robot health --format json".to_string(),
+        });
+    }
+
+    if let Some(db) = db_snapshot {
+        if db.ack_pending > 0 {
+            recommendations.push(OperatorRecommendationCard {
+                severity: if db.ack_pending >= 5 {
+                    AnomalySeverity::High
+                } else {
+                    AnomalySeverity::Medium
+                },
+                confidence: 0.9,
+                action: "Review ack-required messages".to_string(),
+                reason: format!("{} message(s) are awaiting acknowledgement", db.ack_pending),
+                evidence: format!("system-health://ack-pending?count={}", db.ack_pending),
+                safe_command: "am robot inbox --all --ack-overdue".to_string(),
+            });
+        }
+
+        let now_us = mcp_agent_mail_db::now_micros();
+        let expiring = db
+            .reservation_snapshots
+            .iter()
+            .filter(|reservation| {
+                !reservation.is_released()
+                    && reservation.expires_ts >= now_us
+                    && reservation.expires_ts.saturating_sub(now_us)
+                        <= RECOMMENDATION_EXPIRING_RESERVATION_US
+            })
+            .count();
+        if expiring > 0 {
+            recommendations.push(OperatorRecommendationCard {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.88,
+                action: "Renew or release expiring reservations".to_string(),
+                reason: format!("{expiring} active reservation(s) expire within 5 minutes"),
+                evidence: format!("system-health://reservations-expiring?count={expiring}"),
+                safe_command: "am robot reservations --expiring 5".to_string(),
+            });
+        }
+    }
+
+    if let Some(canary) = &snap.atc_canary
+        && canary.verdict != "canary_passed"
+    {
+        recommendations.push(OperatorRecommendationCard {
+            severity: if canary.verdict == "disable_live" {
+                AnomalySeverity::Critical
+            } else {
+                AnomalySeverity::Medium
+            },
+            confidence: 0.92,
+            action: "Inspect ATC canary verdict".to_string(),
+            reason: canary.recommendation.clone(),
+            evidence: canary.artifact_path.clone(),
+            safe_command: "am robot atc --format json".to_string(),
+        });
+    }
+
+    if let Some(banner) = snap.git_ref_integrity.banner() {
+        recommendations.push(OperatorRecommendationCard {
+            severity: AnomalySeverity::Medium,
+            confidence: 0.9,
+            action: "Dry-run orphan ref cleanup".to_string(),
+            reason: banner,
+            evidence: "system-health://git-ref-integrity".to_string(),
+            safe_command: "am doctor fix-orphan-refs --all --dry-run".to_string(),
+        });
+    }
+
+    if let Some(boot) = snap.boot_archive_preflight.as_ref()
+        && let Some(remediation) = boot_archive_preflight_remediation(boot)
+    {
+        recommendations.push(OperatorRecommendationCard {
+            severity: if boot.should_abort {
+                AnomalySeverity::High
+            } else {
+                AnomalySeverity::Medium
+            },
+            confidence: 0.95,
+            action: "Review boot archive findings".to_string(),
+            reason: remediation,
+            evidence: format!(
+                "mode={} projects={} findings={} duration={}ms",
+                boot.mode, boot.total_projects, boot.findings_count, boot.duration_ms
+            ),
+            safe_command: "am doctor fix-orphan-refs --all --dry-run".to_string(),
+        });
+    }
+
+    recommendations
+}
+
+fn run_diagnostics(
+    state: &TuiSharedState,
+    tailscale_ip: Option<&str>,
+    git_ref_integrity: &mut GitRefIntegritySweepState,
+    git_ref_cursor_index: &mut usize,
+    git_ref_dismissals: &[GitRefSweepDismissalEntry],
+    run_git_ref_sweep: bool,
+) -> DiagnosticsSnapshot {
     let cfg = state.config_snapshot();
     let env_cfg = Config::from_env();
 
@@ -1915,18 +3213,28 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
         token_present: env_cfg.http_bearer_token.is_some(),
         token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
         atc: crate::atc_operator_snapshot(),
+        atc_canary: load_latest_atc_canary_report(&env_cfg.storage_root),
+        boot_archive_preflight: state.boot_archive_preflight_snapshot(),
         remote_url,
         ..Default::default()
     };
-    if let Some(db_snapshot) = state.db_stats_snapshot() {
+    out.drop_close_total = mcp_agent_mail_core::global_metrics()
+        .db
+        .drop_close_total
+        .load();
+    out.coalescer_worker_liveness = mcp_agent_mail_storage::commit_coalescer_worker_liveness();
+    let db_snapshot = state.db_stats_snapshot();
+    if let Some(db_snapshot) = &db_snapshot {
         let mut attention_agents = db_snapshot
             .agents_list
-            .into_iter()
+            .iter()
             .filter_map(|agent| {
-                agent.health.and_then(|health| {
-                    health
-                        .needs_attention()
-                        .then_some((health.score, health.badge(), agent.name))
+                agent.health.as_ref().and_then(|health| {
+                    health.needs_attention().then_some((
+                        health.score,
+                        health.badge(),
+                        agent.name.clone(),
+                    ))
                 })
             })
             .collect::<Vec<_>>();
@@ -1944,6 +3252,29 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
                 .join(", ")
         };
     }
+    let git_ref_targets = db_snapshot
+        .as_ref()
+        .map_or_else(Vec::new, git_ref_integrity_targets_from_snapshot);
+    if run_git_ref_sweep || !env_cfg.health_sweep_enabled {
+        *git_ref_integrity = git_ref_integrity_sweep(
+            &git_ref_targets,
+            *git_ref_cursor_index,
+            env_cfg.health_sweep_batch,
+            env_cfg.health_sweep_enabled,
+            env_cfg.health_sweep_interval_seconds,
+            std::env::var_os("AM_GIT_BINARY").is_some(),
+            git_ref_dismissals,
+            out.checked_at.unwrap_or_else(Utc::now),
+        );
+        *git_ref_cursor_index = git_ref_integrity.next_cursor_index;
+    } else {
+        git_ref_integrity.enabled = env_cfg.health_sweep_enabled;
+        git_ref_integrity.interval_seconds = env_cfg.health_sweep_interval_seconds;
+        git_ref_integrity.batch_size = env_cfg.health_sweep_batch;
+        git_ref_integrity.total_projects = git_ref_targets.len();
+        git_ref_integrity.am_git_binary_set = std::env::var_os("AM_GIT_BINARY").is_some();
+    }
+    out.git_ref_integrity = git_ref_integrity.clone();
 
     let parsed = match parse_http_endpoint(&cfg) {
         Ok(p) => p,
@@ -2014,8 +3345,53 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
     add_base_path_findings(&mut out);
     add_auth_findings(&mut out);
     add_atc_findings(&mut out);
+    add_db_connection_findings(&mut out);
+    out.operator_recommendations = build_system_health_recommendations(db_snapshot.as_ref(), &out);
 
     out
+}
+
+/// Connection-lifecycle health findings (NOT gated on ATC).
+///
+/// I3 (br-bvq1x.9.3): a `drop_close` is a DB-engine signal that must surface
+/// even when ATC is off (it is off-by-default), unlike [`add_atc_findings`].
+fn add_db_connection_findings(out: &mut DiagnosticsSnapshot) {
+    // SQLite connections dropped without an explicit close(). The count is a
+    // snapshot of the global counter fed by the binaries' tracing layers (0
+    // until one is registered — e.g. in unit tests — so this stays quiet).
+    if out.drop_close_total > 0 {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "db-drop-close",
+            detail: format!(
+                "{} SQLite connection(s) dropped without explicit close()",
+                out.drop_close_total
+            ),
+            remediation: Some(
+                "Connection-lifecycle debt (paired with ATC tick overruns in the ts1 incident). Inspect pooled-connection teardown and the ATC operator's DB usage.".into(),
+            ),
+        });
+    }
+
+    // I5 (br-bvq1x.9.5): a dead commit-coalescer worker silently stalls
+    // durability (git writes stop being committed) while the rest of the
+    // process looks alive — escalate to Fail.
+    if let Some(liveness) = out.coalescer_worker_liveness
+        && liveness.any_dead()
+    {
+        out.lines.push(ProbeLine {
+            level: Level::Fail,
+            name: "commit-coalescer-thread-died",
+            detail: format!(
+                "commit coalescer: {} of {} worker thread(s) dead — git archive writes are stalling",
+                liveness.dead_workers(),
+                liveness.expected
+            ),
+            remediation: Some(
+                "A coalescer worker panicked; queued git commits are no longer draining. Restart the server to respawn workers, then check recent logs for the panic.".into(),
+            ),
+        });
+    }
 }
 
 fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
@@ -2073,6 +3449,31 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
         });
     }
 
+    if let Some(canary) = &out.atc_canary
+        && canary.verdict != "canary_passed"
+    {
+        out.lines.push(ProbeLine {
+            level: if canary.verdict == "disable_live" {
+                Level::Fail
+            } else {
+                Level::Warn
+            },
+            name: "atc-canary",
+            detail: format!(
+                "Latest ATC canary verdict is {} (quick_check={}, atc_rows={})",
+                canary.verdict,
+                canary.quick_check,
+                canary
+                    .atc_rows
+                    .map_or_else(|| "--".to_string(), |rows| rows.to_string())
+            ),
+            remediation: Some(format!(
+                "{} Report: {}",
+                canary.recommendation, canary.artifact_path
+            )),
+        });
+    }
+
     if out.atc.deadlock_cycles > 0 {
         out.lines.push(ProbeLine {
             level: Level::Fail,
@@ -2098,6 +3499,26 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
             remediation: Some(
                 "Profile the ATC hot path before increasing the tick interval or budget.".into(),
+            ),
+        });
+    }
+
+    // I3 (br-bvq1x.9.3): a SUSTAINED run of consecutive overruns is the
+    // freeze-adjacent "running-but-over-budget" loop ts1 hit — escalate it
+    // distinctly from a one-off overrun above.
+    if crate::atc_budget_watchdog_tripped(out.atc.budget_overruns_consecutive) {
+        out.lines.push(ProbeLine {
+            level: Level::Fail,
+            name: "atc-budget-watchdog",
+            detail: format!(
+                "ATC operator persistently over budget: {} consecutive tick overrun(s) (worst {}us over {}us budget; {} total)",
+                out.atc.budget_overruns_consecutive,
+                out.atc.worst_tick_overrun_micros,
+                out.atc.last_tick_budget_micros,
+                out.atc.budget_overruns_total,
+            ),
+            remediation: Some(
+                "ATC ticks are starving the operator loop. Profile the ATC hot path, reduce experience churn (AM_ATC_* knobs), or disable ATC (AM_ATC_ENABLED=false) until resolved.".into(),
             ),
         });
     }
@@ -2223,6 +3644,311 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
         });
     }
+}
+
+fn git_ref_sweep_cursor_path() -> PathBuf {
+    let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    git_ref_sweep_cursor_path_from_data_dir(&data_dir)
+}
+
+fn git_ref_sweep_dismissals_path() -> PathBuf {
+    let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    git_ref_sweep_data_file_path_from_data_dir(&data_dir, GIT_REF_SWEEP_DISMISSALS_FILE_NAME)
+}
+
+fn git_ref_sweep_cursor_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    git_ref_sweep_data_file_path_from_data_dir(data_dir, GIT_REF_SWEEP_CURSOR_FILE_NAME)
+}
+
+fn git_ref_sweep_data_file_path_from_data_dir(data_dir: &Path, file_name: &str) -> PathBuf {
+    data_dir.join(HEALTH_SWEEP_DATA_DIR_NAME).join(file_name)
+}
+
+fn load_git_ref_sweep_cursor(path: &Path) -> usize {
+    match crate::tui_persist::read_persist_text(path) {
+        Ok(json) => match serde_json::from_str::<GitRefSweepCursorFile>(&json) {
+            Ok(file) => file.cursor_index,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mcp_agent_mail::health_sweep",
+                    path = %path.display(),
+                    error = %error,
+                    "git_ref_integrity_cursor_parse_failed"
+                );
+                0
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            tracing::warn!(
+                target: "mcp_agent_mail::health_sweep",
+                path = %path.display(),
+                error = %error,
+                "git_ref_integrity_cursor_load_failed"
+            );
+            0
+        }
+    }
+}
+
+fn save_git_ref_sweep_cursor(path: &Path, cursor_index: usize) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(&GitRefSweepCursorFile { cursor_index })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    crate::tui_persist::atomic_write_text(path, &json)
+}
+
+fn load_git_ref_sweep_dismissals(path: &Path) -> Vec<GitRefSweepDismissalEntry> {
+    match crate::tui_persist::read_persist_text(path) {
+        Ok(toml_text) => match toml::from_str::<GitRefSweepDismissalsFile>(&toml_text) {
+            Ok(file) => file
+                .dismissed
+                .into_iter()
+                .filter(|entry| {
+                    !entry.project_slug.trim().is_empty() && !entry.ref_kind.trim().is_empty()
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(
+                    target: "mcp_agent_mail::health_sweep",
+                    path = %path.display(),
+                    error = %error,
+                    "git_ref_integrity_dismissals_parse_failed"
+                );
+                Vec::new()
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            tracing::warn!(
+                target: "mcp_agent_mail::health_sweep",
+                path = %path.display(),
+                error = %error,
+                "git_ref_integrity_dismissals_load_failed"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn git_ref_finding_is_dismissed(
+    dismissals: &[GitRefSweepDismissalEntry],
+    project_slug: &str,
+    ref_kind: &str,
+) -> bool {
+    dismissals.iter().any(|entry| {
+        entry.project_slug == project_slug && entry.ref_kind.eq_ignore_ascii_case(ref_kind)
+    })
+}
+
+fn git_ref_integrity_targets_from_snapshot(
+    db_snapshot: &crate::tui_events::DbStatSnapshot,
+) -> Vec<GitRefIntegrityProjectTarget> {
+    db_snapshot
+        .projects_list
+        .iter()
+        .filter(|project| !project.slug.trim().is_empty() && !project.human_key.trim().is_empty())
+        .map(|project| GitRefIntegrityProjectTarget {
+            slug: project.slug.clone(),
+            path: PathBuf::from(project.human_key.clone()),
+        })
+        .collect()
+}
+
+fn git_ref_integrity_classification(
+    finding_count: usize,
+    protected_count: usize,
+    error: Option<&str>,
+) -> Level {
+    if error.is_some() || protected_count > 0 {
+        Level::Fail
+    } else if finding_count > 0 {
+        Level::Warn
+    } else {
+        Level::Ok
+    }
+}
+
+fn git_ref_kind(
+    ref_name: &str,
+    category: mcp_agent_mail_storage::recovery::RefCategory,
+) -> &'static str {
+    match category {
+        mcp_agent_mail_storage::recovery::RefCategory::Protected => "orphan_protected",
+        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune if ref_name == "refs/stash" => {
+            "orphan_stash"
+        }
+        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => "orphan_safe_to_prune",
+        mcp_agent_mail_storage::recovery::RefCategory::AskUser => "orphan_ref",
+    }
+}
+
+fn git_ref_severity(category: mcp_agent_mail_storage::recovery::RefCategory) -> &'static str {
+    match category {
+        mcp_agent_mail_storage::recovery::RefCategory::Protected => "error",
+        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => "warn",
+        mcp_agent_mail_storage::recovery::RefCategory::AskUser => "warn",
+    }
+}
+
+fn git_ref_visible_findings<'a>(
+    project_slug: &str,
+    findings: &'a [mcp_agent_mail_storage::recovery::PrunableRef],
+    dismissals: &[GitRefSweepDismissalEntry],
+) -> Vec<(
+    &'a mcp_agent_mail_storage::recovery::PrunableRef,
+    &'static str,
+)> {
+    findings
+        .iter()
+        .filter_map(|finding| {
+            let ref_kind = git_ref_kind(&finding.ref_name, finding.category);
+            (!git_ref_finding_is_dismissed(dismissals, project_slug, ref_kind))
+                .then_some((finding, ref_kind))
+        })
+        .collect()
+}
+
+/// Run one bounded Git ref-integrity health-sweep cycle.
+#[doc(hidden)]
+#[must_use]
+pub fn git_ref_integrity_sweep(
+    targets: &[GitRefIntegrityProjectTarget],
+    cursor_index: usize,
+    batch_size: usize,
+    enabled: bool,
+    interval_seconds: u64,
+    am_git_binary_set: bool,
+    dismissals: &[GitRefSweepDismissalEntry],
+    now: DateTime<Utc>,
+) -> GitRefIntegritySweepState {
+    let batch_size = batch_size.max(1);
+    let total_projects = targets.len();
+    let cursor_index = if total_projects == 0 {
+        0
+    } else {
+        cursor_index % total_projects
+    };
+    let mut state = GitRefIntegritySweepState {
+        enabled,
+        interval_seconds,
+        batch_size,
+        cursor_index,
+        next_cursor_index: cursor_index,
+        total_projects,
+        checked_at: Some(now),
+        am_git_binary_set,
+        ..Default::default()
+    };
+
+    if !enabled || total_projects == 0 {
+        return state;
+    }
+
+    let projects_to_scan = batch_size.min(total_projects);
+    state.projects_scanned = projects_to_scan;
+
+    tracing::info!(
+        target: "mcp_agent_mail::health_sweep",
+        batch_size = projects_to_scan,
+        cursor_index,
+        total_projects,
+        "git_ref_integrity_started"
+    );
+
+    let sweep_started = Instant::now();
+    for offset in 0..projects_to_scan {
+        let project_index = (cursor_index + offset) % total_projects;
+        let target = &targets[project_index];
+        let project_started = Instant::now();
+        let last_sweep_ts = Some(now);
+
+        match mcp_agent_mail_storage::recovery::detect_missing_refs(&target.path) {
+            Ok(findings) => {
+                let visible_findings =
+                    git_ref_visible_findings(&target.slug, &findings, dismissals);
+                let mut finding_count = 0;
+                let mut protected_count = 0;
+                let mut safe_to_prune_count = 0;
+                let mut ask_user_count = 0;
+                for (finding, ref_kind) in &visible_findings {
+                    finding_count += 1;
+                    match finding.category {
+                        mcp_agent_mail_storage::recovery::RefCategory::Protected => {
+                            protected_count += 1;
+                        }
+                        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => {
+                            safe_to_prune_count += 1;
+                        }
+                        mcp_agent_mail_storage::recovery::RefCategory::AskUser => {
+                            ask_user_count += 1;
+                        }
+                    }
+                    tracing::warn!(
+                        target: "mcp_agent_mail::health_sweep",
+                        project_slug = %target.slug,
+                        ref_kind = *ref_kind,
+                        ref_name = %finding.ref_name,
+                        severity = git_ref_severity(finding.category),
+                        "git_ref_integrity_finding"
+                    );
+                }
+                state.total_findings += finding_count;
+                let duration_ms = saturating_duration_ms_u64(project_started.elapsed());
+                tracing::info!(
+                    target: "mcp_agent_mail::health_sweep",
+                    project_slug = %target.slug,
+                    finding_count,
+                    duration_ms,
+                    outcome = "ok",
+                    "git_ref_integrity_swept"
+                );
+                state.projects.push(GitRefIntegrityProjectSummary {
+                    slug: target.slug.clone(),
+                    last_sweep_ts,
+                    finding_count,
+                    protected_count,
+                    safe_to_prune_count,
+                    ask_user_count,
+                    classification: git_ref_integrity_classification(
+                        finding_count,
+                        protected_count,
+                        None,
+                    ),
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let duration_ms = saturating_duration_ms_u64(project_started.elapsed());
+                tracing::warn!(
+                    target: "mcp_agent_mail::health_sweep",
+                    project_slug = %target.slug,
+                    finding_count = 0,
+                    duration_ms,
+                    outcome = "error",
+                    error = %error,
+                    "git_ref_integrity_swept"
+                );
+                state.projects.push(GitRefIntegrityProjectSummary {
+                    slug: target.slug.clone(),
+                    last_sweep_ts,
+                    classification: git_ref_integrity_classification(0, 0, Some(error.message())),
+                    error: Some(error.message().to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    state.next_cursor_index = (cursor_index + projects_to_scan) % total_projects;
+    tracing::info!(
+        target: "mcp_agent_mail::health_sweep",
+        batch_size = projects_to_scan,
+        total_findings = state.total_findings,
+        total_duration_ms = saturating_duration_ms_u64(sweep_started.elapsed()),
+        next_cursor_index = state.next_cursor_index,
+        "git_ref_integrity_completed"
+    );
+    state
 }
 
 fn push_unique_path(list: &mut Vec<String>, path: &str) {
@@ -2550,9 +4276,285 @@ mod tests {
     use super::*;
     use ftui_harness::buffer_to_text;
     use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_test_helpers::repo;
 
     fn test_state() -> Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    fn boot_preflight_snapshot(findings_count: usize) -> BootArchivePreflightSnapshot {
+        BootArchivePreflightSnapshot {
+            mode: "warn",
+            root: "/tmp/mailbox".to_string(),
+            started_at: "2026-05-11T00:00:00Z".to_string(),
+            completed_at: "2026-05-11T00:00:01Z".to_string(),
+            duration_ms: 12,
+            total_projects: 3,
+            findings_count,
+            auto_repaired_count: 0,
+            should_abort: false,
+            findings: if findings_count == 0 {
+                Vec::new()
+            } else {
+                vec![crate::tui_bridge::BootArchivePreflightFindingSnapshot {
+                    project: "proj-a".to_string(),
+                    kind: "orphan_refs",
+                    detail: "refs/stash target missing".to_string(),
+                }]
+            },
+        }
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mcp-agent-mail-system-health-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("test dir");
+        path
+    }
+
+    fn segfault_retry_event(exhausted: bool) -> MailEvent {
+        MailEvent::git_segfault_retry(
+            if exhausted {
+                "git_segfault_retry_exhausted"
+            } else {
+                "git_segfault_retry_attempt"
+            },
+            "data-projects-foo",
+            if exhausted { 4 } else { 1 },
+            Some(11),
+            exhausted,
+        )
+    }
+
+    #[test]
+    fn segfault_toast_first_event_emits_warning() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let now = Instant::now();
+        let toasts = git_segfault_retry_toast_handler(
+            &mut state,
+            &segfault_retry_event(false),
+            now,
+            true,
+            true,
+        );
+
+        assert_eq!(toasts.len(), 1);
+        assert_eq!(toasts[0].severity, GitSegfaultRetryToastSeverity::Warning);
+        assert_eq!(
+            toasts[0].message,
+            "git 2.51.0 segfault retried on data-projects-foo. Set AM_GIT_BINARY or upgrade git to stop seeing this."
+        );
+    }
+
+    #[test]
+    fn segfault_toast_subsequent_event_increments_badge_only() {
+        let mut toast_state = GitSegfaultRetryToastState::default();
+        let mut badge = GitSegfaultRetryBadge::default();
+        let now = Instant::now();
+        let event = segfault_retry_event(false);
+        let mut toast_count = 0;
+
+        for _ in 0..5 {
+            badge.ingest(&event);
+            toast_count +=
+                git_segfault_retry_toast_handler(&mut toast_state, &event, now, true, true).len();
+        }
+
+        assert_eq!(toast_count, 1);
+        assert_eq!(badge.retry_count, 5);
+        assert_eq!(badge.text(), "git segfault retries: 5");
+    }
+
+    #[test]
+    fn segfault_toast_respects_global_toast_disabled_env() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let mut badge = GitSegfaultRetryBadge::default();
+        let event = segfault_retry_event(false);
+        badge.ingest(&event);
+
+        let toasts =
+            git_segfault_retry_toast_handler(&mut state, &event, Instant::now(), false, true);
+
+        assert!(toasts.is_empty());
+        assert_eq!(badge.retry_count, 1);
+    }
+
+    #[test]
+    fn segfault_toast_respects_specific_category_disabled_env() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let toasts = git_segfault_retry_toast_handler(
+            &mut state,
+            &segfault_retry_event(false),
+            Instant::now(),
+            true,
+            false,
+        );
+
+        assert!(toasts.is_empty());
+    }
+
+    #[test]
+    fn segfault_toast_badge_format_plain_below_threshold() {
+        assert_eq!(
+            git_segfault_retry_badge_text(29, 0),
+            "git segfault retries: 29"
+        );
+        assert_eq!(git_segfault_retry_badge_level(29, 0), Level::Ok);
+    }
+
+    #[test]
+    fn segfault_toast_badge_format_high_above_30() {
+        assert_eq!(
+            git_segfault_retry_badge_text(30, 0),
+            "git segfault retries: 30 (HIGH)"
+        );
+        assert_eq!(git_segfault_retry_badge_level(30, 0), Level::Warn);
+    }
+
+    #[test]
+    fn segfault_toast_badge_format_exhausted_when_exhaust_count_positive() {
+        assert_eq!(
+            git_segfault_retry_badge_text(31, 1),
+            "git segfault retries: 31 (EXHAUSTED 1)"
+        );
+        assert_eq!(git_segfault_retry_badge_level(31, 1), Level::Fail);
+    }
+
+    #[test]
+    fn segfault_toast_rate_limit_emits_followup_at_30() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let now = Instant::now();
+        let event = segfault_retry_event(false);
+        let mut messages = Vec::new();
+
+        for _ in 0..30 {
+            messages.extend(
+                git_segfault_retry_toast_handler(&mut state, &event, now, true, true)
+                    .into_iter()
+                    .map(|toast| toast.message),
+            );
+        }
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1], git_segfault_window_warning_text());
+    }
+
+    #[test]
+    fn segfault_toast_window_resets_after_5min() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let start = Instant::now();
+        let event = segfault_retry_event(false);
+
+        for _ in 0..30 {
+            let _ = git_segfault_retry_toast_handler(&mut state, &event, start, true, true);
+        }
+        let after_window = start + Duration::from_secs(5 * 60 + 1);
+        let toasts = git_segfault_retry_toast_handler(&mut state, &event, after_window, true, true);
+
+        assert!(toasts.is_empty());
+    }
+
+    #[test]
+    fn segfault_toast_escalation_emits_error_on_exhausted() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let toasts = git_segfault_retry_toast_handler(
+            &mut state,
+            &segfault_retry_event(true),
+            Instant::now(),
+            true,
+            true,
+        );
+
+        assert_eq!(toasts.len(), 1);
+        assert_eq!(toasts[0].severity, GitSegfaultRetryToastSeverity::Error);
+        assert_eq!(
+            toasts[0].message,
+            "git 2.51.0 retry EXHAUSTED on data-projects-foo. Operations failing. Set AM_GIT_BINARY immediately."
+        );
+    }
+
+    #[test]
+    fn segfault_toast_system_health_tick_updates_badge() {
+        let state = test_state();
+        let mut screen = SystemHealthScreen::new(Arc::clone(&state));
+        assert!(state.push_event(segfault_retry_event(false)));
+        assert!(state.push_event(segfault_retry_event(false)));
+        assert!(state.push_event(segfault_retry_event(true)));
+
+        screen.tick(1, &state);
+
+        assert_eq!(screen.git_segfault_badge.retry_count, 3);
+        assert_eq!(screen.git_segfault_badge.exhausted_count, 1);
+        assert_eq!(
+            screen.git_segfault_badge.text(),
+            "git segfault retries: 3 (EXHAUSTED 1)"
+        );
+    }
+
+    fn source_function_body<'a>(source: &'a str, fn_name: &str) -> &'a str {
+        let signature = format!("fn {fn_name}");
+        let start = source.find(&signature).expect("function signature");
+        let brace_start = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .expect("function body start");
+        let mut depth = 0_u32;
+        for (offset, ch) in source[brace_start..].char_indices() {
+            match ch {
+                '{' => depth = depth.saturating_add(1),
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let end = brace_start + offset + ch.len_utf8();
+                        return &source[brace_start..end];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body end for {fn_name}");
+    }
+
+    #[test]
+    fn segfault_toast_formatter_pure_no_env_reads() {
+        let source = include_str!("system_health.rs");
+        for fn_name in [
+            "git_segfault_first_warning_text",
+            "git_segfault_window_warning_text",
+            "git_segfault_exhausted_error_text",
+            "git_segfault_retry_badge_text",
+            "git_segfault_retry_badge_level",
+        ] {
+            let body = source_function_body(source, fn_name);
+            assert!(!body.contains("std::env"), "{fn_name} reads environment");
+            assert!(!body.contains("env::"), "{fn_name} reads environment");
+            assert!(
+                !body.contains("std::fs"),
+                "{fn_name} performs filesystem I/O"
+            );
+            assert!(
+                !body.contains("File::"),
+                "{fn_name} performs filesystem I/O"
+            );
+        }
+    }
+
+    fn prunable_ref(
+        ref_name: &str,
+        category: mcp_agent_mail_storage::recovery::RefCategory,
+    ) -> mcp_agent_mail_storage::recovery::PrunableRef {
+        mcp_agent_mail_storage::recovery::PrunableRef {
+            ref_name: ref_name.to_string(),
+            target_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            reason: "test".to_string(),
+            category,
+        }
     }
 
     fn test_screen(snapshot: DiagnosticsSnapshot) -> SystemHealthScreen {
@@ -2568,6 +4570,8 @@ mod tests {
             last_detail_max_scroll: std::cell::Cell::new(0),
             anomaly_cursor: 0,
             last_data_gen: crate::tui_screens::DataGeneration::default(),
+            git_segfault_last_seq: 0,
+            git_segfault_badge: GitSegfaultRetryBadge::default(),
         }
     }
 
@@ -3409,6 +5413,47 @@ mod tests {
     }
 
     #[test]
+    fn atc_findings_surface_canary_fallback_verdict() {
+        let mut out = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                ..Default::default()
+            },
+            atc_canary: Some(AtcCanaryReportSummary {
+                status: "pass".to_string(),
+                verdict: "hold_live".to_string(),
+                artifact_path: "/tmp/atc/canary_report.json".to_string(),
+                quick_check: "ok".to_string(),
+                atc_rows: Some(0),
+                live_p95_ms: Some(13.0),
+                shadow_p95_ms: Some(12.5),
+                reason: "canary database recorded no ATC experience rows".to_string(),
+                recommendation: "Do not promote live ATC writes.".to_string(),
+                safe_command: Some("export AM_ATC_WRITE_MODE=shadow".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        add_atc_findings(&mut out);
+
+        let finding = out
+            .lines
+            .iter()
+            .find(|line| line.name == "atc-canary")
+            .expect("canary finding");
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.detail.contains("hold_live"));
+        assert!(finding.detail.contains("atc_rows=0"));
+        assert!(
+            finding
+                .remediation
+                .as_ref()
+                .is_some_and(|text| text.contains("/tmp/atc/canary_report.json"))
+        );
+    }
+
+    #[test]
     fn atc_findings_surface_agent_attention_warning() {
         let mut out = DiagnosticsSnapshot {
             atc: crate::AtcOperatorSnapshot {
@@ -3722,6 +5767,276 @@ mod tests {
     }
 
     #[test]
+    fn text_view_surfaces_last_boot_check() {
+        let state = test_state();
+        let mut screen = test_screen(DiagnosticsSnapshot {
+            boot_archive_preflight: Some(boot_preflight_snapshot(1)),
+            ..Default::default()
+        });
+        screen.view_mode = ViewMode::Text;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.render_text_view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Last boot check"),
+            "expected boot-check row, got:\n{text}"
+        );
+        assert!(
+            text.contains("am doctor fix-orphan-refs --all --dry-run"),
+            "expected boot-check remediation, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn ws_state_payload_includes_boot_archive_preflight() {
+        let state = test_state();
+        state.update_boot_archive_preflight_snapshot(boot_preflight_snapshot(1));
+
+        let payload = ws_state_system_health_payload(&state);
+
+        assert_eq!(
+            payload["boot_archive_preflight"]["mode"].as_str(),
+            Some("warn")
+        );
+        assert_eq!(
+            payload["boot_archive_preflight"]["findings_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            payload["boot_archive_preflight"]["findings"][0]["kind"].as_str(),
+            Some("orphan_refs")
+        );
+    }
+
+    #[test]
+    fn ws_state_payload_includes_loop_heartbeats() {
+        let state = test_state();
+        state.mark_loop_tick(TuiLoopHeartbeatKind::Render);
+        state.mark_loop_success_with_duration(TuiLoopHeartbeatKind::Render, 12_000);
+        state.mark_loop_failure(TuiLoopHeartbeatKind::DbPoll);
+
+        let payload = ws_state_system_health_payload(&state);
+        let heartbeats = payload["loop_heartbeats"]
+            .as_array()
+            .expect("loop heartbeat array");
+        assert_eq!(heartbeats.len(), 5);
+
+        let render = heartbeats
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some("render"))
+            .expect("render heartbeat");
+        assert_eq!(render["ticks_total"].as_u64(), Some(1));
+        assert_eq!(render["successes_total"].as_u64(), Some(1));
+        assert_eq!(
+            render["last_success_duration_micros"].as_u64(),
+            Some(12_000)
+        );
+        assert_eq!(render["level"].as_str(), Some("OK"));
+
+        let db_poll = heartbeats
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some("db_poll"))
+            .expect("db poll heartbeat");
+        assert_eq!(db_poll["failures_total"].as_u64(), Some(1));
+        assert_eq!(db_poll["consecutive_failures"].as_u64(), Some(1));
+        assert_eq!(db_poll["level"].as_str(), Some("FAIL"));
+
+        let coalescer = heartbeats
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some("commit_coalescer"))
+            .expect("coalescer heartbeat");
+        assert_eq!(coalescer["periodic"].as_bool(), Some(false));
+        assert_eq!(coalescer["stale"].as_bool(), Some(false));
+
+        let db_latency = payload["db_latency_histograms"]
+            .as_object()
+            .expect("db latency histogram object");
+        assert!(db_latency.get("query_latency_us").is_some());
+        assert!(db_latency.get("pool_acquire_latency_us").is_some());
+        assert!(
+            db_latency["query_latency_us"]["count"].is_u64(),
+            "expected query latency histogram count"
+        );
+    }
+
+    #[test]
+    fn db_poll_heartbeat_gap_allows_frankensqlite_poll_interval() {
+        let now_micros = mcp_agent_mail_db::now_micros();
+        let db_poll = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::DbPoll,
+            last_tick_micros: now_micros.saturating_sub(5_000_000),
+            last_success_micros: now_micros.saturating_sub(5_000_000),
+            last_failure_micros: 0,
+            last_gap_micros: 5_000_000,
+            last_success_duration_micros: 1_000,
+            ticks_total: 2,
+            successes_total: 2,
+            failures_total: 0,
+            consecutive_failures: 0,
+        };
+        assert_eq!(loop_heartbeat_level(&db_poll, now_micros), Level::Ok);
+
+        let render = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::Render,
+            ..db_poll
+        };
+        assert_eq!(loop_heartbeat_level(&render, now_micros), Level::Warn);
+    }
+
+    #[test]
+    fn loop_heartbeat_is_stale_flips_true_under_injected_stall() {
+        let now_micros = mcp_agent_mail_db::now_micros();
+
+        // A render loop that ticked within the staleness window is fresh.
+        let fresh = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::Render,
+            last_tick_micros: now_micros.saturating_sub(1_000_000),
+            last_success_micros: now_micros.saturating_sub(1_000_000),
+            last_failure_micros: 0,
+            last_gap_micros: 250_000,
+            last_success_duration_micros: 1_000,
+            ticks_total: 10,
+            successes_total: 10,
+            failures_total: 0,
+            consecutive_failures: 0,
+        };
+        assert!(!loop_heartbeat_is_stale(&fresh, now_micros));
+        assert_eq!(loop_heartbeat_level(&fresh, now_micros), Level::Ok);
+
+        // Inject a stall (L3): no tick for well over the staleness threshold.
+        // The periodic loop's heartbeat must flip stale and escalate to Warn.
+        let stall_age = LOOP_HEARTBEAT_STALE_MICROS + 5_000_000;
+        let stalled = TuiLoopHeartbeatSnapshot {
+            last_tick_micros: now_micros.saturating_sub(stall_age),
+            last_success_micros: now_micros.saturating_sub(stall_age),
+            ..fresh
+        };
+        assert!(loop_heartbeat_is_stale(&stalled, now_micros));
+        assert_eq!(loop_heartbeat_level(&stalled, now_micros), Level::Warn);
+
+        // The same stall on the DB-poll loop (also periodic) is likewise stale.
+        let db_stalled = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::DbPoll,
+            ..stalled
+        };
+        assert!(loop_heartbeat_is_stale(&db_stalled, now_micros));
+
+        // Non-periodic loops (MCP/API) only tick on demand, so an idle gap must
+        // NOT be reported as stale — that would be a false freeze alarm.
+        let idle_mcp = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::McpApi,
+            ..stalled
+        };
+        assert!(!loop_heartbeat_is_stale(&idle_mcp, now_micros));
+    }
+
+    #[test]
+    fn ws_state_payload_includes_screen_refreshes() {
+        use crate::tui_screens::MailScreenId;
+
+        let state = test_state();
+        // First tick bootstraps from the stale sentinel → registers a refresh.
+        assert!(state.record_screen_tick(MailScreenId::Dashboard));
+        // Tick a second screen too.
+        state.record_screen_tick(MailScreenId::SystemHealth);
+
+        let payload = ws_state_system_health_payload(&state);
+        let refreshes = payload["screen_refreshes"]
+            .as_array()
+            .expect("screen refresh array");
+        assert_eq!(refreshes.len(), MailScreenId::COUNT);
+
+        let dashboard = refreshes
+            .iter()
+            .find(|entry| entry["screen"].as_str() == Some("dashboard"))
+            .expect("dashboard refresh entry");
+        assert_eq!(dashboard["observed"].as_bool(), Some(true));
+        assert_eq!(dashboard["ticks_total"].as_u64(), Some(1));
+        assert_eq!(dashboard["refreshes_total"].as_u64(), Some(1));
+        assert!(dashboard["last_refresh_micros"].as_i64().unwrap_or(0) > 0);
+
+        // An un-ticked screen is present but reports as not yet observed.
+        let atc = refreshes
+            .iter()
+            .find(|entry| entry["screen"].as_str() == Some("atc"))
+            .expect("atc refresh entry");
+        assert_eq!(atc["observed"].as_bool(), Some(false));
+        assert_eq!(atc["ticks_total"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn system_health_text_view_renders_screen_refreshes() {
+        use crate::tui_screens::MailScreenId;
+
+        let state = test_state();
+        state.record_screen_tick(MailScreenId::Dashboard);
+
+        let screen = test_screen(DiagnosticsSnapshot {
+            checked_at: Some(Utc::now()),
+            ..Default::default()
+        });
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 80, &mut pool);
+        screen.render_text_view(&mut frame, Rect::new(0, 0, 120, 80), &state);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Screen Data Refresh"),
+            "expected screen refresh section, got:\n{text}"
+        );
+        assert!(
+            text.contains("dashboard"),
+            "expected dashboard refresh row, got:\n{text}"
+        );
+        assert!(
+            text.contains("refreshes=1"),
+            "expected refresh counter, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn system_health_text_view_renders_loop_heartbeats() {
+        let state = test_state();
+        state.mark_loop_tick(TuiLoopHeartbeatKind::Render);
+        state.mark_loop_success_with_duration(TuiLoopHeartbeatKind::Render, 12_000);
+        state.mark_loop_tick(TuiLoopHeartbeatKind::McpApi);
+
+        let screen = test_screen(DiagnosticsSnapshot {
+            checked_at: Some(Utc::now()),
+            ..Default::default()
+        });
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 80, &mut pool);
+        screen.render_text_view(&mut frame, Rect::new(0, 0, 120, 80), &state);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Loop Heartbeats"),
+            "expected loop heartbeat section, got:\n{text}"
+        );
+        assert!(text.contains("render"), "expected render row, got:\n{text}");
+        assert!(
+            text.contains("successes=1"),
+            "expected success counter, got:\n{text}"
+        );
+        assert!(
+            text.contains("commit_coalescer"),
+            "expected coalescer row, got:\n{text}"
+        );
+        assert!(
+            text.contains("DB Query Latency"),
+            "expected DB query latency section, got:\n{text}"
+        );
+        assert!(
+            text.contains("pool_acquire"),
+            "expected pool acquire histogram row, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn atc_health_widget_renders_observability_summary() {
         let screen = test_screen(DiagnosticsSnapshot::default());
         let snap = DiagnosticsSnapshot {
@@ -3829,6 +6144,599 @@ mod tests {
     }
 
     #[test]
+    fn atc_budget_watchdog_finding_trips_only_on_sustained_overruns() {
+        // I3 (br-bvq1x.9.3): a sub-threshold streak surfaces only the routine
+        // single-tick "atc-budget" warning; a sustained streak escalates to the
+        // distinct "atc-budget-watchdog" Fail finding.
+        let mut transient = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                last_tick_micros: mcp_agent_mail_db::now_micros(),
+                last_tick_budget_micros: 5_000,
+                last_tick_budget_exceeded: true,
+                budget_overruns_total: 1,
+                budget_overruns_consecutive: 1,
+                worst_tick_overrun_micros: 3_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        add_atc_findings(&mut transient);
+        assert!(
+            transient.lines.iter().any(|line| line.name == "atc-budget"),
+            "a single overrun still emits the routine budget warning"
+        );
+        assert!(
+            !transient
+                .lines
+                .iter()
+                .any(|line| line.name == "atc-budget-watchdog"),
+            "a single overrun must NOT trip the watchdog"
+        );
+
+        let mut sustained = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                last_tick_micros: mcp_agent_mail_db::now_micros(),
+                last_tick_budget_micros: 5_000,
+                last_tick_budget_exceeded: true,
+                budget_overruns_total: 9,
+                budget_overruns_consecutive: 6,
+                worst_tick_overrun_micros: 181_887,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        add_atc_findings(&mut sustained);
+        let watchdog = sustained
+            .lines
+            .iter()
+            .find(|line| line.name == "atc-budget-watchdog")
+            .expect("sustained overruns must trip the watchdog");
+        assert_eq!(watchdog.level, Level::Fail);
+        assert!(watchdog.detail.contains("6 consecutive"));
+        assert!(watchdog.detail.contains("181887us"));
+    }
+
+    #[test]
+    fn db_drop_close_finding_surfaces_only_when_nonzero() {
+        // I3 (br-bvq1x.9.3): zero drop_close => no finding (the common case).
+        // ATC is disabled in these snapshots on purpose: drop_close must surface
+        // independently of ATC (the finding lives outside add_atc_findings).
+        let mut clean = DiagnosticsSnapshot {
+            drop_close_total: 0,
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut clean);
+        assert!(
+            !clean.lines.iter().any(|line| line.name == "db-drop-close"),
+            "no drop_close means no connection-hygiene finding"
+        );
+
+        let mut leaky = DiagnosticsSnapshot {
+            drop_close_total: 4,
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut leaky);
+        let finding = leaky
+            .lines
+            .iter()
+            .find(|line| line.name == "db-drop-close")
+            .expect("nonzero drop_close must surface a finding");
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.detail.contains("4 SQLite connection"));
+    }
+
+    #[test]
+    fn commit_coalescer_death_finding_surfaces_only_when_a_worker_is_dead() {
+        // I5 (br-bvq1x.9.5): None (no coalescer) and all-alive => no finding.
+        let mut none = DiagnosticsSnapshot {
+            coalescer_worker_liveness: None,
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut none);
+        assert!(
+            !none
+                .lines
+                .iter()
+                .any(|line| line.name == "commit-coalescer-thread-died")
+        );
+
+        let mut healthy = DiagnosticsSnapshot {
+            coalescer_worker_liveness: Some(
+                mcp_agent_mail_storage::CommitCoalescerWorkerLiveness {
+                    expected: 4,
+                    alive: 4,
+                },
+            ),
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut healthy);
+        assert!(
+            !healthy
+                .lines
+                .iter()
+                .any(|line| line.name == "commit-coalescer-thread-died"),
+            "all workers alive => no death finding"
+        );
+
+        let mut dead = DiagnosticsSnapshot {
+            coalescer_worker_liveness: Some(
+                mcp_agent_mail_storage::CommitCoalescerWorkerLiveness {
+                    expected: 4,
+                    alive: 1,
+                },
+            ),
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut dead);
+        let finding = dead
+            .lines
+            .iter()
+            .find(|line| line.name == "commit-coalescer-thread-died")
+            .expect("a dead coalescer worker must surface a Fail finding");
+        assert_eq!(finding.level, Level::Fail);
+        assert!(finding.detail.contains("3 of 4"));
+    }
+
+    #[test]
+    fn health_sweep_banner_emits_when_findings_present() {
+        let sweep = GitRefIntegritySweepState {
+            enabled: true,
+            interval_seconds: 900,
+            batch_size: 5,
+            total_projects: 3,
+            projects_scanned: 3,
+            total_findings: 3,
+            projects: vec![
+                GitRefIntegrityProjectSummary {
+                    slug: "proj-a".to_string(),
+                    finding_count: 2,
+                    classification: Level::Warn,
+                    ..Default::default()
+                },
+                GitRefIntegrityProjectSummary {
+                    slug: "proj-b".to_string(),
+                    finding_count: 1,
+                    classification: Level::Warn,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sweep.banner().as_deref(),
+            Some(
+                "registered projects have 3 orphan refs across 2 projects. Run: am doctor fix-orphan-refs --all --dry-run"
+            )
+        );
+    }
+
+    #[test]
+    fn health_sweep_banner_suppressed_when_am_git_binary_set() {
+        let sweep = GitRefIntegritySweepState {
+            enabled: true,
+            total_findings: 1,
+            am_git_binary_set: true,
+            projects: vec![GitRefIntegrityProjectSummary {
+                slug: "proj-a".to_string(),
+                finding_count: 1,
+                classification: Level::Warn,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(sweep.banner().is_none());
+    }
+
+    #[test]
+    fn health_sweep_interval_default_is_900s() {
+        let config = Config::default();
+
+        assert!(config.health_sweep_enabled);
+        assert_eq!(config.health_sweep_interval_seconds, 900);
+        assert_eq!(config.health_sweep_batch, 5);
+    }
+
+    #[test]
+    fn health_sweep_disabled_env_skips_step() {
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "missing".to_string(),
+            path: PathBuf::from("/definitely/not/a/git/repo"),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 10, false, 900, false, &[], Utc::now());
+
+        assert!(!sweep.enabled);
+        assert_eq!(sweep.total_projects, 1);
+        assert_eq!(sweep.projects_scanned, 0);
+        assert!(sweep.projects.is_empty());
+    }
+
+    #[test]
+    fn health_sweep_cursor_round_robin() {
+        let targets = ["alpha", "beta", "gamma", "delta"]
+            .into_iter()
+            .map(|slug| GitRefIntegrityProjectTarget {
+                slug: slug.to_string(),
+                path: PathBuf::from(format!("/definitely/not/a/git/repo/{slug}")),
+            })
+            .collect::<Vec<_>>();
+
+        let sweep = git_ref_integrity_sweep(&targets, 1, 2, true, 900, false, &[], Utc::now());
+
+        assert_eq!(sweep.cursor_index, 1);
+        assert_eq!(sweep.next_cursor_index, 3);
+        assert_eq!(sweep.projects_scanned, 2);
+        assert_eq!(sweep.projects[0].slug, "beta");
+        assert_eq!(sweep.projects[1].slug, "gamma");
+    }
+
+    #[test]
+    fn health_sweep_batch_size_caps_at_total_projects() {
+        let targets = ["alpha", "beta"]
+            .into_iter()
+            .map(|slug| GitRefIntegrityProjectTarget {
+                slug: slug.to_string(),
+                path: PathBuf::from(format!("/definitely/not/a/git/repo/{slug}")),
+            })
+            .collect::<Vec<_>>();
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 99, true, 900, false, &[], Utc::now());
+
+        assert_eq!(sweep.total_projects, 2);
+        assert_eq!(sweep.projects_scanned, 2);
+        assert_eq!(sweep.next_cursor_index, 0);
+    }
+
+    #[test]
+    fn health_sweep_healthy_project_no_findings() {
+        let clean_repo = repo::single_commit();
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "clean".to_string(),
+            path: clean_repo.path().to_path_buf(),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+
+        assert_eq!(sweep.total_projects, 1);
+        assert_eq!(sweep.projects_scanned, 1);
+        assert_eq!(sweep.total_findings, 0);
+        assert_eq!(sweep.level(), Level::Ok);
+        assert_eq!(sweep.projects[0].slug, "clean");
+        assert_eq!(sweep.projects[0].finding_count, 0);
+        assert_eq!(sweep.projects[0].classification, Level::Ok);
+        assert!(sweep.projects[0].error.is_none());
+    }
+
+    #[test]
+    fn health_sweep_orphan_stash_detected() {
+        let damaged_repo = repo::with_orphan_stash_ref();
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "stash-damage".to_string(),
+            path: damaged_repo.path().to_path_buf(),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+        let project = &sweep.projects[0];
+
+        assert_eq!(sweep.total_findings, 1);
+        assert_eq!(sweep.level(), Level::Warn);
+        assert_eq!(project.finding_count, 1);
+        assert_eq!(project.safe_to_prune_count, 1);
+        assert_eq!(project.ask_user_count, 0);
+        assert_eq!(project.protected_count, 0);
+        assert_eq!(project.classification, Level::Warn);
+        assert!(project.error.is_none());
+    }
+
+    #[test]
+    fn health_sweep_dangling_branch_detected() {
+        let damaged_repo = repo::with_dangling_branch();
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "branch-damage".to_string(),
+            path: damaged_repo.path().to_path_buf(),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+        let project = &sweep.projects[0];
+
+        assert_eq!(sweep.total_findings, 1);
+        assert_eq!(sweep.level(), Level::Warn);
+        assert_eq!(project.finding_count, 1);
+        assert_eq!(project.safe_to_prune_count, 0);
+        assert_eq!(project.ask_user_count, 1);
+        assert_eq!(project.protected_count, 0);
+        assert_eq!(project.classification, Level::Warn);
+        assert!(project.error.is_none());
+    }
+
+    #[test]
+    fn health_sweep_error_project_does_not_panic() {
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "missing".to_string(),
+            path: PathBuf::from("/definitely/not/a/git/repo"),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+        let project = &sweep.projects[0];
+
+        assert_eq!(sweep.total_findings, 0);
+        assert_eq!(sweep.level(), Level::Fail);
+        assert_eq!(project.slug, "missing");
+        assert_eq!(project.classification, Level::Fail);
+        assert!(project.error.is_some());
+    }
+
+    #[test]
+    fn health_sweep_cursor_path_uses_xdg_app_dir() {
+        let path = git_ref_sweep_cursor_path_from_data_dir(Path::new("/tmp/xdg-data"));
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/xdg-data/mcp-agent-mail/sweep_cursor.json")
+        );
+    }
+
+    #[test]
+    fn health_sweep_dismissals_path_uses_xdg_app_dir() {
+        let path = git_ref_sweep_data_file_path_from_data_dir(
+            Path::new("/tmp/xdg-data"),
+            GIT_REF_SWEEP_DISMISSALS_FILE_NAME,
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/xdg-data/mcp-agent-mail/sweep_dismissals.toml")
+        );
+    }
+
+    #[test]
+    fn health_sweep_cursor_persistence_round_trip() {
+        let temp = unique_test_dir("cursor-round-trip");
+        let path = temp.join("state").join("sweep_cursor.json");
+
+        save_git_ref_sweep_cursor(&path, 17).expect("save cursor");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 17);
+        let json = std::fs::read_to_string(&path).expect("cursor json");
+        assert!(
+            json.contains("\"cursor_index\": 17"),
+            "expected persisted cursor index, got:\n{json}"
+        );
+
+        save_git_ref_sweep_cursor(&path, 3).expect("replace cursor");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 3);
+    }
+
+    #[test]
+    fn health_sweep_cursor_atomic_write_survives_stale_temp_file() {
+        let temp = unique_test_dir("cursor-stale-temp");
+        let path = temp.join("state").join("sweep_cursor.json");
+
+        save_git_ref_sweep_cursor(&path, 17).expect("save cursor");
+        let stale_temp = path.with_file_name(".sweep_cursor.json.tmp-stale");
+        std::fs::write(&stale_temp, r#"{"cursor_index":999}"#).expect("stale temp cursor");
+
+        assert_eq!(load_git_ref_sweep_cursor(&path), 17);
+
+        save_git_ref_sweep_cursor(&path, 5).expect("replace cursor after stale temp");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 5);
+        assert_eq!(
+            std::fs::read_to_string(&stale_temp).expect("stale temp preserved"),
+            r#"{"cursor_index":999}"#
+        );
+    }
+
+    #[test]
+    fn health_sweep_cursor_missing_or_invalid_defaults_to_zero() {
+        let temp = unique_test_dir("cursor-defaults");
+        let path = temp.join("state").join("sweep_cursor.json");
+
+        assert_eq!(load_git_ref_sweep_cursor(&path), 0);
+
+        std::fs::create_dir_all(path.parent().expect("cursor parent")).expect("cursor parent");
+        std::fs::write(&path, "not json").expect("invalid cursor");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 0);
+    }
+
+    #[test]
+    fn health_sweep_dismissal_toml_loads_entries() {
+        let temp = unique_test_dir("dismissals-load");
+        let path = temp.join("state").join("sweep_dismissals.toml");
+        std::fs::create_dir_all(path.parent().expect("dismissals parent"))
+            .expect("dismissals parent");
+        std::fs::write(
+            &path,
+            r#"
+[[dismissed]]
+project_slug = "proj-c"
+ref_kind = "orphan_stash"
+dismissed_at = "2026-05-09T12:00:00Z"
+reason = "manual prune"
+"#,
+        )
+        .expect("dismissals toml");
+
+        let dismissals = load_git_ref_sweep_dismissals(&path);
+
+        assert_eq!(
+            dismissals,
+            vec![GitRefSweepDismissalEntry {
+                project_slug: "proj-c".to_string(),
+                ref_kind: "orphan_stash".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn health_sweep_dismissal_malformed_toml_logs_warn() {
+        let temp = unique_test_dir("dismissals-invalid");
+        let path = temp.join("state").join("sweep_dismissals.toml");
+        std::fs::create_dir_all(path.parent().expect("dismissals parent"))
+            .expect("dismissals parent");
+        std::fs::write(&path, "[[dismissed]\nproject_slug =").expect("invalid toml");
+
+        assert!(load_git_ref_sweep_dismissals(&path).is_empty());
+    }
+
+    #[test]
+    fn health_sweep_dismissal_filters_finding() {
+        let findings = vec![
+            prunable_ref(
+                "refs/stash",
+                mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+            ),
+            prunable_ref(
+                "refs/heads/recovery",
+                mcp_agent_mail_storage::recovery::RefCategory::AskUser,
+            ),
+        ];
+        let dismissals = vec![GitRefSweepDismissalEntry {
+            project_slug: "proj-c".to_string(),
+            ref_kind: "orphan_stash".to_string(),
+        }];
+
+        let visible = git_ref_visible_findings("proj-c", &findings, &dismissals);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0.ref_name, "refs/heads/recovery");
+        assert_eq!(visible[0].1, "orphan_ref");
+    }
+
+    #[test]
+    fn health_sweep_dismissal_unrelated_passes_through() {
+        let findings = vec![prunable_ref(
+            "refs/stash",
+            mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+        )];
+        let dismissals = vec![GitRefSweepDismissalEntry {
+            project_slug: "proj-a".to_string(),
+            ref_kind: "orphan_stash".to_string(),
+        }];
+
+        let visible = git_ref_visible_findings("proj-b", &findings, &dismissals);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0.ref_name, "refs/stash");
+        assert_eq!(visible[0].1, "orphan_stash");
+    }
+
+    #[test]
+    fn health_sweep_per_finding_event_includes_required_fields() {
+        let project_slug = "proj-c";
+        let findings = vec![prunable_ref(
+            "refs/stash",
+            mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+        )];
+        let visible = git_ref_visible_findings(project_slug, &findings, &[]);
+        let (finding, ref_kind) = visible[0];
+        let severity = git_ref_severity(finding.category);
+        let fields = [
+            ("project_slug", project_slug),
+            ("ref_kind", ref_kind),
+            ("ref_name", finding.ref_name.as_str()),
+            ("severity", severity),
+        ];
+
+        assert_eq!(
+            fields,
+            [
+                ("project_slug", "proj-c"),
+                ("ref_kind", "orphan_stash"),
+                ("ref_name", "refs/stash"),
+                ("severity", "warn"),
+            ]
+        );
+        assert!(
+            fields
+                .iter()
+                .all(|(name, value)| !name.is_empty() && !value.is_empty())
+        );
+        assert!(!finding.target_sha.is_empty());
+        assert!(!finding.reason.is_empty());
+    }
+
+    #[test]
+    fn health_sweep_banner_suppressed_after_dismissal_clears_findings() {
+        let findings = vec![prunable_ref(
+            "refs/stash",
+            mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+        )];
+        let dismissals = vec![GitRefSweepDismissalEntry {
+            project_slug: "proj-c".to_string(),
+            ref_kind: "orphan_stash".to_string(),
+        }];
+        let visible = git_ref_visible_findings("proj-c", &findings, &dismissals);
+        let sweep = GitRefIntegritySweepState {
+            enabled: true,
+            total_findings: visible.len(),
+            projects: vec![GitRefIntegrityProjectSummary {
+                slug: "proj-c".to_string(),
+                finding_count: visible.len(),
+                classification: Level::Ok,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(sweep.banner().is_none());
+    }
+
+    #[test]
+    fn health_sweep_panel_renders_per_project_summary() {
+        let screen = test_screen(DiagnosticsSnapshot::default());
+        let snap = DiagnosticsSnapshot {
+            git_ref_integrity: GitRefIntegritySweepState {
+                enabled: true,
+                interval_seconds: 900,
+                batch_size: 5,
+                cursor_index: 2,
+                next_cursor_index: 3,
+                total_projects: 4,
+                projects_scanned: 1,
+                total_findings: 1,
+                checked_at: Some(Utc::now()),
+                projects: vec![GitRefIntegrityProjectSummary {
+                    slug: "proj-c".to_string(),
+                    finding_count: 1,
+                    safe_to_prune_count: 1,
+                    classification: Level::Warn,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            boot_archive_preflight: Some(boot_preflight_snapshot(0)),
+            ..Default::default()
+        };
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 6, &mut pool);
+        screen.render_git_ref_integrity_widget(&mut frame, Rect::new(0, 0, 120, 6), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Git ref integrity"),
+            "expected panel title, got:\n{text}"
+        );
+        assert!(
+            text.contains("findings=1"),
+            "expected finding count, got:\n{text}"
+        );
+        assert!(
+            text.contains("proj-c"),
+            "expected project row, got:\n{text}"
+        );
+        assert!(
+            text.contains("boot=warn"),
+            "expected boot-check summary, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn metric_tiles_narrow_width_renders_compact_summary() {
         let state = test_state();
         let screen = test_screen(DiagnosticsSnapshot {
@@ -3899,6 +6807,70 @@ mod tests {
         assert!(
             text.contains("hidden"),
             "expected single-slot overflow annotation, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn system_health_recommendations_render_safe_command_and_evidence() {
+        let mut snap = DiagnosticsSnapshot::default();
+        snap.operator_recommendations
+            .push(OperatorRecommendationCard {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.9,
+                action: "Review ack-required messages".to_string(),
+                reason: "3 message(s) are awaiting acknowledgement".to_string(),
+                evidence: "system-health://ack-pending?count=3".to_string(),
+                safe_command: "am robot inbox --all --ack-overdue".to_string(),
+            });
+        let screen = test_screen(DiagnosticsSnapshot::default());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 7, &mut pool);
+        screen.render_anomaly_cards(&mut frame, Rect::new(0, 0, 120, 7), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("Recommended: Review ack"), "{text}");
+        assert!(
+            text.contains("am robot inbox --all --ack-overdue"),
+            "{text}"
+        );
+        assert!(text.contains("system-health://ack-pending"), "{text}");
+    }
+
+    #[test]
+    fn system_health_recommendations_from_db_stats_include_proof_links() {
+        let now_us = mcp_agent_mail_db::now_micros();
+        let db = crate::tui_events::DbStatSnapshot {
+            ack_pending: 3,
+            reservation_snapshots: vec![crate::tui_events::ReservationSnapshot {
+                id: 7,
+                project_slug: "demo".to_string(),
+                agent_name: "CobaltBay".to_string(),
+                path_pattern: "crates/**".to_string(),
+                exclusive: true,
+                granted_ts: now_us,
+                expires_ts: now_us + RECOMMENDATION_EXPIRING_RESERVATION_US / 2,
+                released_ts: None,
+            }],
+            timestamp_micros: now_us,
+            ..Default::default()
+        };
+        let recommendations =
+            build_system_health_recommendations(Some(&db), &DiagnosticsSnapshot::default());
+
+        assert!(
+            recommendations.iter().any(|recommendation| {
+                recommendation.safe_command == "am robot inbox --all --ack-overdue"
+                    && recommendation.evidence.contains("ack-pending")
+            }),
+            "{recommendations:?}"
+        );
+        assert!(
+            recommendations.iter().any(|recommendation| {
+                recommendation.safe_command == "am robot reservations --expiring 5"
+                    && recommendation.evidence.contains("reservations-expiring")
+            }),
+            "{recommendations:?}"
         );
     }
 

@@ -1,0 +1,18 @@
+{
+  "ts": "2026-05-09T19:00:00Z",
+  "level": "info",
+  "target": "mcp_agent_mail::storage::archive::batch_write",
+  "name": "complete",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "write_message_batch_bundle",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 42.5,
+    "outcome": "success",
+    "git_version": "libgit2",
+    "batch_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "total_duration_ms": 42.5,
+    "message_count": 100,
+    "success": true
+  }
+}

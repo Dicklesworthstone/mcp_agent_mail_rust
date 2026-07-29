@@ -53,7 +53,7 @@ pub struct ContactListResponse {
     pub incoming: Vec<ContactLinkState>,
 }
 
-/// Simple contact entry for `list_contacts` (matches Python format).
+/// Simple contact entry for `list_contacts`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleContactEntry {
     pub to: String,
@@ -147,6 +147,15 @@ pub(crate) async fn resolve_or_register_sender(
         Ok(a) => Ok(a),
         Err(e) if !register_if_missing => Err(e),
         Err(_) => {
+            // Proof gate (fail-closed): auto-registering a not-yet-known
+            // `from_agent` here cannot carry a signed `registration_proof`
+            // bundle, so when the gate is enabled we refuse instead of minting
+            // an unproven identity. Without this, `request_contact` was a side
+            // door around the gate (it only guarded register_agent /
+            // create_agent_identity / the session macros). Disabled gate = no-op.
+            crate::proof_gate::reject_auto_registration_if_enabled(
+                "request_contact auto-registration of from_agent",
+            )?;
             let program = program.ok_or_else(|| {
                 legacy_tool_error(
                     "MISSING_FIELD",
@@ -242,7 +251,7 @@ fn parse_contact_target(
 /// Creates or refreshes a pending `AgentLink` and sends a small `ack_required` intro message.
 ///
 /// # Conformance
-/// Python-parity.
+/// Rust extends the legacy Python fixture by returning both outgoing and incoming relationships.
 #[allow(clippy::too_many_arguments)]
 #[tool(
     description = "Request contact approval to message another agent.\n\nCreates (or refreshes) a pending AgentLink and sends a small ack_required intro message.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nfrom_agent : str\n    Your agent name (must be registered in the project).\nto_agent : str\n    Target agent name (use resource://agents/{project_key} to discover names).\nto_project : Optional[str]\n    Target project if different from your project (cross-project coordination).\nreason : str\n    Optional explanation for the contact request.\nttl_seconds : int\n    Time to live for the contact approval request (default: 7 days)."
@@ -298,6 +307,8 @@ pub async fn request_contact(
         &target_project_row.human_key,
     )
     .await?;
+    let from_agent_name = from_row.name.clone();
+    let target_agent_name = to_row.name.clone();
 
     // Clamp caller-supplied TTL to [60s, 1 year], matching file_reservation_paths,
     // acquire_build_slot, macro_file_reservation_cycle, and macro_contact_handshake.
@@ -328,7 +339,7 @@ pub async fn request_contact(
     .await;
     if let Outcome::Err(ref err) = link_out {
         tracing::error!(
-            from_agent = %from_agent,
+            from_agent = %from_agent_name,
             from_project_id = project_id,
             to_agent = %target_agent_name,
             to_project_id = target_project_id,
@@ -343,8 +354,9 @@ pub async fn request_contact(
     let should_send_intro = to_row.contact_policy != "block_all" && link_row.status != "blocked";
 
     if should_send_intro {
-        let subject = format!("Contact request from {from_agent}");
-        let body_md = format!("{from_agent} requests permission to contact {target_agent_name}.");
+        let subject = format!("Contact request from {from_agent_name}");
+        let body_md =
+            format!("{from_agent_name} requests permission to contact {target_agent_name}.");
 
         let to_id = to_row.id.unwrap_or(0);
         let recipients: &[(i64, &str)] = &[(to_id, "to")];
@@ -364,7 +376,7 @@ pub async fn request_contact(
         .await;
         if let Outcome::Err(ref err) = message_out {
             tracing::error!(
-                from_agent = %from_agent,
+                from_agent = %from_agent_name,
                 from_project_id = project_id,
                 to_agent = %target_agent_name,
                 to_project_id = target_project_id,
@@ -381,6 +393,19 @@ pub async fn request_contact(
             &message.subject,
             &message.body_md,
         );
+        crate::messaging::enqueue_message_lexical_index(
+            &mcp_agent_mail_db::search_v3::IndexableMessage {
+                id: message.id.unwrap_or(0),
+                project_id: target_project_id,
+                project_slug: target_project_row.slug.clone(),
+                sender_name: from_agent_name.clone(),
+                subject: message.subject.clone(),
+                body_md: message.body_md.clone(),
+                thread_id: message.thread_id.clone(),
+                importance: message.importance.clone(),
+                created_ts: message.created_ts,
+            },
+        );
 
         // Write message to archive
         let config = mcp_agent_mail_core::Config::get();
@@ -389,7 +414,7 @@ pub async fn request_contact(
 
         let msg_json = serde_json::json!({
             "id": message_id,
-            "from": &from_agent,
+            "from": &from_agent_name,
             "to": &all_recipient_names,
             "cc": [],
             "bcc": [],
@@ -408,14 +433,14 @@ pub async fn request_contact(
             &target_project_row.slug,
             &msg_json,
             &message.body_md,
-            &from_agent,
+            &from_agent_name,
             &all_recipient_names,
             &[],
         );
     }
 
     let response = ContactLinkState {
-        from: from_agent,
+        from: from_agent_name,
         from_project: project.human_key,
         to: target_agent_name,
         to_project: target_project_row.human_key,
@@ -538,7 +563,11 @@ pub async fn respond_contact(
 /// - `agent_name`: Agent to list contacts for
 ///
 /// # Returns
-/// Array of outgoing contacts with `to`, `status`, `reason`, `updated_ts`, `expires_ts`
+/// Array of contact counterparties with `to`, `status`, `reason`, `updated_ts`, `expires_ts`.
+///
+/// The legacy Python-compatible shape uses the field name `to` for the
+/// counterparty. Outgoing links put the request target there; incoming links
+/// put the requester there.
 ///
 /// # Conformance
 /// Python-parity.
@@ -552,7 +581,7 @@ pub async fn list_contacts(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -567,22 +596,28 @@ pub async fn list_contacts(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    let (outgoing_rows, _incoming_rows) = db_outcome_to_mcp_result(
+    let (outgoing_rows, incoming_rows) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_contacts(ctx.cx(), &pool, project_id, agent_id).await,
     )?;
 
     // Resolve referenced agents to names (batch)
-    let mut b_agent_ids: SmallVec<[i64; 32]> = SmallVec::with_capacity(outgoing_rows.len());
+    let mut counterparty_agent_ids: SmallVec<[i64; 32]> =
+        SmallVec::with_capacity(outgoing_rows.len() + incoming_rows.len());
     for r in &outgoing_rows {
-        b_agent_ids.push(r.b_agent_id);
+        counterparty_agent_ids.push(r.b_agent_id);
     }
-    b_agent_ids.sort_unstable();
-    b_agent_ids.dedup();
+    for r in &incoming_rows {
+        counterparty_agent_ids.push(r.a_agent_id);
+    }
+    counterparty_agent_ids.sort_unstable();
+    counterparty_agent_ids.dedup();
 
-    let mut agent_names: HashMap<i64, String> = HashMap::with_capacity(b_agent_ids.len());
-    if !b_agent_ids.is_empty() {
+    let mut agent_names: HashMap<i64, String> =
+        HashMap::with_capacity(counterparty_agent_ids.len());
+    if !counterparty_agent_ids.is_empty() {
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &b_agent_ids).await,
+            mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &counterparty_agent_ids)
+                .await,
         ) {
             Ok(rows) => {
                 for row in rows {
@@ -593,7 +628,7 @@ pub async fn list_contacts(
             }
             Err(e) => {
                 tracing::warn!(
-                    agent_ids = ?b_agent_ids,
+                    agent_ids = ?counterparty_agent_ids,
                     error = %e,
                     "list_contacts: failed to resolve agent names, using synthetic fallbacks"
                 );
@@ -602,9 +637,10 @@ pub async fn list_contacts(
     }
 
     // Return simple array format with actual timestamps from the database.
-    let contacts: Vec<SimpleContactEntry> = outgoing_rows
-        .into_iter()
-        .map(|r| SimpleContactEntry {
+    let mut contacts: Vec<SimpleContactEntry> =
+        Vec::with_capacity(outgoing_rows.len() + incoming_rows.len());
+    contacts.extend(outgoing_rows.into_iter().map(|r| {
+        SimpleContactEntry {
             to: agent_names
                 .get(&r.b_agent_id)
                 .cloned()
@@ -613,8 +649,20 @@ pub async fn list_contacts(
             reason: r.reason,
             updated_ts: Some(micros_to_iso(r.updated_ts)),
             expires_ts: r.expires_ts.map(micros_to_iso),
-        })
-        .collect();
+        }
+    }));
+    contacts.extend(incoming_rows.into_iter().map(|r| {
+        SimpleContactEntry {
+            to: agent_names
+                .get(&r.a_agent_id)
+                .cloned()
+                .unwrap_or_else(|| format!("agent_{}", r.a_agent_id)),
+            status: r.status,
+            reason: r.reason,
+            updated_ts: Some(micros_to_iso(r.updated_ts)),
+            expires_ts: r.expires_ts.map(micros_to_iso),
+        }
+    }));
 
     tracing::debug!(
         "Listed {} contacts for {} in project {}",

@@ -1,6 +1,6 @@
 //! Step 1: SQLite snapshot creation via SQL-level dump and restore.
 //!
-//! Creates an atomic, clean FrankenSQLite copy of the source database suitable for
+//! Creates an atomic, clean canonical SQLite copy of the source database suitable for
 //! offline manipulation (scoping, scrubbing, finalization with FTS5/VACUUM).
 //!
 //! Instead of a byte-level file copy we read schema + data through the runtime
@@ -9,16 +9,31 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
 use sqlmodel_core::Value;
 
 use crate::ShareError;
 
 const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum SnapshotDestinationProfile {
+    #[default]
+    Default,
+    PortableExport,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum SnapshotSourceProfile {
+    #[default]
+    Runtime,
+    CanonicalExport,
+}
+
 #[cfg(test)]
-// Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
-type SqliteConnection = DbConn;
+// Export snapshots are canonical SQLite artifacts, so tests inspect them
+// through the same engine external consumers use.
+type SqliteConnection = CanonicalDbConn;
 
 /// Known tables produced by the `mcp-agent-mail-db` schema.
 ///
@@ -67,6 +82,8 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "last_active_ts",
             "attachments_policy",
             "contact_policy",
+            "reaper_exempt",
+            "registration_token",
         ],
     },
     KnownTable {
@@ -205,14 +222,21 @@ pub fn create_sqlite_snapshot(
     destination: &Path,
     checkpoint: bool,
 ) -> Result<PathBuf, ShareError> {
-    rebuild_sqlite_snapshot_with_pragmas(source, destination, checkpoint, &[])
+    rebuild_sqlite_snapshot_with_profiles(
+        source,
+        destination,
+        checkpoint,
+        SnapshotSourceProfile::Runtime,
+        SnapshotDestinationProfile::Default,
+    )
 }
 
-pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
+pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
     source: &Path,
     destination: &Path,
     checkpoint: bool,
-    destination_pragmas: &[&str],
+    source_profile: SnapshotSourceProfile,
+    destination_profile: SnapshotDestinationProfile,
 ) -> Result<PathBuf, ShareError> {
     let source = crate::resolve_share_sqlite_path(source);
 
@@ -288,44 +312,104 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
 
     let source_str = source.display().to_string();
 
-    // Create destination with FrankenSQLite. Page size must be chosen before
-    // page 1 is initialized, so honor any requested destination page_size here.
+    // Page size must be chosen before page 1 is initialized, so configure the
+    // closed export profile before the first destination write.
     let dest_str = staged_dest.display().to_string();
-    let dst_conn = if let Some(page_size) = destination_page_size_bytes(destination_pragmas)? {
-        DbConn::open_file_with_page_size(&dest_str, page_size).map_err(|e| ShareError::Sqlite {
-            message: format!(
-                "cannot create destination DB {dest_str} with page size {page_size}: {e}"
-            ),
-        })?
-    } else {
-        DbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
-            message: format!("cannot create destination DB {dest_str}: {e}"),
-        })?
-    };
-    for pragma in destination_pragmas {
-        dst_conn
-            .execute_raw(pragma)
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("failed to apply destination pragma {pragma:?}: {e}"),
-            })?;
-    }
-
-    let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot open source DB {source_str}: {e}"),
+    // The source is the live FrankenSQLite database, but the destination is a
+    // disposable export image that will be renamed into place. Creating that
+    // image through FrankenSQLite would bind persistent namespace records to
+    // the staging pathname. Canonical SQLite has no pathname-bound namespace,
+    // so it is the correct writer for portable export artifacts.
+    let dst_conn = CanonicalDbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot create destination DB {dest_str}: {e}"),
     })?;
-    let transfer_result = transfer_tables_frank(&src, &dst_conn);
-    let src_close_result = src.close_sync().map_err(|e| ShareError::Sqlite {
-        message: format!("failed to close source DB {source_str}: {e}"),
-    });
-    let dst_close_result = dst_conn.close_sync().map_err(|e| ShareError::Sqlite {
-        message: format!("failed to close destination DB {dest_str}: {e}"),
-    });
-    transfer_result?;
-    src_close_result?;
-    dst_close_result?;
+    configure_destination(&dst_conn, &dest_str, destination_profile)?;
+    configure_staging_durability(&dst_conn, &dest_str)?;
+
+    match source_profile {
+        SnapshotSourceProfile::Runtime => {
+            let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+                message: format!("cannot open runtime source DB {source_str}: {e}"),
+            })?;
+            transfer_tables(&src, &dst_conn)?;
+        }
+        SnapshotSourceProfile::CanonicalExport => {
+            let src = CanonicalDbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+                message: format!("cannot open canonical export source DB {source_str}: {e}"),
+            })?;
+            transfer_tables(&src, &dst_conn)?;
+        }
+    }
+    drop(dst_conn);
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&staged_dest).map_err(|e| {
+        ShareError::Sqlite {
+            message: format!(
+                "cannot checkpoint destination DB {} before publishing snapshot: {e}",
+                staged_dest.display()
+            ),
+        }
+    })?;
+    // Staging ran with synchronous=OFF (br-gi4z3), so force the finished image
+    // to disk once, here, before the rename publishes it.
+    std::fs::File::open(&staged_dest)
+        .and_then(|file| file.sync_all())
+        .map_err(ShareError::Io)?;
     std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
 
     Ok(dest)
+}
+
+/// Relax durability on the staged destination while tables stream in.
+///
+/// br-gi4z3: the destination lives in a `.snapshot-stage.` tempdir that is
+/// discarded on any failure and only published via checkpoint + `sync_all` +
+/// rename on success, so per-statement durability during staging buys nothing.
+/// Without this, autocommit fsyncs made live-snapshot creation take minutes
+/// (~2 fsyncs/row; 4,149 journal create/unlink events observed in a 2-minute
+/// strace window on a 1,690-message mailbox).
+fn configure_staging_durability(
+    conn: &CanonicalDbConn,
+    destination: &str,
+) -> Result<(), ShareError> {
+    conn.execute_raw("PRAGMA synchronous = OFF")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure staging destination DB {destination} with synchronous=OFF: \
+                 {error}"
+            ),
+        })?;
+    conn.execute_raw("PRAGMA journal_mode = MEMORY")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure staging destination DB {destination} with MEMORY journal \
+                 mode: {error}"
+            ),
+        })?;
+    Ok(())
+}
+
+fn configure_destination(
+    conn: &CanonicalDbConn,
+    destination: &str,
+    profile: SnapshotDestinationProfile,
+) -> Result<(), ShareError> {
+    if !matches!(profile, SnapshotDestinationProfile::PortableExport) {
+        return Ok(());
+    }
+
+    conn.execute_raw("PRAGMA page_size = 1024")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure destination DB {destination} with page size 1024: {error}"
+            ),
+        })?;
+    conn.execute_raw("PRAGMA journal_mode='DELETE'")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure destination DB {destination} with DELETE journal mode: {error}"
+            ),
+        })?;
+    Ok(())
 }
 
 fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
@@ -388,11 +472,42 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+trait SnapshotSource {
+    // Mirrors `DbConn::query_sync`'s signature; `sqlmodel_core::Error`'s size
+    // is upstream's choice and boxing here would diverge from that API.
+    #[allow(clippy::result_large_err)]
+    fn query_snapshot(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error>;
+}
+
+impl SnapshotSource for DbConn {
+    fn query_snapshot(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+        self.query_sync(sql, params)
+    }
+}
+
+impl SnapshotSource for CanonicalDbConn {
+    fn query_snapshot(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+        self.query_sync(sql, params)
+    }
+}
+
 /// Transfer tables from a source snapshot to a fresh destination database.
-fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
+fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<(), ShareError> {
     for table in KNOWN_TABLES {
         create_dst_table(dst, table)?;
-        let source_columns = source_columns_frank(src, table.name)?;
+        let source_columns = source_columns(src, table.name)?;
         if source_columns.is_empty() {
             continue;
         }
@@ -424,16 +539,24 @@ fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
                     )
                 };
 
-            let rows = src
-                .query_sync(&select_sql, &params)
-                .map_err(|e| ShareError::Sqlite {
-                    message: format!("SELECT from {} failed: {e}", table.name),
-                })?;
+            let rows =
+                src.query_snapshot(&select_sql, &params)
+                    .map_err(|e| ShareError::Sqlite {
+                        message: format!("SELECT from {} failed: {e}", table.name),
+                    })?;
 
             if rows.is_empty() {
                 break;
             }
 
+            // br-gi4z3: one transaction per page instead of one autocommit
+            // (and, pre-staging-pragmas, ~2 fsyncs) per row. Error paths may
+            // leave the transaction open: the staged destination is discarded
+            // wholesale on failure, so no explicit ROLLBACK is needed.
+            dst.execute_sync("BEGIN IMMEDIATE", &[])
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("BEGIN for {} page failed: {e}", table.name),
+                })?;
             for row in &rows {
                 let values: Vec<Value> = table
                     .columns
@@ -456,6 +579,10 @@ fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
                         message: format!("INSERT into {} failed: {e}", table.name),
                     })?;
             }
+            dst.execute_sync("COMMIT", &[])
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("COMMIT for {} page failed: {e}", table.name),
+                })?;
             if page_by_column.is_none() {
                 break;
             }
@@ -465,7 +592,7 @@ fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
 }
 
 /// Create a table in the destination database.
-fn create_dst_table(dst: &DbConn, table: &KnownTable) -> Result<(), ShareError> {
+fn create_dst_table(dst: &CanonicalDbConn, table: &KnownTable) -> Result<(), ShareError> {
     let col_defs: Vec<String> = table.columns.iter().map(|c| format!("\"{c}\"")).collect();
 
     let pk_suffix = primary_key_suffix(table.primary_key_columns);
@@ -491,27 +618,6 @@ fn build_insert(table: &str, columns: &[&str]) -> String {
     format!("INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
 }
 
-fn destination_page_size_bytes(destination_pragmas: &[&str]) -> Result<Option<u32>, ShareError> {
-    let mut requested = None;
-    for pragma in destination_pragmas {
-        let compact: String = pragma
-            .chars()
-            .filter(|ch| !ch.is_ascii_whitespace())
-            .collect();
-        let compact = compact.trim_end_matches(';').to_ascii_lowercase();
-        let Some(raw_value) = compact.strip_prefix("pragmapage_size=") else {
-            continue;
-        };
-        let page_size = raw_value
-            .parse::<u32>()
-            .map_err(|_| ShareError::Validation {
-                message: format!("invalid destination page_size pragma: {pragma}"),
-            })?;
-        requested = Some(page_size);
-    }
-    Ok(requested)
-}
-
 fn quoted_column_list(columns: &[&str]) -> String {
     columns
         .iter()
@@ -527,9 +633,9 @@ fn primary_key_suffix(primary_key_columns: &[&str]) -> String {
     format!(", PRIMARY KEY({})", quoted_column_list(primary_key_columns))
 }
 
-fn source_columns_frank(src: &DbConn, table: &str) -> Result<HashSet<String>, ShareError> {
+fn source_columns<S: SnapshotSource>(src: &S, table: &str) -> Result<HashSet<String>, ShareError> {
     let rows = src
-        .query_sync(&format!("PRAGMA table_info(\"{table}\")"), &[])
+        .query_snapshot(&format!("PRAGMA table_info(\"{table}\")"), &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("PRAGMA table_info({table}) failed: {e}"),
         })?;
@@ -572,6 +678,7 @@ fn available_columns<'a>(table: &'a KnownTable, source_columns: &HashSet<String>
 
 fn snapshot_default_value(table: &str, column: &str) -> Option<Value> {
     match (table, column) {
+        ("agents", "reaper_exempt") => Some(Value::BigInt(0)),
         ("messages", "recipients_json") => Some(Value::Text("{}".to_string())),
         _ => None,
     }
@@ -605,8 +712,11 @@ pub fn create_snapshot_context(
     scrub_preset: crate::ScrubPreset,
 ) -> Result<SnapshotContext, ShareError> {
     create_sqlite_snapshot(source, snapshot_path, true)?;
-    let scope = crate::apply_project_scope(snapshot_path, project_filters)?;
+    let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
     let scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
+    if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
+        crate::scrub::redact_scope_project_human_keys(&mut scope);
+    }
     let finalize = crate::finalize_export_db(snapshot_path)?;
 
     Ok(SnapshotContext {
@@ -920,8 +1030,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        let released_ts: i64 = rows[0].get_named("released_ts").unwrap();
-        assert_eq!(released_ts, 9001);
+        let released_ts: String = rows[0].get_named("released_ts").unwrap();
+        assert_eq!(released_ts, "9001");
 
         let rows = copy_conn
             .query_sync(
@@ -944,6 +1054,51 @@ mod tests {
         let capabilities_json: String = rows[0].get_named("capabilities_json").unwrap();
         assert_eq!(tool_name, "send_message");
         assert_eq!(capabilities_json, "[\"attachments\"]");
+    }
+
+    #[test]
+    fn snapshot_preserves_agent_recovery_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("runtime.sqlite3");
+        let dest = dir.path().join("snapshot.sqlite3");
+
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY, \
+                project_id INTEGER NOT NULL, \
+                name TEXT NOT NULL, \
+                reaper_exempt INTEGER NOT NULL DEFAULT 0, \
+                registration_token TEXT\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents \
+             (id, project_id, name, reaper_exempt, registration_token) \
+             VALUES (7, 3, 'RecoveryAgent', 1, 'registration-secret')",
+        )
+        .unwrap();
+        drop(conn);
+
+        create_sqlite_snapshot(&source, &dest, false).unwrap();
+
+        let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
+        let rows = copy_conn
+            .query_sync(
+                "SELECT reaper_exempt, registration_token FROM agents WHERE id = 7",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("reaper_exempt").unwrap(), 1);
+        assert_eq!(
+            rows[0]
+                .get_named::<Option<String>>("registration_token")
+                .unwrap()
+                .as_deref(),
+            Some("registration-secret")
+        );
     }
 
     #[test]
@@ -990,16 +1145,16 @@ mod tests {
 
         let cc_kind: String = rows[0].get_named("kind").unwrap();
         let cc_read_ts: Option<i64> = rows[0].get_named("read_ts").unwrap();
-        let cc_ack_ts: Option<i64> = rows[0].get_named("ack_ts").unwrap();
+        let cc_ack_ts: Option<String> = rows[0].get_named("ack_ts").unwrap();
         assert_eq!(cc_kind, "cc");
         assert_eq!(cc_read_ts, None);
-        assert_eq!(cc_ack_ts, Some(222));
+        assert_eq!(cc_ack_ts.as_deref(), Some("222"));
 
         let to_kind: String = rows[1].get_named("kind").unwrap();
-        let to_read_ts: Option<i64> = rows[1].get_named("read_ts").unwrap();
-        let to_ack_ts: Option<i64> = rows[1].get_named("ack_ts").unwrap();
+        let to_read_ts: Option<String> = rows[1].get_named("read_ts").unwrap();
+        let to_ack_ts: Option<String> = rows[1].get_named("ack_ts").unwrap();
         assert_eq!(to_kind, "to");
-        assert_eq!(to_read_ts, Some(111));
+        assert_eq!(to_read_ts.as_deref(), Some("111"));
         assert_eq!(to_ack_ts, None);
     }
 
@@ -1214,6 +1369,10 @@ mod tests {
             create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
         assert!(context.snapshot_path.exists());
         assert!(!context.scope.projects.is_empty());
+        assert_eq!(
+            context.scope.projects[0].human_key,
+            "[project path redacted: myproj]"
+        );
         assert!(context.scrub_summary.secrets_replaced >= 0);
 
         let output = dir.path().join("bundle");
@@ -1439,6 +1598,7 @@ mod tests {
         let snapshot = dir.path().join("snapshot.sqlite3");
         let context =
             create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Archive).unwrap();
+        assert_eq!(context.scope.projects[0].human_key, "/test/proj");
 
         let output = dir.path().join("bundle");
         std::fs::create_dir_all(output.join("viewer/data")).unwrap();

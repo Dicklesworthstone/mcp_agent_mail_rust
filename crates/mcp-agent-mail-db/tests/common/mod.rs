@@ -18,32 +18,43 @@
 use asupersync::{Budget, Cx};
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 /// Drive a future to completion using a spin loop.
 ///
-/// Panics if the future does not resolve within `MAX_POLLS` iterations,
-/// which indicates a genuine bug (not a waker/park issue).
+/// Panics if the future does not resolve within `HANG_TIMEOUT`, which indicates
+/// a genuine bug (not a waker/park issue).
 fn spin_block_on_future<F: Future>(future: F) -> F::Output {
-    const MAX_POLLS: u64 = 500_000;
+    const HANG_TIMEOUT: Duration = Duration::from_mins(1);
+    const YIELD_EVERY: u64 = 1_000;
+    const SLEEP_EVERY: u64 = 50_000;
 
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let mut future = Box::pin(future);
+    let started = Instant::now();
+    let mut polls = 0_u64;
 
-    for poll_count in 0..MAX_POLLS {
+    loop {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(output) => return output,
             Poll::Pending => {
-                if poll_count % 10_000 == 9_999 {
+                polls = polls.saturating_add(1);
+                if polls.is_multiple_of(YIELD_EVERY) {
                     std::thread::yield_now();
+                }
+                if polls.is_multiple_of(SLEEP_EVERY) {
+                    let elapsed = started.elapsed();
+                    assert!(
+                        elapsed < HANG_TIMEOUT,
+                        "spin_block_on: future did not resolve after {polls} polls over \
+                             {elapsed:?} — likely a genuine hang (not a waker issue)"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
         }
     }
-    panic!(
-        "spin_block_on: future did not resolve after {MAX_POLLS} polls — \
-         likely a genuine hang (not a waker issue)"
-    );
 }
 
 /// Run an async function with a `Cx::for_testing()` context.

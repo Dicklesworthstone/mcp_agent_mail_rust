@@ -79,6 +79,8 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
         Some("validation parity test".to_string()),
         None,
         None,
+        None,
+        None,
     )
     .await
     .expect("register_agent");
@@ -111,6 +113,9 @@ fn test_invalid_timestamp_message() {
             "BlueLake".to_string(),
             None,
             Some("not-a-timestamp".to_string()),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -316,6 +321,8 @@ fn test_empty_program_message() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("empty program should fail");
@@ -361,6 +368,8 @@ fn test_empty_model_message() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("empty model should fail");
@@ -402,6 +411,9 @@ fn test_invalid_limit_message() {
             None,
             None,
             Some(0),
+            None,
+            None,
+            None,
             None,
             None,
         )
@@ -454,6 +466,9 @@ fn test_invalid_limit_negative() {
             Some(-5),
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("limit=-5 should fail");
@@ -491,6 +506,9 @@ fn test_limit_capped_at_1000() {
             None,
             None,
             Some(5000),
+            None,
+            None,
+            None,
             None,
             None,
         )

@@ -111,6 +111,23 @@ For operator CLI commands, use: am {command}
 Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ...
 ```
 
+When `{command}` is a known MCP tool name or common shorthand rather than a
+real CLI subcommand, the denial replaces the generic `am {command}` hint with a
+deterministic correction block:
+
+```
+Corrected command:
+  CLI: am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>
+  MCP tool: send_message
+```
+
+The correction table covers the currently observed protocol/CLI mismatch inputs:
+`reserve`, `file-reserve`, `file_reservation_paths`, `macro_start_session`,
+`send_message`, `send`, `inbox`, `fetch_inbox`, `reservations`,
+`serve-http`, and `serve-stdio`.
+The `serve-http` and `serve-stdio` rows include only the CLI correction; they
+must not label `serve` as an `MCP tool` because it is an MCP server command.
+
 ### CLI mode: MCP-only attempt denial
 
 Trigger: `AM_INTERFACE_MODE=cli` and argv[1] is an MCP-only command that is not part of the CLI
@@ -142,6 +159,28 @@ CLI equivalents:
   am serve-stdio ...
 ```
 
+### Legacy `am serve` compatibility preflight
+
+Trigger: the `am` CLI binary receives the retired top-level subcommand `serve`.
+
+This is distinct from `mcp-agent-mail serve`, which remains the MCP server
+HTTP-mode command. `am serve` must fail before any mailbox/config initialization
+or transport startup.
+
+Requirements:
+
+- Print to **stderr** only.
+- Exit code `64`.
+- Include a stable classifier line:
+  `classification: legacy-subcommand-migration`
+- Include a stable retry policy line:
+  `retry_policy: do-not-retry-unchanged`
+- Include migration mappings to both explicit CLI transport commands:
+  - `am serve-http ...`
+  - `am serve-stdio`
+- Include the server-binary fallback:
+  - `mcp-agent-mail serve`
+
 ## Exit Codes
 
 | Code | Meaning | Examples |
@@ -149,6 +188,7 @@ CLI equivalents:
 | 0 | success | normal operation |
 | 1 | runtime error | server startup failure, IO error |
 | 2 | usage error / wrong-mode | unknown subcommand, invalid mode value, wrong-mode denial |
+| 64 | legacy subcommand migration required | retired `am serve`; supervisor should not retry unchanged |
 
 ## Test Vectors (Must Be Covered)
 
@@ -158,6 +198,8 @@ Unit / integration:
 2. CLI mode: `AM_INTERFACE_MODE=cli mcp-agent-mail --help` → exit 0, output is CLI help surface.
 3. CLI mode wrong-mode: `AM_INTERFACE_MODE=cli mcp-agent-mail serve` → exit 2 with deterministic denial.
 4. Invalid value: `AM_INTERFACE_MODE=wat mcp-agent-mail --help` → exit 2 with deterministic error.
+5. Legacy CLI preflight: `am serve` → exit 64 with the
+   `legacy-subcommand-migration` classifier and no stdout.
 
 E2E:
 

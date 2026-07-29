@@ -7,9 +7,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn am_bin() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_BIN_EXE_am").expect("CARGO_BIN_EXE_am must be set"))
+}
+
+fn explicit_mcp_bin_path() -> Option<PathBuf> {
+    std::env::var_os("MCP_AGENT_MAIL_BIN").map(PathBuf::from)
+}
+
+fn implicit_mcp_bin_path() -> PathBuf {
+    let am = am_bin();
+    am.parent().expect("target dir").join("mcp-agent-mail")
 }
 
 fn repo_root() -> PathBuf {
@@ -18,6 +28,135 @@ fn repo_root() -> PathBuf {
         .and_then(|p| p.parent())
         .expect("repo root")
         .to_path_buf()
+}
+
+fn mcp_binary_freshness_inputs() -> [PathBuf; 2] {
+    let root = repo_root();
+    [
+        root.join("crates/mcp-agent-mail/src/main.rs"),
+        root.join("crates/mcp-agent-mail/Cargo.toml"),
+    ]
+}
+
+fn path_modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn implicit_mcp_bin_stale_reason(binary: &Path) -> Option<String> {
+    let binary_modified = path_modified(binary)?;
+    for source in mcp_binary_freshness_inputs() {
+        let Some(source_modified) = path_modified(&source) else {
+            continue;
+        };
+        if source_modified > binary_modified {
+            return Some(format!(
+                "MCP binary at {} is older than {}; build it with `cargo build -p mcp-agent-mail` or set MCP_AGENT_MAIL_BIN to a current binary",
+                binary.display(),
+                source.display()
+            ));
+        }
+    }
+    None
+}
+
+fn rch_worker_mcp_bin_candidates() -> Vec<PathBuf> {
+    let implicit = implicit_mcp_bin_path();
+    let Some(debug_dir) = implicit.parent() else {
+        return Vec::new();
+    };
+    let Some(target_dir) = debug_dir.parent() else {
+        return Vec::new();
+    };
+    let Some(target_name) = target_dir.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let Some((worker_prefix, _job_suffix)) = target_name.split_once("-job-") else {
+        return Vec::new();
+    };
+    let rch_prefix = format!("{worker_prefix}-job-");
+
+    let mut candidates = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo_root()) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&rch_prefix) {
+            continue;
+        }
+        let candidate = path.join("debug").join("mcp-agent-mail");
+        if !candidate.is_file() {
+            continue;
+        }
+        let modified = path_modified(&candidate).unwrap_or(UNIX_EPOCH);
+        candidates.push((modified, candidate));
+    }
+    candidates.sort_by(|(left, _), (right, _)| right.cmp(left));
+    candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+fn implicit_mcp_bin_candidates() -> Vec<PathBuf> {
+    std::iter::once(implicit_mcp_bin_path())
+        .chain(rch_worker_mcp_bin_candidates())
+        .collect()
+}
+
+fn resolve_mcp_bin_path() -> Result<PathBuf, String> {
+    if let Some(explicit) = explicit_mcp_bin_path() {
+        if explicit.is_file() {
+            return Ok(explicit);
+        }
+        return Err(format!(
+            "MCP binary not found at {}. Build with `cargo build -p mcp-agent-mail` or set MCP_AGENT_MAIL_BIN.",
+            explicit.display()
+        ));
+    }
+
+    let mut stale_reasons = Vec::new();
+    let candidates = implicit_mcp_bin_candidates();
+    for candidate in &candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        if let Some(reason) = implicit_mcp_bin_stale_reason(candidate) {
+            stale_reasons.push(reason);
+            continue;
+        }
+        return Ok(candidate.clone());
+    }
+
+    if let Some(reason) = stale_reasons.into_iter().next() {
+        return Err(reason);
+    }
+    let searched = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "MCP binary not found. Build with `cargo build -p mcp-agent-mail` or set MCP_AGENT_MAIL_BIN. Searched: {searched}"
+    ))
+}
+
+fn mcp_bin_unavailable_reason() -> Option<String> {
+    resolve_mcp_bin_path().err()
+}
+
+fn skip_if_mcp_bin_unavailable() -> bool {
+    if let Some(reason) = mcp_bin_unavailable_reason() {
+        eprintln!("SKIP: {reason}");
+        true
+    } else {
+        false
+    }
 }
 
 fn artifacts_dir() -> PathBuf {
@@ -60,6 +199,10 @@ fn run_cli(args: &[&str], env_pairs: &[(String, String)]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Mode is part of the matrix contract: an ambient AM_INTERFACE_MODE (e.g.
+    // from an `AM_INTERFACE_MODE=cli am e2e run` invocation) must not leak into
+    // spawned binaries. Cases that need it push it through env_pairs.
+    cmd.env_remove("AM_INTERFACE_MODE");
     for (k, v) in env_pairs {
         cmd.env(k, v);
     }
@@ -69,25 +212,26 @@ fn run_cli(args: &[&str], env_pairs: &[(String, String)]) -> Output {
 /// Run the MCP server binary with given args and env.
 /// The binary rejects CLI-only commands with exit code 2.
 fn run_mcp(args: &[&str], env_pairs: &[(String, String)]) -> Output {
-    // Find the mcp-agent-mail binary in the same target dir as the am binary.
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
     // If the MCP binary isn't built yet, skip gracefully.
-    if !mcp_bin.exists() {
-        return Output {
-            status: std::process::ExitStatus::default(),
-            stdout: Vec::new(),
-            stderr: format!("MCP binary not found at {}", mcp_bin.display()).into_bytes(),
-        };
-    }
+    let mcp_bin = match resolve_mcp_bin_path() {
+        Ok(path) => path,
+        Err(reason) => {
+            return Output {
+                status: std::process::ExitStatus::default(),
+                stdout: Vec::new(),
+                stderr: reason.into_bytes(),
+            };
+        }
+    };
 
     let mut cmd = Command::new(&mcp_bin);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // See run_cli: ambient AM_INTERFACE_MODE would flip the MCP binary into
+    // CLI mode and invalidate every MCP-mode denial assertion in the matrix.
+    cmd.env_remove("AM_INTERFACE_MODE");
     for (k, v) in env_pairs {
         cmd.env(k, v);
     }
@@ -108,6 +252,38 @@ fn base_env() -> Vec<(String, String)> {
         ("HTTP_PORT".to_string(), "1".to_string()),
         ("HTTP_PATH".to_string(), "/mcp/".to_string()),
     ]
+}
+
+fn isolated_env_without_precreated_root(label: &str) -> (PathBuf, Vec<(String, String)>) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "mode_matrix_{label}_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    let env = vec![
+        (
+            "DATABASE_URL".to_string(),
+            format!("sqlite:///{}/test.sqlite3", root.display()),
+        ),
+        (
+            "STORAGE_ROOT".to_string(),
+            root.join("storage").display().to_string(),
+        ),
+        ("HOME".to_string(), root.join("home").display().to_string()),
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            root.join("xdg_config").display().to_string(),
+        ),
+        ("AGENT_NAME".to_string(), "TestAgent".to_string()),
+        ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
+        ("HTTP_PORT".to_string(), "1".to_string()),
+        ("HTTP_PATH".to_string(), "/mcp/".to_string()),
+    ];
+    (root, env)
 }
 
 fn stdout_str(out: &Output) -> String {
@@ -134,8 +310,19 @@ fn digest(s: &str) -> String {
 const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["serve-http", "--help"],
     &["serve-stdio", "--help"],
+    &["capabilities", "--help"],
+    &["agent", "--help"],
+    &["status", "--help"],
+    &["inbox", "--help"],
+    &["reservations", "--help"],
+    &["health", "--help"],
+    &["thread", "--help"],
     &["check-inbox", "--help"],
+    &["tui-dump", "--help"],
+    &["check", "--help"],
     &["ci", "--help"],
+    &["verify", "--help"],
+    &["release", "--help"],
     &["bench", "--help"],
     &["e2e", "--help"],
     &["share", "--help"],
@@ -162,7 +349,9 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["setup", "--help"],
     &["golden", "--help"],
     &["flake-triage", "--help"],
+    &["atc", "--help"],
     &["robot", "--help"],
+    &["robot-docs", "--help"],
     &["legacy", "--help"],
     &["upgrade", "--help"],
     &["service", "--help"],
@@ -174,8 +363,19 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["share"],
     &["archive"],
     &["guard"],
+    &["capabilities"],
+    &["agent"],
+    &["status"],
+    &["inbox"],
+    &["reservations"],
+    &["health"],
+    &["thread"],
     &["check-inbox"],
+    &["tui-dump"],
+    &["check"],
     &["ci"],
+    &["verify"],
+    &["release"],
     &["bench"],
     &["e2e"],
     &["acks"],
@@ -196,7 +396,9 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["setup"],
     &["golden"],
     &["flake-triage"],
+    &["atc"],
     &["robot"],
+    &["robot-docs"],
     &["legacy"],
     &["upgrade"],
     &["service"],
@@ -205,6 +407,28 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
 
 /// Commands that MCP binary should allow (not deny).
 const MCP_ALLOW_COMMANDS: &[&[&str]] = &[&["serve", "--help"], &["config"]];
+
+struct CommandCorrectionCase {
+    attempted: String,
+    expected_cli: &'static str,
+    expected_mcp_tool: Option<&'static str>,
+}
+
+fn mcp_name_mismatch_correction_cases() -> Vec<CommandCorrectionCase> {
+    mcp_agent_mail_cli::mcp_tool_cli_corrections()
+        .iter()
+        .flat_map(|correction| {
+            correction
+                .attempted_names
+                .iter()
+                .map(move |attempted| CommandCorrectionCase {
+                    attempted: (*attempted).to_string(),
+                    expected_cli: correction.cli,
+                    expected_mcp_tool: correction.mcp_tool,
+                })
+        })
+        .collect()
+}
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -252,15 +476,7 @@ fn matrix_cli_binary_accepts_all_command_families() {
 #[test]
 fn matrix_mcp_binary_denies_cli_only_commands() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!(
-            "SKIP: MCP binary not found at {}. Build with `cargo build -p mcp-agent-mail`.",
-            mcp_bin.display()
-        );
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -325,12 +541,7 @@ fn matrix_mcp_binary_denies_cli_only_commands() {
 #[test]
 fn matrix_mcp_binary_allows_server_commands() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -375,12 +586,7 @@ fn matrix_mcp_binary_allows_server_commands() {
 #[test]
 fn matrix_mcp_denial_message_contains_remediation() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -398,6 +604,74 @@ fn matrix_mcp_denial_message_contains_remediation() {
             serr.contains("use: am "),
             "denial stderr for '{cmd}' should mention the CLI binary: {serr}"
         );
+    }
+}
+
+#[test]
+fn matrix_mcp_name_mismatch_denials_print_exact_corrections() {
+    let env = base_env();
+    if skip_if_mcp_bin_unavailable() {
+        return;
+    }
+
+    for case in mcp_name_mismatch_correction_cases() {
+        let out = run_mcp(&[case.attempted.as_str()], &env);
+        let sout = stdout_str(&out);
+        let serr = stderr_str(&out);
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "MCP name-mismatch denial for `{}` must exit 2.\nstderr:\n{}",
+            case.attempted,
+            serr
+        );
+        assert!(
+            sout.is_empty(),
+            "MCP name-mismatch denial for `{}` must keep stdout empty.\nstdout:\n{}",
+            case.attempted,
+            sout
+        );
+        assert!(
+            serr.contains(&format!(
+                "Error: \"{}\" is not an MCP server command.",
+                case.attempted
+            )),
+            "denial must name attempted command `{}`.\nstderr:\n{}",
+            case.attempted,
+            serr
+        );
+        assert!(
+            serr.contains("Corrected command:"),
+            "denial for `{}` must include correction header.\nstderr:\n{}",
+            case.attempted,
+            serr
+        );
+        assert!(
+            serr.contains(case.expected_cli),
+            "denial for `{}` must include exact CLI correction `{}`.\nstderr:\n{}",
+            case.attempted,
+            case.expected_cli,
+            serr
+        );
+        if let Some(expected_mcp_tool) = case.expected_mcp_tool {
+            assert!(
+                serr.contains(&format!("MCP tool: {expected_mcp_tool}")),
+                "denial for `{}` must include MCP tool correction `{}`.\nstderr:\n{}",
+                case.attempted,
+                expected_mcp_tool,
+                serr
+            );
+        }
+
+        if case.expected_cli != format!("am {}", case.attempted) {
+            assert!(
+                !serr.contains(&format!("use: am {}", case.attempted)),
+                "denial for `{}` must not emit the old misleading generic hint.\nstderr:\n{}",
+                case.attempted,
+                serr
+            );
+        }
     }
 }
 
@@ -443,7 +717,13 @@ fn maybe_update_golden_snapshot(name: &str, content: &str) {
 
 fn normalize_snapshot_text(text: &str) -> String {
     let normalized = mcp_agent_mail_cli::golden::normalize_output(text);
-    normalized.trim_end().to_string()
+    normalized
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
 }
 
 fn assert_snapshot_match(case_label: &str, expected: &str, actual: &str, update_hint: &str) {
@@ -466,12 +746,7 @@ fn assert_snapshot_match(case_label: &str, expected: &str, actual: &str, update_
 #[test]
 fn golden_denial_message_format_contract() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -528,6 +803,242 @@ fn golden_denial_message_format_contract() {
 
         eprintln!("golden_denial[{cmd}] PASS");
     }
+}
+
+#[test]
+fn golden_cli_mode_denial_for_mcp_only_serve() {
+    let (root, mut env) = isolated_env_without_precreated_root("cli_deny_serve");
+    env.push(("AM_INTERFACE_MODE".to_string(), "cli".to_string()));
+    if skip_if_mcp_bin_unavailable() {
+        return;
+    }
+
+    assert!(
+        !root.exists(),
+        "isolated root should not exist before CLI-mode wrong-surface denial: {}",
+        root.display()
+    );
+
+    let out = run_mcp(&["serve"], &env);
+    let serr = stderr_str(&out);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "CLI mode denial for `serve` must exit with code 2, got {:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout_str(&out).is_empty(),
+        "CLI mode denial for `serve` must not write to stdout"
+    );
+    assert!(
+        !root.exists(),
+        "CLI-mode wrong-surface denial must not create mailbox or config state under {}",
+        root.display()
+    );
+    assert!(
+        serr.contains("\"serve\" is not available in CLI mode"),
+        "CLI mode denial must name the MCP-only command.\nActual stderr:\n{serr}"
+    );
+    assert!(
+        serr.contains("unset AM_INTERFACE_MODE"),
+        "CLI mode denial must explain how to return to MCP mode.\nActual stderr:\n{serr}"
+    );
+    assert!(
+        serr.contains("mcp-agent-mail serve-http"),
+        "CLI mode denial must list the CLI HTTP equivalent.\nActual stderr:\n{serr}"
+    );
+
+    let snapshot_name = "mcp_cli_mode_deny_serve.txt";
+    maybe_update_golden_snapshot(snapshot_name, &serr);
+    let golden = load_golden_snapshot(snapshot_name).unwrap_or_else(|| {
+        panic!(
+            "missing golden snapshot {snapshot_name}. \
+             Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_cli_mode_denial_for_mcp_only_serve -- --nocapture` to generate it."
+        )
+    });
+    let norm_golden = normalize_snapshot_text(&golden);
+    let norm_actual = normalize_snapshot_text(&serr);
+    assert_snapshot_match(
+        "CLI mode denial 'serve'",
+        &norm_golden,
+        &norm_actual,
+        "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_cli_mode_denial_for_mcp_only_serve -- --nocapture` to update.",
+    );
+}
+
+#[test]
+fn golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects() {
+    let (root, env) = isolated_env_without_precreated_root("mcp_deny_doctor");
+    if skip_if_mcp_bin_unavailable() {
+        return;
+    }
+
+    assert!(
+        !root.exists(),
+        "isolated root should not exist before wrong-surface denial: {}",
+        root.display()
+    );
+
+    let out = run_mcp(&["doctor"], &env);
+    let serr = stderr_str(&out);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "MCP mode denial for CLI-only `doctor` must exit with code 2, got {:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout_str(&out).is_empty(),
+        "MCP mode denial for CLI-only `doctor` must not write to stdout"
+    );
+    assert!(
+        !root.exists(),
+        "wrong-surface denial must not create mailbox or config state under {}",
+        root.display()
+    );
+
+    let snapshot_name = "mcp_deny_doctor.txt";
+    maybe_update_golden_snapshot(snapshot_name, &serr);
+    let golden = load_golden_snapshot(snapshot_name).unwrap_or_else(|| {
+        panic!(
+            "missing golden snapshot {snapshot_name}. \
+             Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects -- --nocapture` to generate it."
+        )
+    });
+    let norm_golden = normalize_snapshot_text(&golden);
+    let norm_actual = normalize_snapshot_text(&serr);
+    assert_snapshot_match(
+        "MCP mode denial 'doctor'",
+        &norm_golden,
+        &norm_actual,
+        "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects -- --nocapture` to update.",
+    );
+}
+
+#[test]
+fn golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects() -> Result<(), String> {
+    let cases = [
+        ("setup", "mcp_deny_setup.txt"),
+        ("robot", "mcp_deny_robot.txt"),
+    ];
+    if skip_if_mcp_bin_unavailable() {
+        return Ok(());
+    }
+
+    for (command, snapshot_name) in cases {
+        let (root, env) = isolated_env_without_precreated_root(command);
+
+        assert!(
+            !root.exists(),
+            "isolated root should not exist before wrong-surface denial for {command}: {}",
+            root.display()
+        );
+
+        let out = run_mcp(&[command], &env);
+        let serr = stderr_str(&out);
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "MCP mode denial for CLI-only `{command}` must exit with code 2, got {:?}",
+            out.status.code()
+        );
+        assert!(
+            stdout_str(&out).is_empty(),
+            "MCP mode denial for CLI-only `{command}` must not write to stdout"
+        );
+        assert!(
+            !root.exists(),
+            "wrong-surface `{command}` denial must not create mailbox or config state under {}",
+            root.display()
+        );
+
+        maybe_update_golden_snapshot(snapshot_name, &serr);
+        let golden = load_golden_snapshot(snapshot_name).ok_or_else(|| {
+            format!(
+                "missing golden snapshot {snapshot_name}. \
+                 Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects -- --nocapture` to generate it."
+            )
+        })?;
+        let norm_golden = normalize_snapshot_text(&golden);
+        let norm_actual = normalize_snapshot_text(&serr);
+        assert_snapshot_match(
+            &format!("MCP mode denial '{command}'"),
+            &norm_golden,
+            &norm_actual,
+            "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects -- --nocapture` to update.",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn cli_mode_opt_in_allows_cli_help_and_invalid_mode_is_side_effect_free() -> Result<(), String> {
+    if skip_if_mcp_bin_unavailable() {
+        return Ok(());
+    }
+
+    let (cli_root, mut cli_env) = isolated_env_without_precreated_root("cli_opt_in");
+    cli_env.push(("AM_INTERFACE_MODE".to_string(), "cli".to_string()));
+
+    let cli_cases: &[(&[&str], &str)] = &[
+        (&["--help"], "mcp-agent-mail"),
+        (&["share", "--help"], "Usage:"),
+    ];
+    for (args, required_stdout) in cli_cases {
+        let out = run_mcp(args, &cli_env);
+        let sout = stdout_str(&out);
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "CLI opt-in command {:?} must exit 0, got {:?}",
+            args,
+            out.status.code()
+        );
+        assert!(
+            sout.contains(required_stdout),
+            "CLI opt-in command {:?} stdout must contain {required_stdout:?}.\nActual stdout:\n{sout}",
+            args
+        );
+    }
+    assert!(
+        !cli_root.exists(),
+        "CLI opt-in help commands must not create mailbox or config state under {}",
+        cli_root.display()
+    );
+
+    let (invalid_root, mut invalid_env) =
+        isolated_env_without_precreated_root("invalid_interface_mode");
+    invalid_env.push(("AM_INTERFACE_MODE".to_string(), "wat".to_string()));
+
+    let out = run_mcp(&["--help"], &invalid_env);
+    let serr = stderr_str(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid AM_INTERFACE_MODE must exit with usage code 2, got {:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout_str(&out).is_empty(),
+        "invalid AM_INTERFACE_MODE must not write to stdout"
+    );
+    assert!(
+        serr.contains("AM_INTERFACE_MODE") && serr.contains("wat"),
+        "invalid mode denial must name AM_INTERFACE_MODE and the rejected value.\nActual stderr:\n{serr}"
+    );
+    assert!(
+        !invalid_root.exists(),
+        "invalid AM_INTERFACE_MODE denial must not create mailbox or config state under {}",
+        invalid_root.display()
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -614,6 +1125,31 @@ fn golden_usage_error_format() {
             expected_fragment
         );
     }
+}
+
+#[test]
+fn docs_dual_mode_guidance_matches_mode_matrix_contract() {
+    let readme = include_str!("../../../README.md");
+    let runbook = include_str!("../../../docs/OPERATOR_RUNBOOK.md");
+    let spec = include_str!("../../../docs/SPEC-interface-mode-switch.md");
+
+    assert!(
+        readme.contains("mcp-agent-mail")
+            && readme.contains("stdio transport")
+            && readme.contains("AM_INTERFACE_MODE=cli mcp-agent-mail"),
+        "README must document MCP stdio default and CLI opt-in mode"
+    );
+    assert!(
+        runbook.contains("MCP server: `mcp-agent-mail`")
+            && runbook.contains("CLI: `am`")
+            && runbook.contains("deny on `stderr` and exit with code `2`"),
+        "operator runbook must preserve the CLI-vs-server wrong-surface guidance"
+    );
+    assert!(
+        spec.contains("For operator CLI commands, use: am {command}")
+            && spec.contains("AM_INTERFACE_MODE=wat mcp-agent-mail --help"),
+        "interface mode spec must preserve denial remediation and invalid-mode test vector"
+    );
 }
 
 /// Verify that the matrix rows cover all top-level CLI subcommands.

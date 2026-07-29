@@ -1711,6 +1711,7 @@ pub fn style_for_event_kind(kind: MailEventKind) -> Style {
         MailEventKind::AgentRegistered | MailEventKind::ServerStarted => tp.severity_ok,
         MailEventKind::HttpRequest => tp.text_secondary,
         MailEventKind::HealthPulse => tp.text_muted,
+        MailEventKind::GitSegfaultRetry => tp.severity_warn,
         MailEventKind::ServerShutdown => tp.severity_error,
     };
     Style::default().fg(fg)
@@ -2519,6 +2520,7 @@ mod tests {
             MailEventKind::AgentRegistered,
             MailEventKind::HttpRequest,
             MailEventKind::HealthPulse,
+            MailEventKind::GitSegfaultRetry,
             MailEventKind::ServerStarted,
             MailEventKind::ServerShutdown,
         ];

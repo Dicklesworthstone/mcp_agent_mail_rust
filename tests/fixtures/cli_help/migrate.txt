@@ -1,3 +1,5 @@
+Migrate or check the on-disk database format (with backup/rollback)
+
 Usage: am migrate [OPTIONS]
 
 Options:

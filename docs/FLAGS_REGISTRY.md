@@ -39,6 +39,9 @@ am flags off TUI_EFFECTS
 | `NOTIFICATIONS_ENABLED` | `NOTIFICATIONS_ENABLED` | `false` | stable | no | Filesystem notification signals |
 | `QUOTA_ENABLED` | `QUOTA_ENABLED` | `false` | experimental | no | Attachment and inbox quota enforcement |
 | `RETENTION_REPORT_ENABLED` | `RETENTION_REPORT_ENABLED` | `false` | stable | no | Periodic retention reports |
+| `RETENTION_REPORT_INTERVAL_SECONDS` | `RETENTION_REPORT_INTERVAL_SECONDS` | `3600` | stable | no | Retention/quota worker scan interval, floored at 60 seconds |
+| `RETENTION_MAX_AGE_DAYS` | `RETENTION_MAX_AGE_DAYS` | `180` | stable | no | Age threshold for read-only retention reports |
+| `RETENTION_IGNORE_PROJECT_PATTERNS` | `RETENTION_IGNORE_PROJECT_PATTERNS` | `demo,test*,testproj*,testproject,backendproj*,frontendproj*` | stable | no | Comma-separated project slug patterns skipped by retention reports |
 | `TOOLS_FILTER_ENABLED` | `TOOLS_FILTER_ENABLED` | `false` | experimental | no | Tool-surface reduction profiles |
 | `TUI_EFFECTS` | `AM_TUI_EFFECTS` | `true` | stable | yes | Ambient TUI effects |
 | `TUI_ENABLED` | `TUI_ENABLED` | `true` | stable | no | Start the interactive TUI |

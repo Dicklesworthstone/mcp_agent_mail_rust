@@ -1,12 +1,12 @@
-Msg          Ack          Locks         
-0 ─          0 ─          0 ─           
- [1:All]  [2:Msg]  [3:Tools]  [4:Resv]  
-No events yet.                          
-Waiting for HTTP/tool/message traffic an
-Enter opens Timeline/Search context when
-                                        
-                                        
-                                        
-                                        
-                                        
-                                        
+Msg       Ack       Locks     Req       
+0 ─       0 ─       0 ─       0 ─       
+╭Events (0/0) [FOLLOW] [Verbose] [filte╮
+│                                      │
+│  [1:All]  [2:Msg]  [3:Tools]         │
+│ [4:Resv]                             │
+│ No events yet.                       │
+│ Waiting for HTTP/tool/message traffi │
+│ Enter opens Timeline/Search context  │
+│                                      │
+│                                      │
+╰──────────────────────────────────────╯

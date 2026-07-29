@@ -70,6 +70,10 @@
               "/health_level",
               "/recovery",
               "/semantic_readiness",
+              "/storage_root",
+              "/two_tier_indexing",
+              "/verdicts",
+              "/failing_verdicts",
               "/pool_utilization/acquire_p50_ms",
               "/pool_utilization/acquire_p95_ms",
               "/pool_utilization/acquire_p99_ms",
@@ -489,7 +493,21 @@
             "agent_name": "GreenCastle"
           },
           "expect": {
-            "ok": []
+            "ok": [
+              {
+                "to": "BlueLake",
+                "status": "approved",
+                "reason": "",
+                "updated_ts": null,
+                "expires_ts": null
+              }
+            ]
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/0/expires_ts",
+              "/0/updated_ts"
+            ]
           }
         }
       ]
@@ -938,9 +956,17 @@
           "normalize": {
             "ignore_json_pointers": [
               "/0/created_ts",
+              "/0/ack_ts",
+              "/0/read_ts",
               "/1/created_ts",
+              "/1/ack_ts",
+              "/1/read_ts",
               "/2/created_ts",
-              "/3/created_ts"
+              "/2/ack_ts",
+              "/2/read_ts",
+              "/3/created_ts",
+              "/3/ack_ts",
+              "/3/read_ts"
             ]
           }
         }
@@ -1407,9 +1433,17 @@
           "normalize": {
             "ignore_json_pointers": [
               "/0/created_ts",
+              "/0/ack_ts",
+              "/0/read_ts",
               "/1/created_ts",
+              "/1/ack_ts",
+              "/1/read_ts",
               "/2/created_ts",
-              "/3/created_ts"
+              "/2/ack_ts",
+              "/2/read_ts",
+              "/3/created_ts",
+              "/3/ack_ts",
+              "/3/read_ts"
             ]
           }
         }
@@ -1948,8 +1982,14 @@
               "/agent/last_active_ts",
               "/agent/registration_token",
               "/inbox/0/created_ts",
+              "/inbox/0/ack_ts",
+              "/inbox/0/read_ts",
               "/inbox/1/created_ts",
+              "/inbox/1/ack_ts",
+              "/inbox/1/read_ts",
               "/inbox/2/created_ts",
+              "/inbox/2/ack_ts",
+              "/inbox/2/read_ts",
               "/project/created_at",
               "/thread/examples/0/created_ts",
               "/thread/examples/1/created_ts"
@@ -2089,8 +2129,14 @@
               "/agent/last_active_ts",
               "/agent/registration_token",
               "/inbox/0/created_ts",
+              "/inbox/0/ack_ts",
+              "/inbox/0/read_ts",
               "/inbox/1/created_ts",
+              "/inbox/1/ack_ts",
+              "/inbox/1/read_ts",
               "/inbox/2/created_ts",
+              "/inbox/2/ack_ts",
+              "/inbox/2/read_ts",
               "/project/created_at",
               "/thread/examples/0/created_ts",
               "/thread/examples/1/created_ts"
@@ -3070,7 +3116,7 @@
                     },
                     {
                       "name": "fetch_inbox",
-                      "summary": "Poll recent messages for an agent with filters (urgent_only, since_ts).",
+                      "summary": "Poll recent messages for an agent with filters and record read receipts.",
                       "use_when": "After each work unit to ingest coordination updates.",
                       "related": [
                         "mark_message_read",
@@ -3079,7 +3125,7 @@
                       "expected_frequency": "Frequent polling in agent loops.",
                       "required_capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "usage_examples": [
                         {
@@ -3089,7 +3135,7 @@
                       ],
                       "capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "complexity": "medium"
                     },
@@ -3103,7 +3149,7 @@
                       "expected_frequency": "Whenever FYI mail is processed.",
                       "required_capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "usage_examples": [
                         {
@@ -3113,7 +3159,7 @@
                       ],
                       "capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "complexity": "medium"
                     },
@@ -3816,7 +3862,7 @@
                     },
                     {
                       "name": "fetch_inbox",
-                      "summary": "Poll recent messages for an agent with filters (urgent_only, since_ts).",
+                      "summary": "Poll recent messages for an agent with filters and record read receipts.",
                       "use_when": "After each work unit to ingest coordination updates.",
                       "related": [
                         "mark_message_read",
@@ -3825,7 +3871,7 @@
                       "expected_frequency": "Frequent polling in agent loops.",
                       "required_capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "usage_examples": [
                         {
@@ -3835,7 +3881,7 @@
                       ],
                       "capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "complexity": "medium"
                     },
@@ -3849,7 +3895,7 @@
                       "expected_frequency": "Whenever FYI mail is processed.",
                       "required_capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "usage_examples": [
                         {
@@ -3859,7 +3905,7 @@
                       ],
                       "capabilities": [
                         "messaging",
-                        "read"
+                        "write"
                       ],
                       "complexity": "medium"
                     },
@@ -5344,7 +5390,7 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 1,
+              "count": 2,
               "messages": [
                 {
                   "id": 2,
@@ -5357,13 +5403,26 @@
                   "created_ts": null,
                   "attachments": [],
                   "kind": "to"
+                },
+                {
+                  "id": 3,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": null,
+                  "subject": "Hello",
+                  "importance": "urgent",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "kind": "to"
                 }
               ]
             }
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/messages/0/created_ts"
+              "/messages/0/created_ts",
+              "/messages/1/created_ts"
             ]
           }
         }

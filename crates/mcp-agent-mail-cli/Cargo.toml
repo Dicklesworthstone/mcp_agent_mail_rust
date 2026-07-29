@@ -7,22 +7,29 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "CLI tool for MCP Agent Mail (am binary)"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
+publish = false
 
 [[bin]]
 name = "am"
 path = "src/main.rs"
 
 [dependencies]
+# GH#161: global allocator to bound long-running daemon RSS (glibc arena fragmentation).
+mimalloc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 fastmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 json5.workspace = true
+toml_edit.workspace = true
 ftui.workspace = true
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
 thiserror.workspace = true
 chrono.workspace = true
 sqlmodel-core.workspace = true
+sqlmodel-sqlite.workspace = true
 mcp-agent-mail-core = { workspace = true, features = ["agent-detect"] }
 mcp-agent-mail-db = { workspace = true, default-features = false }
 mcp-agent-mail-share = { workspace = true, default-features = false }
@@ -30,26 +37,33 @@ mcp-agent-mail-guard = { workspace = true }
 mcp-agent-mail-server = { workspace = true, default-features = false }
 mcp-agent-mail-tools = { workspace = true, default-features = false }
 mcp-agent-mail-storage = { workspace = true, default-features = false }
-beads_rust = { version = "0.1.42", default-features = false }
+beads_rust.workspace = true
 sha2.workspace = true
 hex.workspace = true
 asupersync.workspace = true
 tempfile.workspace = true
 zip.workspace = true
 toon.workspace = true
-crossterm = "0.28.1"
+crossterm = "0.29.0"
 glob.workspace = true
 regex.workspace = true
 walkdir.workspace = true
-unicode-width = "0.1.14"
+unicode-width = "0.2.2"
 tracing.workspace = true
 tracing-subscriber.workspace = true
-nix = { workspace = true, features = ["signal", "process"] }
+signal-hook.workspace = true
 fs2.workspace = true
 git2.workspace = true
+dirs = "6"
+getrandom = "0.4.2"
+
+# nix is Unix-only (it doesn't compile on Windows). The CLI's nix usages
+# (PID liveness, mkfifo, mode bits) live in #[cfg(unix)] code paths.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-plist = "1.8.0"
+plist = "1.9.0"
 
 [features]
 default = [
@@ -68,4 +82,8 @@ portable = [
 ]
 
 [dev-dependencies]
+# Enable asupersync `test-internals` for TEST builds only so tests can
+# construct `Cx::for_testing()`; the release build excludes dev-deps and keeps
+# the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
+asupersync = { workspace = true, features = ["test-internals"] }
 similar.workspace = true

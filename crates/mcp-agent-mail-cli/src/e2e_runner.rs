@@ -245,8 +245,17 @@ impl SuiteRegistry {
         self.suites.is_empty()
     }
 
-    /// Filters suites by include/exclude patterns.
-    pub fn filter(&self, include: Option<&[String]>, exclude: Option<&[String]>) -> Vec<&Suite> {
+    /// Filters suites by include/exclude patterns and `@tags:` membership.
+    ///
+    /// Tags are matched exactly (no globbing): a suite qualifies when it
+    /// carries at least one of the requested tags. All three filters compose
+    /// as AND: (include if any) AND (tags if any) AND NOT (exclude).
+    pub fn filter(
+        &self,
+        include: Option<&[String]>,
+        exclude: Option<&[String]>,
+        tags: Option<&[String]>,
+    ) -> Vec<&Suite> {
         self.suites()
             .into_iter()
             .filter(|suite| {
@@ -257,6 +266,13 @@ impl SuiteRegistry {
                         .any(|p| Self::matches_pattern(&suite.name, p))
                 });
 
+                // If tags specified, suite must carry at least one of them
+                let tagged = tags.is_none_or(|wanted| {
+                    wanted
+                        .iter()
+                        .any(|t| suite.tags.iter().any(|have| have == t))
+                });
+
                 // If exclude patterns specified, suite must not match any
                 let excluded = exclude.is_some_and(|patterns| {
                     patterns
@@ -264,7 +280,7 @@ impl SuiteRegistry {
                         .any(|p| Self::matches_pattern(&suite.name, p))
                 });
 
-                included && !excluded
+                included && tagged && !excluded
             })
             .collect()
     }
@@ -463,13 +479,14 @@ impl Runner {
         }
     }
 
-    /// Runs suites with include/exclude filtering.
+    /// Runs suites with include/exclude/tag filtering.
     pub fn run_filtered(
         &self,
         include: Option<&[String]>,
         exclude: Option<&[String]>,
+        tags: Option<&[String]>,
     ) -> RunReport {
-        let suites = self.registry.filter(include, exclude);
+        let suites = self.registry.filter(include, exclude, tags);
         let suite_names: Vec<String> = suites.iter().map(|s| s.name.clone()).collect();
         self.run(&suite_names)
     }
@@ -609,11 +626,22 @@ impl Runner {
         }
     }
 
+    /// Suites must not inherit the operator's interface mode: the documented
+    /// invocation is `AM_INTERFACE_MODE=cli am e2e run ...`, and a leaked mode
+    /// flips `mcp-agent-mail`/`am` binaries spawned inside a suite onto the
+    /// wrong surface (e.g. MCP-mode denial fixtures silently become CLI runs).
+    /// Suites that need a mode set it explicitly; direct `bash tests/e2e/...`
+    /// invocation never had the variable, and runner invocation must match.
+    fn scrub_operator_env(cmd: &mut Command) {
+        cmd.env_remove("AM_INTERFACE_MODE");
+    }
+
     fn run_suite_once(&self, suite: &Suite) -> std::io::Result<SuiteExecution> {
         // Build the command
         let mut cmd = Command::new("bash");
         cmd.arg(&suite.script_path);
         cmd.current_dir(&self.config.project_root);
+        Self::scrub_operator_env(&mut cmd);
 
         // Set environment
         cmd.env("E2E_PROJECT_ROOT", &self.config.project_root);
@@ -705,6 +733,7 @@ impl Runner {
         let start_instant = Instant::now();
 
         let mut cmd = Command::new("cargo");
+        Self::scrub_operator_env(&mut cmd);
         cmd.args([
             "test",
             "-p",
@@ -773,6 +802,7 @@ impl Runner {
         let start_instant = Instant::now();
 
         let mut cmd = Command::new("cargo");
+        Self::scrub_operator_env(&mut cmd);
         cmd.args([
             "test",
             "-p",
@@ -841,6 +871,7 @@ impl Runner {
         let start_instant = Instant::now();
 
         let mut cmd = Command::new("cargo");
+        Self::scrub_operator_env(&mut cmd);
         cmd.args([
             "test",
             "-p",
@@ -907,6 +938,7 @@ impl Runner {
         let start_instant = Instant::now();
 
         let mut cmd = Command::new("cargo");
+        Self::scrub_operator_env(&mut cmd);
         cmd.args([
             "test",
             "-p",
@@ -973,6 +1005,7 @@ impl Runner {
         let start_instant = Instant::now();
 
         let mut cmd = Command::new("cargo");
+        Self::scrub_operator_env(&mut cmd);
         cmd.args([
             "test",
             "-p",
@@ -1041,6 +1074,7 @@ impl Runner {
         let start_instant = Instant::now();
 
         let mut cmd = Command::new("cargo");
+        Self::scrub_operator_env(&mut cmd);
         cmd.args([
             "test",
             "-p",
@@ -1732,6 +1766,7 @@ impl Runner {
         let mut cmd = Command::new(binary);
         cmd.args(args);
         cmd.current_dir(&self.config.project_root);
+        Self::scrub_operator_env(&mut cmd);
         for (key, value) in env_map {
             cmd.env(key, value);
         }
@@ -1961,6 +1996,170 @@ impl RunReport {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Release scorecard (br-bvq1x.14.13 / N13)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Suite whose per-incident-class scorecard feeds the release scorecard.
+pub const INCIDENT_CORPUS_SUITE: &str = "incident_corpus";
+
+/// Finds the newest `scorecard.json` under
+/// `tests/artifacts/incident_corpus/*/` and reports whether it was produced
+/// by the current run (mtime at or after `run_started_at`, with a small
+/// clock-slack allowance).
+fn newest_incident_scorecard(
+    project_root: &Path,
+    run_started_at: &str,
+) -> Option<(PathBuf, bool, serde_json::Value)> {
+    let root = project_root
+        .join("tests/artifacts")
+        .join(INCIDENT_CORPUS_SUITE);
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(&root).ok()?.flatten() {
+        let candidate = entry.path().join("scorecard.json");
+        let Ok(meta) = fs::metadata(&candidate) else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, candidate));
+        }
+    }
+    let (mtime, path) = best?;
+    let text = fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let fresh = chrono::DateTime::parse_from_rfc3339(run_started_at)
+        .ok()
+        .map(|started| {
+            let started: std::time::SystemTime = started.into();
+            let slack = Duration::from_secs(5);
+            mtime >= started.checked_sub(slack).unwrap_or(started)
+        })
+        .unwrap_or(false);
+    Some((path, fresh, value))
+}
+
+/// Writes the aggregated release-readiness scorecard for a completed run.
+///
+/// Per-suite rows join each `SuiteResult` with the registry's `@tags:` and
+/// description metadata (the suite-level anchor). Per-incident-class rows
+/// with their originating session-history anchors are lifted from the
+/// `scorecard.json` that the `incident_corpus` suite produced during this
+/// run. The combined `release_ready` verdict is true only when every suite
+/// passed AND a fresh incident-class scorecard is itself release-ready —
+/// a run that omits the incident corpus can never claim release readiness.
+///
+/// Returns the path of the written `release_scorecard.json`.
+pub fn write_release_scorecard(
+    report: &RunReport,
+    registry: &SuiteRegistry,
+    project_root: &Path,
+) -> std::io::Result<PathBuf> {
+    let mut problems: Vec<String> = Vec::new();
+
+    let suites: Vec<serde_json::Value> = report
+        .results
+        .iter()
+        .map(|r| {
+            let meta = registry.get(&r.name);
+            serde_json::json!({
+                "name": r.name,
+                "passed": r.passed,
+                "exit_code": r.exit_code,
+                "duration_ms": r.duration_ms,
+                "assertions_passed": r.assertions_passed,
+                "assertions_failed": r.assertions_failed,
+                "assertions_skipped": r.assertions_skipped,
+                "description": meta.and_then(|m| m.description.clone()),
+                "tags": meta.map(|m| m.tags.clone()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    let corpus_ran = report
+        .results
+        .iter()
+        .any(|r| r.name == INCIDENT_CORPUS_SUITE);
+    let mut incident_classes = serde_json::Value::Null;
+    let mut incident_summary = serde_json::Value::Null;
+    let mut incident_source: Option<String> = None;
+    let mut incident_fresh = false;
+    let mut incident_ready = false;
+    if corpus_ran {
+        match newest_incident_scorecard(project_root, &report.started_at) {
+            Some((path, fresh, value)) => {
+                incident_fresh = fresh;
+                incident_source = Some(path.display().to_string());
+                incident_ready = value
+                    .get("release_ready")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                incident_classes = value
+                    .get("classes")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                incident_summary = value
+                    .get("summary")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                if !fresh {
+                    problems.push(format!(
+                        "incident_corpus ran but no scorecard.json newer than run start was found; \
+                         stale evidence at {}",
+                        path.display()
+                    ));
+                }
+            }
+            None => problems
+                .push("incident_corpus ran but no scorecard.json artifact was found".to_string()),
+        }
+    } else {
+        problems.push(
+            "incident_corpus suite was not part of this run; per-incident-class evidence is missing"
+                .to_string(),
+        );
+    }
+
+    let release_ready = report.success() && corpus_ran && incident_fresh && incident_ready;
+
+    let scorecard = serde_json::json!({
+        "schema_version": 1,
+        "kind": "release_scorecard",
+        "generated_at": report.ended_at,
+        "run": {
+            "started_at": report.started_at,
+            "ended_at": report.ended_at,
+            "duration_ms": report.duration_ms,
+            "suites_total": report.total,
+            "suites_passed": report.passed,
+            "suites_failed": report.failed,
+        },
+        "suites": suites,
+        "incident_scorecard": {
+            "source": incident_source,
+            "fresh": incident_fresh,
+            "release_ready": incident_ready,
+            "summary": incident_summary,
+        },
+        "incident_classes": incident_classes,
+        "problems": problems,
+        "release_ready": release_ready,
+    });
+
+    let stamp = chrono::DateTime::parse_from_rfc3339(&report.ended_at)
+        .map(|t| t.format("%Y%m%d_%H%M%S").to_string())
+        .unwrap_or_else(|_| "latest".to_string());
+    let out_dir = project_root
+        .join("tests/artifacts/release_scorecard")
+        .join(stamp);
+    fs::create_dir_all(&out_dir)?;
+    let out_path = out_dir.join("release_scorecard.json");
+    fs::write(&out_path, format!("{scorecard:#}\n"))?;
+    Ok(out_path)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -2115,13 +2314,13 @@ exit 1
         let runner = Runner::new(temp.path(), config).expect("runner");
 
         let include = vec!["f*".to_string()];
-        let report_include = runner.run_filtered(Some(&include), None);
+        let report_include = runner.run_filtered(Some(&include), None, None);
         assert_eq!(report_include.total, 1);
         assert_eq!(report_include.failed, 1);
         assert_eq!(report_include.results[0].name, "fail");
 
         let exclude = vec!["fail".to_string()];
-        let report_exclude = runner.run_filtered(None, Some(&exclude));
+        let report_exclude = runner.run_filtered(None, Some(&exclude), None);
         assert_eq!(report_exclude.total, 1);
         assert_eq!(report_exclude.passed, 1);
         assert_eq!(report_exclude.results[0].name, "pass");
@@ -2785,7 +2984,7 @@ exit 1
         write_suite_script(temp.path(), "alpha", "#!/bin/bash\necho ok");
         write_suite_script(temp.path(), "beta", "#!/bin/bash\necho ok");
         let registry = SuiteRegistry::new(temp.path()).expect("registry");
-        let filtered = registry.filter(None, None);
+        let filtered = registry.filter(None, None, None);
         assert_eq!(filtered.len(), 2);
     }
 
@@ -2798,9 +2997,207 @@ exit 1
         let registry = SuiteRegistry::new(temp.path()).expect("registry");
         let include = vec!["alpha*".to_string()];
         let exclude = vec!["*slow".to_string()];
-        let filtered = registry.filter(Some(&include), Some(&exclude));
+        let filtered = registry.filter(Some(&include), Some(&exclude), None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "alpha_fast");
+    }
+
+    #[test]
+    fn filter_by_tag_selects_only_tagged_suites() {
+        let temp = TempDir::new().expect("tempdir");
+        write_suite_script(
+            temp.path(),
+            "tagged",
+            "#!/bin/bash\n# Tagged suite\n# @tags: reliability, track-x\necho ok",
+        );
+        write_suite_script(temp.path(), "untagged", "#!/bin/bash\necho ok");
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+
+        let tags = vec!["reliability".to_string()];
+        let filtered = registry.filter(None, None, Some(&tags));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "tagged");
+
+        // Tags are exact matches, not substrings/globs.
+        let partial = vec!["relia".to_string()];
+        assert!(registry.filter(None, None, Some(&partial)).is_empty());
+
+        // Tags compose with exclude.
+        let exclude = vec!["tagged".to_string()];
+        assert!(
+            registry
+                .filter(None, Some(&exclude), Some(&tags))
+                .is_empty()
+        );
+    }
+
+    // ── release scorecard (br-bvq1x.14.13) ───────────────────────────────
+
+    fn scorecard_suite_result(name: &str, passed: bool) -> SuiteResult {
+        SuiteResult {
+            name: name.to_string(),
+            passed,
+            exit_code: i32::from(!passed),
+            duration_ms: 10,
+            stdout: String::new(),
+            stderr: String::new(),
+            assertions_passed: 5,
+            assertions_failed: u32::from(!passed),
+            assertions_skipped: 0,
+            started_at: "2026-02-12T00:00:00+00:00".to_string(),
+            ended_at: "2026-02-12T00:00:01+00:00".to_string(),
+        }
+    }
+
+    fn scorecard_report(results: Vec<SuiteResult>, started_at: &str) -> RunReport {
+        let failed = results.iter().filter(|r| !r.passed).count() as u32;
+        RunReport {
+            total: results.len() as u32,
+            passed: results.len() as u32 - failed,
+            failed,
+            skipped: 0,
+            duration_ms: 100,
+            started_at: started_at.to_string(),
+            ended_at: "2026-02-12T00:10:00+00:00".to_string(),
+            results,
+        }
+    }
+
+    #[test]
+    fn release_scorecard_ready_with_fresh_incident_scorecard() {
+        let temp = TempDir::new().expect("tempdir");
+        write_suite_script(
+            temp.path(),
+            INCIDENT_CORPUS_SUITE,
+            "#!/bin/bash\n# L4 harness\n# @tags: reliability, corpus\necho ok",
+        );
+        write_suite_script(
+            temp.path(),
+            "corruption_taxonomy",
+            "#!/bin/bash\n# Track A taxonomy\n# @tags: reliability\necho ok",
+        );
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+
+        // A scorecard artifact written NOW is fresh relative to a run that
+        // started in the past.
+        let corpus_dir = temp
+            .path()
+            .join("tests/artifacts")
+            .join(INCIDENT_CORPUS_SUITE)
+            .join("20260212_000500");
+        fs::create_dir_all(&corpus_dir).expect("corpus artifact dir");
+        fs::write(
+            corpus_dir.join("scorecard.json"),
+            r#"{"release_ready": true,
+                "classes": [{"id": "zero_byte_wal", "status": "pass",
+                             "anchor": "startup quarantine logs"}],
+                "summary": {"total": 1, "pass": 1, "fail": 0, "skip": 0}}"#,
+        )
+        .expect("write scorecard");
+
+        let report = scorecard_report(
+            vec![
+                scorecard_suite_result(INCIDENT_CORPUS_SUITE, true),
+                scorecard_suite_result("corruption_taxonomy", true),
+            ],
+            "2026-02-12T00:00:00+00:00",
+        );
+
+        let path = write_release_scorecard(&report, &registry, temp.path())
+            .expect("write release scorecard");
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+
+        assert_eq!(value["kind"], "release_scorecard");
+        assert_eq!(value["release_ready"], true);
+        assert_eq!(value["problems"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["incident_scorecard"]["fresh"], true);
+        assert_eq!(value["incident_classes"][0]["id"], "zero_byte_wal");
+        // Suite rows join registry tag metadata.
+        let suites = value["suites"].as_array().expect("suites array");
+        assert_eq!(suites.len(), 2);
+        assert!(suites.iter().all(|s| {
+            s["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|t| t == "reliability")
+        }));
+    }
+
+    #[test]
+    fn release_scorecard_not_ready_without_incident_corpus() {
+        let temp = TempDir::new().expect("tempdir");
+        write_suite_script(
+            temp.path(),
+            "corruption_taxonomy",
+            "#!/bin/bash\n# Track A taxonomy\n# @tags: reliability\necho ok",
+        );
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+
+        let report = scorecard_report(
+            vec![scorecard_suite_result("corruption_taxonomy", true)],
+            "2026-02-12T00:00:00+00:00",
+        );
+
+        let path = write_release_scorecard(&report, &registry, temp.path())
+            .expect("write release scorecard");
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+
+        // All suites green, but no incident-class evidence -> never ready.
+        assert_eq!(value["release_ready"], false);
+        assert!(
+            value["problems"][0]
+                .as_str()
+                .unwrap()
+                .contains("not part of this run")
+        );
+    }
+
+    #[test]
+    fn release_scorecard_not_ready_with_failed_suite_or_stale_evidence() {
+        let temp = TempDir::new().expect("tempdir");
+        write_suite_script(
+            temp.path(),
+            INCIDENT_CORPUS_SUITE,
+            "#!/bin/bash\n# L4 harness\n# @tags: reliability\necho ok",
+        );
+        let registry = SuiteRegistry::new(temp.path()).expect("registry");
+
+        let corpus_dir = temp
+            .path()
+            .join("tests/artifacts")
+            .join(INCIDENT_CORPUS_SUITE)
+            .join("20990101_000000");
+        fs::create_dir_all(&corpus_dir).expect("corpus artifact dir");
+        fs::write(
+            corpus_dir.join("scorecard.json"),
+            r#"{"release_ready": true}"#,
+        )
+        .expect("write scorecard");
+
+        // Failed suite -> not ready even with fresh, ready class evidence.
+        let report = scorecard_report(
+            vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, false)],
+            "2026-02-12T00:00:00+00:00",
+        );
+        let path = write_release_scorecard(&report, &registry, temp.path()).expect("write");
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(value["release_ready"], false);
+
+        // Stale evidence (run "started" far in the future) -> not ready + problem.
+        let report = scorecard_report(
+            vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
+            "2099-01-01T00:00:00+00:00",
+        );
+        let path = write_release_scorecard(&report, &registry, temp.path()).expect("write");
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(value["release_ready"], false);
+        assert_eq!(value["incident_scorecard"]["fresh"], false);
+        assert!(value["problems"][0].as_str().unwrap().contains("stale"));
     }
 
     // ── write_dual_mode_step_artifact: pass case ─────────────────────────

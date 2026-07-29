@@ -1,24 +1,24 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-                                → Comm • Threads                                
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search               >
+ / Filter threads                                                               
+╭Threads (0)  [v]Activity  [s]Recent───────────────────────────────────────────╮
+│                                                                              │
+│   No threads found.                                                          │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
                                                                                 
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
- Threads api up:0m00s                                                         ? 
+╭Thread Detail─────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│  Select a thread to view conversation.                                       │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ Threads mcp up:0m00s                                              LIVE [^P] F1 

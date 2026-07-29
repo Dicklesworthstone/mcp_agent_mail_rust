@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 #[cfg(feature = "tantivy-engine")]
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 #[cfg(feature = "tantivy-engine")]
 use tantivy::query::Query;
 #[cfg(feature = "tantivy-engine")]
@@ -248,48 +248,38 @@ pub fn execute_search(
     };
     let searcher = reader.searcher();
 
-    // Fetch more results than needed to handle offset + count total
+    // Fetch more results than needed to handle offset while counting the full
+    // matching set for pagination metadata.
     let fetch_limit = offset.saturating_add(limit).max(1);
-    let Ok(top_docs) = searcher.search(query, &TopDocs::with_limit(fetch_limit)) else {
+    let Ok((total_count, top_docs)) = searcher.search(
+        query,
+        &(Count, TopDocs::with_limit(fetch_limit).order_by_score()),
+    ) else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
 
-    let total_count = top_docs.len();
-
-    // Apply offset
-    let page_docs: Vec<_> = top_docs.into_iter().skip(offset).collect();
-
     // Build hits
-    let mut hits = Vec::with_capacity(page_docs.len());
-    let mut explanations = Vec::new();
+    let mut ranked_hits = Vec::with_capacity(top_docs.len());
     let composer_config = ExplainComposerConfig {
         verbosity: config.explain_verbosity,
         max_factors_per_stage: config.explain_max_factors,
     };
 
-    for (score, doc_addr) in &page_docs {
-        let doc: TantivyDocument = match searcher.doc(*doc_addr) {
+    for (score, doc_addr) in top_docs {
+        let doc: TantivyDocument = match searcher.doc(doc_addr) {
             Ok(d) => d,
             Err(_) => continue,
         };
 
-        let hit = build_hit(&doc, handles, *score, query_terms, config);
-
-        if explain {
-            explanations.push(build_explanation(
-                &hit,
-                *score,
-                query_terms,
-                &composer_config,
-            ));
-        }
-
-        hits.push(hit);
+        let hit = build_hit(&doc, handles, score, query_terms, config);
+        let explanation =
+            explain.then(|| build_explanation(&hit, score, query_terms, &composer_config));
+        ranked_hits.push((hit, explanation));
     }
 
     // Deterministic tie-breaking: when scores are equal, sort by ID descending
-    // (newer documents first)
-    hits.sort_by(|a, b| {
+    // (newer documents first), then apply pagination to the stable ordering.
+    ranked_hits.sort_by(|(a, _), (b, _)| {
         let score_cmp = b.score.total_cmp(&a.score);
         if score_cmp == std::cmp::Ordering::Equal {
             b.doc_id.cmp(&a.doc_id)
@@ -297,6 +287,22 @@ pub fn execute_search(
             score_cmp
         }
     });
+
+    if offset > 0 {
+        ranked_hits.drain(0..offset.min(ranked_hits.len()));
+    }
+    if ranked_hits.len() > limit {
+        ranked_hits.truncate(limit);
+    }
+
+    let mut hits = Vec::with_capacity(ranked_hits.len());
+    let mut explanations = Vec::new();
+    for (hit, explanation) in ranked_hits {
+        if let Some(explanation) = explanation {
+            explanations.push(explanation);
+        }
+        hits.push(hit);
+    }
 
     let elapsed = start.elapsed();
 
@@ -804,8 +810,8 @@ mod tests {
             let (index, handles) = setup_index();
             let config = ResponseConfig::default();
             let results = execute_search(&index, &AllQuery, &handles, &[], 2, 0, false, &config);
-            // total_count reflects docs fetched (up to limit)
-            assert!(results.hits.len() <= 2);
+            assert_eq!(results.total_count, 3);
+            assert_eq!(results.hits.len(), 2);
         }
 
         #[test]
@@ -813,8 +819,18 @@ mod tests {
             let (index, handles) = setup_index();
             let config = ResponseConfig::default();
             let results = execute_search(&index, &AllQuery, &handles, &[], 100, 2, false, &config);
-            // Should skip 2 results
             assert_eq!(results.hits.len(), 1);
+            assert_eq!(results.hits[0].doc_id, 1);
+        }
+
+        #[test]
+        fn execute_search_offset_applies_after_stable_tie_break() {
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            let results = execute_search(&index, &AllQuery, &handles, &[], 2, 1, false, &config);
+            let ids: Vec<i64> = results.hits.iter().map(|hit| hit.doc_id).collect();
+            assert_eq!(results.total_count, 3);
+            assert_eq!(ids, vec![2, 1]);
         }
 
         #[test]

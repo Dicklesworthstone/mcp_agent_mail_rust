@@ -17,7 +17,17 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
-const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to"];
+///
+/// Includes both a row's own `id` and foreign keys that REFERENCE an
+/// autoincrement id (`message_id`, `reply_to` → messages.id; `sender_id`
+/// → agents.id). agents.id and messages.id are global `AUTOINCREMENT`
+/// counters, so when the fixture cases replay sequentially in a shared DB
+/// the concrete value an agent/message lands on depends on how many were
+/// created in earlier cases — it diverges from the value the Python
+/// reference happened to record. Sender ATTRIBUTION is still verified via
+/// the human-readable `from`/`sender_name` field, so nulling `sender_id`
+/// loses no semantic coverage (mirrors how `id` is already nulled).
+const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to", "sender_id"];
 const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
 const TEST_SEARCH_ENGINE: &str = "legacy";
 const RUST_NATIVE_FIXTURE_DIR: &str = "tests/conformance/fixtures/rust_native";
@@ -66,6 +76,10 @@ fn null_auto_increment_ids(value: &mut Value) {
 /// For tooling/directory-like resources with "clusters" → "tools" arrays,
 /// filter the actual response to only include tools whose names appear in
 /// the expected output. This handles tools added after fixture generation.
+///
+/// Tool entries may also grow Rust-only examples after the Python fixture was
+/// generated. Keep fixture parity focused on the examples Python knows about by
+/// matching `usage_examples` on their stable `hint` labels.
 fn align_cluster_tools(actual: &mut Value, expected: &Value) {
     let Some(expected_clusters) = expected.get("clusters").and_then(|c| c.as_array()) else {
         return;
@@ -91,7 +105,8 @@ fn align_cluster_tools(actual: &mut Value, expected: &Value) {
         return;
     }
 
-    // Filter actual clusters: remove tools not in expected, remove empty clusters
+    // Filter actual clusters: remove tools not in expected, remove extra usage
+    // examples inside known tools, then remove empty clusters.
     for cluster in actual_clusters.iter_mut() {
         if let Some(tools) = cluster.get_mut("tools").and_then(|t| t.as_array_mut()) {
             tools.retain(|tool| {
@@ -99,6 +114,52 @@ fn align_cluster_tools(actual: &mut Value, expected: &Value) {
                     .and_then(|n| n.as_str())
                     .is_some_and(|name| expected_tool_names.contains(name))
             });
+
+            for tool in tools {
+                let Some(tool_name) = tool.get("name").and_then(|name| name.as_str()) else {
+                    continue;
+                };
+                let expected_hints: std::collections::HashSet<String> = expected_clusters
+                    .iter()
+                    .filter_map(|cluster| cluster.get("tools").and_then(|tools| tools.as_array()))
+                    .flatten()
+                    .find(|expected_tool| {
+                        expected_tool.get("name").and_then(|name| name.as_str()) == Some(tool_name)
+                    })
+                    .and_then(|expected_tool| {
+                        expected_tool
+                            .get("usage_examples")
+                            .and_then(|examples| examples.as_array())
+                    })
+                    .map(|examples| {
+                        examples
+                            .iter()
+                            .filter_map(|example| {
+                                example
+                                    .get("hint")
+                                    .and_then(|hint| hint.as_str())
+                                    .map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if expected_hints.is_empty() {
+                    continue;
+                }
+
+                if let Some(actual_examples) = tool
+                    .get_mut("usage_examples")
+                    .and_then(|examples| examples.as_array_mut())
+                {
+                    actual_examples.retain(|example| {
+                        example
+                            .get("hint")
+                            .and_then(|hint| hint.as_str())
+                            .is_some_and(|hint| expected_hints.contains(hint))
+                    });
+                }
+            }
         }
     }
     actual_clusters.retain(|c| {
@@ -1215,6 +1276,7 @@ fn setup_fixture_env() -> FixtureEnv {
         ("TOOLS_FILTER_ENABLED", "0"),
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
+        ("LLM_DEFAULT_MODEL", "conformance-stub"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
@@ -1286,6 +1348,37 @@ fn load_and_validate_fixture_schema() {
             .contains_key("resource://config/environment"),
         "fixtures should include resource://config/environment"
     );
+}
+
+#[test]
+fn null_auto_increment_ids_nulls_sender_id_but_keeps_attribution() {
+    // Regression for br-zbqrq: a fetch_inbox message carries `sender_id`
+    // (FK -> agents.id, a global AUTOINCREMENT) whose concrete value depends
+    // on how many agents earlier shared-DB cases registered. It must be
+    // nulled like `id`/`message_id`/`reply_to`, while the human-readable
+    // sender attribution (`from`) and the user-supplied `thread_id` (a
+    // deterministic string) must survive so parity coverage isn't lost.
+    let mut value = serde_json::json!([
+        {
+            "id": 4,
+            "sender_id": 2,
+            "message_id": 9,
+            "reply_to": 7,
+            "thread_id": "T-2",
+            "from": "BlueLake",
+            "subject": "LLM Thread T-2"
+        }
+    ]);
+    null_auto_increment_ids(&mut value);
+    let msg = &value[0];
+    assert!(msg["id"].is_null(), "id must be nulled");
+    assert!(msg["sender_id"].is_null(), "sender_id must be nulled");
+    assert!(msg["message_id"].is_null(), "message_id must be nulled");
+    assert!(msg["reply_to"].is_null(), "reply_to must be nulled");
+    // Semantic fields preserved.
+    assert_eq!(msg["thread_id"], "T-2", "user thread_id must survive");
+    assert_eq!(msg["from"], "BlueLake", "sender attribution must survive");
+    assert_eq!(msg["subject"], "LLM Thread T-2");
 }
 
 #[test]
@@ -1884,7 +1977,14 @@ fn run_fixtures_against_rust_server_router() {
         use sha1::Digest;
         let mut hasher = sha1::Sha1::new();
         hasher.update(path_pattern.as_bytes());
-        let sha1_hex = format!("{:x}", hasher.finalize());
+        let digest = hasher.finalize();
+        let digest_bytes: &[u8] = digest.as_ref();
+        let mut sha1_hex = String::with_capacity(digest.len() * 2);
+        for &byte in digest_bytes {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            sha1_hex.push(char::from(HEX[usize::from(byte >> 4)]));
+            sha1_hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
         let sha1_file = format!("{res_dir_prefix}{sha1_hex}.json");
         assert!(
             res_in_dir.iter().any(|f| *f == sha1_file),
@@ -2187,6 +2287,7 @@ fn tool_filter_profiles_match_fixtures() {
 fn rust_native_fixture_coverage_matches_classification() {
     let actual = rust_native_tool_names();
     let expected: BTreeSet<String> = [
+        "check_file_reservation_conflicts",
         "cleanup_pane_identities",
         "list_agents",
         "resolve_pane_identity",

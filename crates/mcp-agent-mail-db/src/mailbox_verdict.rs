@@ -32,7 +32,8 @@ use crate::pool::{
     MailboxOwnershipDisposition, MailboxOwnershipState, MailboxRecoveryLockState,
     MailboxSidecarState, inspect_mailbox_db_inventory, inspect_mailbox_ownership,
     inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state, resolve_mailbox_sqlite_path,
-    sqlite_compatibility_read_path_is_healthy, sqlite_primary_read_path_is_healthy,
+    sqlite_compatibility_read_path_is_healthy, sqlite_path_with_suffix,
+    sqlite_primary_read_path_is_healthy,
 };
 use crate::reconstruct::{archive_missing_project_identities, scan_archive_message_inventory};
 use serde::{Deserialize, Serialize};
@@ -736,6 +737,7 @@ fn compute_state_from_probes(probes: &[ProbeResult], recovery_lock_held: bool) -
 
 /// Options for verdict computation.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct VerdictOptions {
     /// Skip archive count check (for offline/fast-path).
     pub skip_archive_count: bool,
@@ -745,6 +747,18 @@ pub struct VerdictOptions {
     pub stale_threshold_abs: usize,
     /// Skip integrity check (expensive).
     pub skip_integrity_check: bool,
+    /// Skip SQLite file sanity probes.
+    ///
+    /// The sanity probe intentionally reopens the database through both the
+    /// primary and compatibility read paths. That is useful for doctor/startup
+    /// diagnostics, but too expensive for request-path health probes.
+    pub skip_db_sanity_check: bool,
+    /// Skip live mailbox owner discovery.
+    ///
+    /// Ownership inspection walks `/proc/*/fd` on Linux to find processes with
+    /// open mailbox files. That is appropriate for doctor/startup diagnostics,
+    /// but too expensive for request-path readiness probes.
+    pub skip_ownership_check: bool,
     /// Check for recovery lock.
     pub check_recovery_lock: bool,
 }
@@ -756,6 +770,8 @@ impl Default for VerdictOptions {
             stale_threshold_pct: 0.05,
             stale_threshold_abs: 100,
             skip_integrity_check: false,
+            skip_db_sanity_check: false,
+            skip_ownership_check: false,
             check_recovery_lock: true,
         }
     }
@@ -768,6 +784,8 @@ impl VerdictOptions {
         Self {
             skip_archive_count: true,
             skip_integrity_check: true,
+            skip_db_sanity_check: true,
+            skip_ownership_check: true,
             check_recovery_lock: true,
             ..Default::default()
         }
@@ -871,15 +889,20 @@ pub fn compute_mailbox_verdict(
         .unwrap_or_else(|| PathBuf::from(":memory:"));
 
     probes.push(probe_db_file_exists(&db_path));
-    if probes.last().is_some_and(|probe| probe.passed) {
+    if probes.last().is_some_and(|probe| probe.passed) && !options.skip_db_sanity_check {
         probes.push(probe_db_file_sanity(&db_path));
+    } else if options.skip_db_sanity_check {
+        probes.push(ProbeResult::ok(
+            "db_sanity",
+            "SQLite file sanity probe skipped by verdict options",
+        ));
     }
 
     probes.push(probe_archive_accessible(archive_root));
     probes.push(probe_archive_writable(archive_root));
 
     let wal = inspect_mailbox_sidecar_state(&db_path);
-    probes.push(probe_sidecar_state(&wal));
+    probes.push(probe_sidecar_state(&wal, &db_path));
 
     let recovery_lock = if options.check_recovery_lock {
         inspect_mailbox_recovery_lock(&db_path)
@@ -896,7 +919,22 @@ pub fn compute_mailbox_verdict(
         probes.push(probe_recovery_lock(&recovery_lock));
     }
 
-    let ownership = inspect_mailbox_ownership(&db_path, archive_root);
+    let ownership = if options.skip_ownership_check {
+        MailboxOwnershipState {
+            disposition: MailboxOwnershipDisposition::Unowned,
+            storage_lock_path: archive_root
+                .join(".mailbox.activity.lock")
+                .display()
+                .to_string(),
+            sqlite_lock_path: format!("{}.activity.lock", db_path.display()),
+            processes: Vec::new(),
+            competing_pids: Vec::new(),
+            supervised_restart_required: false,
+            detail: "Ownership inspection skipped by verdict options".to_string(),
+        }
+    } else {
+        inspect_mailbox_ownership(&db_path, archive_root)
+    };
     probes.push(probe_mailbox_ownership(&ownership));
 
     let integrity = if !options.skip_integrity_check
@@ -1070,7 +1108,7 @@ fn describe_sidecar_state(sidecars: &MailboxSidecarState) -> String {
 }
 
 /// Probe: Check rollback-journal/WAL/SHM sidecar state.
-fn probe_sidecar_state(sidecars: &MailboxSidecarState) -> ProbeResult {
+fn probe_sidecar_state(sidecars: &MailboxSidecarState, db_path: &Path) -> ProbeResult {
     let detail = describe_sidecar_state(sidecars);
     match (
         sidecars.journal_exists,
@@ -1091,11 +1129,37 @@ fn probe_sidecar_state(sidecars: &MailboxSidecarState) -> ProbeResult {
             "sidecar_state",
             format!("WAL and SHM sidecars present ({detail})"),
         ),
-        (false, true, false, _) => ProbeResult::warn_state(
-            "sidecar_state",
-            format!("WAL exists without SHM ({detail})"),
-            MailboxState::Suspect,
-        ),
+        (false, true, false, _) => {
+            // #160: a WAL with no SHM is NOT inherently corrupt. Under heavy
+            // concurrency an unclean writer exit can leave a benign *valid*
+            // 32-byte header-only (frameless, zero committed frames) WAL that
+            // SQLite opens as-is and quick_check/integrity_check pass on. The
+            // doctor sidecar classifier (`classify_wal_sidecar`) already treats
+            // this as IdleEmpty/benign (#159), but the runtime durability
+            // verdict did not — it unconditionally escalated WAL-without-SHM to
+            // `Suspect`, which sticks `degraded_read_only`. Make this arm
+            // magic-aware: only a WAL that is an actual truncation/garbage-header
+            // artifact (truncated <32 bytes, or 32 bytes with a bad magic) is a
+            // durability problem; a valid header-only WAL (or one carrying real
+            // committed frames) is benign.
+            let wal_path = sqlite_path_with_suffix(db_path, "-wal");
+            if crate::wal_classify::wal_sidecar_is_truncation_artifact(wal_path.as_path()) {
+                ProbeResult::warn_state(
+                    "sidecar_state",
+                    format!(
+                        "WAL exists without SHM and is a truncation/garbage-header artifact ({detail})"
+                    ),
+                    MailboxState::Suspect,
+                )
+            } else {
+                ProbeResult::ok(
+                    "sidecar_state",
+                    format!(
+                        "WAL exists without SHM but is a benign valid/header-only WAL ({detail})"
+                    ),
+                )
+            }
+        }
         (false, false, true, _) => ProbeResult::warn_state(
             "sidecar_state",
             format!("SHM exists without WAL ({detail})"),
@@ -1308,11 +1372,35 @@ fn probe_archive_drift(
                 )
             }
         }
-        MailboxArchiveDriftState::DbAhead => ProbeResult::warn_state(
-            "archive_db_parity",
-            drift.detail.clone(),
-            MailboxState::Suspect,
-        ),
+        MailboxArchiveDriftState::DbAhead => {
+            // The write-behind git archive is designed to trail the live DB:
+            // writes land in SQLite synchronously while the archive flush is
+            // coalesced behind. "DB ahead of archive" is therefore the *normal*
+            // steady state of a busy mailbox, not corruption (integrity_check
+            // stays clean). Treat a small DB-ahead delta — within the same
+            // in-flight write-behind tolerance the ArchiveAhead arm uses — as
+            // benign, and never escalate DB-ahead to `Suspect` (which forces
+            // `degraded_read_only` + archive-snapshot reads and would hide newer
+            // live data behind a staler snapshot). Beyond tolerance we surface
+            // it as `Stale` (informational drift), the same impact level as a
+            // lagging archive in the other direction.
+            let diff = drift.db_messages.saturating_sub(drift.archive_messages);
+            let max_count = drift.archive_messages.max(drift.db_messages);
+            let pct = if max_count > 0 {
+                diff as f64 / max_count as f64
+            } else {
+                0.0
+            };
+            if diff <= threshold_abs && pct <= threshold_pct {
+                ProbeResult::ok("archive_db_parity", drift.detail.clone())
+            } else {
+                ProbeResult::warn_state(
+                    "archive_db_parity",
+                    drift.detail.clone(),
+                    MailboxState::Stale,
+                )
+            }
+        }
     }
 }
 
@@ -1410,6 +1498,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             .and_then(|count| usize::try_from(count).ok())
             .unwrap_or(0),
         Err(error) => {
+            crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
             return ProbeResult::error(
                 "schema_populated",
                 format!("Cannot query sqlite_master: {error}"),
@@ -1424,7 +1513,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         )
         .is_ok_and(|rows| !rows.is_empty());
 
-    match (table_count, archive_presence, has_messages_table) {
+    let result = match (table_count, archive_presence, has_messages_table) {
         (0, ArchiveStatePresence::Empty, _) => ProbeResult::ok(
             "schema_populated",
             "Database schema is empty and the archive is also empty",
@@ -1448,7 +1537,9 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             format!("Database schema populated with {tables} tables including 'messages'"),
         ),
         _ => ProbeResult::ok("schema_populated", "Schema state accepted"),
-    }
+    };
+    crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
+    result
 }
 
 // ============================================================================
@@ -1961,11 +2052,14 @@ mod tests {
 
     #[test]
     fn probe_sidecar_state_warns_on_rollback_journal() {
-        let probe = probe_sidecar_state(&MailboxSidecarState {
-            journal_exists: true,
-            journal_bytes: Some(128),
-            ..MailboxSidecarState::default()
-        });
+        let probe = probe_sidecar_state(
+            &MailboxSidecarState {
+                journal_exists: true,
+                journal_bytes: Some(128),
+                ..MailboxSidecarState::default()
+            },
+            Path::new("/nonexistent/storage.sqlite3"),
+        );
 
         assert!(!probe.passed);
         assert_eq!(probe.severity, ProbeSeverity::Warning);
@@ -1976,10 +2070,13 @@ mod tests {
 
     #[test]
     fn probe_sidecar_state_warns_on_non_file_sidecar_artifact() {
-        let probe = probe_sidecar_state(&MailboxSidecarState {
-            live_sidecars: true,
-            ..MailboxSidecarState::default()
-        });
+        let probe = probe_sidecar_state(
+            &MailboxSidecarState {
+                live_sidecars: true,
+                ..MailboxSidecarState::default()
+            },
+            Path::new("/nonexistent/storage.sqlite3"),
+        );
 
         assert!(!probe.passed);
         assert_eq!(probe.severity, ProbeSeverity::Warning);
@@ -1989,6 +2086,85 @@ mod tests {
                 .detail
                 .contains("Malformed or non-file SQLite sidecar artifact present")
         );
+    }
+
+    #[test]
+    fn probe_sidecar_state_benign_header_only_wal_without_shm_is_not_suspect() {
+        // #160: a busy mailbox can leave a benign *valid* 32-byte header-only
+        // WAL with no SHM (unclean writer exit, zero committed frames). The
+        // runtime durability verdict must NOT escalate this to `Suspect`
+        // (which sticks `degraded_read_only`) — quick_check/integrity_check
+        // pass on it and SQLite opens it as-is.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        // Produce a real engine-written valid 32-byte WAL header.
+        let header = {
+            let conn = crate::DbConn::open_file(primary.display().to_string()).expect("open");
+            conn.execute_raw("PRAGMA journal_mode = WAL;").expect("wal");
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+                .expect("no autockpt");
+            conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .expect("schema");
+            conn.execute_raw("INSERT INTO t (id) VALUES (1);")
+                .expect("seed");
+            let wal = sqlite_path_with_suffix(&primary, "-wal");
+            let mut buf = [0u8; 32];
+            {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&wal).expect("open wal");
+                f.read_exact(&mut buf).expect("read 32-byte header");
+            }
+            buf
+        };
+        // Drop any SHM so we hit the WAL-without-SHM arm, and write back the
+        // valid header-only WAL.
+        let _ = std::fs::remove_file(sqlite_path_with_suffix(&primary, "-shm"));
+        std::fs::write(sqlite_path_with_suffix(&primary, "-wal"), header)
+            .expect("write 32-byte wal");
+
+        let probe = probe_sidecar_state(
+            &MailboxSidecarState {
+                wal_exists: true,
+                wal_bytes: Some(32),
+                shm_exists: false,
+                ..MailboxSidecarState::default()
+            },
+            &primary,
+        );
+        assert!(
+            probe.passed,
+            "benign valid header-only WAL must not degrade durability: {}",
+            probe.detail
+        );
+        assert_eq!(probe.impact_state, MailboxState::Healthy);
+    }
+
+    #[test]
+    fn probe_sidecar_state_garbage_header_only_wal_without_shm_is_suspect() {
+        // The opposite of #160: a 32-byte WAL with an INVALID (all-zeros) magic
+        // is a genuine garbage/truncation artifact and must still be `Suspect`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        {
+            let conn = crate::DbConn::open_file(primary.display().to_string()).expect("open");
+            conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .expect("schema");
+        }
+        std::fs::write(sqlite_path_with_suffix(&primary, "-wal"), [0u8; 32])
+            .expect("write garbage wal");
+        let _ = std::fs::remove_file(sqlite_path_with_suffix(&primary, "-shm"));
+
+        let probe = probe_sidecar_state(
+            &MailboxSidecarState {
+                wal_exists: true,
+                wal_bytes: Some(32),
+                shm_exists: false,
+                ..MailboxSidecarState::default()
+            },
+            &primary,
+        );
+        assert!(!probe.passed, "garbage 32-byte WAL must remain Suspect");
+        assert_eq!(probe.impact_state, MailboxState::Suspect);
     }
 
     #[test]
@@ -2070,6 +2246,58 @@ mod tests {
         };
 
         assert!(verdict_prefers_archive_snapshot_reads(&verdict));
+    }
+
+    fn db_ahead_drift(db_messages: usize, archive_messages: usize) -> MailboxArchiveDriftVerdict {
+        MailboxArchiveDriftVerdict {
+            state: MailboxArchiveDriftState::DbAhead,
+            archive_projects: 0,
+            archive_agents: 0,
+            archive_messages,
+            db_projects: 0,
+            db_agents: 0,
+            db_messages,
+            archive_latest_message_id: Some(i64::try_from(archive_messages).unwrap_or(i64::MAX)),
+            db_max_message_id: i64::try_from(db_messages).unwrap_or(i64::MAX),
+            missing_projects: Vec::new(),
+            detail: format!(
+                "DB is ahead of archive by {} messages",
+                db_messages.saturating_sub(archive_messages)
+            ),
+        }
+    }
+
+    #[test]
+    fn probe_archive_drift_small_db_ahead_is_benign_not_suspect() {
+        // A busy mailbox is almost always slightly DB-ahead because the
+        // write-behind git archive coalesces flushes. A small DB-ahead delta
+        // (within the in-flight write-behind tolerance) must NOT degrade
+        // durability — historically it unconditionally mapped to `Suspect`
+        // -> `degraded_read_only` (#163).
+        let drift = db_ahead_drift(6499, 6480);
+        let probe = probe_archive_drift(&drift, 0.05, 100);
+        assert!(
+            probe.passed,
+            "small DB-ahead drift should be a passing/benign probe, got {probe:?}"
+        );
+        assert_eq!(probe.impact_state, MailboxState::Healthy);
+    }
+
+    #[test]
+    fn probe_archive_drift_large_db_ahead_is_stale_never_suspect() {
+        // Beyond tolerance we surface DB-ahead drift as informational `Stale`
+        // (the same impact level as a lagging archive in the ArchiveAhead arm),
+        // and crucially NEVER `Suspect` — DB-ahead is delayed persistence, not
+        // page-level corruption (integrity_check stays clean).
+        let drift = db_ahead_drift(10_000, 1_000);
+        let probe = probe_archive_drift(&drift, 0.05, 100);
+        assert!(!probe.passed, "large DB-ahead drift should fail the probe");
+        assert_eq!(
+            probe.impact_state,
+            MailboxState::Stale,
+            "DB-ahead must never escalate to Suspect/degraded_read_only"
+        );
+        assert_ne!(probe.impact_state, MailboxState::Suspect);
     }
 
     #[test]
@@ -2306,6 +2534,8 @@ mod tests {
         let opts = VerdictOptions::default();
         assert!(!opts.skip_archive_count);
         assert!(!opts.skip_integrity_check);
+        assert!(!opts.skip_db_sanity_check);
+        assert!(!opts.skip_ownership_check);
         assert!(opts.check_recovery_lock);
         assert!((opts.stale_threshold_pct - 0.05).abs() < f64::EPSILON);
         assert_eq!(opts.stale_threshold_abs, 100);
@@ -2316,6 +2546,8 @@ mod tests {
         let opts = VerdictOptions::fast();
         assert!(opts.skip_archive_count);
         assert!(opts.skip_integrity_check);
+        assert!(opts.skip_db_sanity_check);
+        assert!(opts.skip_ownership_check);
         assert!(opts.check_recovery_lock);
     }
 
@@ -2542,6 +2774,69 @@ first body
             .find(|probe| probe.name == "schema_populated")
             .expect("schema_populated probe present");
         assert_eq!(schema_probe.severity, ProbeSeverity::Error);
+    }
+
+    #[test]
+    fn compute_mailbox_verdict_fast_skips_ownership_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = dir.path().join("fast-ownership.sqlite3");
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        drop(conn);
+
+        let verdict = compute_mailbox_verdict(
+            &format!("sqlite:///{}", db_path.display()),
+            &storage_root,
+            &VerdictOptions::fast(),
+        );
+
+        assert_eq!(
+            verdict.ownership.disposition,
+            MailboxOwnershipDisposition::Unowned
+        );
+        assert!(
+            verdict
+                .ownership
+                .detail
+                .contains("Ownership inspection skipped"),
+            "fast verdict should not walk live process ownership: {verdict:?}"
+        );
+        let ownership_probe = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "mailbox_ownership")
+            .expect("mailbox ownership probe present");
+        assert!(ownership_probe.passed);
+    }
+
+    #[test]
+    fn compute_mailbox_verdict_fast_skips_db_sanity_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = dir.path().join("fast-sanity.sqlite3");
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let verdict = compute_mailbox_verdict(
+            &format!("sqlite:///{}", db_path.display()),
+            &storage_root,
+            &VerdictOptions::fast(),
+        );
+
+        let sanity_probe = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "db_sanity")
+            .expect("db_sanity probe present");
+        assert!(sanity_probe.passed);
+        assert!(
+            sanity_probe.detail.contains("skipped by verdict options"),
+            "fast verdict must not run request-path SQLite quick checks: {sanity_probe:?}"
+        );
     }
 
     // ── DurabilityState tests ────────────────────────────────────────

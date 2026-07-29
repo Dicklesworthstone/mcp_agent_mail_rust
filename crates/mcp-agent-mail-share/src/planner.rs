@@ -150,12 +150,142 @@ pub fn validate_inputs(inputs: &WizardInputs) -> PlanResult<()> {
         ));
     }
 
+    validate_optional_input(
+        "--github-branch",
+        inputs.github_branch.as_deref(),
+        validate_git_branch_operand,
+        "Use a normal branch name such as main or docs/deploy; values cannot begin with '-' or '+'",
+    )?;
+    validate_optional_input(
+        "--cloudflare-project",
+        inputs.cloudflare_project.as_deref(),
+        validate_dns_label_operand,
+        "Use a Pages project slug containing only letters, numbers, and hyphens",
+    )?;
+    validate_optional_input(
+        "--netlify-site",
+        inputs.netlify_site.as_deref(),
+        validate_dns_label_operand,
+        "Use a Netlify site slug or ID containing only letters, numbers, and hyphens",
+    )?;
+    validate_optional_input(
+        "--s3-bucket",
+        inputs.s3_bucket.as_deref(),
+        validate_s3_bucket_operand,
+        "Use a valid S3 bucket name: 3-63 lowercase letters, numbers, dots, and hyphens",
+    )?;
+    validate_optional_input(
+        "--cloudfront-id",
+        inputs.cloudfront_id.as_deref(),
+        validate_cloudfront_distribution_id_operand,
+        "Use the CloudFront distribution ID only, not an AWS CLI option or full command",
+    )?;
+
     // Validate provider-specific options
     if let Some(provider) = inputs.provider {
         validate_provider_options(provider, inputs)?;
     }
 
     Ok(())
+}
+
+fn validate_optional_input(
+    flag: &str,
+    value: Option<&str>,
+    validator: fn(&str) -> bool,
+    hint: &'static str,
+) -> PlanResult<()> {
+    if let Some(value) = value
+        && !validator(value)
+    {
+        return Err(WizardError::new(
+            WizardErrorCode::InvalidOption,
+            format!("Invalid value for {flag}: {}", value.escape_debug()),
+        )
+        .with_hint(hint));
+    }
+    Ok(())
+}
+
+fn is_clean_cli_operand(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.starts_with('-')
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+fn validate_dns_label_operand(value: &str) -> bool {
+    let len = value.len();
+    (1..=63).contains(&len)
+        && is_clean_cli_operand(value)
+        && starts_with_ascii_alnum(value)
+        && ends_with_ascii_alnum(value)
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn validate_cloudfront_distribution_id_operand(value: &str) -> bool {
+    is_clean_cli_operand(value) && value.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn validate_s3_bucket_operand(value: &str) -> bool {
+    let len = value.len();
+    (3..=63).contains(&len)
+        && is_clean_cli_operand(value)
+        && starts_with_ascii_lower_or_digit(value)
+        && ends_with_ascii_lower_or_digit(value)
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        && !value.contains("..")
+        && !value.contains(".-")
+        && !value.contains("-.")
+        && value.parse::<std::net::Ipv4Addr>().is_err()
+}
+
+fn validate_git_branch_operand(value: &str) -> bool {
+    is_clean_cli_operand(value)
+        && !value.starts_with('+')
+        && value != "@"
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.ends_with('.')
+        && !value.contains("//")
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value
+            .chars()
+            .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        && value.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
+}
+
+fn starts_with_ascii_alnum(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn ends_with_ascii_alnum(value: &str) -> bool {
+    value
+        .as_bytes()
+        .last()
+        .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn starts_with_ascii_lower_or_digit(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+fn ends_with_ascii_lower_or_digit(value: &str) -> bool {
+    value
+        .as_bytes()
+        .last()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 // ── Provider Resolution ─────────────────────────────────────────────────
@@ -244,6 +374,13 @@ pub(crate) fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> Pa
     let mut scripts_candidate = None;
 
     for ancestor in fallback_root.ancestors() {
+        if crate::git::is_shared_ancestor_boundary(ancestor) {
+            return if ancestor == fallback_root && crate::is_real_dir(&resolved_bundle_path) {
+                resolved_bundle_path
+            } else {
+                scripts_candidate.unwrap_or_else(|| fallback_root.to_path_buf())
+            };
+        }
         if has_strong_project_root_marker(ancestor) {
             return ancestor.to_path_buf();
         }
@@ -296,6 +433,9 @@ fn resolve_path_against_root(root: &Path, path: &Path) -> PathBuf {
 
 fn resolve_git_repo_root(project_root: &Path) -> PathBuf {
     for ancestor in project_root.ancestors() {
+        if crate::git::is_shared_ancestor_boundary(ancestor) {
+            break;
+        }
         if is_real_file_or_dir(&ancestor.join(".git")) {
             return ancestor.to_path_buf();
         }
@@ -473,6 +613,7 @@ fn generate_github_pages_plan(
     let mut generated_files = Vec::new();
     let mut warnings = Vec::new();
     let repo_root = resolve_git_repo_root(project_root);
+    let repo_root_is_git = is_real_file_or_dir(&repo_root.join(".git"));
 
     // Determine output directory
     let output_dir = inputs
@@ -480,20 +621,24 @@ fn generate_github_pages_plan(
         .clone()
         .unwrap_or_else(|| bundle_path.parent().unwrap_or(bundle_path).join("docs"));
     let resolved_output_dir = resolve_path_against_root(project_root, &output_dir);
-    validate_github_pages_output_dir(&repo_root, &resolved_output_dir)?;
-    let output_dir_for_git = resolved_output_dir
-        .strip_prefix(&repo_root)
-        .map_err(|_| {
-            WizardError::new(
-                WizardErrorCode::InvalidOption,
-                format!(
-                    "GitHub Pages output directory must be inside the repository root: {}",
-                    repo_root.display()
-                ),
-            )
-            .with_context(resolved_output_dir.display().to_string())
-        })?
-        .to_path_buf();
+    let output_dir_for_git = if repo_root_is_git {
+        validate_github_pages_output_dir(&repo_root, &resolved_output_dir)?;
+        resolved_output_dir
+            .strip_prefix(&repo_root)
+            .map_err(|_| {
+                WizardError::new(
+                    WizardErrorCode::InvalidOption,
+                    format!(
+                        "GitHub Pages output directory must be inside the repository root: {}",
+                        repo_root.display()
+                    ),
+                )
+                .with_context(resolved_output_dir.display().to_string())
+            })?
+            .to_path_buf()
+    } else {
+        resolved_output_dir.clone()
+    };
 
     // Step 1: Create output directory
     steps.push(PlanStep {
@@ -729,14 +874,20 @@ fn generate_netlify_plan(
 
     // Step 3: Deploy with Netlify CLI
     let site = inputs.netlify_site.as_deref().unwrap_or("agent-mail");
+    let deploy_command = if let Some(site) = inputs.netlify_site.as_deref() {
+        format!(
+            "netlify deploy --dir {} --prod --site {}",
+            quote_path(&output_dir),
+            quote_str(site)
+        )
+    } else {
+        format!("netlify deploy --dir {} --prod", quote_path(&output_dir))
+    };
     steps.push(PlanStep {
         index: 3,
         id: "netlify_deploy".to_string(),
         description: format!("Deploy to Netlify site: {site}"),
-        command: Some(format!(
-            "netlify deploy --dir {} --prod",
-            quote_path(&output_dir)
-        )),
+        command: Some(deploy_command),
         optional: false,
         requires_confirm: true,
     });
@@ -1237,6 +1388,89 @@ mod tests {
     }
 
     #[test]
+    fn validate_inputs_rejects_option_like_github_branch() {
+        let inputs = WizardInputs {
+            github_branch: Some("--all".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("branch option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--github-branch"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_force_refspec_github_branch() {
+        let inputs = WizardInputs {
+            github_branch: Some("+main".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("force-push refspec should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--github-branch"));
+    }
+
+    #[test]
+    fn validate_inputs_accepts_nested_github_branch() {
+        let inputs = WizardInputs {
+            github_branch: Some("docs/deploy".to_string()),
+            ..Default::default()
+        };
+
+        validate_inputs(&inputs).expect("nested branch names should remain valid");
+    }
+
+    #[test]
+    fn validate_inputs_rejects_option_like_cloudflare_project() {
+        let inputs = WizardInputs {
+            cloudflare_project: Some("--help".to_string()),
+            ..Default::default()
+        };
+
+        let err =
+            validate_inputs(&inputs).expect_err("cloudflare project option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--cloudflare-project"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_option_like_netlify_site() {
+        let inputs = WizardInputs {
+            netlify_site: Some("--help".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("netlify site option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--netlify-site"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_invalid_s3_bucket_name() {
+        let inputs = WizardInputs {
+            s3_bucket: Some("bad bucket".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("invalid s3 bucket should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--s3-bucket"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_option_like_cloudfront_distribution_id() {
+        let inputs = WizardInputs {
+            cloudfront_id: Some("--profile".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("cloudfront id option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--cloudfront-id"));
+    }
+
+    #[test]
     fn validate_inputs_rejects_invalid_manifest_json() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("manifest.json"), "{not json").unwrap();
@@ -1397,6 +1631,55 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_detection_root_does_not_trust_sticky_shared_bundle_parent_markers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let dir = tempfile::tempdir().expect("shared parent holder");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).expect("create shared parent");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("make shared parent sticky");
+        std::fs::write(shared.join("wrangler.toml"), "name = \"unrelated\"")
+            .expect("write unrelated shared marker");
+
+        let bundle = shared.join("bundle");
+        std::fs::create_dir(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(&bundle, shell_cwd.path());
+        assert_eq!(
+            detection_root, bundle,
+            "bundle directly under a sticky shared parent must not inherit the shared parent's markers"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_detection_root_still_detects_project_inside_sticky_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let dir = tempfile::tempdir().expect("shared parent holder");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).expect("create shared parent");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("make shared parent sticky");
+        let project = shared.join("project");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"demo\"")
+            .expect("write project marker");
+
+        let bundle = project.join("nested/output/bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(&bundle, shell_cwd.path());
+        assert_eq!(detection_root, project);
+    }
+
     #[test]
     fn s3_plan_with_cloudfront() {
         let inputs = WizardInputs {
@@ -1488,8 +1771,32 @@ mod tests {
         assert_eq!(
             deploy_step.command,
             Some(format!(
-                "netlify deploy --dir {} --prod",
+                "netlify deploy --dir {} --prod --site my-site",
                 quote_path(&output_dir)
+            ))
+        );
+    }
+
+    #[test]
+    fn netlify_plan_without_site_uses_linked_site_command() {
+        let bundle = tempfile::tempdir().unwrap();
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Netlify),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let plan = generate_netlify_plan(&inputs, &env, bundle.path()).unwrap();
+        let deploy_step = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "netlify_deploy")
+            .unwrap();
+        assert_eq!(
+            deploy_step.command,
+            Some(format!(
+                "netlify deploy --dir {} --prod",
+                quote_path(bundle.path())
             ))
         );
     }

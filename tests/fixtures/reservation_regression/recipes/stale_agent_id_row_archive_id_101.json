@@ -1,0 +1,11 @@
+{
+  "id": 101,
+  "project": "reservation-regression",
+  "agent": "CorrectHolder",
+  "path_pattern": "src/reservation.rs",
+  "exclusive": true,
+  "reason": "br-bvq1x.6.4 stale agent_id fixture",
+  "created_ts": 1700001010000000,
+  "expires_ts": 1700004610000000,
+  "released_ts": null
+}

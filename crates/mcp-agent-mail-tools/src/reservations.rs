@@ -1,6 +1,7 @@
 //! File reservation cluster tools
 //!
 //! Tools for advisory file locking:
+//! - `check_file_reservation_conflicts`: Read-only authoritative conflict check
 //! - `file_reservation_paths`: Request file reservations
 //! - `release_file_reservations`: Release reservations
 //! - `renew_file_reservations`: Extend reservation TTL
@@ -12,13 +13,15 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
-use mcp_agent_mail_db::micros_to_iso;
+use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::io::Write as IoWrite;
+use std::path::{Path, PathBuf};
 
 use crate::messaging::{
     enqueue_message_semantic_index, try_dispatch_archive_write, try_write_message_archive,
@@ -29,8 +32,16 @@ use crate::resources::{
     reservation_project_workspace_path,
 };
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
+    legacy_tool_error, resolve_agent, resolve_project,
 };
+
+const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
+const RELEASE_INTENT_KIND: &str = "release_file_reservations_intent";
+const RELEASE_INTENT_REPLAY_KIND: &str = "release_file_reservations_replay";
+const RELEASE_INTENT_DIR: &str = "degraded_intents";
+const RELEASE_INTENT_LOG_FILE: &str = "release_file_reservations.jsonl";
+const RELEASE_INTENT_LOCK_FILE: &str = ".release_file_reservations.jsonl.lock";
 
 /// Granted reservation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,11 +90,46 @@ pub struct ReservationResponse {
     pub conflicts: Vec<ReservationConflict>,
 }
 
+/// Result of an authoritative, side-effect-free reservation conflict check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReservationConflictCheckResponse {
+    pub conflict_free: bool,
+    pub conflicts: Vec<ReservationConflict>,
+    pub clear_paths: Vec<String>,
+    pub checked_paths: usize,
+    pub total_conflicting_reservations: usize,
+    pub output_truncated: bool,
+    pub project: String,
+    pub snapshot_ts: String,
+    pub authoritative_source: String,
+    pub read_only: bool,
+}
+
 /// Release result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseResult {
     pub released: i32,
     pub released_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseIntentReceipt {
+    intent_id: String,
+    intent_path: PathBuf,
+    content_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QueuedReleaseIntent {
+    kind: String,
+    intent_id: String,
+    content_sha256: String,
+    project_key: String,
+    agent_name: String,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    #[serde(default)]
+    file_reservation_ids: Option<Vec<i64>>,
 }
 
 /// Renewal result
@@ -145,11 +191,463 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
     None
 }
 
+const MAX_CONFLICT_CHECK_PATHS: usize = 200;
+const MAX_CONFLICT_CHECK_PATH_BYTES: usize = 4_096;
+const MAX_CONFLICT_CHECK_PAYLOAD_BYTES: usize = 65_536;
+const MAX_CONFLICT_CHECK_SNAPSHOT_ROWS: usize = 10_000;
+const MAX_CONFLICT_HOLDERS_PER_PATH: usize = 50;
+const MAX_CONFLICT_HOLDERS_TOTAL: usize = 1_000;
+
+fn validate_conflict_check_paths(paths: &[String]) -> McpResult<()> {
+    if paths.is_empty() {
+        return Err(legacy_tool_error(
+            "EMPTY_PATHS",
+            "paths list cannot be empty",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        ));
+    }
+    if paths.len() > MAX_CONFLICT_CHECK_PATHS {
+        return Err(legacy_tool_error(
+            "TOO_MANY_PATHS",
+            format!(
+                "Maximum {MAX_CONFLICT_CHECK_PATHS} paths per conflict check, got {}",
+                paths.len()
+            ),
+            true,
+            json!({
+                "fail_closed": true,
+                "count": paths.len(),
+                "max": MAX_CONFLICT_CHECK_PATHS,
+                "do_not_edit": paths,
+            }),
+        ));
+    }
+
+    let mut payload_bytes = 0_usize;
+    for path in paths {
+        payload_bytes = payload_bytes.saturating_add(path.len());
+        if path.len() > MAX_CONFLICT_CHECK_PATH_BYTES {
+            return Err(legacy_tool_error(
+                "PATH_TOO_LONG",
+                format!(
+                    "Path exceeds the {MAX_CONFLICT_CHECK_PATH_BYTES}-byte conflict-check limit"
+                ),
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        }
+        if path.contains('\0') {
+            return Err(legacy_tool_error(
+                "INVALID_PATH",
+                "Path contains a NUL byte",
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        }
+    }
+    if payload_bytes > MAX_CONFLICT_CHECK_PAYLOAD_BYTES {
+        return Err(legacy_tool_error(
+            "PAYLOAD_TOO_LARGE",
+            format!(
+                "Combined paths exceed the {MAX_CONFLICT_CHECK_PAYLOAD_BYTES}-byte conflict-check limit"
+            ),
+            true,
+            json!({
+                "fail_closed": true,
+                "payload_bytes": payload_bytes,
+                "max": MAX_CONFLICT_CHECK_PAYLOAD_BYTES,
+                "do_not_edit": paths,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+/// The single chokepoint every reservation mutation (acquire / renew / release /
+/// force-release) and the reconcile-on-read healer funnel their archive write
+/// through, so `SQLite` and the Git/JSON archive cannot drift independently (F1,
+/// GH#112).
+///
+/// The pre-commit guard reads the `id-<id>.json` reservation artifacts directly,
+/// so a stale archive yields a *wrong holder* — the exact #112 divergence. The
+/// artifact is written synchronously on this thread (GH#178) so it is durable on
+/// return; the git commit is coalesced asynchronously. When the direct write
+/// fails, the fallback depends on the op's content: a terminal release artifact
+/// (`released_ts` set) is safe to re-emit from the write-behind queue at any
+/// later time, but an ACTIVE grant/renew artifact is NOT — a queued active op
+/// drained after a newer direct-written release would resurrect a stale-active
+/// artifact (wrong holder until TTL), so active ops are dropped and healed by
+/// reconcile-on-read instead (the same convergence path as the disk-critical
+/// skip).
 fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
-    try_dispatch_archive_write(op, context);
-    // The pre-commit guard reads reservation JSON artifacts directly. Keep
-    // reservation mutations visible once the tool call returns.
-    mcp_agent_mail_storage::wbq_flush();
+    // GH#178: the reservation JSON artifact (`id-<id>.json`) must be durable on
+    // return because the pre-commit guard reads it directly; a stale artifact
+    // yields the *wrong holder* (GH#112). The previous implementation enqueued
+    // the op onto the shared write-behind queue and then flushed the ENTIRE
+    // queue (`wbq_flush_status`), which turned every reservation grant into a
+    // global FIFO barrier behind unrelated archive work (message-bundle writes
+    // from other agents). Under concurrent swarm load that fence produced
+    // long-tail 30s-ceiling reservation stalls even though the authoritative DB
+    // grant had already committed.
+    //
+    // Write the artifact synchronously and directly instead. This writes only
+    // *this* reservation's JSON files (a cheap, bounded, local filesystem write)
+    // and defers the git commit to the async commit coalescer, so the reservation
+    // hot path is never coupled to another agent's archive-drain latency. The
+    // durability guarantee the guard depends on is strictly stronger: the
+    // artifact is proven on disk on return (or a hard error is surfaced), rather
+    // than merely warned about on a 30s flush timeout.
+    match mcp_agent_mail_storage::write_op_sync_direct(&op) {
+        // Written: the guard-visible artifact is durable. SkippedDiskCritical:
+        // intended disk-pressure behavior — DB stays authoritative and
+        // reconcile-on-read heals the archive once pressure clears (the WBQ
+        // also refuses enqueue at disk-critical, so a retry queue cannot help
+        // here). Active rows heal via the active pass; released rows whose
+        // artifact still claims ACTIVE heal via the released-row pass
+        // (br-74sxo) on the next reservation access.
+        mcp_agent_mail_storage::DirectArchiveWrite::Written
+        | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
+        // The direct write failed (e.g. ENOSPC, FD exhaustion). The DB state is
+        // authoritative and the archive is best-effort — but the fallback must
+        // not reorder history. A queued op's content is frozen at enqueue time,
+        // and the WBQ drains asynchronously: an ACTIVE (grant/renew/reconcile)
+        // op drained AFTER a newer direct-written release would overwrite the
+        // released artifact with a stale-active one — a wrong holder the
+        // released-row reconcile pass (br-74sxo) would only repair on a later
+        // reservation access. Terminal release artifacts can never go stale
+        // this way (ids are never reused), so only those are queued for
+        // background retry; active ops rely on reconcile-on-read, exactly like
+        // the disk-critical skip above.
+        mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
+            if reservation_op_is_terminal_release(&op) {
+                tracing::warn!(
+                    error = %error,
+                    "{context}; synchronous release-artifact write failed; enqueueing for background retry"
+                );
+                try_dispatch_archive_write(op, context);
+            } else {
+                tracing::warn!(
+                    error = %error,
+                    "{context}; synchronous reservation archive write failed; \
+                     leaving the artifact to reconcile-on-read (a queued stale-active \
+                     rewrite could shadow a newer release)"
+                );
+            }
+        }
+    }
+}
+
+/// Is every record in this archive op a TERMINAL release artifact (`released_ts`
+/// present and non-null)?
+///
+/// Terminal release artifacts are safe to re-emit from the write-behind queue at
+/// any later time: `file_reservations.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`
+/// (ids are never reused, even after row deletion), so no later mutation can
+/// make a queued release stale. Any op carrying
+/// an ACTIVE record (grant/renew/reconcile heals) is NOT safe to queue after a
+/// failed direct write — see `dispatch_reservation_archive_write`.
+fn reservation_op_is_terminal_release(op: &mcp_agent_mail_storage::WriteOp) -> bool {
+    match op {
+        mcp_agent_mail_storage::WriteOp::FileReservation { reservations, .. } => {
+            !reservations.is_empty()
+                && reservations.iter().all(|record| {
+                    record
+                        .get("released_ts")
+                        .is_some_and(|value| !value.is_null())
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Build the canonical archive JSON for one active reservation row, authored from
+/// the authoritative DB state. Mirrors the object the acquire/renew paths emit so
+/// a healed artifact is byte-identical to one written by the original mutation.
+fn active_reservation_artifact_json(
+    project_human_key: &str,
+    agent_name: &str,
+    row: &mcp_agent_mail_db::FileReservationRow,
+) -> Value {
+    json!({
+        "id": row.id.unwrap_or(0),
+        "project": project_human_key,
+        "agent": agent_name,
+        "path_pattern": &row.path_pattern,
+        "exclusive": row.exclusive != 0,
+        "reason": &row.reason,
+        "created_ts": micros_to_iso(row.created_ts),
+        "expires_ts": micros_to_iso(row.expires_ts),
+    })
+}
+
+/// Build the canonical archive JSON for one released reservation row, authored
+/// from the authoritative DB state. Mirrors the object the release path emits
+/// so a healed artifact is identical to one written by the original release
+/// (br-74sxo).
+fn released_reservation_artifact_json(
+    project_human_key: &str,
+    agent_name: &str,
+    row: &mcp_agent_mail_db::FileReservationRow,
+) -> Value {
+    json!({
+        "id": row.id.unwrap_or(0),
+        "project": project_human_key,
+        "agent": agent_name,
+        "path_pattern": &row.path_pattern,
+        "exclusive": row.exclusive != 0,
+        "reason": &row.reason,
+        "created_ts": micros_to_iso(row.created_ts),
+        "expires_ts": micros_to_iso(row.expires_ts),
+        "released_ts": released_ts_json_value(row.released_ts),
+    })
+}
+
+fn ts_is_positive(ts: Option<i64>) -> bool {
+    ts.is_some_and(|value| value > 0)
+}
+
+/// Does the present archive artifact diverge from the authoritative active DB
+/// row? Conservative, matching `reservation_parity`: a field the artifact *omits*
+/// is never treated as divergence (br-xyy95) — only a present-but-different value
+/// is. An active DB row (`released_ts` absent) whose artifact records a release is
+/// divergence (the #112 stuck-`released_ts` class).
+fn active_archive_artifact_diverges(
+    view: &crate::reservation_parity::ArchiveReservationView,
+    row: &mcp_agent_mail_db::FileReservationRow,
+    agent_name: &str,
+) -> bool {
+    if view.agent_name.trim() != agent_name.trim() {
+        return true;
+    }
+    if let Some(archive_path) = view.path_pattern.as_deref()
+        && archive_path.trim() != row.path_pattern.trim()
+    {
+        return true;
+    }
+    if let Some(archive_exclusive) = view.exclusive
+        && archive_exclusive != (row.exclusive != 0)
+    {
+        return true;
+    }
+    // A renewal changes ONLY `expires_ts`, so a stale pre-renew artifact would
+    // otherwise never be flagged — and the pre-commit guard (which reads the
+    // artifact directly) would drop protection at the old expiry. Present-but-
+    // different is drift; absence is not (br-xyy95). The round-trip is exact:
+    // artifacts store `micros_to_iso(row.expires_ts)` and the parser restores
+    // the identical microsecond value, so steady state never re-heals.
+    if let Some(archive_expires) = view.expires_ts
+        && archive_expires != row.expires_ts
+    {
+        return true;
+    }
+    // Active DB row -> the archive must not record this reservation as released.
+    if ts_is_positive(view.released_ts) != ts_is_positive(row.released_ts) {
+        return true;
+    }
+    false
+}
+
+/// Pure decision for reconcile-on-read: given the project's active DB
+/// reservations, the `agent_id -> name` map, and the archive artifacts currently
+/// present, return the artifact JSONs that must be (re)written so the on-disk
+/// archive the pre-commit guard reads matches the authoritative DB.
+///
+/// A row is healed when its `id-<id>.json` artifact is missing (the crash-gap
+/// between DB-commit and archive-write — F1's acceptance) or diverges from the DB
+/// (#112 wrong-holder). A row whose `agent_id` is absent from `agent_names` is
+/// skipped: we cannot author a faithful artifact without the holder's name, and
+/// guessing would risk writing a *wrong* holder — the very failure we heal.
+fn reservation_rows_needing_archive_heal(
+    project_human_key: &str,
+    active_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    archive_present: &BTreeMap<i64, crate::reservation_parity::ArchiveReservationView>,
+) -> Vec<Value> {
+    let mut heal = Vec::new();
+    for row in active_rows {
+        let Some(id) = row.id else {
+            continue;
+        };
+        let Some(agent_name) = agent_names.get(&row.agent_id) else {
+            continue;
+        };
+        let needs_heal = archive_present
+            .get(&id)
+            .is_none_or(|view| active_archive_artifact_diverges(view, row, agent_name));
+        if needs_heal {
+            heal.push(active_reservation_artifact_json(
+                project_human_key,
+                agent_name,
+                row,
+            ));
+        }
+    }
+    heal
+}
+
+/// Reconcile the Git archive reservation artifacts for `project` against the
+/// authoritative active DB reservations, healing any that are missing or stale
+/// (F1 reconcile-on-read). Returns the number of artifacts re-emitted.
+///
+/// Cheap and safe on the reservation read path: it reads only the *active* rows'
+/// own `id-<id>.json` artifacts (bounded by the active set, not the project's
+/// full reservation history), and dispatches an archive write only when genuine
+/// drift is found — so the steady state costs a handful of stats. This is what
+/// makes F1's acceptance hold — a crash between a reservation's DB-commit and its
+/// archive-write converges to a consistent archive (no wrong holder) on the next
+/// `file_reservation_paths` call, with no operator action.
+fn reconcile_active_reservation_archive(
+    project: &mcp_agent_mail_db::ProjectRow,
+    active_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    config: &Config,
+) -> usize {
+    if active_rows.is_empty() {
+        return 0;
+    }
+    // Look up only the active reservations' artifacts — never the whole archive.
+    let mut present = BTreeMap::new();
+    for row in active_rows {
+        if let Some(id) = row.id
+            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
+                &config.storage_root,
+                &project.slug,
+                id,
+            )
+        {
+            present.insert(id, view);
+        }
+    }
+    let heal = reservation_rows_needing_archive_heal(
+        &project.human_key,
+        active_rows,
+        agent_names,
+        &present,
+    );
+    if heal.is_empty() {
+        return 0;
+    }
+    let healed = heal.len();
+    tracing::debug!(
+        "reconcile-on-read healed {healed} stale/missing reservation archive artifact(s) for project={}",
+        project.slug
+    );
+    let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+        project_slug: project.slug.clone(),
+        config: config.clone(),
+        reservations: heal,
+    };
+    dispatch_reservation_archive_write(
+        op,
+        &format!(
+            "reservation archive reconcile-on-read project={}",
+            project.slug
+        ),
+    );
+    healed
+}
+
+/// Pure decision for the released-row half of reconcile-on-read (br-74sxo):
+/// given the released-but-unexpired DB rows, return the terminal release
+/// artifact JSONs that must be rewritten because the on-disk artifact still
+/// claims the reservation is ACTIVE — the pre-commit guard would honor the
+/// stale holder until `expires_ts`. A missing artifact needs no heal (there is
+/// nothing for the guard to honor), and a row whose holder name is unknown is
+/// skipped for the same wrong-holder reason as the active healer.
+fn released_rows_needing_archive_heal(
+    project_human_key: &str,
+    released_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    archive_present: &BTreeMap<i64, crate::reservation_parity::ArchiveReservationView>,
+) -> Vec<Value> {
+    let mut heal = Vec::new();
+    for row in released_rows {
+        let Some(id) = row.id else {
+            continue;
+        };
+        let Some(agent_name) = agent_names.get(&row.agent_id) else {
+            continue;
+        };
+        if !ts_is_positive(row.released_ts) {
+            continue;
+        }
+        let artifact_claims_active = archive_present
+            .get(&id)
+            .is_some_and(|view| !ts_is_positive(view.released_ts));
+        if artifact_claims_active {
+            heal.push(released_reservation_artifact_json(
+                project_human_key,
+                agent_name,
+                row,
+            ));
+        }
+    }
+    heal
+}
+
+/// Heal released-but-unexpired reservations whose archive artifact still
+/// claims ACTIVE (br-74sxo). The release-time artifact write can be skipped
+/// under disk-critical backpressure or lost to a crash between the DB
+/// release-commit and the archive write, and it cannot be retried while
+/// pressure persists (the write-behind queue refuses enqueue at disk-critical
+/// too). The active-row reconcile pass never visits released rows, so without
+/// this pass nothing ever rewrites the stale-active artifact and the
+/// pre-commit guard reports a wrong holder until `expires_ts`. Bounded like
+/// the active healer: it reads only the released-unexpired rows' own
+/// `id-<id>.json` artifacts, and rows past `expires_ts` need no heal because
+/// the guard already ignores expired artifacts. Terminal release artifacts are
+/// always safe to (re)write — reservation ids are never reused, so no later
+/// mutation can supersede a release.
+fn reconcile_released_reservation_archive(
+    project: &mcp_agent_mail_db::ProjectRow,
+    released_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    config: &Config,
+) -> usize {
+    if released_rows.is_empty() {
+        return 0;
+    }
+    // Look up only the released reservations' artifacts — never the whole archive.
+    let mut present = BTreeMap::new();
+    for row in released_rows {
+        if let Some(id) = row.id
+            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
+                &config.storage_root,
+                &project.slug,
+                id,
+            )
+        {
+            present.insert(id, view);
+        }
+    }
+    let heal = released_rows_needing_archive_heal(
+        &project.human_key,
+        released_rows,
+        agent_names,
+        &present,
+    );
+    if heal.is_empty() {
+        return 0;
+    }
+    let healed = heal.len();
+    tracing::debug!(
+        "reconcile-on-read healed {healed} stale-active artifact(s) for released reservation(s) in project={}",
+        project.slug
+    );
+    let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+        project_slug: project.slug.clone(),
+        config: config.clone(),
+        reservations: heal,
+    };
+    dispatch_reservation_archive_write(
+        op,
+        &format!(
+            "reservation archive released-row reconcile-on-read project={}",
+            project.slug
+        ),
+    );
+    healed
 }
 
 fn path_looks_absolute(input: &str) -> bool {
@@ -290,6 +788,554 @@ fn released_ts_json_value(released_ts: Option<i64>) -> serde_json::Value {
     })
 }
 
+fn release_intent_log_path(config: &Config) -> PathBuf {
+    config
+        .storage_root
+        .join(RELEASE_INTENT_DIR)
+        .join(RELEASE_INTENT_LOG_FILE)
+}
+
+fn release_intent_lock_path(config: &Config) -> PathBuf {
+    config
+        .storage_root
+        .join(RELEASE_INTENT_DIR)
+        .join(RELEASE_INTENT_LOCK_FILE)
+}
+
+fn reject_existing_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::other(format!(
+            "release intent path must not be a symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_release_intent_parent(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::other("release intent log has no parent"));
+    };
+    reject_existing_symlink(parent)?;
+    std::fs::create_dir_all(parent)?;
+    reject_existing_symlink(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn hash_json_value(value: &Value) -> String {
+    let bytes = serde_json::to_vec(value).expect("serializing serde_json::Value should not fail");
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn release_intent_hash_payload(record: &Value) -> Value {
+    json!({
+        "schema_version": record["schema_version"].clone(),
+        "kind": record["kind"].clone(),
+        "created_ts": record["created_ts"].clone(),
+        "project_key": record["project_key"].clone(),
+        "agent_name": record["agent_name"].clone(),
+        "paths": record["paths"].clone(),
+        "file_reservation_ids": record["file_reservation_ids"].clone(),
+        "failure": record["failure"].clone(),
+    })
+}
+
+fn release_replay_hash_payload(record: &Value) -> Value {
+    json!({
+        "schema_version": record["schema_version"].clone(),
+        "kind": record["kind"].clone(),
+        "intent_id": record["intent_id"].clone(),
+        "intent_content_sha256": record["intent_content_sha256"].clone(),
+        "replayed_ts": record["replayed_ts"].clone(),
+        "status": record["status"].clone(),
+        "released": record["released"].clone(),
+        "error_detail": record["error_detail"].clone(),
+    })
+}
+
+fn release_intent_record_has_valid_hash(record: &Value) -> bool {
+    let Some(content_sha256) = record.get("content_sha256").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(intent_id) = record.get("intent_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let computed_hash = hash_json_value(&release_intent_hash_payload(record));
+    content_sha256.len() == 64
+        && intent_id.len() == 16
+        && content_sha256 == computed_hash
+        && content_sha256.starts_with(intent_id)
+}
+
+fn release_replay_record_has_valid_hash(record: &Value) -> bool {
+    let Some(content_sha256) = record.get("content_sha256").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(intent_id) = record.get("intent_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(intent_content_sha256) = record.get("intent_content_sha256").and_then(Value::as_str)
+    else {
+        return false;
+    };
+    content_sha256.len() == 64
+        && intent_id.len() == 16
+        && intent_content_sha256.len() == 64
+        && intent_content_sha256.starts_with(intent_id)
+        && content_sha256 == hash_json_value(&release_replay_hash_payload(record))
+}
+
+fn append_release_intent_jsonl(config: &Config, record: &Value) -> std::io::Result<PathBuf> {
+    let path = release_intent_log_path(config);
+    ensure_release_intent_parent(&path)?;
+    reject_existing_symlink(&path)?;
+    let lock_path = release_intent_lock_path(config);
+    reject_existing_symlink(&lock_path)?;
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    fs2::FileExt::lock_exclusive(&lock_file)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    // Defend against a torn final line from a prior crash (a partial append that
+    // never reached fsync). If the log does not currently end in a newline,
+    // write a leading one so the torn fragment stays isolated on its own
+    // (skippable) line instead of being concatenated onto — and lost together
+    // with — this otherwise-valid record on the next read.
+    let needs_leading_newline = if let Ok(meta) = file.metadata()
+        && meta.len() > 0
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        last[0] != b'\n'
+    } else {
+        false
+    };
+    let mut line = Vec::new();
+    if needs_leading_newline {
+        line.push(b'\n');
+    }
+    line.extend_from_slice(
+        &serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?,
+    );
+    line.push(b'\n');
+    file.write_all(&line)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(path)
+}
+
+fn append_release_intent(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    paths: Option<Vec<String>>,
+    file_reservation_ids: Option<Vec<i64>>,
+    failure_stage: &str,
+    error_detail: &str,
+) -> std::io::Result<ReleaseIntentReceipt> {
+    let created_ts = mcp_agent_mail_db::now_micros();
+    let payload = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_KIND,
+        "created_ts": created_ts,
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "paths": paths,
+        "file_reservation_ids": file_reservation_ids,
+        "failure": {
+            "stage": failure_stage,
+            "error_detail": error_detail,
+        },
+    });
+    let content_sha256 = hash_json_value(&payload);
+    let intent_id = content_sha256.chars().take(16).collect::<String>();
+    let record = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_KIND,
+        "intent_id": intent_id,
+        "content_sha256": content_sha256,
+        "created_ts": created_ts,
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "paths": payload["paths"].clone(),
+        "file_reservation_ids": payload["file_reservation_ids"].clone(),
+        "failure": payload["failure"].clone(),
+    });
+    let intent_path = append_release_intent_jsonl(config, &record)?;
+    Ok(ReleaseIntentReceipt {
+        intent_id,
+        intent_path,
+        content_sha256,
+    })
+}
+
+fn append_release_replay_record(
+    config: &Config,
+    intent_id: &str,
+    intent_content_sha256: &str,
+    status: &str,
+    released: usize,
+    error_detail: Option<&str>,
+) {
+    let replayed_ts = mcp_agent_mail_db::now_micros();
+    let payload = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_REPLAY_KIND,
+        "intent_id": intent_id,
+        "intent_content_sha256": intent_content_sha256,
+        "replayed_ts": replayed_ts,
+        "status": status,
+        "released": released,
+        "error_detail": error_detail,
+    });
+    let content_sha256 = hash_json_value(&payload);
+    let record = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_REPLAY_KIND,
+        "intent_id": intent_id,
+        "content_sha256": content_sha256,
+        "intent_content_sha256": intent_content_sha256,
+        "replayed_ts": replayed_ts,
+        "status": status,
+        "released": released,
+        "error_detail": error_detail,
+    });
+    if let Err(error) = append_release_intent_jsonl(config, &record) {
+        tracing::warn!(
+            error = %error,
+            intent_id,
+            "failed to append release intent replay record"
+        );
+    }
+}
+
+fn queued_release_intent_response(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    paths: Option<Vec<String>>,
+    file_reservation_ids: Option<Vec<i64>>,
+    failure_stage: &str,
+    error_detail: &str,
+) -> McpResult<String> {
+    let receipt = append_release_intent(
+        config,
+        project_key,
+        agent_name,
+        paths,
+        file_reservation_ids,
+        failure_stage,
+        error_detail,
+    )
+    .map_err(|error| {
+        legacy_tool_error(
+            "RELEASE_INTENT_WRITE_FAILED",
+            format!(
+                "Could not release reservations because the database is unavailable, and writing \
+                 the local release-intent log also failed: {error}"
+            ),
+            false,
+            json!({ "error_detail": error.to_string() }),
+        )
+    })?;
+    serde_json::to_string(&json!({
+        "released": 0,
+        "released_at": micros_to_iso(mcp_agent_mail_db::now_micros()),
+        "status": "queued",
+        "queued": true,
+        "message": "lease release queued because DB unavailable",
+        "intent": {
+            "id": receipt.intent_id,
+            "path": receipt.intent_path.display().to_string(),
+            "content_sha256": receipt.content_sha256,
+            "replay": "automatic_on_next_successful_release_file_reservations_call",
+        },
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+const fn db_error_supports_release_intent(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Pool(_)
+            | DbError::Sqlite(_)
+            | DbError::Schema(_)
+            | DbError::ResourceBusy(_)
+            | DbError::PoolExhausted { .. }
+            | DbError::CircuitBreakerOpen { .. }
+            | DbError::IntegrityCorruption { .. }
+    )
+}
+
+fn mcp_error_supports_release_intent(error: &McpError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data["error"]["type"].as_str())
+        .is_some_and(|error_type| {
+            matches!(
+                error_type,
+                "DATABASE_CORRUPTION"
+                    | "DATABASE_ERROR"
+                    | "DATABASE_POOL_EXHAUSTED"
+                    | "RESOURCE_BUSY"
+            )
+        })
+}
+
+fn read_queued_release_intents(config: &Config) -> std::io::Result<Vec<QueuedReleaseIntent>> {
+    let path = release_intent_log_path(config);
+    reject_existing_symlink(&path)?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut terminal = HashSet::new();
+    let mut intents = Vec::new();
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("kind").and_then(Value::as_str) {
+            // A replay marker is terminal when the intent either succeeded
+            // ("replayed") or is permanently un-replayable ("abandoned" — e.g.
+            // the agent or project no longer exists). Both clear the queued
+            // intent so it is not retried forever (mirrors the ack-intent
+            // design in messaging.rs); only a retryable "failed" marker leaves
+            // the intent queued for the next replay attempt.
+            Some(RELEASE_INTENT_REPLAY_KIND)
+                if matches!(
+                    value.get("status").and_then(Value::as_str),
+                    Some("replayed" | "abandoned")
+                ) =>
+            {
+                if !release_replay_record_has_valid_hash(&value) {
+                    tracing::warn!("skipping replay marker with invalid content hash");
+                    continue;
+                }
+                if let Some(intent_id) = value.get("intent_id").and_then(Value::as_str) {
+                    let Some(intent_content_sha256) =
+                        value.get("intent_content_sha256").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    terminal.insert((intent_id.to_string(), intent_content_sha256.to_string()));
+                }
+            }
+            Some(RELEASE_INTENT_KIND) => {
+                if !release_intent_record_has_valid_hash(&value) {
+                    tracing::warn!("skipping release intent with invalid content hash");
+                    continue;
+                }
+                if let Ok(intent) = serde_json::from_value::<QueuedReleaseIntent>(value) {
+                    intents.push(intent);
+                }
+            }
+            _ => {}
+        }
+    }
+    intents.retain(|intent| {
+        !terminal.contains(&(intent.intent_id.clone(), intent.content_sha256.clone()))
+    });
+    Ok(intents)
+}
+
+fn dispatch_release_archive_write(
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    released_rows: &[mcp_agent_mail_db::FileReservationRow],
+    config: &Config,
+) {
+    if released_rows.is_empty() {
+        return;
+    }
+    let res_jsons: Vec<Value> = released_rows
+        .iter()
+        .map(|r| released_reservation_artifact_json(&project.human_key, &agent.name, r))
+        .collect();
+
+    let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+        project_slug: project.slug.clone(),
+        config: config.clone(),
+        reservations: res_jsons,
+    };
+    dispatch_reservation_archive_write(
+        op,
+        &format!("reservation release archive write project={}", project.slug),
+    );
+}
+
+async fn replay_single_release_intent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+    intent: &QueuedReleaseIntent,
+) -> Result<usize, (String, bool)> {
+    if intent.kind != RELEASE_INTENT_KIND {
+        return Ok(0);
+    }
+    let project = resolve_project(ctx, pool, &intent.project_key)
+        .await
+        .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
+    let project_id = project.id.unwrap_or(0);
+    let normalized_paths = normalize_filter_paths(&project.human_key, intent.paths.clone())
+        .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
+    let agent = resolve_agent(
+        ctx,
+        pool,
+        project_id,
+        &intent.agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await
+    .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
+    let agent_id = agent.id.unwrap_or(0);
+    let ids_to_release = if normalized_paths.is_some() || intent.file_reservation_ids.is_some() {
+        let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
+            ctx.cx(),
+            pool,
+            project_id,
+        )
+        .await
+        {
+            asupersync::Outcome::Ok(rows) => rows,
+            asupersync::Outcome::Err(error) => {
+                return Err((error.to_string(), db_error_supports_release_intent(&error)));
+            }
+            asupersync::Outcome::Cancelled(reason) => {
+                return Err((format!("cancelled: {reason:?}"), true));
+            }
+            asupersync::Outcome::Panicked(panic) => {
+                return Err((format!("panicked: {}", panic.message()), true));
+            }
+        };
+        let mut ids = Vec::new();
+        for reservation in existing_rows {
+            if renewal_filter_matches(
+                &reservation,
+                agent_id,
+                normalized_paths.as_deref(),
+                intent.file_reservation_ids.as_deref(),
+            ) && let Some(id) = reservation.id
+            {
+                ids.push(id);
+            }
+        }
+        Some(ids)
+    } else {
+        None
+    };
+
+    let released_rows = match mcp_agent_mail_db::queries::release_reservations(
+        ctx.cx(),
+        pool,
+        project_id,
+        agent_id,
+        None,
+        ids_to_release.as_deref(),
+    )
+    .await
+    {
+        asupersync::Outcome::Ok(rows) => rows,
+        asupersync::Outcome::Err(error) => {
+            return Err((error.to_string(), db_error_supports_release_intent(&error)));
+        }
+        asupersync::Outcome::Cancelled(reason) => {
+            return Err((format!("cancelled: {reason:?}"), true));
+        }
+        asupersync::Outcome::Panicked(panic) => {
+            return Err((format!("panicked: {}", panic.message()), true));
+        }
+    };
+    dispatch_release_archive_write(&project, &agent, &released_rows, config);
+    Ok(released_rows.len())
+}
+
+async fn replay_queued_release_intents(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+) {
+    let intents = match read_queued_release_intents(config) {
+        Ok(intents) => intents,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read queued release intents");
+            return;
+        }
+    };
+    for intent in intents {
+        match replay_single_release_intent(ctx, pool, config, &intent).await {
+            Ok(released) => {
+                append_release_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    "replayed",
+                    released,
+                    None,
+                );
+            }
+            Err((detail, retryable)) => {
+                // Retryable (DB still degraded) → "failed", left queued for the
+                // next replay. Non-retryable (agent/project gone, malformed
+                // paths) → "abandoned", a terminal marker that clears the intent
+                // so it is not retried — and re-appended — forever.
+                let status = if retryable { "failed" } else { "abandoned" };
+                append_release_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    status,
+                    0,
+                    Some(&detail),
+                );
+                tracing::warn!(
+                    intent_id = intent.intent_id,
+                    retryable,
+                    error = %detail,
+                    "queued release intent replay failed"
+                );
+            }
+        }
+    }
+}
+
 fn normalize_repo_path(input: &str) -> McpResult<PathBuf> {
     let path = expand_tilde(input);
     if path.as_os_str().is_empty() {
@@ -313,7 +1359,14 @@ fn renewal_filter_matches(
     paths: Option<&[String]>,
     reservation_ids: Option<&[i64]>,
 ) -> bool {
-    if row.released_ts.is_some() {
+    // A row is active per the canonical ACTIVE_RESERVATION_PREDICATE when
+    // released_ts IS NULL OR released_ts <= 0; only a positive released_ts means
+    // genuinely released. `list_unreleased_file_reservations` can surface a
+    // defensively-active row as released_ts = Some(0), so gate on `> 0` (not the
+    // any-`Some` check) to match the SQL predicate the unfiltered release path
+    // uses — otherwise path/id-filtered release+renew would skip a row the
+    // blanket "release all" branch still acts on.
+    if row.released_ts.is_some_and(|ts| ts > 0) {
         return false;
     }
     if row.agent_id != agent_id {
@@ -362,6 +1415,318 @@ fn collect_previous_expiries(
         .filter(|row| renewal_filter_matches(row, agent_id, paths, reservation_ids))
         .filter_map(|row| row.id.map(|id| (id, row.expires_ts)))
         .collect()
+}
+
+/// F5 (br-bvq1x.6.5): build a fail-closed envelope for a reservation ACQUIRE
+/// failure. Acquire must fail CLOSED for safety, but the agent has to be able to
+/// tell WHY it failed — a corrupt DB, a corrupt index, or a busy/unavailable
+/// subsystem — as distinct from a genuine conflict (which separately returns the
+/// conflicting holder via `FILE_RESERVATION_CONFLICT`). This reuses the A1 typed
+/// classification + A2 failure envelope from [`db_error_to_mcp_error`] (so the
+/// class, severity, recommended command, and corruption metrics stay consistent)
+/// and grafts on the reservation-specific context the generic chokepoint cannot
+/// know: the exact requested paths and an explicit `do_not_edit` set, so an agent
+/// that could not verify current holders treats every requested path as off-limits
+/// until recovery rather than editing blind (the css/ts2 incident: `reserve`
+/// failing with a malformed B-tree left the agent unable to tell "contended" from
+/// "DB corrupt").
+fn reservation_acquire_failure(
+    requested_paths: &[String],
+    operation: &'static str,
+    err: DbError,
+) -> McpError {
+    let classification = err.classification();
+    let cause = classification.class.as_str();
+    let blocks_edits = classification.blocks_edits;
+    let safe_to_continue_read_only = classification.safe_to_continue_read_only;
+    let recommended_command = classification.recommended_command;
+    // Reuse the canonical classified envelope (class / severity / code / metrics)...
+    let mut error = db_error_to_mcp_error(err);
+    // ...then graft the reservation-acquire fail-closed context onto its data.
+    let guidance = if blocks_edits {
+        "Reservation acquire FAILED CLOSED: current holders are unverifiable because the \
+         reservation index could not be read. Do NOT edit the requested paths until the \
+         database is recovered."
+    } else {
+        "Reservation acquire did NOT grant: the reservation subsystem is temporarily \
+         unavailable (busy/locked). The paths were left unreserved; retry after the \
+         condition clears."
+    };
+    // Fail closed: when the index is unreadable, every requested path is a
+    // DO-NOT-EDIT until reservations can be verified again. (Precomputed because
+    // `json!` cannot take a bare `if`/`else` in value position.)
+    let do_not_edit: Vec<String> = if blocks_edits {
+        requested_paths.to_vec()
+    } else {
+        Vec::new()
+    };
+    let context = json!({
+        "operation": operation,
+        "cause": cause,
+        "fail_closed": true,
+        "blocks_edits": blocks_edits,
+        "safe_to_continue_read_only": safe_to_continue_read_only,
+        "recommended_command": recommended_command,
+        "requested_paths": requested_paths,
+        "do_not_edit": do_not_edit,
+        "guidance": guidance,
+    });
+    // `db_error_to_mcp_error` always produces the legacy envelope
+    // `{ error: { type, message, recoverable, data: {...} } }`. Graft the
+    // reservation-acquire context into that INNER `data` object — alongside the
+    // A1 `db_error_classification` and `failure_envelope` — so the whole error
+    // payload is coherent, rather than at an unrelated top level. (If the
+    // envelope shape ever changed, the context is simply dropped and the
+    // classified error still surfaces — defensive, never hit in practice.)
+    if let Some(Value::Object(top)) = error.data.as_mut()
+        && let Some(Value::Object(err_obj)) = top.get_mut("error")
+        && let Some(Value::Object(data_obj)) = err_obj.get_mut("data")
+    {
+        data_obj.insert("reservation_acquire".to_string(), context);
+    }
+    error
+}
+
+/// F5: route an acquire-path DB [`asupersync::Outcome`] through
+/// [`reservation_acquire_failure`] on error (so the caller gets the fail-closed
+/// reservation context), delegating success / cancellation / panic to the shared
+/// [`db_outcome_to_mcp_result`] chokepoint.
+fn acquire_outcome<T>(
+    out: asupersync::Outcome<T, DbError>,
+    requested_paths: &[String],
+    operation: &'static str,
+) -> McpResult<T> {
+    match out {
+        asupersync::Outcome::Err(err) => {
+            Err(reservation_acquire_failure(requested_paths, operation, err))
+        }
+        other => db_outcome_to_mcp_result(other),
+    }
+}
+
+/// Check requested paths against one authoritative reservation snapshot
+/// without registering identities, cleaning up leases, healing archives, or
+/// changing reservation state.
+#[tool(
+    description = "Check project-relative paths against authoritative active exclusive file reservations without mutating Agent Mail.\n\nThis is the guard-safe read API for pre-edit, pre-commit, and pre-push checks. It resolves the existing caller identity and active leases in one fresh database snapshot, ignores only reservations owned by that canonical caller ID, and reports exact, glob, and ancestor conflicts. Expired, released, and shared reservations do not block. Malformed request or stored patterns fail closed. The call never registers agents or projects, cleans up leases, releases reservations, heals archives, or writes mailbox state.\n\nParameters\n----------\nproject_key : str\n    Existing project human key or slug.\nagent_name : str\n    Existing caller identity. Case-insensitive lookup resolves the canonical lowest-ID identity.\npaths : list[str]\n    One to 200 project-relative paths or glob patterns.\n\nReturns\n-------\ndict\n    { conflict_free, conflicts, clear_paths, checked_paths, total_conflicting_reservations, output_truncated, project, snapshot_ts, authoritative_source, read_only }"
+)]
+pub async fn check_file_reservation_conflicts(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    paths: Vec<String>,
+) -> McpResult<String> {
+    validate_conflict_check_paths(&paths)?;
+
+    let project_key = project_key.trim();
+    if project_key.is_empty()
+        || project_key.len() > MAX_CONFLICT_CHECK_PATH_BYTES
+        || project_key.contains('\0')
+    {
+        return Err(legacy_tool_error(
+            "INVALID_PROJECT_KEY",
+            "project_key must be non-empty, NUL-free, and at most 4096 bytes",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        ));
+    }
+    let caller = agent_name.trim();
+    if caller.is_empty() || caller.len() > 256 || caller.contains('\0') {
+        return Err(legacy_tool_error(
+            "INVALID_AGENT_NAME",
+            "agent_name must be non-empty, NUL-free, and at most 256 bytes",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        ));
+    }
+    let caller = mcp_agent_mail_core::models::normalize_agent_name(caller)
+        .unwrap_or_else(|| caller.to_string());
+
+    let pool = get_authoritative_live_db_pool()?;
+    let snapshot = acquire_outcome(
+        mcp_agent_mail_db::queries::get_reservation_conflict_snapshot(
+            ctx.cx(),
+            &pool,
+            project_key,
+            &caller,
+            MAX_CONFLICT_CHECK_SNAPSHOT_ROWS,
+        )
+        .await,
+        &paths,
+        "check_file_reservation_conflicts",
+    )?;
+
+    if snapshot.overflow {
+        return Err(legacy_tool_error(
+            "RESERVATION_SNAPSHOT_TOO_LARGE",
+            format!(
+                "Active reservation snapshot exceeds the safe {MAX_CONFLICT_CHECK_SNAPSHOT_ROWS}-row bound"
+            ),
+            true,
+            json!({
+                "fail_closed": true,
+                "max": MAX_CONFLICT_CHECK_SNAPSHOT_ROWS,
+                "do_not_edit": paths,
+            }),
+        ));
+    }
+
+    let mut normalized_paths = Vec::with_capacity(paths.len());
+    let mut seen_paths = HashSet::with_capacity(paths.len());
+    for path in &paths {
+        let Some(normalized) = relativize_path(&snapshot.project.human_key, path) else {
+            return Err(legacy_tool_error(
+                "INVALID_PATH",
+                "Path is outside the project root or contains invalid traversal",
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        };
+        let compiled = CompiledPattern::cached(&normalized);
+        if normalized.is_empty()
+            || invalid_file_reservation_pattern(&normalized).is_some()
+            || !compiled.is_matchable()
+        {
+            return Err(legacy_tool_error(
+                "INVALID_PATH_PATTERN",
+                format!("Malformed conflict-check path pattern: {path:?}"),
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        }
+        if seen_paths.insert(normalized.clone()) {
+            normalized_paths.push(normalized);
+        }
+    }
+
+    let mut holder_by_agent = HashMap::with_capacity(snapshot.reservations.len());
+    let mut indexed = Vec::with_capacity(snapshot.reservations.len());
+    for reservation in &snapshot.reservations {
+        if reservation.agent_id == snapshot.caller_agent_id {
+            continue;
+        }
+        let Some(holder) = reservation.agent_name.as_deref() else {
+            return Err(legacy_tool_error(
+                "UNRESOLVED_RESERVATION_HOLDER",
+                format!(
+                    "Active reservation {} has no authoritative holder identity",
+                    reservation.id
+                ),
+                false,
+                json!({
+                    "fail_closed": true,
+                    "reservation_id": reservation.id,
+                    "do_not_edit": paths,
+                }),
+            ));
+        };
+        let compiled = CompiledPattern::cached(&reservation.path_pattern);
+        if reservation.path_pattern.is_empty()
+            || reservation.path_pattern.len() > MAX_CONFLICT_CHECK_PATH_BYTES
+            || reservation.path_pattern.contains('\0')
+            || invalid_file_reservation_pattern(&reservation.path_pattern).is_some()
+            || !compiled.is_matchable()
+        {
+            return Err(legacy_tool_error(
+                "MALFORMED_ACTIVE_RESERVATION",
+                format!(
+                    "Active reservation {} contains a malformed path pattern; conflict status is unverifiable",
+                    reservation.id
+                ),
+                false,
+                json!({
+                    "fail_closed": true,
+                    "reservation_id": reservation.id,
+                    "do_not_edit": paths,
+                }),
+            ));
+        }
+
+        holder_by_agent.insert(reservation.agent_id, holder.to_string());
+        indexed.push((
+            reservation.path_pattern.clone(),
+            ReservationRef {
+                agent_id: reservation.agent_id,
+                path_pattern: reservation.path_pattern.clone(),
+                exclusive: true,
+                expires_ts: reservation.expires_ts,
+            },
+        ));
+    }
+
+    let index = ReservationIndex::build(indexed.into_iter());
+    let mut conflicts = Vec::new();
+    let mut clear_paths = Vec::new();
+    let mut refs = Vec::new();
+    let mut total_conflicting_reservations = 0_usize;
+    let mut emitted_holders = 0_usize;
+    let mut output_truncated = false;
+
+    for path in &normalized_paths {
+        let compiled = CompiledPattern::cached(path);
+        index.find_conflicts(compiled.as_ref(), &mut refs);
+        total_conflicting_reservations = total_conflicting_reservations.saturating_add(refs.len());
+        refs.sort_unstable_by(|left, right| {
+            left.path_pattern
+                .cmp(&right.path_pattern)
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+        refs.dedup_by(|left, right| {
+            left.agent_id == right.agent_id && left.path_pattern == right.path_pattern
+        });
+
+        if refs.is_empty() {
+            clear_paths.push(path.clone());
+            continue;
+        }
+
+        let remaining_total = MAX_CONFLICT_HOLDERS_TOTAL.saturating_sub(emitted_holders);
+        let emit_count = refs
+            .len()
+            .min(MAX_CONFLICT_HOLDERS_PER_PATH)
+            .min(remaining_total);
+        if emit_count < refs.len() {
+            output_truncated = true;
+        }
+        let holders = refs
+            .iter()
+            .take(emit_count)
+            .filter_map(|entry| {
+                holder_by_agent
+                    .get(&entry.agent_id)
+                    .map(|holder| ConflictHolder {
+                        agent: holder.clone(),
+                        path_pattern: entry.path_pattern.clone(),
+                        exclusive: true,
+                        expires_ts: micros_to_iso(entry.expires_ts),
+                    })
+            })
+            .collect::<Vec<_>>();
+        emitted_holders = emitted_holders.saturating_add(holders.len());
+        conflicts.push(ReservationConflict {
+            path: path.clone(),
+            holders,
+        });
+    }
+
+    let response = ReservationConflictCheckResponse {
+        conflict_free: conflicts.is_empty(),
+        conflicts,
+        clear_paths,
+        checked_paths: normalized_paths.len(),
+        total_conflicting_reservations,
+        output_truncated,
+        project: snapshot.project.human_key,
+        snapshot_ts: micros_to_iso(snapshot.captured_ts),
+        authoritative_source: "database_snapshot".to_string(),
+        read_only: true,
+    };
+    serde_json::to_string(&response).map_err(|error| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("failed to serialize reservation conflict response: {error}"),
+        )
+    })
 }
 
 /// Request advisory file reservations on project-relative paths/globs.
@@ -497,10 +1862,51 @@ pub async fn file_reservation_paths(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    // Check for conflicts with existing active reservations
-    let active = db_outcome_to_mcp_result(
+    // Check for conflicts with existing active reservations. F5: if this read
+    // fails (DB/index corrupt, busy/unavailable), surface a fail-closed
+    // reservation-acquire envelope that names the cause and the do-not-edit set
+    // instead of an opaque DB error — the agent must be able to tell "could not
+    // verify reservations" from "truly contended".
+    let active = acquire_outcome(
         mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
+        &paths,
+        "file_reservation_paths",
     )?;
+
+    // F1 reconcile-on-read: before granting, heal any *existing* active
+    // reservation whose archive artifact is missing or stale (a crash between
+    // that reservation's DB-commit and its archive-write — GH#112). This is the
+    // "next access converges" guarantee: the pre-commit guard reads the artifacts
+    // directly, so without this a wrong/absent holder would slip through. The
+    // healer fires an archive write only on genuine drift, so the steady state is
+    // just one directory scan. Best-effort: a failed agent lookup never fails the
+    // reserve. The released-row half (br-74sxo) rewrites stale-ACTIVE artifacts
+    // whose release write was skipped (disk-critical) or lost (crash-gap), so
+    // the guard stops honoring a released holder before `expires_ts`.
+    if let asupersync::Outcome::Ok(agent_rows) =
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
+    {
+        let agent_names: HashMap<i64, String> = agent_rows
+            .into_iter()
+            .filter_map(|row| row.id.map(|id| (id, row.name)))
+            .collect();
+        reconcile_active_reservation_archive(&project, &active, &agent_names, &Config::get());
+        if let asupersync::Outcome::Ok(released_rows) =
+            mcp_agent_mail_db::queries::list_released_unexpired_reservations(
+                ctx.cx(),
+                &pool,
+                project_id,
+            )
+            .await
+        {
+            reconcile_released_reservation_archive(
+                &project,
+                &released_rows,
+                &agent_names,
+                &Config::get(),
+            );
+        }
+    }
 
     let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
     let mut seen_paths: HashSet<&str> = HashSet::new();
@@ -725,8 +2131,10 @@ pub async fn file_reservation_paths(
                 (vec![], db_conflicts)
             }
             other => {
-                // All other errors propagate normally.
-                db_outcome_to_mcp_result(other)?;
+                // F5: a grant failure that is not a recoverable conflict still
+                // fails closed with the classified reservation-acquire context
+                // (cause + do-not-edit set) rather than an opaque DB error.
+                acquire_outcome(other, &paths, "file_reservation_paths")?;
                 unreachable!()
             }
         }
@@ -814,13 +2222,43 @@ pub async fn release_file_reservations(
 ) -> McpResult<String> {
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    let config = Config::get();
+    let original_paths = paths.clone();
+    let original_file_reservation_ids = file_reservation_ids.clone();
 
-    let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let pool = match get_db_pool() {
+        Ok(pool) => pool,
+        Err(error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "get_db_pool",
+                &error.to_string(),
+            );
+        }
+    };
+    let project = match resolve_project(ctx, &pool, &project_key).await {
+        Ok(project) => project,
+        Err(error) if mcp_error_supports_release_intent(&error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "resolve_project",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let project_id = project.id.unwrap_or(0);
     let normalized_paths = normalize_filter_paths(&project.human_key, paths)?;
 
-    let agent = resolve_agent(
+    let agent = match resolve_agent(
         ctx,
         &pool,
         project_id,
@@ -828,18 +2266,46 @@ pub async fn release_file_reservations(
         &project.slug,
         &project.human_key,
     )
-    .await?;
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) if mcp_error_supports_release_intent(&error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "resolve_agent",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let agent_id = agent.id.unwrap_or(0);
 
     let ids_to_release = if normalized_paths.is_some() || file_reservation_ids.is_some() {
-        let existing_rows = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_unreleased_file_reservations(
-                ctx.cx(),
-                &pool,
-                project_id,
-            )
-            .await,
-        )?;
+        let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
+            ctx.cx(),
+            &pool,
+            project_id,
+        )
+        .await
+        {
+            asupersync::Outcome::Ok(rows) => rows,
+            asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
+                return queued_release_intent_response(
+                    &config,
+                    &project_key,
+                    &agent_name,
+                    original_paths,
+                    original_file_reservation_ids,
+                    "list_unreleased_file_reservations",
+                    &error.to_string(),
+                );
+            }
+            other => db_outcome_to_mcp_result(other)?,
+        };
         let mut ids = Vec::new();
         for res in existing_rows {
             if renewal_filter_matches(
@@ -858,46 +2324,70 @@ pub async fn release_file_reservations(
     };
 
     // Perform the DB release (returns the actual updated rows)
-    let released_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::release_reservations(
-            ctx.cx(),
-            &pool,
-            project_id,
-            agent_id,
-            None, // Pass resolved IDs only
-            ids_to_release.as_deref(),
-        )
-        .await,
-    )?;
+    let released_rows = match mcp_agent_mail_db::queries::release_reservations(
+        ctx.cx(),
+        &pool,
+        project_id,
+        agent_id,
+        None, // Pass resolved IDs only
+        ids_to_release.as_deref(),
+    )
+    .await
+    {
+        asupersync::Outcome::Ok(rows) => rows,
+        asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "release_reservations",
+                &error.to_string(),
+            );
+        }
+        other => db_outcome_to_mcp_result(other)?,
+    };
 
     // Update archive artifacts for the released items
-    if !released_rows.is_empty() {
-        let res_jsons: Vec<serde_json::Value> = released_rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.id.unwrap_or(0),
-                    "project": &project.human_key,
-                    "agent": &agent.name,
-                    "path_pattern": &r.path_pattern,
-                    "exclusive": r.exclusive != 0,
-                    "reason": &r.reason,
-                    "created_ts": micros_to_iso(r.created_ts),
-                    "expires_ts": micros_to_iso(r.expires_ts),
-                    "released_ts": released_ts_json_value(r.released_ts),
-                })
-            })
-            .collect();
+    dispatch_release_archive_write(&project, &agent, &released_rows, &config);
+    replay_queued_release_intents(ctx, &pool, &config).await;
 
-        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
-            project_slug: project.slug.clone(),
-            config: Config::get(),
-            reservations: res_jsons,
-        };
-        dispatch_reservation_archive_write(
-            op,
-            &format!("reservation release archive write project={}", project.slug),
-        );
+    // F3 (br-bvq1x.6.3): releasing reconciles both stores. The released rows'
+    // artifacts were just rewritten above; now heal any *remaining* active
+    // reservation whose archive artifact drifted (the same reconcile-on-read pass
+    // the acquire path runs, GH#112), so a release access converges the archive
+    // the pre-commit guard reads. Best-effort: a failed lookup never fails the
+    // release, which must degrade gracefully (ts2/css incident). The released-row
+    // half (br-74sxo) additionally rewrites stale-ACTIVE artifacts from earlier
+    // releases whose archive write was skipped (disk-critical) or lost
+    // (crash-gap) — including this release's own artifacts when the write above
+    // was skipped and pressure has since cleared.
+    if let asupersync::Outcome::Ok(active_rows) =
+        mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await
+        && let asupersync::Outcome::Ok(agent_rows) =
+            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
+    {
+        let agent_names: HashMap<i64, String> = agent_rows
+            .into_iter()
+            .filter_map(|row| row.id.map(|id| (id, row.name)))
+            .collect();
+        reconcile_active_reservation_archive(&project, &active_rows, &agent_names, &config);
+        if let asupersync::Outcome::Ok(released_unexpired) =
+            mcp_agent_mail_db::queries::list_released_unexpired_reservations(
+                ctx.cx(),
+                &pool,
+                project_id,
+            )
+            .await
+        {
+            reconcile_released_reservation_archive(
+                &project,
+                &released_unexpired,
+                &agent_names,
+                &config,
+            );
+        }
     }
 
     let response = ReleaseResult {
@@ -1275,7 +2765,27 @@ pub async fn force_release_file_reservation(
         ));
     }
 
-    let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
+    let released_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_reservations_by_ids(
+            ctx.cx(),
+            &pool,
+            &[file_reservation_id],
+        )
+        .await,
+    )?;
+    let released_ts = released_rows
+        .iter()
+        .find(|row| row.id == Some(file_reservation_id))
+        .and_then(|row| row.released_ts)
+        .ok_or_else(|| {
+            legacy_tool_error(
+                "INCONSISTENT_STATE",
+                "Reservation release committed but released_ts could not be read back.",
+                false,
+                json!({ "file_reservation_id": file_reservation_id }),
+            )
+        })?;
+    let released_iso = micros_to_iso(released_ts);
 
     if released_count > 0 {
         let res_json = serde_json::json!({
@@ -1287,7 +2797,7 @@ pub async fn force_release_file_reservation(
             "reason": &reservation.reason,
             "created_ts": micros_to_iso(reservation.created_ts),
             "expires_ts": micros_to_iso(reservation.expires_ts),
-            "released_ts": now_iso.clone(),
+            "released_ts": released_iso.clone(),
         });
 
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -1414,6 +2924,19 @@ pub async fn force_release_file_reservation(
                     &message.subject,
                     &message.body_md,
                 );
+                crate::messaging::enqueue_message_lexical_index(
+                    &mcp_agent_mail_db::search_v3::IndexableMessage {
+                        id: message_id,
+                        project_id,
+                        project_slug: project.slug.clone(),
+                        sender_name: agent_name.clone(),
+                        subject: message.subject.clone(),
+                        body_md: message.body_md.clone(),
+                        thread_id: message.thread_id.clone(),
+                        importance: message.importance.clone(),
+                        created_ts: message.created_ts,
+                    },
+                );
                 let all_recipient_names = vec![holder_agent_name.clone()];
                 let msg_json = serde_json::json!({
                     "id": message_id,
@@ -1451,7 +2974,7 @@ pub async fn force_release_file_reservation(
     // Build response matching Python format
     let response = serde_json::json!({
         "released": released_count,
-        "released_at": &now_iso,
+        "released_at": &released_iso,
         "reservation": {
             "id": file_reservation_id,
             "agent": &holder_agent_name,
@@ -1460,7 +2983,7 @@ pub async fn force_release_file_reservation(
             "reason": reservation.reason,
             "created_ts": micros_to_iso(reservation.created_ts),
             "expires_ts": micros_to_iso(reservation.expires_ts),
-            "released_ts": &now_iso,
+            "released_ts": &released_iso,
             "stale_reasons": stale_reasons,
             "last_agent_activity_ts": holder_last_active_ts.map(micros_to_iso),
             "last_mail_activity_ts": mail_activity.map(micros_to_iso),
@@ -1642,6 +3165,76 @@ mod tests {
         time_component.wrapping_add(RESERVATION_TEST_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
+    // --- F5 (br-bvq1x.6.5): acquire failure classification + fail-closed context ---
+
+    #[test]
+    fn f5_acquire_failure_corruption_fails_closed_with_do_not_edit() {
+        let paths = vec!["src/**".to_string(), "config/app.yaml".to_string()];
+        // A malformed-B-tree read failure on the conflict-check path (the css/ts2
+        // incident): the reservation index could not be read.
+        let err = DbError::Sqlite("database disk image is malformed".to_string());
+        let mcp = reservation_acquire_failure(&paths, "file_reservation_paths", err);
+        let data = mcp.data.expect("F5 envelope carries data");
+        // Legacy envelope shape: { error: { type, message, recoverable, data } }.
+        let payload = data
+            .get("error")
+            .and_then(|e| e.get("data"))
+            .expect("legacy error.data payload");
+        let acq = payload
+            .get("reservation_acquire")
+            .expect("reservation_acquire context block");
+        assert_eq!(
+            acq.get("cause").and_then(Value::as_str),
+            Some("main_db_btree_corruption"),
+            "corruption-driven acquire failure must classify as main_db_btree_corruption"
+        );
+        assert_eq!(acq.get("fail_closed").and_then(Value::as_bool), Some(true));
+        assert_eq!(acq.get("blocks_edits").and_then(Value::as_bool), Some(true));
+        // Fail closed: every requested path is do-not-edit when holders are
+        // unverifiable — the agent must not edit blind.
+        let do_not_edit: Vec<String> = acq
+            .get("do_not_edit")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            do_not_edit, paths,
+            "a corruption-driven acquire failure must mark every requested path do-not-edit"
+        );
+        // Reuses the A1/A2 classified envelope (grafted alongside it) rather than
+        // inventing a new one.
+        assert!(
+            payload.get("db_error_classification").is_some(),
+            "F5 must reuse the A1 classification envelope from db_error_to_mcp_error"
+        );
+    }
+
+    #[test]
+    fn f5_acquire_failure_busy_is_distinct_from_corruption() {
+        let paths = vec!["src/**".to_string()];
+        // Busy/locked subsystem — UNAVAILABLE, not corrupt and not contended.
+        let err = DbError::ResourceBusy("database is locked".to_string());
+        let mcp = reservation_acquire_failure(&paths, "file_reservation_paths", err);
+        let data = mcp.data.expect("data");
+        let payload = data
+            .get("error")
+            .and_then(|e| e.get("data"))
+            .expect("legacy error.data payload");
+        let acq = payload
+            .get("reservation_acquire")
+            .expect("reservation_acquire context block");
+        assert_eq!(acq.get("fail_closed").and_then(Value::as_bool), Some(true));
+        // The whole point of F5: an UNAVAILABLE cause is classified DISTINCTLY
+        // from a corruption cause (and both are distinct from a genuine conflict,
+        // which is the separate FILE_RESERVATION_CONFLICT path).
+        let cause = acq.get("cause").and_then(Value::as_str).unwrap_or_default();
+        assert!(!cause.is_empty(), "busy failure must carry a typed cause");
+        assert_ne!(
+            cause, "main_db_btree_corruption",
+            "a busy/unavailable failure must not be misclassified as corruption"
+        );
+        assert!(payload.get("db_error_classification").is_some());
+    }
+
     fn with_serialized_reservations<F, T>(f: F) -> T
     where
         F: FnOnce() -> T,
@@ -1649,6 +3242,12 @@ mod tests {
         let _lock = RESERVATION_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        mcp_agent_mail_storage::wbq_start();
+        mcp_agent_mail_storage::wbq_flush();
+        mcp_agent_mail_storage::flush_async_commits();
+        mcp_agent_mail_storage::clear_durability_degraded();
+
         let temp = tempfile::tempdir().expect("reservation test tempdir");
         let storage_root = temp.path().join("storage-root");
         std::fs::create_dir_all(&storage_root).expect("reservation test storage root");
@@ -1659,13 +3258,33 @@ mod tests {
             .expect("reservation test storage root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            f,
-        )
+        let (result, stats, degraded) =
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("STORAGE_ROOT", storage_root_str.as_str()),
+                ],
+                || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let stats = mcp_agent_mail_storage::wbq_stats();
+                    let degraded = mcp_agent_mail_storage::durability_degraded();
+                    mcp_agent_mail_storage::clear_durability_degraded();
+                    (result, stats, degraded)
+                },
+            );
+
+        match result {
+            Ok(value) => {
+                assert!(
+                    !degraded,
+                    "reservation test caused WBQ durability degradation after cleanup flush: {stats:?}"
+                );
+                value
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     fn run_async<F, Fut, T>(f: F) -> T
@@ -1709,6 +3328,373 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}) failed: {other:?}"),
         }
+    }
+
+    async fn create_test_reservation(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        agent_id: i64,
+        path: &str,
+        ttl_seconds: i64,
+        exclusive: bool,
+    ) -> mcp_agent_mail_db::FileReservationRow {
+        match queries::create_file_reservations(
+            cx,
+            pool,
+            project_id,
+            agent_id,
+            &[path],
+            ttl_seconds,
+            exclusive,
+            "conflict-check test",
+        )
+        .await
+        {
+            Outcome::Ok(mut rows) => rows.pop().expect("reservation row"),
+            other => panic!("create reservation {path:?} failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflict_check_is_authoritative_read_only_and_filters_non_blocking_rows() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-golden-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let caller = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let holder_id = holder.id.expect("holder id");
+                let caller_id = caller.id.expect("caller id");
+
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "src/main.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "docs/**/*.md",
+                    3_600,
+                    true,
+                )
+                .await;
+                create_test_reservation(&cx, &pool, project_id, holder_id, "config", 3_600, true)
+                    .await;
+                create_test_reservation(&cx, &pool, project_id, caller_id, "own/**", 3_600, true)
+                    .await;
+                create_test_reservation(&cx, &pool, project_id, holder_id, "expired/**", -1, true)
+                    .await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "shared/**",
+                    3_600,
+                    false,
+                )
+                .await;
+                let released = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "released/**",
+                    3_600,
+                    true,
+                )
+                .await;
+                match queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[released.id.expect("released reservation id")]),
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
+                    other => panic!("release fixture failed: {other:?}"),
+                }
+
+                let before =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("before snapshot failed: {other:?}"),
+                    };
+                let ctx = McpContext::new(cx.clone(), 1);
+                let response: ReservationConflictCheckResponse = serde_json::from_str(
+                    &check_file_reservation_conflicts(
+                        &ctx,
+                        project_key,
+                        "bluelake".to_string(),
+                        vec![
+                            "src/main.rs".to_string(),
+                            "src/**".to_string(),
+                            "docs/guide/readme.md".to_string(),
+                            "config/app.toml".to_string(),
+                            "own/file.rs".to_string(),
+                            "expired/file.rs".to_string(),
+                            "released/file.rs".to_string(),
+                            "shared/file.rs".to_string(),
+                            "free/file.rs".to_string(),
+                        ],
+                    )
+                    .await
+                    .expect("conflict check"),
+                )
+                .expect("response json");
+
+                assert!(!response.conflict_free);
+                assert!(response.read_only);
+                assert_eq!(response.authoritative_source, "database_snapshot");
+                assert_eq!(response.checked_paths, 9);
+                let conflict_paths = response
+                    .conflicts
+                    .iter()
+                    .map(|conflict| conflict.path.as_str())
+                    .collect::<HashSet<_>>();
+                assert_eq!(
+                    conflict_paths,
+                    HashSet::from([
+                        "src/main.rs",
+                        "src/**",
+                        "docs/guide/readme.md",
+                        "config/app.toml",
+                    ])
+                );
+                assert!(response.conflicts.iter().all(|conflict| {
+                    conflict
+                        .holders
+                        .iter()
+                        .all(|holder| holder.agent == "GreenCastle" && holder.exclusive)
+                }));
+                assert_eq!(
+                    response.clear_paths,
+                    [
+                        "own/file.rs",
+                        "expired/file.rs",
+                        "released/file.rs",
+                        "shared/file.rs",
+                        "free/file.rs",
+                    ]
+                );
+
+                let after =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("after snapshot failed: {other:?}"),
+                    };
+                assert_eq!(
+                    before
+                        .iter()
+                        .map(|row| (row.id, row.released_ts, row.expires_ts))
+                        .collect::<Vec<_>>(),
+                    after
+                        .iter()
+                        .map(|row| (row.id, row.released_ts, row.expires_ts))
+                        .collect::<Vec<_>>(),
+                    "read-only conflict check must not change reservation state"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn conflict_check_rejects_an_unregistered_caller_spoof() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-spoof-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder.id.expect("holder id"),
+                    "src/guard.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let error = check_file_reservation_conflicts(
+                    &ctx,
+                    project_key,
+                    "GhostAgent".to_string(),
+                    vec!["src/guard.rs".to_string()],
+                )
+                .await
+                .expect_err("unregistered caller must fail closed");
+                let data = error.data.expect("error data");
+                assert_eq!(
+                    data["error"]["data"]["reservation_acquire"]["fail_closed"],
+                    true
+                );
+                assert_eq!(
+                    data["error"]["data"]["reservation_acquire"]["do_not_edit"],
+                    serde_json::json!(["src/guard.rs"])
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn conflict_snapshot_is_fresh_and_enforces_its_sql_row_bound() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-fresh-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let holder_id = holder.id.expect("holder id");
+                let first = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "src/first.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "src/second.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+
+                let bounded = match queries::get_reservation_conflict_snapshot(
+                    &cx,
+                    &pool,
+                    &project_key,
+                    "BlueLake",
+                    1,
+                )
+                .await
+                {
+                    Outcome::Ok(snapshot) => snapshot,
+                    other => panic!("bounded snapshot failed: {other:?}"),
+                };
+                assert!(bounded.overflow);
+                assert!(bounded.reservations.is_empty());
+
+                let primed = match queries::get_reservation_conflict_snapshot(
+                    &cx,
+                    &pool,
+                    &project_key,
+                    "BlueLake",
+                    10,
+                )
+                .await
+                {
+                    Outcome::Ok(snapshot) => snapshot,
+                    other => panic!("prime snapshot failed: {other:?}"),
+                };
+                assert_eq!(primed.reservations.len(), 2);
+                match queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[first.id.expect("first reservation id")]),
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
+                    other => panic!("release failed: {other:?}"),
+                }
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let response: ReservationConflictCheckResponse = serde_json::from_str(
+                    &check_file_reservation_conflicts(
+                        &ctx,
+                        project_key,
+                        "BlueLake".to_string(),
+                        vec!["src/first.rs".to_string()],
+                    )
+                    .await
+                    .expect("fresh conflict check"),
+                )
+                .expect("response json");
+                assert!(response.conflict_free);
+                assert_eq!(response.clear_paths, ["src/first.rs"]);
+            });
+        });
+    }
+
+    #[test]
+    fn conflict_check_fails_closed_on_malformed_request_or_stored_pattern() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-invalid-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                let malformed_request = check_file_reservation_conflicts(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["[broken".to_string()],
+                )
+                .await
+                .expect_err("malformed request must fail closed");
+                let malformed_request_data = malformed_request.data.expect("error data");
+                assert_eq!(malformed_request_data["error"]["data"]["fail_closed"], true);
+
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder.id.expect("holder id"),
+                    "[broken",
+                    3_600,
+                    true,
+                )
+                .await;
+                let malformed_stored = check_file_reservation_conflicts(
+                    &ctx,
+                    project_key,
+                    "BlueLake".to_string(),
+                    vec!["src/main.rs".to_string()],
+                )
+                .await
+                .expect_err("malformed stored reservation must fail closed");
+                let malformed_stored_data = malformed_stored.data.expect("error data");
+                assert_eq!(malformed_stored_data["error"]["data"]["fail_closed"], true);
+                assert_eq!(
+                    malformed_stored_data["error"]["type"],
+                    "MALFORMED_ACTIVE_RESERVATION"
+                );
+            });
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1841,6 +3827,861 @@ mod tests {
         let map = collect_previous_expiries(&rows, 5, None, Some(&[11]));
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&11), Some(&11_000));
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 (br-bvq1x.6.1): reconcile-on-read — heal a reservation whose archive
+    // artifact is missing/stale after a crash between DB-commit and archive-write
+    // -----------------------------------------------------------------------
+
+    fn archive_view(
+        id: i64,
+        agent: &str,
+        path_pattern: Option<&str>,
+        exclusive: Option<bool>,
+        released_ts: Option<i64>,
+    ) -> crate::reservation_parity::ArchiveReservationView {
+        crate::reservation_parity::ArchiveReservationView {
+            reservation_id: id,
+            agent_name: agent.to_string(),
+            reason: String::new(),
+            path_pattern: path_pattern.map(str::to_string),
+            exclusive,
+            released_ts,
+            expires_ts: None,
+        }
+    }
+
+    fn names(pairs: &[(i64, &str)]) -> HashMap<i64, String> {
+        pairs
+            .iter()
+            .map(|(id, name)| (*id, (*name).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn heal_emits_missing_artifact() {
+        // The crash-gap case: DB row committed, archive artifact never written.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let present = BTreeMap::new();
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "a missing artifact must be healed");
+        assert_eq!(heal[0]["id"], 1);
+        assert_eq!(heal[0]["agent"], "GreenCastle");
+        assert_eq!(heal[0]["path_pattern"], "src/**");
+        assert_eq!(heal[0]["exclusive"], true);
+        assert_eq!(heal[0]["project"], "/abs/proj");
+    }
+
+    #[test]
+    fn heal_emits_stale_holder() {
+        // GH#112's wrong-holder class: the archive names a different agent than
+        // the authoritative DB row.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "RustyOtter", Some("src/**"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1);
+        assert_eq!(
+            heal[0]["agent"], "GreenCastle",
+            "the healed artifact must carry the authoritative DB holder"
+        );
+    }
+
+    #[test]
+    fn heal_emits_stale_path_pattern() {
+        let rows = vec![reservation_row(1, 7, "src/a.rs", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/b.rs"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "a divergent reserved path must be healed");
+        assert_eq!(heal[0]["path_pattern"], "src/a.rs");
+    }
+
+    #[test]
+    fn heal_emits_stale_exclusive_flag() {
+        // DB row is shared (exclusive=0) but the archive claims exclusive.
+        let mut row = reservation_row(1, 7, "src/**", 9_999, None);
+        row.exclusive = 0;
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &[row],
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1);
+        assert_eq!(heal[0]["exclusive"], false);
+    }
+
+    #[test]
+    fn heal_emits_when_archive_claims_released_for_active_db_row() {
+        // #112 stuck-released_ts class: the DB row is active but the archive
+        // records it released (a stale release artifact would hide a live holder).
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), Some(123)),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1);
+    }
+
+    #[test]
+    fn terminal_release_classifier_gates_the_queued_fallback() {
+        // Only ops whose EVERY record is a terminal release (released_ts present,
+        // non-null) may fall back to the write-behind queue after a failed direct
+        // write: a queued ACTIVE record drained later would resurrect a
+        // stale-active artifact over a newer direct-written release.
+        let fr_op = |records: Vec<Value>| mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: "proj".to_string(),
+            config: Config::get(),
+            reservations: records,
+        };
+        let active = json!({"id": 1, "agent": "GreenCastle", "path_pattern": "src/**"});
+        let active_null_release = json!({"id": 1, "released_ts": null});
+        let released = json!({"id": 1, "released_ts": "2026-07-05T00:00:00.000000Z"});
+
+        assert!(reservation_op_is_terminal_release(&fr_op(vec![
+            released.clone()
+        ])));
+        assert!(!reservation_op_is_terminal_release(&fr_op(vec![
+            active.clone()
+        ])));
+        assert!(!reservation_op_is_terminal_release(&fr_op(vec![
+            active_null_release
+        ])));
+        // A mixed batch carries an active record -> not safe to queue.
+        assert!(!reservation_op_is_terminal_release(&fr_op(vec![
+            released, active
+        ])));
+        // An empty op has nothing terminal about it.
+        assert!(!reservation_op_is_terminal_release(&fr_op(Vec::new())));
+    }
+
+    #[test]
+    fn heal_emits_stale_expires_ts_after_renew() {
+        // A renewal changes ONLY expires_ts. A pre-renew artifact left behind by
+        // a failed direct write must be flagged as divergent, or the pre-commit
+        // guard (which reads the artifact directly) drops protection at the OLD
+        // expiry while the DB lease is still live.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut stale = archive_view(1, "GreenCastle", Some("src/**"), Some(true), None);
+        stale.expires_ts = Some(5_000);
+        let mut present = BTreeMap::new();
+        present.insert(1, stale);
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "stale pre-renew expiry must heal");
+    }
+
+    #[test]
+    fn heal_is_noop_when_expires_ts_matches() {
+        // The exact-match case: same expiry (as after a clean grant/renew write)
+        // must never re-heal, or every read would churn the archive.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut view = archive_view(1, "GreenCastle", Some("src/**"), Some(true), None);
+        view.expires_ts = Some(9_999);
+        let mut present = BTreeMap::new();
+        present.insert(1, view);
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(heal.is_empty(), "a matching expiry must not re-emit");
+    }
+
+    #[test]
+    fn heal_is_noop_when_consistent() {
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "a consistent artifact must not be re-emitted"
+        );
+    }
+
+    #[test]
+    fn heal_skips_row_with_unknown_agent() {
+        // We must never *guess* a holder — that would write the wrong holder, the
+        // exact failure being healed. A row whose agent_id is unresolvable is left
+        // untouched.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let present = BTreeMap::new();
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(9, "Other")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "an unresolvable holder must be skipped, never guessed"
+        );
+    }
+
+    #[test]
+    fn heal_does_not_flag_archive_that_omits_path_or_exclusive() {
+        // br-xyy95 conservatism: a legacy/hand-authored artifact that omits
+        // path_pattern/exclusive is not divergence. With a matching agent and no
+        // release mismatch, it must not be re-emitted.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(1, archive_view(1, "GreenCastle", None, None, None));
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "absent archive path_pattern/exclusive must not manufacture a heal"
+        );
+    }
+
+    #[test]
+    fn healed_artifact_json_round_trips_through_archive_scan() {
+        // The consistency proof: the artifact the healer authors, written to disk
+        // and scanned back, agrees with the DB row — so re-emitting converges
+        // (does not itself become a new source of drift).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-roundtrip";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+
+        let row = reservation_row(1, 7, "src/**", 9_999, None);
+        let artifact = active_reservation_artifact_json("/abs/proj", "GreenCastle", &row);
+        std::fs::write(
+            reservation_dir.join("id-1.json"),
+            serde_json::to_vec_pretty(&artifact).expect("serialize artifact"),
+        )
+        .expect("write artifact");
+
+        let view =
+            crate::reservation_parity::read_project_archive_reservation(&storage_root, slug, 1)
+                .expect("artifact scanned back");
+        assert_eq!(view.agent_name, "GreenCastle");
+        assert_eq!(view.path_pattern.as_deref(), Some("src/**"));
+        assert_eq!(view.exclusive, Some(true));
+        assert_eq!(view.released_ts, None);
+        assert!(
+            !active_archive_artifact_diverges(&view, &row, "GreenCastle"),
+            "a freshly healed artifact must read back as consistent with the DB row"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // br-74sxo: released-row reconcile-on-read — a release artifact skipped
+    // under disk-critical (or lost to a crash-gap) leaves a stale-ACTIVE
+    // artifact the guard honors until expires_ts; the released-row pass
+    // rewrites it on the next reservation access.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn released_heal_rewrites_stale_active_artifact() {
+        // The skipped-release case: DB row released, artifact still ACTIVE.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), None),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "stale-active artifact must be rewritten");
+        assert_eq!(heal[0]["agent"], "GreenCastle");
+        assert!(
+            !heal[0]["released_ts"].is_null(),
+            "the healed artifact must be terminal (released_ts set)"
+        );
+    }
+
+    #[test]
+    fn released_heal_is_noop_when_artifact_already_released() {
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), Some(5_000)),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "an artifact that already records the release needs no heal"
+        );
+    }
+
+    #[test]
+    fn released_heal_skips_missing_artifact_and_unknown_agent() {
+        // A missing artifact cannot mislead the guard — nothing to heal. An
+        // unresolvable holder must never be guessed (same rule as the active
+        // healer).
+        let rows = vec![
+            reservation_row(1, 7, "src/**", 9_999, Some(5_000)),
+            reservation_row(2, 8, "docs/**", 9_999, Some(5_000)),
+        ];
+        let mut present = BTreeMap::new();
+        present.insert(
+            2,
+            archive_view(2, "Unknowable", Some("docs/**"), Some(true), None),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "missing artifacts and unresolvable holders must not be healed"
+        );
+    }
+
+    #[test]
+    fn released_heal_artifact_round_trips_as_released() {
+        // Consistency proof for the released healer: the artifact it authors,
+        // written and scanned back, records the release — so the guard stops
+        // honoring the holder.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-released-roundtrip";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+
+        let row = reservation_row(1, 7, "src/**", 9_999, Some(5_000));
+        let artifact = released_reservation_artifact_json("/abs/proj", "GreenCastle", &row);
+        std::fs::write(
+            reservation_dir.join("id-1.json"),
+            serde_json::to_vec_pretty(&artifact).expect("serialize artifact"),
+        )
+        .expect("write artifact");
+
+        let view =
+            crate::reservation_parity::read_project_archive_reservation(&storage_root, slug, 1)
+                .expect("artifact scanned back");
+        assert_eq!(view.agent_name, "GreenCastle");
+        assert!(
+            ts_is_positive(view.released_ts),
+            "healed release artifact must scan back as released"
+        );
+    }
+
+    #[test]
+    fn reconcile_on_read_heals_missing_artifact_after_crash_gap() {
+        // The bead acceptance (br-bvq1x.6.1): a crafted crash between a
+        // reservation's DB-commit and its archive-write reconciles to a consistent
+        // state on next access — no wrong holder, no operator action.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f1-reconcile-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                // Reserve src/** through the real tool so the DB row + archive
+                // artifact are both written, then flush so the artifact lands.
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    Some("f1 reconcile holder".to_string()),
+                )
+                .await
+                .expect("initial reservation");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                let reservation_id = active
+                    .iter()
+                    .find(|row| row.agent_id == holder_id)
+                    .and_then(|row| row.id)
+                    .expect("reserved row exists");
+
+                let artifact_path = config
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations")
+                    .join(format!("id-{reservation_id}.json"));
+                assert!(
+                    artifact_path.exists(),
+                    "archive artifact must exist after the initial reservation"
+                );
+
+                // Inject the crash gap: the DB row stays committed but its archive
+                // artifact vanishes (the archive write was lost).
+                std::fs::remove_file(&artifact_path).expect("inject crash gap");
+                assert!(!artifact_path.exists(), "crash gap injected");
+
+                // Next access: a second agent reserves a *different* path. The
+                // reconcile-on-read pass over the active set must heal the missing
+                // artifact for the first holder.
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["docs/**".to_string()],
+                    Some(3600),
+                    Some(false),
+                    Some("f1 reconcile next access".to_string()),
+                )
+                .await
+                .expect("second reservation triggers reconcile-on-read");
+                mcp_agent_mail_storage::wbq_flush();
+
+                assert!(
+                    artifact_path.exists(),
+                    "reconcile-on-read must heal the missing archive artifact on next access"
+                );
+                let healed: Value = serde_json::from_slice(
+                    &std::fs::read(&artifact_path).expect("read healed artifact"),
+                )
+                .expect("healed artifact is valid JSON");
+                assert_eq!(
+                    healed["agent"], "GreenCastle",
+                    "healed artifact must name the authoritative holder (no wrong holder)"
+                );
+                assert_eq!(healed["path_pattern"], "src/**");
+                assert_eq!(healed["exclusive"], true);
+            });
+        });
+    }
+
+    #[test]
+    fn released_row_stale_active_artifact_heals_on_next_access() {
+        // br-74sxo acceptance: a release whose archive write was skipped
+        // (disk-critical) or lost (crash between DB release-commit and the
+        // artifact write) leaves the on-disk artifact claiming ACTIVE. The
+        // pre-commit guard reads that artifact directly, so it keeps honoring
+        // the released holder. The next reservation access must rewrite the
+        // artifact as released — before this pass, nothing ever healed it and
+        // the wrong holder stood until expires_ts.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/released-heal-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                // Reserve, capturing the ACTIVE artifact the release should
+                // later replace.
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    Some("released-heal holder".to_string()),
+                )
+                .await
+                .expect("initial reservation");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                let reservation_id = active
+                    .iter()
+                    .find(|row| row.agent_id == holder_id)
+                    .and_then(|row| row.id)
+                    .expect("reserved row exists");
+                let artifact_path = config
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations")
+                    .join(format!("id-{reservation_id}.json"));
+                let active_artifact_bytes =
+                    std::fs::read(&artifact_path).expect("snapshot ACTIVE artifact bytes");
+
+                // Release through the real tool (DB releases + artifact
+                // rewritten), then inject the skip: put the stale ACTIVE
+                // artifact back, as if the release-time write never landed.
+                release_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("release reservation");
+                mcp_agent_mail_storage::wbq_flush();
+                std::fs::write(&artifact_path, &active_artifact_bytes)
+                    .expect("inject skipped release-artifact write");
+                let stale: Value = serde_json::from_slice(
+                    &std::fs::read(&artifact_path).expect("read stale artifact"),
+                )
+                .expect("stale artifact is valid JSON");
+                assert!(
+                    stale.get("released_ts").is_none_or(Value::is_null),
+                    "injected artifact must claim ACTIVE"
+                );
+
+                // Next access: another agent touches reservations in the same
+                // project. The released-row reconcile pass must rewrite the
+                // stale-active artifact as released.
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["docs/**".to_string()],
+                    Some(3600),
+                    Some(false),
+                    Some("released-heal next access".to_string()),
+                )
+                .await
+                .expect("second reservation triggers released-row reconcile");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let healed: Value = serde_json::from_slice(
+                    &std::fs::read(&artifact_path).expect("read healed artifact"),
+                )
+                .expect("healed artifact is valid JSON");
+                assert_eq!(
+                    healed["agent"], "GreenCastle",
+                    "heal must preserve the authoritative holder identity"
+                );
+                assert!(
+                    healed.get("released_ts").is_some_and(|ts| !ts.is_null()),
+                    "released-row reconcile must rewrite the stale-active artifact as released"
+                );
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // F3 (br-bvq1x.6.3): idempotent, parity-aware release_file_reservations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn release_double_release_is_a_clean_noop() {
+        // Acceptance: releasing an already-released lease is a no-op success, not
+        // an error — release_reservations_by_ids is eligibility-checked, so the
+        // second release matches nothing.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f3-double-release-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("reserve");
+
+                let first: Value = serde_json::from_str(
+                    &release_file_reservations(
+                        &ctx,
+                        project_key.clone(),
+                        "GreenCastle".to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("first release"),
+                )
+                .expect("release json");
+                assert!(
+                    first["released"].as_i64().unwrap_or(0) >= 1,
+                    "first release should release the held lease"
+                );
+
+                let second: Value = serde_json::from_str(
+                    &release_file_reservations(
+                        &ctx,
+                        project_key.clone(),
+                        "GreenCastle".to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("second release must not error"),
+                )
+                .expect("release json");
+                assert_eq!(
+                    second["released"].as_i64(),
+                    Some(0),
+                    "double release must be a clean no-op (0 released, no error)"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn release_reconciles_missing_archive_artifact_for_other_active_holder() {
+        // Acceptance: releasing reconciles both stores. A still-active holder's
+        // archive artifact that drifted (missing after a crash gap) is healed when
+        // ANY agent releases — the release path runs the same reconcile-on-read
+        // pass as the acquire path.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f3-release-reconcile-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("holder reserve");
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["docs/**".to_string()],
+                    Some(3600),
+                    Some(false),
+                    None,
+                )
+                .await
+                .expect("releaser reserve");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                let holder_reservation_id = active
+                    .iter()
+                    .find(|row| row.agent_id == holder_id)
+                    .and_then(|row| row.id)
+                    .expect("holder reservation exists");
+                let artifact_path = config
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations")
+                    .join(format!("id-{holder_reservation_id}.json"));
+                assert!(artifact_path.exists(), "holder artifact written");
+                std::fs::remove_file(&artifact_path).expect("inject crash gap");
+
+                // BlueLake releases its OWN reservation; the release path reconciles
+                // the still-active holder's drifted artifact.
+                release_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("release triggers reconcile");
+                mcp_agent_mail_storage::wbq_flush();
+
+                assert!(
+                    artifact_path.exists(),
+                    "release must reconcile the other holder's missing archive artifact"
+                );
+                let healed: Value =
+                    serde_json::from_slice(&std::fs::read(&artifact_path).expect("read healed"))
+                        .expect("valid json");
+                assert_eq!(healed["agent"], "GreenCastle");
+                assert_eq!(healed["path_pattern"], "src/**");
+            });
+        });
+    }
+
+    #[test]
+    fn replay_release_intent_does_not_release_lease_reacquired_by_other_agent() {
+        // The bead REVISION: a queued release-intent replay must re-validate, never
+        // blindly release a lease another agent now legitimately holds. The intent
+        // is left pending by releasing the original lease via the DB directly (the
+        // tool's own release auto-replays, which would consume it too early).
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f3-replay-revalidate-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                let reacquirer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let reacquirer_id = reacquirer.id.unwrap_or(0);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("holder reserve");
+                let holder_reservation_id =
+                    match queries::get_active_reservations(&cx, &pool, project_id).await {
+                        Outcome::Ok(rows) => rows
+                            .iter()
+                            .find(|row| row.agent_id == holder_id)
+                            .and_then(|row| row.id)
+                            .expect("holder reservation"),
+                        other => panic!("get_active_reservations failed: {other:?}"),
+                    };
+
+                // Queue a durable release-intent for the holder (simulating a
+                // DB-unavailable release), then release the lease via the DB
+                // directly so the intent stays pending.
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    "GreenCastle",
+                    Some(vec!["src/**".to_string()]),
+                    None,
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("queue release intent");
+                match queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[holder_reservation_id]),
+                )
+                .await
+                {
+                    Outcome::Ok(_) => {}
+                    other => panic!("direct release failed: {other:?}"),
+                }
+
+                // BlueLake now legitimately RE-ACQUIRES src/**.
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("reacquire");
+
+                // Replaying the prior holder's intent must NOT release BlueLake's
+                // re-acquired lease — the replay is agent-scoped + eligibility-checked.
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                assert!(
+                    active
+                        .iter()
+                        .any(|row| row.agent_id == reacquirer_id && row.released_ts.is_none()),
+                    "replay of the prior holder's intent must not release the re-acquired lease"
+                );
+            });
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -2179,6 +5020,542 @@ mod tests {
     }
 
     #[test]
+    fn release_intent_error_classifier_only_queues_database_failures() {
+        let corruption = legacy_tool_error(
+            "DATABASE_CORRUPTION",
+            "database is malformed",
+            false,
+            json!({}),
+        );
+        let busy = legacy_tool_error("RESOURCE_BUSY", "database is locked", true, json!({}));
+        let not_found = legacy_tool_error("NOT_FOUND", "agent not found", true, json!({}));
+        let invalid = McpError::new(McpErrorCode::InvalidParams, "invalid path");
+
+        assert!(mcp_error_supports_release_intent(&corruption));
+        assert!(mcp_error_supports_release_intent(&busy));
+        assert!(!mcp_error_supports_release_intent(&not_found));
+        assert!(!mcp_error_supports_release_intent(&invalid));
+    }
+
+    #[test]
+    fn release_intent_append_writes_hash_stamped_private_jsonl() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/release-intent-project",
+                "BlueLake",
+                Some(vec!["src/**".to_string()]),
+                Some(vec![7]),
+                "get_db_pool",
+                "database disk image is malformed",
+            )
+            .expect("append release intent");
+
+            assert_eq!(receipt.intent_path, release_intent_log_path(&config));
+            assert_eq!(receipt.content_sha256.len(), 64);
+            assert_eq!(&receipt.content_sha256[..16], receipt.intent_id);
+
+            let content =
+                std::fs::read_to_string(&receipt.intent_path).expect("read release intent log");
+            let value: Value = serde_json::from_str(content.trim()).expect("release intent JSON");
+            assert_eq!(
+                value["schema_version"].as_u64(),
+                Some(u64::from(RELEASE_INTENT_SCHEMA_VERSION))
+            );
+            assert_eq!(value["kind"].as_str(), Some(RELEASE_INTENT_KIND));
+            assert_eq!(
+                value["intent_id"].as_str(),
+                Some(receipt.intent_id.as_str())
+            );
+            assert_eq!(
+                value["content_sha256"].as_str(),
+                Some(receipt.content_sha256.as_str())
+            );
+            assert_eq!(
+                value["project_key"].as_str(),
+                Some("/tmp/release-intent-project")
+            );
+            assert_eq!(value["agent_name"].as_str(), Some("BlueLake"));
+            assert_eq!(value["paths"][0].as_str(), Some("src/**"));
+            assert_eq!(value["file_reservation_ids"][0].as_i64(), Some(7));
+            assert_eq!(value["failure"]["stage"].as_str(), Some("get_db_pool"));
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let log_mode = std::fs::metadata(&receipt.intent_path)
+                    .expect("release intent log metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(log_mode, 0o600);
+                let parent = receipt
+                    .intent_path
+                    .parent()
+                    .expect("release intent log parent");
+                let parent_mode = std::fs::metadata(parent)
+                    .expect("release intent parent metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(parent_mode, 0o700);
+
+                let lock_mode = std::fs::metadata(release_intent_lock_path(&config))
+                    .expect("release intent lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(lock_mode, 0o600);
+            }
+        });
+    }
+
+    #[test]
+    fn queued_release_intent_response_reports_queued_release() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let payload = queued_release_intent_response(
+                &config,
+                "/tmp/queued-release",
+                "BlueLake",
+                Some(vec!["src/main.rs".to_string()]),
+                None,
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("queued response");
+            let parsed: Value = serde_json::from_str(&payload).expect("queued JSON");
+            assert_eq!(parsed["released"].as_i64(), Some(0));
+            assert_eq!(parsed["status"].as_str(), Some("queued"));
+            assert_eq!(parsed["queued"].as_bool(), Some(true));
+            assert_eq!(
+                parsed["message"].as_str(),
+                Some("lease release queued because DB unavailable")
+            );
+            assert!(parsed["released_at"].as_str().is_some());
+            assert!(parsed["intent"]["id"].as_str().is_some());
+            assert!(parsed["intent"]["content_sha256"].as_str().is_some());
+            assert_eq!(
+                parsed["intent"]["path"].as_str(),
+                Some(release_intent_log_path(&config).to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                read_queued_release_intents(&config)
+                    .expect("read queued intents")
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_suppresses_replayed_intents() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/replayed-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "list_unreleased_file_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            assert_eq!(
+                read_queued_release_intents(&config)
+                    .expect("read pending release intent")
+                    .len(),
+                1
+            );
+            append_release_replay_record(
+                &config,
+                &receipt.intent_id,
+                &receipt.content_sha256,
+                "replayed",
+                1,
+                None,
+            );
+            assert!(
+                read_queued_release_intents(&config)
+                    .expect("read after replay")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_suppresses_abandoned_intents() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/abandoned-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "list_unreleased_file_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            assert_eq!(
+                read_queued_release_intents(&config)
+                    .expect("read pending release intent")
+                    .len(),
+                1
+            );
+            // A permanently un-replayable intent records a terminal "abandoned"
+            // marker; the reader must clear it just like "replayed" so it is not
+            // retried (and re-appended) forever.
+            append_release_replay_record(
+                &config,
+                &receipt.intent_id,
+                &receipt.content_sha256,
+                "abandoned",
+                0,
+                Some("agent no longer exists"),
+            );
+            assert!(
+                read_queued_release_intents(&config)
+                    .expect("read after abandon")
+                    .is_empty(),
+                "abandoned release intent must be terminal, not retried forever"
+            );
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_isolates_torn_final_line() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            // Record 1: a valid queued intent — the log now ends in a newline.
+            append_release_intent(
+                &config,
+                "/tmp/torn-release",
+                "BlueLake",
+                None,
+                Some(vec![7]),
+                "list_unreleased_file_reservations",
+                "database is locked",
+            )
+            .expect("append intent 1");
+
+            // Simulate a crash mid-append: a torn fragment with NO trailing
+            // newline (looks like a release intent but is truncated/invalid).
+            let log_path = release_intent_log_path(&config);
+            {
+                use std::io::Write;
+                let mut torn = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log_path)
+                    .expect("open release intent log");
+                torn.write_all(b"{\"kind\":\"release_file_reservations_intent\",\"partial")
+                    .expect("write torn fragment");
+            }
+
+            // Record 2: another valid intent appended after the torn fragment.
+            append_release_intent(
+                &config,
+                "/tmp/torn-release",
+                "BlueLake",
+                None,
+                Some(vec![8]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append intent 2");
+
+            // The leading-newline guard isolates the torn fragment on its own
+            // skippable line, so the second valid record is not swallowed.
+            let intents = read_queued_release_intents(&config).expect("read intents");
+            assert_eq!(
+                intents.len(),
+                2,
+                "torn final line must not swallow the following valid record"
+            );
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_ignores_unhashed_replay_marker() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/unhashed-replay-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            let fake_replay = json!({
+                "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+                "kind": RELEASE_INTENT_REPLAY_KIND,
+                "intent_id": &receipt.intent_id,
+                "replayed_ts": mcp_agent_mail_db::now_micros(),
+                "status": "replayed",
+                "released": 1,
+                "error_detail": Value::Null,
+            });
+            append_release_intent_jsonl(&config, &fake_replay)
+                .expect("append unhashed replay marker");
+
+            let intents = read_queued_release_intents(&config).expect("read queued intents");
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].intent_id, receipt.intent_id);
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_ignores_replay_marker_for_wrong_intent_hash() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/wrong-hash-replay-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            let mut wrong_intent_hash = format!("{}{}", receipt.intent_id, "0".repeat(48));
+            if wrong_intent_hash == receipt.content_sha256 {
+                wrong_intent_hash = format!("{}{}", receipt.intent_id, "f".repeat(48));
+            }
+            append_release_replay_record(
+                &config,
+                &receipt.intent_id,
+                &wrong_intent_hash,
+                "replayed",
+                1,
+                None,
+            );
+
+            let intents = read_queued_release_intents(&config).expect("read queued intents");
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].intent_id, receipt.intent_id);
+            assert_eq!(intents[0].content_sha256, receipt.content_sha256);
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_skips_hash_mismatches() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/hash-mismatch-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            let content =
+                std::fs::read_to_string(&receipt.intent_path).expect("read release intent log");
+            let first_line = content.lines().next().expect("release intent line");
+            let mut tampered: Value =
+                serde_json::from_str(first_line).expect("release intent JSON");
+            tampered["agent_name"] = Value::String("RedLake".to_string());
+            append_release_intent_jsonl(&config, &tampered).expect("append tampered intent");
+
+            let intents = read_queued_release_intents(&config).expect("read queued intents");
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].intent_id, receipt.intent_id);
+            assert_eq!(intents[0].agent_name, "BlueLake");
+        });
+    }
+
+    #[test]
+    fn replay_queued_release_intent_releases_once() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/replay-release-intent-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "queued release replay regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    &agent.name,
+                    None,
+                    Some(vec![reservation_id]),
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("append release intent");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+
+                let rows =
+                    match queries::get_reservations_by_ids(&cx, &pool, &[reservation_id]).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("get_reservations_by_ids failed: {other:?}"),
+                    };
+                let released_ts = rows
+                    .iter()
+                    .find(|row| row.id == Some(reservation_id))
+                    .and_then(|row| row.released_ts);
+                assert!(
+                    released_ts.is_some(),
+                    "queued intent replay should release the reservation"
+                );
+                assert!(
+                    read_queued_release_intents(&config)
+                        .expect("read queued release intents")
+                        .is_empty(),
+                    "successfully replayed intents should not be replayed again"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn replay_abandons_release_intent_for_missing_agent() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/abandon-release-intent-{}", unique_suffix());
+                // Create the project but never register the queued agent, so the
+                // replay's resolve_agent returns NOT_FOUND — a permanent,
+                // non-retryable failure (mirrors the ack abandon test).
+                let project = ensure_project(&cx, &pool, &project_key).await;
+
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    "GhostAgent",
+                    None,
+                    Some(vec![1]),
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("append release intent");
+                assert_eq!(
+                    read_queued_release_intents(&config)
+                        .expect("read queued release intents")
+                        .len(),
+                    1
+                );
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                // Idempotent: a permanently un-replayable intent must clear on the
+                // first replay and stay cleared, never retried forever.
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+
+                assert!(
+                    read_queued_release_intents(&config)
+                        .expect("read after abandon")
+                        .is_empty(),
+                    "release intent for a missing agent should be abandoned, not retried forever"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn release_intent_retry_reports_current_release_before_replay() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/release-intent-retry-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "queued release retry regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    &agent.name,
+                    None,
+                    Some(vec![reservation_id]),
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("append release intent");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = release_file_reservations(
+                    &ctx,
+                    project.human_key.clone(),
+                    agent.name.clone(),
+                    None,
+                    Some(vec![reservation_id]),
+                )
+                .await
+                .expect("release_file_reservations");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(
+                    parsed["released"].as_i64(),
+                    Some(1),
+                    "retrying the same release should report the caller's release, not a pre-call replay"
+                );
+                assert!(
+                    read_queued_release_intents(&config)
+                        .expect("read queued release intents")
+                        .is_empty(),
+                    "successful retry should mark the prior intent replayed after the current release"
+                );
+            });
+        });
+    }
+
+    #[test]
     fn renewal_result_empty_reservations() {
         let r = RenewalResult {
             renewed: 0,
@@ -2326,6 +5703,24 @@ mod tests {
     }
 
     #[test]
+    fn renewal_filter_matches_includes_defensively_active_nonpositive_released_ts() {
+        // released_ts <= 0 is ACTIVE per the canonical predicate, so a path/id
+        // filtered release/renew must still match it — consistent with the
+        // unfiltered "release all" SQL branch.
+        let active_zero = reservation_row(42, 7, "src/**", 1, Some(0));
+        assert!(
+            renewal_filter_matches(&active_zero, 7, Some(&["src/main.rs".to_string()]), None),
+            "released_ts=0 is active and must match for renew/release"
+        );
+        // A genuinely released row (positive released_ts) stays excluded.
+        let released = reservation_row(43, 7, "src/**", 1, Some(1_700_000_000_000_000));
+        assert!(
+            !renewal_filter_matches(&released, 7, Some(&["src/main.rs".to_string()]), None),
+            "a positively-released reservation must not match for renew/release"
+        );
+    }
+
+    #[test]
     fn release_file_reservations_filtered_ids_include_expired_unreleased_rows() {
         with_serialized_reservations(|| {
             run_async(|cx| async move {
@@ -2432,6 +5827,23 @@ mod tests {
                 )
                 .expect("delete holder row");
                 conn.execute_sync(
+                    "INSERT OR REPLACE INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                     VALUES (?, ?, ?, 'src/**', 1, 'force release stale cache regression', ?, ?, NULL)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(2_000_000),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(1),
+                        ),
+                    ],
+                )
+                .expect("restore orphaned reservation fixture");
+                conn.execute_sync(
                     "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
                     &[
                         mcp_agent_mail_db::sqlmodel::Value::BigInt(
@@ -2463,6 +5875,91 @@ mod tests {
                 );
                 assert_eq!(parsed["reservation"]["notified"].as_bool(), Some(false));
                 assert!(parsed["reservation"]["last_agent_activity_ts"].is_null());
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_file_reservation_reports_committed_release_timestamp() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/force-release-db-ts-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let actor = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let holder_id = holder.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    &["src/release-timestamp.rs"],
+                    3600,
+                    true,
+                    "force release timestamp regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(1),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                    ],
+                )
+                .expect("expire reservation");
+                drop(conn);
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = force_release_file_reservation(
+                    &ctx,
+                    project.human_key.clone(),
+                    actor.name.clone(),
+                    reservation_id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("force release succeeds");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(parsed["released"].as_i64(), Some(1));
+
+                let rows =
+                    match queries::get_reservations_by_ids(&cx, &pool, &[reservation_id]).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("get_reservations_by_ids failed: {other:?}"),
+                    };
+                let db_release_ts = rows
+                    .iter()
+                    .find(|row| row.id == Some(reservation_id))
+                    .and_then(|row| row.released_ts)
+                    .expect("reservation should have committed released_ts");
+                let db_release_iso = micros_to_iso(db_release_ts);
+
+                assert_eq!(
+                    parsed["released_at"].as_str(),
+                    Some(db_release_iso.as_str())
+                );
+                assert_eq!(
+                    parsed["reservation"]["released_ts"].as_str(),
+                    Some(db_release_iso.as_str())
+                );
             });
         });
     }

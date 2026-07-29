@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Git archive storage backend for MCP Agent Mail"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
+publish = false
 
 [dependencies]
 serde.workspace = true
@@ -15,13 +18,13 @@ chrono.workspace = true
 regex.workspace = true
 asupersync.workspace = true
 git2.workspace = true
-sha1 = "0.10"
-sha2 = "0.10"
+sha1.workspace = true
+sha2.workspace = true
 hex = "0.4"
 fs2.workspace = true
 nix.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
-base64 = "0.22"
+base64 = "0.23"
 thiserror.workspace = true
 tracing.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
@@ -34,7 +37,17 @@ default = ["mcp-agent-mail-db/default"]
 portable = ["mcp-agent-mail-db/portable"]
 
 [dev-dependencies]
+# Enable asupersync `test-internals` for TEST builds only so tests can
+# construct `Cx::for_testing()`; the release build excludes dev-deps and keeps
+# the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
+asupersync = { workspace = true, features = ["test-internals"] }
+criterion.workspace = true
 tempfile = "3"
+toml.workspace = true
+
+[[bench]]
+name = "boot_check_bench"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

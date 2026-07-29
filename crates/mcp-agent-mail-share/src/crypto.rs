@@ -175,6 +175,8 @@ pub fn verify_bundle(
                     signature_checked: false,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some(format!(
                         "SRI entry for {relative_path} has non-string value"
                     )),
@@ -190,6 +192,8 @@ pub fn verify_bundle(
                         signature_checked: false,
                         signature_verified: false,
                         key_source: None,
+                        database_checked: false,
+                        database_verified: false,
                         error: Some(traversal_err),
                     });
                 }
@@ -214,6 +218,8 @@ pub fn verify_bundle(
                         signature_checked: false,
                         signature_verified: false,
                         key_source: None,
+                        database_checked: false,
+                        database_verified: false,
                         error: Some(format!(
                             "SRI mismatch for {relative_path}: file content does not match manifest hash"
                         )),
@@ -228,6 +234,8 @@ pub fn verify_bundle(
                     signature_checked: false,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some(format!("SRI-referenced file missing: {relative_path}")),
                 });
             }
@@ -252,6 +260,8 @@ pub fn verify_bundle(
                     signature_checked: true,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some("signature file must not be a symlink".to_string()),
                 });
             }
@@ -263,6 +273,8 @@ pub fn verify_bundle(
                     signature_checked: true,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some("signature file must be a regular file".to_string()),
                 });
             }
@@ -311,6 +323,17 @@ pub fn verify_bundle(
         Err(error) => return Err(ShareError::Io(error)),
     }
 
+    // Verify the database payload against the manifest's signed `database.sha256`.
+    // The signature above only proves `manifest.json` is authentic; without this
+    // check an attacker can swap `mailbox.sqlite3` (or its chunks) for arbitrary
+    // content and the bundle would still verify "green".
+    let (database_checked, database_verified, database_error) =
+        match verify_database_payload(bundle_root, &manifest)? {
+            Some(Ok(())) => (true, true, None),
+            Some(Err(message)) => (true, false, Some(message)),
+            None => (false, false, None),
+        };
+
     Ok(VerifyResult {
         bundle: bundle_root.display().to_string(),
         sri_checked,
@@ -318,8 +341,128 @@ pub fn verify_bundle(
         signature_checked,
         signature_verified,
         key_source,
-        error: None,
+        database_checked,
+        database_verified,
+        error: database_error,
     })
+}
+
+/// Verify the bundle's database payload against the manifest's signed
+/// `database.sha256`.
+///
+/// Returns `Ok(None)` when there is nothing to check (no `database` section,
+/// no recorded hash, or no database artifact present in the bundle),
+/// `Ok(Some(Ok(())))` when the payload hash matches the manifest, and
+/// `Ok(Some(Err(message)))` when it diverges or a referenced artifact is
+/// missing/unreadable. For chunked databases the chunks are streamed in index
+/// order — equivalent to hashing the reassembled file — so the comparison is
+/// against the same `database.sha256` the exporter recorded.
+fn verify_database_payload(
+    bundle_root: &Path,
+    manifest: &serde_json::Value,
+) -> ShareResult<Option<Result<(), String>>> {
+    let Some(database) = manifest.get("database") else {
+        return Ok(None);
+    };
+    let Some(expected) = database.get("sha256").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let chunked = database
+        .get("chunked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let db_rel = database
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mailbox.sqlite3");
+
+    if chunked {
+        let Some(chunk_count) = database
+            .get("chunk_manifest")
+            .and_then(|c| c.get("chunk_count"))
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return Ok(Some(Err(
+                "chunked database manifest is missing chunk_count".to_string(),
+            )));
+        };
+        // Verify the reassembled chunks against the signed hash: streamed in
+        // index order, which is byte-identical to the original database file.
+        let mut hasher = Sha256::new();
+        for index in 0..chunk_count {
+            let chunk_rel = format!("chunks/{index:05}.bin");
+            let chunk_path = match resolve_sri_file_path(bundle_root, &chunk_rel) {
+                Ok(path) => path,
+                Err(err) => return Ok(Some(Err(err))),
+            };
+            if !crate::is_real_file(&chunk_path) {
+                return Ok(Some(Err(format!("database chunk missing: {chunk_rel}"))));
+            }
+            if let Err(err) = hash_file_into(&chunk_path, &mut hasher) {
+                return Ok(Some(Err(format!("failed to read {chunk_rel}: {err}"))));
+            }
+        }
+        if !hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected) {
+            return Ok(Some(Err(
+                "reassembled database chunks do not match the signed manifest hash".to_string(),
+            )));
+        }
+        // A chunked bundle also ships the standalone `mailbox.sqlite3`; if present
+        // it must match the same signed hash, so a swapped standalone DB (with the
+        // chunks left intact) cannot pass verification either.
+        return Ok(Some(
+            verify_db_file_against_hash(bundle_root, db_rel, expected)?.unwrap_or(Ok(())),
+        ));
+    }
+
+    // Non-chunked: verify the standalone database file. Absent (e.g. an encrypted
+    // or metadata-only bundle) → not checked.
+    verify_db_file_against_hash(bundle_root, db_rel, expected)
+}
+
+/// Hash the database file at `db_rel` (if present) and compare to `expected`.
+///
+/// Returns `Ok(None)` when the file is absent (nothing to verify),
+/// `Ok(Some(Ok(())))` on a match, and `Ok(Some(Err(_)))` on a mismatch, an
+/// unreadable file, or a rejected path (symlink / traversal).
+fn verify_db_file_against_hash(
+    bundle_root: &Path,
+    db_rel: &str,
+    expected: &str,
+) -> ShareResult<Option<Result<(), String>>> {
+    let db_path = match resolve_sri_file_path(bundle_root, db_rel) {
+        Ok(path) => path,
+        Err(err) => return Ok(Some(Err(err))),
+    };
+    if !crate::is_real_file(&db_path) {
+        return Ok(None);
+    }
+    let mut hasher = Sha256::new();
+    if let Err(err) = hash_file_into(&db_path, &mut hasher) {
+        return Ok(Some(Err(format!("failed to read {db_rel}: {err}"))));
+    }
+    if hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected) {
+        Ok(Some(Ok(())))
+    } else {
+        Ok(Some(Err(
+            "database payload does not match the signed manifest hash".to_string(),
+        )))
+    }
+}
+
+/// Stream a file into an existing SHA-256 hasher (bounded memory).
+fn hash_file_into(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(())
 }
 
 fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
@@ -395,6 +538,12 @@ pub struct VerifyResult {
     /// Where the public key came from: `"explicit"` (caller-provided),
     /// `"embedded"` (from sig file itself — self-signed, no trust anchor), or `null`.
     pub key_source: Option<String>,
+    /// Whether the database payload (`mailbox.sqlite3` or its chunks) was checked
+    /// against the manifest's signed `database.sha256`.
+    pub database_checked: bool,
+    /// Whether the database payload matched the manifest's signed `database.sha256`.
+    /// Only meaningful as authenticity when `signature_verified` is also true.
+    pub database_verified: bool,
     pub error: Option<String>,
 }
 
@@ -754,7 +903,7 @@ mod tests {
         );
         let recipient = combined
             .lines()
-            .find(|line| line.contains("public key:"))
+            .find(|line| line.to_ascii_lowercase().contains("public key:"))
             .and_then(|line| line.split_whitespace().last())
             .map(|s| s.to_string())?;
         Some((identity_path, recipient))
@@ -839,6 +988,124 @@ mod tests {
         sig.public_key
     }
 
+    const PRIVACY_RAW_MARKERS: &[&str] = &[
+        "/home/ubuntu/private/acme-client",
+        "sk-abcdef0123456789012345",
+        "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+        "Bearer dGVzdF90b2tlbl9uZXN0ZWQxMjM0NTY3ODkw",
+        "PeerAgent",
+    ];
+
+    fn assert_text_omits_privacy_markers(label: &str, text: &str) {
+        for marker in PRIVACY_RAW_MARKERS {
+            assert!(
+                !text.contains(marker),
+                "{label} leaked private privacy-corpus marker: {marker}"
+            );
+        }
+    }
+
+    fn assert_bytes_omit_privacy_markers(label: &str, bytes: &[u8]) {
+        for marker in PRIVACY_RAW_MARKERS {
+            let marker_bytes = marker.as_bytes();
+            assert!(
+                !bytes
+                    .windows(marker_bytes.len())
+                    .any(|window| window == marker_bytes),
+                "{label} leaked private privacy-corpus marker: {marker}"
+            );
+        }
+    }
+
+    fn write_privacy_proof_bundle_fixture(bundle_dir: &Path) -> String {
+        std::fs::create_dir_all(bundle_dir.join("viewer/vendor")).unwrap();
+        std::fs::create_dir_all(bundle_dir.join("viewer/data")).unwrap();
+
+        let db_bytes = b"redacted mailbox proof for br-lmcob.13";
+        std::fs::write(bundle_dir.join("mailbox.sqlite3"), db_bytes).unwrap();
+        std::fs::write(
+            bundle_dir.join("index.html"),
+            r#"<!doctype html><meta name="agent-mail-schema" content="0.1.0"><main data-fixture="br-lmcob.13" data-product="prod-public">[project path redacted: acme-client]</main>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/index.html"),
+            r#"<main data-fixture="br-lmcob.13">privacy proof viewer</main>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/vendor/app.js"),
+            br#"window.AGENT_MAIL_PRIVACY_FIXTURE="br-lmcob.13";"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/data/messages.json"),
+            r#"[{"id":1,"subject":"Deploy [REDACTED]","body":"[Message body redacted]","project":"acme-client","product_uid":"prod-public"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/data/meta.json"),
+            r#"{"schema_version":"0.1.0","privacy_fixture":"br-lmcob.13","scrub_preset":"strict","product_uid":"prod-public"}"#,
+        )
+        .unwrap();
+
+        let app_js = std::fs::read(bundle_dir.join("viewer/vendor/app.js")).unwrap();
+        let viewer_index = std::fs::read(bundle_dir.join("viewer/index.html")).unwrap();
+        let mut sri_entries = serde_json::Map::new();
+        sri_entries.insert(
+            "vendor/app.js".to_string(),
+            serde_json::Value::String(format!("sha256-{}", base64_encode(&sha256_bytes(&app_js)))),
+        );
+        sri_entries.insert(
+            "viewer/index.html".to_string(),
+            serde_json::Value::String(format!(
+                "sha256-{}",
+                base64_encode(&sha256_bytes(&viewer_index))
+            )),
+        );
+
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "bundle_type": "privacy-proof",
+            "privacy_fixture": {
+                "id": "br-lmcob.13",
+                "public_proof": {
+                    "project_slug": "acme-client",
+                    "project_human_key": "[project path redacted: acme-client]",
+                    "product_uid": "prod-public",
+                    "scrub_preset": "strict"
+                }
+            },
+            "database": {
+                "path": "mailbox.sqlite3",
+                "size_bytes": db_bytes.len(),
+                "sha256": hex_sha256(db_bytes),
+            },
+            "viewer": {
+                "sri": sri_entries,
+                "data": {
+                    "messages": "viewer/data/messages.json",
+                    "meta": "viewer/data/meta.json"
+                }
+            },
+        });
+        let manifest_path = bundle_dir.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let key_path = bundle_dir
+            .parent()
+            .unwrap_or(bundle_dir)
+            .join("privacy_fixture_signing.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+        let sig_path = bundle_dir.join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+        sig.public_key
+    }
+
     #[test]
     fn hex_sha256_known_value() {
         let hash = hex_sha256(b"hello");
@@ -907,6 +1174,124 @@ mod tests {
             !result.signature_verified,
             "tampered manifest should fail verification"
         );
+    }
+
+    #[test]
+    fn tampered_database_fails_verification_despite_valid_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let public_key = write_signed_bundle_fixture(dir.path(), "full");
+
+        // A pristine bundle verifies end-to-end, including the database payload.
+        let ok = verify_bundle(dir.path(), Some(&public_key)).unwrap();
+        assert!(ok.signature_verified, "pristine signature should verify");
+        assert!(ok.database_checked, "database should have been checked");
+        assert!(ok.database_verified, "pristine database should verify");
+        assert!(ok.error.is_none());
+
+        // Swap the database for attacker-controlled content WITHOUT touching the
+        // signed manifest. The Ed25519 signature still validates (it only covers
+        // manifest.json), but the database no longer matches the signed hash — the
+        // exact gap this check closes.
+        std::fs::write(
+            dir.path().join("mailbox.sqlite3"),
+            b"attacker-controlled database",
+        )
+        .unwrap();
+
+        let tampered = verify_bundle(dir.path(), Some(&public_key)).unwrap();
+        assert!(
+            tampered.signature_verified,
+            "manifest signature is untouched, so it still verifies"
+        );
+        assert!(tampered.database_checked);
+        assert!(
+            !tampered.database_verified,
+            "a swapped database must fail verification"
+        );
+        assert!(
+            tampered.error.is_some(),
+            "a database mismatch must surface an error"
+        );
+    }
+
+    #[test]
+    fn chunked_bundle_verifies_both_chunks_and_standalone_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A small "database" split into two chunks; the standalone file is the
+        // concatenation, and the signed manifest hash is over that concatenation
+        // (exactly how the exporter computes db_sha256, then chunks).
+        let part0 = b"chunk-zero-contents-".to_vec();
+        let part1 = b"chunk-one-contents!!".to_vec();
+        let db_bytes: Vec<u8> = part0.iter().chain(part1.iter()).copied().collect();
+        let db_hash = hex_sha256(&db_bytes);
+
+        std::fs::create_dir_all(root.join("chunks")).unwrap();
+        std::fs::write(root.join("chunks/00000.bin"), &part0).unwrap();
+        std::fs::write(root.join("chunks/00001.bin"), &part1).unwrap();
+        std::fs::write(root.join("mailbox.sqlite3"), &db_bytes).unwrap();
+
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "database": {
+                "path": "mailbox.sqlite3",
+                "size_bytes": db_bytes.len(),
+                "sha256": db_hash,
+                "chunked": true,
+                "chunk_manifest": { "version": 1, "chunk_count": 2 },
+            },
+        });
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let key_path = root.join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+        let sig_path = root.join("manifest.sig.json");
+        let public_key = sign_manifest(&manifest_path, &key_path, &sig_path, false)
+            .unwrap()
+            .public_key;
+
+        // Pristine: both the reassembled chunks and the standalone DB match.
+        let ok = verify_bundle(root, Some(&public_key)).unwrap();
+        assert!(ok.signature_verified);
+        assert!(
+            ok.database_checked && ok.database_verified,
+            "pristine chunked bundle should verify"
+        );
+        assert!(ok.error.is_none());
+
+        // Swap the standalone mailbox.sqlite3 (chunks left intact). A consumer
+        // that loads the standalone DB would otherwise get attacker content while
+        // verify reported green — so this MUST fail.
+        std::fs::write(
+            root.join("mailbox.sqlite3"),
+            b"attacker-controlled standalone db",
+        )
+        .unwrap();
+        let swapped_db = verify_bundle(root, Some(&public_key)).unwrap();
+        assert!(
+            swapped_db.signature_verified,
+            "manifest signature untouched"
+        );
+        assert!(
+            !swapped_db.database_verified,
+            "a swapped standalone DB must fail verification even when chunks are intact"
+        );
+        assert!(swapped_db.error.is_some());
+
+        // Restore the standalone DB and tamper a chunk instead — must also fail.
+        std::fs::write(root.join("mailbox.sqlite3"), &db_bytes).unwrap();
+        std::fs::write(root.join("chunks/00001.bin"), b"tampered-chunk").unwrap();
+        let swapped_chunk = verify_bundle(root, Some(&public_key)).unwrap();
+        assert!(
+            !swapped_chunk.database_verified,
+            "a tampered chunk must fail verification"
+        );
+        assert!(swapped_chunk.error.is_some());
     }
 
     #[test]
@@ -1833,6 +2218,118 @@ mod tests {
         assert_eq!(
             manifest.get("bundle_type").and_then(|v| v.as_str()),
             Some("full")
+        );
+
+        let verify = verify_bundle(&extracted, Some(&explicit_pubkey)).unwrap();
+        assert!(verify.sri_checked);
+        assert!(verify.sri_valid);
+        assert!(verify.signature_checked);
+        assert!(verify.signature_verified);
+        assert_eq!(verify.key_source.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn age_roundtrip_privacy_proof_bundle_preserves_redacted_replay_artifacts() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let source = dir.path().join("privacy_bundle_source");
+        std::fs::create_dir_all(&source).unwrap();
+        let explicit_pubkey = write_privacy_proof_bundle_fixture(&source);
+
+        let exported_text = [
+            "manifest.json",
+            "index.html",
+            "viewer/index.html",
+            "viewer/data/messages.json",
+            "viewer/data/meta.json",
+        ]
+        .iter()
+        .map(|relative| std::fs::read_to_string(source.join(relative)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_text_omits_privacy_markers("privacy proof source bundle", &exported_text);
+        for public_marker in [
+            "br-lmcob.13",
+            "prod-public",
+            "[project path redacted: acme-client]",
+            "\"schema_version\": \"0.1.0\"",
+        ] {
+            assert!(
+                exported_text.contains(public_marker),
+                "privacy proof source bundle should retain public marker: {public_marker}"
+            );
+        }
+
+        let zip_path = dir.path().join("privacy_bundle.zip");
+        crate::package_directory_as_zip(&source, &zip_path).unwrap();
+        let original_zip = std::fs::read(&zip_path).unwrap();
+        assert_bytes_omit_privacy_markers("privacy proof zip", &original_zip);
+
+        let encrypted = encrypt_with_age(&zip_path, std::slice::from_ref(&recipient)).unwrap();
+        let ciphertext = std::fs::read(&encrypted).unwrap();
+        assert_bytes_omit_privacy_markers("privacy proof age payload", &ciphertext);
+        for public_marker in [
+            "br-lmcob.13".as_bytes(),
+            b"prod-public".as_slice(),
+            b"[project path redacted: acme-client]".as_slice(),
+        ] {
+            assert!(
+                !ciphertext
+                    .windows(public_marker.len())
+                    .any(|window| window == public_marker),
+                "age ciphertext should not expose plaintext marker"
+            );
+        }
+
+        let decrypted_zip_path = dir.path().join("privacy_bundle.decrypted.zip");
+        decrypt_with_age(&encrypted, &decrypted_zip_path, Some(&identity_path), None).unwrap();
+        let decrypted_zip = std::fs::read(&decrypted_zip_path).unwrap();
+        assert_eq!(
+            decrypted_zip, original_zip,
+            "decrypted privacy proof bundle should match original zip bytes"
+        );
+
+        let extracted = dir.path().join("privacy_bundle_extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
+        extract_zip_archive(&decrypted_zip_path, &extracted);
+
+        let manifest_text = std::fs::read_to_string(extracted.join("manifest.json")).unwrap();
+        assert_text_omits_privacy_markers("decrypted privacy manifest", &manifest_text);
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest.get("schema_version").and_then(|v| v.as_str()),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            manifest["privacy_fixture"]["public_proof"]["product_uid"],
+            "prod-public"
+        );
+        assert_eq!(
+            manifest["privacy_fixture"]["public_proof"]["project_human_key"],
+            "[project path redacted: acme-client]"
+        );
+
+        let decrypted_exported_text = [
+            "index.html",
+            "viewer/index.html",
+            "viewer/data/messages.json",
+            "viewer/data/meta.json",
+        ]
+        .iter()
+        .map(|relative| std::fs::read_to_string(extracted.join(relative)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_text_omits_privacy_markers(
+            "decrypted privacy static artifacts",
+            &decrypted_exported_text,
         );
 
         let verify = verify_bundle(&extracted, Some(&explicit_pubkey)).unwrap();

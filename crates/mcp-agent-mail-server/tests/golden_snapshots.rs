@@ -386,9 +386,9 @@ fn app_dashboard_80x24_status_segments() {
         text.contains("Dashboard"),
         "80-col: screen title must be present (Critical): {text}"
     );
-    // Help hint '?' must be present (Critical)
+    // Help hint must be present (Critical)
     assert!(
-        text.contains('?'),
+        text.contains("F1") || text.contains('?'),
         "80-col: help hint must be present (Critical): {text}"
     );
 }
@@ -500,7 +500,9 @@ fn app_help_over_palette_precedence_80x24() {
     let text = buffer_to_text(&frame.buffer);
     // Help overlay title should be visible (topmost overlay)
     assert!(
-        text.contains("Keyboard Shortcuts") || text.contains("Esc to close"),
+        text.contains("Help & Keybindings")
+            || text.contains("Keyboard Shortcuts")
+            || text.contains("Esc close"),
         "help overlay should be visible on top of palette: {text}"
     );
 

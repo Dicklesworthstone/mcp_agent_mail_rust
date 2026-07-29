@@ -273,6 +273,13 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
     ),
     // File reservations
     (
+        "check_file_reservation_conflicts",
+        ToolMeta {
+            capabilities: &["audit", "file_reservations", "read", "repository"],
+            complexity: "medium",
+        },
+    ),
+    (
         "file_reservation_paths",
         ToolMeta {
             capabilities: &["file_reservations", "repository"],

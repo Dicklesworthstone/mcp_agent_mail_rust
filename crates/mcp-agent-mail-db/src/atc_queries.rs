@@ -200,7 +200,7 @@ impl RollupConn for crate::DbConn {
     }
 }
 
-impl RollupConn for sqlmodel_pool::PooledConnection<crate::DbConn> {
+impl RollupConn for crate::CanonicalDbConn {
     fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         self.query_sync(sql, params)
             .map_err(|error| error.to_string())
@@ -213,7 +213,7 @@ impl RollupConn for sqlmodel_pool::PooledConnection<crate::DbConn> {
     }
 }
 
-impl RollupConn for crate::CanonicalDbConn {
+impl RollupConn for sqlmodel_pool::PooledConnection<crate::DbConn> {
     fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
         self.query_sync(sql, params)
             .map_err(|error| error.to_string())
@@ -1315,6 +1315,217 @@ pub async fn retention_compact(
     })
 }
 
+const COUNT_ALL_EXPERIENCES_SQL: &str = "SELECT COUNT(*) AS c FROM atc_experiences";
+
+const COUNT_TERMINAL_EXPERIENCES_SQL: &str = "\
+    SELECT COUNT(*) AS c FROM atc_experiences \
+    WHERE state IN ('resolved', 'censored', 'expired') AND resolved_ts IS NOT NULL";
+
+const EVICTION_CUTOFF_SQL: &str = "\
+    SELECT resolved_ts AS rts FROM atc_experiences \
+    WHERE state IN ('resolved', 'censored', 'expired') AND resolved_ts IS NOT NULL \
+    ORDER BY resolved_ts ASC, experience_id ASC LIMIT 1 OFFSET ?";
+
+fn experience_scalar_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::BigInt(n) => Some(*n),
+        Value::Int(n) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
+
+/// Hysteresis target for the experience ceiling: evict down to ~90% of the cap
+/// so a table hovering at the ceiling does not trigger a full eviction pass on
+/// every maintenance cycle. Pure (no IO) so it is unit-testable. Always strictly
+/// below `max_rows` for `max_rows >= 2`.
+fn experience_ceiling_target(max_rows: i64) -> i64 {
+    if max_rows <= 1 {
+        return 0;
+    }
+    let slack = (max_rows / 10).max(1);
+    (max_rows - slack).max(0)
+}
+
+fn count_atc_experiences(conn: &impl RollupConn, sql: &str) -> Result<i64, DbError> {
+    let rows = conn
+        .rollup_query_sync(sql, &[])
+        .map_err(|error| DbError::Sqlite(format!("atc experience ceiling count: {error}")))?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get_by_name("c"))
+        .and_then(experience_scalar_i64)
+        .unwrap_or(0))
+}
+
+fn experience_eviction_cutoff_ts(conn: &impl RollupConn, to_evict: i64) -> Result<i64, DbError> {
+    let offset = to_evict.saturating_sub(1).max(0);
+    let rows = conn
+        .rollup_query_sync(EVICTION_CUTOFF_SQL, &[Value::BigInt(offset)])
+        .map_err(|error| DbError::Sqlite(format!("atc experience ceiling cutoff: {error}")))?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get_by_name("rts"))
+        .and_then(experience_scalar_i64)
+        .unwrap_or(i64::MAX))
+}
+
+/// Roll up and evict the oldest terminal rows down to the hysteresis target when
+/// `atc_experiences` exceeds `max_rows`. See [`enforce_experience_row_ceiling`]
+/// for the contract; this is the connection-level core, factored out so it can be
+/// driven directly in tests.
+fn enforce_experience_row_ceiling_with_conn(
+    conn: &impl RollupConn,
+    max_rows: i64,
+) -> Result<usize, DbError> {
+    if max_rows <= 0 {
+        return Ok(0);
+    }
+    let total = count_atc_experiences(conn, COUNT_ALL_EXPERIENCES_SQL)?;
+    if total <= max_rows {
+        return Ok(0);
+    }
+
+    let target = experience_ceiling_target(max_rows);
+    let to_evict = total - target; // > 0 because total > max_rows >= target
+    let terminal = count_atc_experiences(conn, COUNT_TERMINAL_EXPERIENCES_SQL)?;
+
+    // Phase 1 — learning-friendly path: roll up and evict the oldest TERMINAL
+    // (resolved/censored/expired) rows. `retention_compact_with_conn` deletes
+    // terminal rows with `resolved_ts <= cutoff`; pick a cutoff that captures (at
+    // least) the `to_evict` oldest terminal rows; ties at the cutoff timestamp
+    // evict a few extra rows, which only helps boundedness. When there are no
+    // terminal rows at all the table is a pure open backlog — Phase 2 handles it.
+    let evicted = if terminal == 0 {
+        0
+    } else {
+        let cutoff = if to_evict >= terminal {
+            i64::MAX
+        } else {
+            experience_eviction_cutoff_ts(conn, to_evict)?
+        };
+        retention_compact_with_conn(conn, cutoff)?
+    };
+
+    let remaining = total.saturating_sub(i64::try_from(evicted).unwrap_or(i64::MAX));
+    if remaining <= max_rows {
+        tracing::info!(
+            total,
+            evicted,
+            target,
+            max_rows,
+            "atc experience ceiling enforced: rolled up and evicted oldest terminal rows"
+        );
+        return Ok(evicted);
+    }
+
+    // Phase 2 — hard-cap backstop. A large OPEN/unresolved backlog still leaves
+    // the table over the ceiling (the outcome-resolution pipeline is not keeping
+    // up). An unbounded ledger wedges startup and bloats the DB (css 2026-06:
+    // 629K rows / 2.41 GB), so force-rotate the oldest rows REGARDLESS of state
+    // down to the target. Boundedness is the invariant; the dropped rows are the
+    // oldest stale pending decisions, and rollups retain the aggregate signal for
+    // resolved history.
+    let surplus = remaining - target; // > 0 because remaining > max_rows >= target
+    let forced = force_rotate_oldest_experiences_with_conn(conn, surplus)?;
+    let evicted_total = evicted.saturating_add(forced);
+    tracing::warn!(
+        total,
+        terminal,
+        evicted,
+        forced,
+        max_rows,
+        "atc experience ceiling: open/unresolved backlog exceeded the cap; \
+         force-rotated the oldest rows regardless of state to keep the ledger \
+         bounded (raw learning detail for those decisions is lost — the \
+         outcome-resolution pipeline is not keeping up)"
+    );
+    Ok(evicted_total)
+}
+
+const FORCE_ROTATE_CUTOFF_SQL: &str = "\
+    SELECT experience_id AS eid FROM atc_experiences \
+    ORDER BY experience_id ASC LIMIT 1 OFFSET ?";
+
+const FORCE_ROTATE_COUNT_SQL: &str =
+    "SELECT COUNT(*) AS c FROM atc_experiences WHERE experience_id <= ?";
+
+const FORCE_ROTATE_DELETE_SQL: &str = "DELETE FROM atc_experiences WHERE experience_id <= ?";
+
+/// Hard-cap backstop: delete the oldest `to_evict` rows by durable
+/// `experience_id` REGARDLESS of lifecycle state.
+///
+/// Used only when [`enforce_experience_row_ceiling_with_conn`]'s terminal-row
+/// eviction cannot bound the table because the surplus is open/unresolved (a
+/// starved outcome-resolution pipeline). This intentionally drops raw learning
+/// detail for the oldest pending decisions so the ledger can never grow
+/// unbounded; the rollups already hold the aggregate signal for resolved
+/// history. `experience_id` is the durable monotone insertion sequence, so
+/// "oldest by `experience_id`" is a stable, gap-tolerant ordering. Returns the
+/// number of rows deleted.
+fn force_rotate_oldest_experiences_with_conn(
+    conn: &impl RollupConn,
+    to_evict: i64,
+) -> Result<usize, DbError> {
+    if to_evict <= 0 {
+        return Ok(0);
+    }
+    let offset = to_evict.saturating_sub(1).max(0);
+    let cutoff_eid = conn
+        .rollup_query_sync(FORCE_ROTATE_CUTOFF_SQL, &[Value::BigInt(offset)])
+        .map_err(|error| DbError::Sqlite(format!("atc force-rotate cutoff: {error}")))?
+        .first()
+        .and_then(|row| row.get_by_name("eid"))
+        .and_then(experience_scalar_i64);
+    let Some(cutoff_eid) = cutoff_eid else {
+        return Ok(0);
+    };
+
+    conn.rollup_execute_sync("BEGIN IMMEDIATE", &[])
+        .map_err(|error| DbError::Sqlite(format!("atc force-rotate begin: {error}")))?;
+    let result = (|| -> Result<usize, DbError> {
+        let doomed = conn
+            .rollup_query_sync(FORCE_ROTATE_COUNT_SQL, &[Value::BigInt(cutoff_eid)])
+            .map_err(|error| DbError::Sqlite(format!("atc force-rotate count: {error}")))?
+            .first()
+            .and_then(|row| row.get_by_name("c"))
+            .and_then(experience_scalar_i64)
+            .unwrap_or(0);
+        conn.rollup_execute_sync(FORCE_ROTATE_DELETE_SQL, &[Value::BigInt(cutoff_eid)])
+            .map_err(|error| DbError::Sqlite(format!("atc force-rotate delete: {error}")))?;
+        conn.rollup_execute_sync("COMMIT", &[])
+            .map_err(|error| DbError::Sqlite(format!("atc force-rotate commit: {error}")))?;
+        Ok(usize::try_from(doomed).unwrap_or(0))
+    })();
+    if let Err(error) = result {
+        let _ = conn.rollup_execute_sync("ROLLBACK", &[]);
+        return Err(error);
+    }
+    result
+}
+
+/// Enforce a hard row ceiling on `atc_experiences` for a file-backed pool.
+///
+/// When the table exceeds `max_rows`, the oldest TERMINAL (resolved/censored/
+/// expired) rows are folded into the rollups and deleted down to a hysteresis
+/// target — preserving rollups and all open/unresolved rows. This is a SAFETY
+/// bound (not a fidelity policy): unbounded raw-experience growth corrupted
+/// SQLite and OOM'd the host on ts2 (859K rows / 3.36 GB), so the ceiling takes
+/// precedence over the age-based 365-day drop window. Open rows are never
+/// evicted (they are needed for outcome resolution); if they alone exceed the
+/// cap, the function logs a backlog warning and leaves them in place.
+///
+/// No-op for `:memory:` pools and for `max_rows <= 0` (disabled). Returns the
+/// number of raw rows evicted.
+pub fn enforce_experience_row_ceiling(pool: &DbPool, max_rows: i64) -> Result<usize, DbError> {
+    if max_rows <= 0 || pool.sqlite_path() == ":memory:" {
+        return Ok(0);
+    }
+    let conn = crate::queries::open_canonical_atc_conn(pool, "experience_ceiling")?;
+    let result = enforce_experience_row_ceiling_with_conn(&conn, max_rows);
+    crate::queries::close_canonical_db_conn(conn, "experience_ceiling connection");
+    result
+}
+
 fn replay_canonical(pool: &DbPool, range: SequenceRange) -> Result<ExperienceStream, DbError> {
     let conn = crate::queries::open_canonical_atc_conn(pool, "replay_atc_experiences")?;
     let result = (|| {
@@ -1506,6 +1717,11 @@ mod tests {
     }
 
     fn test_pool() -> DbPool {
+        // These pools exercise rollup arithmetic, not durability: every ATC
+        // sidecar connection in this process runs with synchronous=OFF so 256
+        // proptest cases don't grind hundreds of WAL fsyncs each (br-j5l8s;
+        // 380s -> seconds for refresh_rollups_conserves_counts standalone).
+        crate::queries::ATC_CONN_TEST_RELAXED_DURABILITY.store(true, Ordering::Relaxed);
         let pool_id = TEST_POOL_ID.fetch_add(1, Ordering::Relaxed);
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(format!("atc_rollup_test_{pool_id}.db"));
@@ -1514,6 +1730,9 @@ mod tests {
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
             .expect("apply ATC test pragmas");
+        init_conn
+            .execute_raw("PRAGMA synchronous = OFF;")
+            .expect("relax ATC test init durability");
         let base_sql = crate::schema::init_schema_sql_base();
         init_conn
             .execute_raw(&base_sql)
@@ -1534,7 +1753,7 @@ mod tests {
             .expect("apply ATC canonical follow-up schema");
         crate::queries::close_canonical_db_conn(init_conn, "ATC rollup test init connection");
 
-        crate::create_pool(&crate::pool::DbPoolConfig {
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
             max_connections: 1,
@@ -1549,7 +1768,18 @@ mod tests {
                 .expect("lock test tempdir registry")
                 .push(dir);
         })
-        .expect("create file-backed ATC test pool")
+        .expect("create file-backed ATC test pool");
+
+        // ATC telemetry now lives in the dedicated sidecar DB (br-bvq1x.11.7);
+        // canonical ATC IO opens the sidecar, so its schema must be initialized
+        // there (the schema applied to the primary file above is now unused).
+        runtime
+            .block_on(crate::queries::ensure_file_backed_atc_pool_initialized(
+                &cx, &pool,
+            ))
+            .into_result()
+            .expect("initialize ATC sidecar schema for test pool");
+        pool
     }
 
     fn encode_outcome(spec: &TestExperienceSpec) -> Option<String> {
@@ -2104,6 +2334,212 @@ mod tests {
         assert!(summary.preserved_rollups);
         assert_eq!(before_rollups, after_rollups);
         assert_eq!(ids, vec![3, 4]);
+    }
+
+    // ── br-bvq1x.11.6: count-based hard ceiling (ts2 unbounded-growth killer) ──
+
+    #[test]
+    fn experience_ceiling_target_uses_ten_percent_hysteresis() {
+        assert_eq!(experience_ceiling_target(250_000), 225_000);
+        assert_eq!(experience_ceiling_target(100), 90);
+        assert_eq!(experience_ceiling_target(10), 9);
+        assert_eq!(experience_ceiling_target(1), 0);
+        assert_eq!(experience_ceiling_target(0), 0);
+        for cap in [2_i64, 5, 50, 999, 1_000_000] {
+            let target = experience_ceiling_target(cap);
+            assert!(target < cap, "target {target} must be below cap {cap}");
+            assert!(target >= 0);
+        }
+    }
+
+    #[test]
+    fn enforce_experience_row_ceiling_evicts_oldest_terminal_rows_down_to_target() {
+        let pool = test_pool();
+        let base = crate::now_micros();
+        // 12 terminal (resolved) rows with strictly increasing resolved_ts.
+        for id in 1..=12i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "liveness".to_string(),
+                    effect_kind: "probe".to_string(),
+                    state: "resolved".to_string(),
+                    created_ts_micros: base + id * 1_000 - 500,
+                    resolved_ts_micros: Some(base + id * 1_000),
+                    correct: Some(true),
+                    actual_loss: Some(0.0),
+                    regret: Some(0.0),
+                },
+            );
+        }
+        // 2 open rows that must never be evicted.
+        for id in 13..=14i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "liveness".to_string(),
+                    effect_kind: "probe".to_string(),
+                    state: "open".to_string(),
+                    created_ts_micros: base + id * 1_000,
+                    resolved_ts_micros: None,
+                    correct: None,
+                    actual_loss: None,
+                    regret: None,
+                },
+            );
+        }
+
+        // cap=10 -> target=9; total=14 -> evict the 5 oldest terminal rows.
+        let evicted = enforce_experience_row_ceiling(&pool, 10).expect("ceiling sweep");
+        assert_eq!(
+            evicted, 5,
+            "should evict total(14) - target(9) oldest terminal rows"
+        );
+
+        let remaining: Vec<u64> = run_replay(&pool, SequenceRange::default())
+            .rows
+            .iter()
+            .map(|row| row.experience_id)
+            .collect();
+        assert_eq!(
+            remaining,
+            (6u64..=14).collect::<Vec<_>>(),
+            "oldest 5 terminal rows evicted; the rest plus open rows are preserved"
+        );
+
+        let open_ids: Vec<u64> = query_open_rows(&pool, OpenExperienceFilter::default())
+            .iter()
+            .map(|row| row.experience_id)
+            .collect();
+        assert!(
+            open_ids.contains(&13) && open_ids.contains(&14),
+            "open rows must be preserved: {open_ids:?}"
+        );
+
+        assert!(
+            !fetch_rollups(&pool).is_empty(),
+            "evicted rows must be folded into rollups (aggregate signal preserved)"
+        );
+
+        // Now under the cap, a second sweep is a no-op.
+        assert_eq!(
+            enforce_experience_row_ceiling(&pool, 10).expect("second sweep"),
+            0,
+            "ceiling sweep must be a no-op once the table is at/under target"
+        );
+    }
+
+    #[test]
+    fn enforce_experience_row_ceiling_force_rotates_pure_open_backlog() {
+        // br-78c6m: a pure OPEN/unresolved backlog (a starved outcome-resolution
+        // pipeline, exactly the css 2.41 GB / 629K-row incident) must NOT grow
+        // unbounded. When terminal eviction cannot bound the table, the hard-cap
+        // backstop force-rotates the oldest rows regardless of state so the
+        // ledger is provably bounded by the cap.
+        let pool = test_pool();
+        let base = crate::now_micros();
+        for id in 1..=5i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "conflict".to_string(),
+                    effect_kind: "release".to_string(),
+                    state: "open".to_string(),
+                    created_ts_micros: base + id * 1_000,
+                    resolved_ts_micros: None,
+                    correct: None,
+                    actual_loss: None,
+                    regret: None,
+                },
+            );
+        }
+        // cap=2 -> target=1; total=5, no terminal rows -> force-rotate the 4
+        // oldest open rows so the table can never exceed the cap.
+        let evicted = enforce_experience_row_ceiling(&pool, 2).expect("ceiling sweep");
+        assert_eq!(evicted, 4, "force-rotate total(5) - target(1) oldest rows");
+        let remaining: Vec<u64> = run_replay(&pool, SequenceRange::default())
+            .rows
+            .iter()
+            .map(|row| row.experience_id)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![5u64],
+            "only the newest row survives; the ledger is bounded to the target"
+        );
+        // Idempotent once at/under the cap.
+        assert_eq!(
+            enforce_experience_row_ceiling(&pool, 2).expect("second sweep"),
+            0,
+            "no-op once the table is within the cap"
+        );
+    }
+
+    #[test]
+    fn enforce_experience_row_ceiling_force_rotates_open_surplus_after_terminal_eviction() {
+        // br-78c6m mixed case: terminal rows are folded + evicted first
+        // (learning-friendly), but a large open backlog still exceeds the cap, so
+        // the hard-cap backstop trims the oldest remaining (open) rows down to the
+        // target. Boundedness is guaranteed regardless of resolution state.
+        let pool = test_pool();
+        let base = crate::now_micros();
+        // 3 terminal rows (oldest) ...
+        for id in 1..=3i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "liveness".to_string(),
+                    effect_kind: "probe".to_string(),
+                    state: "resolved".to_string(),
+                    created_ts_micros: base + id * 1_000 - 500,
+                    resolved_ts_micros: Some(base + id * 1_000),
+                    correct: Some(true),
+                    actual_loss: Some(0.0),
+                    regret: Some(0.0),
+                },
+            );
+        }
+        // ... then 9 open rows.
+        for id in 4..=12i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "liveness".to_string(),
+                    effect_kind: "probe".to_string(),
+                    state: "open".to_string(),
+                    created_ts_micros: base + id * 1_000,
+                    resolved_ts_micros: None,
+                    correct: None,
+                    actual_loss: None,
+                    regret: None,
+                },
+            );
+        }
+        // cap=4 -> target=3. total=12. Phase 1 folds+evicts the 3 terminal rows
+        // (ids 1-3); remaining 9 (>4). Phase 2 force-rotates surplus = 9 - 3 = 6
+        // oldest (ids 4-9). Final table = ids 10,11,12.
+        let evicted = enforce_experience_row_ceiling(&pool, 4).expect("ceiling sweep");
+        assert_eq!(evicted, 9, "3 terminal evicted + 6 open force-rotated");
+        let remaining: Vec<u64> = run_replay(&pool, SequenceRange::default())
+            .rows
+            .iter()
+            .map(|row| row.experience_id)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![10u64, 11, 12],
+            "only the newest `target` rows survive"
+        );
+        // Terminal rows folded into rollups before the open surplus was rotated.
+        assert!(
+            !fetch_rollups(&pool).is_empty(),
+            "terminal rows must be folded into rollups before force-rotation"
+        );
     }
 
     #[test]

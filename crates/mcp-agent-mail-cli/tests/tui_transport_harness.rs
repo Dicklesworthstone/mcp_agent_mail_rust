@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -152,6 +153,18 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
 
     let start = Instant::now();
     let mut child = cmd.spawn().expect("spawn command");
+    let mut stdout_pipe = child.stdout.take().expect("child stdout pipe");
+    let mut stderr_pipe = child.stderr.take().expect("child stderr pipe");
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut output);
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut output);
+        output
+    });
     let mut timed_out = false;
 
     loop {
@@ -169,8 +182,10 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
         }
     }
 
-    let output = child.wait_with_output().expect("wait_with_output");
-    let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let status = child.wait().expect("wait child");
+    let stdout = stdout_reader.join().expect("join stdout reader");
+    let stderr_bytes = stderr_reader.join().expect("join stderr reader");
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
     if timed_out {
         if !stderr.is_empty() {
             stderr.push('\n');
@@ -182,8 +197,8 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
     }
 
     CommandOutcome {
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        exit_code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
         stderr,
         duration_ms: start.elapsed().as_millis() as u64,
         timed_out,

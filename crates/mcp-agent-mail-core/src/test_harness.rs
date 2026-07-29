@@ -491,7 +491,7 @@ pub fn seed_from_env_or_random(test_name: &str) -> u64 {
         return s;
     }
     let mut buf = [0u8; 8];
-    if getrandom::getrandom(&mut buf).is_err() {
+    if getrandom::fill(&mut buf).is_err() {
         // Fallback: combine PID + timestamp bits
         let fallback = u64::from(std::process::id())
             .wrapping_mul(0x517c_c1b7_2722_0a95)

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/git_repo_lock.schema.json",
+  "title": "git repo mutex event",
+  "description": "Structured tracing payload for per-process git repository mutex events.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": [],
+  "x-planned": true,
+  "x-drift-required-fields": [],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version", "lock_kind"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "lock_kind": { "type": "string", "enum": ["process_mutex"] },
+        "wait_seconds": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

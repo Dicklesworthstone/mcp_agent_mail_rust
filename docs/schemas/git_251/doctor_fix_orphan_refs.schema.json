@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/doctor_fix_orphan_refs.schema.json",
+  "title": "doctor fix orphan refs event",
+  "description": "Structured tracing payload for doctor fix-orphan-refs operations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": [
+    "no_projects_to_scan",
+    "fix_orphan_refs_started",
+    "flock_acquire_failed",
+    "ref_pruned",
+    "fix_orphan_refs_done",
+    "packed_refs_backup_written",
+    "packed_refs_rebuild_completed",
+    "backup_rotation_remove_failed",
+    "backup_pruned"
+  ],
+  "x-drift-required-fields": [],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version", "op"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "op": { "type": "string" },
+        "project": { "type": "string" },
+        "apply": { "type": "boolean" },
+        "dry_run": { "type": "boolean" },
+        "force": { "type": "boolean" },
+        "findings": { "type": "integer", "minimum": 0 },
+        "pruned": { "type": "integer", "minimum": 0 },
+        "refused_protected": { "type": "integer", "minimum": 0 },
+        "refused_unknown": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "ref_name": { "type": "string" },
+        "oid": { "type": "string" },
+        "src": { "type": "string" },
+        "dst": { "type": "string" },
+        "path": { "type": "string" },
+        "err": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

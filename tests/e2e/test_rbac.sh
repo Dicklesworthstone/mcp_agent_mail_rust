@@ -2,8 +2,8 @@
 # test_rbac.sh - E2E test suite for RBAC (role-based access control) enforcement
 #
 # Verifies (br-3h13.9.2):
-# - Reader role can call read tools (fetch_inbox, whois, list_contacts, search_messages)
-# - Reader role is DENIED for write tools (send_message, register_agent, file_reservation_paths)
+# - Reader role can call read tools (whois, list_contacts, search_messages)
+# - Reader role is DENIED for write tools (send_message, register_agent, file_reservation_paths, fetch_inbox)
 # - Writer role can call both read and write tools
 # - Unknown role is denied for all tools
 # - RBAC error responses include role information
@@ -271,16 +271,16 @@ fi
 e2e_mark_case_end "case02_reader_whois"
 fail_fast_if_needed
 
-e2e_case_banner "Reader role: fetch_inbox (read operation - should succeed)"
+e2e_case_banner "Reader role: fetch_inbox (state-mutating read receipt - should be denied)"
 e2e_mark_case_start "case03_reader_inbox"
 rbac_rpc_call "case03_reader_inbox" "fetch_inbox" \
     "{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RbacTestAgent\"}" \
     "Authorization: Bearer ${READER_TOKEN}"
 STATUS_CASE3="$(e2e_rpc_read_status "case03_reader_inbox")"
-if [ "$STATUS_CASE3" = "200" ]; then
-    e2e_pass "fetch_inbox accessible for reader role (HTTP 200)"
+if [ "$STATUS_CASE3" = "403" ]; then
+    e2e_pass "fetch_inbox denied for reader role (HTTP 403)"
 else
-    e2e_fail "fetch_inbox denied for reader role (status=${STATUS_CASE3})"
+    e2e_fail "fetch_inbox reader-role status" "${STATUS_CASE3}" "403"
 fi
 e2e_mark_case_end "case03_reader_inbox"
 fail_fast_if_needed

@@ -29,7 +29,7 @@ e2e_case_banner "Golden output validation"
 GOLDEN_DIR="${E2E_PROJECT_ROOT}/benches/golden"
 if [ -f "${GOLDEN_DIR}/checksums.sha256" ]; then
     set +e
-    golden_result=$("$AM" golden validate 2>&1)
+    golden_result=$("$AM" golden verify 2>&1)
     golden_rc=$?
     set -e
 

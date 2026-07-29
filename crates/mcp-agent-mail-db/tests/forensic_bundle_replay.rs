@@ -9,7 +9,7 @@
 //! - **Salvage merge**: DB-only state from a salvage database is merged correctly.
 //! - **Drift detection**: archive vs DB drift is reported accurately.
 //! - **Interrupted bundle**: partially written / truncated bundle artifacts.
-//! - **Corrupt salvage**: recovery degrades gracefully with corrupt salvage db.
+//! - **Corrupt salvage**: recovery fails closed rather than promoting archive-only state.
 //! - **Multi-project / multi-agent**: complex archive with multiple projects,
 //!   agents, messages, cross-project messaging.
 
@@ -1039,11 +1039,11 @@ fn replay_drift_detection_db_ahead() {
 }
 
 // ============================================================================
-// Scenario 4: Corrupt salvage database graceful degradation
+// Scenario 4: Corrupt salvage database fails closed
 // ============================================================================
 
 #[test]
-fn replay_corrupt_salvage_degrades_gracefully() {
+fn replay_corrupt_salvage_refuses_archive_only_candidate() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("reconstructed.db");
     let salvage_db_path = tmp.path().join("corrupt-salvage.db");
@@ -1079,30 +1079,20 @@ fn replay_corrupt_salvage_degrades_gracefully() {
     std::fs::write(&salvage_db_path, b"THIS IS NOT A SQLITE DATABASE")
         .expect("write corrupt salvage");
 
-    // Should succeed (salvage is skipped with a warning, not fatal)
-    let stats =
+    let error =
         reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-            .expect("should succeed despite corrupt salvage");
+            .expect_err("corrupt salvage must prevent archive-only promotion");
 
-    assert_eq!(stats.projects, 1);
-    assert_eq!(stats.agents, 1);
-    assert_eq!(stats.messages, 1);
-    assert_eq!(
-        stats.salvaged_projects, 0,
-        "corrupt salvage should not contribute"
-    );
-    assert_eq!(stats.salvaged_agents, 0);
-    assert_eq!(stats.salvaged_messages, 0);
     assert!(
-        stats.warnings.iter().any(|w| w.contains("Skipping")),
-        "should have a warning about skipping corrupt salvage; warnings: {:?}",
-        stats.warnings,
+        error
+            .to_string()
+            .contains("refusing an archive-only candidate"),
+        "failure should explain that DB-only coordination state is protected: {error}"
     );
-
-    // Verify the archive data survived
-    let snapshot = snapshot_db(&db_path);
-    assert_eq!(snapshot.messages.len(), 1);
-    assert_eq!(snapshot.messages[0].1, "Survived msg");
+    assert!(
+        !db_path.exists(),
+        "a failed salvage probe must not create a promotable candidate"
+    );
 }
 
 // ============================================================================

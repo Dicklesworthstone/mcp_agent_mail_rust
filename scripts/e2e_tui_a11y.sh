@@ -20,7 +20,7 @@ set -euo pipefail
 
 E2E_SUITE="${E2E_SUITE:-tui_a11y}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 : "${AM_TUI_A11Y_SKIP_CONTRAST:=0}"
@@ -30,6 +30,41 @@ TMP_BASE="${TMP_BASE%/}"
 
 e2e_init_artifacts
 e2e_banner "TUI Accessibility (Keyboard + Contrast) E2E Test Suite"
+
+_TUI_A11Y_ADAPTER_MANIFEST_WRITTEN=0
+write_tui_a11y_adapter_manifest() {
+    if [ -z "${AM_TUI_A11Y_ADAPTER_OUTPUT:-}" ]; then
+        return 0
+    fi
+    if [ "${_TUI_A11Y_ADAPTER_MANIFEST_WRITTEN}" = "1" ]; then
+        return 0
+    fi
+    _TUI_A11Y_ADAPTER_MANIFEST_WRITTEN=1
+
+    local adapter_status="pass"
+    local adapter_exit=0
+    if [ "${_E2E_FAIL:-0}" -gt 0 ]; then
+        adapter_status="fail"
+        adapter_exit=1
+    elif [ "${_E2E_PASS:-0}" -eq 0 ] && [ "${_E2E_SKIP:-0}" -gt 0 ]; then
+        adapter_status="skip"
+    fi
+
+    mkdir -p "$(dirname "${AM_TUI_A11Y_ADAPTER_OUTPUT}")"
+    cat > "${AM_TUI_A11Y_ADAPTER_OUTPUT}" <<ADAPTER_EOF
+{
+  "suite": "${E2E_SUITE}",
+  "timestamp": "$(_e2e_now_rfc3339)",
+  "status": "${adapter_status}",
+  "exit_code": ${adapter_exit},
+  "artifact_dir": "${E2E_ARTIFACT_DIR}",
+  "summary_path": "${E2E_ARTIFACT_DIR}/summary.json",
+  "bundle_path": "${E2E_ARTIFACT_DIR}/bundle.json",
+  "trace_path": "${E2E_ARTIFACT_DIR}/trace/events.jsonl"
+}
+ADAPTER_EOF
+}
+trap write_tui_a11y_adapter_manifest EXIT
 
 is_truthy() {
     case "${1:-0}" in
@@ -282,6 +317,44 @@ jsonrpc_call() {
     e2e_rpc_read_response "${case_id}"
 }
 
+wait_tui_http_ready() {
+    local port="$1"
+    local timeout_s="${2:-30}"
+    local url="http://127.0.0.1:${port}/health/readiness"
+    local deadline
+    deadline=$(( $(date +%s) + timeout_s ))
+
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        if curl -fsS --connect-timeout 1 --max-time 2 "${url}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    return 1
+}
+
+jsonrpc_call_retry() {
+    local port="$1"
+    local tool="$2"
+    local params="$3"
+    local attempts="${4:-12}"
+    local delay_s="${5:-1}"
+    local out=""
+    local attempt=1
+
+    while [ "${attempt}" -le "${attempts}" ]; do
+        if out="$(jsonrpc_call "${port}" "${tool}" "${params}")"; then
+            printf '%s\n' "${out}"
+            return 0
+        fi
+        sleep "${delay_s}"
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
 # Start a TUI session via expect with proper terminal dimensions.
 # Args: label bin port db storage raw_log expect_script
 run_tui_expect() {
@@ -371,6 +444,7 @@ RAW2="${E2E_ARTIFACT_DIR}/core_screens.raw"
 # Exercise a mix of jump/tab navigation without asserting an exact PTY-visible
 # route. Exact screen semantics are covered natively; the shell adapter verifies
 # no-crash behavior plus artifact capture.
+# shellcheck disable=SC2016
 EXPECT_SCRIPT_CORE='
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
@@ -405,7 +479,7 @@ send "\t\t\t"
 sleep 0.5
 send "7"
 sleep 0.5
-send "\033[Z"
+send "\033\[Z"
 sleep 0.4
 
 # Basic keyboard interaction on Tools screen
@@ -418,25 +492,59 @@ sleep 0.2
 send "v"
 sleep 0.2
 
+if {[info exists env(AM_TUI_A11Y_SEED_DONE)] && $env(AM_TUI_A11Y_SEED_DONE) ne ""} {
+    set seed_deadline [expr {[clock seconds] + 20}]
+    while {[clock seconds] < $seed_deadline} {
+        if {[file exists $env(AM_TUI_A11Y_SEED_DONE)]} {
+            break
+        }
+        sleep 1
+    }
+}
+
 send "q"
 expect eof
 '
 
+SEED_DONE2="${E2E_ARTIFACT_DIR}/core_screens.seed.done"
+export AM_TUI_A11Y_SEED_DONE="${SEED_DONE2}"
 run_tui_expect "core_screens" "${BIN}" "${PORT2}" "${DB2}" "${STORAGE2}" "${RAW2}" "${EXPECT_SCRIPT_CORE}" &
 EXPECT_PID2=$!
+unset AM_TUI_A11Y_SEED_DONE
 
 sleep 6
 if e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
-    EP="$(jsonrpc_call "${PORT2}" "ensure_project" '{"human_key":"/data/e2e/tui_a11y"}')"
-    REG1="$(jsonrpc_call "${PORT2}" "register_agent" '{"project_key":"/data/e2e/tui_a11y","program":"e2e","model":"test","name":"A11yFox","task_description":"seed"}')"
-    MSG="$(jsonrpc_call "${PORT2}" "send_message" '{"project_key":"/data/e2e/tui_a11y","sender_name":"A11yFox","to":["A11yFox"],"subject":"A11Y seed","body_md":"seeded"}')"
+    if wait_tui_http_ready "${PORT2}" 30; then
+        e2e_pass "TUI HTTP readiness endpoint became ready"
+    else
+        e2e_fail "TUI HTTP readiness endpoint became ready"
+    fi
+    EP=""
+    REG1=""
+    MSG=""
+    SEED_OK=1
+    if ! EP="$(jsonrpc_call_retry "${PORT2}" "ensure_project" '{"human_key":"/data/e2e/tui_a11y"}')"; then
+        e2e_fail "seed ensure_project during live TUI session"
+        SEED_OK=0
+    fi
+    if ! REG1="$(jsonrpc_call_retry "${PORT2}" "register_agent" '{"project_key":"/data/e2e/tui_a11y","program":"e2e","model":"test","name":"A11yFox","task_description":"seed"}')"; then
+        e2e_fail "seed register_agent during live TUI session"
+        SEED_OK=0
+    fi
+    if ! MSG="$(jsonrpc_call_retry "${PORT2}" "send_message" '{"project_key":"/data/e2e/tui_a11y","sender_name":"A11yFox","to":["A11yFox"],"subject":"A11Y seed","body_md":"seeded"}')"; then
+        e2e_fail "seed send_message during live TUI session"
+        SEED_OK=0
+    fi
     e2e_save_artifact "case_02_seed_project.json" "${EP}"
     e2e_save_artifact "case_02_seed_agent.json" "${REG1}"
     e2e_save_artifact "case_02_seed_message.json" "${MSG}"
-    e2e_pass "seeded data during live TUI session"
+    if [ "${SEED_OK}" = "1" ]; then
+        e2e_pass "seeded data during live TUI session"
+    fi
 else
     e2e_fail "server port not reachable during live TUI session"
 fi
+: > "${SEED_DONE2}"
 
 wait "${EXPECT_PID2}" 2>/dev/null || true
 
@@ -476,6 +584,7 @@ mkdir -p "${STORAGE3}"
 PORT3="$(pick_port)"
 RAW3="${E2E_ARTIFACT_DIR}/key_hints_default.raw"
 
+# shellcheck disable=SC2016
 EXPECT_SCRIPT_HINTS_DEFAULT='
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
@@ -541,6 +650,7 @@ mkdir -p "${STORAGE4}"
 PORT4="$(pick_port)"
 RAW4="${E2E_ARTIFACT_DIR}/key_hints.raw"
 
+# shellcheck disable=SC2016
 EXPECT_SCRIPT_HINTS='
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
@@ -588,26 +698,5 @@ fi
 e2e_assert_file_not_contains "key hints hidden" "${RENDERED4}" "j/k  Scroll event log"
 e2e_assert_file_not_contains "key hints disabled binary path valid" "${RENDERED4}" "No such file or directory"
 
-# Write adapter result manifest if requested by the harness.
-if [ -n "${AM_TUI_A11Y_ADAPTER_OUTPUT:-}" ]; then
-    _adapter_status="pass"
-    _adapter_exit=0
-    if [ "${_E2E_FAIL:-0}" -gt 0 ]; then
-        _adapter_status="fail"
-        _adapter_exit=1
-    fi
-    cat > "${AM_TUI_A11Y_ADAPTER_OUTPUT}" <<ADAPTER_EOF
-{
-  "suite": "${E2E_SUITE}",
-  "timestamp": "$(_e2e_now_rfc3339)",
-  "status": "${_adapter_status}",
-  "exit_code": ${_adapter_exit},
-  "artifact_dir": "${E2E_ARTIFACT_DIR}",
-  "summary_path": "${E2E_ARTIFACT_DIR}/summary.json",
-  "bundle_path": "${E2E_ARTIFACT_DIR}/bundle.json",
-  "trace_path": "${E2E_ARTIFACT_DIR}/trace/events.jsonl"
-}
-ADAPTER_EOF
-fi
-
 e2e_summary
+write_tui_a11y_adapter_manifest

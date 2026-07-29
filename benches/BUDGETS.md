@@ -341,11 +341,14 @@ Initial budgets (conservative; tighten after the first baseline run on CI-like h
 | medium | 5,000 | < 15ms | < 25ms |
 | large | 15,000 | < 50ms | < 80ms |
 
-## Search V3 Frankensearch Lexical Budgets (br-2tnl.7.5)
+## Search V3 frankensearch lexical-tier budgets (br-2tnl.7.5)
 
 Deterministic harness implemented in `crates/mcp-agent-mail-db/benches/search_v3_bench.rs`.
 Seeds frankensearch indexes (Tantivy is the lexical backend inside frankensearch) with synthetic
 documents and measures `TantivyBridge::search()` p50/p95/p99 for a fixed query (`needle`, `limit=20`).
+
+Tantivy is the lexical backend inside frankensearch; semantic and hybrid fusion are controlled by the
+`hybrid` feature.
 
 Artifacts are written under:
 - `tests/artifacts/bench/search_v3/<run_id>/summary.json`

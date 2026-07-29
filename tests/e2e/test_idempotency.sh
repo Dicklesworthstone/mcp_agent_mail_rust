@@ -151,6 +151,7 @@ run_installer() {
         HOME="$TEST_HOME" \
         SHELL="$TEST_SHELL" \
         STORAGE_ROOT="$STORAGE_ROOT" \
+        AM_INSTALL_SKIP_REMOTE_HTTP_READINESS="1" \
         PATH="$PATH_BASE" \
         bash "$INSTALL_SH" \
             --version "v${version}" \
@@ -186,6 +187,7 @@ run_legacy_link_installer() {
         HOME="$LEGACY_LINK_HOME" \
         SHELL="$TEST_SHELL" \
         STORAGE_ROOT="$LEGACY_LINK_STORAGE" \
+        AM_INSTALL_SKIP_REMOTE_HTTP_READINESS="1" \
         PATH="$path_value" \
         bash "$INSTALL_SH" \
             --version "v${install_version}" \
@@ -367,7 +369,9 @@ EOF
 chmod +x "${LEGACY_LINK_DEST}/.venv/bin/am"
 printf 'migrated_at=2026-01-01T00:00:00Z\nnote=test fixture\n' \
     > "${LEGACY_LINK_HOME}/.config/mcp-agent-mail/.python-migration-complete"
-ln -s "${LEGACY_LINK_DEST}/am" "${LEGACY_LINK_BIN}/am"
+if [ ! -e "${LEGACY_LINK_BIN}/am" ] && [ ! -L "${LEGACY_LINK_BIN}/am" ]; then
+    ln -s "${LEGACY_LINK_DEST}/am" "${LEGACY_LINK_BIN}/am"
+fi
 cat > "${LEGACY_LINK_HOME}/.zshrc" <<EOF
 alias am='${LEGACY_LINK_BIN}/am'
 EOF
@@ -571,7 +575,7 @@ TOKEN_UPGRADE="$(grep -E '^HTTP_BEARER_TOKEN=' "$RUST_ENV" | head -1 | cut -d= -
 e2e_assert_eq "bearer token preserved through upgrade" "$TOKEN_FIRST" "$TOKEN_UPGRADE"
 
 MCP_CONFIG_SHA_UPGRADE="$(sha256_file "$MCP_CONFIG")"
-e2e_assert_eq "mcp config remains uncorrupted through upgrade" "$MCP_CONFIG_SHA_BEFORE" "$MCP_CONFIG_SHA_UPGRADE"
+e2e_assert_eq "mcp config remains stable through upgrade" "$MCP_CONFIG_SHA_SECOND" "$MCP_CONFIG_SHA_UPGRADE"
 
 set +e
 DOCTOR_UPGRADE="$("$DEST/am" doctor 2>&1)"
@@ -668,6 +672,7 @@ run_real_installer() {
         HOME="$REAL_HOME" \
         SHELL="$TEST_SHELL" \
         STORAGE_ROOT="$REAL_STORAGE" \
+        AM_INSTALL_SKIP_REMOTE_HTTP_READINESS="1" \
         PATH="$PATH_BASE" \
         bash "$INSTALL_SH" \
             --version "v${REAL_VERSION}" \

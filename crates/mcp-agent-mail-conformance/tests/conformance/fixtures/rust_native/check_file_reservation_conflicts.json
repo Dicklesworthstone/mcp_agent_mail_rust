@@ -1,0 +1,114 @@
+{
+  "version": "rust-native@2026-07-27",
+  "generated_at": "2026-07-27T23:30:00Z",
+  "tool": "check_file_reservation_conflicts",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "conflict_free_paths_report_clear",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/conflict-check-clear",
+        "agent_name": "CalmRiver",
+        "paths": ["src/lib.rs"]
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/conflict-check-clear"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-clear",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "CalmRiver"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/check_file_reservation_conflicts/conflict_free_paths_report_clear.output.json"
+      },
+      "normalize": {
+        "replace": {
+          "/project": "__PROJECT_HUMAN_KEY__",
+          "/snapshot_ts": "__SNAPSHOT_TS__"
+        }
+      }
+    },
+    {
+      "name": "exclusive_overlap_reports_conflict",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/conflict-check-overlap",
+        "agent_name": "CalmRiver",
+        "paths": ["src/lib.rs", "docs/notes.md"]
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/conflict-check-overlap"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-overlap",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "CalmRiver"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-overlap",
+              "program": "claude-code",
+              "model": "opus-4.1",
+              "name": "StoneOwl"
+            }
+          },
+          {
+            "name": "file_reservation_paths",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-overlap",
+              "agent_name": "StoneOwl",
+              "paths": ["src/**"],
+              "ttl_seconds": 3600,
+              "exclusive": true,
+              "reason": "conformance overlap fixture"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/check_file_reservation_conflicts/exclusive_overlap_reports_conflict.output.json"
+      },
+      "normalize": {
+        "replace": {
+          "/project": "__PROJECT_HUMAN_KEY__",
+          "/snapshot_ts": "__SNAPSHOT_TS__",
+          "/conflicts/0/holders/0/expires_ts": "__EXPIRES_TS__"
+        }
+      }
+    },
+    {
+      "name": "empty_paths_fail_closed",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/conflict-check-clear",
+        "agent_name": "CalmRiver",
+        "paths": []
+      },
+      "expect": {
+        "err": {
+          "message_contains": "paths list cannot be empty"
+        }
+      }
+    }
+  ]
+}

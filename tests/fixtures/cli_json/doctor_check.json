@@ -9,7 +9,16 @@
     {
       "category": "live_incident",
       "check": "db_file_sanity",
-      "detail": "quick_check OK (430080 bytes)",
+      "detail": "quick_check OK (<DB_BYTES> bytes)",
+      "status": "ok"
+    },
+    {
+      "active": false,
+      "category": "environment",
+      "check": "recovery_lock",
+      "detail": "No recovery lock present",
+      "lock_path": "<TMP_ROOT>/mailbox.sqlite3.recovery.lock",
+      "pid": null,
       "status": "ok"
     },
     {
@@ -21,8 +30,39 @@
     {
       "category": "live_incident",
       "check": "foreign_key_integrity",
-      "detail": "No foreign key violations detected",
+      "detail": "No foreign key violations detected (foreign_key_check engine=canonical_sqlite authority=authoritative; orphaned_recipient_query engine=canonical_sqlite authority=authoritative)",
+      "diagnostic_evidence": [
+        {
+          "authority": "authoritative",
+          "engine": "canonical_sqlite",
+          "operation": "foreign_key_check",
+          "primary_engine": "canonical_sqlite",
+          "primary_error_class": null
+        },
+        {
+          "authority": "authoritative",
+          "engine": "canonical_sqlite",
+          "operation": "orphaned_recipient_query",
+          "primary_engine": "canonical_sqlite",
+          "primary_error_class": null
+        }
+      ],
       "status": "ok"
+    },
+    {
+      "category": "environment",
+      "check": "query_plan_hot_paths",
+      "detail": "Skipped hot query-plan diagnostics: read-only doctor check avoids WAL-capable DB opens",
+      "status": "warn"
+    },
+    {
+      "category": "environment",
+      "check": "git_binary_path",
+      "detail": "git <GIT_VERSION> at git is not on the known-bad list",
+      "path": "git",
+      "source": "path",
+      "status": "ok",
+      "version": "<GIT_VERSION>"
     },
     {
       "category": "archive_hygiene",
@@ -97,9 +137,45 @@
       "status": "ok"
     },
     {
+      "binary": "am",
+      "candidates": [
+        {
+          "display": "<TMP_ROOT>/home/.local/bin/am",
+          "matches_source_version": true,
+          "parsed_version": "<PACKAGE_VERSION>",
+          "path": "<TMP_ROOT>/home/.local/bin/am",
+          "source": "path",
+          "version_line": "am <PACKAGE_VERSION>"
+        }
+      ],
       "category": "environment",
       "check": "binary_version",
-      "detail": "am 0.2.42 (expected v0.2.42)",
+      "detail": "am on PATH/install matches source version v<PACKAGE_VERSION>",
+      "expected_install_path": "<TMP_ROOT>/home/.local/bin/am",
+      "path_binary": "<TMP_ROOT>/home/.local/bin/am",
+      "running_exe": "<RUNNING_EXE>",
+      "source_version": "<PACKAGE_VERSION>",
+      "status": "ok"
+    },
+    {
+      "binary": "mcp-agent-mail",
+      "candidates": [
+        {
+          "display": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+          "matches_source_version": true,
+          "parsed_version": "<PACKAGE_VERSION>",
+          "path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+          "source": "path",
+          "version_line": "mcp-agent-mail <PACKAGE_VERSION>"
+        }
+      ],
+      "category": "environment",
+      "check": "server_binary_version",
+      "detail": "mcp-agent-mail on PATH/install matches source version v<PACKAGE_VERSION>",
+      "expected_install_path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+      "path_binary": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+      "running_exe": "<RUNNING_EXE>",
+      "source_version": "<PACKAGE_VERSION>",
       "status": "ok"
     },
     {
@@ -141,8 +217,8 @@
     {
       "category": "environment",
       "check": "timestamp_format",
-      "detail": "i64 microseconds (Rust native)",
-      "status": "ok"
+      "detail": "Skipped timestamp format probe: read-only doctor check avoids WAL-capable DB opens",
+      "status": "warn"
     },
     {
       "category": "environment",
@@ -169,10 +245,11 @@
       "status": "warn"
     }
   ],
+  "daemon_mailbox_binding": null,
   "diagnostic_payload": {
     "artifacts": [
       {
-        "detail": "bytes=430080",
+        "detail": "bytes=<DB_BYTES>",
         "kind": "sqlite_db",
         "label": "SQLite database",
         "path": "<TMP_ROOT>/mailbox.sqlite3",
@@ -182,8 +259,8 @@
     "finding_counts": {
       "critical": 0,
       "info": 0,
-      "total": 16,
-      "warning": 16
+      "total": 18,
+      "warning": 18
     },
     "generated_at": "<GENERATED_AT>",
     "headline": "All doctor checks passed.",
@@ -196,23 +273,62 @@
     "source": "doctor-check",
     "status": "warn"
   },
+  "forensic_timeline": {
+    "archive_commits": {
+      "head": null,
+      "project_slug": "<TMP_DOCTOR_PROJECT_SLUG>",
+      "recent": [],
+      "repo_path": "<TMP_ROOT>/storage_root/projects/<TMP_DOCTOR_PROJECT_SLUG>"
+    },
+    "artifacts": [],
+    "changes_since_last_healthy": [],
+    "checkpoint_status": "no_checkpoint",
+    "current": {
+      "binary_version": "<PACKAGE_VERSION>",
+      "database_path": "<TMP_ROOT>/mailbox.sqlite3",
+      "generated_at": "<GENERATED_AT>",
+      "schema_version": "0",
+      "search_index_generation": {
+        "db_identity": "<TMP_ROOT>/mailbox.sqlite3@1",
+        "index_dir": "<SEARCH_INDEX_ROOT>/<HASH>",
+        "indexed_messages": 0,
+        "last_backfill_at_micros": null,
+        "rebuild_in_progress": false,
+        "skipped_messages": 0,
+        "source_messages": null,
+        "stale_reason": "lexical backfill has not completed for this database",
+        "state": "delayed"
+      },
+      "status": "warn",
+      "storage_root": "<TMP_ROOT>/storage_root"
+    },
+    "last_healthy_timestamp": null,
+    "next_actions": [
+      "am doctor check --json",
+      "am doctor support-bundle --json"
+    ],
+    "recent_recovery_runs": [],
+    "schema": "forensic-timeline.v1"
+  },
   "healthy": true,
+  "runtime_identity": "<RUNTIME_IDENTITY>",
   "summary": {
     "archive_hygiene": null,
     "category_breakdown": {
       "archive_hygiene_findings": 4,
-      "environment_findings": 6,
+      "environment_findings": 8,
       "live_incident_findings": 6
     },
+    "database_fix_strategy": null,
     "overall_status": "warn",
     "primary_issue": {
       "check": "storage_root_writable",
       "class": "live_mailbox_incident",
       "detail": "Skipped: storage root missing",
-      "next_action": "No database repair action is currently recommended.",
+      "next_action": null,
       "status": "warn"
     },
     "secondary_fail_count": 0,
-    "secondary_warning_count": 15
+    "secondary_warning_count": 17
   }
 }

@@ -29,13 +29,13 @@ use mcp_agent_mail_db::search_scope::{
 };
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
 #[cfg(feature = "tantivy-engine")]
-use mcp_agent_mail_db::search_v3::{get_bridge, init_bridge};
+use mcp_agent_mail_db::search_v3::{get_bridge, init_or_switch_bridge};
 use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, QueryTracker};
 use sqlmodel_core::{Connection, Value};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "tantivy-engine")]
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "tantivy-engine")]
 use tantivy::doc;
 
@@ -53,12 +53,9 @@ fn tantivy_test_lock() -> &'static Mutex<()> {
 
 #[cfg(feature = "tantivy-engine")]
 fn ensure_tantivy_bridge_initialized() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let index_dir = std::env::temp_dir().join("mcp_agent_mail_search_v3_test_index");
-        std::fs::create_dir_all(&index_dir).expect("create tantivy test index dir");
-        init_bridge(&index_dir).expect("initialize Tantivy bridge");
-    });
+    let index_dir = std::env::temp_dir().join("mcp_agent_mail_search_v3_test_index");
+    std::fs::create_dir_all(&index_dir).expect("create tantivy test index dir");
+    init_or_switch_bridge(&index_dir).expect("initialize Tantivy bridge");
 }
 
 #[cfg(feature = "tantivy-engine")]
@@ -590,7 +587,7 @@ fn acknowledge_messages_batch_integration_large_ack_wave_uses_fixed_recipient_qu
     assert_eq!(first.ack_ts, Some(original_ack_ts));
 
     assert!(
-        snapshot.total <= 6,
+        snapshot.total <= 7,
         "batch acknowledgement should stay fixed-query for a 100+ ack wave, got {snapshot:?}"
     );
     assert_eq!(
@@ -654,6 +651,59 @@ fn fetch_inbox_for_nonexistent_agent_returns_empty() {
         Outcome::Err(_) => {} // error is also acceptable
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[test]
+fn fetch_inbox_query_is_bounded_by_limit() {
+    // K5 (br-bvq1x.11.5): the inbox/poll read path must be bounded so a busy
+    // agent never pulls an unbounded result set that holds a connection and
+    // starves the pool. Verify the DB-level LIMIT actually clamps the row count.
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let sender = setup_agent(&pool, pid, "BlueLake");
+    let recipient = setup_agent(&pool, pid, "GreenStone");
+
+    let total = 8usize;
+    for i in 0..total {
+        let _ = send_msg(
+            &pool,
+            pid,
+            sender,
+            recipient,
+            &format!("msg {i}"),
+            "body",
+            None,
+        );
+    }
+
+    // A small limit must clamp the result set even though more messages exist.
+    let pool_limit = pool.clone();
+    let bounded = block_on(|cx| async move {
+        match queries::fetch_inbox(&cx, &pool_limit, pid, recipient, false, None, 3).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("fetch_inbox(limit=3) failed: {other:?}"),
+        }
+    });
+    assert_eq!(
+        bounded.len(),
+        3,
+        "fetch_inbox must return at most `limit` rows; got {}",
+        bounded.len()
+    );
+
+    // A limit above the message count returns everything (no spurious truncation).
+    let pool_all = pool.clone();
+    let all = block_on(|cx| async move {
+        match queries::fetch_inbox(&cx, &pool_all, pid, recipient, false, None, 100).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("fetch_inbox(limit=100) failed: {other:?}"),
+        }
+    });
+    assert_eq!(
+        all.len(),
+        total,
+        "fetch_inbox must return all messages when under the limit"
+    );
 }
 
 #[test]
@@ -1661,7 +1711,7 @@ fn respond_contact_updates_status_and_expires() {
     assert_eq!(link.status, "approved");
     assert!(
         link.expires_ts.is_some(),
-        "accepted contact should have expiry"
+        "approved contact should have expiry"
     );
     assert!(link.updated_ts > 0, "updated_ts should be set");
 

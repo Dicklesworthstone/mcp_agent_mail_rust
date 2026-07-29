@@ -41,7 +41,7 @@
   </script>
 
   <!-- Tailwind CSS -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="./vendor/tailwind.min.js" integrity="sha256-F26JRmGqnNyaXLpscgBEy797i9gNHJoUKnwksbbFDRU="></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
@@ -150,7 +150,7 @@
   <!-- Alpine.js will be loaded after our controllers at the end of body -->
 
   <!-- Lucide Icons -->
-  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="./vendor/lucide.min.js" integrity="sha256-GyLGwEocabdaQcZMfqmSZX6PYo2r1jJJhP/GHDdhpWo="></script>
 
   <!-- Marked.js for markdown rendering -->
   <script src="./vendor/marked.min.js" integrity="sha256-iiOIwxmH8YPwUHaWKofAvi6NTUI9pec6g05elbtCB+8="
@@ -1269,9 +1269,8 @@
 
   <!-- Scripts -->
   <script type="module" src="./preview-reload.js"></script>
-  <script src="./viewer.js"></script>
-  <!-- Load Alpine AFTER viewer.js so controllers exist before Alpine scans -->
-  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
+  <!-- Load Alpine AFTER the inline controllers above so controllers exist before Alpine scans -->
+  <script src="./vendor/alpine.min.js" integrity="sha256-NY2a+7GrW++i9IBhowd25bzXcH9BCmBrqYX5i8OxwDQ=" defer></script>
 
   <script>
     // Initialize Lucide icons

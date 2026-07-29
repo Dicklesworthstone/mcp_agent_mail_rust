@@ -366,6 +366,7 @@ pub fn detect_column_format(
 /// - `"2026-02-24T15:30:00"` (no fractional, T separator)
 /// - `"2026-02-24"` (date only → midnight UTC)
 /// - `"2026-02-24 15:30:00.123456+00:00"` (with timezone → strip tz, treat as UTC)
+/// - `"1772368496123456"` (already-microseconds value stored as TEXT)
 ///
 /// Returns `None` for empty strings (treated as NULL).
 ///
@@ -390,6 +391,10 @@ pub fn text_to_micros(
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(None);
+    }
+
+    if let Ok(micros) = trimmed.parse::<i64>() {
+        return Ok(Some(micros));
     }
 
     // Try parsing with timezone (RFC 3339 / ISO 8601 with offset)
@@ -1642,6 +1647,14 @@ mod tests {
             .expect("detect")
             .unwrap();
         assert_eq!(format, "integer");
+    }
+
+    #[test]
+    fn text_to_micros_accepts_stringified_microseconds() {
+        let micros = text_to_micros("1772368496123456", "projects", "created_at", 1)
+            .expect("parse stringified micros")
+            .expect("non-null micros");
+        assert_eq!(micros, 1_772_368_496_123_456);
     }
 
     #[test]

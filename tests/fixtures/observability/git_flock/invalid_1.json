@@ -1,0 +1,14 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "info",
+  "target": "mcp_agent_mail::git_lock",
+  "name": "flock_acquired_after_wait",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "git_cmd.run",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 20,
+    "outcome": "success",
+    "git_version": "2.50.1"
+  }
+}

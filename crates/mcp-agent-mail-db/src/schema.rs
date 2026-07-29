@@ -6,6 +6,7 @@ use crate::DbConn;
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection, Error as SqlError, Value};
 use sqlmodel_schema::{Migration, MigrationRunner, MigrationStatus};
+use std::collections::HashSet;
 use std::time::Duration;
 
 // Schema creation SQL - no runtime dependencies needed
@@ -158,6 +159,22 @@ CREATE TABLE IF NOT EXISTS project_sibling_suggestions (
     UNIQUE(project_a_id, project_b_id)
 );
 
+-- Consumed registration-proof nonces (durable replay prevention for the
+-- optional proof gate). A proof's (issuer_key, nonce) pair may be accepted at
+-- most once. The composite PRIMARY KEY makes the consume atomic: an INSERT that
+-- hits the constraint is a replay. `retain_until` is the proof's skewed expiry;
+-- rows are pruned after that, so the table stays bounded. Durable + shared DB =
+-- replay prevention that survives process restarts and spans processes, unlike
+-- the previous in-memory store.
+CREATE TABLE IF NOT EXISTS proof_gate_consumed_nonces (
+    issuer_key TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    retain_until INTEGER NOT NULL,
+    consumed_at INTEGER NOT NULL,
+    PRIMARY KEY (issuer_key, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_proof_nonces_retain_until ON proof_gate_consumed_nonces(retain_until);
+
 -- FTS5 virtual table for message search
 -- Porter stemmer: run/running/runs → run. Unicode61: Unicode-aware tokenization.
 -- remove_diacritics 2: normalize accented characters. prefix='2 3': fast prefix queries.
@@ -221,6 +238,7 @@ END;
 pub const PRAGMA_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;
@@ -231,20 +249,27 @@ PRAGMA threads = 4;
 PRAGMA journal_size_limit = 268435456;
 ";
 
-/// Database-wide initialization PRAGMAs (applied once per sqlite file).
+/// Runtime startup PRAGMAs for file-backed mailboxes.
+///
+/// These are issued by the single startup init path before pooled connections
+/// are exposed. The same bundle may run on migration, canonical follow-up, and
+/// runtime init connections so every phase agrees on lock and journal mode.
 pub const PRAGMA_DB_INIT_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = WAL;
 ";
 
-/// Base-mode DB init PRAGMAs for files later opened by `FrankenConnection`.
+/// Base-only DB init PRAGMAs for isolated recovery/export paths.
 ///
-/// WAL mode is intentionally avoided here to prevent mixed-runtime corruption
-/// and malformed-image scenarios when the server process is terminated abruptly.
+/// Runtime startup must use [`PRAGMA_DB_INIT_SQL`] so Agent Mail always opens
+/// file-backed mailboxes in WAL mode. This rollback-journal variant is reserved
+/// for one-shot paths that intentionally avoid the normal pooled runtime.
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = 'DELETE';
 ";
 
@@ -260,6 +285,7 @@ PRAGMA journal_mode = 'DELETE';
 pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;
 PRAGMA cache_size = -8192;
@@ -297,6 +323,7 @@ pub fn build_conn_pragmas(max_connections: usize, cache_budget_kb: usize) -> Str
         "\
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;
 PRAGMA cache_size = -{per_conn_kb};
@@ -322,8 +349,8 @@ pub fn init_schema_sql() -> String {
 /// Safe for databases that will be opened by `FrankenConnection` (pure-Rust `SQLite`).
 /// PRAGMAs are intentionally excluded because:
 /// - The pool applies per-connection PRAGMAs separately via [`build_conn_pragmas`]
-/// - The pool's init gate applies base-safe DB init pragmas via
-///   [`PRAGMA_DB_INIT_BASE_SQL`] before pooled connections open
+/// - The pool's init gate applies runtime DB init pragmas via
+///   [`PRAGMA_DB_INIT_SQL`] before pooled connections open
 ///
 /// Search queries automatically fall back to LIKE-based search when FTS5 tables are absent.
 #[must_use]
@@ -494,10 +521,14 @@ pub fn schema_migrations() -> Vec<Migration> {
     // The conversion: strftime('%s', text) * 1000000 + fractional_micros
     let ts_conversion = |col: &str| -> String {
         format!(
-            "CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
-             CASE WHEN instr({col}, '.') > 0 \
-                  THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
-                  ELSE 0 \
+            "CASE \
+                 WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
+                 THEN CAST(trim({col}) AS INTEGER) \
+                 ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
+                      CASE WHEN instr({col}, '.') > 0 \
+                           THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
+                           ELSE 0 \
+                      END \
              END"
         )
     };
@@ -510,6 +541,13 @@ pub fn schema_migrations() -> Vec<Migration> {
             "UPDATE projects SET created_at = ({}) WHERE typeof(created_at) = 'text'",
             ts_conversion("created_at")
         ),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v3b_rebuild_projects_created_at_integer_affinity".to_string(),
+        "rebuild legacy projects table when created_at has TEXT affinity".to_string(),
+        "-- handled by the migration runner".to_string(),
         String::new(),
     ));
 
@@ -1991,11 +2029,11 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
-    // Step 7: cascade-trigger — when an agent is deleted, drop dependent
-    // `message_recipients` rows whose only purpose was to address that
-    // agent.  Issue #120: this prevents future steady accumulation of
-    // missing-agent recipient rows.  Fires inside the parent DELETE
-    // transaction, so the cascade is atomic.
+    // Step 7 originally cascaded message recipient rows when an agent was
+    // deleted. v24 below deliberately drops that trigger again: recipient rows
+    // are message history, and preserving them lets reconstruction render
+    // unknown-agent recipients instead of silently erasing who a message was
+    // addressed to.
     migrations.push(Migration::new(
         "v23_trg_agents_cascade_message_recipients".to_string(),
         "issue #120: cascade-delete message_recipients when an agent is removed".to_string(),
@@ -2087,13 +2125,17 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    migrations.push(Migration::new(
+        "v24_drop_agents_cascade_message_recipients".to_string(),
+        "preserve message recipient history when agent metadata is removed".to_string(),
+        "DROP TRIGGER IF EXISTS trg_agents_cascade_message_recipients".to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
-/// Returns `true` if a migration creates or manipulates FTS5 virtual tables.
-///
-/// Trigger DDL is supported by `FrankenConnection`; base mode only excludes
-/// FTS virtual table migrations.
+/// Returns `true` if a migration creates, backfills, or drops FTS5 objects.
 fn is_fts_migration(id: &str) -> bool {
     let id_lower = id.to_ascii_lowercase();
     id_lower.contains("fts")
@@ -2117,16 +2159,32 @@ fn is_obsolete_message_fts_trigger_migration(id: &str) -> bool {
     )
 }
 
+fn is_fts_decommission_trigger_migration(id: &str) -> bool {
+    matches!(
+        id,
+        "v11_drop_trigger_messages_ai"
+            | "v11_drop_trigger_messages_ad"
+            | "v11_drop_trigger_messages_au"
+            | "v11_drop_trigger_agents_ai"
+            | "v11_drop_trigger_agents_ad"
+            | "v11_drop_trigger_agents_au"
+            | "v11_drop_trigger_projects_ai"
+            | "v11_drop_trigger_projects_ad"
+            | "v11_drop_trigger_projects_au"
+    )
+}
+
 /// Migrations that use SQL features unsupported by `FrankenConnection`.
 ///
-/// Includes FTS5 virtual tables, queries with aggregate functions over JOINs,
-/// CREATE INDEX with expressions (COLLATE NOCASE), and message triggers that
-/// depend on `fts_messages`. The obsolete message FTS triggers are skipped in
-/// both startup lanes; Search V3 decommissions FTS, and reintroducing those
-/// triggers before later table migrations makes SQLite reparse trigger bodies
-/// that reference missing `fts_messages`. ANALYZE migrations are also excluded
-/// because their `sqlite_stat1` table can make FrankenSQLite reenter schema
-/// refresh while query planning.
+/// Includes FTS5 object DDL/backfills, official v11 FTS trigger-drop ledger IDs,
+/// queries with aggregate functions over JOINs, CREATE INDEX with expressions
+/// (COLLATE NOCASE), and message triggers that depend on `fts_messages`.
+/// Search V3 decommissions FTS, and base mode uses separate cleanup migration
+/// IDs for FTS trigger/table cleanup. That lets the later canonical full-ledger
+/// pass replay historical v7 FTS creation followed by the official v11 drops in
+/// authored order instead of seeing the v11 trigger-drop IDs already recorded.
+/// ANALYZE migrations are also excluded because their `sqlite_stat1` table can
+/// make FrankenSQLite reenter schema refresh while query planning.
 ///
 /// `v15_add_recipients_json_to_messages` is also excluded from base mode.
 /// The base-mode startup path and compatibility probes do not require the
@@ -2136,6 +2194,7 @@ fn is_obsolete_message_fts_trigger_migration(id: &str) -> bool {
 fn is_unsupported_by_franken(id: &str) -> bool {
     is_fts_migration(id)
         || is_obsolete_message_fts_trigger_migration(id)
+        || is_fts_decommission_trigger_migration(id)
         || is_analyze_migration(id)
         || is_runtime_canonical_followup_migration(id)
 }
@@ -2333,11 +2392,13 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
     Ok(())
 }
 
-/// Migrations excluding FTS5 virtual tables and FTS backfill inserts.
+/// Migrations excluding FTS5 object migrations, canonical-only cleanup ledger
+/// IDs, and runtime-canonical follow-ups.
 ///
 /// Safe for databases that will be opened by `FrankenConnection`. The migration
-/// runner records core schema migrations plus base cleanup drops in the
-/// migrations table.
+/// runner records core schema migrations plus base-specific cleanup drops in the
+/// migrations table; it intentionally leaves the official canonical cleanup IDs
+/// for the later full-ledger pass.
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
     // NOTE: We intentionally do NOT filter out ADD COLUMN migrations here.
@@ -2374,6 +2435,14 @@ pub fn schema_migrations_runtime_canonical_followup() -> Vec<Migration> {
         .collect();
     migrations.sort_by_key(|migration| runtime_canonical_followup_order(migration.id.as_str()));
     migrations
+}
+
+#[must_use]
+pub fn schema_migrations_atc_runtime_canonical_followup() -> Vec<Migration> {
+    schema_migrations_runtime_canonical_followup()
+        .into_iter()
+        .filter(|migration| is_atc_runtime_canonical_migration(migration.id.as_str()))
+        .collect()
 }
 
 #[must_use]
@@ -2548,6 +2617,382 @@ async fn migration_set_is_complete<C: Connection>(
     )
 }
 
+async fn read_user_version<C: Connection>(cx: &Cx, conn: &C) -> Outcome<i64, SqlError> {
+    let rows = match conn.query(cx, "PRAGMA user_version", &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let Some(row) = rows.first() else {
+        return Outcome::Err(SqlError::Custom(
+            "schema gate failed: PRAGMA user_version returned no rows".to_string(),
+        ));
+    };
+    match row
+        .get_named::<i64>("user_version")
+        .or_else(|_| row.get_as(0))
+    {
+        Ok(version) => Outcome::Ok(version),
+        Err(err) => Outcome::Err(SqlError::Custom(format!(
+            "schema gate failed: PRAGMA user_version did not return an integer: {err}"
+        ))),
+    }
+}
+
+/// Refuse databases written by a newer binary before startup migrations mutate them.
+pub async fn refuse_newer_schema_version<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    db_label: &str,
+) -> Outcome<(), SqlError> {
+    let on_disk = match read_user_version(cx, conn).await {
+        Outcome::Ok(version) => version,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let compiled = i64::from(SCHEMA_VERSION);
+    if on_disk > compiled {
+        return Outcome::Err(SqlError::Custom(format!(
+            "schema gate refused {db_label}: database user_version={on_disk} was written by a newer Agent Mail schema than this binary supports ({compiled}); upgrade binary before opening this mailbox"
+        )));
+    }
+    Outcome::Ok(())
+}
+
+async fn sqlite_master_names<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    object_type: &str,
+) -> Outcome<std::collections::BTreeSet<String>, SqlError> {
+    let params = [Value::Text(object_type.to_string())];
+    let rows = match conn
+        .query(
+            cx,
+            "SELECT name FROM sqlite_master WHERE type = $1 ORDER BY name",
+            &params,
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    Outcome::Ok(
+        rows.into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect(),
+    )
+}
+
+async fn table_column_names<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    table: &str,
+) -> Outcome<std::collections::BTreeSet<String>, SqlError> {
+    let rows = match conn
+        .query(cx, &format!("PRAGMA table_info({table})"), &[])
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    Outcome::Ok(
+        rows.into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect(),
+    )
+}
+
+async fn applied_migration_ids<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<std::collections::BTreeSet<String>, SqlError> {
+    let sql = format!("SELECT id FROM {MIGRATIONS_TABLE_NAME}");
+    let rows = match conn.query(cx, &sql, &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    Outcome::Ok(
+        rows.into_iter()
+            .filter_map(|row| row.get_named::<String>("id").ok())
+            .collect(),
+    )
+}
+
+fn missing_required(
+    required: &[&str],
+    present: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    required
+        .iter()
+        .filter(|name| !present.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn format_schema_gate_failure(problems: &[String]) -> SqlError {
+    SqlError::Custom(format!(
+        "schema gate failed: {}; run `am migrate` or restart `am serve` so the single startup migration path can repair the mailbox before retrying",
+        problems.join("; ")
+    ))
+}
+
+/// Validate the post-migration schema surface before normal runtime traffic starts.
+///
+/// This is intentionally a compact gate over critical tables, columns, indexes,
+/// triggers, legacy FTS residue, and the migration ledger. It turns schema drift
+/// into an explicit startup action instead of letting later queries fail with
+/// ambiguous `no such column` or corruption-like messages.
+pub async fn validate_startup_schema_gate<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    const REQUIRED_TABLES: &[&str] = &[
+        MIGRATIONS_TABLE_NAME,
+        "projects",
+        "products",
+        "product_project_links",
+        "agents",
+        "messages",
+        "message_recipients",
+        "file_reservations",
+        "file_reservation_releases",
+        "agent_links",
+        "inbox_stats",
+    ];
+    const REQUIRED_INDEXES: &[&str] = &[
+        "idx_projects_slug",
+        "idx_agents_project_name_nocase",
+        "idx_messages_ack_required_id",
+        "idx_mr_ack_message",
+        "idx_file_reservations_released_expires_id",
+        "idx_file_reservation_releases_ts",
+    ];
+    const REQUIRED_TRIGGERS: &[&str] = &["trg_messages_default_recipients_json"];
+    const FORBIDDEN_FTS_TABLES: &[&str] = &["fts_messages", "fts_agents", "fts_projects"];
+    const FORBIDDEN_FTS_TRIGGERS: &[&str] = &[
+        "messages_ai",
+        "messages_ad",
+        "messages_au",
+        "agents_ai",
+        "agents_ad",
+        "agents_au",
+        "projects_ai",
+        "projects_ad",
+        "projects_au",
+        "fts_messages_ai",
+        "fts_messages_ad",
+        "fts_messages_au",
+    ];
+    const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+        ("projects", &["id", "slug", "human_key", "created_at"]),
+        (
+            "agents",
+            &[
+                "id",
+                "project_id",
+                "name",
+                "program",
+                "model",
+                "inception_ts",
+                "last_active_ts",
+                "contact_policy",
+                "reaper_exempt",
+                "registration_token",
+            ],
+        ),
+        (
+            "messages",
+            &[
+                "id",
+                "project_id",
+                "sender_id",
+                "thread_id",
+                "subject",
+                "body_md",
+                "ack_required",
+                "created_ts",
+                "recipients_json",
+                "attachments",
+            ],
+        ),
+        (
+            "message_recipients",
+            &["message_id", "agent_id", "kind", "read_ts", "ack_ts"],
+        ),
+        (
+            "file_reservations",
+            &[
+                "id",
+                "project_id",
+                "agent_id",
+                "path_pattern",
+                "expires_ts",
+                "released_ts",
+            ],
+        ),
+        (
+            "file_reservation_releases",
+            &["reservation_id", "released_ts"],
+        ),
+        (
+            "agent_links",
+            &[
+                "id",
+                "a_project_id",
+                "a_agent_id",
+                "b_project_id",
+                "b_agent_id",
+                "status",
+                "created_ts",
+                "updated_ts",
+                "expires_ts",
+            ],
+        ),
+        (
+            "inbox_stats",
+            &[
+                "agent_id",
+                "total_count",
+                "unread_count",
+                "ack_pending_count",
+                "last_message_ts",
+            ],
+        ),
+        ("products", &["id", "product_uid", "name", "created_at"]),
+        (
+            "product_project_links",
+            &["id", "product_id", "project_id", "created_at"],
+        ),
+    ];
+
+    let tables = match sqlite_master_names(cx, conn, "table").await {
+        Outcome::Ok(tables) => tables,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let indexes = match sqlite_master_names(cx, conn, "index").await {
+        Outcome::Ok(indexes) => indexes,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let triggers = match sqlite_master_names(cx, conn, "trigger").await {
+        Outcome::Ok(triggers) => triggers,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut problems = Vec::new();
+    let missing_tables = missing_required(REQUIRED_TABLES, &tables);
+    if !missing_tables.is_empty() {
+        problems.push(format!(
+            "missing required table(s): {}",
+            missing_tables.join(", ")
+        ));
+    }
+
+    for (table, columns) in REQUIRED_COLUMNS {
+        if missing_tables.iter().any(|missing| missing == table) {
+            continue;
+        }
+        let present_columns = match table_column_names(cx, conn, table).await {
+            Outcome::Ok(columns) => columns,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let missing_columns = missing_required(columns, &present_columns)
+            .into_iter()
+            .map(|column| format!("{table}.{column}"))
+            .collect::<Vec<_>>();
+        if !missing_columns.is_empty() {
+            problems.push(format!(
+                "missing required column(s): {}",
+                missing_columns.join(", ")
+            ));
+        }
+    }
+
+    let missing_indexes = missing_required(REQUIRED_INDEXES, &indexes);
+    if !missing_indexes.is_empty() {
+        problems.push(format!(
+            "missing critical index(es): {}",
+            missing_indexes.join(", ")
+        ));
+    }
+
+    let missing_triggers = missing_required(REQUIRED_TRIGGERS, &triggers);
+    if !missing_triggers.is_empty() {
+        problems.push(format!(
+            "missing critical trigger(s): {}",
+            missing_triggers.join(", ")
+        ));
+    }
+
+    let present_fts_tables = FORBIDDEN_FTS_TABLES
+        .iter()
+        .filter(|name| tables.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    if !present_fts_tables.is_empty() {
+        problems.push(format!(
+            "unexpected legacy FTS table(s): {}",
+            present_fts_tables.join(", ")
+        ));
+    }
+
+    let present_fts_triggers = FORBIDDEN_FTS_TRIGGERS
+        .iter()
+        .filter(|name| triggers.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    if !present_fts_triggers.is_empty() {
+        problems.push(format!(
+            "unexpected legacy FTS trigger(s): {}",
+            present_fts_triggers.join(", ")
+        ));
+    }
+
+    if !missing_tables
+        .iter()
+        .any(|table| table == MIGRATIONS_TABLE_NAME)
+    {
+        let applied_ids = match applied_migration_ids(cx, conn).await {
+            Outcome::Ok(ids) => ids,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let missing_migration_ids = schema_migrations()
+            .into_iter()
+            .filter_map(|migration| (!applied_ids.contains(&migration.id)).then_some(migration.id))
+            .take(12)
+            .collect::<Vec<_>>();
+        if !missing_migration_ids.is_empty() {
+            problems.push(format!(
+                "migration ledger incomplete, missing id(s): {}",
+                missing_migration_ids.join(", ")
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        Outcome::Ok(())
+    } else {
+        Outcome::Err(format_schema_gate_failure(&problems))
+    }
+}
+
 async fn run_migrations<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -2668,10 +3113,36 @@ async fn migration_statement_already_satisfied<C: Connection>(
     migration: &Migration,
     err: &SqlError,
 ) -> Outcome<bool, SqlError> {
+    // ANALYZE migrations are query-planner statistics refreshes: they change
+    // no schema and no data. When the target table is absent (e.g. the legacy
+    // atc_* tables now live in the ATC sidecar, or an older reconstruct
+    // rebuilt the primary without them), a bare `ANALYZE <table>` hard-fails
+    // with "no such table" — and one failing statistics migration must not
+    // abort `migrate_to_latest` and wedge the whole server into DB-degraded
+    // mode where every MCP op returns a generic database error (GH#185).
+    // Skipping is safe: there is nothing to analyze, so the migration is
+    // vacuously satisfied. Record it and move on.
+    if is_analyze_migration(&migration.id) && is_missing_table_error(err) {
+        tracing::warn!(
+            migration_id = %migration.id,
+            error = %err,
+            "ANALYZE migration target table is absent; recording the migration \
+             as applied without executing (statistics-only, safe to skip)"
+        );
+        return Outcome::Ok(true);
+    }
     if !is_duplicate_column_error(err) {
         return Outcome::Ok(false);
     }
     migration_preflight_already_satisfied(cx, conn, migration).await
+}
+
+/// True when `err` is SQLite's "no such table: …" complaint (any table).
+#[must_use]
+fn is_missing_table_error(err: &SqlError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("no such table")
 }
 
 async fn migration_preflight_already_satisfied<C: Connection>(
@@ -2714,8 +3185,8 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "DROP TABLE IF EXISTS messages_v15_rebuild",
         "CREATE TABLE messages_v15_rebuild (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
-            project_id INTEGER NOT NULL REFERENCES projects(id),\
-            sender_id INTEGER NOT NULL REFERENCES agents(id),\
+            project_id INTEGER NOT NULL,\
+            sender_id INTEGER NOT NULL,\
             thread_id TEXT,\
             subject TEXT NOT NULL,\
             body_md TEXT NOT NULL,\
@@ -2750,6 +3221,234 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
 
     for sql in REBUILD_SQL {
         match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    Outcome::Ok(())
+}
+
+async fn execute_v3b_rebuild_projects_created_at_integer_affinity<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    const REBUILD_SQL: [&str; 7] = [
+        "DROP TABLE IF EXISTS projects_v3b_rebuild",
+        "CREATE TABLE projects_v3b_rebuild (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            slug TEXT NOT NULL UNIQUE,\
+            human_key TEXT NOT NULL,\
+            created_at INTEGER NOT NULL\
+        )",
+        "INSERT INTO projects_v3b_rebuild (id, slug, human_key, created_at) \
+         SELECT id, slug, human_key, \
+                CASE \
+                    WHEN typeof(created_at) = 'integer' THEN created_at \
+                    WHEN typeof(created_at) = 'real' THEN CAST(created_at AS INTEGER) \
+                    WHEN typeof(created_at) = 'text' AND trim(created_at) <> '' \
+                         AND trim(created_at) NOT GLOB '*[^0-9]*' \
+                    THEN CAST(trim(created_at) AS INTEGER) \
+                    ELSE CAST(strftime('%s', created_at) AS INTEGER) * 1000000 + \
+                         CASE WHEN instr(created_at, '.') > 0 \
+                              THEN CAST(substr(created_at || '000000', instr(created_at, '.') + 1, 6) AS INTEGER) \
+                              ELSE 0 \
+                         END \
+                END \
+         FROM projects",
+        "DROP TABLE projects",
+        "ALTER TABLE projects_v3b_rebuild RENAME TO projects",
+        "CREATE INDEX IF NOT EXISTS idx_projects_slug ON projects(slug)",
+        "CREATE INDEX IF NOT EXISTS idx_projects_human_key ON projects(human_key)",
+    ];
+
+    for sql in REBUILD_SQL {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    match conn
+        .execute(
+            cx,
+            "CREATE INDEX IF NOT EXISTS idx_projects_created_id_desc ON projects(created_at DESC, id DESC)",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(err) => Outcome::Err(err),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Execute the `v3_fix_messages_text_timestamps` conversion while working around
+/// a sqlmodel-frankensqlite UPDATE-cursor defect (GH#181).
+///
+/// An in-place `UPDATE messages SET created_ts = ...` on a legacy Python-era
+/// store that carries many accumulated secondary indexes aborts with
+/// "database disk image is malformed: table_seek called on index page ... cursor
+/// is_table flag likely incorrect" while the engine maintains those index btrees
+/// during the row walk. Canonical SQLite runs the identical UPDATE cleanly and
+/// the store passes `integrity_check` / `quick_check` (the abort even survives a
+/// `VACUUM INTO` rebuild), so the data is valid — this is an engine defect, not
+/// corruption.
+///
+/// Sidestep the buggy index-maintenance path deterministically and
+/// page-layout-independently: snapshot and DROP every secondary index on
+/// `messages`, run the timestamp-conversion UPDATE with no index btrees to
+/// maintain, then rebuild each captured index from its original DDL. A fresh
+/// `CREATE INDEX` scans the table and builds the btree bottom-up; it does not
+/// exercise the UPDATE-cursor path, which is the same reason the `v3b` /`v15`
+/// table rebuilds already work on these stores.
+///
+/// On a canonical/fresh DB (no TEXT `created_ts`) this is a no-op guarded by a
+/// cheap `COUNT` so it never churns the `messages` indexes.
+async fn execute_v3_fix_messages_text_timestamps<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    update_sql: &str,
+) -> Outcome<(), SqlError> {
+    // 0. Only legacy stores have TEXT timestamps; skip entirely otherwise so a
+    //    fresh-DB bootstrap pays only one COUNT and no index rebuild.
+    let text_count_rows = match conn
+        .query(
+            cx,
+            "SELECT COUNT(*) AS n FROM messages WHERE typeof(created_ts) = 'text'",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let text_count = text_count_rows
+        .first()
+        .and_then(|row| row.get_named::<i64>("n").ok())
+        .unwrap_or(0);
+    if text_count == 0 {
+        return Outcome::Ok(());
+    }
+
+    // 1. Snapshot the secondary-index DDL for `messages`. Auto-indexes (PK /
+    //    UNIQUE constraints) have a NULL `sql` and are excluded — they are not
+    //    droppable and are not implicated in the UPDATE-cursor abort.
+    let index_rows = match conn
+        .query(
+            cx,
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'messages' AND sql IS NOT NULL",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut indexes: Vec<(String, String)> = Vec::with_capacity(index_rows.len());
+    for row in index_rows {
+        let name = match row.get_named::<String>("name") {
+            Ok(name) => name,
+            Err(err) => return Outcome::Err(err),
+        };
+        let sql = match row.get_named::<String>("sql") {
+            Ok(sql) => sql,
+            Err(err) => return Outcome::Err(err),
+        };
+        indexes.push((name, sql));
+    }
+
+    // 2. DROP each captured index so the UPDATE maintains no secondary btrees.
+    for (name, _sql) in &indexes {
+        let drop_sql = format!("DROP INDEX IF EXISTS \"{}\"", name.replace('"', "\"\""));
+        match conn.execute(cx, &drop_sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    // 3. Run the timestamp-conversion UPDATE (identical SQL the migration would
+    //    have run in-place), now with no index maintenance to trip the engine.
+    match conn.execute(cx, update_sql, &[]).await {
+        Outcome::Ok(_) => {}
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    // 4. Rebuild each captured index from its original DDL (a fresh, safe build).
+    for (_name, sql) in &indexes {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    Outcome::Ok(())
+}
+
+async fn execute_v10a_dedup_agents_case_insensitive<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    let rows = match conn
+        .query(
+            cx,
+            "SELECT id, project_id, name FROM agents ORDER BY project_id, id",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut seen = HashSet::new();
+    let mut duplicate_ids = Vec::new();
+    for row in rows {
+        let id = match row.get_named::<i64>("id") {
+            Ok(id) => id,
+            Err(err) => return Outcome::Err(err),
+        };
+        let project_id = match row.get_named::<i64>("project_id") {
+            Ok(project_id) => project_id,
+            Err(err) => return Outcome::Err(err),
+        };
+        let name = match row.get_named::<String>("name") {
+            Ok(name) => name,
+            Err(err) => return Outcome::Err(err),
+        };
+
+        if !seen.insert((project_id, name.to_ascii_lowercase())) {
+            duplicate_ids.push(id);
+        }
+    }
+
+    for duplicate_id in duplicate_ids {
+        match conn
+            .execute(
+                cx,
+                "DELETE FROM agents WHERE id = $1",
+                &[Value::BigInt(duplicate_id)],
+            )
+            .await
+        {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => return Outcome::Err(err),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -2856,16 +3555,23 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                 "migration preflight found schema already satisfies migration; recording migration without executing DDL"
             );
         } else {
-            let statement_result = if migration.id == "v15_add_recipients_json_to_messages" {
-                execute_v15_add_recipients_json_to_messages(cx, conn).await
-            } else {
-                match conn.execute(cx, &migration.up, &[]).await {
-                    Outcome::Ok(_) => Outcome::Ok(()),
-                    Outcome::Err(err) => Outcome::Err(err),
-                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-                    Outcome::Panicked(payload) => Outcome::Panicked(payload),
-                }
-            };
+            let statement_result =
+                if migration.id == "v3b_rebuild_projects_created_at_integer_affinity" {
+                    execute_v3b_rebuild_projects_created_at_integer_affinity(cx, conn).await
+                } else if migration.id == "v3_fix_messages_text_timestamps" {
+                    execute_v3_fix_messages_text_timestamps(cx, conn, &migration.up).await
+                } else if migration.id == "v10a_dedup_agents_case_insensitive" {
+                    execute_v10a_dedup_agents_case_insensitive(cx, conn).await
+                } else if migration.id == "v15_add_recipients_json_to_messages" {
+                    execute_v15_add_recipients_json_to_messages(cx, conn).await
+                } else {
+                    match conn.execute(cx, &migration.up, &[]).await {
+                        Outcome::Ok(_) => Outcome::Ok(()),
+                        Outcome::Err(err) => Outcome::Err(err),
+                        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+                    }
+                };
 
             match statement_result {
                 Outcome::Ok(()) => {}
@@ -3142,6 +3848,29 @@ pub async fn migrate_runtime_canonical_followup<C: Connection>(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
     let expected = schema_migrations_runtime_canonical_followup();
+    let already_complete = match migration_set_is_complete(cx, conn, &expected).await {
+        Outcome::Ok(value) => value,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    if already_complete {
+        return Outcome::Ok(Vec::new());
+    }
+    run_specific_migrations(cx, conn, expected).await
+}
+
+pub async fn migrate_atc_runtime_canonical_followup<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<Vec<String>, SqlError> {
+    match init_migrations_table(cx, conn).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    let expected = schema_migrations_atc_runtime_canonical_followup();
     let already_complete = match migration_set_is_complete(cx, conn, &expected).await {
         Outcome::Ok(value) => value,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -3453,6 +4182,49 @@ mod tests {
     }
 
     #[test]
+    fn analyze_migration_records_when_target_table_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("analyze_missing_atc_table.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_single_migration_with_lock_retry(
+                    &cx,
+                    conn,
+                    &Migration::new(
+                        "v16_analyze_atc_experiences".to_string(),
+                        "analyze ATC experiences after adding indexes".to_string(),
+                        "ANALYZE atc_experiences".to_string(),
+                        String::new(),
+                    ),
+                )
+                .await
+                .into_result()
+                .expect("missing statistics target is vacuously satisfied");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                &format!("SELECT id FROM {MIGRATIONS_TABLE_NAME} WHERE id = $1"),
+                &[Value::Text("v16_analyze_atc_experiences".to_string())],
+            )
+            .expect("query migration row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "missing ANALYZE target should still record the migration"
+        );
+    }
+
+    #[test]
     fn recipients_column_rebuild_drops_stale_inbox_triggers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir
@@ -3694,13 +4466,28 @@ mod tests {
         assert!(ids.contains("base_v2_drop_fts_agents_table"));
         assert!(ids.contains("base_v2_drop_fts_projects_table"));
 
-        // FTS table creation must still be excluded from base migrations.
+        // FTS table/trigger ledger entries must still be excluded from base
+        // migrations. Base mode uses its own cleanup IDs above so canonical
+        // startup can later run the official v11 drop IDs after any pending v7
+        // FTS creation IDs.
         assert!(!ids.contains("v1_create_trigger_messages_ai"));
         assert!(!ids.contains("v1_create_trigger_messages_ad"));
         assert!(!ids.contains("v1_create_trigger_messages_au"));
         assert!(!ids.contains("v5_create_fts_with_porter"));
         assert!(!ids.contains("v7_create_fts_agents"));
         assert!(!ids.contains("v7_create_fts_projects"));
+        assert!(!ids.contains("v11_drop_trigger_messages_ai"));
+        assert!(!ids.contains("v11_drop_trigger_messages_ad"));
+        assert!(!ids.contains("v11_drop_trigger_messages_au"));
+        assert!(!ids.contains("v11_drop_fts_messages_table"));
+        assert!(!ids.contains("v11_drop_trigger_agents_ai"));
+        assert!(!ids.contains("v11_drop_trigger_agents_ad"));
+        assert!(!ids.contains("v11_drop_trigger_agents_au"));
+        assert!(!ids.contains("v11_drop_fts_agents_table"));
+        assert!(!ids.contains("v11_drop_trigger_projects_ai"));
+        assert!(!ids.contains("v11_drop_trigger_projects_ad"));
+        assert!(!ids.contains("v11_drop_trigger_projects_au"));
+        assert!(!ids.contains("v11_drop_fts_projects_table"));
         // ANALYZE creates sqlite_stat1, which currently trips FrankenSQLite's
         // planner/schema-refresh path after startup.
         assert!(!ids.contains("v4_analyze_after_indexes"));
@@ -3873,6 +4660,127 @@ mod tests {
         assert!(
             !is_complete,
             "migration completeness must fail when any expected migration id is missing"
+        );
+    }
+
+    #[test]
+    fn schema_gate_refuses_newer_user_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("future_schema.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_raw(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+            .expect("set future user_version");
+
+        let err = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                refuse_newer_schema_version(&cx, conn, "future_schema.db")
+                    .await
+                    .into_result()
+                    .expect_err("newer schema must be refused")
+            }
+        });
+        let message = err.to_string();
+        assert!(
+            message.contains("upgrade binary"),
+            "future-schema refusal should tell the operator to upgrade binary: {message}"
+        );
+        assert!(
+            message.contains(&format!("user_version={}", SCHEMA_VERSION + 1)),
+            "future-schema refusal should include the on-disk version: {message}"
+        );
+    }
+
+    #[test]
+    fn startup_schema_gate_accepts_latest_migrated_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("latest_gate.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("migrate latest schema");
+                enforce_runtime_fts_cleanup(conn).expect("runtime fts cleanup");
+                validate_startup_schema_gate(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("latest schema should pass startup gate");
+            }
+        });
+    }
+
+    #[test]
+    fn startup_schema_gate_reports_missing_recipients_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_recipients_json.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY,\
+                project_id INTEGER NOT NULL,\
+                sender_id INTEGER NOT NULL,\
+                thread_id TEXT,\
+                subject TEXT NOT NULL,\
+                body_md TEXT NOT NULL,\
+                importance TEXT NOT NULL DEFAULT 'normal',\
+                ack_required INTEGER NOT NULL DEFAULT 0,\
+                created_ts INTEGER NOT NULL,\
+                attachments TEXT NOT NULL DEFAULT '[]'\
+            )",
+        )
+        .expect("create legacy messages table");
+
+        let err = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                validate_startup_schema_gate(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect_err("missing recipients_json should fail schema gate")
+            }
+        });
+        let message = err.to_string();
+        assert!(
+            message.contains("messages.recipients_json"),
+            "schema gate should name the missing column: {message}"
+        );
+        assert!(
+            message.contains("am migrate"),
+            "schema gate should provide the exact migration command: {message}"
+        );
+    }
+
+    #[test]
+    fn startup_schema_gate_reports_missing_required_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_required_tables.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_raw("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .expect("create unrelated metadata table");
+
+        let err = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                validate_startup_schema_gate(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect_err("missing required tables should fail schema gate")
+            }
+        });
+        let message = err.to_string();
+        for expected in ["projects", "agents", "messages", "message_recipients"] {
+            assert!(
+                message.contains(expected),
+                "schema gate should name missing table {expected}: {message}"
+            );
+        }
+        assert!(
+            message.contains("am migrate"),
+            "schema gate should provide the exact migration command: {message}"
         );
     }
 
@@ -4103,6 +5011,146 @@ mod tests {
         assert!(
             fts_rows.is_empty(),
             "runtime cleanup should remove ALL FTS tables"
+        );
+    }
+
+    #[test]
+    fn v3_migration_preserves_distinct_per_row_timestamps() {
+        // Regression for #153 defect 2: every migrated reservation collapsed to
+        // a single constant `expires_ts`. The v3 conversion must preserve each
+        // row's distinct legacy DATETIME value, not fold them to one instant.
+        use sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v3_multi_row_ts.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            &[],
+        )
+        .expect("create legacy projects table");
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("legacy-proj".to_string()),
+                Value::Text("/data/legacy".to_string()),
+                Value::Text("2026-02-04 22:13:11.079199".to_string()),
+            ],
+        )
+        .expect("insert legacy project");
+
+        // The migration's v23 orphan-scrub deletes file_reservations whose
+        // holder agent is gone (`DELETE FROM file_reservations WHERE agent_id
+        // NOT IN (SELECT id FROM agents)`). A real legacy DB always carries the
+        // holder agents, so the parent agent (id=1) for the reservations below
+        // must exist or all three rows are scrubbed before the conversion is
+        // ever asserted (the row-count assert then fails 0 != 3).
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', reaper_exempt INTEGER NOT NULL DEFAULT 0, registration_token TEXT, UNIQUE(project_id, name))",
+            &[],
+        )
+        .expect("create legacy agents table");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("claude-code".to_string()),
+                Value::Text("opus".to_string()),
+                Value::Text("2026-02-05 00:06:44.082288".to_string()),
+                Value::Text("2026-02-05 01:30:00.000000".to_string()),
+            ],
+        )
+        .expect("insert legacy agent");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL DEFAULT 1, reason TEXT NOT NULL DEFAULT '', created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
+            &[],
+        )
+        .expect("create legacy file_reservations table");
+
+        // Distinct per-row ISO-8601 DATETIME values, mirroring the issue's repro.
+        let legacy_rows = [
+            ("2026-06-17 23:00:00.111111", "2026-06-17 23:12:21.295382"),
+            ("2026-06-17 23:01:00.222222", "2026-06-17 23:12:02.904292"),
+            ("2026-06-17 23:02:00.333333", "2026-06-18 00:03:49.589340"),
+        ];
+        for (created, expires) in legacy_rows {
+            conn.execute_sync(
+                "INSERT INTO file_reservations (project_id, agent_id, path_pattern, created_ts, expires_ts) VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(1),
+                    Value::BigInt(1),
+                    Value::Text("src/**".to_string()),
+                    Value::Text(created.to_string()),
+                    Value::Text(expires.to_string()),
+                ],
+            )
+            .expect("insert legacy file_reservation");
+        }
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(expires_ts) AS t, expires_ts FROM file_reservations ORDER BY id",
+                &[],
+            )
+            .expect("query file_reservations");
+        assert_eq!(rows.len(), 3, "all three reservations should survive");
+
+        let mut values: Vec<i64> = Vec::new();
+        for row in &rows {
+            assert_eq!(
+                row.get_named::<String>("t").unwrap(),
+                "integer",
+                "expires_ts must convert to integer microseconds"
+            );
+            values.push(row.get_named::<i64>("expires_ts").unwrap());
+        }
+
+        // The per-row values canonical SQLite produces for these inputs (the
+        // truncating `strftime('%s')` whole-second epoch + the 6-digit
+        // fractional micros). The migration runs on the bespoke engine, whose
+        // `strftime('%s')` rounds the whole-second component to nearest instead
+        // of truncating, so a fractional component >= 0.5s lands one second
+        // (1_000_000 us) high relative to canonical SQLite. That ~1s engine
+        // divergence is tracked with the other frankensqlite strftime/integrity
+        // divergences (#151/#152) and is orthogonal to defect 2 (the per-row
+        // value must not collapse to a shared constant). Assert each row stayed
+        // anchored to its own canonical instant within that 1s tolerance rather
+        // than pinning one engine's rounding.
+        let canonical_expected = [
+            1_781_737_941_295_382_i64, // ...23:12:21.295382 (frac < 0.5 -> exact)
+            1_781_737_922_904_292_i64, // ...23:12:02.904292 (frac >= 0.5 -> +1s on bespoke)
+            1_781_741_029_589_340_i64, // ...00:03:49.589340 (frac >= 0.5 -> +1s on bespoke)
+        ];
+        const SECOND_US: i64 = 1_000_000;
+        for (got, expected) in values.iter().zip(canonical_expected.iter()) {
+            assert!(
+                (got - expected).abs() <= SECOND_US,
+                "each reservation must keep its own converted expiry, not a shared \
+                 constant: got {got}, expected ~{expected} (within {SECOND_US}us)"
+            );
+        }
+
+        let distinct: std::collections::HashSet<i64> = values.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "expires_ts collapsed to a constant across rows (got {values:?})"
         );
     }
 
@@ -4405,6 +5453,60 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
                 .get_named::<String>("t")
                 .expect("projects.created_at type"),
             "integer"
+        );
+    }
+
+    #[test]
+    fn v3_migration_accepts_stringified_microseconds_in_text_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("stringified_micros.sqlite3");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        conn.execute_raw(
+            "\
+            CREATE TABLE IF NOT EXISTS projects (\
+                id INTEGER PRIMARY KEY,\
+                slug TEXT NOT NULL,\
+                human_key TEXT NOT NULL,\
+                created_at TEXT NOT NULL\
+            )",
+        )
+        .expect("create legacy projects table");
+        conn.execute_raw(
+            "\
+            INSERT INTO projects (id, slug, human_key, created_at) \
+            VALUES (1, 'legacy-stringified-micros', '/tmp/legacy', '1772368496123456')",
+        )
+        .expect("insert stringified micros project");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) AS t, created_at FROM projects WHERE id = 1",
+                &[],
+            )
+            .expect("query migrated project");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("t")
+                .expect("projects.created_at type"),
+            "integer"
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<i64>("created_at")
+                .expect("projects.created_at value"),
+            1_772_368_496_123_456
         );
     }
 

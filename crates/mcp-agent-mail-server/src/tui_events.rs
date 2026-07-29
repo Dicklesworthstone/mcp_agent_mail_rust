@@ -44,6 +44,7 @@ pub enum MailEventKind {
     AgentRegistered,
     HttpRequest,
     HealthPulse,
+    GitSegfaultRetry,
     ServerStarted,
     ServerShutdown,
 }
@@ -62,6 +63,7 @@ impl MailEventKind {
             Self::AgentRegistered => "AgentReg",
             Self::HttpRequest => "HTTP",
             Self::HealthPulse => "Health",
+            Self::GitSegfaultRetry => "GitSegv",
             Self::ServerStarted => "SrvStart",
             Self::ServerShutdown => "SrvStop",
         }
@@ -197,6 +199,7 @@ pub(crate) const fn event_log_icon(kind: MailEventKind) -> char {
         MailEventKind::AgentRegistered => '👤',
         MailEventKind::HttpRequest => '↔',
         MailEventKind::HealthPulse => '♥',
+        MailEventKind::GitSegfaultRetry => '!',
         MailEventKind::ServerStarted => '▶',
         MailEventKind::ServerShutdown => '⏹',
     }
@@ -464,6 +467,17 @@ pub enum MailEvent {
         redacted: bool,
         db_stats: DbStatSnapshot,
     },
+    GitSegfaultRetry {
+        seq: u64,
+        timestamp_micros: i64,
+        source: EventSource,
+        redacted: bool,
+        name: String,
+        repo_slug: String,
+        attempt_n: u32,
+        signal: Option<i32>,
+        exhausted: bool,
+    },
     ServerStarted {
         seq: u64,
         timestamp_micros: i64,
@@ -668,6 +682,27 @@ impl MailEvent {
     }
 
     #[must_use]
+    pub fn git_segfault_retry(
+        name: impl Into<String>,
+        repo_slug: impl Into<String>,
+        attempt_n: u32,
+        signal: Option<i32>,
+        exhausted: bool,
+    ) -> Self {
+        Self::GitSegfaultRetry {
+            seq: 0,
+            timestamp_micros: 0,
+            source: EventSource::Tooling,
+            redacted: false,
+            name: name.into(),
+            repo_slug: repo_slug.into(),
+            attempt_n,
+            signal,
+            exhausted,
+        }
+    }
+
+    #[must_use]
     pub fn server_started(endpoint: impl Into<String>, config_summary: impl Into<String>) -> Self {
         Self::ServerStarted {
             seq: 0,
@@ -705,6 +740,13 @@ impl MailEvent {
             | Self::ReservationReleased { .. }
             | Self::AgentRegistered { .. }
             | Self::ServerStarted { .. } => EventSeverity::Info,
+            Self::GitSegfaultRetry { exhausted, .. } => {
+                if *exhausted {
+                    EventSeverity::Error
+                } else {
+                    EventSeverity::Warn
+                }
+            }
             Self::HttpRequest { status, .. } => {
                 if *status >= 500 {
                     EventSeverity::Error
@@ -730,6 +772,7 @@ impl MailEvent {
             Self::AgentRegistered { .. } => MailEventKind::AgentRegistered,
             Self::HttpRequest { .. } => MailEventKind::HttpRequest,
             Self::HealthPulse { .. } => MailEventKind::HealthPulse,
+            Self::GitSegfaultRetry { .. } => MailEventKind::GitSegfaultRetry,
             Self::ServerStarted { .. } => MailEventKind::ServerStarted,
             Self::ServerShutdown { .. } => MailEventKind::ServerShutdown,
         }
@@ -747,6 +790,7 @@ impl MailEvent {
             | Self::AgentRegistered { seq, .. }
             | Self::HttpRequest { seq, .. }
             | Self::HealthPulse { seq, .. }
+            | Self::GitSegfaultRetry { seq, .. }
             | Self::ServerStarted { seq, .. }
             | Self::ServerShutdown { seq, .. } => *seq,
         }
@@ -782,6 +826,9 @@ impl MailEvent {
             | Self::HealthPulse {
                 timestamp_micros, ..
             }
+            | Self::GitSegfaultRetry {
+                timestamp_micros, ..
+            }
             | Self::ServerStarted {
                 timestamp_micros, ..
             }
@@ -803,6 +850,7 @@ impl MailEvent {
             | Self::AgentRegistered { source, .. }
             | Self::HttpRequest { source, .. }
             | Self::HealthPulse { source, .. }
+            | Self::GitSegfaultRetry { source, .. }
             | Self::ServerStarted { source, .. }
             | Self::ServerShutdown { source, .. } => *source,
         }
@@ -820,6 +868,7 @@ impl MailEvent {
             | Self::AgentRegistered { redacted, .. }
             | Self::HttpRequest { redacted, .. }
             | Self::HealthPulse { redacted, .. }
+            | Self::GitSegfaultRetry { redacted, .. }
             | Self::ServerStarted { redacted, .. }
             | Self::ServerShutdown { redacted, .. } => *redacted,
         }
@@ -934,6 +983,18 @@ impl MailEvent {
                 db_stats.contact_links,
                 db_stats.ack_pending
             ),
+            Self::GitSegfaultRetry {
+                name,
+                repo_slug,
+                attempt_n,
+                signal,
+                exhausted,
+                ..
+            } => {
+                let outcome = if *exhausted { "exhausted" } else { "retry" };
+                let signal = signal.map_or_else(|| "?".to_string(), |value| value.to_string());
+                format!("{name} {outcome} repo={repo_slug} attempt={attempt_n} signal={signal}")
+            }
             Self::ServerStarted { endpoint, .. } => format!("Server started at {endpoint}"),
             Self::ServerShutdown { .. } => "Server shutting down".to_string(),
         }
@@ -950,6 +1011,7 @@ impl MailEvent {
             | Self::AgentRegistered { seq: s, .. }
             | Self::HttpRequest { seq: s, .. }
             | Self::HealthPulse { seq: s, .. }
+            | Self::GitSegfaultRetry { seq: s, .. }
             | Self::ServerStarted { seq: s, .. }
             | Self::ServerShutdown { seq: s, .. } => *s = seq,
         }
@@ -993,6 +1055,10 @@ impl MailEvent {
                 ..
             }
             | Self::HealthPulse {
+                timestamp_micros: ts,
+                ..
+            }
+            | Self::GitSegfaultRetry {
                 timestamp_micros: ts,
                 ..
             }
@@ -1602,6 +1668,7 @@ impl TimelineRow {
             MailEventKind::AgentRegistered => '⊕',
             MailEventKind::HttpRequest => '⇄',
             MailEventKind::HealthPulse => '♥',
+            MailEventKind::GitSegfaultRetry => '!',
             MailEventKind::ServerStarted => '🚀',
             MailEventKind::ServerShutdown => '⏹',
         };
@@ -1676,6 +1743,18 @@ impl TimelineRow {
                     "agents={} msgs={} rsv={}",
                     db_stats.agents, db_stats.messages, db_stats.file_reservations
                 )
+            }
+            MailEvent::GitSegfaultRetry {
+                repo_slug,
+                attempt_n,
+                exhausted,
+                ..
+            } => {
+                if *exhausted {
+                    format!("git retry exhausted on {repo_slug}")
+                } else {
+                    format!("git segfault retry {attempt_n} on {repo_slug}")
+                }
             }
             MailEvent::ServerStarted { endpoint, .. } => {
                 format!("Server started on {endpoint}")
@@ -2364,17 +2443,28 @@ mod tests {
                     ..Default::default()
                 },
             },
-            MailEvent::ServerStarted {
+            MailEvent::GitSegfaultRetry {
                 seq: 10,
                 timestamp_micros: 110,
+                source: EventSource::Tooling,
+                redacted: false,
+                name: "git_segfault_retry_attempt".to_string(),
+                repo_slug: "data-projects-demo".to_string(),
+                attempt_n: 1,
+                signal: Some(11),
+                exhausted: false,
+            },
+            MailEvent::ServerStarted {
+                seq: 11,
+                timestamp_micros: 111,
                 source: EventSource::Lifecycle,
                 redacted: false,
                 endpoint: "http://127.0.0.1:8765/mcp/".to_string(),
                 config_summary: "auth=on".to_string(),
             },
             MailEvent::ServerShutdown {
-                seq: 11,
-                timestamp_micros: 111,
+                seq: 12,
+                timestamp_micros: 112,
                 source: EventSource::Lifecycle,
                 redacted: false,
             },
@@ -2491,6 +2581,13 @@ mod tests {
             MailEvent::agent_registered("n", "prog", "model", "p"),
             MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1"),
             MailEvent::health_pulse(DbStatSnapshot::default()),
+            MailEvent::git_segfault_retry(
+                "git_segfault_retry_attempt",
+                "data-projects-demo",
+                1,
+                Some(11),
+                false,
+            ),
             MailEvent::server_started("http://localhost", "test"),
             MailEvent::server_shutdown(),
         ];
@@ -2504,6 +2601,7 @@ mod tests {
             MailEventKind::AgentRegistered,
             MailEventKind::HttpRequest,
             MailEventKind::HealthPulse,
+            MailEventKind::GitSegfaultRetry,
             MailEventKind::ServerStarted,
             MailEventKind::ServerShutdown,
         ];
@@ -2627,6 +2725,28 @@ mod tests {
             MailEvent::health_pulse(DbStatSnapshot::default()).severity(),
             EventSeverity::Debug
         );
+        assert_eq!(
+            MailEvent::git_segfault_retry(
+                "git_segfault_retry_attempt",
+                "data-projects-demo",
+                1,
+                Some(11),
+                false,
+            )
+            .severity(),
+            EventSeverity::Warn
+        );
+        assert_eq!(
+            MailEvent::git_segfault_retry(
+                "git_segfault_retry_exhausted",
+                "data-projects-demo",
+                4,
+                Some(11),
+                true,
+            )
+            .severity(),
+            EventSeverity::Error
+        );
     }
 
     #[test]
@@ -2669,6 +2789,16 @@ mod tests {
                 EventSeverity::Debug,
             ),
             (
+                MailEvent::git_segfault_retry(
+                    "git_segfault_retry_attempt",
+                    "data-projects-demo",
+                    1,
+                    Some(11),
+                    false,
+                ),
+                EventSeverity::Warn,
+            ),
+            (
                 MailEvent::server_started("http://127.0.0.1:8080", "test"),
                 EventSeverity::Info,
             ),
@@ -2697,6 +2827,7 @@ mod tests {
             MailEventKind::AgentRegistered.compact_label(),
             MailEventKind::HttpRequest.compact_label(),
             MailEventKind::HealthPulse.compact_label(),
+            MailEventKind::GitSegfaultRetry.compact_label(),
             MailEventKind::ServerStarted.compact_label(),
             MailEventKind::ServerShutdown.compact_label(),
         ];
@@ -2804,6 +2935,13 @@ mod tests {
             MailEvent::reservation_released("A", vec![], "proj"),
             MailEvent::agent_registered("A", "cc", "opus", "proj"),
             MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1"),
+            MailEvent::git_segfault_retry(
+                "git_segfault_retry_attempt",
+                "data-projects-demo",
+                1,
+                Some(11),
+                false,
+            ),
             MailEvent::server_started("http://127.0.0.1:8080", "test"),
         ];
         for event in &events {
@@ -2826,6 +2964,13 @@ mod tests {
             MailEvent::message_sent(1, "A", vec![], "sub", "tid", "proj", ""),
             MailEvent::agent_registered("A", "cc", "opus", "proj"),
             MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1"),
+            MailEvent::git_segfault_retry(
+                "git_segfault_retry_attempt",
+                "data-projects-demo",
+                1,
+                Some(11),
+                false,
+            ),
         ];
         for event in &events {
             assert!(
@@ -2870,6 +3015,17 @@ mod tests {
         assert_eq!(
             MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1").source(),
             EventSource::Http
+        );
+        assert_eq!(
+            MailEvent::git_segfault_retry(
+                "git_segfault_retry_attempt",
+                "data-projects-demo",
+                1,
+                Some(11),
+                false,
+            )
+            .source(),
+            EventSource::Tooling
         );
         assert_eq!(
             MailEvent::server_started("http://127.0.0.1", "test").source(),
@@ -2938,6 +3094,17 @@ mod tests {
         assert_eq!(
             MailEvent::http_request("GET", "/", 200, 5, "127.0.0.1").kind(),
             MailEventKind::HttpRequest
+        );
+        assert_eq!(
+            MailEvent::git_segfault_retry(
+                "git_segfault_retry_attempt",
+                "data-projects-demo",
+                1,
+                Some(11),
+                false,
+            )
+            .kind(),
+            MailEventKind::GitSegfaultRetry
         );
         assert_eq!(
             MailEvent::server_started("http://127.0.0.1", "test").kind(),

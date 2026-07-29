@@ -24,7 +24,7 @@
   <div class="mb-6">
     <h1 class="text-3xl font-semibold text-slate-900 dark:text-white mb-2">Send Message as Human Overseer</h1>
     <p class="text-slate-600 dark:text-slate-400">
-      Send high-priority instructions directly to your agents. Messages are automatically marked as urgent.
+      Send high-priority instructions directly to your agents.
     </p>
   </div>
 
@@ -173,6 +173,23 @@
                  class="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all" />
           <p class="mt-1.5 text-xs text-slate-500 dark:text-slate-500">
             <span x-text="subject.length"></span> / 200 characters
+          </p>
+        </div>
+
+        <!-- Intervention Reason -->
+        <div>
+          <label for="reason" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+            Intervention Reason <span class="text-red-500">*</span>
+          </label>
+          <input type="text"
+                 id="reason"
+                 x-model="reason"
+                 required
+                 maxlength="500"
+                 placeholder="e.g., Production incident, blocked release, security review"
+                 class="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all" />
+          <p class="mt-1.5 text-xs text-slate-500 dark:text-slate-500">
+            <span x-text="reason.length"></span> / 500 characters
           </p>
         </div>
 
@@ -360,14 +377,31 @@ Please investigate the following:
             <span class="text-slate-600 dark:text-slate-400">Recipients:</span>
             <span class="font-medium text-slate-900 dark:text-white" x-text="selectedRecipients.length + ' agent' + (selectedRecipients.length !== 1 ? 's' : '')"></span>
           </div>
+          <div class="text-sm">
+            <span class="block text-slate-600 dark:text-slate-400 mb-1">Recipient names:</span>
+            <div class="max-h-24 overflow-y-auto rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 p-2 text-xs text-slate-800 dark:text-slate-200" x-text="recipientSummary()"></div>
+          </div>
           <div class="flex items-start justify-between text-sm gap-3">
             <span class="text-slate-600 dark:text-slate-400 flex-shrink-0">Subject:</span>
             <span class="font-medium text-slate-900 dark:text-white text-right" x-text="subject"></span>
+          </div>
+          <div class="flex items-start justify-between text-sm gap-3">
+            <span class="text-slate-600 dark:text-slate-400 flex-shrink-0">Reason:</span>
+            <span class="font-medium text-slate-900 dark:text-white text-right" x-text="reason"></span>
           </div>
           <div class="flex items-center justify-between text-sm">
             <span class="text-slate-600 dark:text-slate-400">Priority:</span>
             <span class="px-2 py-0.5 bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 text-xs font-medium rounded">High</span>
           </div>
+
+          <label x-show="requiresMultiRecipientConfirm()" class="flex items-start gap-3 p-3 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 text-sm">
+            <input type="checkbox"
+                   x-model="confirmedMultiRecipient"
+                   class="mt-0.5 w-4 h-4 text-amber-700 bg-white dark:bg-slate-700 border-amber-400 dark:border-amber-700 rounded focus:ring-2 focus:ring-amber-500" />
+            <span class="text-amber-950 dark:text-amber-100">
+              I confirm this intervention targets multiple explicit recipients.
+            </span>
+          </label>
 
           <div class="p-3 bg-amber-50 dark:bg-amber-900/20 rounded-lg border border-amber-200 dark:border-amber-800 mt-4">
             <p class="text-xs text-amber-900 dark:text-amber-100">
@@ -382,7 +416,7 @@ Please investigate the following:
             Cancel
           </button>
           <button @click="confirmSend()" type="button"
-                  :disabled="sending"
+                  :disabled="!canConfirmSend()"
                   class="px-4 py-2 text-sm font-medium bg-slate-900 dark:bg-white text-white dark:text-slate-900 hover:bg-slate-800 dark:hover:bg-slate-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
             Confirm & Send
           </button>
@@ -398,12 +432,14 @@ function overseerComposer() {
     agents: [{% for agent in agents %}{{ agent.name | tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
     selectedRecipients: [],
     subject: '',
+    reason: '',
     body: '',
     threadId: '',
     recipientSearch: '',
     viewMode: 'write',
     renderedPreview: '',
     sending: false,
+    confirmedMultiRecipient: false,
     showToast: false,
     showConfirmModal: false,
     toastType: 'success',
@@ -421,10 +457,12 @@ function overseerComposer() {
 
     selectAll() {
       this.selectedRecipients = [...this.agents];
+      this.confirmedMultiRecipient = false;
     },
 
     selectNone() {
       this.selectedRecipients = [];
+      this.confirmedMultiRecipient = false;
     },
 
     filteredRecipientsCount() {
@@ -438,9 +476,27 @@ function overseerComposer() {
              this.selectedRecipients.length <= 100 &&
              this.subject.trim() &&
              this.subject.length <= 200 &&
+             this.reason.trim() &&
+             this.reason.length <= 500 &&
              this.body.trim() &&
              this.body.length <= 49600 &&
              !this.sending;
+    },
+
+    requiresMultiRecipientConfirm() {
+      return this.selectedRecipients.length > 1;
+    },
+
+    canConfirmSend() {
+      return !this.sending &&
+             (!this.requiresMultiRecipientConfirm() || this.confirmedMultiRecipient);
+    },
+
+    recipientSummary() {
+      if (this.selectedRecipients.length <= 12) {
+        return this.selectedRecipients.join(', ');
+      }
+      return this.selectedRecipients.slice(0, 12).join(', ') + `, and ${this.selectedRecipients.length - 12} more`;
     },
 
     insertMarkdown(before, after, placeholder) {
@@ -506,6 +562,7 @@ function overseerComposer() {
 
     async sendMessage() {
       if (!this.canSend()) return;
+      this.confirmedMultiRecipient = false;
       this.showConfirmModal = true;
     },
 
@@ -526,10 +583,13 @@ function overseerComposer() {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
+            intent: 'human_overseer_send',
             recipients: this.selectedRecipients,
             subject: this.subject.trim(),
+            reason: this.reason.trim(),
             body_md: this.body.trim(),
             thread_id: this.threadId.trim() || null,
+            confirm_multiple: this.selectedRecipients.length > 1 && this.confirmedMultiRecipient,
           })
         });
 

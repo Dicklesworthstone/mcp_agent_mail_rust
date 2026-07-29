@@ -1090,6 +1090,7 @@ first body
     fn with_static_export_env<T>(
         storage_root: &Path,
         database_path: &Path,
+        extra_env: &[(&str, &str)],
         f: impl FnOnce() -> T,
     ) -> T {
         let database_url = format!("sqlite:///{}", database_path.display());
@@ -1097,13 +1098,12 @@ first body
             .to_str()
             .expect("static export storage root utf-8")
             .to_string();
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            f,
-        )
+        let mut env = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        env.extend_from_slice(extra_env);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&env, f)
     }
 
     #[test]
@@ -1350,7 +1350,7 @@ first body
             include_search_index: true,
         };
 
-        let manifest = with_static_export_env(&storage_root, &db_path, || {
+        let manifest = with_static_export_env(&storage_root, &db_path, &[], || {
             export_static_site(&config).expect("static export should succeed")
         });
 
@@ -1394,12 +1394,12 @@ first body
             .expect("tmpdir override utf-8")
             .to_string();
 
-        let err = with_static_export_env(&storage_root, &db_path, || {
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[("TMPDIR", tmpdir.as_str())],
-                || export_static_site(&config),
-            )
-        })
+        let err = with_static_export_env(
+            &storage_root,
+            &db_path,
+            &[("TMPDIR", tmpdir.as_str())],
+            || export_static_site(&config),
+        )
         .expect_err("static export should fail closed when snapshot setup fails");
 
         assert!(err.contains("static export read pool unavailable"), "{err}");

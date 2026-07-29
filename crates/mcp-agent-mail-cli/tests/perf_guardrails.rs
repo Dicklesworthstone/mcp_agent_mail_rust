@@ -131,8 +131,19 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = (p.clamp(0.0, 100.0) / 100.0) * (sorted.len() as f64 - 1.0);
+    let lower_idx = rank.floor() as usize;
+    let upper_idx = rank.ceil() as usize;
+    if lower_idx == upper_idx {
+        return sorted[lower_idx];
+    }
+    let lower = sorted[lower_idx] as f64;
+    let upper = sorted[upper_idx.min(sorted.len() - 1)] as f64;
+    let weight = rank - lower_idx as f64;
+    (lower + (upper - lower) * weight).round() as u64
 }
 
 fn format_command(program: &str, args: &[&str]) -> String {

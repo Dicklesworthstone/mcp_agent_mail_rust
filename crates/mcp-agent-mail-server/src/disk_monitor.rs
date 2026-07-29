@@ -55,6 +55,7 @@ pub fn start(config: &Config) {
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("disk-monitor".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || monitor_loop(&config))
         {
             Ok(handle) => {

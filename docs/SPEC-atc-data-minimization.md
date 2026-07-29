@@ -159,3 +159,22 @@ Callers should reject rows where `validate()` returns a non-empty list.
 | Transparency cards | 365d | Never (folded) | Batched audit |
 | Audit summaries | 730d | Archived | Aggregated only |
 | Feature vectors | With parent | Never | Parent denylist |
+
+## Operator Privacy Report
+
+`am robot atc --project <path> --format json` includes a `privacy` report when
+the local SQLite mailbox is available. The report is intentionally inventory-only:
+
+- row counts by lifecycle state and privacy classification
+- suspected-secret and redaction-candidate counts
+- per-project counts keyed by a domain-separated SHA-256 prefix, never by raw
+  `project_key`
+- per-stratum counts using `{subsystem}:{effect_kind}:{state}` only
+- retention windows, redaction options, and schema classification summary from
+  this document
+
+The report never renders raw `subject`, `project_key`, `evidence_summary`,
+`outcome_json`, or `context_json` values. Rows are counted as redaction
+candidates when they have `contained_suspected_secret = 1`, are classified as
+`legacy_unclassified` or `redacted_due_to_secret`, or carry non-empty Category D
+payload columns that require operator review.

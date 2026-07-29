@@ -1,14 +1,18 @@
-//! 1000-agent load simulation benchmarks (br-15dv.7.2).
+//! Replayable swarm capacity simulator and load benchmarks
+//! (`br-oci92.3`, `br-idea-wizard-swarm-reliability-2ac6x.2`).
 //!
-//! Four scenarios exercising the DB layer under realistic concurrent load:
+//! Scenarios exercise the DB layer under realistic concurrent load and produce
+//! replay-plan artifacts for 100, 1k, and 10k agent capacity forecasts:
 //!
+//! - **CI replay**: 100 agents across 10 projects using isolated SQLite/storage.
 //! - **Scenario A**: Registration storm — 1000 agents register across 50 threads.
 //! - **Scenario B**: Message burst — 100 agents send 10 messages each.
 //! - **Scenario C**: Mixed workload — 60s sustained mixed read/write operations.
 //! - **Scenario D**: Thundering herd — 500 concurrent `fetch_inbox` on one project.
 //!
 //! Each scenario collects per-operation latencies, reports p50/p95/p99/max,
-//! and asserts SLO budgets from br-15dv.10.
+//! and asserts SLO budgets from br-15dv.10. Capacity replay artifacts land under
+//! `tests/artifacts/perf/swarm_capacity/`.
 //!
 //! # Running
 //!
@@ -28,7 +32,13 @@
 mod common;
 
 use asupersync::{Cx, Outcome};
+use mcp_agent_mail_core::config::CacheProfile;
 use mcp_agent_mail_core::models::{VALID_ADJECTIVES, VALID_NOUNS};
+use mcp_agent_mail_core::{
+    EffectKind, ExperienceBuilder, ExperienceState, ExperienceSubsystem, global_metrics,
+};
+use mcp_agent_mail_db::AgentRow;
+use mcp_agent_mail_db::cache::{CacheDiagnosticsSnapshot, ReadCache, cache_diagnostics_snapshot};
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig, QUERY_TRACKER, read_cache};
 use std::collections::BTreeMap;
@@ -129,6 +139,7 @@ fn generate_agent_names(count: usize) -> Vec<String> {
 #[derive(Clone, serde::Serialize)]
 struct LatencyReport {
     count: usize,
+    total_us: u64,
     p50: u64,
     p95: u64,
     p99: u64,
@@ -138,11 +149,13 @@ struct LatencyReport {
 
 impl LatencyReport {
     fn from_latencies(latencies: &mut [u64], errors: u64) -> Self {
+        let total_us = latencies.iter().sum();
         latencies.sort_unstable();
         let n = latencies.len();
         if n == 0 {
             return Self {
                 count: 0,
+                total_us,
                 p50: 0,
                 p95: 0,
                 p99: 0,
@@ -152,6 +165,7 @@ impl LatencyReport {
         }
         Self {
             count: n,
+            total_us,
             p50: latencies[n * 50 / 100],
             p95: latencies[n * 95 / 100],
             p99: latencies[n * 99 / 100],
@@ -182,7 +196,7 @@ fn run_inbox_stats_polling_phase(
     let mut latencies: Vec<u64> = Vec::with_capacity(polls);
     for _ in 0..polls {
         if force_invalidate_each_poll {
-            read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
+            read_cache().invalidate_inbox_stats_scoped(&pool.sqlite_identity_key(), receiver_id);
         }
 
         let t0 = Instant::now();
@@ -209,13 +223,32 @@ fn run_inbox_stats_polling_phase(
 #[derive(serde::Serialize)]
 struct SwarmLoadLabScenario {
     name: &'static str,
+    trace_source: &'static str,
+    scale_target_agents: usize,
     projects: usize,
     agents_per_project: usize,
     total_agents: usize,
     messages_per_agent: usize,
+    reservations_per_project: usize,
+    build_slots: usize,
+    atc_observations: usize,
     default_ci: bool,
     ignored_heavy: bool,
     operations: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct SwarmCapacityTraceFixture {
+    name: &'static str,
+    source: &'static str,
+    captured_projects: usize,
+    captured_agents: usize,
+    captured_messages: usize,
+    captured_file_reservations: usize,
+    captured_contact_links: usize,
+    captured_build_slots: usize,
+    captured_atc_open_experiences: usize,
+    deterministic_seed: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -223,10 +256,33 @@ struct SwarmLoadLabOperationReport {
     operation: &'static str,
     count: usize,
     errors: u64,
+    throughput_ops_per_sec: f64,
     p50_us: u64,
     p95_us: u64,
     p99_us: u64,
     max_us: u64,
+}
+
+#[derive(serde::Serialize)]
+struct SwarmCapacityQueueLedger {
+    storage_surface: &'static str,
+    wbq_depth: u64,
+    wbq_capacity: u64,
+    wbq_peak_depth: u64,
+    wbq_enqueued_total: u64,
+    wbq_drained_total: u64,
+    wbq_errors_total: u64,
+    wbq_fallbacks_total: u64,
+    wbq_queue_p95_us: u64,
+    commit_pending_requests: u64,
+    commit_soft_cap: u64,
+    commit_peak_pending_requests: u64,
+    commit_enqueued_total: u64,
+    commit_drained_total: u64,
+    commit_errors_total: u64,
+    commit_queue_p95_us: u64,
+    db_pool_pending_requests: u64,
+    db_pool_utilization_pct: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -236,10 +292,13 @@ struct SwarmLoadLabResourceLedger {
     rss_growth_kb: u64,
     wal_bytes: u64,
     process_cpu_ticks_delta: u64,
+    rows_touched_estimate: u64,
     db_query_count: u64,
     per_table_queries: BTreeMap<String, u64>,
     isolated_storage_root: String,
     isolated_sqlite_path: String,
+    cache_diagnostics: CacheDiagnosticsSnapshot,
+    queue_ledger: SwarmCapacityQueueLedger,
 }
 
 #[derive(serde::Serialize)]
@@ -255,25 +314,92 @@ struct SwarmLoadLabReport {
     bead: &'static str,
     generated_at: String,
     scenario: &'static str,
+    trace_fixture: SwarmCapacityTraceFixture,
+    total_operations: usize,
+    elapsed_ms: u128,
+    throughput_ops_per_sec: f64,
+    slowest_operation_by_p95: String,
     operation_reports: Vec<SwarmLoadLabOperationReport>,
     scenario_definitions: Vec<SwarmLoadLabScenario>,
     resource_ledger: SwarmLoadLabResourceLedger,
     gates: Vec<SwarmLoadLabGate>,
+    failure_reasons: Vec<String>,
     reproduction_commands: Vec<String>,
     realism_notes: Vec<&'static str>,
 }
 
+#[derive(serde::Serialize)]
+struct CacheProfileHotsetReport {
+    profile: &'static str,
+    capacity_per_category: usize,
+    seeded_agents: usize,
+    probes: usize,
+    hits: u64,
+    misses: u64,
+    hit_ratio: f64,
+    lookup_p50_us: u64,
+    lookup_p95_us: u64,
+    lookup_p99_us: u64,
+    lookup_max_us: u64,
+    output_checksum: u64,
+    final_live_entries: usize,
+    capacity_utilization_bp: u64,
+    total_estimated_bytes: usize,
+}
+
 impl SwarmLoadLabOperationReport {
-    const fn from_latency_report(operation: &'static str, report: &LatencyReport) -> Self {
+    fn from_latency_report(operation: &'static str, report: &LatencyReport) -> Self {
         Self {
             operation,
             count: report.count,
             errors: report.errors,
+            throughput_ops_per_sec: throughput_per_second(report.count, report.total_us),
             p50_us: report.p50,
             p95_us: report.p95,
             p99_us: report.p99,
             max_us: report.max,
         }
+    }
+}
+
+fn throughput_per_second(count: usize, elapsed_us: u64) -> f64 {
+    if elapsed_us == 0 {
+        0.0
+    } else {
+        count as f64 / (elapsed_us as f64 / 1_000_000.0)
+    }
+}
+
+fn throughput_for_duration(count: usize, elapsed: Duration) -> f64 {
+    let elapsed = elapsed.as_secs_f64();
+    if elapsed <= f64::EPSILON {
+        0.0
+    } else {
+        count as f64 / elapsed
+    }
+}
+
+fn storage_queue_ledger(storage_surface: &'static str) -> SwarmCapacityQueueLedger {
+    let metrics = global_metrics().snapshot();
+    SwarmCapacityQueueLedger {
+        storage_surface,
+        wbq_depth: metrics.storage.wbq_depth,
+        wbq_capacity: metrics.storage.wbq_capacity,
+        wbq_peak_depth: metrics.storage.wbq_peak_depth,
+        wbq_enqueued_total: metrics.storage.wbq_enqueued_total,
+        wbq_drained_total: metrics.storage.wbq_drained_total,
+        wbq_errors_total: metrics.storage.wbq_errors_total,
+        wbq_fallbacks_total: metrics.storage.wbq_fallbacks_total,
+        wbq_queue_p95_us: metrics.storage.wbq_queue_latency_us.p95,
+        commit_pending_requests: metrics.storage.commit_pending_requests,
+        commit_soft_cap: metrics.storage.commit_soft_cap,
+        commit_peak_pending_requests: metrics.storage.commit_peak_pending_requests,
+        commit_enqueued_total: metrics.storage.commit_enqueued_total,
+        commit_drained_total: metrics.storage.commit_drained_total,
+        commit_errors_total: metrics.storage.commit_errors_total,
+        commit_queue_p95_us: metrics.storage.commit_queue_latency_us.p95,
+        db_pool_pending_requests: metrics.db.pool_pending_requests,
+        db_pool_utilization_pct: metrics.db.pool_utilization_pct,
     }
 }
 
@@ -313,33 +439,60 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn swarm_load_lab_artifact_dir() -> PathBuf {
+const SWARM_CAPACITY_ARTIFACT_ROOT: &str = "tests/artifacts/perf/swarm_capacity";
+const SWARM_LOAD_LAB_BEAD: &str = "br-idea-wizard-swarm-reliability-2ac6x.2";
+const CI_REPLAY_PROJECTS: usize = 10;
+const CI_REPLAY_AGENTS_PER_PROJECT: usize = 10;
+const CI_REPLAY_TOTAL_AGENTS: usize = CI_REPLAY_PROJECTS * CI_REPLAY_AGENTS_PER_PROJECT;
+const CI_REPLAY_MESSAGES_PER_AGENT: usize = 2;
+
+fn swarm_capacity_artifact_dir() -> PathBuf {
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
     repo_root().join(format!(
-        "tests/artifacts/perf/swarm_load_lab/{ts}_{}",
-        std::process::id()
+        "{SWARM_CAPACITY_ARTIFACT_ROOT}/{ts}_{}",
+        std::process::id(),
     ))
 }
 
-fn markdown_for_swarm_load_lab(report: &SwarmLoadLabReport) -> String {
+fn markdown_for_swarm_capacity(report: &SwarmLoadLabReport) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "# Swarm Load Lab Report");
+    let _ = writeln!(out, "# Swarm Capacity Replay Report");
     let _ = writeln!(out);
     let _ = writeln!(out, "- Bead: `{}`", report.bead);
     let _ = writeln!(out, "- Scenario: `{}`", report.scenario);
     let _ = writeln!(out, "- Generated: `{}`", report.generated_at);
+    let _ = writeln!(out, "- Trace fixture: `{}`", report.trace_fixture.name);
+    let _ = writeln!(out, "- Total operations: `{}`", report.total_operations);
+    let _ = writeln!(out, "- Elapsed: `{}` ms", report.elapsed_ms);
+    let _ = writeln!(
+        out,
+        "- Throughput: `{:.1}` ops/sec",
+        report.throughput_ops_per_sec
+    );
+    let _ = writeln!(
+        out,
+        "- Slowest operation by p95: `{}`",
+        report.slowest_operation_by_p95
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "## Operation Latency");
     let _ = writeln!(
         out,
-        "| Operation | Count | Errors | p50 | p95 | p99 | Max |"
+        "| Operation | Count | Errors | Throughput | p50 | p95 | p99 | Max |"
     );
-    let _ = writeln!(out, "|---|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|");
     for op in &report.operation_reports {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {}us | {}us | {}us | {}us |",
-            op.operation, op.count, op.errors, op.p50_us, op.p95_us, op.p99_us, op.max_us
+            "| {} | {} | {} | {:.1}/s | {}us | {}us | {}us | {}us |",
+            op.operation,
+            op.count,
+            op.errors,
+            op.throughput_ops_per_sec,
+            op.p50_us,
+            op.p95_us,
+            op.p99_us,
+            op.max_us
         );
     }
     let _ = writeln!(out);
@@ -357,6 +510,11 @@ fn markdown_for_swarm_load_lab(report: &SwarmLoadLabReport) -> String {
     );
     let _ = writeln!(
         out,
+        "- Rows touched estimate: `{}`",
+        report.resource_ledger.rows_touched_estimate
+    );
+    let _ = writeln!(
+        out,
         "- DB query count: `{}`",
         report.resource_ledger.db_query_count
     );
@@ -370,6 +528,32 @@ fn markdown_for_swarm_load_lab(report: &SwarmLoadLabReport) -> String {
         "- Isolated storage root: `{}`",
         report.resource_ledger.isolated_storage_root
     );
+    let cache = &report.resource_ledger.cache_diagnostics;
+    let _ = writeln!(
+        out,
+        "- Cache hit rates: project `{:.3}`, agent `{:.3}`, inbox_stats `{:.3}`",
+        cache.metrics.project_hit_rate(),
+        cache.metrics.agent_hit_rate(),
+        cache.metrics.inbox_stats_hit_rate()
+    );
+    let _ = writeln!(
+        out,
+        "- Cache footprint: `{}` entries, `{}` bytes, `{}` deferred touches",
+        cache.footprint.counts.total_live_entries(),
+        cache.footprint.total_estimated_bytes,
+        cache.footprint.deferred_touch_entries
+    );
+    let queue = &report.resource_ledger.queue_ledger;
+    let _ = writeln!(
+        out,
+        "- WBQ depth/capacity: `{}/{}` (peak `{}`)",
+        queue.wbq_depth, queue.wbq_capacity, queue.wbq_peak_depth
+    );
+    let _ = writeln!(
+        out,
+        "- Commit pending/soft-cap: `{}/{}` (peak `{}`)",
+        queue.commit_pending_requests, queue.commit_soft_cap, queue.commit_peak_pending_requests
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "## Gates");
     let _ = writeln!(out, "| Gate | Budget | Actual | Verdict |");
@@ -382,6 +566,13 @@ fn markdown_for_swarm_load_lab(report: &SwarmLoadLabReport) -> String {
             gate.name, gate.budget, gate.actual, verdict
         );
     }
+    if !report.failure_reasons.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## Failure Reasons");
+        for reason in &report.failure_reasons {
+            let _ = writeln!(out, "- {reason}");
+        }
+    }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Reproduction");
     for command in &report.reproduction_commands {
@@ -390,19 +581,39 @@ fn markdown_for_swarm_load_lab(report: &SwarmLoadLabReport) -> String {
     out
 }
 
-fn write_swarm_load_lab_artifacts(report: &SwarmLoadLabReport) {
-    let dir = swarm_load_lab_artifact_dir();
-    std::fs::create_dir_all(&dir).expect("create swarm load lab artifact dir");
+fn write_swarm_capacity_artifacts(report: &SwarmLoadLabReport) {
+    let dir = swarm_capacity_artifact_dir();
+    std::fs::create_dir_all(&dir).expect("create swarm capacity artifact dir");
     let json_path = dir.join("report.json");
     let markdown_path = dir.join("report.md");
-    let json = serde_json::to_string_pretty(report).expect("serialize swarm load lab report");
-    std::fs::write(&json_path, json).expect("write swarm load lab json report");
-    std::fs::write(&markdown_path, markdown_for_swarm_load_lab(report))
-        .expect("write swarm load lab markdown report");
-    eprintln!("swarm load lab json artifact: {}", json_path.display());
+    let json = serde_json::to_string_pretty(report).expect("serialize swarm capacity report");
+    std::fs::write(&json_path, json).expect("write swarm capacity json report");
+    std::fs::write(&markdown_path, markdown_for_swarm_capacity(report))
+        .expect("write swarm capacity markdown report");
+    eprintln!("swarm capacity json artifact: {}", json_path.display());
     eprintln!(
-        "swarm load lab markdown artifact: {}",
+        "swarm capacity markdown artifact: {}",
         markdown_path.display()
+    );
+}
+
+fn cache_profile_hotset_artifact_dir() -> PathBuf {
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    repo_root().join(format!(
+        "tests/artifacts/perf/cache_profile_hotset/{ts}_{}",
+        std::process::id()
+    ))
+}
+
+fn write_cache_profile_hotset_artifact(report: &serde_json::Value) {
+    let dir = cache_profile_hotset_artifact_dir();
+    std::fs::create_dir_all(&dir).expect("create cache profile hotset artifact dir");
+    let json_path = dir.join("report.json");
+    let json = serde_json::to_string_pretty(report).expect("serialize cache profile hotset report");
+    std::fs::write(&json_path, json).expect("write cache profile hotset json report");
+    eprintln!(
+        "cache profile hotset json artifact: {}",
+        json_path.display()
     );
 }
 
@@ -421,6 +632,18 @@ fn build_swarm_load_lab_gates(
         .max()
         .unwrap_or(0);
     let total_errors: u64 = operation_reports.iter().map(|report| report.errors).sum();
+    let cache = &resource_ledger.cache_diagnostics.metrics;
+    let cache_lookups = cache
+        .project_hits
+        .saturating_add(cache.project_misses)
+        .saturating_add(cache.agent_hits)
+        .saturating_add(cache.agent_misses)
+        .saturating_add(cache.inbox_stats_hits)
+        .saturating_add(cache.inbox_stats_misses);
+    let queue = &resource_ledger.queue_ledger;
+    let wbq_depth_bounded = queue.wbq_capacity == 0 || queue.wbq_depth <= queue.wbq_capacity;
+    let commit_depth_bounded =
+        queue.commit_soft_cap == 0 || queue.commit_pending_requests <= queue.commit_soft_cap;
 
     vec![
         SwarmLoadLabGate {
@@ -459,48 +682,141 @@ fn build_swarm_load_lab_gates(
             actual: resource_ledger.db_query_count.to_string(),
             passed: resource_ledger.db_query_count > 0,
         },
+        SwarmLoadLabGate {
+            name: "cache_metrics_present",
+            budget: ">0".to_string(),
+            actual: cache_lookups.to_string(),
+            passed: cache_lookups > 0,
+        },
+        SwarmLoadLabGate {
+            name: "wbq_depth_bounded",
+            budget: format!("<={}", queue.wbq_capacity),
+            actual: queue.wbq_depth.to_string(),
+            passed: wbq_depth_bounded,
+        },
+        SwarmLoadLabGate {
+            name: "commit_queue_depth_bounded",
+            budget: format!("<={}", queue.commit_soft_cap),
+            actual: queue.commit_pending_requests.to_string(),
+            passed: commit_depth_bounded,
+        },
     ]
 }
 
-fn swarm_load_lab_scenario_definitions() -> Vec<SwarmLoadLabScenario> {
+fn slowest_operation_by_p95(operation_reports: &[SwarmLoadLabOperationReport]) -> String {
+    operation_reports
+        .iter()
+        .max_by_key(|report| report.p95_us)
+        .map_or_else(
+            || "none:0us".to_string(),
+            |report| format!("{}:{}us", report.operation, report.p95_us),
+        )
+}
+
+fn swarm_load_failure_reasons(
+    gates: &[SwarmLoadLabGate],
+    operation_reports: &[SwarmLoadLabOperationReport],
+    slowest_operation: &str,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for gate in gates.iter().filter(|gate| !gate.passed) {
+        reasons.push(format!(
+            "gate `{}` failed: budget {}, actual {}; slowest operation by p95 was {}",
+            gate.name, gate.budget, gate.actual, slowest_operation
+        ));
+    }
+    for report in operation_reports.iter().filter(|report| report.errors > 0) {
+        reasons.push(format!(
+            "operation `{}` reported {} error(s); p95={}us, p99={}us",
+            report.operation, report.errors, report.p95_us, report.p99_us
+        ));
+    }
+    reasons
+}
+
+const fn operator_startup_trace_fixture() -> SwarmCapacityTraceFixture {
+    SwarmCapacityTraceFixture {
+        name: "operator_startup_snapshot_2026_05_10_anonymized",
+        source: "anonymized startup counters from operator mailbox",
+        captured_projects: 45,
+        captured_agents: 610,
+        captured_messages: 5622,
+        captured_file_reservations: 10_872,
+        captured_contact_links: 41,
+        captured_build_slots: 0,
+        captured_atc_open_experiences: 0,
+        deterministic_seed: 0x0c19_2030_0510,
+    }
+}
+
+fn swarm_capacity_reproduction_commands() -> Vec<String> {
+    vec![
+        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test load_bench swarm_load_lab_ci_smoke_writes_slo_artifacts -- --nocapture".to_string(),
+        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test load_bench load_scenario_a_registration_storm -- --ignored --nocapture".to_string(),
+        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test load_bench load_scenario_c_mixed_workload -- --ignored --nocapture".to_string(),
+    ]
+}
+
+fn swarm_capacity_scenario_definitions() -> Vec<SwarmLoadLabScenario> {
     vec![
         SwarmLoadLabScenario {
-            name: "ci_smoke",
-            projects: 3,
-            agents_per_project: 4,
-            total_agents: 12,
-            messages_per_agent: 2,
+            name: "ci_100_agent_replay",
+            trace_source: "operator_startup_snapshot_2026_05_10_anonymized",
+            scale_target_agents: 100,
+            projects: CI_REPLAY_PROJECTS,
+            agents_per_project: CI_REPLAY_AGENTS_PER_PROJECT,
+            total_agents: CI_REPLAY_TOTAL_AGENTS,
+            messages_per_agent: CI_REPLAY_MESSAGES_PER_AGENT,
+            reservations_per_project: 2,
+            build_slots: 5,
+            atc_observations: CI_REPLAY_PROJECTS,
             default_ci: true,
             ignored_heavy: false,
             operations: vec![
                 "ensure_project",
                 "register_agent",
+                "list_agents",
                 "ensure_product",
                 "products_link",
                 "send_message",
                 "fetch_inbox",
+                "acknowledge_message",
                 "search_messages",
                 "file_reservation_paths",
+                "renew_file_reservations",
+                "release_file_reservations",
+                "build_slot_replay_plan",
                 "robot_status_snapshot_surrogate",
-                "startup_integrity_check",
+                "atc_observation",
+                "doctor_health_probe_surrogate",
             ],
         },
         SwarmLoadLabScenario {
             name: "ignored_1k_registration_storm",
+            trace_source: "operator_startup_snapshot_2026_05_10_anonymized",
+            scale_target_agents: 1000,
             projects: 50,
             agents_per_project: 20,
             total_agents: 1000,
             messages_per_agent: 0,
+            reservations_per_project: 0,
+            build_slots: 0,
+            atc_observations: 50,
             default_ci: false,
             ignored_heavy: true,
-            operations: vec!["ensure_project", "register_agent"],
+            operations: vec!["ensure_project", "register_agent", "atc_observation"],
         },
         SwarmLoadLabScenario {
             name: "ignored_1k_mixed_workload",
+            trace_source: "operator_startup_snapshot_2026_05_10_anonymized",
+            scale_target_agents: 1000,
             projects: 50,
             agents_per_project: 20,
             total_agents: 1000,
             messages_per_agent: 0,
+            reservations_per_project: 2,
+            build_slots: 50,
+            atc_observations: 100,
             default_ci: false,
             ignored_heavy: true,
             operations: vec![
@@ -508,10 +824,88 @@ fn swarm_load_lab_scenario_definitions() -> Vec<SwarmLoadLabScenario> {
                 "send_message",
                 "search_messages",
                 "file_reservation_paths",
+                "renew_file_reservations",
+                "release_file_reservations",
+                "build_slot_replay_plan",
+                "robot_status_snapshot_surrogate",
+                "atc_observation",
                 "acknowledge_message",
             ],
         },
+        SwarmLoadLabScenario {
+            name: "ignored_10k_forecast_replay",
+            trace_source: "operator_startup_snapshot_2026_05_10_anonymized",
+            scale_target_agents: 10_000,
+            projects: 100,
+            agents_per_project: 100,
+            total_agents: 10_000,
+            messages_per_agent: 1,
+            reservations_per_project: 10,
+            build_slots: 250,
+            atc_observations: 1_000,
+            default_ci: false,
+            ignored_heavy: true,
+            operations: vec![
+                "ensure_project",
+                "register_agent",
+                "send_message",
+                "fetch_inbox",
+                "acknowledge_message",
+                "search_messages",
+                "file_reservation_paths",
+                "renew_file_reservations",
+                "release_file_reservations",
+                "build_slot_replay_plan",
+                "robot_status_snapshot_surrogate",
+                "atc_observation",
+            ],
+        },
     ]
+}
+
+#[test]
+fn swarm_capacity_replay_plan_metadata_covers_required_scales_and_surfaces() {
+    let scenarios = swarm_capacity_scenario_definitions();
+    for required in [100, 1000, 10_000] {
+        assert!(
+            scenarios
+                .iter()
+                .any(|scenario| scenario.scale_target_agents == required),
+            "missing replay scenario for {required} agents"
+        );
+    }
+
+    let mixed = scenarios
+        .iter()
+        .find(|scenario| scenario.name == "ignored_10k_forecast_replay")
+        .expect("10k replay scenario");
+    for operation in [
+        "send_message",
+        "file_reservation_paths",
+        "renew_file_reservations",
+        "release_file_reservations",
+        "build_slot_replay_plan",
+        "search_messages",
+        "robot_status_snapshot_surrogate",
+        "atc_observation",
+    ] {
+        assert!(
+            mixed.operations.contains(&operation),
+            "10k replay plan missing {operation}"
+        );
+    }
+
+    assert!(SWARM_CAPACITY_ARTIFACT_ROOT.ends_with("tests/artifacts/perf/swarm_capacity"));
+    for command in swarm_capacity_reproduction_commands() {
+        assert!(
+            command.starts_with("CARGO_TARGET_DIR="),
+            "rch command must keep target-dir assignment outside rch: {command}"
+        );
+        assert!(
+            !command.contains("rch exec -- env "),
+            "rch command must not use env inside rch wrapper: {command}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,42 +914,55 @@ fn swarm_load_lab_scenario_definitions() -> Vec<SwarmLoadLabScenario> {
 
 #[test]
 fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
-    let (pool, _dir) = make_load_pool(24);
+    let (pool, _dir) = make_load_pool(32);
     let sqlite_path = pool.sqlite_path().to_string();
     let storage_root = Path::new(&sqlite_path)
         .parent()
         .expect("sqlite path parent")
         .join("storage");
-    let names = generate_agent_names(12);
+    let names = generate_agent_names(CI_REPLAY_TOTAL_AGENTS);
     let baseline_rss = rss_kb();
     let baseline_cpu = process_cpu_ticks();
+    let scenario_start = Instant::now();
 
     QUERY_TRACKER.enable(None);
     QUERY_TRACKER.reset();
 
     let mut register_lats = Vec::new();
+    let mut list_agents_lats = Vec::new();
     let mut product_lats = Vec::new();
     let mut send_lats = Vec::new();
     let mut inbox_lats = Vec::new();
+    let mut ack_lats = Vec::new();
     let mut search_lats = Vec::new();
     let mut reservation_lats = Vec::new();
+    let mut renew_lats = Vec::new();
+    let mut release_lats = Vec::new();
     let mut robot_snapshot_lats = Vec::new();
+    let mut atc_lats = Vec::new();
     let mut recovery_lats = Vec::new();
     let mut register_errors = 0_u64;
+    let mut list_agents_errors = 0_u64;
     let mut product_errors = 0_u64;
     let mut send_errors = 0_u64;
     let mut inbox_errors = 0_u64;
+    let mut ack_errors = 0_u64;
     let mut search_errors = 0_u64;
     let mut reservation_errors = 0_u64;
+    let mut renew_errors = 0_u64;
+    let mut release_errors = 0_u64;
     let mut robot_snapshot_errors = 0_u64;
+    let mut atc_errors = 0_u64;
     let mut recovery_errors = 0_u64;
 
     let mut project_data: Vec<(i64, Vec<i64>)> = Vec::new();
-    for project_idx in 0..3 {
+    let mut ack_targets: Vec<(i64, i64)> = Vec::new();
+    let mut reservation_targets: Vec<(i64, i64, Vec<i64>)> = Vec::new();
+    for project_idx in 0..CI_REPLAY_PROJECTS {
         let project_start = Instant::now();
         let project_id = block_on_with_retry(5, |cx| {
             let pp = pool.clone();
-            let key = format!("/data/swarm-load-lab/ci/project-{project_idx}");
+            let key = format!("/data/swarm-capacity/ci/project-{project_idx}");
             async move { queries::ensure_project(&cx, &pp, &key).await }
         })
         .id
@@ -563,8 +970,8 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
         register_lats.push(project_start.elapsed().as_micros() as u64);
 
         let mut agent_ids = Vec::new();
-        for agent_idx in 0..4 {
-            let name = names[project_idx * 4 + agent_idx].clone();
+        for agent_idx in 0..CI_REPLAY_AGENTS_PER_PROJECT {
+            let name = names[project_idx * CI_REPLAY_AGENTS_PER_PROJECT + agent_idx].clone();
             let t0 = Instant::now();
             match block_on(|cx| {
                 let pp = pool.clone();
@@ -574,9 +981,9 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
                         &pp,
                         project_id,
                         &name,
-                        "swarm-load-lab",
-                        "ci-smoke",
-                        Some("br-72syp CI smoke"),
+                        "swarm-capacity",
+                        "ci-100-agent-replay",
+                        Some("br-idea-wizard-swarm-reliability-2ac6x.2 CI capacity replay"),
                         None,
                         None,
                     )
@@ -590,6 +997,16 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
                 _ => register_errors += 1,
             }
         }
+        let t0 = Instant::now();
+        match block_on(|cx| {
+            let pp = pool.clone();
+            async move { queries::list_agents(&cx, &pp, project_id).await }
+        }) {
+            Outcome::Ok(agents) if agents.len() == CI_REPLAY_AGENTS_PER_PROJECT => {
+                list_agents_lats.push(t0.elapsed().as_micros() as u64);
+            }
+            _ => list_agents_errors += 1,
+        }
         project_data.push((project_id, agent_ids));
     }
 
@@ -600,8 +1017,8 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
             queries::ensure_product(
                 &cx,
                 &pp,
-                Some("swarm-load-lab-ci"),
-                Some("Swarm Load Lab CI"),
+                Some("swarm-capacity-ci"),
+                Some("Swarm Capacity CI"),
             )
             .await
         }
@@ -626,7 +1043,7 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
 
     for (project_id, agent_ids) in &project_data {
         for (agent_idx, sender_id) in agent_ids.iter().copied().enumerate() {
-            for msg_idx in 0..2 {
+            for msg_idx in 0..CI_REPLAY_MESSAGES_PER_AGENT {
                 let receiver = agent_ids[(agent_idx + msg_idx + 1) % agent_ids.len()];
                 let t0 = Instant::now();
                 match block_on(|cx| {
@@ -638,8 +1055,8 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
                             *project_id,
                             sender_id,
                             &format!("swarm smoke {project_id}-{agent_idx}-{msg_idx}"),
-                            "swarm load lab smoke body for inbox and search paths",
-                            Some("br-72syp-ci-smoke"),
+                            "swarm capacity replay body for inbox and search paths",
+                            Some("br-idea-wizard-swarm-reliability-2ac6x.2-ci-100-agent-replay"),
                             "normal",
                             msg_idx == 0,
                             "",
@@ -648,10 +1065,28 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
                         .await
                     }
                 }) {
-                    Outcome::Ok(_) => send_lats.push(t0.elapsed().as_micros() as u64),
+                    Outcome::Ok(message) => {
+                        send_lats.push(t0.elapsed().as_micros() as u64);
+                        if msg_idx == 0
+                            && let Some(message_id) = message.id
+                        {
+                            ack_targets.push((receiver, message_id));
+                        }
+                    }
                     _ => send_errors += 1,
                 }
             }
+        }
+    }
+
+    for (agent_id, message_id) in &ack_targets {
+        let t0 = Instant::now();
+        match block_on(|cx| {
+            let pp = pool.clone();
+            async move { queries::acknowledge_message(&cx, &pp, *agent_id, *message_id).await }
+        }) {
+            Outcome::Ok(_) => ack_lats.push(t0.elapsed().as_micros() as u64),
+            _ => ack_errors += 1,
         }
     }
 
@@ -691,7 +1126,7 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
 
         for (idx, agent_id) in agent_ids.iter().copied().take(2).enumerate() {
             let t0 = Instant::now();
-            let path = format!("src/swarm_lab/project_{project_id}/agent_{idx}.rs");
+            let path = format!("src/swarm_capacity/project_{project_id}/agent_{idx}.rs");
             match block_on(|cx| {
                 let pp = pool.clone();
                 async move {
@@ -703,14 +1138,128 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
                         &[path.as_str()],
                         300,
                         true,
-                        "br-72syp ci smoke",
+                        SWARM_LOAD_LAB_BEAD,
                     )
                     .await
                 }
             }) {
-                Outcome::Ok(_) => reservation_lats.push(t0.elapsed().as_micros() as u64),
+                Outcome::Ok(rows) => {
+                    reservation_lats.push(t0.elapsed().as_micros() as u64);
+                    let ids: Vec<i64> = rows.into_iter().filter_map(|row| row.id).collect();
+                    if !ids.is_empty() {
+                        reservation_targets.push((*project_id, agent_id, ids));
+                    }
+                }
                 _ => reservation_errors += 1,
             }
+        }
+    }
+
+    for (project_id, agent_id, reservation_ids) in &reservation_targets {
+        let t0 = Instant::now();
+        match block_on(|cx| {
+            let pp = pool.clone();
+            let ids = reservation_ids.clone();
+            async move {
+                queries::renew_reservations(
+                    &cx,
+                    &pp,
+                    *project_id,
+                    *agent_id,
+                    300,
+                    None,
+                    Some(ids.as_slice()),
+                )
+                .await
+            }
+        }) {
+            Outcome::Ok(_) => renew_lats.push(t0.elapsed().as_micros() as u64),
+            _ => renew_errors += 1,
+        }
+    }
+
+    for (project_id, agent_id, reservation_ids) in &reservation_targets {
+        let t0 = Instant::now();
+        match block_on(|cx| {
+            let pp = pool.clone();
+            let ids = reservation_ids.clone();
+            async move {
+                queries::release_reservations(
+                    &cx,
+                    &pp,
+                    *project_id,
+                    *agent_id,
+                    None,
+                    Some(ids.as_slice()),
+                )
+                .await
+            }
+        }) {
+            Outcome::Ok(_) => release_lats.push(t0.elapsed().as_micros() as u64),
+            _ => release_errors += 1,
+        }
+    }
+
+    for (project_idx, (_project_id, agent_ids)) in project_data.iter().enumerate() {
+        let t0 = Instant::now();
+        let created_ts = chrono::Utc::now().timestamp_micros();
+        let row = ExperienceBuilder::new(
+            10_000 + project_idx as u64,
+            20_000 + project_idx as u64,
+            format!("trc-swarm-capacity-{project_idx}"),
+            format!("clm-swarm-capacity-{project_idx}"),
+            format!("evi-swarm-capacity-{project_idx}"),
+            ExperienceSubsystem::LoadRouting,
+            "swarm_capacity.replay",
+            format!("project-{project_idx}"),
+            EffectKind::RoutingSuggestion,
+            "ObserveReplayContention",
+            vec![
+                ("healthy".to_string(), 0.82),
+                ("saturated".to_string(), 0.18),
+            ],
+            0.18,
+            "deterministic replay topology observation",
+            true,
+            false,
+        )
+        .project_key(format!("/data/swarm-capacity/ci/project-{project_idx}"))
+        .context(serde_json::json!({
+            "bead": SWARM_LOAD_LAB_BEAD,
+            "agent_count": agent_ids.len(),
+            "scenario": "ci_100_agent_replay",
+        }))
+        .build(0, created_ts);
+        match block_on(|cx| {
+            let pp = pool.clone();
+            async move { queries::append_atc_experience(&cx, &pp, &row).await }
+        }) {
+            Outcome::Ok(stored) => {
+                let transition_ts = created_ts.saturating_add(1);
+                let context_patch = serde_json::json!({
+                    "replay": "ci_100_agent",
+                    "operation": "atc_observation"
+                });
+                match block_on(|cx| {
+                    let pp = pool.clone();
+                    async move {
+                        queries::transition_atc_experience(
+                            &cx,
+                            &pp,
+                            stored.experience_id,
+                            ExperienceState::Dispatched,
+                            transition_ts,
+                            None,
+                            Some(&context_patch),
+                        )
+                        .await
+                    }
+                }) {
+                    Outcome::Ok(()) => atc_lats.push(t0.elapsed().as_micros() as u64),
+                    _ => atc_errors += 1,
+                }
+            }
+            _ => atc_errors += 1,
         }
     }
 
@@ -719,6 +1268,7 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
         Ok(_) => recovery_lats.push(t0.elapsed().as_micros() as u64),
         Err(_) => recovery_errors += 1,
     }
+    let scenario_elapsed = scenario_start.elapsed();
 
     let tracker_snapshot = QUERY_TRACKER.snapshot();
     QUERY_TRACKER.disable();
@@ -730,81 +1280,124 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
     let db_query_count = per_table_queries.values().sum();
 
     let register_report = LatencyReport::from_latencies(&mut register_lats, register_errors);
+    let list_agents_report =
+        LatencyReport::from_latencies(&mut list_agents_lats, list_agents_errors);
     let product_report = LatencyReport::from_latencies(&mut product_lats, product_errors);
     let send_report = LatencyReport::from_latencies(&mut send_lats, send_errors);
     let inbox_report = LatencyReport::from_latencies(&mut inbox_lats, inbox_errors);
+    let ack_report = LatencyReport::from_latencies(&mut ack_lats, ack_errors);
     let search_report = LatencyReport::from_latencies(&mut search_lats, search_errors);
     let reservation_report =
         LatencyReport::from_latencies(&mut reservation_lats, reservation_errors);
+    let renew_report = LatencyReport::from_latencies(&mut renew_lats, renew_errors);
+    let release_report = LatencyReport::from_latencies(&mut release_lats, release_errors);
     let robot_snapshot_report =
         LatencyReport::from_latencies(&mut robot_snapshot_lats, robot_snapshot_errors);
+    let atc_report = LatencyReport::from_latencies(&mut atc_lats, atc_errors);
     let recovery_report = LatencyReport::from_latencies(&mut recovery_lats, recovery_errors);
     register_report.print("load_lab_register_agent");
+    list_agents_report.print("load_lab_list_agents");
     product_report.print("load_lab_product_bus");
     send_report.print("load_lab_send_message");
     inbox_report.print("load_lab_fetch_inbox");
+    ack_report.print("load_lab_acknowledge_message");
     search_report.print("load_lab_search_messages");
     reservation_report.print("load_lab_file_reservations");
+    renew_report.print("load_lab_renew_file_reservations");
+    release_report.print("load_lab_release_file_reservations");
     robot_snapshot_report.print("load_lab_robot_status_snapshot_surrogate");
-    recovery_report.print("load_lab_startup_integrity_check");
+    atc_report.print("load_lab_atc_observation");
+    recovery_report.print("load_lab_doctor_health_probe_surrogate");
 
     let operation_reports = vec![
         SwarmLoadLabOperationReport::from_latency_report("register_agent", &register_report),
+        SwarmLoadLabOperationReport::from_latency_report("list_agents", &list_agents_report),
         SwarmLoadLabOperationReport::from_latency_report("product_bus", &product_report),
         SwarmLoadLabOperationReport::from_latency_report("send_message", &send_report),
         SwarmLoadLabOperationReport::from_latency_report("fetch_inbox", &inbox_report),
+        SwarmLoadLabOperationReport::from_latency_report("acknowledge_message", &ack_report),
         SwarmLoadLabOperationReport::from_latency_report("search_messages", &search_report),
         SwarmLoadLabOperationReport::from_latency_report(
             "file_reservation_paths",
             &reservation_report,
         ),
+        SwarmLoadLabOperationReport::from_latency_report("renew_file_reservations", &renew_report),
+        SwarmLoadLabOperationReport::from_latency_report(
+            "release_file_reservations",
+            &release_report,
+        ),
         SwarmLoadLabOperationReport::from_latency_report(
             "robot_status_snapshot_surrogate",
             &robot_snapshot_report,
         ),
+        SwarmLoadLabOperationReport::from_latency_report("atc_observation", &atc_report),
         SwarmLoadLabOperationReport::from_latency_report(
-            "startup_integrity_check",
+            "doctor_health_probe_surrogate",
             &recovery_report,
         ),
     ];
+    let total_operations: usize = operation_reports.iter().map(|report| report.count).sum();
+    let rows_touched_estimate = u64::try_from(CI_REPLAY_PROJECTS).unwrap_or(0)
+        + u64::try_from(CI_REPLAY_TOTAL_AGENTS).unwrap_or(0)
+        + u64::try_from(send_report.count.saturating_mul(2)).unwrap_or(0)
+        + u64::try_from(product_report.count).unwrap_or(0)
+        + u64::try_from(reservation_report.count).unwrap_or(0)
+        + u64::try_from(renew_report.count).unwrap_or(0)
+        + u64::try_from(release_report.count).unwrap_or(0)
+        + u64::try_from(ack_report.count).unwrap_or(0)
+        + u64::try_from(atc_report.count).unwrap_or(0);
     let resource_ledger = SwarmLoadLabResourceLedger {
         baseline_rss_kb: baseline_rss,
         final_rss_kb: final_rss,
         rss_growth_kb: final_rss.saturating_sub(baseline_rss),
         wal_bytes: wal_size_bytes(&sqlite_path),
         process_cpu_ticks_delta: final_cpu.saturating_sub(baseline_cpu),
+        rows_touched_estimate,
         db_query_count,
         per_table_queries,
         isolated_storage_root: storage_root.display().to_string(),
         isolated_sqlite_path: sqlite_path,
+        cache_diagnostics: cache_diagnostics_snapshot(),
+        queue_ledger: storage_queue_ledger(
+            "global storage queue gauges; DB replay writes authoritative SQLite paths",
+        ),
     };
     let gates = build_swarm_load_lab_gates(&operation_reports, &resource_ledger);
+    let slowest_operation_by_p95 = slowest_operation_by_p95(&operation_reports);
+    let failure_reasons =
+        swarm_load_failure_reasons(&gates, &operation_reports, &slowest_operation_by_p95);
     let report = SwarmLoadLabReport {
-        bead: "br-72syp",
+        bead: SWARM_LOAD_LAB_BEAD,
         generated_at: chrono::Utc::now().to_rfc3339(),
-        scenario: "ci_smoke",
+        scenario: "ci_100_agent_replay",
+        trace_fixture: operator_startup_trace_fixture(),
+        total_operations,
+        elapsed_ms: scenario_elapsed.as_millis(),
+        throughput_ops_per_sec: throughput_for_duration(total_operations, scenario_elapsed),
+        slowest_operation_by_p95,
         operation_reports,
-        scenario_definitions: swarm_load_lab_scenario_definitions(),
+        scenario_definitions: swarm_capacity_scenario_definitions(),
         resource_ledger,
         gates,
-        reproduction_commands: vec![
-            "rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_lab cargo test -p mcp-agent-mail-db --test load_bench swarm_load_lab_ci_smoke_writes_slo_artifacts -- --nocapture".to_string(),
-            "rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_lab cargo test -p mcp-agent-mail-db --test load_bench load_scenario_a_registration_storm -- --ignored --nocapture".to_string(),
-            "rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_lab cargo test -p mcp-agent-mail-db --test load_bench load_scenario_c_mixed_workload -- --ignored --nocapture".to_string(),
-        ],
+        failure_reasons,
+        reproduction_commands: swarm_capacity_reproduction_commands(),
         realism_notes: vec![
-            "CI smoke uses the real DB query layer with isolated SQLite and storage roots; it does not touch the operator mailbox.",
+            "CI replay uses the real DB query layer with isolated SQLite and storage roots; it does not touch the operator mailbox.",
+            "The 100-agent replay is a deterministic downscale from the anonymized operator startup topology counters embedded in the report.",
             "The robot status lane is represented by the inbox-stats snapshot path used by robot status summaries, not by a live CLI transport process.",
-            "The ignored 1k scenarios are the heavy-capacity lanes and must run through rch on suitable workers.",
+            "The doctor health lane is represented by DbPool::run_startup_integrity_check over the isolated SQLite database.",
+            "Build-slot pressure is included in the replay plan metadata; the DB crate cannot call the tools crate without a dependency cycle.",
+            "WBQ and commit queue metrics are sampled from global storage gauges; this DB replay does not enqueue archive writes.",
+            "The ignored 1k and 10k scenarios are the heavy-capacity lanes and must run through rch on suitable workers.",
         ],
     };
-    write_swarm_load_lab_artifacts(&report);
+    write_swarm_capacity_artifacts(&report);
 
     let failed_gates: Vec<&SwarmLoadLabGate> =
         report.gates.iter().filter(|gate| !gate.passed).collect();
     assert!(
         failed_gates.is_empty(),
-        "swarm load lab gates failed: {}",
+        "swarm capacity replay gates failed: {}",
         failed_gates
             .iter()
             .map(|gate| gate.name)
@@ -1600,14 +2193,14 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
     QUERY_TRACKER.enable(None);
     QUERY_TRACKER.reset();
 
-    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
+    read_cache().invalidate_inbox_stats_scoped(&pool.sqlite_identity_key(), receiver_id);
     let forced_start = Instant::now();
     let (forced_report, forced_db_queries) =
         run_inbox_stats_polling_phase(&pool, receiver_id, polls, true);
     let forced_elapsed = forced_start.elapsed();
 
     QUERY_TRACKER.reset();
-    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
+    read_cache().invalidate_inbox_stats_scoped(&pool.sqlite_identity_key(), receiver_id);
     let warm_start = Instant::now();
     let (warm_report, warm_db_queries) =
         run_inbox_stats_polling_phase(&pool, receiver_id, polls, false);
@@ -1615,7 +2208,7 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
 
     QUERY_TRACKER.disable();
     QUERY_TRACKER.reset();
-    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), receiver_id);
+    read_cache().invalidate_inbox_stats_scoped(&pool.sqlite_identity_key(), receiver_id);
 
     let forced_hit_ratio = (polls_u64.saturating_sub(forced_db_queries)) as f64 / polls_u64 as f64;
     let warm_hit_ratio = (polls_u64.saturating_sub(warm_db_queries)) as f64 / polls_u64 as f64;
@@ -1687,5 +2280,191 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
     assert!(
         warm_hit_ratio > forced_hit_ratio,
         "warm-cache polling should yield a higher hit ratio (forced={forced_hit_ratio:.4}, warm={warm_hit_ratio:.4})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario F: Read-cache profile hotset retention
+// ---------------------------------------------------------------------------
+// Compare conservative and high-memory read-cache profile capacities on the
+// same deterministic hotset. Misses simulate a DB fallback by reinserting the
+// expected row, so both profiles must produce the same logical output stream
+// while the high-memory profile should avoid most fallback work.
+
+fn make_cache_profile_agent(idx: usize) -> AgentRow {
+    let id = i64::try_from(idx + 1).expect("agent id fits i64");
+    AgentRow {
+        id: Some(id),
+        project_id: 1,
+        name: format!("HotAgent{idx:05}"),
+        program: "load-bench".to_string(),
+        model: "cache-profile".to_string(),
+        task_description: "read-cache hotset profile benchmark".to_string(),
+        inception_ts: 1_700_000_000_000_000,
+        last_active_ts: 1_700_000_000_000_000,
+        attachments_policy: "auto".to_string(),
+        contact_policy: "auto".to_string(),
+        reaper_exempt: 0,
+        registration_token: None,
+    }
+}
+
+fn run_cache_profile_hotset(
+    profile: &'static str,
+    capacity_per_category: usize,
+    agents: &[AgentRow],
+    passes: usize,
+) -> CacheProfileHotsetReport {
+    let cache = ReadCache::new_for_testing_with_capacity(capacity_per_category);
+    for agent in agents {
+        cache.put_agent(agent);
+    }
+
+    let probes = agents
+        .len()
+        .checked_mul(passes)
+        .expect("probe count should fit usize");
+    let mut hits = 0_u64;
+    let mut misses = 0_u64;
+    let mut checksum = 0_u64;
+    let mut latencies = Vec::with_capacity(probes);
+
+    for pass in 0..passes {
+        for step in 0..agents.len() {
+            let idx = (step.wrapping_mul(37).wrapping_add(pass.wrapping_mul(101))) % agents.len();
+            let expected = &agents[idx];
+            let t0 = Instant::now();
+            let cached = cache.get_agent(expected.project_id, &expected.name);
+            latencies.push(t0.elapsed().as_micros() as u64);
+
+            if let Some(agent) = cached {
+                hits += 1;
+                assert_eq!(agent.id, expected.id, "cached agent id mismatch");
+                checksum = checksum
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(agent.id.expect("agent id must exist") as u64);
+            } else {
+                misses += 1;
+                cache.put_agent(expected);
+                checksum = checksum
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(expected.id.expect("agent id must exist") as u64);
+            }
+        }
+    }
+
+    let latency = LatencyReport::from_latencies(&mut latencies, 0);
+    let footprint = cache.footprint_estimate();
+    CacheProfileHotsetReport {
+        profile,
+        capacity_per_category,
+        seeded_agents: agents.len(),
+        probes,
+        hits,
+        misses,
+        hit_ratio: hits as f64 / probes as f64,
+        lookup_p50_us: latency.p50,
+        lookup_p95_us: latency.p95,
+        lookup_p99_us: latency.p99,
+        lookup_max_us: latency.max,
+        output_checksum: checksum,
+        final_live_entries: footprint.counts.total_live_entries(),
+        capacity_utilization_bp: footprint.capacity_utilization_bp,
+        total_estimated_bytes: footprint.total_estimated_bytes,
+    }
+}
+
+#[test]
+#[ignore = "benchmark scenario: read-cache profile hotset retention"]
+fn load_scenario_f_read_cache_profile_hotset_retention() {
+    let conservative_capacity = CacheProfile::Conservative.read_cache_entries_per_category();
+    let high_memory_capacity = CacheProfile::HighMemory.read_cache_entries_per_category();
+    let seeded_agents = 20_000;
+    let passes = 3;
+    assert!(
+        conservative_capacity < seeded_agents,
+        "conservative profile must be smaller than the synthetic hotset"
+    );
+    assert!(
+        high_memory_capacity >= seeded_agents,
+        "high-memory profile must fit the synthetic hotset"
+    );
+
+    let agents: Vec<_> = (0..seeded_agents).map(make_cache_profile_agent).collect();
+    let conservative =
+        run_cache_profile_hotset("conservative", conservative_capacity, &agents, passes);
+    let high_memory =
+        run_cache_profile_hotset("high-memory", high_memory_capacity, &agents, passes);
+
+    eprintln!("\n=== Scenario F: Read Cache Profile Hotset Retention ===");
+    eprintln!(
+        "  conservative: hits={}, misses={}, hit_ratio={:.2}%, p95={}us, live_entries={}, util={}bp",
+        conservative.hits,
+        conservative.misses,
+        conservative.hit_ratio * 100.0,
+        conservative.lookup_p95_us,
+        conservative.final_live_entries,
+        conservative.capacity_utilization_bp
+    );
+    eprintln!(
+        "  high-memory: hits={}, misses={}, hit_ratio={:.2}%, p95={}us, live_entries={}, util={}bp",
+        high_memory.hits,
+        high_memory.misses,
+        high_memory.hit_ratio * 100.0,
+        high_memory.lookup_p95_us,
+        high_memory.final_live_entries,
+        high_memory.capacity_utilization_bp
+    );
+
+    let miss_reduction_factor = if high_memory.misses == 0 {
+        conservative.misses as f64
+    } else {
+        conservative.misses as f64 / high_memory.misses as f64
+    };
+    let report = serde_json::json!({
+        "scenario": "load_scenario_f_read_cache_profile_hotset_retention",
+        "bead": "br-n1wry",
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "workload": {
+            "seeded_agents": seeded_agents,
+            "passes": passes,
+            "probes": seeded_agents * passes,
+            "lookup_order": "deterministic permutation: idx=(step*37 + pass*101) mod seeded_agents",
+            "miss_policy": "simulate DB fallback by reinserting the expected row",
+        },
+        "profiles": {
+            "conservative": conservative,
+            "high_memory": high_memory,
+        },
+        "comparison": {
+            "miss_reduction_factor": miss_reduction_factor,
+        }
+    });
+    eprintln!("BENCH_JSON {report}");
+    write_cache_profile_hotset_artifact(&report);
+
+    let conservative = &report["profiles"]["conservative"];
+    let high_memory = &report["profiles"]["high_memory"];
+    assert_eq!(
+        conservative["output_checksum"], high_memory["output_checksum"],
+        "profile choice must not change logical lookup outputs"
+    );
+    assert!(
+        high_memory["hit_ratio"].as_f64().expect("high hit ratio") >= 0.85,
+        "high-memory profile should retain at least 85% of repeated hotset probes"
+    );
+    assert!(
+        conservative["hit_ratio"]
+            .as_f64()
+            .expect("conservative hit ratio")
+            < 0.10,
+        "conservative profile should show measurable churn on this oversized hotset"
+    );
+    assert!(
+        report["comparison"]["miss_reduction_factor"]
+            .as_f64()
+            .expect("miss reduction factor")
+            >= 8.0,
+        "high-memory profile should reduce simulated DB fallback misses by at least 8x"
     );
 }

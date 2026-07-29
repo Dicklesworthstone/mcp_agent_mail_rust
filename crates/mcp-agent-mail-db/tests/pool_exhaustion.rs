@@ -445,6 +445,165 @@ fn pool_stats_reflect_usage() {
 }
 
 // =============================================================================
+// Test: Pool acquisitions are recorded in the global DB metrics surface
+// (bead K5 — `am robot metrics` reads `global_metrics().db.snapshot()`).
+// =============================================================================
+
+#[test]
+fn pool_acquire_records_global_db_metrics() {
+    // `global_metrics()` is a process-wide singleton shared across parallel
+    // tests, so assert only monotonic lower bounds (counters never decrease),
+    // never absolute values.
+    let before = mcp_agent_mail_core::global_metrics().db.snapshot();
+
+    // A tiny pool that forces queuing: 1 connection, several sequential acquires.
+    let (pool, _dir) = make_pool(1, 1);
+    block_on(|cx| async move {
+        for _ in 0..3 {
+            let conn = unwrap_acquire!(pool.acquire(&cx).await, "acquire for metrics");
+            conn.execute_raw("SELECT 1").expect("query should work");
+            drop(conn);
+        }
+        // Refresh the pool gauges into the global metrics surface.
+        pool.sample_pool_stats_now();
+    });
+
+    let after = mcp_agent_mail_core::global_metrics().db.snapshot();
+
+    // We performed at least one acquire between the two reads, and acquire
+    // counters are monotonic, so the total must have advanced.
+    assert!(
+        after.pool_acquires_total > before.pool_acquires_total,
+        "pool acquires must be counted: before={} after={}",
+        before.pool_acquires_total,
+        after.pool_acquires_total
+    );
+    // The acquire-latency histogram must have observed at least our acquires.
+    assert!(
+        after.pool_acquire_latency_us.count > before.pool_acquire_latency_us.count,
+        "pool acquire latency histogram must record samples"
+    );
+    // Utilization is always a valid 0..=100 percentage.
+    assert!(
+        after.pool_utilization_pct <= 100,
+        "pool utilization must be a clamped percentage, got {}",
+        after.pool_utilization_pct
+    );
+}
+
+// =============================================================================
+// Test: Periodic maintenance ops (bead K4) run on a real file-backed pool.
+// =============================================================================
+
+#[test]
+fn maintenance_ops_run_on_file_pool() {
+    let (pool, _dir) = make_pool(1, 2);
+
+    // Materialize the DB file + schema and write some rows so VACUUM/ANALYZE
+    // have real content to operate on.
+    let setup_pool = pool.clone();
+    block_on(|cx| async move {
+        let conn = unwrap_acquire!(setup_pool.acquire(&cx).await, "acquire to materialize db");
+        conn.execute_raw("CREATE TABLE IF NOT EXISTS k4_probe (id INTEGER PRIMARY KEY, v TEXT)")
+            .expect("create probe table");
+        conn.execute_raw("INSERT INTO k4_probe (v) VALUES ('alpha'), ('beta'), ('gamma')")
+            .expect("insert probe rows");
+        drop(conn);
+    });
+
+    // Each K4 maintenance op must succeed against a real file-backed database.
+    pool.set_journal_size_limit(64 * 1024 * 1024)
+        .expect("set_journal_size_limit should succeed");
+    pool.wal_checkpoint_passive()
+        .expect("passive checkpoint should succeed");
+    pool.analyze().expect("analyze should succeed");
+    pool.vacuum().expect("vacuum should succeed");
+
+    // Ops are idempotent: a second pass also succeeds.
+    pool.analyze().expect("repeat analyze should succeed");
+    pool.vacuum().expect("repeat vacuum should succeed");
+}
+
+// =============================================================================
+// Test: Verified last-known-healthy snapshot (bead K2) via the pool wrapper.
+// =============================================================================
+
+#[test]
+fn create_verified_snapshot_records_metadata() {
+    let (pool, _dir) = make_pool(1, 2);
+
+    // Materialize + migrate the DB so the full integrity check has real content.
+    let setup_pool = pool.clone();
+    block_on(|cx| async move {
+        let key = format!("/tmp/k2_snap_{}", unique_suffix());
+        let _ = queries::ensure_project(&cx, &setup_pool, &key).await;
+    });
+
+    let before = mcp_agent_mail_core::global_metrics()
+        .db
+        .snapshot()
+        .snapshot_created_total;
+
+    let meta = pool
+        .create_verified_snapshot()
+        .expect("snapshot op should succeed")
+        .expect("a healthy DB must produce a verified snapshot");
+    assert!(
+        meta.integrity_verified,
+        "snapshot must be integrity-verified"
+    );
+    assert_eq!(meta.integrity_kind, "integrity_check");
+    assert!(meta.created_us > 0);
+
+    // The .bak + metadata sidecar exist next to the primary, and the snapshot is
+    // discoverable as the latest verified one.
+    let primary = std::path::Path::new(pool.sqlite_path());
+    assert!(
+        mcp_agent_mail_db::snapshot::snapshot_bak_path(primary).is_file(),
+        "verified snapshot .bak must exist"
+    );
+    assert!(
+        mcp_agent_mail_db::snapshot::snapshot_meta_path(primary).is_file(),
+        "verified snapshot metadata sidecar must exist"
+    );
+    assert!(
+        mcp_agent_mail_db::snapshot::latest_verified_snapshot(primary).is_some(),
+        "the recorded snapshot must be discoverable as latest-verified"
+    );
+
+    let after = mcp_agent_mail_core::global_metrics()
+        .db
+        .snapshot()
+        .snapshot_created_total;
+    assert!(
+        after > before,
+        "snapshot_created_total must advance: before={before} after={after}"
+    );
+}
+
+#[test]
+fn maintenance_ops_noop_on_memory_pool() {
+    // :memory: databases have no file to checkpoint/vacuum; the ops must be
+    // graceful no-ops rather than errors (bead K4).
+    let config = DbPoolConfig {
+        database_url: "sqlite:///:memory:".to_string(),
+        storage_root: None,
+        min_connections: 1,
+        max_connections: 1,
+        acquire_timeout_ms: 5_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+        warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+    };
+    let pool = DbPool::new(&config).expect("create in-memory pool");
+    pool.set_journal_size_limit(1024)
+        .expect("memory journal_size_limit no-op");
+    pool.analyze().expect("memory analyze no-op");
+    pool.vacuum().expect("memory vacuum no-op");
+}
+
+// =============================================================================
 // Test: Warmup with pool_size=1 opens exactly 1 connection
 // =============================================================================
 

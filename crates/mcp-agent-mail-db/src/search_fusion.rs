@@ -146,7 +146,7 @@ fn build_fs_lexical_hits(candidates: &[PreparedCandidate]) -> Vec<FsScoredResult
 
     let mut hits: Vec<FsScoredResult> = (0..max_rank)
         .map(|idx| FsScoredResult {
-            doc_id: format!("{FS_DUMMY_LEX_PREFIX}{idx}"),
+            doc_id: format!("{FS_DUMMY_LEX_PREFIX}{idx}").into(),
             score: f32::NEG_INFINITY,
             source: fs::core::types::ScoreSource::Lexical,
             index: None,
@@ -164,7 +164,7 @@ fn build_fs_lexical_hits(candidates: &[PreparedCandidate]) -> Vec<FsScoredResult
             let slot = rank.saturating_sub(1);
             if slot < hits.len() {
                 hits[slot] = FsScoredResult {
-                    doc_id: candidate.doc_id.to_string(),
+                    doc_id: candidate.doc_id.to_string().into(),
                     score: candidate.lexical_score.unwrap_or(0.0) as f32,
                     source: fs::core::types::ScoreSource::Lexical,
                     index: None,
@@ -198,7 +198,7 @@ fn build_fs_semantic_hits(candidates: &[PreparedCandidate]) -> Vec<FsVectorHit> 
         .map(|idx| FsVectorHit {
             index: u32::try_from(idx).unwrap_or(u32::MAX),
             score: f32::NEG_INFINITY,
-            doc_id: format!("{FS_DUMMY_SEM_PREFIX}{idx}"),
+            doc_id: format!("{FS_DUMMY_SEM_PREFIX}{idx}").into(),
         })
         .collect();
 
@@ -209,7 +209,7 @@ fn build_fs_semantic_hits(candidates: &[PreparedCandidate]) -> Vec<FsVectorHit> 
                 hits[slot] = FsVectorHit {
                     index: u32::try_from(slot).unwrap_or(u32::MAX),
                     score: candidate.semantic_score.unwrap_or(0.0) as f32,
-                    doc_id: candidate.doc_id.to_string(),
+                    doc_id: candidate.doc_id.to_string().into(),
                 };
             }
         }
@@ -320,7 +320,12 @@ pub fn fuse_rrf(
 
         let lexical_hits = build_fs_lexical_hits(candidates);
         let semantic_hits = build_fs_semantic_hits(candidates);
-        let fs_config = FsRrfConfig { k: config.k };
+        // Weights/tiebreak stay at frankensearch's neutral defaults (1.0/1.0 +
+        // LexicalThenId), preserving the pre-upgrade unweighted-RRF semantics.
+        let fs_config = FsRrfConfig {
+            k: config.k,
+            ..FsRrfConfig::default()
+        };
         let fs_hits = fs_rrf_fuse(
             &lexical_hits,
             &semantic_hits,

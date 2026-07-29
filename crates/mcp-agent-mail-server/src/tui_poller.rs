@@ -22,7 +22,7 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
 
-use crate::tui_bridge::{DbWarmupState, TuiSharedState};
+use crate::tui_bridge::{DbWarmupState, TuiLoopHeartbeatKind, TuiSharedState};
 use crate::tui_events::{
     AgentSummary, ContactSummary, DbStatSnapshot, MailEvent, ProjectSummary, ReservationSnapshot,
 };
@@ -106,6 +106,13 @@ struct AgentReservationStats {
 struct AgentContactStats {
     respected_count: u64,
     violation_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AgentHealthSourceAvailability {
+    ack: bool,
+    reservations: bool,
+    contacts: bool,
 }
 
 #[derive(Debug, Default)]
@@ -437,6 +444,7 @@ impl DbPoller {
         let state = Arc::clone(&self.state);
         let join = thread::Builder::new()
             .name("tui-db-poller".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 self.run();
             });
@@ -465,8 +473,11 @@ impl DbPoller {
             .unwrap_or(now);
 
         while !self.stop.load(Ordering::Relaxed) {
+            let poll_started = Instant::now();
+            self.state.mark_loop_tick(TuiLoopHeartbeatKind::DbPoll);
             let mut allow_poll = true;
             let mut warmup_wait_consumed_interval = false;
+            let mut poll_fetch_started = None;
             if connection_state.is_none() && prev.timestamp_micros == 0 {
                 match self.state.wait_for_db_warmup(self.interval) {
                     DbWarmupState::Ready => {}
@@ -493,6 +504,7 @@ impl DbPoller {
             }
             // Fetch fresh snapshot
             let snapshot_update = if allow_poll {
+                poll_fetch_started = Some(Instant::now());
                 if let Ok(snapshot) = catch_optional_panic(std::panic::AssertUnwindSafe(|| {
                     if connection_state.is_none() {
                         let config = self.state.config_snapshot();
@@ -527,6 +539,10 @@ impl DbPoller {
                 None
             };
             if let Some(update) = snapshot_update {
+                self.state.mark_loop_success(
+                    TuiLoopHeartbeatKind::DbPoll,
+                    poll_fetch_started.unwrap_or(poll_started),
+                );
                 self.state.mark_db_context_available();
                 self.state.mark_db_ready();
                 match update {
@@ -555,6 +571,7 @@ impl DbPoller {
                     .checked_sub(DB_WARMUP_FAILURE_RETRY_INTERVAL)
                     .unwrap_or_else(Instant::now);
             } else if allow_poll {
+                self.state.mark_loop_failure(TuiLoopHeartbeatKind::DbPoll);
                 self.state.mark_db_context_unavailable();
                 connection_state = None;
             }
@@ -833,20 +850,25 @@ fn table_has_required_columns(
     table: &str,
     required_columns: &[&str],
 ) -> Option<bool> {
-    let rows = conn
-        .query_sync(&format!("PRAGMA table_info({table})"), &[])
-        .ok()?;
-    if rows.is_empty() {
-        return Some(false);
-    }
-    let available_columns: std::collections::HashSet<String> = rows
-        .into_iter()
-        .filter_map(|row| pragma_table_info_column_name(&row))
-        .collect();
+    let available_columns = table_column_names(conn, table)?;
     Some(
         required_columns
             .iter()
             .all(|column_name| available_columns.contains(*column_name)),
+    )
+}
+
+fn table_column_names(conn: &DbConn, table: &str) -> Option<std::collections::HashSet<String>> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .ok()?;
+    if rows.is_empty() {
+        return Some(std::collections::HashSet::new());
+    }
+    Some(
+        rows.into_iter()
+            .filter_map(|row| pragma_table_info_column_name(&row))
+            .collect(),
     )
 }
 
@@ -1093,12 +1115,28 @@ fn restore_missing_agent_fields_from_previous(
     if current_agents.is_empty() || previous_agents.is_empty() {
         return;
     }
+
+    if current_agents.len() == previous_agents.len()
+        && current_agents.iter().any(agent_summary_missing_core_fields)
+        && current_agents
+            .iter()
+            .all(|agent| unique_previous_agent_summary(previous_agents, agent).is_some())
+    {
+        current_agents.clone_from_slice(previous_agents);
+        tracing::warn!(
+            path = sqlite_path.unwrap_or("<unknown>"),
+            rows = current_agents.len(),
+            "tui poller restored previous agent list after partial current batch"
+        );
+        return;
+    }
+
     let mut patched = 0_usize;
     for agent in current_agents.iter_mut() {
         if agent.name.is_empty() {
             continue;
         }
-        if !agent.program.is_empty() && agent.last_active_ts != 0 {
+        if !agent_summary_missing_core_fields(agent) {
             continue;
         }
         let Some(prev) = unique_previous_agent_summary(previous_agents, agent) else {
@@ -1120,6 +1158,10 @@ fn restore_missing_agent_fields_from_previous(
             "tui poller backfilled empty agent fields from previous snapshot"
         );
     }
+}
+
+fn agent_summary_missing_core_fields(agent: &AgentSummary) -> bool {
+    agent.program.is_empty() || agent.last_active_ts == 0
 }
 
 fn unique_previous_agent_summary<'a>(
@@ -1348,9 +1390,8 @@ fn refill_missing_detail_lists_from_sqlite(
     let Ok(conn) = crate::open_best_effort_sync_db_connection(sqlite_path) else {
         return;
     };
-    // Wrap in DbConnGuard so the connection is closed via close_sync() at scope
-    // exit. Without this, every refill emits the FrankenConnection drop_close
-    // WARN ("Connection dropped without explicit close()") in the TUI poll loop.
+    // Wrap in DbConnGuard so the best-effort live connection closes at scope
+    // exit.
     let conn = guard_db_conn(conn, "tui_poller::refill_missing_detail_lists");
 
     if snapshot.agents > 0 && snapshot.agents_list.is_empty() {
@@ -1459,19 +1500,66 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
 }
 
 fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
-    let last_active_sort = timestamp_sort_expr("a.last_active_ts");
+    let available_columns = table_column_names(conn, "agents").unwrap_or_default();
+    if available_columns.is_empty() || !available_columns.contains("id") {
+        return Vec::new();
+    }
+    let has_project_id = available_columns.contains("project_id");
+    let has_projects_slug =
+        table_has_required_columns(conn, "projects", &["id", "slug"]).unwrap_or(false);
+    let has_name = available_columns.contains("name");
+    let has_program = available_columns.contains("program");
+    let has_model = available_columns.contains("model");
+    let has_last_active = available_columns.contains("last_active_ts");
+
+    let raw_project_id_select = if has_project_id {
+        "a.project_id AS raw_project_id"
+    } else {
+        "0 AS raw_project_id"
+    };
+    let project_slug_select = if has_project_id && has_projects_slug {
+        "COALESCE(p.slug, '') AS project_slug"
+    } else {
+        "'' AS project_slug"
+    };
+    let name_select = if has_name { "a.name" } else { "NULL AS name" };
+    let program_select = if has_program {
+        "a.program"
+    } else {
+        "'' AS program"
+    };
+    let model_select = if has_model {
+        "COALESCE(a.model, '') AS model"
+    } else {
+        "'' AS model"
+    };
+    let last_active_select = if has_last_active {
+        "a.last_active_ts"
+    } else {
+        "0 AS last_active_ts"
+    };
+    let project_join = if has_project_id && has_projects_slug {
+        "LEFT JOIN projects p ON p.id = a.project_id"
+    } else {
+        ""
+    };
+    let last_active_sort = if has_last_active {
+        timestamp_sort_expr("a.last_active_ts")
+    } else {
+        "0".to_string()
+    };
     conn.query_sync(
         &format!(
             "SELECT \
                 a.id AS raw_agent_id, \
-                a.project_id AS raw_project_id, \
-                COALESCE(p.slug, '') AS project_slug, \
-                a.name, \
-                a.program, \
-                COALESCE(a.model, '') AS model, \
-                a.last_active_ts \
+                {raw_project_id_select}, \
+                {project_slug_select}, \
+                {name_select}, \
+                {program_select}, \
+                {model_select}, \
+                {last_active_select} \
              FROM agents a \
-             LEFT JOIN projects p ON p.id = a.project_id \
+             {project_join} \
              ORDER BY {last_active_sort} DESC, a.id DESC \
              LIMIT {MAX_AGENTS}"
         ),
@@ -1489,7 +1577,13 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
                     .or_else(|| row.get_as::<String>(2).ok())
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
+                    .unwrap_or_else(|| {
+                        if has_project_id {
+                            format!("[unknown-project-{project_id}]")
+                        } else {
+                            String::new()
+                        }
+                    });
                 let name = row
                     .get_named::<String>("name")
                     .ok()
@@ -1503,7 +1597,7 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
                     .or_else(|| row.get_as::<String>(4).ok())
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "[unknown-program]".to_string());
+                    .unwrap_or_default();
                 let model = row
                     .get_named::<String>("model")
                     .ok()
@@ -1539,10 +1633,23 @@ fn fetch_agent_health_inputs(
         .collect::<Vec<_>>()
         .join(",");
 
-    let ack_stats = fetch_agent_ack_stats(conn, &ids, window_start);
-    let reservation_stats = fetch_agent_reservation_stats(conn, &ids, window_start, now);
-    let contact_stats = fetch_agent_contact_stats(conn, &ids, window_start, now);
-    let decision_counts = fetch_agent_decision_counts(conn, agents, window_start);
+    let source_availability = agent_health_source_availability(conn);
+    let ack_stats = if source_availability.ack {
+        fetch_agent_ack_stats(conn, &ids, window_start)
+    } else {
+        HashMap::new()
+    };
+    let reservation_stats = if source_availability.reservations {
+        fetch_agent_reservation_stats(conn, &ids, window_start, now)
+    } else {
+        HashMap::new()
+    };
+    let contact_stats = if source_availability.contacts {
+        fetch_agent_contact_stats(conn, &ids, window_start, now)
+    } else {
+        HashMap::new()
+    };
+    let decision_counts = fetch_agent_decision_counts(agents, window_start);
 
     agents
         .iter()
@@ -1580,6 +1687,42 @@ fn fetch_agent_health_inputs(
         .collect()
 }
 
+fn agent_health_source_availability(conn: &DbConn) -> AgentHealthSourceAvailability {
+    let ack = table_has_required_columns(conn, "messages", &["id", "ack_required", "created_ts"])
+        .unwrap_or(false)
+        && table_has_required_columns(
+            conn,
+            "message_recipients",
+            &["message_id", "agent_id", "ack_ts"],
+        )
+        .unwrap_or(false);
+
+    let reservations = table_has_required_columns(
+        conn,
+        "file_reservations",
+        &["agent_id", "created_ts", "expires_ts", "released_ts"],
+    )
+    .unwrap_or(false);
+
+    let contacts = table_has_required_columns(conn, "messages", &["id", "created_ts", "sender_id"])
+        .unwrap_or(false)
+        && table_has_required_columns(conn, "message_recipients", &["message_id", "agent_id"])
+            .unwrap_or(false)
+        && table_has_required_columns(
+            conn,
+            "agent_links",
+            &["a_agent_id", "b_agent_id", "status", "expires_ts"],
+        )
+        .unwrap_or(false)
+        && table_has_required_columns(conn, "agents", &["id", "contact_policy"]).unwrap_or(false);
+
+    AgentHealthSourceAvailability {
+        ack,
+        reservations,
+        contacts,
+    }
+}
+
 fn fetch_agent_ack_stats(
     conn: &DbConn,
     agent_ids_sql: &str,
@@ -1600,17 +1743,17 @@ fn fetch_agent_ack_stats(
                     WHEN {ack_expr} > 0 \
                     THEN {ack_delta_expr} \
                     ELSE NULL END AS ack_latency_micros, \
-            SUM(CASE \
+            CASE \
                     WHEN {ack_expr} > 0 \
                      AND {ack_delta_expr} <= {ACK_ON_TIME_THRESHOLD_MICROS} \
-                    THEN 1 ELSE 0 END) AS ack_on_time, \
-            SUM(CASE \
+                    THEN 1 ELSE 0 END AS ack_on_time, \
+            CASE \
                     WHEN {ack_expr} > 0 \
                      AND {ack_delta_expr} > {ACK_ON_TIME_THRESHOLD_MICROS} \
-                    THEN 1 ELSE 0 END) AS ack_late, \
-            SUM(CASE \
+                    THEN 1 ELSE 0 END AS ack_late, \
+            CASE \
                     WHEN {ack_expr} <= 0 \
-                    THEN 1 ELSE 0 END) AS ack_pending, \
+                    THEN 1 ELSE 0 END AS ack_pending \
          FROM message_recipients mr \
          JOIN messages m ON m.id = mr.message_id \
          WHERE mr.agent_id IN ({agent_ids_sql}) \
@@ -1809,14 +1952,23 @@ fn fetch_agent_contact_stats(
         .unwrap_or_default()
 }
 
-fn fetch_agent_decision_counts(
-    conn: &DbConn,
-    agents: &[AgentListRow],
-    window_start: i64,
-) -> HashMap<String, u64> {
+fn fetch_agent_decision_counts(agents: &[AgentListRow], window_start: i64) -> HashMap<String, u64> {
     if agents.is_empty() {
         return HashMap::new();
     }
+    // ATC experiences live in the dedicated sidecar DB (br-bvq1x.11.7); read
+    // per-agent decision counts from there. No sidecar (ATC never wrote, or the
+    // DB is in-memory) => no telemetry => empty counts.
+    let config = mcp_agent_mail_core::Config::from_env();
+    let Some(resolved) =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()
+    else {
+        return HashMap::new();
+    };
+    let Some(atc_conn) = mcp_agent_mail_db::pool::open_atc_sidecar_conn(&resolved.canonical_path)
+    else {
+        return HashMap::new();
+    };
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
     for agent in agents {
         *name_counts.entry(agent.name.as_str()).or_insert(0) += 1;
@@ -1846,7 +1998,8 @@ fn fetch_agent_decision_counts(
            AND subject IN ({placeholders}) \
          GROUP BY subject"
     );
-    conn.query_sync(&sql, &params)
+    atc_conn
+        .query_sync(&sql, &params)
         .ok()
         .map(|rows| {
             rows.into_iter()
@@ -2288,7 +2441,12 @@ fn parse_text_timestamp(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn is_active_reservation_row(row: &Row, now: i64, expires_col: &str, released_col: &str) -> bool {
+pub(crate) fn is_active_reservation_row(
+    row: &Row,
+    now: i64,
+    expires_col: &str,
+    released_col: &str,
+) -> bool {
     parse_raw_ts(row, expires_col) > now && released_ts_is_active(row.get_by_name(released_col))
 }
 
@@ -2403,20 +2561,8 @@ fn reservation_released_ts_sql(
     release_alias: &str,
 ) -> String {
     let table_ref = table_ref.trim().trim_end_matches('.');
-    let legacy_release_expr = has_legacy_released_ts_column.then(|| {
-        format!(
-            "CASE \
-                 WHEN {table_ref}.released_ts IS NULL THEN NULL \
-                 WHEN typeof({table_ref}.released_ts) = 'text' THEN \
-                     CAST(strftime('%s', REPLACE(REPLACE({table_ref}.released_ts, 'T', ' '), 'Z', '')) AS INTEGER) * 1000000 + \
-                     CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
-                          THEN CAST(substr(REPLACE({table_ref}.released_ts, 'Z', '') || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
-                          ELSE 0 \
-                     END \
-                 ELSE {table_ref}.released_ts \
-             END"
-        )
-    });
+    let legacy_release_expr =
+        has_legacy_released_ts_column.then(|| format!("{table_ref}.released_ts"));
     match (has_release_ledger, legacy_release_expr) {
         (true, Some(legacy_release_expr)) => {
             format!("COALESCE({release_alias}.released_ts, {legacy_release_expr})")
@@ -2599,10 +2745,6 @@ fn reservation_scan_mode(conn: &DbConn, sqlite_path: Option<&str>) -> Reservatio
     }
 
     detect_reservation_scan_mode(conn)
-}
-
-pub(crate) fn file_reservations_support_active_fast_scan(conn: &DbConn) -> bool {
-    detect_reservation_scan_mode(conn) == ReservationScanMode::ActiveFast
 }
 
 fn detect_reservation_scan_mode(conn: &DbConn) -> ReservationScanMode {
@@ -3661,17 +3803,14 @@ mod tests {
         create_empty_mail_schema(&conn);
         drop(conn);
 
-        let tempdir_name = dir
-            .path()
-            .file_name()
-            .expect("tempdir basename")
+        let relative_path = absolute_db
             .to_string_lossy()
-            .into_owned();
-        let relative_path = format!("tmp/{tempdir_name}/poller_fallback.sqlite3");
-        let shadow_root = std::env::current_dir()
-            .expect("cwd")
-            .join("tmp")
-            .join(&tempdir_name);
+            .trim_start_matches('/')
+            .to_string();
+        let relative_parent = std::path::Path::new(&relative_path)
+            .parent()
+            .expect("relative db parent");
+        let shadow_root = std::env::current_dir().expect("cwd").join(relative_parent);
         struct ShadowRootCleanup(std::path::PathBuf);
         impl Drop for ShadowRootCleanup {
             fn drop(&mut self) {
@@ -6253,18 +6392,18 @@ first body
 
         conn.execute_sync(
             "INSERT INTO messages (id, created_ts, ack_required) VALUES
-                (1, 1_000_000, 1),
-                (2, 2_000_000, 1),
-                (3, 3_000_000, 1),
-                (4, 4_000_000, 1)",
+                (1, 1000000, 1),
+                (2, 2000000, 1),
+                (3, 3000000, 1),
+                (4, 4000000, 1)",
             &[],
         )
         .expect("insert messages");
         conn.execute_sync(
             "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
-                (1, 7, 301_000_000),
-                (2, 7, 1_802_000_000),
-                (3, 7, 7_203_000_000),
+                (1, 7, 301000000),
+                (2, 7, 1802000000),
+                (3, 7, 7203000000),
                 (4, 7, NULL)",
             &[],
         )
@@ -6277,5 +6416,134 @@ first body
         assert_eq!(agent.late_count, 1);
         assert_eq!(agent.pending_count, 1);
         assert_eq!(agent.p50_latency_micros, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn fetch_agent_ack_stats_keeps_agents_separate() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                ack_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create recipients");
+
+        conn.execute_sync(
+            "INSERT INTO messages (id, created_ts, ack_required) VALUES
+                (1, 1000000, 1),
+                (2, 2000000, 1),
+                (3, 3000000, 1)",
+            &[],
+        )
+        .expect("insert messages");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
+                (1, 7, 301000000),
+                (2, 7, NULL),
+                (3, 9, 7203000000)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let stats = fetch_agent_ack_stats(&conn, "7,9", 0);
+        let first = stats.get(&7).expect("first agent stats present");
+        let second = stats.get(&9).expect("second agent stats present");
+
+        assert_eq!(first.on_time_count, 1);
+        assert_eq!(first.late_count, 0);
+        assert_eq!(first.pending_count, 1);
+        assert_eq!(first.p50_latency_micros, Some(300_000_000));
+
+        assert_eq!(second.on_time_count, 0);
+        assert_eq!(second.late_count, 1);
+        assert_eq!(second.pending_count, 0);
+        assert_eq!(second.p50_latency_micros, Some(7_200_000_000));
+    }
+
+    #[test]
+    fn fetch_agent_health_inputs_keeps_ack_when_optional_sources_missing() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                ack_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create recipients");
+
+        let now = now_micros();
+        let ack_created = now.saturating_sub(120_000_000);
+        let ack_ts = now.saturating_sub(60_000_000);
+        let pending_created = now.saturating_sub(30_000_000);
+        conn.execute_sync(
+            "INSERT INTO messages (id, created_ts, ack_required) VALUES (?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(ack_created),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert acked message");
+        conn.execute_sync(
+            "INSERT INTO messages (id, created_ts, ack_required) VALUES (?, ?, ?)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(pending_created),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert pending message");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES (?, ?, ?)",
+            &[Value::BigInt(1), Value::BigInt(7), Value::BigInt(ack_ts)],
+        )
+        .expect("insert acked recipient");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES (?, ?, NULL)",
+            &[Value::BigInt(2), Value::BigInt(7)],
+        )
+        .expect("insert pending recipient");
+
+        let inputs = fetch_agent_health_inputs(
+            &conn,
+            &[AgentListRow {
+                id: 7,
+                project: "proj".to_string(),
+                name: "BlueLake".to_string(),
+                program: "codex-cli".to_string(),
+                model: String::new(),
+                last_active_ts: now.saturating_sub(1_000_000),
+            }],
+        );
+
+        let input = inputs.get(&7).expect("health input retained");
+        assert_eq!(input.ack_on_time_count, 1);
+        assert_eq!(input.ack_pending_count, 1);
+        assert_eq!(input.reservation_active_count, 0);
+        assert_eq!(input.contact_policy_respected_count, None);
+        assert!(input.last_active_age_micros.is_some());
     }
 }

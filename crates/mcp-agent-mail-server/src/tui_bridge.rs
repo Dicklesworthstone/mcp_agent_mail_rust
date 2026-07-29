@@ -10,7 +10,7 @@ use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REQUEST_SPARKLINE_CAPACITY: usize = 60;
 const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4096;
@@ -214,6 +214,91 @@ impl ScreenDiagnosticSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootArchivePreflightFindingSnapshot {
+    pub project: String,
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootArchivePreflightSnapshot {
+    pub mode: &'static str,
+    pub root: String,
+    pub started_at: String,
+    pub completed_at: String,
+    pub duration_ms: u64,
+    pub total_projects: u32,
+    pub findings_count: usize,
+    pub auto_repaired_count: u32,
+    pub should_abort: bool,
+    pub findings: Vec<BootArchivePreflightFindingSnapshot>,
+}
+
+impl BootArchivePreflightSnapshot {
+    #[must_use]
+    pub fn from_report(report: &mcp_agent_mail_storage::boot_check::BootCheckReport) -> Self {
+        Self {
+            mode: boot_archive_preflight_mode_label(report.mode),
+            root: report.root.display().to_string(),
+            started_at: report.started_at.clone(),
+            completed_at: report.completed_at.clone(),
+            duration_ms: report.duration_ms,
+            total_projects: report.total_projects,
+            findings_count: report.findings.len(),
+            auto_repaired_count: report.auto_repaired_count,
+            should_abort: report.should_abort(),
+            findings: report
+                .findings
+                .iter()
+                .map(BootArchivePreflightFindingSnapshot::from_finding)
+                .collect(),
+        }
+    }
+}
+
+impl BootArchivePreflightFindingSnapshot {
+    #[must_use]
+    fn from_finding(finding: &mcp_agent_mail_storage::boot_check::BootCheckFinding) -> Self {
+        Self {
+            project: finding.project.clone(),
+            kind: boot_archive_preflight_finding_kind_label(&finding.kind),
+            detail: finding.detail.clone(),
+        }
+    }
+}
+
+const fn boot_archive_preflight_mode_label(
+    mode: mcp_agent_mail_storage::boot_check::BootCheckMode,
+) -> &'static str {
+    match mode {
+        mcp_agent_mail_storage::boot_check::BootCheckMode::Warn => "warn",
+        mcp_agent_mail_storage::boot_check::BootCheckMode::Abort => "abort",
+        mcp_agent_mail_storage::boot_check::BootCheckMode::AutoRepair => "auto_repair",
+    }
+}
+
+fn boot_archive_preflight_finding_kind_label(
+    kind: &mcp_agent_mail_storage::boot_check::BootCheckFindingKind,
+) -> &'static str {
+    match kind {
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::RepoBroken => "repo_broken",
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::OrphanRefs(_) => "orphan_refs",
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::DanglingBranch(_) => {
+            "dangling_branch"
+        }
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::ConfigCorrupt(_) => {
+            "config_corrupt"
+        }
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::TimeoutExceeded { .. } => {
+            "timeout_exceeded"
+        }
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::AutoRepaired { .. } => {
+            "auto_repaired"
+        }
+    }
+}
+
 fn env_truthy(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
         let normalized = value.trim().to_ascii_lowercase();
@@ -274,6 +359,280 @@ fn assert_screen_truth(snapshot: &ScreenDiagnosticSnapshot) {
             "possible silent false-empty state (truth assertion)"
         );
     }
+}
+
+const TUI_LOOP_HEARTBEAT_KIND_COUNT: usize = 5;
+
+/// Long-running loops whose progress must stay visible to the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiLoopHeartbeatKind {
+    Render,
+    Input,
+    DbPoll,
+    McpApi,
+    CommitCoalescer,
+}
+
+impl TuiLoopHeartbeatKind {
+    pub const ALL: [Self; TUI_LOOP_HEARTBEAT_KIND_COUNT] = [
+        Self::Render,
+        Self::Input,
+        Self::DbPoll,
+        Self::McpApi,
+        Self::CommitCoalescer,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Render => 0,
+            Self::Input => 1,
+            Self::DbPoll => 2,
+            Self::McpApi => 3,
+            Self::CommitCoalescer => 4,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Render => "render",
+            Self::Input => "input",
+            Self::DbPoll => "db_poll",
+            Self::McpApi => "mcp_api",
+            Self::CommitCoalescer => "commit_coalescer",
+        }
+    }
+}
+
+/// Lock-free point-in-time progress snapshot for a long-running TUI loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiLoopHeartbeatSnapshot {
+    pub kind: TuiLoopHeartbeatKind,
+    pub last_tick_micros: i64,
+    pub last_success_micros: i64,
+    pub last_failure_micros: i64,
+    pub last_gap_micros: u64,
+    pub last_success_duration_micros: u64,
+    pub ticks_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub consecutive_failures: u64,
+}
+
+#[derive(Debug)]
+struct LoopHeartbeatSlot {
+    last_tick_micros: AtomicI64,
+    last_tick_elapsed_micros: AtomicU64,
+    last_success_micros: AtomicI64,
+    last_failure_micros: AtomicI64,
+    last_gap_micros: AtomicU64,
+    last_success_duration_micros: AtomicU64,
+    ticks_total: AtomicU64,
+    successes_total: AtomicU64,
+    failures_total: AtomicU64,
+    consecutive_failures: AtomicU64,
+}
+
+impl LoopHeartbeatSlot {
+    fn new() -> Self {
+        Self {
+            last_tick_micros: AtomicI64::new(0),
+            last_tick_elapsed_micros: AtomicU64::new(0),
+            last_success_micros: AtomicI64::new(0),
+            last_failure_micros: AtomicI64::new(0),
+            last_gap_micros: AtomicU64::new(0),
+            last_success_duration_micros: AtomicU64::new(0),
+            ticks_total: AtomicU64::new(0),
+            successes_total: AtomicU64::new(0),
+            failures_total: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LoopHeartbeatSlots {
+    slots: [LoopHeartbeatSlot; TUI_LOOP_HEARTBEAT_KIND_COUNT],
+}
+
+impl LoopHeartbeatSlots {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| LoopHeartbeatSlot::new()),
+        }
+    }
+
+    fn record_tick_at(&self, kind: TuiLoopHeartbeatKind, now_micros: i64, elapsed_micros: u64) {
+        let slot = &self.slots[kind.index()];
+        let previous_elapsed = slot
+            .last_tick_elapsed_micros
+            .swap(elapsed_micros, Ordering::Relaxed);
+        slot.last_tick_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        if previous_elapsed > 0 {
+            slot.last_gap_micros.store(
+                elapsed_micros.saturating_sub(previous_elapsed),
+                Ordering::Relaxed,
+            );
+        }
+        slot.ticks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_success_at(&self, kind: TuiLoopHeartbeatKind, now_micros: i64, duration_micros: u64) {
+        let slot = &self.slots[kind.index()];
+        slot.last_success_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        slot.last_success_duration_micros
+            .store(duration_micros, Ordering::Relaxed);
+        slot.successes_total.fetch_add(1, Ordering::Relaxed);
+        slot.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_failure_at(&self, kind: TuiLoopHeartbeatKind, now_micros: i64) {
+        let slot = &self.slots[kind.index()];
+        slot.last_failure_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        slot.failures_total.fetch_add(1, Ordering::Relaxed);
+        slot.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, kind: TuiLoopHeartbeatKind) -> TuiLoopHeartbeatSnapshot {
+        let slot = &self.slots[kind.index()];
+        TuiLoopHeartbeatSnapshot {
+            kind,
+            last_tick_micros: slot.last_tick_micros.load(Ordering::Relaxed),
+            last_success_micros: slot.last_success_micros.load(Ordering::Relaxed),
+            last_failure_micros: slot.last_failure_micros.load(Ordering::Relaxed),
+            last_gap_micros: slot.last_gap_micros.load(Ordering::Relaxed),
+            last_success_duration_micros: slot.last_success_duration_micros.load(Ordering::Relaxed),
+            ticks_total: slot.ticks_total.load(Ordering::Relaxed),
+            successes_total: slot.successes_total.load(Ordering::Relaxed),
+            failures_total: slot.failures_total.load(Ordering::Relaxed),
+            consecutive_failures: slot.consecutive_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn loop_heartbeat_now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Lock-free point-in-time snapshot of one TUI screen's data-refresh liveness.
+///
+/// Distinct from [`TuiLoopHeartbeatSnapshot`]: loop heartbeats prove the
+/// long-running *loops* are advancing, whereas this proves each *screen*
+/// is still applying freshly-generated data (and was not silently frozen
+/// or starved of ticks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiScreenRefreshSnapshot {
+    pub screen: crate::tui_screens::MailScreenId,
+    /// Wall-clock micros of this screen's most recent successful (non-panicking) tick.
+    pub last_tick_micros: i64,
+    /// Wall-clock micros of the most recent tick that observed newly-generated data.
+    pub last_refresh_micros: i64,
+    pub ticks_total: u64,
+    pub refreshes_total: u64,
+}
+
+#[derive(Debug)]
+struct ScreenRefreshSlot {
+    last_tick_micros: AtomicI64,
+    last_refresh_micros: AtomicI64,
+    ticks_total: AtomicU64,
+    refreshes_total: AtomicU64,
+    // Last data-generation channels observed by this screen. Initialized to
+    // the `DataGeneration::stale()` sentinel (all-MAX) so the first real tick
+    // always registers as a refresh, mirroring each screen's own
+    // `last_data_gen` bootstrap.
+    seen_event_total_pushed: AtomicU64,
+    seen_console_log_seq: AtomicU64,
+    seen_db_stats_gen: AtomicU64,
+    seen_request_gen: AtomicU64,
+}
+
+impl ScreenRefreshSlot {
+    fn new() -> Self {
+        Self {
+            last_tick_micros: AtomicI64::new(0),
+            last_refresh_micros: AtomicI64::new(0),
+            ticks_total: AtomicU64::new(0),
+            refreshes_total: AtomicU64::new(0),
+            seen_event_total_pushed: AtomicU64::new(u64::MAX),
+            seen_console_log_seq: AtomicU64::new(u64::MAX),
+            seen_db_stats_gen: AtomicU64::new(u64::MAX),
+            seen_request_gen: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScreenRefreshSlots {
+    slots: [ScreenRefreshSlot; crate::tui_screens::MailScreenId::COUNT],
+}
+
+impl ScreenRefreshSlots {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ScreenRefreshSlot::new()),
+        }
+    }
+
+    /// Record a successful screen tick. Returns `true` if the global data
+    /// generation advanced since this screen last ticked (i.e. fresh data was
+    /// available to apply).
+    fn record_tick_at(
+        &self,
+        id: crate::tui_screens::MailScreenId,
+        now_micros: i64,
+        current: crate::tui_screens::DataGeneration,
+    ) -> bool {
+        let slot = &self.slots[id.index()];
+        slot.last_tick_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        slot.ticks_total.fetch_add(1, Ordering::Relaxed);
+        // Single-writer per slot (the TUI tick loop), so the per-field swaps
+        // cannot interleave with one another for a given screen.
+        let prev_event = slot
+            .seen_event_total_pushed
+            .swap(current.event_total_pushed, Ordering::Relaxed);
+        let prev_console = slot
+            .seen_console_log_seq
+            .swap(current.console_log_seq, Ordering::Relaxed);
+        let prev_db = slot
+            .seen_db_stats_gen
+            .swap(current.db_stats_gen, Ordering::Relaxed);
+        let prev_request = slot
+            .seen_request_gen
+            .swap(current.request_gen, Ordering::Relaxed);
+        let refreshed = prev_event != current.event_total_pushed
+            || prev_console != current.console_log_seq
+            || prev_db != current.db_stats_gen
+            || prev_request != current.request_gen;
+        if refreshed {
+            slot.last_refresh_micros
+                .store(now_micros.max(0), Ordering::Relaxed);
+            slot.refreshes_total.fetch_add(1, Ordering::Relaxed);
+        }
+        refreshed
+    }
+
+    fn snapshot(&self, id: crate::tui_screens::MailScreenId) -> TuiScreenRefreshSnapshot {
+        let slot = &self.slots[id.index()];
+        TuiScreenRefreshSnapshot {
+            screen: id,
+            last_tick_micros: slot.last_tick_micros.load(Ordering::Relaxed),
+            last_refresh_micros: slot.last_refresh_micros.load(Ordering::Relaxed),
+            ticks_total: slot.ticks_total.load(Ordering::Relaxed),
+            refreshes_total: slot.refreshes_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn elapsed_micros_u64(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +730,8 @@ pub struct TuiSharedState {
     /// Per-screen diagnostics snapshots, keyed by insertion sequence.
     screen_diagnostics: Mutex<VecDeque<(u64, ScreenDiagnosticSnapshot)>>,
     screen_diagnostic_seq: AtomicU64,
+    /// Last archive boot-time integrity check report produced during startup.
+    boot_archive_preflight: Mutex<Option<BootArchivePreflightSnapshot>>,
     /// Generation counter bumped when `update_db_stats` changes semantic DB content.
     db_stats_gen: AtomicU64,
     /// Whether the DB poller most recently observed a usable MCP Agent Mail DB context.
@@ -381,6 +742,10 @@ pub struct TuiSharedState {
     next_active_reservation_expiry_micros: AtomicI64,
     /// Generation counter bumped on each `record_request` call.
     request_gen: AtomicU64,
+    /// Lock-free per-loop progress markers for freeze/stall diagnosis.
+    loop_heartbeats: LoopHeartbeatSlots,
+    /// Lock-free per-screen data-refresh markers for freeze/stall diagnosis.
+    screen_refreshes: ScreenRefreshSlots,
     /// Startup latches used to stage heavyweight background work behind first
     /// paint and behind the initial DB readiness result.
     startup_signals: (Mutex<StartupSignalState>, Condvar),
@@ -425,11 +790,14 @@ impl TuiSharedState {
             console_log_seq: AtomicU64::new(0),
             screen_diagnostics: Mutex::new(VecDeque::with_capacity(SCREEN_DIAGNOSTIC_CAPACITY)),
             screen_diagnostic_seq: AtomicU64::new(0),
+            boot_archive_preflight: Mutex::new(None),
             db_stats_gen: AtomicU64::new(0),
             db_context_available: AtomicBool::new(false),
             urgent_ack_pending: AtomicBool::new(false),
             next_active_reservation_expiry_micros: AtomicI64::new(0),
             request_gen: AtomicU64::new(0),
+            loop_heartbeats: LoopHeartbeatSlots::new(),
+            screen_refreshes: ScreenRefreshSlots::new(),
             startup_signals: (Mutex::new(StartupSignalState::default()), Condvar::new()),
             web_dashboard_frame: crate::tui_web_dashboard::WebDashboardFrameStore::new(),
         })
@@ -571,6 +939,15 @@ impl TuiSharedState {
     }
 
     pub fn record_request(&self, status: u16, duration_ms: u64) {
+        self.mark_loop_tick(TuiLoopHeartbeatKind::McpApi);
+        if (500..=599).contains(&status) {
+            self.mark_loop_failure(TuiLoopHeartbeatKind::McpApi);
+        } else {
+            self.mark_loop_success_with_duration(
+                TuiLoopHeartbeatKind::McpApi,
+                duration_ms.saturating_mul(1_000),
+            );
+        }
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.request_gen.fetch_add(1, Ordering::Relaxed);
         self.latency_total_ms
@@ -590,6 +967,90 @@ impl TuiSharedState {
 
         let duration_ms_f64 = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX));
         self.sparkline_data.push(duration_ms_f64);
+    }
+
+    pub fn mark_loop_tick(&self, kind: TuiLoopHeartbeatKind) {
+        self.loop_heartbeats.record_tick_at(
+            kind,
+            loop_heartbeat_now_micros(),
+            elapsed_micros_u64(self.started_at),
+        );
+    }
+
+    pub fn mark_loop_success(&self, kind: TuiLoopHeartbeatKind, started_at: Instant) {
+        self.mark_loop_success_with_duration(kind, elapsed_micros_u64(started_at));
+    }
+
+    pub fn mark_loop_success_with_duration(
+        &self,
+        kind: TuiLoopHeartbeatKind,
+        duration_micros: u64,
+    ) {
+        self.loop_heartbeats
+            .record_success_at(kind, loop_heartbeat_now_micros(), duration_micros);
+    }
+
+    pub fn mark_loop_failure(&self, kind: TuiLoopHeartbeatKind) {
+        self.loop_heartbeats
+            .record_failure_at(kind, loop_heartbeat_now_micros());
+    }
+
+    #[must_use]
+    pub fn loop_heartbeat_snapshot(&self, kind: TuiLoopHeartbeatKind) -> TuiLoopHeartbeatSnapshot {
+        if kind == TuiLoopHeartbeatKind::CommitCoalescer
+            && let Some(snapshot) = mcp_agent_mail_storage::commit_coalescer_heartbeat_snapshot()
+        {
+            return TuiLoopHeartbeatSnapshot {
+                kind,
+                last_tick_micros: snapshot.last_tick_micros,
+                last_success_micros: snapshot.last_success_micros,
+                last_failure_micros: snapshot.last_failure_micros,
+                last_gap_micros: snapshot.last_gap_micros,
+                last_success_duration_micros: snapshot.last_success_duration_micros,
+                ticks_total: snapshot.ticks_total,
+                successes_total: snapshot.successes_total,
+                failures_total: snapshot.failures_total,
+                consecutive_failures: snapshot.consecutive_failures,
+            };
+        }
+        self.loop_heartbeats.snapshot(kind)
+    }
+
+    #[must_use]
+    pub fn loop_heartbeats_snapshot(&self) -> Vec<TuiLoopHeartbeatSnapshot> {
+        TuiLoopHeartbeatKind::ALL
+            .iter()
+            .map(|kind| self.loop_heartbeat_snapshot(*kind))
+            .collect()
+    }
+
+    /// Record a successful (non-panicking) tick for `id`, stamping the screen's
+    /// data-refresh liveness markers. Returns `true` if newly-generated data was
+    /// available to apply on this tick.
+    ///
+    /// Called from the single TUI tick loop after each screen tick. Cheap:
+    /// reads four atomics ([`Self::data_generation`]) and updates a handful more.
+    pub fn record_screen_tick(&self, id: crate::tui_screens::MailScreenId) -> bool {
+        let current = self.data_generation();
+        self.screen_refreshes
+            .record_tick_at(id, loop_heartbeat_now_micros(), current)
+    }
+
+    #[must_use]
+    pub fn screen_refresh_snapshot(
+        &self,
+        id: crate::tui_screens::MailScreenId,
+    ) -> TuiScreenRefreshSnapshot {
+        self.screen_refreshes.snapshot(id)
+    }
+
+    /// Per-screen data-refresh liveness snapshots, in canonical display order.
+    #[must_use]
+    pub fn screen_refresh_snapshots(&self) -> Vec<TuiScreenRefreshSnapshot> {
+        crate::tui_screens::ALL_SCREEN_IDS
+            .iter()
+            .map(|&id| self.screen_refreshes.snapshot(id))
+            .collect()
     }
 
     pub fn update_db_stats(&self, stats: DbStatSnapshot) {
@@ -839,6 +1300,22 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = snapshot;
+    }
+
+    #[must_use]
+    pub fn boot_archive_preflight_snapshot(&self) -> Option<BootArchivePreflightSnapshot> {
+        self.boot_archive_preflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn update_boot_archive_preflight_snapshot(&self, snapshot: BootArchivePreflightSnapshot) {
+        let mut guard = self
+            .boot_archive_preflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(snapshot);
     }
 
     /// Snapshot the active message drag state, if any.
@@ -1254,6 +1731,140 @@ mod tests {
         assert_eq!(counters.status_4xx, 1);
         assert_eq!(counters.status_5xx, 1);
         assert_eq!(state.avg_latency_ms(), 20);
+
+        let heartbeat = state.loop_heartbeat_snapshot(TuiLoopHeartbeatKind::McpApi);
+        assert_eq!(heartbeat.ticks_total, 3);
+        assert_eq!(heartbeat.successes_total, 2);
+        assert_eq!(heartbeat.failures_total, 1);
+        assert_eq!(heartbeat.consecutive_failures, 1);
+        assert_eq!(heartbeat.last_success_duration_micros, 30_000);
+        assert!(heartbeat.last_tick_micros > 0);
+        assert!(heartbeat.last_success_micros > 0);
+        assert!(heartbeat.last_failure_micros > 0);
+    }
+
+    #[test]
+    fn loop_heartbeat_slots_track_tick_success_and_failure() {
+        let heartbeats = LoopHeartbeatSlots::new();
+
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 100, 1_000);
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 75, 1_075);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Render, 190, 12);
+        heartbeats.record_failure_at(TuiLoopHeartbeatKind::Render, 210);
+
+        let render = heartbeats.snapshot(TuiLoopHeartbeatKind::Render);
+        assert_eq!(render.kind, TuiLoopHeartbeatKind::Render);
+        assert_eq!(render.last_tick_micros, 75);
+        assert_eq!(render.last_success_micros, 190);
+        assert_eq!(render.last_failure_micros, 210);
+        assert_eq!(render.last_gap_micros, 75);
+        assert_eq!(render.last_success_duration_micros, 12);
+        assert_eq!(render.ticks_total, 2);
+        assert_eq!(render.successes_total, 1);
+        assert_eq!(render.failures_total, 1);
+        assert_eq!(render.consecutive_failures, 1);
+
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Render, 230, 8);
+        assert_eq!(
+            heartbeats
+                .snapshot(TuiLoopHeartbeatKind::Render)
+                .consecutive_failures,
+            0
+        );
+    }
+
+    #[test]
+    fn loop_heartbeats_snapshot_covers_every_known_loop() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let snapshots = state.loop_heartbeats_snapshot();
+        let kinds: Vec<TuiLoopHeartbeatKind> =
+            snapshots.iter().map(|snapshot| snapshot.kind).collect();
+        assert_eq!(kinds, TuiLoopHeartbeatKind::ALL.as_slice());
+    }
+
+    #[test]
+    fn loop_heartbeats_capture_render_stall_without_hiding_input_progress() {
+        let heartbeats = LoopHeartbeatSlots::new();
+
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 10_000, 5_000);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Render, 14_000, 4_000);
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Input, 15_000, 6_000);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Input, 16_000, 700);
+
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 200_000, 191_000);
+        heartbeats.record_failure_at(TuiLoopHeartbeatKind::Render, 201_000);
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Input, 202_000, 192_000);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Input, 203_000, 800);
+
+        let render = heartbeats.snapshot(TuiLoopHeartbeatKind::Render);
+        assert_eq!(render.last_gap_micros, 186_000);
+        assert_eq!(render.last_success_duration_micros, 4_000);
+        assert_eq!(render.ticks_total, 2);
+        assert_eq!(render.successes_total, 1);
+        assert_eq!(render.failures_total, 1);
+        assert_eq!(render.consecutive_failures, 1);
+
+        let input = heartbeats.snapshot(TuiLoopHeartbeatKind::Input);
+        assert_eq!(input.ticks_total, 2);
+        assert_eq!(input.successes_total, 2);
+        assert_eq!(input.failures_total, 0);
+        assert_eq!(input.consecutive_failures, 0);
+        assert_eq!(input.last_success_duration_micros, 800);
+    }
+
+    #[test]
+    fn screen_refresh_slots_detect_fresh_data_and_record_ticks() {
+        use crate::tui_screens::{DataGeneration, MailScreenId};
+
+        let slots = ScreenRefreshSlots::new();
+        let gen0 = DataGeneration {
+            event_total_pushed: 5,
+            console_log_seq: 2,
+            db_stats_gen: 1,
+            request_gen: 9,
+        };
+
+        // First tick bootstraps from the stale sentinel → always counts as a
+        // refresh, mirroring each screen's `last_data_gen` initialization.
+        assert!(slots.record_tick_at(MailScreenId::Dashboard, 1_000, gen0));
+        // Re-tick with the same generation → tick recorded, but NOT a refresh.
+        assert!(!slots.record_tick_at(MailScreenId::Dashboard, 2_000, gen0));
+        // Advance a single data channel → counts as a refresh again.
+        let gen1 = DataGeneration {
+            db_stats_gen: 2,
+            ..gen0
+        };
+        assert!(slots.record_tick_at(MailScreenId::Dashboard, 3_000, gen1));
+
+        let snap = slots.snapshot(MailScreenId::Dashboard);
+        assert_eq!(snap.screen, MailScreenId::Dashboard);
+        assert_eq!(snap.ticks_total, 3);
+        assert_eq!(snap.refreshes_total, 2);
+        assert_eq!(snap.last_tick_micros, 3_000);
+        // last_refresh holds the second refresh time, not the no-op tick at 2_000.
+        assert_eq!(snap.last_refresh_micros, 3_000);
+
+        // An independently-tracked, never-ticked screen stays zeroed.
+        let untouched = slots.snapshot(MailScreenId::Atc);
+        assert_eq!(untouched.ticks_total, 0);
+        assert_eq!(untouched.refreshes_total, 0);
+        assert_eq!(untouched.last_tick_micros, 0);
+        assert_eq!(untouched.last_refresh_micros, 0);
+    }
+
+    #[test]
+    fn screen_refresh_snapshots_cover_every_screen() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let snapshots = state.screen_refresh_snapshots();
+        assert_eq!(snapshots.len(), crate::tui_screens::MailScreenId::COUNT);
+        let screens: Vec<_> = snapshots.iter().map(|s| s.screen).collect();
+        assert_eq!(
+            screens.as_slice(),
+            crate::tui_screens::ALL_SCREEN_IDS,
+            "screen refresh snapshots must be in canonical display order"
+        );
     }
 
     #[test]

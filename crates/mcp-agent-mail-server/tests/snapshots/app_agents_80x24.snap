@@ -1,24 +1,24 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-                                 → Ops • Agents                                 
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
- Agents api up:0m00s                                                          ? 
+< 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations           >
+╭ Registered Agents ───────────────────────────────────────────────────────────╮
+│                                                                              │
+│ Agents         Active         Healthy        Attention      Messages         │
+│ 0 ─            0 ─            0 ─            0 ─            0 ─              │
+│ 0 agents | Sort: Active ▼                                                    │
+│ Name                             │Health         │Last Active                │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│ 0 agents │ 0 active │ 0 idle │ 0 offline │ 0 attention │ 0 msgs              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ Agents mcp up:0m00s                                               LIVE [^P] F1 

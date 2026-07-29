@@ -68,7 +68,10 @@ VERBOSE_DUMP_LINES=20
 LOG_FILE="${LOG_FILE:-/tmp/am-install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log}"
 LOG_INITIALIZED=0
 ERROR_TAIL_EMITTED=0
-ORIGINAL_ARGS=("$@")
+# `${1+"$@"}` (not bare `"$@"`) keeps this safe on bash 3.2 (stock macOS):
+# pre-4.4 bash treats an argument-less `"$@"` expansion as an unbound
+# variable under `set -u`, which would abort a plain `curl ... | bash` run.
+ORIGINAL_ARGS=(${1+"$@"})
 UNINSTALL_SUMMARY=()
 REMOTE_HTTP_PROBE_DETAIL=""
 
@@ -372,8 +375,7 @@ set_artifact_url() {
       TAR=$(basename "$ARTIFACT_URL")
       URL="$ARTIFACT_URL"
     elif [ -n "$TARGET" ]; then
-      TAR="mcp-agent-mail-${TARGET}.tar.xz"
-      URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+      set_target_artifact "$TARGET"
     else
       warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
       FROM_SOURCE=1
@@ -382,16 +384,26 @@ set_artifact_url() {
   verbose "set_artifact_url:done tar=${TAR:-<none>} url=${URL:-<none>} from_source=${FROM_SOURCE}"
 }
 
-artifact_url_for_target() {
+artifact_url_for_target_ext() {
   local target="$1"
-  printf 'https://github.com/%s/%s/releases/download/%s/mcp-agent-mail-%s.tar.xz' \
-    "$OWNER" "$REPO" "$VERSION" "$target"
+  local ext="$2"
+  printf 'https://github.com/%s/%s/releases/download/%s/mcp-agent-mail-%s.%s' \
+    "$OWNER" "$REPO" "$VERSION" "$target" "$ext"
+}
+
+artifact_url_for_target() {
+  artifact_url_for_target_ext "$1" "tar.xz"
+}
+
+set_target_artifact_ext() {
+  TARGET="$1"
+  local ext="$2"
+  TAR="mcp-agent-mail-${TARGET}.${ext}"
+  URL="$(artifact_url_for_target_ext "$TARGET" "$ext")"
 }
 
 set_target_artifact() {
-  TARGET="$1"
-  TAR="mcp-agent-mail-${TARGET}.tar.xz"
-  URL="$(artifact_url_for_target "$TARGET")"
+  set_target_artifact_ext "$1" "tar.xz"
 }
 
 linux_x86_64_gnu_fallback_allowed() {
@@ -403,16 +415,47 @@ artifact_url_reachable() {
   curl -fsSI --connect-timeout 3 --max-time 5 -o /dev/null "$url" 2>/dev/null
 }
 
+artifact_target_fallback_allowed() {
+  [ -n "${TARGET:-}" ] && [ -z "${ARTIFACT_URL:-}" ]
+}
+
+select_artifact_for_target_if_available() {
+  local target="$1"
+  local ext url
+  for ext in tar.xz tar.gz; do
+    url="$(artifact_url_for_target_ext "$target" "$ext")"
+    artifact_url_reachable "$url" || continue
+    set_target_artifact_ext "$target" "$ext"
+    return 0
+  done
+  return 1
+}
+
+select_current_target_artifact_if_available() {
+  artifact_target_fallback_allowed || return 1
+  select_artifact_for_target_if_available "$TARGET"
+}
+
+select_same_target_gzip_artifact() {
+  artifact_target_fallback_allowed || return 1
+  case "${TAR:-}" in
+    *.tar.xz)
+      set_target_artifact_ext "$TARGET" "tar.gz"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 select_linux_x86_64_gnu_artifact() {
   set_target_artifact "x86_64-unknown-linux-gnu"
 }
 
 select_linux_x86_64_gnu_artifact_if_available() {
   linux_x86_64_gnu_fallback_allowed || return 1
-  local fallback_url
-  fallback_url="$(artifact_url_for_target "x86_64-unknown-linux-gnu")"
-  artifact_url_reachable "$fallback_url" || return 1
-  select_linux_x86_64_gnu_artifact
+  select_artifact_for_target_if_available "x86_64-unknown-linux-gnu"
 }
 
 check_disk_space() {
@@ -606,6 +649,11 @@ check_network() {
   if artifact_url_reachable "$URL"; then
     return 0
   fi
+  if select_current_target_artifact_if_available; then
+    info "Selected ${TAR} for $VERSION"
+    verbose "network:same_target_extension_fallback version=${VERSION} url=${URL}"
+    return 0
+  fi
   if select_linux_x86_64_gnu_artifact_if_available; then
     info "Selected gnu artifact for $VERSION (preferred musl build is not published)"
     verbose "network:musl_fallback_to_gnu version=${VERSION} url=${URL}"
@@ -726,7 +774,12 @@ detect_python_alias() {
       fi
     done < <(grep -oE '^\s*(source|\.)\s+"?[^"#]+"?' "$rc" 2>/dev/null | sed -E 's/^\s*(source|\.)\s+//' | sed 's/#.*//' | sed 's/[[:space:]]*$//' || true)
   done
-  rc_files+=("${sourced_files[@]}")
+  # Bash 3.2 (the stock macOS shell) treats an empty array expansion as an
+  # unbound variable under `set -u`. Guard the expansion explicitly so the
+  # normal no-sourced-files path remains portable.
+  if ((${#sourced_files[@]} > 0)); then
+    rc_files+=("${sourced_files[@]}")
+  fi
 
   # Also directly check ACFS paths (common agent framework that defines am alias)
   local acfs_zshrc="$HOME/.acfs/zsh/acfs.zshrc"
@@ -913,12 +966,19 @@ detect_python_binary() {
     fi
   done <<< "$all_am"
 
-  # Also check for python -m mcp_agent_mail availability
-  if command -v python3 >/dev/null 2>&1 && python3 -c "import mcp_agent_mail" 2>/dev/null; then
+  # Also check for python -m mcp_agent_mail availability.
+  #
+  # Run the probe from `/` so CWD-on-sys.path can't let an unrelated directory
+  # (notably the Rust install at $HOME/mcp_agent_mail/) spoof the import via a
+  # PEP 420 implicit namespace package. Also require `__file__` — only real,
+  # initialized packages set it; namespace packages do not. (#128)
+  if command -v python3 >/dev/null 2>&1 && \
+     (cd / && python3 -c "import mcp_agent_mail, sys; sys.exit(0 if getattr(mcp_agent_mail, '__file__', None) else 1)") 2>/dev/null; then
     PYTHON_BINARY_FOUND=1
     PYTHON_BINARY_PATH="python3 -m mcp_agent_mail"
     verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
-  elif command -v python >/dev/null 2>&1 && python -c "import mcp_agent_mail" 2>/dev/null; then
+  elif command -v python >/dev/null 2>&1 && \
+       (cd / && python -c "import mcp_agent_mail, sys; sys.exit(0 if getattr(mcp_agent_mail, '__file__', None) else 1)") 2>/dev/null; then
     PYTHON_BINARY_FOUND=1
     PYTHON_BINARY_PATH="python -m mcp_agent_mail"
     verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
@@ -1522,6 +1582,13 @@ displace_python_binary() {
   if [ "$PYTHON_CLONE_FOUND" -eq 1 ] && [ -n "${PYTHON_CLONE_PATH:-}" ]; then
     candidates+=("$PYTHON_CLONE_PATH/.venv/bin/am")
     candidates+=("$PYTHON_CLONE_PATH/venv/bin/am")
+  fi
+
+  # Empty-array expansion aborts under `set -u` on bash 3.2, and candidates
+  # is only populated when a legacy Python launcher was detected.
+  if [ "${#candidates[@]}" -eq 0 ]; then
+    verbose "displace_python_binary:no_candidates"
+    return 0
   fi
 
   local bin_path
@@ -2820,6 +2887,11 @@ service_setup_unavailable_failure() {
 }
 
 has_remote_http_client_targets() {
+  if [ "${AM_INSTALL_SKIP_REMOTE_HTTP_READINESS:-0}" = "1" ]; then
+    verbose "remote_http_readiness:skip reason=env_override"
+    return 1
+  fi
+
   if command -v codex >/dev/null 2>&1 || [ -d "${HOME}/.codex" ] || [ -d "${HOME}/.config/codex" ]; then
     return 0
   fi
@@ -2888,16 +2960,176 @@ wait_for_remote_http_endpoint() {
   return 1
 }
 
+plist_xml_escape() {
+  local value="${1:-}"
+  value="${value//&/\&amp;}"
+  value="${value//</\&lt;}"
+  value="${value//>/\&gt;}"
+  value="${value//\"/\&quot;}"
+  value="${value//\'/\&apos;}"
+  printf '%s' "$value"
+}
+
+plist_string_entry() {
+  local value="${1:-}"
+  printf '        <string>%s</string>\n' "$(plist_xml_escape "$value")"
+}
+
+plist_env_entry() {
+  local key="${1:-}"
+  local value="${2:-}"
+  [ -n "$key" ] || return 0
+  [ -n "$value" ] || return 0
+  printf '        <key>%s</key>\n' "$(plist_xml_escape "$key")"
+  printf '        <string>%s</string>\n' "$(plist_xml_escape "$value")"
+}
+
+ensure_real_directory_tree() {
+  local path="$1"
+  local label="$2"
+  local current="" part
+
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*) current="/" ;;
+  esac
+
+  local parts=()
+  IFS='/' read -r -a parts <<< "$path"
+
+  for part in "${parts[@]}"; do
+    [ -n "$part" ] || continue
+    [ "$part" = "." ] && continue
+    if [ "$part" = ".." ]; then
+      warn "Refusing to create $label with parent traversal: $path"
+      return 1
+    fi
+    if [ "$current" = "/" ]; then
+      current="/$part"
+    elif [ -n "$current" ]; then
+      current="$current/$part"
+    else
+      current="$part"
+    fi
+
+    if [ -L "$current" ]; then
+      warn "$label component is a symlink; refusing to write through it: $current"
+      return 1
+    fi
+    if [ -e "$current" ] && [ ! -d "$current" ]; then
+      warn "$label component exists but is not a directory: $current"
+      return 1
+    fi
+    [ -d "$current" ] || mkdir "$current" || return 1
+  done
+}
+
+ensure_real_file_target_path() {
+  local path="$1"
+  local label="$2"
+  local parent
+
+  parent="$(dirname "$path")"
+  ensure_real_directory_tree "$parent" "$label parent" || return 1
+  if [ -L "$path" ]; then
+    warn "$label is a symlink; refusing to write through it: $path"
+    return 1
+  fi
+  if [ -e "$path" ] && [ ! -f "$path" ]; then
+    warn "$label exists but is not a regular file: $path"
+    return 1
+  fi
+}
+
+write_launchd_service_plist() {
+  local plist_path="$1"
+  local am_bin="$2"
+  local home="$3"
+  local storage_root="$4"
+  local database_url="$5"
+  local bearer_token="$6"
+  local host="$7"
+  local port="$8"
+  local http_path="$9"
+
+  local log_dir="$home/Library/Logs/agent-mail"
+  local args_xml env_xml tmp_plist
+  ensure_real_file_target_path "$plist_path" "LaunchAgent plist" || return 1
+  ensure_real_directory_tree "$log_dir" "LaunchAgent log directory" || return 1
+  ensure_real_directory_tree "$storage_root" "Agent Mail storage root" || return 1
+
+  args_xml="$(
+    plist_string_entry "$am_bin"
+    plist_string_entry "serve-http"
+    plist_string_entry "--host"
+    plist_string_entry "$host"
+    plist_string_entry "--port"
+    plist_string_entry "$port"
+    plist_string_entry "--no-tui"
+  )"
+
+  env_xml="$(
+    plist_env_entry "RUST_LOG" "info"
+    plist_env_entry "HOME" "$home"
+    plist_env_entry "DATABASE_URL" "$database_url"
+    plist_env_entry "STORAGE_ROOT" "$storage_root"
+    plist_env_entry "HTTP_BEARER_TOKEN" "$bearer_token"
+    plist_env_entry "HTTP_HOST" "$host"
+    plist_env_entry "HTTP_PORT" "$port"
+    plist_env_entry "HTTP_PATH" "$http_path"
+  )"
+
+  tmp_plist="$(mktemp "${plist_path}.tmp.XXXXXX")" || return 1
+  if ! cat > "$tmp_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agent-mail</string>
+    <key>ProgramArguments</key>
+    <array>
+${args_xml}
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$(plist_xml_escape "$storage_root")</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>$(plist_xml_escape "$log_dir")/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$(plist_xml_escape "$log_dir")/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+${env_xml}
+    </dict>
+</dict>
+</plist>
+EOF
+  then
+    return 1
+  fi
+  chmod 644 "$tmp_plist" || return 1
+  mv -f "$tmp_plist" "$plist_path" || return 1
+}
+
 repair_launchd_service_env_from_rust_config() {
   [ "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" = "darwin" ] || return 0
 
   local plist_path="$HOME/Library/LaunchAgents/com.agent-mail.plist"
-  [ -f "$plist_path" ] || return 0
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    warn "python3 not found; cannot patch LaunchAgent environment for config.env compatibility."
+  if [ -L "$plist_path" ]; then
+    warn "LaunchAgent plist is a symlink; refusing to rewrite it automatically: $plist_path"
     return 0
   fi
+  [ -f "$plist_path" ] || return 0
 
   local rust_env="$HOME/.config/mcp-agent-mail/config.env"
   local storage_root database_url bearer_token host port http_path
@@ -2916,40 +3148,9 @@ repair_launchd_service_env_from_rust_config() {
   http_path=$(read_env_assignment_value "$rust_env" "HTTP_PATH")
   [ -z "$http_path" ] && http_path="${HTTP_PATH:-/mcp/}"
 
-  if ! python3 - "$plist_path" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path" <<'PY'
-import plistlib
-import sys
-
-plist_path, home, storage_root, database_url, bearer_token, host, port, http_path = sys.argv[1:]
-
-with open(plist_path, "rb") as fh:
-    data = plistlib.load(fh)
-
-env = dict(data.get("EnvironmentVariables") or {})
-env["RUST_LOG"] = env.get("RUST_LOG", "info")
-env["HOME"] = home
-
-for key, value in (
-    ("STORAGE_ROOT", storage_root),
-    ("DATABASE_URL", database_url),
-    ("HTTP_BEARER_TOKEN", bearer_token),
-    ("HTTP_HOST", host),
-    ("HTTP_PORT", port),
-    ("HTTP_PATH", http_path),
-):
-    if value:
-        env[key] = value
-    else:
-        env.pop(key, None)
-
-data["EnvironmentVariables"] = env
-data["WorkingDirectory"] = storage_root or home
-
-with open(plist_path, "wb") as fh:
-    plistlib.dump(data, fh)
-PY
+  if ! write_launchd_service_plist "$plist_path" "$DEST/$BIN_CLI" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path"
   then
-    warn "Failed to inject Rust config environment into LaunchAgent plist."
+    warn "Failed to rewrite LaunchAgent plist with Rust config environment."
     return 0
   fi
 
@@ -3441,6 +3642,171 @@ PY
   esac
 }
 
+# Insert or create an mcp-agent-mail entry in an OpenCode `opencode.json`.
+# OpenCode reads MCP servers from the top-level `mcp` object (NOT the
+# Claude-style `mcpServers`), and mcp-agent-mail's `serve` runs an HTTP
+# runtime, so the entry is a remote server (`type: "remote"` + `url`),
+# never a stdio/local command. Mirrors the Rust `am setup` path
+# (crates/mcp-agent-mail-core/src/setup.rs OpenCode arm). See GH#165.
+setup_single_opencode_json_config() {
+  local tool="$1"
+  local config_path="$2"
+  local desired_url
+  desired_url="$(desired_mcp_http_url)"
+  local bearer_token
+  bearer_token="$(resolve_setup_http_bearer_token)"
+  local desired_auth_header=""
+
+  if [ -n "$bearer_token" ]; then
+    desired_auth_header="Bearer ${bearer_token}"
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    verbose "setup_opencode_json:skip_no_python3 tool=${tool} path=${config_path}"
+    return 2
+  fi
+
+  local result
+  result=$(python3 - "$config_path" "$desired_url" "$desired_auth_header" <<'PY'
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime, timezone
+
+config_path, desired_url, desired_auth_header = sys.argv[1:4]
+
+ENTRY_NAMES = ("mcp-agent-mail", "mcp_agent_mail")
+
+
+def load_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+
+
+def parse_json(text: str):
+    if text.startswith("﻿"):
+        text = text[1:]
+    if not text.strip():
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r"//.*?\n", "\n", text)
+        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        return json.loads(cleaned)
+
+
+def dump_json(doc) -> str:
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+text = load_text(config_path)
+doc = parse_json(text)
+if not isinstance(doc, dict):
+    print("ERROR:not_object")
+    raise SystemExit(0)
+
+# OpenCode reads MCP servers ONLY from the top-level `mcp` object.
+container = doc.get("mcp")
+if not isinstance(container, dict):
+    container = {}
+    doc["mcp"] = container
+
+entry_key = "mcp-agent-mail"
+for candidate in ENTRY_NAMES:
+    if isinstance(container.get(candidate), dict):
+        entry_key = candidate
+        break
+
+existing_entry = container.get(entry_key)
+if not isinstance(existing_entry, dict):
+    existing_entry = {}
+
+# Preserve any unrelated fields the user added, but drop stdio/local and
+# stale transport keys so the remote entry is clean and authoritative.
+# Keep `type`/`url`/`enabled` if present so they are overwritten in place
+# (stable key order) and a re-run is a true no-op (SKIP:unchanged).
+new_entry = {
+    key: value
+    for key, value in existing_entry.items()
+    if key not in {"command", "args", "environment", "env", "transport", "httpUrl"}
+}
+new_entry["type"] = "remote"
+new_entry["url"] = desired_url
+new_entry["enabled"] = True
+
+headers = new_entry.get("headers")
+if not isinstance(headers, dict):
+    headers = {}
+if desired_auth_header:
+    headers["Authorization"] = desired_auth_header
+if headers:
+    new_entry["headers"] = headers
+else:
+    new_entry.pop("headers", None)
+
+container[entry_key] = new_entry
+
+# Self-heal: older installer versions wrote a dead entry under the
+# Claude-style `mcpServers` key, which OpenCode ignores. Remove our entry
+# there and drop the container if it is now empty.
+legacy = doc.get("mcpServers")
+if isinstance(legacy, dict):
+    for candidate in ENTRY_NAMES:
+        legacy.pop(candidate, None)
+    if not legacy:
+        doc.pop("mcpServers", None)
+
+new_text = dump_json(doc)
+if new_text == dump_json(parse_json(text)):
+    print("SKIP:unchanged")
+    raise SystemExit(0)
+
+parent_dir = os.path.dirname(config_path)
+if parent_dir:
+    os.makedirs(parent_dir, exist_ok=True)
+if os.path.exists(config_path):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup = f"{config_path}.{stamp}.bak"
+    shutil.copy2(config_path, backup)
+else:
+    backup = ""
+with open(config_path, "w", encoding="utf-8") as handle:
+    handle.write(new_text)
+
+if backup:
+    print(f"OK:updated backup={backup}")
+else:
+    print("OK:created")
+PY
+) || true
+
+  case "$result" in
+    SKIP:unchanged)
+      verbose "setup_opencode_json:unchanged tool=${tool} path=${config_path}"
+      return 1
+      ;;
+    OK:*)
+      verbose "setup_opencode_json:configured tool=${tool} path=${config_path} ${result}"
+      return 0
+      ;;
+    ERROR:*)
+      verbose "setup_opencode_json:error tool=${tool} path=${config_path} ${result}"
+      return 2
+      ;;
+    *)
+      verbose "setup_opencode_json:unknown_result tool=${tool} path=${config_path} ${result}"
+      return 2
+      ;;
+  esac
+}
+
 # Insert or create an mcp-agent-mail entry in a JSON config file.
 # Uses python3/jq for JSON manipulation if available, otherwise sed-based.
 setup_single_mcp_config() {
@@ -3462,6 +3828,11 @@ setup_single_mcp_config() {
 
   if [ "$tool" = "codex" ]; then
     setup_single_codex_json_config "$tool" "$config_path"
+    return $?
+  fi
+
+  if [ "$tool" = "opencode" ]; then
+    setup_single_opencode_json_config "$tool" "$config_path"
     return $?
   fi
 
@@ -4074,13 +4445,16 @@ remove_update_cache_and_logs() {
   if [ -n "${HOME:-}" ]; then
     cache_candidates+=("${HOME}/.cache/mcp-agent-mail/update-check.json")
   fi
-  for cache_file in "${cache_candidates[@]}"; do
-    if [ -f "$cache_file" ]; then
-      rm -f "$cache_file"
-      record_uninstall_summary "Removed update cache ${cache_file}"
-      removed=$((removed + 1))
-    fi
-  done
+  # Guard: expanding an empty array aborts under `set -u` on bash 3.2.
+  if [ "${#cache_candidates[@]}" -gt 0 ]; then
+    for cache_file in "${cache_candidates[@]}"; do
+      if [ -f "$cache_file" ]; then
+        rm -f "$cache_file"
+        record_uninstall_summary "Removed update cache ${cache_file}"
+        removed=$((removed + 1))
+      fi
+    done
+  fi
 
   local log_count=0
   while IFS= read -r log_path; do
@@ -4155,8 +4529,13 @@ collect_uninstall_data_paths() {
 }
 
 purge_data_paths() {
+  # `mapfile` is a bash 4 builtin; the stock macOS shell is bash 3.2, so
+  # populate the array with a portable while-read loop instead.
   local -a purge_paths=()
-  mapfile -t purge_paths < <(collect_uninstall_data_paths)
+  local purge_candidate
+  while IFS= read -r purge_candidate; do
+    [ -n "$purge_candidate" ] && purge_paths+=("$purge_candidate")
+  done < <(collect_uninstall_data_paths)
 
   if [ "${#purge_paths[@]}" -eq 0 ]; then
     record_uninstall_summary "No storage/database paths were found to purge"
@@ -4428,12 +4807,37 @@ verify_sigstore_bundle() {
     return 0
   fi
 
+  # Our releases ship the new standardized Sigstore protobuf bundle
+  # (.sigstore.json). cosign 2.x can verify it but only with an explicit
+  # --new-bundle-format; cosign 3.x enables that format by default. Passing the
+  # flag to a 3.x build is harmless (it still exists), but to avoid depending on
+  # the flag's continued presence we only add it for the 2.x line. For an
+  # unparseable version we add it: every cosign that can verify a .sigstore.json
+  # bundle at all (2.4+) accepts the flag, so this is the safe default.
+  local nbf_flag=""
+  case "$bundle_file" in
+    *.sigstore.json|*.sigstore)
+      local cosign_major
+      cosign_major="$(cosign version 2>/dev/null \
+        | sed -n 's/.*GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\).*/\1/p' \
+        | head -n1)"
+      # Add the flag unless cosign is a known v3+ (where the new format is the
+      # default). Empty/non-numeric version (e.g. "devel") falls through to the
+      # safe default of adding it.
+      if ! printf '%s' "$cosign_major" | grep -qE '^[0-9]+$' || [ "$cosign_major" -lt 3 ]; then
+        nbf_flag="--new-bundle-format"
+      fi
+      verbose "verify_sigstore_bundle:cosign_major=${cosign_major:-unknown} new_bundle_format=${nbf_flag:-off}"
+      ;;
+  esac
+
   if ! cosign verify-blob \
+    ${nbf_flag:+$nbf_flag} \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
-    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file}"
+    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=${nbf_flag:-off}"
     return 1
   fi
 
@@ -4975,6 +5379,66 @@ if [ "$EASY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 1 ] && [ -e /dev/tty ]; 
   esac
 fi
 
+remove_installer_lock_dir() {
+  local lock_dir="$1"
+  [ -n "$lock_dir" ] || return 0
+  [ -d "$lock_dir" ] || return 0
+  case "$lock_dir" in
+    "/"|"$HOME"|"/tmp"|"/var/tmp")
+      warn "Refusing unsafe installer lock cleanup path: ${lock_dir}"
+      return 1
+      ;;
+  esac
+
+  local unexpected
+  unexpected=$(find "$lock_dir" -mindepth 1 ! -name pid -print -quit 2>/dev/null || true)
+  if [ -n "$unexpected" ]; then
+    warn "Installer lock ${lock_dir} contains unexpected entry ${unexpected}; refusing automatic cleanup"
+    return 1
+  fi
+
+  if [ -e "$lock_dir/pid" ]; then
+    if [ ! -f "$lock_dir/pid" ] && [ ! -L "$lock_dir/pid" ]; then
+      warn "Installer lock ${lock_dir}/pid is not a regular file; refusing automatic cleanup"
+      return 1
+    fi
+    rm -f "$lock_dir/pid" || return 1
+  fi
+  rmdir "$lock_dir"
+}
+
+remove_installer_tmp_dir() {
+  local tmp_dir="$1"
+  [ -n "$tmp_dir" ] || return 0
+  [ -d "$tmp_dir" ] || return 0
+  case "${tmp_dir##*/}" in
+    mcp-agent-mail-install.*) ;;
+    *)
+      warn "Refusing automatic cleanup for unexpected temp path: ${tmp_dir}"
+      return 1
+      ;;
+  esac
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$tmp_dir" <<'PY'
+import pathlib
+import shutil
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.name.startswith("mcp-agent-mail-install."):
+    raise SystemExit("refusing unexpected temp path")
+shutil.rmtree(path)
+PY
+    return $?
+  fi
+
+  find "$tmp_dir" -depth -mindepth 1 -type f -exec rm -f {} + 2>/dev/null || true
+  find "$tmp_dir" -depth -mindepth 1 -type l -exec rm -f {} + 2>/dev/null || true
+  find "$tmp_dir" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
+  rmdir "$tmp_dir"
+}
+
 # Cross-platform locking using mkdir (atomic on all POSIX systems)
 LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
@@ -4985,7 +5449,7 @@ else
   if [ -f "$LOCK_DIR/pid" ]; then
     OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
     if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
-      rm -rf "$LOCK_DIR"
+      remove_installer_lock_dir "$LOCK_DIR" || true
       if mkdir "$LOCK_DIR" 2>/dev/null; then
         LOCKED=1
         echo $$ > "$LOCK_DIR/pid"
@@ -5003,9 +5467,11 @@ fi
 
 cleanup() {
   local rc=$?
-  [ -n "${TMP:-}" ] && rm -rf "$TMP"
+  if [ -n "${TMP:-}" ]; then
+    remove_installer_tmp_dir "$TMP" || true
+  fi
   if [ "${LOCKED:-0}" -eq 1 ]; then
-    rm -rf "${LOCK_DIR:-}"
+    remove_installer_lock_dir "${LOCK_DIR:-}" || true
   fi
   if [ "$rc" -ne 0 ]; then
     dump_verbose_tail
@@ -5013,12 +5479,25 @@ cleanup() {
   return "$rc"
 }
 
-TMP=$(mktemp -d)
+TMP_PARENT="${TMPDIR:-/tmp}"
+TMP=$(mktemp -d "${TMP_PARENT%/}/mcp-agent-mail-install.XXXXXX")
 trap cleanup EXIT
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
+  binary_download_failed=0
   if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+    binary_download_failed=1
+    if select_same_target_gzip_artifact; then
+      warn "tar.xz artifact not available for $TARGET at $VERSION; trying tar.gz"
+      verbose "binary-download:same_target_tar_gz_fallback version=${VERSION} url=${URL}"
+      info "Downloading $URL"
+      if download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+        binary_download_failed=0
+      fi
+    fi
+  fi
+  if [ "$binary_download_failed" -eq 1 ]; then
     # If we preferred a musl artifact that isn't published for this release
     # (older tags only shipped gnu), fall back to the gnu artifact before
     # giving up and attempting a source build.
@@ -5028,10 +5507,22 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
       select_linux_x86_64_gnu_artifact
       info "Downloading $URL"
       if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
-        warn "Binary download failed (release may not exist for $VERSION)"
-        warn "Attempting build from source as fallback..."
-        verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-        FROM_SOURCE=1
+        if select_same_target_gzip_artifact; then
+          warn "gnu tar.xz artifact not available for $VERSION; trying gnu tar.gz"
+          verbose "binary-download:gnu_tar_gz_fallback version=${VERSION} url=${URL}"
+          info "Downloading $URL"
+          if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+            warn "Binary download failed (release may not exist for $VERSION)"
+            warn "Attempting build from source as fallback..."
+            verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
+            FROM_SOURCE=1
+          fi
+        else
+          warn "Binary download failed (release may not exist for $VERSION)"
+          warn "Attempting build from source as fallback..."
+          verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
+          FROM_SOURCE=1
+        fi
       fi
     else
       warn "Binary download failed (release may not exist for $VERSION)"
@@ -5172,8 +5663,8 @@ fi
 info "Extracting"
 tar -xf "$TMP/$TAR" -C "$TMP"
 
-# Nested-archive detection: some releases accidentally nest a .tar.gz inside
-# the outer .tar.xz.  If we find one after the first extraction, unpack it too.
+# Nested-archive detection: some releases accidentally nest a second archive
+# inside the outer archive. If we find one after the first extraction, unpack it too.
 shopt -s nullglob
 for nested in "$TMP"/*.tar.gz "$TMP"/mcp-agent-mail-*/*.tar.gz; do
   if [ -f "$nested" ]; then
@@ -5903,12 +6394,16 @@ sqlite_timestamp_fallback_migration() {
     cat >> "$sql_file" <<SQL
 UPDATE ${table}
 SET ${column} =
-  CAST(strftime('%s', ${column}) AS INTEGER) * 1000000
-  + CASE
-      WHEN instr(${column}, '.') > 0
-      THEN CAST(substr(${column} || '000000', instr(${column}, '.') + 1, 6) AS INTEGER)
-      ELSE 0
-    END
+  CASE
+    WHEN trim(${column}) <> '' AND trim(${column}) NOT GLOB '*[^0-9]*'
+    THEN CAST(trim(${column}) AS INTEGER)
+    ELSE CAST(strftime('%s', ${column}) AS INTEGER) * 1000000
+      + CASE
+          WHEN instr(${column}, '.') > 0
+          THEN CAST(substr(${column} || '000000', instr(${column}, '.') + 1, 6) AS INTEGER)
+          ELSE 0
+        END
+  END
 WHERE typeof(${column}) = 'text';
 SQL
     updates=$((updates + 1))
@@ -5942,12 +6437,12 @@ SQL
   local remaining_text_columns
   remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$db_path")
   if [ -n "$remaining_text_columns" ]; then
-    warn "installer fallback left TEXT timestamps in: ${remaining_text_columns}"
-    return 1
+    warn "installer fallback left TEXT-affinity timestamp rows in: ${remaining_text_columns}"
+    warn "Continuing to Rust schema refresh so text-affinity tables can be rebuilt safely."
   fi
 
   verbose "migration:fallback_sqlite ok db=${db_path} update_statements=${updates} backup=${SQLITE_FALLBACK_BACKUP_PATH:-<none>}"
-  ok "Database timestamps normalized (installer fallback)"
+  ok "Database timestamp fallback completed"
   return 0
 }
 
@@ -6471,6 +6966,48 @@ if [ "$VERIFY" -eq 1 ]; then
   verify_installation
 fi
 
+# Persist a copy of this installer to disk so later `--uninstall` / re-run
+# invocations work even when this run was piped from curl (no ./install.sh on
+# disk). Best-effort: failure to persist must never fail the install.
+SAVED_INSTALLER_PATH=""
+persist_installer_copy() {
+  local target_dir="${XDG_DATA_HOME:-$HOME/.local/share}/mcp-agent-mail"
+  local target="$target_dir/install.sh"
+  local staged_target="${target}.tmp.$$"
+  local source_path="${BASH_SOURCE[0]:-}"
+  local installer_payload=""
+  mkdir -p "$target_dir" 2>/dev/null || return 0
+  if [ -n "$source_path" ] && [ -f "$source_path" ] && [ "$source_path" != "$target" ]; then
+    cp "$source_path" "$staged_target" 2>/dev/null || return 0
+    chmod 0755 "$staged_target" 2>/dev/null || return 0
+    mv -f "$staged_target" "$target" 2>/dev/null || return 0
+  elif [ ! -f "$source_path" ]; then
+    # Piped install (`curl | bash`): the running script has no on-disk source,
+    # so fetch a copy from the canonical URL for later use. Buffer the response
+    # before touching the target so a truncated network transfer cannot leave a
+    # partial executable behind.
+    [ "$OFFLINE" -eq 1 ] && return 0
+    if ! installer_payload="$(curl -fsSL "$INSTALL_SCRIPT_URL" 2>/dev/null)"; then
+      return 0
+    fi
+    case "$installer_payload" in
+      '#!/usr/bin/env bash'*'# mcp-agent-mail installer'*) ;;
+      *) return 0 ;;
+    esac
+    if ! printf '%s\n' "$installer_payload" | bash -n >/dev/null 2>&1; then
+      return 0
+    fi
+    printf '%s\n' "$installer_payload" > "$staged_target" 2>/dev/null || return 0
+    chmod 0755 "$staged_target" 2>/dev/null || return 0
+    mv -f "$staged_target" "$target" 2>/dev/null || return 0
+  fi
+  [ -f "$target" ] || return 0
+  chmod 0755 "$target" 2>/dev/null || true
+  SAVED_INSTALLER_PATH="$target"
+  verbose "persist_installer_copy:saved path=${target}"
+}
+persist_installer_copy || true
+
 # Final summary
 echo ""
 if [ "$QUIET" -eq 0 ]; then
@@ -6505,9 +7042,9 @@ if [ "$QUIET" -eq 0 ]; then
 
   echo ""
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 245 --italic "Managed removal: ./install.sh --uninstall --dest $DEST"
+    gum style --foreground 245 --italic "Managed removal: ${SAVED_INSTALLER_PATH:-./install.sh} --uninstall --dest $DEST"
   else
-    echo -e "\033[0;90mManaged removal: ./install.sh --uninstall --dest $DEST\033[0m"
+    echo -e "\033[0;90mManaged removal: ${SAVED_INSTALLER_PATH:-./install.sh} --uninstall --dest $DEST\033[0m"
   fi
 fi
 

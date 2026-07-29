@@ -1,30 +1,30 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │     
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations                 >
 Messages    Ack Pend    Locks       Agents      Contacts    Requests    Avg Lat     Error %         
 0 ─         0 ─         0 ─         0 ─         0 ─         0 ─         0ms ─       0.0% ─          
- [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                                              
-No events yet.                                                                                      
-Waiting for HTTP/tool/message traffic and health pulses.                                            
-Enter opens Timeline/Search context when results are available.                                     
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
- Dashboard api up:0m00sreq:0 ok:0 err:0 avg:0ms |  j/k  Scroll event loLIVEVE Cyberpunk Aurora [^P] 
+╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────────────────────────╮
+│                                                                                                  │
+│  [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                                           │
+│ No events yet.                                                                                   │
+│ Waiting for HTTP/tool/message traffic and health pulses.                                         │
+│ Enter opens Timeline/Search context when results are available.                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Dashboard mcp up:0m00sreq:0 ok:0 err:0 avg:0ms ·  j/k  Scroll event logLIVE Cyberpunk Aurora [^P] F

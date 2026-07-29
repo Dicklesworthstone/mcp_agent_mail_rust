@@ -77,6 +77,62 @@ impl Default for ToolFilterSettings {
     }
 }
 
+/// Optional cryptographic proof gate for agent registration.
+///
+/// # Default posture (disabled)
+///
+/// When [`enabled`](Self::enabled) is `false` — the default — registration keeps
+/// the historical **self-asserted** identity model with *zero* behavior change:
+/// `register_agent` / `create_agent_identity` (and every macro that registers)
+/// accept a caller-chosen identity without any proof. This preserves fast local
+/// trusted multi-agent coordination.
+///
+/// # Enabled posture (fail-closed)
+///
+/// When `enabled` is `true`, registration requires a signed proof bundle whose
+/// Ed25519 signature verifies against one of the configured [`trusted_keys`]
+/// trust anchors AND whose claims bind the requested identity, program, model,
+/// project, and capability scope. On a missing, malformed, untrusted, expired,
+/// not-yet-valid, replayed, or mismatched proof the registration **fails closed**
+/// (no row is written) with a distinct, actionable error.
+///
+/// [`trusted_keys`]: Self::trusted_keys
+#[derive(Debug, Clone)]
+pub struct ProofGateConfig {
+    /// Master switch. `false` (default) => self-asserted registration (unchanged).
+    pub enabled: bool,
+    /// Trust-anchor Ed25519 public keys, base64 (standard alphabet), each
+    /// decoding to exactly 32 raw bytes. Only proofs signed by one of these
+    /// keys are accepted. Empty while `enabled` is `true` means *every*
+    /// registration fails closed (no key can ever be trusted) — this is an
+    /// intentional safe default, not a bypass.
+    pub trusted_keys: Vec<String>,
+    /// Maximum allowed proof lifetime in seconds (`expires_at - issued_at`).
+    /// Rejects proofs minted with an over-long validity window so a single
+    /// leaked proof cannot be replayed indefinitely. Default `300`.
+    pub max_lifetime_seconds: u64,
+    /// Clock-skew tolerance in seconds applied to `issued_at` / `expires_at`
+    /// comparisons against server wall-clock. Default `60`.
+    pub clock_skew_seconds: u64,
+    /// Track consumed nonces in-process and reject replayed proofs. Default
+    /// `true`. The nonce store is per-process (documented as such); it hardens
+    /// against replay within a running server's lifetime and complements the
+    /// mandatory `expires_at` bound.
+    pub require_nonce: bool,
+}
+
+impl Default for ProofGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trusted_keys: Vec::new(),
+            max_lifetime_seconds: 300,
+            clock_skew_seconds: 60,
+            require_nonce: true,
+        }
+    }
+}
+
 /// Main configuration struct for MCP Agent Mail
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -105,6 +161,13 @@ pub struct Config {
     /// Override via `DATABASE_CACHE_BUDGET_KB`. Default: profile-derived
     /// `524_288` (512 MiB).
     pub database_cache_budget_kb: usize,
+    /// In-memory read-cache entries per category.
+    ///
+    /// This bounds each hot lookup cache independently (projects by slug,
+    /// projects by human key, agents by name, agents by id, and inbox stats).
+    /// Override via `AM_READ_CACHE_ENTRIES_PER_CATEGORY`. Default:
+    /// profile-derived `16_384`.
+    pub read_cache_entries_per_category: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
     /// Hours between periodic full `PRAGMA integrity_check` runs
@@ -160,6 +223,33 @@ pub struct Config {
     // Archive git maintenance (background loose-object repack)
     pub archive_maintenance_enabled: bool,
     pub archive_maintenance_interval_secs: u64,
+
+    // Periodic SQLite maintenance (background, off the request hot path; bead K4)
+    pub db_maintenance_enabled: bool,
+    pub db_checkpoint_interval_secs: u64,
+    pub db_analyze_interval_secs: u64,
+    pub db_vacuum_interval_secs: u64,
+    pub db_journal_size_limit_bytes: u64,
+
+    // Doctor recovery-debris retention (br-mudrv): bound forensic bundles +
+    // `.corrupt-*` quarantine siblings that accumulate one-per-recovery-event
+    // (a prod box reached ~19 GB). The background sweep only OBSERVES + ALERTS
+    // (the forensic manifest forbids automatic deletion); `am doctor reclaim`
+    // does the operator-explicit consolidation/reclaim.
+    pub doctor_retention_enabled: bool,
+    pub doctor_retention_keep_min: u64,
+    pub doctor_retention_max_age_secs: u64,
+    pub doctor_retention_alert_bytes: u64,
+    pub doctor_retention_sweep_interval_secs: u64,
+
+    // Periodic git health sweep (read-only orphan-ref detection)
+    pub health_sweep_enabled: bool,
+    pub health_sweep_interval_seconds: u64,
+    pub health_sweep_batch: usize,
+
+    // Boot-time archive git integrity check
+    pub boot_check_mode: String,
+    pub boot_auto_repair_enabled: bool,
 
     // Memory pressure monitoring (RSS-based)
     pub memory_warning_mb: u64,
@@ -232,6 +322,14 @@ pub struct Config {
     pub http_cors_allow_methods: Vec<String>,
     pub http_cors_allow_headers: Vec<String>,
 
+    /// Additional Host header values the HTTP listener accepts beyond the
+    /// always-present built-ins (the configured `http_host`, its loopback
+    /// probe variant, and `localhost`). Empty by default — keeping the
+    /// listener loopback-only — so this is purely additive/opt-in. Populated
+    /// from the `HTTP_ALLOWED_HOSTS` env var (comma-separated) or the
+    /// `serve-http --allowed-host` flag. See GitHub issue #146.
+    pub http_allowed_hosts: Vec<String>,
+
     // Contact & Messaging
     pub contact_enforcement_enabled: bool,
     pub contact_auto_ttl_seconds: u64,
@@ -250,6 +348,14 @@ pub struct Config {
     pub file_reservation_inactivity_seconds: u64,
     pub file_reservation_activity_grace_seconds: u64,
     pub file_reservations_enforcement_enabled: bool,
+    /// Retention horizon (days) for hard-pruning released/expired file
+    /// reservations from the live DB (GH#154 item 2). When the cleanup worker is
+    /// enabled, released reservations whose settled timestamp is older than this
+    /// many days are `DELETE`d from `file_reservations` (the git archive retains
+    /// the audit history, so the delete is non-destructive). `0` disables the
+    /// retention prune (rows are only ever marked released, never deleted —
+    /// the historical behavior).
+    pub file_reservations_retention_days: u64,
 
     // Ack TTL warnings
     pub ack_ttl_enabled: bool,
@@ -281,6 +387,9 @@ pub struct Config {
 
     // Tool filtering
     pub tool_filter: ToolFilterSettings,
+
+    // Registration proof gate (optional cryptographic gate; default off)
+    pub proof_gate: ProofGateConfig,
 
     // Backpressure shedding
     /// When `true`, the dispatch layer rejects shedable (read-only, deferrable)
@@ -354,8 +463,21 @@ pub struct Config {
     pub tui_toast_info_dismiss_secs: u64,
     pub tui_toast_warn_dismiss_secs: u64,
     pub tui_toast_error_dismiss_secs: u64,
+    pub tui_git_segfault_toast_enabled: bool,
     /// Enable one-shot contextual coach hints on first screen visit.
     pub tui_coach_hints_enabled: bool,
+
+    // TUI screen tick strategy (Predictive Screen Tick Management).
+    /// Screen tick strategy: `predictive`, `uniform`, `adjacent`, `active_only`.
+    pub tui_tick_strategy: String,
+    /// Divisor for the Uniform strategy; fallback divisor for Predictive.
+    pub tui_tick_divisor: u64,
+    /// Persist screen-transition data across TUI sessions.
+    pub tui_tick_persist: bool,
+    /// Minimum observed transitions before Predictive predictions are trusted.
+    pub tui_tick_min_observations: u64,
+    /// Temporal decay factor for transition counts (0.0–1.0).
+    pub tui_tick_decay_factor: f64,
 
     // ATC (Air Traffic Controller) — proactive agent coordination
     /// Master switch for the ATC engine.
@@ -380,6 +502,21 @@ pub struct Config {
     pub atc_suspicion_k: f64,
     /// Experience write mode: `off` (suppress), `shadow` (trace-log only), `live` (persist).
     pub atc_write_mode: AtcWriteMode,
+    /// Hard ceiling on raw `atc_experiences` rows — a true upper bound the table
+    /// can never exceed. When the table exceeds this, the background maintenance
+    /// worker first rolls up and evicts the oldest TERMINAL
+    /// (resolved/censored/expired) rows down to a hysteresis target (rollups
+    /// preserved, the learning-friendly path). If a large OPEN/unresolved backlog
+    /// still leaves the table over the ceiling (e.g. the outcome-resolution
+    /// pipeline is starved), it then force-rotates the oldest rows regardless of
+    /// state — boundedness wins over preserving stale pending rows. A safety bound
+    /// against the unbounded-growth incidents (css 2026-06: 629K rows / 2.41 GB
+    /// that wedged startup; ts2: 859K rows / 3.36 GB corrupted `SQLite`). `0`
+    /// disables the ceiling.
+    pub atc_experience_max_rows: i64,
+    /// Cadence (seconds) for the background ATC experience-ceiling sweep. `0`
+    /// disables the periodic sweep (the ceiling is then never enforced).
+    pub atc_retention_sweep_interval_secs: u64,
 
     // Write-behind queue (WBQ) tuning
     /// Channel capacity for the write-behind queue (default 8192).
@@ -446,6 +583,15 @@ impl CacheProfile {
             Self::Conservative => 128 * 1024,
             Self::Balanced => 512 * 1024,
             Self::HighMemory => 2 * 1024 * 1024,
+        }
+    }
+
+    #[must_use]
+    pub const fn read_cache_entries_per_category(self) -> usize {
+        match self {
+            Self::Conservative => 4_096,
+            Self::Balanced => 16_384,
+            Self::HighMemory => 131_072,
         }
     }
 }
@@ -1111,6 +1257,7 @@ fn resolve_data_path(legacy_base: &Path, subdir: &str) -> PathBuf {
 /// when no explicit `DATABASE_URL` was provided and derive the path from
 /// `storage_root` instead.
 const DEFAULT_LEGACY_DATABASE_URL: &str = "sqlite+aiosqlite:///./storage.sqlite3";
+const BOOT_AUTO_REPAIR_GATE_VALUE: &str = "I_UNDERSTAND_THE_RISKS";
 
 impl Default for Config {
     #[allow(clippy::too_many_lines)]
@@ -1136,6 +1283,8 @@ impl Default for Config {
             database_pool_timeout: None,
             cache_profile: CacheProfile::Balanced,
             database_cache_budget_kb: CacheProfile::Balanced.database_cache_budget_kb(),
+            read_cache_entries_per_category: CacheProfile::Balanced
+                .read_cache_entries_per_category(),
             integrity_check_on_startup: true,
             integrity_check_interval_hours: 1,
 
@@ -1169,6 +1318,27 @@ impl Default for Config {
             archive_maintenance_enabled: true,
             archive_maintenance_interval_secs: 1800, // 30 minutes
 
+            // Periodic SQLite maintenance (bead K4)
+            db_maintenance_enabled: true,
+            db_checkpoint_interval_secs: 300, // passive WAL checkpoint every 5 min
+            db_analyze_interval_secs: 21_600, // refresh planner stats every 6 h
+            db_vacuum_interval_secs: 86_400,  // reclaim/defragment daily (0 disables)
+            db_journal_size_limit_bytes: 268_435_456, // 256 MiB WAL truncation cap
+
+            // Doctor recovery-debris retention (br-mudrv)
+            doctor_retention_enabled: true,
+            doctor_retention_keep_min: 5, // always keep the 5 newest per category
+            doctor_retention_max_age_secs: 1_209_600, // always keep < 14 days old
+            doctor_retention_alert_bytes: 5_368_709_120, // warn at 5 GiB reclaimable
+            doctor_retention_sweep_interval_secs: 3_600, // hourly observe+alert sweep
+
+            // Periodic git health sweep
+            health_sweep_enabled: true,
+            health_sweep_interval_seconds: 900, // 15 minutes
+            health_sweep_batch: 5,
+            boot_check_mode: "warn".to_string(),
+            boot_auto_repair_enabled: false,
+
             // Memory pressure monitoring
             memory_warning_mb: 2048,  // 2 GB
             memory_critical_mb: 4096, // 4 GB
@@ -1179,7 +1349,7 @@ impl Default for Config {
             http_port: 8765,
             http_path: "/mcp/".to_string(),
             http_bearer_token: None,
-            http_allow_localhost_unauthenticated: true,
+            http_allow_localhost_unauthenticated: false,
             http_request_log_enabled: false,
             http_otel_enabled: false,
             http_otel_service_name: "mcp-agent-mail".to_string(),
@@ -1232,8 +1402,8 @@ impl Default for Config {
             http_rbac_default_role: "reader".to_string(),
             http_rbac_readonly_tools: vec![
                 "health_check".to_string(),
-                "fetch_inbox".to_string(),
                 "whois".to_string(),
+                "list_agents".to_string(),
                 "search_messages".to_string(),
                 "summarize_thread".to_string(),
                 "list_contacts".to_string(),
@@ -1248,6 +1418,9 @@ impl Default for Config {
             http_cors_allow_credentials: false,
             http_cors_allow_methods: vec!["*".to_string()],
             http_cors_allow_headers: vec!["*".to_string()],
+
+            // Extra Host header allow-list (loopback-only by default).
+            http_allowed_hosts: vec![],
 
             // Contact & Messaging
             contact_enforcement_enabled: true,
@@ -1267,6 +1440,7 @@ impl Default for Config {
             file_reservation_inactivity_seconds: 1800, // 30 minutes
             file_reservation_activity_grace_seconds: 900, // 15 minutes
             file_reservations_enforcement_enabled: true,
+            file_reservations_retention_days: 30,
 
             // Ack TTL warnings
             ack_ttl_enabled: false,
@@ -1303,6 +1477,9 @@ impl Default for Config {
 
             // Tool filtering
             tool_filter: ToolFilterSettings::default(),
+
+            // Registration proof gate (disabled by default)
+            proof_gate: ProofGateConfig::default(),
 
             // Backpressure shedding
             backpressure_shedding_enabled: false,
@@ -1391,7 +1568,16 @@ impl Default for Config {
             tui_toast_info_dismiss_secs: 5,
             tui_toast_warn_dismiss_secs: 8,
             tui_toast_error_dismiss_secs: 15,
+            tui_git_segfault_toast_enabled: true,
             tui_coach_hints_enabled: true,
+            tui_tick_strategy: "predictive".to_string(),
+            // Matches the tuned in-tree inactive-screen cadence (the original
+            // plan said 5, but the TUI was later re-tuned to 12 to stop
+            // background churn; the Predictive fallback keeps that envelope).
+            tui_tick_divisor: 12,
+            tui_tick_persist: true,
+            tui_tick_min_observations: 20,
+            tui_tick_decay_factor: 0.85,
             atc_enabled: true,
             atc_probe_interval_secs: 120,
             atc_advisory_cooldown_secs: 300,
@@ -1403,6 +1589,8 @@ impl Default for Config {
             atc_ledger_capacity: 1000,
             atc_suspicion_k: 3.0,
             atc_write_mode: AtcWriteMode::Off,
+            atc_experience_max_rows: 50_000,
+            atc_retention_sweep_interval_secs: 900,
 
             // WBQ tuning
             wbq_channel_capacity: 8_192,
@@ -1422,7 +1610,29 @@ impl Default for Config {
 /// Module-level shared config cache (used by `Config::get` and `Config::reset_cached`).
 static CONFIG_CACHE: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
 
+fn test_config_env_overrides_active() -> bool {
+    let process_overrides_empty = process_env_overrides()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty();
+    if !process_overrides_empty {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        TEST_ENV_OVERRIDES.with(|cell| !cell.borrow().is_empty())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn global_config_cache_get() -> Config {
+    if test_config_env_overrides_active() {
+        return Config::from_env();
+    }
+
     // Fast path: read lock, return clone if present
     {
         let guard = CONFIG_CACHE
@@ -1460,6 +1670,10 @@ impl std::fmt::Debug for Config {
             .field("database_url", &redact_db_url(&self.database_url))
             .field("cache_profile", &self.cache_profile)
             .field("database_cache_budget_kb", &self.database_cache_budget_kb)
+            .field(
+                "read_cache_entries_per_category",
+                &self.read_cache_entries_per_category,
+            )
             .field("http_host", &self.http_host)
             .field("http_port", &self.http_port)
             .field("http_path", &self.http_path)
@@ -1474,6 +1688,14 @@ impl std::fmt::Debug for Config {
             .field("storage_root", &self.storage_root)
             .field("ephemeral_mode", &self.ephemeral_mode)
             .field("ephemeral_root", &self.ephemeral_root)
+            .field("health_sweep_enabled", &self.health_sweep_enabled)
+            .field(
+                "health_sweep_interval_seconds",
+                &self.health_sweep_interval_seconds,
+            )
+            .field("health_sweep_batch", &self.health_sweep_batch)
+            .field("boot_check_mode", &self.boot_check_mode)
+            .field("boot_auto_repair_enabled", &self.boot_auto_repair_enabled)
             .field("log_level", &self.log_level)
             .field("tui_enabled", &self.tui_enabled)
             .finish_non_exhaustive()
@@ -1532,11 +1754,17 @@ impl Config {
         if let Some(v) = env_value("AM_CACHE_PROFILE") {
             config.cache_profile = CacheProfile::parse(&v);
             config.database_cache_budget_kb = config.cache_profile.database_cache_budget_kb();
+            config.read_cache_entries_per_category =
+                config.cache_profile.read_cache_entries_per_category();
         }
         config.database_cache_budget_kb = env_value("DATABASE_CACHE_BUDGET_KB")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(config.database_cache_budget_kb)
             .clamp(16_384, 4_194_304); // 16 MiB .. 4 GiB
+        config.read_cache_entries_per_category = env_value("AM_READ_CACHE_ENTRIES_PER_CATEGORY")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(config.read_cache_entries_per_category)
+            .clamp(1_024, 1_048_576);
         config.integrity_check_on_startup = env_bool(
             "INTEGRITY_CHECK_ON_STARTUP",
             config.integrity_check_on_startup,
@@ -1544,6 +1772,46 @@ impl Config {
         config.integrity_check_interval_hours = env_u64(
             "INTEGRITY_CHECK_INTERVAL_HOURS",
             config.integrity_check_interval_hours,
+        );
+
+        // Periodic SQLite maintenance knobs (bead K4). Each interval is in
+        // seconds; 0 disables that op (and `DB_MAINTENANCE_ENABLED=false`
+        // disables the whole maintenance cycle).
+        config.db_maintenance_enabled =
+            env_bool("DB_MAINTENANCE_ENABLED", config.db_maintenance_enabled);
+        config.db_checkpoint_interval_secs = env_u64(
+            "DB_CHECKPOINT_INTERVAL_SECS",
+            config.db_checkpoint_interval_secs,
+        );
+        config.db_analyze_interval_secs =
+            env_u64("DB_ANALYZE_INTERVAL_SECS", config.db_analyze_interval_secs);
+        config.db_vacuum_interval_secs =
+            env_u64("DB_VACUUM_INTERVAL_SECS", config.db_vacuum_interval_secs);
+        config.db_journal_size_limit_bytes = env_u64(
+            "DB_JOURNAL_SIZE_LIMIT_BYTES",
+            config.db_journal_size_limit_bytes,
+        );
+
+        // Doctor recovery-debris retention (br-mudrv). `*_KEEP_MIN` newest and
+        // anything younger than `*_MAX_AGE_SECS` are always retained;
+        // `DOCTOR_RETENTION_ENABLED=false` disables the background alert sweep.
+        config.doctor_retention_enabled =
+            env_bool("DOCTOR_RETENTION_ENABLED", config.doctor_retention_enabled);
+        config.doctor_retention_keep_min = env_u64(
+            "DOCTOR_RETENTION_KEEP_MIN",
+            config.doctor_retention_keep_min,
+        );
+        config.doctor_retention_max_age_secs = env_u64(
+            "DOCTOR_RETENTION_MAX_AGE_SECS",
+            config.doctor_retention_max_age_secs,
+        );
+        config.doctor_retention_alert_bytes = env_u64(
+            "DOCTOR_RETENTION_ALERT_BYTES",
+            config.doctor_retention_alert_bytes,
+        );
+        config.doctor_retention_sweep_interval_secs = env_u64(
+            "DOCTOR_RETENTION_SWEEP_INTERVAL_SECS",
+            config.doctor_retention_sweep_interval_secs,
         );
 
         // FrankenSQLite MVCC / RaptorQ
@@ -1632,6 +1900,54 @@ impl Config {
             }
             config.archive_maintenance_interval_secs =
                 raw.clamp(MIN_MAINTENANCE_INTERVAL_SECS, MAX_MAINTENANCE_INTERVAL_SECS);
+        }
+
+        // Periodic git health sweep
+        config.health_sweep_enabled =
+            env_bool("AM_HEALTH_SWEEP_ENABLED", config.health_sweep_enabled);
+        config.health_sweep_interval_seconds = env_u64(
+            "AM_HEALTH_SWEEP_INTERVAL_SEC",
+            config.health_sweep_interval_seconds,
+        )
+        .max(1);
+        config.health_sweep_batch =
+            env_usize("AM_HEALTH_SWEEP_BATCH", config.health_sweep_batch).max(1);
+
+        // Boot-time archive integrity check
+        if let Some(raw_mode) = env_value("AM_BOOT_CHECK_MODE") {
+            let normalized = raw_mode.trim().to_ascii_lowercase();
+            config.boot_check_mode = match normalized.as_str() {
+                "warn" | "abort" => normalized,
+                "auto_repair" => {
+                    if env_value("AM_BOOT_AUTO_REPAIR").as_deref()
+                        == Some(BOOT_AUTO_REPAIR_GATE_VALUE)
+                    {
+                        config.boot_auto_repair_enabled = true;
+                        normalized
+                    } else {
+                        tracing::error!(
+                            target: "mcp_agent_mail::boot_check",
+                            repo_slug = "config",
+                            caller = "Config::from_env",
+                            args_hash = "0000000000000000000000000000000000000000000000000000000000000000",
+                            duration_ms = 0_u64,
+                            outcome = "error",
+                            git_version = "n/a",
+                            mode = %normalized,
+                            "boot_check_auto_repair_gate_violated"
+                        );
+                        "warn".to_string()
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        target: "mcp_agent_mail::config",
+                        raw_mode = %raw_mode,
+                        "invalid_boot_check_mode_defaulting_to_warn"
+                    );
+                    "warn".to_string()
+                }
+            };
         }
 
         // Memory pressure monitoring
@@ -1778,6 +2094,11 @@ impl Config {
             config.http_cors_allow_headers = parse_csv(&v);
         }
 
+        // Extra HTTP Host header allow-list (additive; loopback-only default).
+        if let Some(v) = env_value("HTTP_ALLOWED_HOSTS") {
+            config.http_allowed_hosts = parse_csv(&v);
+        }
+
         // Contact & Messaging
         config.contact_enforcement_enabled = env_bool(
             "CONTACT_ENFORCEMENT_ENABLED",
@@ -1823,6 +2144,10 @@ impl Config {
         config.file_reservations_enforcement_enabled = env_bool(
             "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
             config.file_reservations_enforcement_enabled,
+        );
+        config.file_reservations_retention_days = env_u64(
+            "FILE_RESERVATIONS_RETENTION_DAYS",
+            config.file_reservations_retention_days,
         );
 
         // Ack TTL warnings
@@ -1980,6 +2305,28 @@ impl Config {
         if let Some(v) = env_value("TOOLS_FILTER_TOOLS") {
             config.tool_filter.tools = parse_csv(&v);
         }
+
+        // Registration proof gate (optional cryptographic gate; default off).
+        // When disabled these have zero effect; registration is unchanged.
+        config.proof_gate.enabled = env_bool(
+            "AM_REGISTRATION_PROOF_GATE_ENABLED",
+            config.proof_gate.enabled,
+        );
+        if let Some(v) = env_value("AM_REGISTRATION_PROOF_TRUSTED_KEYS") {
+            config.proof_gate.trusted_keys = parse_csv(&v);
+        }
+        config.proof_gate.max_lifetime_seconds = env_u64(
+            "AM_REGISTRATION_PROOF_MAX_LIFETIME_SECONDS",
+            config.proof_gate.max_lifetime_seconds,
+        );
+        config.proof_gate.clock_skew_seconds = env_u64(
+            "AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS",
+            config.proof_gate.clock_skew_seconds,
+        );
+        config.proof_gate.require_nonce = env_bool(
+            "AM_REGISTRATION_PROOF_REQUIRE_NONCE",
+            config.proof_gate.require_nonce,
+        );
 
         // TOON output format
         // Encoder binary: TOON_TRU_BIN > TOON_BIN > None (will use default "tru")
@@ -2192,8 +2539,38 @@ impl Config {
             config.tui_toast_error_dismiss_secs,
         )
         .max(1);
+        config.tui_git_segfault_toast_enabled = console_bool(
+            "AM_TUI_GIT_SEGFAULT_TOAST_ENABLED",
+            config.tui_git_segfault_toast_enabled,
+        );
         config.tui_coach_hints_enabled =
             console_bool("AM_TUI_COACH_HINTS_ENABLED", config.tui_coach_hints_enabled);
+
+        // TUI screen tick strategy. An unrecognized strategy string keeps the
+        // default ("predictive") — the conservative fallback the TUI applies.
+        if let Some(v) = console_value("AM_TUI_TICK_STRATEGY") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "predictive" | "uniform" | "adjacent" | "active_only"
+            ) {
+                config.tui_tick_strategy = lower;
+            }
+        }
+        config.tui_tick_divisor =
+            console_u64("AM_TUI_TICK_DIVISOR", config.tui_tick_divisor).max(1);
+        config.tui_tick_persist = console_bool("AM_TUI_TICK_PERSIST", config.tui_tick_persist);
+        config.tui_tick_min_observations = console_u64(
+            "AM_TUI_TICK_MIN_OBSERVATIONS",
+            config.tui_tick_min_observations,
+        )
+        .max(1);
+        if let Some(v) = console_value("AM_TUI_TICK_DECAY_FACTOR")
+            && let Ok(parsed) = v.trim().parse::<f64>()
+            && (0.0..=1.0).contains(&parsed)
+        {
+            config.tui_tick_decay_factor = parsed;
+        }
 
         // ATC (Air Traffic Controller) configuration
         config.atc_enabled = console_bool("AM_ATC_ENABLED", config.atc_enabled);
@@ -2252,8 +2629,26 @@ impl Config {
             config.atc_write_mode = AtcWriteMode::from_str_lossy(&v);
         }
         if console_bool("ATC_LEARNING_DISABLED", false) {
+            // ATC_LEARNING_DISABLED is the documented kill switch, so it must
+            // fully disable the learning subsystem — NOT merely flip the write
+            // mode. Durable ATC experience writes (the atc_experiences ledger)
+            // are driven by the operator loop, which is gated by `atc_enabled`
+            // and AM_ATC_EXECUTOR_MODE (default Live) — NOT by atc_write_mode.
+            // Setting only the write mode silently leaves the Live operator
+            // churning the ledger, whose index corrupts under sustained load.
+            // Force the master gate off so the documented switch truly stops it.
             config.atc_write_mode = AtcWriteMode::Off;
+            config.atc_enabled = false;
         }
+        config.atc_experience_max_rows = i64::try_from(console_u64(
+            "AM_ATC_EXPERIENCE_MAX_ROWS",
+            u64::try_from(config.atc_experience_max_rows).unwrap_or(0),
+        ))
+        .unwrap_or(config.atc_experience_max_rows);
+        config.atc_retention_sweep_interval_secs = console_u64(
+            "AM_ATC_RETENTION_SWEEP_INTERVAL_SECS",
+            config.atc_retention_sweep_interval_secs,
+        );
 
         // WBQ tuning
         config.wbq_channel_capacity =
@@ -2342,6 +2737,19 @@ impl Config {
     #[must_use]
     pub fn is_production(&self) -> bool {
         self.app_environment == AppEnvironment::Production
+    }
+
+    /// Canonical tick-strategy label for diagnostics surfaces (`am robot
+    /// health`, tracing). Mirrors the strategy the TUI actually constructs:
+    /// unknown strings resolve to `Predictive`, the conservative fallback.
+    #[must_use]
+    pub fn resolved_tick_strategy_label(&self) -> &'static str {
+        match self.tui_tick_strategy.as_str() {
+            "active_only" => "ActiveOnly",
+            "uniform" => "Uniform",
+            "adjacent" => "ActivePlusAdjacent",
+            _ => "Predictive",
+        }
     }
 
     /// Determine if a tool should be exposed based on tool filter settings.
@@ -2584,18 +2992,22 @@ pub fn mask_secret(value: &str) -> String {
 /// Handles standard URL formats like `postgres://user:pass@host/db` and
 /// `SQLite` paths like `sqlite:///path/to/db.sqlite3`.
 fn redact_db_url(url: &str) -> String {
-    // If it contains `://` with a `@`, there may be embedded credentials.
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = &url[scheme_end + 3..];
-        if let Some(at_pos) = after_scheme.find('@') {
-            // Everything between `://` and `@` is userinfo — redact it.
-            let before = &url[..scheme_end + 3];
-            let after = &after_scheme[at_pos..];
-            return format!("{before}****{after}");
-        }
-    }
-    // No credentials detected; return as-is.
-    url.to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+    let authority = &url[authority_start..authority_end];
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}****{}",
+        &url[..authority_start],
+        &url[authority_start + at_pos..]
+    )
 }
 
 /// Detect which config source tier provided a given key.
@@ -3113,8 +3525,12 @@ fn env_bool(key: &str, default: bool) -> bool {
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    // Trim before parsing so a process-env value carrying surrounding
+    // whitespace or a trailing CR (e.g. sourced from a CRLF file) is honored
+    // rather than silently reverting to the default — matching env_bool /
+    // env_u64_opt, which already trim.
     env_value(key)
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
 
@@ -3181,7 +3597,7 @@ fn normalize_tool_filter_mode(value: &str) -> String {
 
 fn env_f64(key: &str, default: f64) -> f64 {
     env_value(key)
-        .and_then(|v| v.parse::<f64>().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|f| f.is_finite())
         .unwrap_or(default)
 }
@@ -3243,6 +3659,7 @@ mod tests {
         assert!(config.database_pool_timeout.is_none());
         assert_eq!(config.cache_profile, CacheProfile::Balanced);
         assert_eq!(config.database_cache_budget_kb, 512 * 1024);
+        assert_eq!(config.read_cache_entries_per_category, 16_384);
         assert_eq!(
             config.database_url,
             "sqlite+aiosqlite:///./storage.sqlite3".to_string()
@@ -3250,6 +3667,21 @@ mod tests {
         assert!(config.contact_enforcement_enabled);
         assert!(!config.allow_absolute_attachment_paths);
         assert!(!config.allow_ephemeral_projects_in_default_storage);
+    }
+
+    #[test]
+    fn env_parse_trims_surrounding_whitespace() {
+        // A process-env value carrying surrounding whitespace or a trailing CR
+        // (e.g. sourced from a CRLF file) must still be honored — matching
+        // env_bool / env_u64_opt — instead of silently reverting to the default.
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_TEST_TRIM_U64", " 256 "),
+            ("AM_TEST_TRIM_U32", "512\r"),
+            ("AM_TEST_TRIM_F64", "  1.5\n"),
+        ]);
+        assert_eq!(env_u64("AM_TEST_TRIM_U64", 7), 256);
+        assert_eq!(env_u32("AM_TEST_TRIM_U32", 7), 512);
+        assert_f64_eq(env_f64("AM_TEST_TRIM_F64", 9.0), 1.5);
     }
 
     #[test]
@@ -3269,6 +3701,7 @@ mod tests {
         let config = Config::from_env();
         assert_eq!(config.cache_profile, CacheProfile::HighMemory);
         assert_eq!(config.database_cache_budget_kb, 2 * 1024 * 1024);
+        assert_eq!(config.read_cache_entries_per_category, 131_072);
     }
 
     #[test]
@@ -3293,6 +3726,27 @@ mod tests {
     }
 
     #[test]
+    fn test_read_cache_entry_budget_overrides_profile_and_clamps() {
+        let env_guard = TestEnvOverrideGuard::set(&[
+            ("AM_CACHE_PROFILE", "high-memory"),
+            ("AM_READ_CACHE_ENTRIES_PER_CATEGORY", "999999999"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.cache_profile, CacheProfile::HighMemory);
+        assert_eq!(config.read_cache_entries_per_category, 1_048_576);
+
+        drop(env_guard);
+
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_CACHE_PROFILE", "conservative"),
+            ("AM_READ_CACHE_ENTRIES_PER_CATEGORY", "1"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.cache_profile, CacheProfile::Conservative);
+        assert_eq!(config.read_cache_entries_per_category, 1_024);
+    }
+
+    #[test]
     fn test_tool_call_logging_config_defaults() {
         let config = Config::default();
         assert!(config.log_tool_calls_enabled);
@@ -3309,6 +3763,39 @@ mod tests {
         let config = Config::from_env();
         assert!(!config.log_tool_calls_enabled);
         assert_eq!(config.log_tool_calls_result_max_chars, 1234);
+    }
+
+    #[test]
+    fn test_proof_gate_config_defaults() {
+        let config = Config::default();
+        // Off by default => self-asserted registration is unchanged.
+        assert!(!config.proof_gate.enabled);
+        assert!(config.proof_gate.trusted_keys.is_empty());
+        assert_eq!(config.proof_gate.max_lifetime_seconds, 300);
+        assert_eq!(config.proof_gate.clock_skew_seconds, 60);
+        assert!(config.proof_gate.require_nonce);
+    }
+
+    #[test]
+    fn test_proof_gate_config_from_env() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_REGISTRATION_PROOF_GATE_ENABLED", "true"),
+            (
+                "AM_REGISTRATION_PROOF_TRUSTED_KEYS",
+                " aaaa , bbbb ,, cccc ",
+            ),
+            ("AM_REGISTRATION_PROOF_MAX_LIFETIME_SECONDS", "900"),
+            ("AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS", "30"),
+            ("AM_REGISTRATION_PROOF_REQUIRE_NONCE", "false"),
+        ]);
+
+        let config = Config::from_env();
+        assert!(config.proof_gate.enabled);
+        // parse_csv trims and drops empties.
+        assert_eq!(config.proof_gate.trusted_keys, vec!["aaaa", "bbbb", "cccc"]);
+        assert_eq!(config.proof_gate.max_lifetime_seconds, 900);
+        assert_eq!(config.proof_gate.clock_skew_seconds, 30);
+        assert!(!config.proof_gate.require_nonce);
     }
 
     #[test]
@@ -3337,6 +3824,80 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("AM_ARCHIVE_MAINTENANCE_DISABLED", "1")]);
         let config = Config::from_env();
         assert!(!config.archive_maintenance_enabled);
+    }
+
+    #[test]
+    fn test_health_sweep_config_defaults() {
+        let config = Config::default();
+        assert!(config.health_sweep_enabled);
+        assert_eq!(config.health_sweep_interval_seconds, 900);
+        assert_eq!(config.health_sweep_batch, 5);
+        assert_eq!(config.boot_check_mode, "warn");
+        assert!(!config.boot_auto_repair_enabled);
+    }
+
+    #[test]
+    fn test_health_sweep_config_from_env() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_HEALTH_SWEEP_ENABLED", "false"),
+            ("AM_HEALTH_SWEEP_INTERVAL_SEC", "60"),
+            ("AM_HEALTH_SWEEP_BATCH", "12"),
+        ]);
+
+        let config = Config::from_env();
+        assert!(!config.health_sweep_enabled);
+        assert_eq!(config.health_sweep_interval_seconds, 60);
+        assert_eq!(config.health_sweep_batch, 12);
+    }
+
+    #[test]
+    fn test_health_sweep_interval_invalid_env_falls_back_to_default() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_HEALTH_SWEEP_INTERVAL_SEC", "garbage")]);
+        let config = Config::from_env();
+        assert_eq!(config.health_sweep_interval_seconds, 900);
+    }
+
+    #[test]
+    fn test_health_sweep_batch_floor_is_one() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_HEALTH_SWEEP_BATCH", "0")]);
+        let config = Config::from_env();
+        assert_eq!(config.health_sweep_batch, 1);
+    }
+
+    #[test]
+    fn test_boot_check_mode_env_abort() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_BOOT_CHECK_MODE", "abort")]);
+
+        let config = Config::from_env();
+
+        assert_eq!(config.boot_check_mode, "abort");
+        assert!(!config.boot_auto_repair_enabled);
+    }
+
+    #[test]
+    fn test_boot_check_auto_repair_requires_literal_gate() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_BOOT_CHECK_MODE", "auto_repair"),
+            ("AM_BOOT_AUTO_REPAIR", "true"),
+        ]);
+
+        let config = Config::from_env();
+
+        assert_eq!(config.boot_check_mode, "warn");
+        assert!(!config.boot_auto_repair_enabled);
+    }
+
+    #[test]
+    fn test_boot_check_auto_repair_accepts_literal_gate() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_BOOT_CHECK_MODE", "auto_repair"),
+            ("AM_BOOT_AUTO_REPAIR", BOOT_AUTO_REPAIR_GATE_VALUE),
+        ]);
+
+        let config = Config::from_env();
+
+        assert_eq!(config.boot_check_mode, "auto_repair");
+        assert!(config.boot_auto_repair_enabled);
     }
 
     #[test]
@@ -3430,6 +3991,33 @@ mod tests {
     }
 
     #[test]
+    fn test_config_get_bypasses_stale_cache_when_process_override_active() {
+        Config::reset_cached();
+        {
+            let stale = Config {
+                atc_write_mode: AtcWriteMode::Off,
+                ..Config::default()
+            };
+            let mut guard = CONFIG_CACHE
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(stale);
+        }
+
+        with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("ATC_LEARNING_DISABLED", "0"),
+            ],
+            || {
+                assert!(Config::get().atc_write_mode.is_live());
+            },
+        );
+
+        Config::reset_cached();
+    }
+
+    #[test]
     fn test_atc_learning_disabled_overrides_write_mode() {
         let _env = TestEnvOverrideGuard::set(&[
             ("AM_ATC_WRITE_MODE", "live"),
@@ -3439,6 +4027,12 @@ mod tests {
         assert!(
             config.atc_write_mode.is_off(),
             "ATC_LEARNING_DISABLED=1 must force write mode to off even when AM_ATC_WRITE_MODE=live"
+        );
+        assert!(
+            !config.atc_enabled,
+            "ATC_LEARNING_DISABLED=1 must fully disable ATC (atc_enabled=false), not just the \
+             write mode — otherwise the Live operator keeps writing the experience ledger and \
+             corrupts its index"
         );
     }
 
@@ -3758,6 +4352,26 @@ mod tests {
     }
 
     #[test]
+    fn default_rbac_readonly_tools_exclude_state_mutating_inbox_fetch() {
+        let config = Config::default();
+
+        assert!(
+            !config
+                .http_rbac_readonly_tools
+                .iter()
+                .any(|tool| tool == "fetch_inbox"),
+            "fetch_inbox records read state and must require a writer role"
+        );
+        assert!(
+            config
+                .http_rbac_readonly_tools
+                .iter()
+                .any(|tool| tool == "fetch_inbox_product"),
+            "fetch_inbox_product is non-mutating and should remain reader-accessible"
+        );
+    }
+
+    #[test]
     fn full_profile_exposes_all() {
         let config = make_filter(true, "full");
         assert!(config.should_expose_tool("send_message", "messaging"));
@@ -3952,6 +4566,27 @@ mod tests {
     }
 
     #[test]
+    fn http_allowed_hosts_default_is_empty() {
+        // #146: loopback-only by default — no extra Host headers are accepted
+        // unless explicitly opted in.
+        let config = Config::default();
+        assert!(config.http_allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn http_allowed_hosts_parsed_from_env_csv() {
+        // #146: HTTP_ALLOWED_HOSTS is comma-separated, trimmed, empties skipped —
+        // mirroring the HTTP_RBAC_READER_ROLES / HTTP_CORS_ORIGINS idiom.
+        let _env =
+            TestEnvOverrideGuard::set(&[("HTTP_ALLOWED_HOSTS", " mail.internal , 10.0.0.5 ,,")]);
+        let config = Config::from_env();
+        assert_eq!(
+            config.http_allowed_hosts,
+            vec!["mail.internal".to_string(), "10.0.0.5".to_string()]
+        );
+    }
+
+    #[test]
     fn tui_toast_defaults() {
         let config = Config::default();
         assert!(config.tui_toast_enabled);
@@ -3961,6 +4596,7 @@ mod tests {
         assert_eq!(config.tui_toast_info_dismiss_secs, 5);
         assert_eq!(config.tui_toast_warn_dismiss_secs, 8);
         assert_eq!(config.tui_toast_error_dismiss_secs, 15);
+        assert!(config.tui_git_segfault_toast_enabled);
     }
 
     #[test]
@@ -3973,6 +4609,7 @@ mod tests {
             ("AM_TUI_TOAST_INFO_DISMISS_SECS", "7"),
             ("AM_TUI_TOAST_WARN_DISMISS_SECS", "11"),
             ("AM_TUI_TOAST_ERROR_DISMISS_SECS", "19"),
+            ("AM_TUI_GIT_SEGFAULT_TOAST_ENABLED", "false"),
         ]);
         let config = Config::from_env();
         assert!(!config.tui_toast_enabled);
@@ -3982,6 +4619,7 @@ mod tests {
         assert_eq!(config.tui_toast_info_dismiss_secs, 7);
         assert_eq!(config.tui_toast_warn_dismiss_secs, 11);
         assert_eq!(config.tui_toast_error_dismiss_secs, 19);
+        assert!(!config.tui_git_segfault_toast_enabled);
     }
 
     #[test]
@@ -4652,6 +5290,10 @@ mod tests {
             redact_db_url("postgres://admin:s3cret@host:5432/mydb?sslmode=require"),
             "postgres://****@host:5432/mydb?sslmode=require"
         );
+        assert_eq!(
+            redact_db_url("postgres://user:p@ss@localhost/db"),
+            "postgres://****@localhost/db"
+        );
     }
 
     #[test]
@@ -4659,6 +5301,14 @@ mod tests {
         assert_eq!(
             redact_db_url("sqlite:///path/to/db.sqlite3"),
             "sqlite:///path/to/db.sqlite3"
+        );
+        assert_eq!(
+            redact_db_url("sqlite:///tmp/mail@box.sqlite3"),
+            "sqlite:///tmp/mail@box.sqlite3"
+        );
+        assert_eq!(
+            redact_db_url("sqlite+aiosqlite:///tmp/mail@box.sqlite3?mode=rwc"),
+            "sqlite+aiosqlite:///tmp/mail@box.sqlite3?mode=rwc"
         );
         assert_eq!(redact_db_url("sqlite:///:memory:"), "sqlite:///:memory:");
     }
@@ -5214,6 +5864,38 @@ mod tests {
                 "deny mode must prevent reroute for {path}"
             );
         }
+    }
+
+    #[test]
+    fn default_tick_strategy_config_is_predictive_with_tuned_cadence() {
+        let config = Config::default();
+        assert_eq!(
+            config.tui_tick_strategy, "predictive",
+            "default tick strategy must be predictive"
+        );
+        assert_eq!(
+            config.tui_tick_divisor, 12,
+            "fallback divisor must match the tuned inactive-screen cadence"
+        );
+        assert!(config.tui_tick_persist, "persistence defaults on");
+        assert_eq!(config.tui_tick_min_observations, 20);
+        assert!((config.tui_tick_decay_factor - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolved_tick_strategy_label_maps_every_strategy_string() {
+        let mut config = Config::default();
+        assert_eq!(config.resolved_tick_strategy_label(), "Predictive");
+        config.tui_tick_strategy = "uniform".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "Uniform");
+        config.tui_tick_strategy = "adjacent".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "ActivePlusAdjacent");
+        config.tui_tick_strategy = "active_only".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "ActiveOnly");
+        // Unknown strings resolve to the conservative fallback rather than
+        // failing: the TUI must always have a working strategy.
+        config.tui_tick_strategy = "warp_speed".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "Predictive");
     }
 
     #[test]

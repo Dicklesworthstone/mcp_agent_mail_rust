@@ -274,7 +274,7 @@ fn validate_agents_md(doc: &str, counts: LiveCounts) -> Result<(), String> {
             ClaimPattern {
                 label: "AGENTS conformance category resource count",
                 regex: compile(
-                    r"34 Python-parity tools \+ 3 Rust-native, (?P<count>\d+) resources",
+                    r"34 Python-parity tools \+ 4 Rust-native, (?P<count>\d+) resources",
                 ),
                 expected: counts.resources,
                 source_of_truth: "mcp_agent_mail_server::build_server(...).into_router() resource/template inventory",

@@ -184,6 +184,23 @@ fn is_url_drive_letter_prefix(path: &str) -> bool {
 /// Return `true` when the database URL points to an in-memory `SQLite` database.
 #[must_use]
 pub fn is_sqlite_memory_database_url(database_url: &str) -> bool {
+    let url = database_url.trim();
+    let Some(stripped) = url
+        .strip_prefix("sqlite+aiosqlite://")
+        .or_else(|| url.strip_prefix("sqlite://"))
+    else {
+        return false;
+    };
+    if stripped.starts_with("file:")
+        && stripped.split_once('?').is_some_and(|(_, query)| {
+            query
+                .split('&')
+                .any(|part| part.eq_ignore_ascii_case("mode=memory"))
+        })
+    {
+        return true;
+    }
+
     matches!(
         sqlite_path_component(database_url),
         Some("/:memory:" | ":memory:")
@@ -211,8 +228,12 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     // - relative/path.db   -> relative/path.db
     let mut path = stripped.to_string();
     if path.starts_with("//") {
-        // Absolute path (sqlite:////abs/path.db).
-        path.remove(0);
+        // Absolute path (sqlite:////abs/path.db). Also tolerate accidental
+        // extra URL slashes (sqlite://///tmp/db.sqlite3) by reducing the
+        // filesystem root to exactly one slash.
+        while path.starts_with("//") {
+            path.remove(0);
+        }
     } else if path.starts_with("/./") || path.starts_with("/../") {
         // Explicitly relative path (sqlite:///./path.db or sqlite:///../path.db).
         path.remove(0);
@@ -443,6 +464,12 @@ mod tests {
             "/abs/path.db"
         );
         assert_eq!(
+            sqlite_file_path_from_database_url("sqlite://///tmp/db.sqlite3")
+                .unwrap()
+                .to_string_lossy(),
+            "/tmp/db.sqlite3"
+        );
+        assert_eq!(
             sqlite_file_path_from_database_url("sqlite:////abs/path.db?cache=shared")
                 .unwrap()
                 .to_string_lossy(),
@@ -451,9 +478,16 @@ mod tests {
         assert!(sqlite_file_path_from_database_url("sqlite3:///storage.sqlite3").is_none());
         assert!(sqlite_file_path_from_database_url("sqlite:///:memory:").is_none());
         assert!(sqlite_file_path_from_database_url("sqlite:///:memory:?cache=shared").is_none());
+        assert!(
+            sqlite_file_path_from_database_url("sqlite://file:memdb1?mode=memory&cache=shared")
+                .is_none()
+        );
         assert!(is_sqlite_memory_database_url("sqlite:///:memory:"));
         assert!(is_sqlite_memory_database_url(
             "sqlite:///:memory:?cache=shared"
+        ));
+        assert!(is_sqlite_memory_database_url(
+            "sqlite://file:memdb1?mode=memory&cache=shared"
         ));
         assert!(sqlite_file_path_from_database_url("postgres://localhost/db").is_none());
         assert!(!is_sqlite_memory_database_url("postgres://localhost/db"));

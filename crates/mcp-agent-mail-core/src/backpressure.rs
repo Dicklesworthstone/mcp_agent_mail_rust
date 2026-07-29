@@ -525,12 +525,17 @@ const fn duration_since_s(since_us: u64, now_us: u64) -> u64 {
 
 /// Compute a percentage, clamped to 100.
 #[inline]
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    reason = "const fn cannot use From/TryFrom; the result is clamped before narrowing"
+)]
 const fn pct(value: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
     }
-    let p = value.saturating_mul(100).saturating_div(total);
-    if p > 100 { 100 } else { p }
+    let p = ((value as u128) * 100).saturating_div(total as u128);
+    if p > 100 { 100 } else { p as u64 }
 }
 
 /// Resource pressure samples older than three monitor intervals are ignored.
@@ -875,6 +880,7 @@ mod tests {
         assert_eq!(pct(50, 100), 50);
         assert_eq!(pct(100, 100), 100);
         assert_eq!(pct(200, 100), 100); // clamped
+        assert_eq!(pct(u64::MAX, u64::MAX), 100);
     }
 
     #[test]
@@ -940,6 +946,8 @@ mod tests {
                 pool_utilization_pct: 0,
                 pool_over_80_since_us: 0,
                 integrity_failures_total: 0,
+                bespoke_parser_only_rejections_total: 0,
+                ..DbMetricsSnapshot::default()
             },
             storage: StorageMetricsSnapshot {
                 wbq_enqueued_total: 0,
@@ -959,6 +967,14 @@ mod tests {
                     p95: 0,
                     p99: 0,
                 },
+                wbq_last_unrecoverable_error_us: 0,
+                wbq_unrecoverable_errors_total: 0,
+                wbq_respawn_salvaged_total: 0,
+                wbq_respawn_lost_total: 0,
+                archive_direct_writes_total: 0,
+                archive_direct_write_errors_total: 0,
+                archive_direct_write_latency_us: HistogramSnapshot::default(),
+                archive_direct_skips_disk_critical_total: 0,
                 commit_enqueued_total: 0,
                 commit_drained_total: 0,
                 commit_errors_total: 0,
@@ -1032,6 +1048,7 @@ mod tests {
             search: SearchMetricsSnapshot::default(),
             atc: AtcMetricsSnapshot::default(),
             canary: CanaryMetricsSnapshot::default(),
+            corruption: CorruptionMetricsSnapshot::default(),
         };
 
         let signals = HealthSignals::from_snapshot(&snap, 1_000_000_000);

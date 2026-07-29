@@ -10,8 +10,10 @@ use std::path::Path;
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
-use asupersync::{Budget, Cx};
+use asupersync::Cx;
+use asupersync::time::wall_now;
 // Tests run outside the HTTP server's async runtime, so `fastmcp_core::block_on`
 // is safe there. Production code uses `spin_block_on` instead (see below).
 #[cfg(test)]
@@ -26,6 +28,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::markdown;
 use crate::templates;
+
+/// Mail UI request budget helper.
+///
+/// `asupersync::Budget` deadlines are absolute timestamps in asupersync's
+/// process-relative clock. Request handlers need a fresh relative deadline for
+/// every request, so keep the conversion at this boundary.
+struct Budget;
+
+impl Budget {
+    fn with_deadline_secs(secs: u64) -> asupersync::Budget {
+        let deadline = wall_now() + Duration::from_secs(secs);
+        asupersync::Budget::new().with_deadline(deadline)
+    }
+}
 
 /// Dispatch a mail UI request to the correct handler.
 ///
@@ -44,12 +60,25 @@ pub fn dispatch(
     // Cx::for_testing() was previously used here, which provides no
     // timeout enforcement and could let slow queries block indefinitely.
     let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
-    let read_pool_owner = if method == "GET" {
+    // GH#184: when this dispatch runs inside a live server process, the
+    // server's pool for this database is already open — reuse it for BOTH
+    // reads and writes instead of bootstrapping a fresh observability pool
+    // per GET request. A second in-process `DbPool::new` on the live file
+    // re-runs the entire startup init (integrity probes, WAL checkpoint,
+    // recovery) and can block outright against the live pool's engine-level
+    // coordination — exactly the wedge that took the whole HTTP surface
+    // down. The observability read pool (with its archive-snapshot fallback)
+    // remains the GET path when no live pool exists in this process
+    // (CLI/static-export contexts and tests).
+    let cached_live_owner = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env());
+    let read_pool_owner = if method == "GET" && cached_live_owner.is_none() {
         open_mail_ui_read_pool()?
     } else {
         None
     };
-    let live_pool_owner = if method == "GET" && read_pool_owner.is_some() {
+    let live_pool_owner = if cached_live_owner.is_some() {
+        cached_live_owner
+    } else if method == "GET" && read_pool_owner.is_some() {
         None
     } else {
         Some(get_pool()?)
@@ -122,6 +151,22 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
         ..DbPoolConfig::default()
     };
     get_or_create_pool(&cfg).expect("test pool should initialize")
+}
+
+#[cfg(test)]
+mod request_budget_tests {
+    use super::*;
+
+    #[test]
+    fn mail_ui_request_budget_deadline_is_relative_to_now() {
+        let budget = Budget::with_deadline_secs(30);
+        let now = wall_now();
+
+        assert!(
+            !budget.is_past_deadline(now),
+            "mail UI request deadlines must be relative to the current asupersync clock"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -424,6 +469,100 @@ first body
         });
     }
 
+    /// Regression for #157: the static-export / live file_reservations page must
+    /// distinguish Released, Expired and Active leases — it previously labeled
+    /// every unreleased row "Active" (ignoring `expires_ts`) and counted every
+    /// row, including released ones, in the "N active reservations" headline.
+    #[test]
+    fn file_reservations_page_labels_released_expired_and_active_distinctly() {
+        let project = ProjectView {
+            id: 1,
+            slug: "demo".to_string(),
+            human_key: "Demo".to_string(),
+            created_at: String::new(),
+        };
+        let now = now_micros();
+        let hour = 3_600_000_000_i64;
+
+        let mk = |id: i64, expires_ts: i64, released_ts: Option<i64>| {
+            let status = if released_ts.is_some_and(|ts| ts > 0) {
+                "Released"
+            } else if expires_ts <= now {
+                "Expired"
+            } else {
+                "Active"
+            };
+            ReservationView {
+                id,
+                agent: format!("agent{id}"),
+                path_pattern: format!("src/file{id}.rs"),
+                exclusive: true,
+                reason: String::new(),
+                created: ts_display(now - hour),
+                expires: ts_display(expires_ts),
+                released: ts_display_opt(released_ts),
+                status,
+            }
+        };
+
+        // 1 active (future expiry, unreleased), 1 expired (past expiry,
+        // unreleased), 1 released — only the first is genuinely "active".
+        let reservations = vec![
+            mk(1, now + hour, None),
+            mk(2, now - hour, None),
+            mk(3, now + hour, Some(now - hour)),
+        ];
+        let active_count = reservations.iter().filter(|r| r.status == "Active").count();
+        assert_eq!(active_count, 1, "exactly one lease should be active");
+
+        let html = render(
+            "mail_file_reservations.html",
+            FileReservationsCtx {
+                project,
+                file_reservations: reservations,
+                active_count,
+            },
+        )
+        .expect("render should succeed")
+        .expect("render should return html");
+
+        // Headline reflects the live count (1), not the total row count (3).
+        assert!(
+            html.contains(">1</span> active"),
+            "headline should show 1 active, got: {html}"
+        );
+        assert!(
+            html.contains("of 3 total"),
+            "headline should show total of 3, got: {html}"
+        );
+        // Scope badge assertions to the reservations <tbody> so unrelated
+        // chrome icons in the base layout can't skew the counts.
+        let tbody = html
+            .split("<tbody")
+            .nth(1)
+            .and_then(|s| s.split("</tbody>").next())
+            .expect("rendered page should contain a reservations tbody");
+        // Each lifecycle badge renders exactly once. The badge icons are
+        // unambiguous (the literal words also appear in the column tooltip):
+        // clock = Active, timer-off = Expired, check-circle = Released. Exactly
+        // one of each proves the expired-unreleased row is no longer "Active".
+        assert_eq!(
+            tbody.matches("data-lucide=\"clock\"").count(),
+            1,
+            "exactly one Active badge expected in tbody: {tbody}"
+        );
+        assert_eq!(
+            tbody.matches("data-lucide=\"timer-off\"").count(),
+            1,
+            "exactly one Expired badge expected in tbody: {tbody}"
+        );
+        assert_eq!(
+            tbody.matches("data-lucide=\"check-circle\"").count(),
+            1,
+            "exactly one Released badge expected in tbody: {tbody}"
+        );
+    }
+
     #[test]
     fn archive_time_travel_snapshot_uses_archive_without_registered_project() {
         let dir = tempdir().expect("tempdir");
@@ -456,15 +595,24 @@ first body
             .expect("tmpdir override utf-8")
             .to_string();
 
-        with_mail_ui_env(&storage_root, &db_path, || {
-            let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[("TMPDIR", tmpdir.as_str())],
-                || dispatch("/mail/ahead-project", "", "GET", ""),
-            )
-            .expect_err("dispatch should fail closed when archive snapshot setup fails");
-            assert_eq!(err.0, 500);
-            assert!(err.1.contains("Mail UI read pool unavailable"), "{}", err.1);
-        });
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("mail ui storage root utf-8")
+            .to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+                ("TMPDIR", tmpdir.as_str()),
+            ],
+            || {
+                let err = dispatch("/mail/ahead-project", "", "GET", "")
+                    .expect_err("dispatch should fail closed when archive snapshot setup fails");
+                assert_eq!(err.0, 500);
+                assert!(err.1.contains("Mail UI read pool unavailable"), "{}", err.1);
+            },
+        );
     }
 
     #[test]
@@ -1118,6 +1266,18 @@ first body
                 "window.agentMailAppendAuth(`/mail/${request.projectSlug}/inbox/${encodeURIComponent(request.agentName)}/mark-read`)"
             ),
             "{html}"
+        );
+        // Regression for #129: the helpers must be DEFINED (in base.html), not merely
+        // referenced. The previous tests only asserted call sites, which passed even
+        // though `window.agentMailAppendAuth`/`agentMailNavigate` were undefined,
+        // leaving every `:href` binding inert.
+        assert!(
+            html.contains("window.agentMailAppendAuth = function"),
+            "base.html must DEFINE window.agentMailAppendAuth, not just reference it: {html}"
+        );
+        assert!(
+            html.contains("window.agentMailNavigate = function"),
+            "base.html must DEFINE window.agentMailNavigate, not just reference it: {html}"
         );
     }
 }
@@ -3870,8 +4030,7 @@ fn load_recipes() -> Vec<RecipeView> {
     let Some(conn) = crate::open_live_metadata_sync_db_connection(&config.database_url) else {
         return Vec::new();
     };
-    // Wrap in DbConnGuard so close_sync() runs at scope exit; otherwise every
-    // /mail recipe load drops a FrankenConnection, emitting drop_close WARN.
+    // Wrap in DbConnGuard so the live metadata connection closes at scope exit.
     let conn = mcp_agent_mail_db::guard_db_conn(conn, "mail_ui::load_recipes");
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();
     recipes
@@ -3929,6 +4088,9 @@ fn truncate_body(body: &str, max: usize) -> String {
 struct FileReservationsCtx {
     project: ProjectView,
     file_reservations: Vec<ReservationView>,
+    /// Count of reservations that are still live (not released and not expired)
+    /// at render time. The total row count is `file_reservations|length`.
+    active_count: usize,
 }
 
 #[derive(Serialize)]
@@ -3941,6 +4103,11 @@ struct ReservationView {
     created: String,
     expires: String,
     released: String,
+    /// Three-state lifecycle label: "Released" (released_ts set), "Expired"
+    /// (unreleased but past expires_ts at render time), or "Active". Computed in
+    /// Rust because the template has no clock — for the static export this is
+    /// evaluated against the generation-time `now`, matching the live route.
+    status: &'static str,
 }
 
 fn render_file_reservations(
@@ -3958,10 +4125,25 @@ fn render_file_reservations(
         Vec::new()
     };
 
+    // Evaluate expiry once against a single generation-time clock so the
+    // headline count and every per-row badge agree. For the live HTTP route
+    // this is "now"; for `am share static-export` the route is rendered at
+    // export time, so this is effectively `manifest.generated_at`.
+    let now = now_micros();
     let mut reservations = Vec::with_capacity(rows.len());
+    let mut active_count = 0usize;
     for r in &rows {
         let agent = block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, r.agent_id))
             .map_or_else(|_| format!("agent#{}", r.agent_id), |a| a.name);
+        // Three-state lifecycle: Released > Expired > Active.
+        let status = if r.released_ts.is_some_and(|ts| ts > 0) {
+            "Released"
+        } else if r.expires_ts <= now {
+            "Expired"
+        } else {
+            active_count += 1;
+            "Active"
+        };
         reservations.push(ReservationView {
             id: r.id.unwrap_or(0),
             agent,
@@ -3971,6 +4153,7 @@ fn render_file_reservations(
             created: ts_display(r.created_ts),
             expires: ts_display(r.expires_ts),
             released: ts_display_opt(r.released_ts),
+            status,
         });
     }
 
@@ -3979,6 +4162,7 @@ fn render_file_reservations(
         FileReservationsCtx {
             project,
             file_reservations: reservations,
+            active_count,
         },
     )
 }
@@ -5036,17 +5220,47 @@ const OVERSEER_PREAMBLE: &str = "---\n\n\
     The human's guidance supersedes all other priorities.\n\n\
     ---\n\n";
 
+const OVERSEER_SEND_INTENT: &str = "human_overseer_send";
+const OVERSEER_REASON_MAX_CHARS: usize = 500;
+const OVERSEER_MAX_RECIPIENTS: usize = 100;
+
 #[derive(Debug)]
 struct OverseerPayload {
     recipients: Vec<String>,
     subject: String,
     body_md: String,
     thread_id: Option<String>,
+    reason: String,
 }
 
 fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
     let payload: serde_json::Value =
         serde_json::from_str(body).map_err(|e| (400, format!("Invalid JSON: {e}")))?;
+
+    let err = |msg: &str| -> (u16, String) {
+        match encode_json_error_body("error", msg) {
+            Ok(body) => (400, body),
+            Err(error) => error,
+        }
+    };
+
+    let intent = payload
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if intent != OVERSEER_SEND_INTENT {
+        return Err(err("Missing or invalid overseer send intent"));
+    }
+    if payload
+        .get("broadcast")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(err(
+            "Broadcast delivery is intentionally unsupported; choose explicit recipients",
+        ));
+    }
 
     let recipients: Vec<String> = payload
         .get("recipients")
@@ -5077,6 +5291,16 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
         .unwrap_or("")
         .trim()
         .to_string();
+    let reason = payload
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let confirm_multiple = payload
+        .get("confirm_multiple")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let thread_id = payload
         .get("thread_id")
         .and_then(|v| v.as_str())
@@ -5084,18 +5308,14 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
         .filter(|value| !value.is_empty())
         .map(String::from);
 
-    // Validation (Python parity).
-    let err = |msg: &str| -> (u16, String) {
-        match encode_json_error_body("error", msg) {
-            Ok(body) => (400, body),
-            Err(error) => error,
-        }
-    };
     if recipients.is_empty() {
         return Err(err("At least one recipient is required"));
     }
-    if recipients.len() > 100 {
+    if recipients.len() > OVERSEER_MAX_RECIPIENTS {
         return Err(err("Too many recipients (maximum 100 agents)"));
+    }
+    if recipients.len() > 1 && !confirm_multiple {
+        return Err(err("Multiple recipients require explicit confirmation"));
     }
     if subject.is_empty() {
         return Err(err("Subject is required"));
@@ -5109,12 +5329,19 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
     if body_md.len() > 50_000 {
         return Err(err("Message body too long (maximum 50,000 characters)"));
     }
+    if reason.is_empty() {
+        return Err(err("Intervention reason is required"));
+    }
+    if reason.len() > OVERSEER_REASON_MAX_CHARS {
+        return Err(err("Intervention reason too long (maximum 500 characters)"));
+    }
 
     Ok(OverseerPayload {
         recipients,
         subject,
         body_md,
         thread_id,
+        reason,
     })
 }
 
@@ -5125,7 +5352,10 @@ fn handle_overseer_send(
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
     let parsed = parse_overseer_body(body)?;
-    let full_body = format!("{OVERSEER_PREAMBLE}{}", parsed.body_md);
+    let full_body = format!(
+        "{OVERSEER_PREAMBLE}Human intervention reason: {}\n\n{}",
+        parsed.reason, parsed.body_md
+    );
 
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
@@ -5149,18 +5379,21 @@ fn handle_overseer_send(
 
     // Resolve valid recipient agent IDs.
     let mut valid: Vec<(String, i64)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     for name in &parsed.recipients {
-        if let Ok(a) = block_on_outcome(cx, queries::get_agent(cx, pool, pid, name)) {
-            valid.push((name.clone(), a.id.unwrap_or(0)));
+        match block_on_outcome(cx, queries::get_agent(cx, pool, pid, name)) {
+            Ok(a) => valid.push((name.clone(), a.id.unwrap_or(0))),
+            Err((404, _)) => missing.push(name.clone()),
+            Err(err) => return Err(err),
         }
     }
 
-    if valid.is_empty() {
+    if !missing.is_empty() {
         return json_err(
             400,
             &format!(
-                "None of the specified recipients exist in this project. \
-                 Available agents can be seen at /mail/{project_slug}"
+                "Unknown recipient(s): {}. Available agents can be seen at /mail/{project_slug}",
+                missing.join(", ")
             ),
         );
     }
@@ -5185,13 +5418,38 @@ fn handle_overseer_send(
         ),
     )?;
 
-    let valid_names: Vec<&str> = valid.iter().map(|(n, _)| n.as_str()).collect();
+    let valid_names: Vec<String> = valid.iter().map(|(n, _)| n.clone()).collect();
     let created = ts_display(msg.created_ts);
+    let thread_id = parsed.thread_id.clone().unwrap_or_default();
+    tracing::warn!(
+        target: "mcp_agent_mail::overseer",
+        event = "human_overseer_message_sent",
+        project = %p.slug,
+        human_overseer = true,
+        contact_policy_bypass = true,
+        message_id = msg.id.unwrap_or(0),
+        recipients = ?valid_names,
+        recipient_count = valid_names.len(),
+        thread_id = %thread_id,
+        reason = %parsed.reason,
+        sent_at = %created,
+        "human overseer message sent"
+    );
 
     json_ok(&serde_json::json!({
         "success": true,
         "message_id": msg.id.unwrap_or(0),
         "recipients": valid_names,
+        "recipient_count": valid_names.len(),
+        "thread_id": thread_id,
+        "audit": {
+            "actor": "HumanOverseer",
+            "human_overseer": true,
+            "contact_policy_bypass": true,
+            "reason": parsed.reason,
+            "recipients": valid_names,
+            "thread_id": thread_id,
+        },
         "sent_at": created,
     }))
 }
@@ -5730,8 +5988,34 @@ mod fresh_eyes_regression_tests {
 
 #[cfg(test)]
 mod overseer_form_validation_tests {
-    use super::parse_overseer_body;
+    use super::*;
+    use asupersync::Outcome;
     use serde_json::json;
+
+    fn make_test_pool(label: &str) -> DbPool {
+        initialized_test_pool(label)
+    }
+
+    fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
+        match outcome {
+            Outcome::Ok(value) => value,
+            Outcome::Err(err) => panic!("db error: {err}"),
+            Outcome::Cancelled(_) => panic!("db operation cancelled"),
+            Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
+        }
+    }
+
+    fn valid_body(recipients: serde_json::Value) -> serde_json::Value {
+        json!({
+            "intent": OVERSEER_SEND_INTENT,
+            "recipients": recipients,
+            "subject": "Operator notice",
+            "body_md": "Please prioritize this task.",
+            "reason": "production incident",
+            "thread_id": "br-123",
+            "confirm_multiple": true,
+        })
+    }
 
     fn parse_err_message(body: &str) -> (u16, String) {
         let (status, payload) = parse_overseer_body(body).expect_err("expected parse error");
@@ -5749,10 +6033,13 @@ mod overseer_form_validation_tests {
     #[test]
     fn parse_overseer_body_normalizes_and_deduplicates_recipients() {
         let body = json!({
+            "intent": OVERSEER_SEND_INTENT,
             "recipients": [" BlueLake ", "GreenField", "bluelake", "  "],
             "subject": "  Operator notice  ",
             "body_md": "  Please prioritize this task.  ",
+            "reason": "  production incident  ",
             "thread_id": "br-123",
+            "confirm_multiple": true,
         })
         .to_string();
 
@@ -5760,6 +6047,7 @@ mod overseer_form_validation_tests {
         assert_eq!(parsed.recipients, vec!["BlueLake", "GreenField"]);
         assert_eq!(parsed.subject, "Operator notice");
         assert_eq!(parsed.body_md, "Please prioritize this task.");
+        assert_eq!(parsed.reason, "production incident");
         assert_eq!(parsed.thread_id.as_deref(), Some("br-123"));
     }
 
@@ -5772,13 +6060,7 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn parse_overseer_body_requires_recipients() {
-        let body = json!({
-            "recipients": [],
-            "subject": "hi",
-            "body_md": "body",
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let body = valid_body(json!([])).to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "At least one recipient is required");
@@ -5787,13 +6069,7 @@ mod overseer_form_validation_tests {
     #[test]
     fn parse_overseer_body_enforces_recipient_limit() {
         let recipients: Vec<String> = (0..101).map(|i| format!("Agent{i}")).collect();
-        let body = json!({
-            "recipients": recipients,
-            "subject": "hi",
-            "body_md": "body",
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let body = valid_body(json!(recipients)).to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Too many recipients (maximum 100 agents)");
@@ -5801,13 +6077,9 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn parse_overseer_body_requires_non_empty_subject() {
-        let body = json!({
-            "recipients": ["BlueLake"],
-            "subject": "   ",
-            "body_md": "body",
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["subject"] = json!("   ");
+        let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Subject is required");
@@ -5815,13 +6087,9 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn parse_overseer_body_enforces_subject_length() {
-        let body = json!({
-            "recipients": ["BlueLake"],
-            "subject": "x".repeat(201),
-            "body_md": "body",
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["subject"] = json!("x".repeat(201));
+        let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Subject too long (maximum 200 characters)");
@@ -5829,13 +6097,9 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn parse_overseer_body_requires_non_empty_body() {
-        let body = json!({
-            "recipients": ["BlueLake"],
-            "subject": "hello",
-            "body_md": "   ",
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["body_md"] = json!("   ");
+        let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Message body is required");
@@ -5843,26 +6107,78 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn parse_overseer_body_enforces_body_length() {
-        let body = json!({
-            "recipients": ["BlueLake"],
-            "subject": "hello",
-            "body_md": "x".repeat(50_001),
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["body_md"] = json!("x".repeat(50_001));
+        let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Message body too long (maximum 50,000 characters)");
     }
 
     #[test]
+    fn parse_overseer_body_requires_reason() {
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["reason"] = json!(" ");
+        let body = body.to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Intervention reason is required");
+    }
+
+    #[test]
+    fn parse_overseer_body_enforces_reason_length() {
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["reason"] = json!("x".repeat(501));
+        let body = body.to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Intervention reason too long (maximum 500 characters)");
+    }
+
+    #[test]
+    fn parse_overseer_body_rejects_broadcast_flag() {
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["broadcast"] = json!(true);
+        let body = body.to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(
+            msg,
+            "Broadcast delivery is intentionally unsupported; choose explicit recipients"
+        );
+    }
+
+    #[test]
+    fn parse_overseer_body_requires_explicit_intent() {
+        let mut body = valid_body(json!(["BlueLake"]));
+        body.as_object_mut()
+            .expect("valid object")
+            .remove("intent")
+            .expect("intent exists");
+        let body = body.to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Missing or invalid overseer send intent");
+    }
+
+    #[test]
+    fn parse_overseer_body_requires_confirmation_for_multiple_recipients() {
+        let mut body = valid_body(json!(["BlueLake", "GreenCastle"]));
+        body["confirm_multiple"] = json!(false);
+        let body = body.to_string();
+        let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Multiple recipients require explicit confirmation");
+    }
+
+    #[test]
     fn parse_overseer_body_missing_thread_id_defaults_to_none() {
-        let body = json!({
-            "recipients": ["BlueLake"],
-            "subject": "hello",
-            "body_md": "body",
-        })
-        .to_string();
+        let mut body = valid_body(json!(["BlueLake"]));
+        body.as_object_mut()
+            .expect("valid object")
+            .remove("thread_id")
+            .expect("thread id exists");
+        let body = body.to_string();
         let parsed = parse_overseer_body(&body).expect("valid payload");
         assert_eq!(parsed.thread_id, None);
     }
@@ -5870,13 +6186,9 @@ mod overseer_form_validation_tests {
     #[test]
     fn parse_overseer_body_trims_thread_id_and_deduplicates_before_limit() {
         let recipients: Vec<String> = (0..101).map(|_| "BlueLake".to_string()).collect();
-        let body = json!({
-            "recipients": recipients,
-            "subject": "hello",
-            "body_md": "body",
-            "thread_id": "  br-123  ",
-        })
-        .to_string();
+        let mut body = valid_body(json!(recipients));
+        body["thread_id"] = json!("  br-123  ");
+        let body = body.to_string();
 
         let parsed = parse_overseer_body(&body).expect("duplicates should collapse before limit");
         assert_eq!(parsed.recipients, vec!["BlueLake"]);
@@ -5885,12 +6197,12 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn parse_overseer_body_rejects_missing_subject_field() {
-        let body = json!({
-            "recipients": ["BlueLake"],
-            "body_md": "body",
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let mut body = valid_body(json!(["BlueLake"]));
+        body.as_object_mut()
+            .expect("valid object")
+            .remove("subject")
+            .expect("subject exists");
+        let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Subject is required");
@@ -5898,14 +6210,110 @@ mod overseer_form_validation_tests {
 
     #[test]
     fn parse_overseer_body_rejects_missing_body_field() {
-        let body = json!({
-            "recipients": ["BlueLake"],
-            "subject": "hello",
-            "thread_id": "br-123",
-        })
-        .to_string();
+        let mut body = valid_body(json!(["BlueLake"]));
+        body.as_object_mut()
+            .expect("valid object")
+            .remove("body_md")
+            .expect("body exists");
+        let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Message body is required");
+    }
+
+    #[test]
+    fn handle_overseer_send_requires_all_recipients_to_exist() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-overseer-missing-recipient");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-overseer-missing-recipient",
+        )));
+        let project_id = project.id.expect("project id");
+        outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+        )));
+
+        let mut body = valid_body(json!(["BlueLake", "MissingAgent"]));
+        body["confirm_multiple"] = json!(true);
+        let (status, payload) = handle_overseer_send(&cx, &pool, &project.slug, &body.to_string())
+            .expect_err("unknown recipient should fail");
+        assert_eq!(status, 400);
+        assert!(
+            payload.contains("Unknown recipient(s): MissingAgent"),
+            "unexpected payload: {payload}"
+        );
+    }
+
+    #[test]
+    fn handle_overseer_send_records_explicit_recipients_and_audit_metadata() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-overseer-audit");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-overseer-audit",
+        )));
+        let project_id = project.id.expect("project id");
+        let blue = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+        )));
+        let green = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+
+        let mut body = valid_body(json!(["BlueLake", "GreenCastle"]));
+        body["subject"] = json!("Human override");
+        body["body_md"] = json!("Pause and inspect the failing deployment.");
+        body["reason"] = json!("deployment rollback");
+        let payload = handle_overseer_send(&cx, &pool, &project.slug, &body.to_string())
+            .expect("overseer send should succeed")
+            .expect("route should return json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload should parse");
+
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["recipient_count"], 2);
+        assert_eq!(
+            parsed["recipients"].as_array().expect("recipients array"),
+            &[json!("BlueLake"), json!("GreenCastle")]
+        );
+        assert_eq!(parsed["audit"]["actor"], "HumanOverseer");
+        assert_eq!(parsed["audit"]["human_overseer"], true);
+        assert_eq!(parsed["audit"]["contact_policy_bypass"], true);
+        assert_eq!(parsed["audit"]["reason"], "deployment rollback");
+        assert_eq!(parsed["audit"]["thread_id"], "br-123");
+
+        let message_id = parsed["message_id"].as_i64().expect("message id");
+        let message = outcome_ok(block_on(queries::get_message(&cx, &pool, message_id)));
+        assert_eq!(message.importance, "high");
+        assert!(message.body_md.contains("MESSAGE FROM HUMAN OVERSEER"));
+        assert!(
+            message
+                .body_md
+                .contains("Human intervention reason: deployment rollback")
+        );
+        let recipients = outcome_ok(block_on(queries::list_message_recipients_by_message(
+            &cx, &pool, project_id, message_id,
+        )));
+        let mut recipient_names = recipients
+            .into_iter()
+            .map(|recipient| recipient.name)
+            .collect::<Vec<_>>();
+        recipient_names.sort();
+        assert_eq!(recipient_names, vec!["BlueLake", "GreenCastle"]);
+        assert_ne!(
+            blue.id, green.id,
+            "test setup should use distinct recipients"
+        );
     }
 }

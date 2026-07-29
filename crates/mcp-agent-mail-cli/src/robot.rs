@@ -12,17 +12,20 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::{McpContext, McpError, McpResult};
 use mcp_agent_mail_core::{
     AgentHealthGrade, AgentHealthInputs, AgentHealthMetric, AgentHealthScorecard,
-    TailLatencyPhaseLedger, TailLatencyPhaseRecorder, append_tail_latency_evidence_if_configured,
-    compute_agent_health,
+    AtcCanaryReportSummary, TailLatencyPhaseLedger, TailLatencyPhaseRecorder,
+    append_tail_latency_evidence_if_configured, compute_agent_health,
+    load_latest_atc_canary_report,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlmodel_core::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::CliError;
+use mcp_agent_mail_db::search_service::LexicalBackfillHealth;
 
 const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
@@ -561,8 +564,168 @@ pub struct RobotEnvelope<T: Serialize> {
     pub _actions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _diagnostics: Option<TailLatencyPhaseLedger>,
+    /// E4 (br-bvq1x.5.4): present only when the command hit a classified failure
+    /// (e.g. a database error). Carries the safe-remediation contract so an agent
+    /// can decide what is safe to do — never present on a healthy response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _remediation: Option<RobotRemediation>,
     #[serde(flatten)]
     pub data: T,
+}
+
+/// E4 (br-bvq1x.5.4): the robot-mode safe-remediation contract.
+///
+/// Reuses A2's [`DbFailurePolicy`](mcp_agent_mail_db::error::DbFailurePolicy)
+/// fields and adds an explicit `operator_only` label so an agent knows whether
+/// `recommended_command` is something it may auto-apply (read-only / scoped fix)
+/// or something only a human operator should run (repair / reconstruct / service
+/// lifecycle / kill). Downstream AGENTS files forbid agents from running the
+/// operator-only commands; this makes that boundary machine-readable.
+#[derive(Debug, Serialize)]
+pub struct RobotRemediation {
+    /// The single recommended next command.
+    pub recommended_command: String,
+    /// True when `recommended_command` mutates state in a way only a human
+    /// operator should run; agents must NOT silently auto-apply it.
+    pub operator_only: bool,
+    /// A repair path exists (vs. nothing actionable / a source fix is required).
+    pub repairable: bool,
+    /// The failed operation can be safely retried as-is.
+    pub safe_to_retry: bool,
+    /// Reads can continue — the mailbox is still queryable read-only.
+    pub safe_to_continue_read_only: bool,
+    /// Writes/edits are blocked until remediation (agents should not edit).
+    pub blocks_edits: bool,
+    /// H4 (br-bvq1x.8.4): the agent-safe degraded-mode verdict + fallback lane,
+    /// derived from the same A2 classification.
+    pub coordination: CoordinationContract,
+}
+
+/// H4 (br-bvq1x.8.4): the agent-safe degraded-mode coordination contract.
+///
+/// A single verdict distinguishing the three degraded scenarios an agent must
+/// react to differently: writes/reservations blocked ("do not edit"), reads
+/// degraded but writes safe, or `am doctor` blocked by a live mailbox owner.
+/// Each verdict carries a distinct message and the exact fallback coordination
+/// lane. Derived from A1/A2 (the typed error class + the read/write safety
+/// flags), so it never disagrees with the rest of the diagnosis.
+#[derive(Debug, Serialize)]
+pub struct CoordinationContract {
+    /// One of `writes_blocked` / `reads_degraded` / `doctor_blocked_by_live_owner`.
+    pub verdict: &'static str,
+    /// The distinct, agent-facing contract message for this degraded mode.
+    pub message: String,
+    /// The exact fallback coordination lane to use while degraded.
+    pub fallback_lane: &'static str,
+}
+
+impl CoordinationContract {
+    fn from_db_class(
+        class: mcp_agent_mail_db::error::DbErrorClass,
+        blocks_edits: bool,
+        reads_ok: bool,
+    ) -> Self {
+        use mcp_agent_mail_db::error::DbErrorClass;
+        // Scenario 3: a live owner holds the mailbox — doctor recovery refuses.
+        if matches!(class, DbErrorClass::LiveOwnerNoActivityLock) {
+            return Self {
+                verdict: "doctor_blocked_by_live_owner",
+                message: "A live mailbox owner holds the lock: do NOT run `am doctor repair`/`reconstruct` (they will refuse, exit 3). Drain/stop the owner via your supervisor (`am service restart`), or route writes through the running server."
+                    .to_string(),
+                fallback_lane:
+                    "route writes through the running Agent Mail server; do not run operator-only recovery",
+            };
+        }
+        if blocks_edits {
+            // Scenario 1 / 2b: reservation/edit writes are blocked.
+            let reads = if reads_ok {
+                " Reads still work, so you can keep reading mail/threads."
+            } else {
+                " Reads are also degraded."
+            };
+            return Self {
+                verdict: "writes_blocked",
+                message: format!(
+                    "Do NOT edit files that require a reservation: reservation writes are blocked ({}).{} Coordinate intent via direct agent messaging until writes recover.",
+                    class.as_str(),
+                    reads
+                ),
+                fallback_lane: "do not edit reserved files; coordinate intent via direct agent messaging (send_message)",
+            };
+        }
+        // Scenario 2a: reads degraded but writes are safe.
+        Self {
+            verdict: "reads_degraded",
+            message: format!(
+                "Reads are degraded but WRITES ARE SAFE ({}): you may still acquire reservations and edit; treat search/read results as possibly incomplete.",
+                class.as_str()
+            ),
+            fallback_lane: "writes safe; treat read/search results as possibly incomplete",
+        }
+    }
+}
+
+impl RobotRemediation {
+    /// Build the contract from a database error message, reusing the A1/A2
+    /// classifier so robot mode and the MCP/DB layers agree on the same facts:
+    /// the five remediation flags, `operator_only` (E4), and the H4 degraded-mode
+    /// `coordination` verdict.
+    pub fn from_db_error_message(message: &str) -> Self {
+        let classification = mcp_agent_mail_db::error::classify_db_error_message(message);
+        let class = classification.class;
+        let policy = mcp_agent_mail_db::error::DbFailurePolicy::from(classification);
+        let recommended_command = policy.recommended_command.to_string();
+        let operator_only = remediation_command_is_operator_only(&recommended_command);
+        let coordination = CoordinationContract::from_db_class(
+            class,
+            policy.blocks_edits,
+            policy.safe_to_continue_read_only,
+        );
+        Self {
+            recommended_command,
+            operator_only,
+            repairable: policy.repairable,
+            safe_to_retry: policy.safe_to_retry,
+            safe_to_continue_read_only: policy.safe_to_continue_read_only,
+            blocks_edits: policy.blocks_edits,
+            coordination,
+        }
+    }
+}
+
+/// E4 (br-bvq1x.5.4): classify a recommended next-command as OPERATOR-ONLY (a
+/// human must run it; agents must not silently auto-apply) vs agent-safe.
+///
+/// Operator-only = state-mutating recovery + lifecycle: `am doctor repair`,
+/// `am doctor reconstruct`, `am doctor restore`, `am doctor undo`, the legacy
+/// bare `am doctor fix` multi-detector mutate flow, `am service restart|stop|
+/// uninstall`, `am clear-and-reset-everything`, and any `kill`/`pkill`. Agent-safe
+/// = read-only diagnostics (`am doctor check|health|locks|--json`, `am robot *`),
+/// scoped per-FM fixes (`am doctor fix --only ...`), `--list`/`--dry-run`
+/// rehearsals, and "route the write through the running server" guidance.
+pub fn remediation_command_is_operator_only(cmd: &str) -> bool {
+    let c = cmd.trim();
+    if c.split_whitespace()
+        .any(|tok| tok == "kill" || tok == "pkill")
+    {
+        return true;
+    }
+    if c.starts_with("am doctor fix") {
+        // Scoped (`--only`), read-only enumerate (`--list`), and rehearsal
+        // (`--dry-run`) are agent-safe; the bare legacy mutate flow is not.
+        return !(c.contains("--only") || c.contains("--list") || c.contains("--dry-run"));
+    }
+    const OPERATOR_ONLY_PREFIXES: &[&str] = &[
+        "am doctor repair",
+        "am doctor reconstruct",
+        "am doctor restore",
+        "am doctor undo",
+        "am service restart",
+        "am service stop",
+        "am service uninstall",
+        "am clear-and-reset-everything",
+    ];
+    OPERATOR_ONLY_PREFIXES.iter().any(|p| c.starts_with(p))
 }
 
 /// Infrastructure metadata attached to every robot response.
@@ -604,8 +767,15 @@ impl<T: Serialize> RobotEnvelope<T> {
             _alerts: Vec::new(),
             _actions: Vec::new(),
             _diagnostics: None,
+            _remediation: None,
             data,
         }
+    }
+
+    /// Attach the E4 safe-remediation contract (present only on failures).
+    pub fn with_remediation(mut self, remediation: RobotRemediation) -> Self {
+        self._remediation = Some(remediation);
+        self
     }
 
     /// Add an alert to the envelope.
@@ -679,6 +849,11 @@ struct RobotEnvelopeView<'a, T: Serialize> {
     _actions: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     _diagnostics: Option<&'a TailLatencyPhaseLedger>,
+    // E4 (br-bvq1x.5.4): the view must carry the safe-remediation contract too,
+    // otherwise `with_remediation` is silently dropped on the real output path
+    // (the bare-struct serialization in the unit test does NOT exercise this view).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _remediation: Option<&'a RobotRemediation>,
     #[serde(flatten)]
     data: &'a T,
 }
@@ -701,6 +876,7 @@ fn serialize_envelope_with_format<T: Serialize>(
         _alerts: &envelope._alerts,
         _actions: &envelope._actions,
         _diagnostics: envelope._diagnostics.as_ref(),
+        _remediation: envelope._remediation.as_ref(),
         data: &envelope.data,
     };
     if pretty {
@@ -802,8 +978,20 @@ pub struct StatusData {
     pub top_threads: Vec<ThreadSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<AnomalyCard>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<OperatorRecommendation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation_forecast: Option<ReservationForecast>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryStatus>,
+    /// Degraded-mode intents (ack/release/send) queued for replay because the
+    /// mailbox was unavailable, each with how to replay it (br-bvq1x.8.3 / H3).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub queued_intents: Vec<QueuedIntentSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<LexicalBackfillHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forensic_timeline: Option<crate::ForensicTimelineReport>,
 }
 
 /// Recovery state surfaced in `robot status` when the mailbox is degraded or recovering.
@@ -842,6 +1030,31 @@ pub struct RecoveryStatus {
     pub admission: Option<RecoveryAdmissionSnapshot>,
 }
 
+/// A degraded-mode intent queued for replay, surfaced in `am robot status`.
+///
+/// When a mutating verb cannot reach the live mailbox it persists a durable
+/// intent so the action is not silently dropped; this is the read-only view an
+/// agent uses to see what is pending and exactly how to flush it
+/// (br-bvq1x.8.3 / H3).
+#[derive(Debug, Clone, Serialize)]
+pub struct QueuedIntentSummary {
+    /// Verb the intent will replay: `acknowledge_message`, `send_message`, or
+    /// `release_file_reservations`.
+    pub kind: String,
+    /// Stable identifier (intent id or content hash).
+    pub id: String,
+    /// Agent that queued the intent, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// One-line human summary of what is queued.
+    pub summary: String,
+    /// How to replay: a copy-paste command, or the automatic mechanism.
+    pub replay: String,
+    /// Absolute path of the durable artifact backing this intent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// Deferred-write backlog summary for operator-facing recovery status.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeferredWriteBacklog {
@@ -868,8 +1081,128 @@ pub struct RecoveryAdmissionSnapshot {
     pub consecutive_failures: u32,
     /// Number of recovery attempts within the current sliding window.
     pub attempts_in_window: usize,
-    /// Whether loop suppression is active (too many failures).
+    /// Number of *successful* recoveries for the active path within the current
+    /// sliding window. A high count signals a non-convergent reconstruct loop
+    /// (recovery keeps succeeding then re-corrupting under concurrent writers).
+    pub successes_in_window: usize,
+    /// Whether loop suppression is active (too many failures, or a
+    /// non-convergent succeed-then-recorrupt loop).
     pub suppressed: bool,
+}
+
+fn robot_search_index_health_from_config(
+    config: &mcp_agent_mail_core::Config,
+) -> Result<LexicalBackfillHealth, String> {
+    let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    pool_cfg.database_url = config.database_url.clone();
+    pool_cfg.storage_root = Some(config.storage_root.clone());
+    pool_cfg.run_migrations = false;
+    pool_cfg.warmup_connections = 0;
+    let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
+        .map_err(|err| format!("db pool init failed: {err}"))?;
+    Ok(mcp_agent_mail_db::search_service::lexical_backfill_health(
+        &pool,
+    ))
+}
+
+fn search_index_probe_status(health: &LexicalBackfillHealth) -> &'static str {
+    match health.state.as_str() {
+        "fresh" | "in_memory" => "ok",
+        "delayed" | "partial" => "degraded",
+        _ => "fail",
+    }
+}
+
+fn search_index_probe_detail(health: &LexicalBackfillHealth) -> String {
+    let reason = health
+        .stale_reason
+        .as_deref()
+        .unwrap_or("lexical Search V3 backfill state is current");
+    format!(
+        "state={} indexed={} source={} skipped={} index_dir={} reason={}",
+        health.state,
+        health.indexed_messages,
+        health
+            .source_messages
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+        health.skipped_messages,
+        health.index_dir,
+        reason
+    )
+}
+
+fn enrich_status_with_search_index(
+    data: &mut StatusData,
+    actions: &mut Vec<String>,
+    health: LexicalBackfillHealth,
+) {
+    let probe_status = search_index_probe_status(&health);
+    if probe_status != "ok" {
+        let severity = if probe_status == "fail" {
+            "error"
+        } else {
+            "warn"
+        };
+        if data.health == "ok" {
+            data.health = if severity == "error" {
+                "error".to_string()
+            } else {
+                "degraded".to_string()
+            };
+        } else if severity == "error" && data.health != "recovering" {
+            data.health = "error".to_string();
+        }
+        let headline = format!("Search V3 lexical index state is {}", health.state);
+        let remediation = health
+            .safe_remediation
+            .clone()
+            .unwrap_or_else(|| "am robot health --format json".to_string());
+        data.anomalies.push(AnomalyCard {
+            severity: severity.to_string(),
+            confidence: 1.0,
+            category: "search_index".to_string(),
+            headline,
+            rationale: health
+                .stale_reason
+                .clone()
+                .unwrap_or_else(|| search_index_probe_detail(&health)),
+            remediation: remediation.clone(),
+            playbooks: vec![],
+        });
+        if !actions.contains(&remediation) {
+            actions.push(remediation);
+        }
+    }
+    data.search_index = Some(health);
+}
+
+fn enrich_envelope_with_search_index_alert<T: Serialize>(
+    mut env: RobotEnvelope<T>,
+    health: Option<&LexicalBackfillHealth>,
+) -> RobotEnvelope<T> {
+    let Some(health) = health else {
+        return env;
+    };
+    let probe_status = search_index_probe_status(health);
+    if probe_status == "ok" {
+        return env;
+    }
+
+    let severity = if probe_status == "fail" {
+        "error"
+    } else {
+        "warn"
+    };
+    let remediation = health
+        .safe_remediation
+        .clone()
+        .unwrap_or_else(|| "am robot health --format json".to_string());
+    env = env.with_alert(
+        severity,
+        format!("Search V3 lexical index state is {}", health.state),
+        Some(remediation.clone()),
+    );
+    env.with_action(remediation)
 }
 
 /// File reservation entry for status/reservation display.
@@ -884,6 +1217,49 @@ pub struct ReservationEntry {
     pub remaining: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<String>,
+}
+
+/// Expiry bucket highlighting reservation TTL herds.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationExpiryBucket {
+    pub window: String,
+    pub from_seconds: i64,
+    pub until_seconds: i64,
+    pub count: usize,
+    pub agents: Vec<String>,
+    pub paths: Vec<String>,
+    pub safe_command: String,
+    pub evidence: String,
+}
+
+/// Hot path where active exclusive reservations already overlap.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationConflictHotspot {
+    pub path: String,
+    pub conflict_pairs: usize,
+    pub agents: Vec<String>,
+    pub overlapping_paths: Vec<String>,
+    pub safe_command: String,
+    pub evidence: String,
+}
+
+/// Advisory reservation forecast for robot reservations/status output.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReservationForecast {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expiry_herds: Vec<ReservationExpiryBucket>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflict_hotspots: Vec<ReservationConflictHotspot>,
+}
+
+impl ReservationForecast {
+    fn is_empty(&self) -> bool {
+        self.expiry_herds.is_empty() && self.conflict_hotspots.is_empty()
+    }
+
+    fn into_option(self) -> Option<Self> {
+        (!self.is_empty()).then_some(self)
+    }
 }
 
 /// Summary entry for a thread (used in status and overview).
@@ -973,6 +1349,30 @@ pub struct SearchResult {
     pub thread: String,
     pub snippet: String,
     pub age: String,
+}
+
+/// robot search — compact route diagnostics derived from Search V3 explain output.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchRouteDiagnostic {
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_query: Option<String>,
+    pub used_like_fallback: bool,
+    pub facet_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub facets_applied: Vec<String>,
+}
+
+impl SearchRouteDiagnostic {
+    fn from_explain(explain: &mcp_agent_mail_db::search_planner::QueryExplain) -> Self {
+        Self {
+            method: explain.method.clone(),
+            normalized_query: explain.normalized_query.clone(),
+            used_like_fallback: explain.used_like_fallback,
+            facet_count: explain.facet_count,
+            facets_applied: explain.facets_applied.clone(),
+        }
+    }
 }
 
 /// robot message — full message with context.
@@ -1075,6 +1475,181 @@ pub struct MetricEntry {
     pub p99_ms: f64,
 }
 
+/// robot metrics — DB connection-pool and file-descriptor backpressure view
+/// (bead K5). The live `pool`/`fd` gauges describe the *process that ran this
+/// command*, not a remote server, so `scope` is surfaced explicitly to keep the
+/// reading honest: in a short-lived `am robot metrics` invocation the pool
+/// gauges are typically zero, while the configured pool limits and the inherited
+/// FD limits (`ulimit -n`) remain meaningful environment signals.
+#[derive(Debug, Serialize)]
+pub struct ResourcePressure {
+    /// Always `"current_process"` — a guard against reading the pool gauges as
+    /// if they reflected the long-running server.
+    pub scope: &'static str,
+    /// Configured maximum pooled connections (`DATABASE_POOL_SIZE` + overflow).
+    pub pool_max_connections: usize,
+    /// Configured minimum pooled connections.
+    pub pool_min_connections: usize,
+    /// Configured connection-acquire timeout in milliseconds.
+    pub pool_acquire_timeout_ms: u64,
+    /// Live pool gauges for this process (acquires, utilization, waiters, …).
+    pub pool: mcp_agent_mail_core::DbMetricsSnapshot,
+    /// Live file-descriptor pressure (soft/hard limits, open fds, utilization).
+    pub fd: mcp_agent_mail_core::FdMetricsSnapshot,
+    /// Entries in the storage repo-path cache (paths, not held descriptors).
+    pub repo_cache_entries: usize,
+    /// Sticky durability-degraded flag: a WBQ write permanently failed its
+    /// retries and the live operational state may lag the Git archive.
+    pub durability_degraded: bool,
+    /// Per-archive WBQ circuit-breaker state (br-bvq1x.9.8 Part 3). Each row
+    /// reports an archive that has accumulated consecutive drain failures and
+    /// how many times its breaker has tripped a recovery self-heal. Empty in
+    /// the healthy case.
+    pub wbq_circuit_breakers: Vec<mcp_agent_mail_storage::WbqCircuitBreakerArchive>,
+}
+
+/// A derived backpressure alert (kept independent of `RobotEnvelope` so the
+/// guidance text is unit-testable without real pool/FD exhaustion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackpressureAlert {
+    pub severity: &'static str,
+    pub message: String,
+    pub action: Option<String>,
+}
+
+/// The specific, ordered next-step list for pool/FD backpressure (bead K5).
+/// Agents that merely retry on a busy/exhaustion error make the problem worse;
+/// this enumerates the real levers instead.
+pub const BACKPRESSURE_NEXT_STEPS: &str = "reduce concurrent agents, check for long-running \
+    readers (open inbox/thread queries), reduce TUI polling frequency, run `am doctor health`, \
+    and inspect the pool metrics above";
+
+/// Derive pool/FD backpressure alerts from already-sampled snapshots.
+///
+/// Pure and side-effect free so the guidance can be asserted deterministically.
+/// Thresholds: a pool acquire error is a hard exhaustion signal; >=80% pool
+/// utilization or any waiting request is pressure; FD utilization >=90% is
+/// imminent exhaustion and >=80% is a warning. When the repo-path cache is the
+/// only thing growing it is *not* flagged, because evicting it frees zero
+/// descriptors (the D3 "freed 0" footgun).
+#[must_use]
+pub fn derive_backpressure_alerts(
+    pool: &mcp_agent_mail_core::DbMetricsSnapshot,
+    fd: &mcp_agent_mail_core::FdMetricsSnapshot,
+) -> Vec<BackpressureAlert> {
+    let mut alerts = Vec::new();
+
+    if pool.pool_acquire_errors_total > 0 {
+        alerts.push(BackpressureAlert {
+            severity: "error",
+            message: format!(
+                "{} pool-acquire error(s) since start — the DB connection pool has been \
+                 exhausted (max {} connections). Do not blind-retry; instead {BACKPRESSURE_NEXT_STEPS}.",
+                pool.pool_acquire_errors_total, pool.pool_total_connections
+            ),
+            action: Some("am robot health --include-host".to_string()),
+        });
+    } else if pool.pool_utilization_pct >= 80 || pool.pool_pending_requests > 0 {
+        alerts.push(BackpressureAlert {
+            severity: "warn",
+            message: format!(
+                "DB pool under pressure ({}% utilization, {} request(s) waiting). To relieve it: \
+                 {BACKPRESSURE_NEXT_STEPS}.",
+                pool.pool_utilization_pct, pool.pool_pending_requests
+            ),
+            action: Some("am robot health --include-host".to_string()),
+        });
+    }
+
+    if let Some(util) = fd.utilization_pct {
+        let open = fd.open_fds.unwrap_or(0);
+        let soft = fd.soft_limit.unwrap_or(0);
+        if util >= 90 {
+            alerts.push(BackpressureAlert {
+                severity: "error",
+                message: format!(
+                    "Open file descriptors at {util}% of the soft limit ({open}/{soft}); FD \
+                     exhaustion is imminent. Raise `ulimit -n`, close stale Agent Mail processes, \
+                     then {BACKPRESSURE_NEXT_STEPS}."
+                ),
+                action: Some("am robot health --include-host".to_string()),
+            });
+        } else if util >= 80 {
+            alerts.push(BackpressureAlert {
+                severity: "warn",
+                message: format!(
+                    "Open file descriptors at {util}% of the soft limit ({open}/{soft}). Consider \
+                     raising `ulimit -n` or reducing concurrent agents before it becomes exhaustion."
+                ),
+                action: Some("am robot health --include-host".to_string()),
+            });
+        }
+    }
+
+    alerts
+}
+
+/// Derive durability / WBQ circuit-breaker alerts from already-sampled state
+/// (br-bvq1x.9.8 Part 3 → br-5stvf). Pure and side-effect free so the guidance
+/// can be asserted deterministically without tripping a real breaker.
+///
+/// A tripped breaker (`trips_total > 0`) is the high-signal event: it means the
+/// archive accumulated enough consecutive drain failures to fire a bounded
+/// recovery self-heal, so it warrants an `error` alert naming the archive and
+/// the trip count. An archive that is merely accumulating consecutive failures
+/// without a trip yet is a `warn`. The sticky `durability_degraded` flag is
+/// surfaced once even when no per-archive breaker row is present (e.g. a legacy
+/// degrade path that predates the breaker).
+#[must_use]
+pub fn derive_wbq_breaker_alerts(
+    durability_degraded: bool,
+    breakers: &[mcp_agent_mail_storage::WbqCircuitBreakerArchive],
+) -> Vec<BackpressureAlert> {
+    let mut alerts = Vec::new();
+
+    for b in breakers {
+        if b.trips_total > 0 {
+            alerts.push(BackpressureAlert {
+                severity: "error",
+                message: format!(
+                    "WBQ circuit breaker tripped {} time(s) for archive `{}` ({} consecutive \
+                     failure(s) currently) — git-archive writes for that archive repeatedly failed \
+                     their retries and a bounded recovery self-heal was fired. Inspect that \
+                     archive's repo health and disk before assuming a broader outage.",
+                    b.trips_total, b.archive_key, b.consecutive_failures
+                ),
+                action: Some("am doctor health".to_string()),
+            });
+        } else if b.consecutive_failures > 0 {
+            alerts.push(BackpressureAlert {
+                severity: "warn",
+                message: format!(
+                    "Archive `{}` has {} consecutive WBQ drain failure(s) (breaker not yet \
+                     tripped). Watch for a trip; check that archive's repo and disk.",
+                    b.archive_key, b.consecutive_failures
+                ),
+                action: Some("am doctor health".to_string()),
+            });
+        }
+    }
+
+    // Surface the sticky flag once if it is set but no per-archive breaker row
+    // explains it (avoids double-reporting when a breaker alert already fired).
+    if durability_degraded && !breakers.iter().any(|b| b.trips_total > 0) {
+        alerts.push(BackpressureAlert {
+            severity: "warn",
+            message: "Durability is flagged degraded: a write-behind git-archive write \
+                 permanently failed its retries, so the live operational state may lag the \
+                 durable Git archive. Run `am doctor health` and reconcile before relying on \
+                 archive completeness."
+                .to_string(),
+            action: Some("am doctor health".to_string()),
+        });
+    }
+
+    alerts
+}
+
 /// robot health — system probe entry.
 #[derive(Debug, Serialize)]
 pub struct HealthProbe {
@@ -1093,6 +1668,23 @@ pub struct AnomalyCard {
     pub headline: String,
     pub rationale: String,
     pub remediation: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub playbooks: Vec<ReservationPlaybook>,
+}
+
+/// Ranked operator next action with machine-checkable proof context.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OperatorRecommendation {
+    pub rank: usize,
+    pub category: String,
+    pub action: String,
+    pub reason: String,
+    pub confidence: f64,
+    pub affected: String,
+    pub evidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    pub safe_command: String,
 }
 
 /// robot analytics — swarm topology coverage counts.
@@ -1169,6 +1761,18 @@ pub struct AgentHealthView {
     pub decision_count: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub metrics: Vec<AgentHealthMetricRow>,
+}
+
+/// robot agents — read-only identity lifecycle diagnostic.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentLifecycleDiagnostic {
+    pub reason_code: String,
+    pub severity: String,
+    pub agent: String,
+    pub summary: String,
+    pub detail: String,
+    pub evidence: String,
+    pub safe_command: String,
 }
 
 /// robot agents — agent roster entry.
@@ -1588,6 +2192,78 @@ struct AtcConflictData {
     recent_actions: Vec<AtcDecisionData>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyTotals {
+    total_rows: u64,
+    open_rows: u64,
+    resolved_rows: u64,
+    censored_rows: u64,
+    expired_rows: u64,
+    suspected_secret_rows: u64,
+    redacted_due_to_secret_rows: u64,
+    legacy_unclassified_rows: u64,
+    redaction_candidate_rows: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyProjectData {
+    project_hash: String,
+    total_rows: u64,
+    suspected_secret_rows: u64,
+    redaction_candidate_rows: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyStratumData {
+    stratum: String,
+    total_rows: u64,
+    suspected_secret_rows: u64,
+    redaction_candidate_rows: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyRetentionWindow {
+    artifact: &'static str,
+    sqlite_ttl_days: Option<u16>,
+    git_archive: &'static str,
+    enforced_by: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacySchemaClass {
+    category: &'static str,
+    risk: &'static str,
+    field_count: u8,
+    handling: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyRedactionOption {
+    action: &'static str,
+    target_rows: &'static str,
+    effect: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyReportData {
+    report_version: u8,
+    generated_at: String,
+    scope: &'static str,
+    source_table: &'static str,
+    policy_doc: &'static str,
+    totals: AtcPrivacyTotals,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    privacy_classifications: std::collections::BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    projects: Vec<AtcPrivacyProjectData>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    strata: Vec<AtcPrivacyStratumData>,
+    retention_windows: Vec<AtcPrivacyRetentionWindow>,
+    redaction_options: Vec<AtcPrivacyRedactionOption>,
+    schema_classification_summary: Vec<AtcPrivacySchemaClass>,
+    safety_notes: Vec<&'static str>,
+}
+
 #[derive(Debug, Serialize)]
 struct AtcData {
     enabled: bool,
@@ -1599,6 +2275,8 @@ struct AtcData {
     #[serde(skip_serializing_if = "Option::is_none")]
     stratum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    canary: Option<AtcCanaryReportSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<AtcSummaryData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     decisions: Option<Vec<AtcDecisionData>>,
@@ -1608,6 +2286,208 @@ struct AtcData {
     liveness: Option<Vec<AtcLivenessData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflicts: Option<AtcConflictData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    privacy: Option<AtcPrivacyReportData>,
+}
+
+// ── Stale handoff command data model ────────────────────────────────────────
+
+const ROBOT_HANDOFF_DEFAULT_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct HandoffSummary {
+    total_in_progress: usize,
+    shown: usize,
+    keep: usize,
+    ask_owner: usize,
+    takeover_candidates: usize,
+    reopen_candidates: usize,
+    blocked_by_reservation: usize,
+    needs_human_review: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffData {
+    mode: String,
+    read_only: bool,
+    dry_run: bool,
+    explicit_dry_run: bool,
+    project_root: String,
+    beads_jsonl: String,
+    stale_after_minutes: u32,
+    active_after_minutes: u32,
+    fresh_comment_minutes: u32,
+    summary: HandoffSummary,
+    records: Vec<HandoffRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffRecord {
+    id: String,
+    title: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+    updated_age_seconds: Option<i64>,
+    stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inferred_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_state: Option<HandoffOwnerState>,
+    recent_comments: Vec<HandoffCommentView>,
+    active_reservations: Vec<HandoffReservationView>,
+    mail: HandoffMailState,
+    action: String,
+    reason_codes: Vec<String>,
+    rationale: String,
+    safe_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffOwnerState {
+    name: String,
+    program: String,
+    model: String,
+    last_active_ts: Option<String>,
+    last_active_age_seconds: Option<i64>,
+    last_active: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffCommentView {
+    author: String,
+    created_at: String,
+    age_seconds: Option<i64>,
+    text_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffReservationView {
+    agent: String,
+    path: String,
+    exclusive: bool,
+    reason: String,
+    created_age_seconds: Option<i64>,
+    remaining_seconds: i64,
+    remaining: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct HandoffMailState {
+    thread_id: String,
+    messages: usize,
+    ack_required_pending: usize,
+    unread: usize,
+    latest_message_at: Option<String>,
+    latest_message_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BeadsIssueJson {
+    id: String,
+    title: String,
+    status: String,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    comments: Vec<BeadsCommentJson>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BeadsCommentJson {
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HandoffAgentInfo {
+    name: String,
+    program: String,
+    model: String,
+    last_active_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct HandoffReservationInfo {
+    id: i64,
+    agent: String,
+    path: String,
+    exclusive: bool,
+    reason: String,
+    created_ts: Option<i64>,
+    expires_ts: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HandoffClassificationInput {
+    stale: bool,
+    owner_present: bool,
+    owner_active: bool,
+    has_active_reservation: bool,
+    has_fresh_comment: bool,
+    has_ack_required_mail: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandoffClassification {
+    action: &'static str,
+    reason_codes: Vec<&'static str>,
+}
+
+fn classify_handoff(input: &HandoffClassificationInput) -> HandoffClassification {
+    if !input.stale {
+        return HandoffClassification {
+            action: "keep",
+            reason_codes: vec!["fresh_bead_update"],
+        };
+    }
+    if input.has_active_reservation {
+        return HandoffClassification {
+            action: "blocked_by_reservation",
+            reason_codes: vec!["active_file_reservation"],
+        };
+    }
+    if input.has_ack_required_mail {
+        return HandoffClassification {
+            action: "ask_owner",
+            reason_codes: vec!["ack_required_mail"],
+        };
+    }
+    if input.owner_active {
+        return HandoffClassification {
+            action: "keep",
+            reason_codes: vec!["owner_active"],
+        };
+    }
+    if input.has_fresh_comment {
+        return HandoffClassification {
+            action: "keep",
+            reason_codes: vec!["fresh_comment"],
+        };
+    }
+    if input.owner_present {
+        return HandoffClassification {
+            action: "takeover_candidate",
+            reason_codes: vec!["owner_inactive"],
+        };
+    }
+    HandoffClassification {
+        action: "reopen_candidate",
+        reason_codes: vec!["no_owner"],
+    }
 }
 
 // ── Robot subcommand scaffold ────────────────────────────────────────────────
@@ -1618,6 +2498,10 @@ pub struct RobotArgs {
     /// Output format: toon (default at TTY), json (default when piped), md (for thread/message).
     #[arg(long, global = true, value_parser = parse_output_format)]
     pub format: Option<OutputFormat>,
+
+    /// Output JSON (shorthand for --format json).
+    #[arg(long, global = true)]
+    pub json: bool,
 
     /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
     #[arg(long, global = true)]
@@ -1641,6 +2525,14 @@ pub enum RobotSubcommand {
     // ── Track 2: Situational Awareness ──────────────────────────────────
     /// Dashboard synthesis: health, inbox counts, activity, anomalies, reservations, top threads.
     Status,
+
+    /// Non-interactive TUI snapshot dump — the I6 freeze escape hatch.
+    ///
+    /// Returns the live `/mail/ws-state` snapshot the interactive TUI renders
+    /// (including per-loop liveness), falling back to a local SQLite read when
+    /// the server/TUI is frozen or unreachable. Always exits 0 so an agent can
+    /// read state instead of killing the process.
+    TuiDump,
 
     /// Actionable inbox with priority ordering, urgency/ack synthesis.
     Inbox {
@@ -1741,7 +2633,14 @@ pub enum RobotSubcommand {
     Metrics,
 
     /// System diagnostics synthesis (probes, DB pool, disk, anomalies).
-    Health,
+    Health {
+        /// Include a bounded host-pressure section (disk/inodes/load/memory,
+        /// data-dir writability, DB/WAL/SHM sizes, stale-WAL age, writer-PID
+        /// liveness) with a conservative `host_pressure_likely` verdict. Helps
+        /// distinguish host overload from Agent Mail corruption.
+        #[arg(long)]
+        include_host: bool,
+    },
 
     /// Anomaly insights with severity, confidence, remediation commands.
     Analytics,
@@ -1788,6 +2687,28 @@ pub enum RobotSubcommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// Stale bead ownership handoff dashboard with dry-run reopen recommendations.
+    Handoff {
+        /// Consider in-progress beads stale after this many minutes without updates.
+        #[arg(long, default_value_t = 12 * 60)]
+        stale_minutes: u32,
+        /// Consider registered agents active when seen within this many minutes.
+        #[arg(long, default_value_t = 30)]
+        active_minutes: u32,
+        /// Treat comments within this many minutes as recent work.
+        #[arg(long, default_value_t = 24 * 60)]
+        fresh_comment_minutes: u32,
+        /// Include non-stale/keep records instead of only actionable handoffs.
+        #[arg(long)]
+        include_fresh: bool,
+        /// Maximum records to return.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Explicitly request dry-run output. The command is always read-only.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 impl RobotSubcommand {
@@ -1808,6 +2729,7 @@ impl RobotSubcommand {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Status => "robot status",
+            Self::TuiDump => "tui-dump",
             Self::Inbox { .. } => "robot inbox",
             Self::Timeline { .. } => "robot timeline",
             Self::Overview => "robot overview",
@@ -1817,25 +2739,33 @@ impl RobotSubcommand {
             Self::Navigate { .. } => "robot navigate",
             Self::Reservations { .. } => "robot reservations",
             Self::Metrics => "robot metrics",
-            Self::Health => "robot health",
+            Self::Health { .. } => "robot health",
             Self::Analytics => "robot analytics",
             Self::Agents { .. } => "robot agents",
             Self::Contacts => "robot contacts",
             Self::Projects => "robot projects",
             Self::Attachments => "robot attachments",
             Self::Atc { .. } => "robot atc",
+            Self::Handoff { .. } => "robot handoff",
         }
     }
 }
 
 fn validate_requested_robot_format(args: &RobotArgs) -> Result<(), CliError> {
-    if matches!(args.format, Some(OutputFormat::Markdown)) && !args.command.supports_markdown() {
-        return Err(CliError::InvalidArgument(
+    if matches!(requested_robot_format(args), Some(OutputFormat::Markdown))
+        && !args.command.supports_markdown()
+    {
+        return Err(CliError::Usage(
             "--format md is only supported for `am robot thread` and `am robot message`"
                 .to_string(),
         ));
     }
     Ok(())
+}
+
+fn requested_robot_format(args: &RobotArgs) -> Option<OutputFormat> {
+    args.format
+        .or_else(|| args.json.then_some(OutputFormat::Json))
 }
 
 fn parse_search_recipient_kind(kind: Option<&str>) -> Result<Option<String>, CliError> {
@@ -2118,7 +3048,7 @@ fn resolve_optional_agent_id(
 
 struct RobotDbHandle {
     conn: DbConn,
-    _snapshot_dir: Option<tempfile::TempDir>,
+    _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
 }
 
 impl RobotDbHandle {
@@ -2145,8 +3075,11 @@ impl RobotDbHandle {
         } else {
             None
         };
-        let snapshot_dir = tempfile::tempdir()
-            .map_err(|e| CliError::Other(format!("robot archive snapshot tempdir failed: {e}")))?;
+        let snapshot_dir =
+            mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("robot-archive-snapshot-")
+                .map_err(|e| {
+                    CliError::Other(format!("robot archive snapshot tempdir failed: {e}"))
+                })?;
         let db_path = snapshot_dir.path().join("robot-archive-snapshot.sqlite3");
         mcp_agent_mail_db::reconstruct_from_archive(&db_path, storage_root).map_err(|e| {
             CliError::Other(format!("robot archive snapshot reconstruction failed: {e}"))
@@ -3156,11 +4089,13 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
         || adm.suppressed
         || adm.in_progress
         || adm.attempts_in_window > 0
+        || adm.successes_in_window > 1
     {
         Some(RecoveryAdmissionSnapshot {
             in_progress: adm.in_progress,
             consecutive_failures: adm.consecutive_failures,
             attempts_in_window: adm.attempts_in_window,
+            successes_in_window: adm.successes_in_window,
             suppressed: adm.suppressed,
         })
     } else {
@@ -3184,7 +4119,12 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     }
     if adm.suppressed {
         stall_detected = true;
-        stall_reasons.push("admission controller suppressed after repeated failures");
+        if adm.consecutive_failures == 0 && adm.successes_in_window > 1 {
+            stall_reasons
+                .push("admission controller suppressed after a non-convergent reconstruct loop");
+        } else {
+            stall_reasons.push("admission controller suppressed after repeated failures");
+        }
     }
     if matches!(
         dw_status.pressure,
@@ -3214,10 +4154,17 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
                     "Recovery lock is stale (process exited); run `am doctor repair` to restart"
                         .to_string()
                 } else if adm.suppressed {
-                    format!(
-                        "Recovery suppressed after {} consecutive failures; run `am doctor repair --yes` to override",
-                        adm.consecutive_failures,
-                    )
+                    if adm.consecutive_failures == 0 && adm.successes_in_window > 1 {
+                        format!(
+                            "Recovery suppressed after a non-convergent reconstruct loop ({} successful rebuilds re-corrupted in the window); quiesce writers, then run `am doctor reconstruct --yes` / `am doctor repair --yes`",
+                            adm.successes_in_window,
+                        )
+                    } else {
+                        format!(
+                            "Recovery suppressed after {} consecutive failures; run `am doctor repair --yes` to override",
+                            adm.consecutive_failures,
+                        )
+                    }
                 } else if let Some(age) = elapsed_secs {
                     format!(
                         "Recovery has been running for {} without completing; investigate lock holder or run `am doctor repair --yes`",
@@ -3288,6 +4235,125 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     })
 }
 
+/// Build the degraded-mode queued-intent list for `am robot status`
+/// (br-bvq1x.8.3 / H3).
+///
+/// Aggregates the three durable-intent surfaces: queued acknowledgements and
+/// reservation releases (auto-replayed on the next successful call) and queued
+/// UNSENT messages (replayed via an explicit command). Best-effort: any
+/// unreadable surface is skipped rather than failing the status command.
+fn build_queued_intents_for_robot() -> Vec<QueuedIntentSummary> {
+    build_queued_intents_for_config(&mcp_agent_mail_core::Config::get())
+}
+
+/// Config-taking core of [`build_queued_intents_for_robot`] (unit-testable).
+fn build_queued_intents_for_config(
+    config: &mcp_agent_mail_core::Config,
+) -> Vec<QueuedIntentSummary> {
+    use mcp_agent_mail_tools::degraded_intents as di;
+
+    let mut out: Vec<QueuedIntentSummary> = Vec::new();
+
+    // 1. Queued acknowledgements (auto-replay on next successful ack).
+    if let Ok(acks) = di::read_queued_ack_intents(config) {
+        let path = di::log_path(config, di::ACK_INTENT_LOG_FILE)
+            .display()
+            .to_string();
+        for intent in acks {
+            out.push(QueuedIntentSummary {
+                kind: "acknowledge_message".to_string(),
+                id: intent.intent_id,
+                agent: Some(intent.agent_name.clone()),
+                summary: format!(
+                    "ack of message {} by {} queued ({})",
+                    intent.message_id, intent.agent_name, intent.failure.stage
+                ),
+                replay: "automatic on next successful acknowledge_message".to_string(),
+                path: Some(path.clone()),
+            });
+        }
+    }
+
+    // 2. Queued reservation releases (auto-replay on next successful release).
+    if let Ok(releases) = di::read_queued_release_intents(config) {
+        let path = di::log_path(config, di::RELEASE_INTENT_LOG_FILE)
+            .display()
+            .to_string();
+        for intent in releases {
+            let target = match (&intent.paths, &intent.file_reservation_ids) {
+                (Some(paths), _) if !paths.is_empty() => paths.join(", "),
+                (_, Some(ids)) if !ids.is_empty() => format!(
+                    "reservation ids {}",
+                    ids.iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => "all reservations".to_string(),
+            };
+            out.push(QueuedIntentSummary {
+                kind: "release_file_reservations".to_string(),
+                id: intent.intent_id,
+                agent: Some(intent.agent_name.clone()),
+                summary: format!("release of {target} by {} queued", intent.agent_name),
+                replay: "automatic on next successful release_file_reservations".to_string(),
+                path: Some(path.clone()),
+            });
+        }
+    }
+
+    // 3. Queued UNSENT messages (explicit `am mail replay-queued` command).
+    out.extend(scan_pending_send_intents(config));
+
+    out
+}
+
+/// Scan `<storage_root>/pending_sends/` for UNSENT message artifacts that have
+/// not yet been replayed (no sibling `.sent.json` receipt).
+fn scan_pending_send_intents(config: &mcp_agent_mail_core::Config) -> Vec<QueuedIntentSummary> {
+    let dir = config.storage_root.join("pending_sends");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<QueuedIntentSummary> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Only artifacts; skip ".sent.json" receipts and anything else.
+        if !name.ends_with(".json") || name.ends_with(".sent.json") {
+            continue;
+        }
+        // An artifact with a sibling receipt has already been sent.
+        if crate::pending_send_receipt_path(&path).exists() {
+            continue;
+        }
+        let Ok(artifact) = crate::load_pending_send_artifact(&path) else {
+            continue;
+        };
+        if artifact.status != crate::PENDING_SEND_UNSENT_STATUS {
+            continue;
+        }
+        out.push(QueuedIntentSummary {
+            kind: "send_message".to_string(),
+            id: artifact.content_hash.clone(),
+            agent: Some(artifact.envelope.sender.clone()),
+            summary: format!(
+                "UNSENT message \"{}\" from {} to {}",
+                artifact.envelope.subject,
+                artifact.envelope.sender,
+                artifact.envelope.to.join(", ")
+            ),
+            replay: artifact.replay_command.clone(),
+            path: Some(path.display().to_string()),
+        });
+    }
+    // Deterministic order for stable robot output.
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 /// Format a duration in seconds into a compact human-readable string.
 ///
 /// Examples: "12s", "2m 35s", "1h 12m", "2h 0m".
@@ -3354,6 +4420,261 @@ fn find_latest_forensic_bundle_for_robot(
         }
     }
     latest.map(|(_, path)| path.display().to_string())
+}
+
+const ROBOT_RECOMMENDATION_STALE_AFTER_US: i64 = 10 * MICROS_PER_MINUTE;
+const ROBOT_RECOMMENDATION_LIMIT: usize = 6;
+
+#[derive(Debug, Clone)]
+struct OperatorRecommendationCandidate {
+    category: String,
+    action: String,
+    reason: String,
+    confidence: f64,
+    affected: String,
+    evidence: String,
+    artifact: Option<String>,
+    safe_command: String,
+    observed_ts_us: i64,
+    stale_after_us: i64,
+}
+
+impl OperatorRecommendationCandidate {
+    fn is_stale(&self, now_us: i64) -> bool {
+        now_us.saturating_sub(self.observed_ts_us) > self.stale_after_us
+    }
+
+    fn dedupe_key(&self) -> String {
+        format!("{}|{}|{}", self.category, self.affected, self.safe_command)
+    }
+
+    fn into_recommendation(self, rank: usize) -> OperatorRecommendation {
+        let confidence = if self.confidence.is_finite() {
+            self.confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        OperatorRecommendation {
+            rank,
+            category: self.category,
+            action: redact_recommendation_text(&self.action),
+            reason: redact_recommendation_text(&self.reason),
+            confidence,
+            affected: redact_recommendation_text(&self.affected),
+            evidence: redact_recommendation_text(&self.evidence),
+            artifact: self
+                .artifact
+                .map(|artifact| redact_recommendation_text(&artifact)),
+            safe_command: redact_recommendation_text(&self.safe_command),
+        }
+    }
+}
+
+fn rank_operator_recommendations(
+    now_us: i64,
+    mut candidates: Vec<OperatorRecommendationCandidate>,
+    limit: usize,
+) -> Vec<OperatorRecommendation> {
+    candidates.retain(|candidate| !candidate.is_stale(now_us));
+    candidates.sort_by(|left, right| {
+        right
+            .confidence
+            .total_cmp(&left.confidence)
+            .then_with(|| left.category.cmp(&right.category))
+            .then_with(|| left.safe_command.cmp(&right.safe_command))
+    });
+
+    let mut seen = HashSet::new();
+    let mut recommendations = Vec::new();
+    for candidate in candidates {
+        if seen.insert(candidate.dedupe_key()) {
+            recommendations.push(candidate.into_recommendation(recommendations.len() + 1));
+            if recommendations.len() >= limit {
+                break;
+            }
+        }
+    }
+    recommendations
+}
+
+fn redaction_value_delimiter(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '&' | '?' | '#' | '"' | '\'' | '`' | ')' | '(' | ']' | '[' | '}' | '{' | ',' | ';'
+        )
+}
+
+fn redact_after_marker(input: &str, marker: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let marker_lower = marker.to_ascii_lowercase();
+    let mut cursor = 0;
+    let mut output = String::with_capacity(input.len());
+
+    while let Some(relative_start) = lower[cursor..].find(&marker_lower) {
+        let marker_start = cursor + relative_start;
+        let value_start = marker_start + marker.len();
+        output.push_str(&input[cursor..value_start]);
+
+        let value_end = input[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| redaction_value_delimiter(ch).then_some(value_start + idx))
+            .unwrap_or(input.len());
+        if value_end > value_start {
+            output.push_str("[redacted]");
+        }
+        cursor = value_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn redact_recommendation_text(input: &str) -> String {
+    [
+        "bearer ",
+        "token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "secret=",
+        "authorization=",
+    ]
+    .into_iter()
+    .fold(input.to_string(), |text, marker| {
+        redact_after_marker(&text, marker)
+    })
+}
+
+fn robot_shell_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn build_status_recommendations(
+    project_slug: &str,
+    agent_name: Option<&str>,
+    ack_overdue: usize,
+    reservations_expiring_soon: usize,
+    top_threads: &[ThreadSummary],
+    recovery: Option<&RecoveryStatus>,
+    now_us: i64,
+) -> Vec<OperatorRecommendation> {
+    let project_arg = robot_shell_arg(project_slug);
+    let mut candidates = Vec::new();
+
+    if ack_overdue > 0
+        && let Some(agent_name) = agent_name
+    {
+        let agent_arg = robot_shell_arg(agent_name);
+        candidates.push(OperatorRecommendationCandidate {
+            category: "ack_sla".to_string(),
+            action: "Review overdue acknowledgements".to_string(),
+            reason: format!(
+                "{ack_overdue} ack-required message(s) are beyond the 30-minute acknowledgement threshold"
+            ),
+            confidence: 1.0,
+            affected: format!("project:{project_slug};agent:{agent_name}"),
+            evidence: format!(
+                "robot://status/ack-overdue?project={project_slug}&agent={agent_name}&count={ack_overdue}"
+            ),
+            artifact: None,
+            safe_command: format!(
+                "am robot inbox --project {project_arg} --agent {agent_arg} --ack-overdue"
+            ),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    if reservations_expiring_soon > 0 {
+        candidates.push(OperatorRecommendationCandidate {
+            category: "reservation_expiry".to_string(),
+            action: "Renew or release expiring reservations".to_string(),
+            reason: format!(
+                "{reservations_expiring_soon} active reservation(s) expire within 5 minutes"
+            ),
+            confidence: 0.95,
+            affected: format!("project:{project_slug};reservations:expiring_soon"),
+            evidence: format!(
+                "robot://status/reservations-expiring-soon?project={project_slug}&count={reservations_expiring_soon}"
+            ),
+            artifact: None,
+            safe_command: format!("am robot reservations --project {project_arg} --expiring 5"),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    if let Some(recovery) = recovery {
+        candidates.push(OperatorRecommendationCandidate {
+            category: "mailbox_recovery".to_string(),
+            action: "Inspect mailbox durability state".to_string(),
+            reason: recovery.next_action.clone(),
+            confidence: if recovery.stall_detected { 0.98 } else { 0.9 },
+            affected: format!("mailbox:{};phase:{}", recovery.mode, recovery.phase),
+            evidence: format!(
+                "robot://status/recovery?mode={}&phase={}&stalled={}",
+                recovery.mode, recovery.phase, recovery.stall_detected
+            ),
+            artifact: recovery.bundle_path.clone(),
+            safe_command: "am doctor check --json".to_string(),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    if let Some(top) = top_threads.first() {
+        candidates.push(OperatorRecommendationCandidate {
+            category: "thread_activity".to_string(),
+            action: "Inspect the most active thread".to_string(),
+            reason: format!(
+                "Thread {} is the latest active thread with {} message(s) and {} participant(s)",
+                top.id, top.messages, top.participants
+            ),
+            confidence: 0.6,
+            affected: format!("project:{project_slug};thread:{}", top.id),
+            evidence: format!(
+                "resource://thread/{}?project={project_slug}&include_bodies=false",
+                top.id
+            ),
+            artifact: None,
+            safe_command: format!(
+                "am robot thread --project {project_arg} {}",
+                robot_shell_arg(&top.id)
+            ),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    let agent_flag = agent_name
+        .map(|name| format!(" --agent {}", robot_shell_arg(name)))
+        .unwrap_or_default();
+    candidates.push(OperatorRecommendationCandidate {
+        category: "verification_lane".to_string(),
+        action: "Run workspace cargo check under build-slot admission".to_string(),
+        reason: "Heavy verification should acquire the verify-cargo-check build slot and offload cargo through rch before running".to_string(),
+        confidence: 0.55,
+        affected: format!("project:{project_slug};slot:verify-cargo-check"),
+        evidence: format!(
+            "robot://status/verification-lane?project={project_slug}&slot=verify-cargo-check"
+        ),
+        artifact: None,
+        safe_command: format!(
+            "am verify cargo-check --path .{agent_flag} --block-on-conflicts"
+        ),
+        observed_ts_us: now_us,
+        stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+    });
+
+    rank_operator_recommendations(now_us, candidates, ROBOT_RECOMMENDATION_LIMIT)
 }
 
 #[cfg(test)]
@@ -3525,6 +4846,19 @@ fn build_status_with_phase(
     };
     mark_tail_latency_phase(&mut phase, "sqlite_my_reservations");
 
+    let reservation_forecast = build_reservations(
+        conn,
+        project_id,
+        project_slug,
+        agent.clone(),
+        true,
+        false,
+        Some(10),
+    )?
+    .0
+    .forecast;
+    mark_tail_latency_phase(&mut phase, "sqlite_reservation_forecast");
+
     // 6. Top threads (3 most recently active)
     let top_threads_rows = conn
         .query_sync(
@@ -3567,6 +4901,10 @@ fn build_status_with_phase(
         .collect::<Result<Vec<_>, _>>()?;
     mark_tail_latency_phase(&mut phase, "sqlite_top_threads_materialization");
 
+    // Degraded-mode intents queued for replay (ack/release/send).
+    let queued_intents = build_queued_intents_for_robot();
+    mark_tail_latency_phase(&mut phase, "degraded_queued_intents");
+
     // 7. Build anomalies
     let mut anomalies = Vec::new();
     if ack_overdue > 0 {
@@ -3577,6 +4915,7 @@ fn build_status_with_phase(
             headline: format!("{ack_overdue} message(s) pending ack > 30 minutes"),
             rationale: "Messages with ack_required=true have been waiting beyond the 30-minute SLA threshold".to_string(),
             remediation: "am robot inbox --ack-overdue".to_string(),
+            playbooks: vec![],
         });
     }
     if reservations_expiring_soon > 0 {
@@ -3590,6 +4929,24 @@ fn build_status_with_phase(
             rationale: "File reservations are about to expire which may cause edit conflicts"
                 .to_string(),
             remediation: "am robot reservations --expiring=5".to_string(),
+            playbooks: vec![],
+        });
+    }
+    if !queued_intents.is_empty() {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 1.0,
+            category: "degraded_intents".to_string(),
+            headline: format!(
+                "{} degraded-mode intent(s) queued for replay",
+                queued_intents.len()
+            ),
+            rationale: "Mutations were queued locally because the mailbox was unavailable; \
+                 acknowledgements/releases replay automatically on the next successful call, \
+                 sends replay via the listed command once the mailbox recovers"
+                .to_string(),
+            remediation: "am robot status --format json | jq '.queued_intents'".to_string(),
+            playbooks: vec![],
         });
     }
 
@@ -3611,9 +4968,29 @@ fn build_status_with_phase(
             top.id
         ));
     }
+    // Surface explicit replay commands for queued UNSENT messages.
+    for qi in &queued_intents {
+        if qi.kind == "send_message" && !actions.contains(&qi.replay) {
+            actions.push(qi.replay.clone());
+        }
+    }
     mark_tail_latency_phase(&mut phase, "downstream_actions");
 
     let recovery = build_recovery_status_for_robot();
+    let recommendations = build_status_recommendations(
+        project_slug,
+        agent.as_ref().map(|(_, name)| name.as_str()),
+        ack_overdue,
+        reservations_expiring_soon,
+        &top_threads,
+        recovery.as_ref(),
+        now_us,
+    );
+    for recommendation in &recommendations {
+        if !actions.contains(&recommendation.safe_command) {
+            actions.push(recommendation.safe_command.clone());
+        }
+    }
 
     // Escalate health to "recovering" or "error" if durability is degraded.
     let health = if recovery.is_some() {
@@ -3642,6 +5019,15 @@ fn build_status_with_phase(
         "degraded".to_string()
     };
 
+    let config = mcp_agent_mail_core::Config::get();
+    let forensic_timeline = crate::build_forensic_timeline_report(
+        &config.database_url,
+        &config.storage_root,
+        &health,
+        &[],
+        true,
+    );
+
     let data = StatusData {
         health,
         unread,
@@ -3655,7 +5041,12 @@ fn build_status_with_phase(
         my_reservations,
         top_threads,
         anomalies,
+        recommendations,
+        reservation_forecast,
         recovery,
+        queued_intents,
+        search_index: None,
+        forensic_timeline: Some(forensic_timeline),
     };
 
     Ok((data, actions))
@@ -3690,13 +5081,13 @@ fn build_status_with_snapshot_cache(
         agent_id: agent.as_ref().map(|(id, _)| *id),
         agent_name: agent.as_ref().map(|(_, name)| name.clone()),
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_status_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok((entry.data.clone(), entry.actions.clone()));
@@ -3711,12 +5102,165 @@ fn build_status_with_snapshot_cache(
         key,
         RobotStatusSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             data: data.clone(),
             actions: actions.clone(),
         },
     );
     Ok((data, actions))
+}
+
+fn status_health_from_recovery(
+    recovery: Option<&RecoveryStatus>,
+    anomalies: &[AnomalyCard],
+) -> String {
+    if let Some(recovery) = recovery {
+        match recovery.mode.as_str() {
+            "recovering" => return "recovering".to_string(),
+            "corrupt" => return "error".to_string(),
+            "degraded_read_only" => return "degraded".to_string(),
+            _ => {}
+        }
+    }
+
+    if anomalies.iter().any(|a| a.severity == "error") {
+        "error".to_string()
+    } else if anomalies.is_empty() {
+        "ok".to_string()
+    } else {
+        "degraded".to_string()
+    }
+}
+
+fn recovery_fallback_project_slug(project_flag: Option<&str>) -> String {
+    let project_key = resolved_project_flag_or_env(project_flag)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| normalize_project_lookup_path(&path))
+        })
+        .unwrap_or_else(|| "unknown-project".to_string());
+    mcp_agent_mail_core::resolve_project_identity(&project_key).slug
+}
+
+fn build_recovery_only_status(
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+    source_error: &CliError,
+) -> Option<(StatusData, Vec<String>, String, Option<String>)> {
+    let recovery = build_recovery_status_for_robot()?;
+    if recovery.mode == "healthy" {
+        return None;
+    }
+
+    let project_slug = recovery_fallback_project_slug(project_flag);
+    let agent_name = resolved_agent_flag_or_env(agent_flag);
+    let now_us = mcp_agent_mail_db::now_micros();
+    let recommendations = build_status_recommendations(
+        &project_slug,
+        agent_name.as_deref(),
+        0,
+        0,
+        &[],
+        Some(&recovery),
+        now_us,
+    );
+    let mut actions = recommendations
+        .iter()
+        .map(|recommendation| recommendation.safe_command.clone())
+        .fold(Vec::new(), |mut acc, action| {
+            if !acc.contains(&action) {
+                acc.push(action);
+            }
+            acc
+        });
+    // Degraded-mode queued intents are read from disk, not the (possibly
+    // unreadable) live index, so they remain visible exactly when they matter.
+    let queued_intents = build_queued_intents_for_robot();
+    for qi in &queued_intents {
+        if qi.kind == "send_message" && !actions.contains(&qi.replay) {
+            actions.push(qi.replay.clone());
+        }
+    }
+    let source_error = redact_recommendation_text(&source_error.to_string());
+    let anomalies = vec![AnomalyCard {
+        severity: if recovery.mode == "corrupt" {
+            "error".to_string()
+        } else {
+            "warn".to_string()
+        },
+        confidence: if recovery.mode == "corrupt" { 1.0 } else { 0.9 },
+        category: "mailbox_recovery".to_string(),
+        headline: "Mailbox recovery state detected".to_string(),
+        rationale: format!(
+            "robot status could not read the live SQLite index ({source_error}); surfaced a recovery-only status snapshot"
+        ),
+        remediation: recovery.next_action.clone(),
+        playbooks: vec![],
+    }];
+    let health = status_health_from_recovery(Some(&recovery), &anomalies);
+    let config = mcp_agent_mail_core::Config::get();
+    let forensic_timeline = crate::build_forensic_timeline_report(
+        &config.database_url,
+        &config.storage_root,
+        &health,
+        &[],
+        false,
+    );
+
+    let data = StatusData {
+        health,
+        unread: 0,
+        urgent: 0,
+        ack_required: 0,
+        ack_overdue: 0,
+        active_reservations: 0,
+        reservations_expiring_soon: 0,
+        active_agents: 0,
+        recent_messages: 0,
+        my_reservations: vec![],
+        top_threads: vec![],
+        anomalies,
+        recommendations,
+        reservation_forecast: None,
+        recovery: Some(recovery),
+        queued_intents,
+        search_index: None,
+        forensic_timeline: Some(forensic_timeline),
+    };
+
+    Some((data, actions, project_slug, agent_name))
+}
+
+fn render_status_output(
+    cmd_name: &str,
+    format: OutputFormat,
+    data: StatusData,
+    project_slug: Option<String>,
+    agent_name: Option<String>,
+    actions: Vec<String>,
+    mut phase: TailLatencyPhaseRecorder,
+) -> Result<String, CliError> {
+    let mut env = RobotEnvelope::new(cmd_name, format, data);
+    env._meta.project = project_slug;
+    env._meta.agent = agent_name.clone();
+    if agent_name.is_none() {
+        env = env.with_alert(
+            "info",
+            "Agent not detected — inbox/reservation sections omitted. Use --agent to specify.",
+            Some("am robot status --agent <NAME>".to_string()),
+        );
+    }
+    for a in actions {
+        env = env.with_action(&a);
+    }
+    let anomalies = env.data.anomalies.clone();
+    env = append_status_anomaly_alerts(env, &anomalies);
+    env = env.with_diagnostics(phase.snapshot("pre_render"));
+    let output = format_output(&env, format)?;
+    phase.mark("render_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(output)
 }
 
 // ── Inbox command implementation ────────────────────────────────────────────
@@ -3727,6 +5271,430 @@ struct InboxResult {
     entries: Vec<InboxEntry>,
     alerts: Vec<(String, String, Option<String>)>,
     actions: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RobotInboxData {
+    count: usize,
+    inbox: Vec<InboxEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct RobotInboxServerRequest {
+    project_key: String,
+    agent_name: String,
+    urgent: bool,
+    ack_overdue: bool,
+    unread: bool,
+    all: bool,
+    limit: usize,
+    include_bodies: bool,
+}
+
+#[derive(Debug)]
+struct ServerInboxEntry {
+    entry: InboxEntry,
+    bucket: i64,
+    created_ts: i64,
+}
+
+fn render_inbox_result(
+    cmd_name: &str,
+    format: OutputFormat,
+    result: InboxResult,
+    project: String,
+    agent: String,
+    mut phase: TailLatencyPhaseRecorder,
+) -> Result<String, CliError> {
+    let count = result.entries.len();
+    phase.set_rows_returned(count);
+    let mut env = RobotEnvelope::new(
+        cmd_name,
+        format,
+        RobotInboxData {
+            count,
+            inbox: result.entries,
+        },
+    );
+    env._meta.project = Some(project);
+    env._meta.agent = Some(agent);
+    for (severity, headline, action) in result.alerts {
+        env = env.with_alert(severity, headline, action);
+    }
+    for action in result.actions {
+        env = env.with_action(&action);
+    }
+    env = env.with_diagnostics(phase.snapshot("pre_render"));
+    let output = format_output(&env, format)?;
+    phase.mark("render_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(output)
+}
+
+fn robot_server_project_key(project_flag: Option<&str>) -> Result<String, CliError> {
+    if let Some(project_key) = resolved_project_flag_or_env(project_flag) {
+        return Ok(project_key);
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliError::Other(format!("cannot get CWD: {error}")))?;
+    Ok(cwd.to_string_lossy().into_owned())
+}
+
+fn build_robot_inbox_server_request(
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+    urgent: bool,
+    ack_overdue: bool,
+    unread: bool,
+    all: bool,
+    limit: Option<usize>,
+    include_bodies: bool,
+) -> Result<Option<RobotInboxServerRequest>, CliError> {
+    let Some(agent_name) = resolved_agent_flag_or_env(agent_flag) else {
+        return Ok(None);
+    };
+    Ok(Some(RobotInboxServerRequest {
+        project_key: robot_server_project_key(project_flag)?,
+        agent_name,
+        urgent,
+        ack_overdue,
+        unread: unread || (!urgent && !ack_overdue && !all),
+        all,
+        limit: limit.unwrap_or(20),
+        include_bodies,
+    }))
+}
+
+fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> {
+    if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL")
+        && !agent_mail_url.trim().is_empty()
+    {
+        return crate::check_inbox_server_urls_for_agent_mail_url(
+            &agent_mail_url,
+            &config.http_path,
+        );
+    }
+    crate::check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path)
+}
+
+fn robot_inbox_server_arguments(request: &RobotInboxServerRequest) -> serde_json::Value {
+    let ack_overdue_only = !request.urgent && request.ack_overdue;
+    let unread_only = if request.urgent {
+        true
+    } else if ack_overdue_only || request.all {
+        false
+    } else {
+        request.unread
+    };
+    serde_json::json!({
+        "project_key": request.project_key,
+        "agent_name": request.agent_name,
+        "urgent_only": request.urgent,
+        "limit": i32::try_from(request.limit).unwrap_or(i32::MAX),
+        "include_bodies": request.include_bodies,
+        "unread_only": unread_only,
+        "ack_overdue_only": ack_overdue_only,
+    })
+}
+
+fn server_inbox_rows(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if let Some(rows) = payload.as_array() {
+        return Some(rows);
+    }
+    if let Some(rows) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    {
+        return Some(rows);
+    }
+    payload.get("result").and_then(serde_json::Value::as_array)
+}
+
+fn server_inbox_iso_micros(row: &serde_json::Value, key: &str) -> Option<i64> {
+    row.get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(mcp_agent_mail_db::iso_to_micros)
+}
+
+fn server_inbox_row_to_entry(
+    row: &serde_json::Value,
+    now_us: i64,
+    ack_threshold: i64,
+    include_bodies: bool,
+) -> ServerInboxEntry {
+    let id = row
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let importance = row
+        .get("importance")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("normal")
+        .to_string();
+    let read_ts = server_inbox_iso_micros(row, "read_ts");
+    let ack_ts = server_inbox_iso_micros(row, "ack_ts");
+    let created_ts = server_inbox_iso_micros(row, "created_ts").unwrap_or(0);
+    let ack_required = row
+        .get("ack_required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let bucket = if matches!(importance.as_str(), "urgent" | "high") && read_ts.is_none() {
+        1
+    } else if ack_required && ack_ts.is_none() && created_ts < ack_threshold {
+        2
+    } else if ack_required && ack_ts.is_none() && read_ts.is_none() {
+        3
+    } else if read_ts.is_none() {
+        4
+    } else if ack_required && ack_ts.is_none() {
+        5
+    } else {
+        6
+    };
+    let priority = match bucket {
+        1 => "urgent",
+        2 => "ack-overdue",
+        3 => "ack-required",
+        4 => "unread",
+        5 => "read-unacked",
+        _ => "read",
+    }
+    .to_string();
+    let ack_status = if !ack_required {
+        "none".to_string()
+    } else if ack_ts.is_some() {
+        "acked".to_string()
+    } else if bucket == 2 {
+        "overdue".to_string()
+    } else if read_ts.is_some() {
+        "pending".to_string()
+    } else {
+        "required".to_string()
+    };
+    let thread_id = row
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let age_seconds = age_seconds_from_micros(now_us, created_ts);
+    ServerInboxEntry {
+        entry: InboxEntry {
+            id,
+            priority,
+            from: row
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            subject: row
+                .get("subject")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            thread: canonical_thread_ref(id, thread_id),
+            age: format_age(age_seconds),
+            ack_status,
+            importance,
+            body_md: if include_bodies {
+                row.get("body_md")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            },
+        },
+        bucket,
+        created_ts,
+    }
+}
+
+fn build_inbox_from_server_payload(
+    payload: &serde_json::Value,
+    request: &RobotInboxServerRequest,
+) -> Result<InboxResult, CliError> {
+    let rows = server_inbox_rows(payload)
+        .ok_or_else(|| CliError::Other("unexpected fetch_inbox response shape".to_string()))?;
+    let now_us = mcp_agent_mail_db::now_micros();
+    let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
+    let mut projected = rows
+        .iter()
+        .map(|row| server_inbox_row_to_entry(row, now_us, ack_threshold, request.include_bodies))
+        .filter(|row| {
+            if request.urgent {
+                row.bucket == 1
+            } else if request.ack_overdue {
+                row.bucket == 2
+            } else if request.all {
+                true
+            } else if request.unread {
+                row.bucket <= 4
+            } else {
+                row.bucket <= 5
+            }
+        })
+        .collect::<Vec<_>>();
+    projected.sort_by(|left, right| {
+        left.bucket
+            .cmp(&right.bucket)
+            .then_with(|| right.created_ts.cmp(&left.created_ts))
+            .then_with(|| right.entry.id.cmp(&left.entry.id))
+    });
+    projected.truncate(request.limit);
+
+    let mut overdue_ids = Vec::new();
+    let entries = projected
+        .into_iter()
+        .map(|row| {
+            if row.bucket == 2 {
+                overdue_ids.push(row.entry.id);
+            }
+            row.entry
+        })
+        .collect::<Vec<_>>();
+
+    let mut alerts = Vec::new();
+    if !overdue_ids.is_empty() {
+        let ids = overdue_ids
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>();
+        alerts.push((
+            "warn".to_string(),
+            format!(
+                "{} message(s) ack overdue (>30m): {}",
+                overdue_ids.len(),
+                ids.join(", ")
+            ),
+            Some(format!(
+                "am mail ack --project {} --agent {} {}",
+                request.project_key, request.agent_name, overdue_ids[0]
+            )),
+        ));
+    }
+
+    let mut actions = Vec::new();
+    for &id in overdue_ids.iter().take(3) {
+        actions.push(format!(
+            "am mail ack --project {} --agent {} {id}",
+            request.project_key, request.agent_name
+        ));
+    }
+    if let Some(entry) = entries.first()
+        && !entry.thread.is_empty()
+    {
+        actions.push(format!(
+            "am robot thread --project {} {}",
+            request.project_key, entry.thread
+        ));
+    }
+
+    Ok(InboxResult {
+        entries,
+        alerts,
+        actions,
+    })
+}
+
+fn try_build_inbox_via_server(
+    request: &RobotInboxServerRequest,
+    config: &mcp_agent_mail_core::Config,
+) -> Result<Option<InboxResult>, CliError> {
+    let urls = robot_inbox_server_urls(config);
+    if urls.is_empty() {
+        return Ok(None);
+    }
+    let bearer = crate::local_server_bearer_token(config);
+    let mut last_unavailable: Option<(String, String)> = None;
+
+    for server_url in urls {
+        let arguments = robot_inbox_server_arguments(request);
+        let call = crate::context::run_async(async {
+            Ok(crate::try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "fetch_inbox",
+                arguments,
+            )
+            .await)
+        })?;
+        match call {
+            crate::ServerToolCall::Success(result) => {
+                let payload = crate::coerce_tool_result_json_or_error("fetch_inbox", result)?;
+                return build_inbox_from_server_payload(&payload, request).map(Some);
+            }
+            crate::ServerToolCall::Unavailable(message) => {
+                last_unavailable = Some((server_url, message));
+            }
+            crate::ServerToolCall::Rejected(message) => {
+                if crate::mail_server_rejection_allows_local_fallback(&message) {
+                    tracing::debug!(
+                        message = %message,
+                        "robot inbox fell back to local scope after server scope mismatch"
+                    );
+                    return Ok(None);
+                }
+                return Err(CliError::Other(format!(
+                    "fetch_inbox via server failed: {message}"
+                )));
+            }
+        }
+    }
+
+    if let Some((server_url, message)) = last_unavailable {
+        crate::reject_local_fallback_if_mailbox_owned(
+            "robot inbox",
+            &server_url,
+            &message,
+            &config.database_url,
+            config.storage_root.as_path(),
+        )?;
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_local_inbox_result(
+    cmd_name: &str,
+    format: OutputFormat,
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+    urgent: bool,
+    ack_overdue: bool,
+    unread: bool,
+    all: bool,
+    limit: Option<usize>,
+    include_bodies: bool,
+    mut phase: TailLatencyPhaseRecorder,
+) -> Result<String, CliError> {
+    let scope = resolve_robot_scope(project_flag, agent_flag)?;
+    phase.mark("scope_resolution");
+    let (agent_id, agent_name_str) = scope.agent.clone().ok_or_else(|| {
+        CliError::InvalidArgument(
+            "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME".to_string(),
+        )
+    })?;
+
+    let result = build_inbox_with_snapshot_cache(
+        scope.conn(),
+        scope.project_id,
+        &scope.project_slug,
+        agent_id,
+        &agent_name_str,
+        urgent,
+        ack_overdue,
+        unread || (!urgent && !ack_overdue && !all),
+        all,
+        limit.unwrap_or(20),
+        include_bodies,
+        Some(&mut phase),
+    )?;
+    render_inbox_result(
+        cmd_name,
+        format,
+        result,
+        scope.project_slug,
+        agent_name_str,
+        phase,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4021,13 +5989,13 @@ fn build_inbox_with_snapshot_cache(
         show_all,
         limit,
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_inbox_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.result.clone());
@@ -4055,7 +6023,7 @@ fn build_inbox_with_snapshot_cache(
         key,
         RobotInboxSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             result: result.clone(),
         },
     );
@@ -4149,7 +6117,10 @@ fn load_recipient_display_names(
 
 fn is_missing_agents_table_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string();
-    message.contains("table not found: agents") || message.contains("no such table: agents")
+    message.contains("table not found: agents")
+        || message.contains("no such table: agents")
+        || message.contains("column not found: a.id")
+        || message.contains("column not found: a.name")
 }
 
 fn is_agent_not_found_error(error: &CliError) -> bool {
@@ -4736,25 +6707,70 @@ fn build_message(
 
 /// Facet count entry.
 #[derive(Debug, Serialize)]
-struct FacetEntry {
-    value: String,
-    count: usize,
+pub struct FacetEntry {
+    pub value: String,
+    pub count: usize,
 }
 
 /// Search result data with facets.
 #[derive(Debug, Serialize)]
-struct SearchData {
-    query: String,
-    total_results: usize,
-    results: Vec<SearchResult>,
+pub struct SearchData {
+    pub query: String,
+    pub total_results: usize,
+    pub results: Vec<SearchResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
+    pub route: Option<SearchRouteDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<mcp_agent_mail_db::search_planner::ZeroResultGuidance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<LexicalBackfillHealth>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_thread: Vec<FacetEntry>,
+    pub by_thread: Vec<FacetEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_agent: Vec<FacetEntry>,
+    pub by_agent: Vec<FacetEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_importance: Vec<FacetEntry>,
+    pub by_importance: Vec<FacetEntry>,
+}
+
+#[derive(Debug)]
+struct CollectedSearchRows {
+    rows: Vec<mcp_agent_mail_db::search_planner::SearchResult>,
+    explain: Option<mcp_agent_mail_db::search_planner::QueryExplain>,
+    assistance: Option<mcp_agent_mail_db::QueryAssistance>,
+    guidance: Option<mcp_agent_mail_db::search_planner::ZeroResultGuidance>,
+    next_cursor: Option<String>,
+}
+
+fn empty_search_guidance() -> mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+    mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+        summary: "No search terms provided. Enter a word, quoted phrase, thread id, or agent name."
+            .to_string(),
+        suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+            kind: "enter_search_terms".to_string(),
+            label: "Enter search terms".to_string(),
+            detail: Some(
+                "Examples: `rollback`, `\"build plan\"`, `thread:br-123`, or `from:BlueLake`."
+                    .to_string(),
+            ),
+        }],
+    }
+}
+
+fn recipient_kind_guidance(kind: &str) -> mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+    mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+        summary: format!("No results found after applying recipient-kind filter `{kind}`."),
+        suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+            kind: "drop_recipient_kind_filter".to_string(),
+            label: "Remove recipient-kind filter".to_string(),
+            detail: Some("Retry without `--kind` to include to/cc/bcc matches.".to_string()),
+        }],
+    }
 }
 
 fn build_search(
@@ -4773,7 +6789,20 @@ fn build_search(
             query: query.to_string(),
             total_results: 0,
             results: vec![],
+            route: Some(SearchRouteDiagnostic {
+                method: "empty_query".to_string(),
+                normalized_query: None,
+                used_like_fallback: false,
+                facet_count: 0,
+                facets_applied: vec![],
+            }),
+            assistance: None,
+            guidance: Some(empty_search_guidance()),
+            next_cursor: None,
             plan_diagnostic: None,
+            search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
+                pool,
+            )),
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -4783,6 +6812,7 @@ fn build_search(
     let now_us = mcp_agent_mail_db::now_micros();
     let mut search_query =
         mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
+    search_query.explain = true;
 
     if let Some(imp) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
         let parsed = mcp_agent_mail_db::search_planner::Importance::parse(imp);
@@ -4809,8 +6839,14 @@ fn build_search(
             &search_query,
         )
         .ok();
-    let search_rows =
+    let collected =
         collect_search_rows(conn, pool, &search_query, recipient_kind.as_deref(), limit)?;
+    let route = collected
+        .explain
+        .as_ref()
+        .map(SearchRouteDiagnostic::from_explain);
+    let mut guidance = collected.guidance;
+    let next_cursor = collected.next_cursor;
 
     // Build results and facets
     let mut results = Vec::new();
@@ -4821,7 +6857,7 @@ fn build_search(
     let mut importance_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
-    for row in search_rows {
+    for row in collected.rows {
         let subject = row.title;
         let thread_ref = canonical_thread_ref_for_row(row.id, row.thread_id.as_deref());
         let importance = row.importance.unwrap_or_else(|| "normal".to_string());
@@ -4877,11 +6913,24 @@ fn build_search(
     by_importance.sort_by_key(|x| std::cmp::Reverse(x.count));
 
     let total = results.len();
+    if total == 0
+        && guidance.is_none()
+        && let Some(kind) = recipient_kind.as_deref()
+    {
+        guidance = Some(recipient_kind_guidance(kind));
+    }
     Ok(SearchData {
         query: query.to_string(),
         total_results: total,
         results,
+        route,
+        assistance: collected.assistance,
+        guidance,
+        next_cursor,
         plan_diagnostic,
+        search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
+            pool,
+        )),
         by_thread,
         by_agent,
         by_importance,
@@ -4894,7 +6943,7 @@ fn collect_search_rows(
     query: &mcp_agent_mail_db::search_planner::SearchQuery,
     recipient_kind: Option<&str>,
     limit: usize,
-) -> Result<Vec<mcp_agent_mail_db::search_planner::SearchResult>, CliError> {
+) -> Result<CollectedSearchRows, CliError> {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build async runtime for search: {e}")))?;
@@ -4918,7 +6967,7 @@ fn collect_search_rows_with_runner<F>(
     recipient_kind: Option<&str>,
     requested_limit: usize,
     mut run_query: F,
-) -> Result<Vec<mcp_agent_mail_db::search_planner::SearchResult>, CliError>
+) -> Result<CollectedSearchRows, CliError>
 where
     F: FnMut(
         &mcp_agent_mail_db::search_planner::SearchQuery,
@@ -4927,9 +6976,22 @@ where
     let mut out = Vec::with_capacity(requested_limit);
     let mut seen_ids = std::collections::HashSet::new();
     let mut seen_cursors = std::collections::HashSet::new();
+    let mut explain = None;
+    let mut assistance = None;
+    let mut guidance = None;
 
     loop {
         let response = run_query(&paged_query)?;
+        if explain.is_none() {
+            explain = response.explain.clone();
+        }
+        if assistance.is_none() {
+            assistance = response.assistance.clone();
+        }
+        if guidance.is_none() {
+            guidance = response.guidance.clone();
+        }
+        let next_cursor = response.next_cursor.clone();
         let kind_id_filter = match recipient_kind {
             Some(kind) => Some(search_message_ids_by_recipient_kind(
                 conn,
@@ -4939,6 +7001,7 @@ where
             None => None,
         };
 
+        let mut omitted_matching_row_in_page = false;
         for row in response.results {
             if let Some(filter_ids) = &kind_id_filter
                 && !filter_ids.contains(&row.id)
@@ -4948,17 +7011,44 @@ where
             if !seen_ids.insert(row.id) {
                 continue;
             }
-            out.push(row);
-            if out.len() >= requested_limit {
-                return Ok(out);
+            if out.len() < requested_limit {
+                out.push(row);
+            } else {
+                omitted_matching_row_in_page = true;
             }
         }
 
-        let Some(next_cursor) = response.next_cursor else {
-            return Ok(out);
+        if out.len() >= requested_limit {
+            return Ok(CollectedSearchRows {
+                rows: out,
+                explain,
+                assistance,
+                guidance,
+                next_cursor: if omitted_matching_row_in_page {
+                    None
+                } else {
+                    next_cursor
+                },
+            });
+        }
+
+        let Some(next_cursor) = next_cursor else {
+            return Ok(CollectedSearchRows {
+                rows: out,
+                explain,
+                assistance,
+                guidance,
+                next_cursor: None,
+            });
         };
         if !seen_cursors.insert(next_cursor.clone()) {
-            return Ok(out);
+            return Ok(CollectedSearchRows {
+                rows: out,
+                explain,
+                assistance,
+                guidance,
+                next_cursor: None,
+            });
         }
         paged_query.cursor = Some(next_cursor);
     }
@@ -5044,8 +7134,12 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
     } else if metrics.failures_total == 0 {
         format!("{} checks, all passed", metrics.checks_total)
     } else {
+        // #164: the last check passed, so the DB is healthy *now*. Make the
+        // cumulative `failures_total` explicitly historical and surface
+        // `failures_since_last_ok` (0 here) so this never reads as current
+        // corruption.
         format!(
-            "last check passed; {} historical failures across {} checks",
+            "last check passed (0 failures since last ok); {} historical failures across {} checks (lifetime tally, not current state)",
             metrics.failures_total, metrics.checks_total
         )
     };
@@ -5384,16 +7478,49 @@ struct ReservationConflict {
     path_b: String,
 }
 
+/// One reservation holder referenced by an advisory playbook.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationPlaybookHolder {
+    pub agent: String,
+    pub path: String,
+}
+
+/// Advisory coordination plan for reservation contention.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationPlaybook {
+    pub id: String,
+    pub kind: String,
+    pub severity: String,
+    pub confidence: f64,
+    pub title: String,
+    pub summary: String,
+    pub holders: Vec<ReservationPlaybookHolder>,
+    pub safe_command: String,
+    pub suggested_subject: String,
+    pub suggested_body: String,
+}
+
 /// Full reservations response data.
 #[derive(Debug, Clone, Serialize)]
 struct ReservationsData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     my_reservations: Vec<ReservationEntry>,
     all_active: Vec<ReservationEntry>,
+    /// Overlap-only projection of `all_active`: the subset of active leases that
+    /// actually participate in a conflict. Additive to `all_active` (which stays
+    /// the authoritative scoped snapshot on every read surface, including the
+    /// conflict-focused view) so conflict consumers can narrow to overlaps
+    /// without an operator mistaking "no overlaps" for "no active reservations".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conflicting_active: Vec<ReservationEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conflicts: Vec<ReservationConflict>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     expiring_soon: Vec<ReservationEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    playbooks: Vec<ReservationPlaybook>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forecast: Option<ReservationForecast>,
 }
 
 /// Format remaining seconds with warning markers.
@@ -5405,6 +7532,191 @@ fn format_remaining(seconds: i64) -> String {
         format!("{base} \u{26a0}")
     } else {
         base
+    }
+}
+
+fn build_reservation_conflict_playbooks(
+    project_slug: &str,
+    conflicts: &[ReservationConflict],
+) -> Vec<ReservationPlaybook> {
+    let project_arg = robot_shell_arg(project_slug);
+    conflicts
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, conflict)| {
+            let ordinal = index + 1;
+            let summary = format!(
+                "{} holds `{}` and {} holds overlapping `{}`",
+                conflict.agent_a, conflict.path_a, conflict.agent_b, conflict.path_b
+            );
+            let safe_command = format!("am robot reservations --project {project_arg} --conflicts --all");
+            ReservationPlaybook {
+                id: format!("reservation-conflict-{ordinal}"),
+                kind: "reservation_conflict".to_string(),
+                severity: "warn".to_string(),
+                confidence: 1.0,
+                title: "Coordinate exclusive reservation conflict".to_string(),
+                summary,
+                holders: vec![
+                    ReservationPlaybookHolder {
+                        agent: conflict.agent_a.clone(),
+                        path: conflict.path_a.clone(),
+                    },
+                    ReservationPlaybookHolder {
+                        agent: conflict.agent_b.clone(),
+                        path: conflict.path_b.clone(),
+                    },
+                ],
+                safe_command: safe_command.clone(),
+                suggested_subject: format!(
+                    "[reservation-conflict] {} / {}",
+                    conflict.agent_a, conflict.agent_b
+                ),
+                suggested_body: format!(
+                    "Please coordinate before editing overlapping reservations.\n\nConflict:\n- {}: `{}`\n- {}: `{}`\n\nSafe inspection command: `{safe_command}`\n\nSuggested resolution: narrow the reservation patterns, or have the relevant holder renew or release only their own reservation after handoff.",
+                    conflict.agent_a, conflict.path_a, conflict.agent_b, conflict.path_b
+                ),
+            }
+        })
+        .collect()
+}
+
+fn reservation_forecast_expiry_buckets(
+    project_slug: &str,
+    all_active: &[ReservationEntry],
+) -> Vec<ReservationExpiryBucket> {
+    const BUCKETS: &[(i64, i64, &str, u32)] = &[
+        (0, 5 * 60, "0-5m", 5),
+        (5 * 60, 15 * 60, "5-15m", 15),
+        (15 * 60, 60 * 60, "15-60m", 60),
+    ];
+
+    let project_arg = robot_shell_arg(project_slug);
+    let mut buckets = Vec::new();
+    for (from_seconds, until_seconds, label, expiring_minutes) in BUCKETS {
+        let entries: Vec<_> = all_active
+            .iter()
+            .filter(|entry| {
+                entry.remaining_seconds >= *from_seconds && entry.remaining_seconds < *until_seconds
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+
+        let mut agents: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.agent.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        agents.truncate(10);
+
+        let mut paths: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        paths.truncate(10);
+
+        buckets.push(ReservationExpiryBucket {
+            window: (*label).to_string(),
+            from_seconds: *from_seconds,
+            until_seconds: *until_seconds,
+            count: entries.len(),
+            agents,
+            paths,
+            safe_command: format!(
+                "am robot reservations --project {project_arg} --expiring {expiring_minutes} --all"
+            ),
+            evidence: format!(
+                "robot://reservations/expiry-herd?project={project_slug}&window={label}&count={}",
+                entries.len()
+            ),
+        });
+    }
+    buckets
+}
+
+fn reservation_forecast_conflict_hotspots(
+    project_slug: &str,
+    conflicts: &[ReservationConflict],
+) -> Vec<ReservationConflictHotspot> {
+    #[derive(Default)]
+    struct HotspotAccumulator {
+        conflict_pairs: usize,
+        agents: std::collections::BTreeSet<String>,
+        overlapping_paths: std::collections::BTreeSet<String>,
+    }
+
+    let mut by_path: std::collections::BTreeMap<String, HotspotAccumulator> =
+        std::collections::BTreeMap::new();
+    for conflict in conflicts {
+        for (path, agent, other_path, other_agent) in [
+            (
+                &conflict.path_a,
+                &conflict.agent_a,
+                &conflict.path_b,
+                &conflict.agent_b,
+            ),
+            (
+                &conflict.path_b,
+                &conflict.agent_b,
+                &conflict.path_a,
+                &conflict.agent_a,
+            ),
+        ] {
+            let acc = by_path.entry(path.clone()).or_default();
+            acc.conflict_pairs += 1;
+            acc.agents.insert(agent.clone());
+            acc.agents.insert(other_agent.clone());
+            acc.overlapping_paths.insert(other_path.clone());
+        }
+    }
+
+    let project_arg = robot_shell_arg(project_slug);
+    let mut hotspots: Vec<_> = by_path
+        .into_iter()
+        .map(|(path, acc)| {
+            let mut agents: Vec<_> = acc.agents.into_iter().collect();
+            agents.truncate(10);
+            let mut overlapping_paths: Vec<_> = acc.overlapping_paths.into_iter().collect();
+            overlapping_paths.truncate(10);
+            ReservationConflictHotspot {
+                evidence: format!(
+                    "robot://reservations/conflict-hotspot?project={project_slug}&path={path}&pairs={}",
+                    acc.conflict_pairs
+                ),
+                safe_command: format!(
+                    "am robot reservations --project {project_arg} --conflicts --all"
+                ),
+                path,
+                conflict_pairs: acc.conflict_pairs,
+                agents,
+                overlapping_paths,
+            }
+        })
+        .collect();
+    hotspots.sort_by(|left, right| {
+        right
+            .conflict_pairs
+            .cmp(&left.conflict_pairs)
+            .then(left.path.cmp(&right.path))
+    });
+    hotspots.truncate(5);
+    hotspots
+}
+
+fn build_reservation_forecast(
+    project_slug: &str,
+    all_active: &[ReservationEntry],
+    conflicts: &[ReservationConflict],
+) -> ReservationForecast {
+    ReservationForecast {
+        expiry_herds: reservation_forecast_expiry_buckets(project_slug, all_active),
+        conflict_hotspots: reservation_forecast_conflict_hotspots(project_slug, conflicts),
     }
 }
 
@@ -5567,15 +7879,20 @@ fn build_reservations(
     } else {
         all_active.clone()
     };
+    let scoped_playbooks = build_reservation_conflict_playbooks(project_slug, &scoped_conflicts);
+    let scoped_forecast =
+        build_reservation_forecast(project_slug, &scoped_all_active, &scoped_conflicts);
 
     // Build actions
     let mut actions = Vec::new();
     if let Some((_, ref agent_name)) = agent {
+        let project_arg = robot_shell_arg(project_slug);
+        let agent_arg = robot_shell_arg(agent_name);
         for entry in &scoped_expiring_soon {
             if entry.agent.as_deref() == Some(agent_name.as_str()) {
+                let path_arg = robot_shell_arg(&entry.path);
                 actions.push(format!(
-                    "am file_reservations renew {project_slug} {agent_name} --paths {} --extend-seconds 3600",
-                    entry.path
+                    "am file_reservations renew {project_arg} {agent_arg} --paths {path_arg} --extend-seconds 3600"
                 ));
             }
         }
@@ -5583,21 +7900,35 @@ fn build_reservations(
 
     // Apply filters
     if conflicts_only {
-        // Only keep entries involved in conflicts
+        // Compute the overlap-only projection, but keep `all_active` as the
+        // authoritative scoped snapshot. Previously the conflict-focused view
+        // *replaced* `all_active` with the overlap-only subset, so a live,
+        // non-overlapping reservation vanished from this one read surface while
+        // remaining visible in the normal/active/list/robot views — an operator
+        // could read "no overlaps" as "no active reservations" (#199). The
+        // narrower set is now surfaced additively as `conflicting_active`.
         let conflict_paths: std::collections::HashSet<String> = scoped_conflicts
             .iter()
             .flat_map(|c| vec![c.path_a.clone(), c.path_b.clone()])
             .collect();
-        let filtered: Vec<_> = scoped_all_active
-            .into_iter()
+        let conflicting_active: Vec<_> = scoped_all_active
+            .iter()
             .filter(|e| conflict_paths.contains(&e.path))
+            .cloned()
             .collect();
         return Ok((
             ReservationsData {
                 my_reservations: vec![],
-                all_active: filtered,
+                all_active: scoped_all_active,
+                conflicting_active,
                 conflicts: scoped_conflicts,
                 expiring_soon: vec![],
+                playbooks: scoped_playbooks,
+                forecast: ReservationForecast {
+                    expiry_herds: vec![],
+                    conflict_hotspots: scoped_forecast.conflict_hotspots,
+                }
+                .into_option(),
             },
             actions,
         ));
@@ -5609,19 +7940,27 @@ fn build_reservations(
             ReservationsData {
                 my_reservations: my_reservations.clone(),
                 all_active: scoped_all_active,
+                conflicting_active: vec![],
                 conflicts: scoped_conflicts,
                 expiring_soon: scoped_expiring_soon,
+                playbooks: scoped_playbooks,
+                forecast: scoped_forecast.into_option(),
             },
             actions,
         ));
     }
 
+    let playbooks = build_reservation_conflict_playbooks(project_slug, &conflicts);
+    let forecast = build_reservation_forecast(project_slug, &all_active, &conflicts);
     Ok((
         ReservationsData {
             my_reservations,
             all_active,
+            conflicting_active: vec![],
             conflicts,
             expiring_soon,
+            playbooks,
+            forecast: forecast.into_option(),
         },
         actions,
     ))
@@ -5665,13 +8004,13 @@ fn build_reservations_with_snapshot_cache(
         conflicts_only,
         expiring_minutes,
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_reservations_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         return Ok((entry.data.clone(), entry.actions.clone()));
     }
@@ -5692,7 +8031,7 @@ fn build_reservations_with_snapshot_cache(
         key,
         RobotReservationsSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             data: data.clone(),
             actions: actions.clone(),
         },
@@ -5703,6 +8042,643 @@ fn build_reservations_with_snapshot_cache(
 /// Check whether two reservation path patterns can overlap.
 fn glob_matches(pattern: &str, path: &str) -> bool {
     mcp_agent_mail_core::pattern_overlap::patterns_overlap(pattern, path)
+}
+
+fn clean_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::borrow::ToOwned::to_owned)
+}
+
+fn parse_handoff_timestamp_micros(value: Option<&str>) -> Option<i64> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(mcp_agent_mail_db::iso_to_micros)
+}
+
+fn find_beads_issues_jsonl(start: &Path) -> Option<PathBuf> {
+    let base = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    for candidate in base.ancestors() {
+        let issues = candidate.join(".beads").join("issues.jsonl");
+        if issues.is_file() {
+            return Some(issues);
+        }
+    }
+    None
+}
+
+fn resolve_handoff_project_root(project_human_key: Option<String>) -> Result<PathBuf, CliError> {
+    let Some(project_human_key) = project_human_key else {
+        return Err(CliError::Other(
+            "handoff requires a persisted project human_key; run `am robot handoff --project /abs/path` for the target beads workspace".to_string(),
+        ));
+    };
+    let project_root = PathBuf::from(&project_human_key);
+    if !project_root.is_absolute() {
+        return Err(CliError::InvalidArgument(format!(
+            "handoff project human_key must be absolute: {project_human_key}"
+        )));
+    }
+    if project_root.is_dir() {
+        Ok(project_root)
+    } else {
+        Err(CliError::InvalidArgument(format!(
+            "handoff project human_key is not an existing directory: {project_human_key}"
+        )))
+    }
+}
+
+fn decode_beads_issue_line(line: &str) -> Result<Option<BeadsIssueJson>, CliError> {
+    let raw: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| CliError::Other(format!("parse .beads/issues.jsonl failed: {error}")))?;
+    let Some(id) = clean_optional_string(raw.get("id").and_then(serde_json::Value::as_str)) else {
+        return Ok(None);
+    };
+    let title = clean_optional_string(raw.get("title").and_then(serde_json::Value::as_str))
+        .unwrap_or_else(|| id.clone());
+    let status = clean_optional_string(raw.get("status").and_then(serde_json::Value::as_str))
+        .unwrap_or_default();
+    let updated_at =
+        clean_optional_string(raw.get("updated_at").and_then(serde_json::Value::as_str));
+    let assignee = clean_optional_string(raw.get("assignee").and_then(serde_json::Value::as_str));
+    let owner = clean_optional_string(raw.get("owner").and_then(serde_json::Value::as_str));
+    let comments = raw
+        .get("comments")
+        .and_then(serde_json::Value::as_array)
+        .map(|comments| {
+            comments
+                .iter()
+                .map(|comment| BeadsCommentJson {
+                    author: clean_optional_string(
+                        comment.get("author").and_then(serde_json::Value::as_str),
+                    ),
+                    text: clean_optional_string(
+                        comment.get("text").and_then(serde_json::Value::as_str),
+                    ),
+                    created_at: clean_optional_string(
+                        comment
+                            .get("created_at")
+                            .and_then(serde_json::Value::as_str),
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(BeadsIssueJson {
+        id,
+        title,
+        status,
+        updated_at,
+        assignee,
+        owner,
+        comments,
+    }))
+}
+
+fn read_in_progress_beads(path: &Path) -> Result<Vec<BeadsIssueJson>, CliError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| CliError::Other(format!("read {} failed: {error}", path.display())))?;
+    let mut issues = Vec::new();
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(issue) = decode_beads_issue_line(line)?
+            && issue.status == "in_progress"
+        {
+            issues.push(issue);
+        }
+    }
+    issues.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(issues)
+}
+
+fn latest_handoff_comment(comments: &[BeadsCommentJson]) -> Option<&BeadsCommentJson> {
+    comments
+        .iter()
+        .filter(|comment| comment.author.is_some() || comment.created_at.is_some())
+        .max_by(|left, right| {
+            let left_ts = parse_handoff_timestamp_micros(left.created_at.as_deref()).unwrap_or(0);
+            let right_ts = parse_handoff_timestamp_micros(right.created_at.as_deref()).unwrap_or(0);
+            left_ts
+                .cmp(&right_ts)
+                .then_with(|| left.author.cmp(&right.author))
+        })
+}
+
+fn recent_handoff_comments(comments: &[BeadsCommentJson], now_us: i64) -> Vec<HandoffCommentView> {
+    let mut comments = comments.to_vec();
+    comments.sort_by(|left, right| {
+        let left_ts = parse_handoff_timestamp_micros(left.created_at.as_deref()).unwrap_or(0);
+        let right_ts = parse_handoff_timestamp_micros(right.created_at.as_deref()).unwrap_or(0);
+        right_ts
+            .cmp(&left_ts)
+            .then_with(|| right.author.cmp(&left.author))
+    });
+    comments
+        .into_iter()
+        .take(3)
+        .map(|comment| {
+            let created_at = comment.created_at.unwrap_or_else(|| "unknown".to_string());
+            let age_seconds = parse_handoff_timestamp_micros(Some(&created_at))
+                .map(|created_ts| age_seconds_from_micros(now_us, created_ts));
+            let text_preview = truncate_str(
+                &comment.text.unwrap_or_default().replace(['\r', '\n'], " "),
+                160,
+            );
+            HandoffCommentView {
+                author: comment.author.unwrap_or_else(|| "unknown".to_string()),
+                created_at,
+                age_seconds,
+                text_preview,
+            }
+        })
+        .collect()
+}
+
+fn fetch_handoff_agents(
+    conn: &DbConn,
+    project_id: i64,
+) -> Result<HashMap<String, HandoffAgentInfo>, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT name, program, model, last_active_ts
+             FROM agents
+             WHERE project_id = ?
+             ORDER BY last_active_ts DESC, id DESC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|error| CliError::Other(format!("handoff agents query failed: {error}")))?;
+    let mut agents = HashMap::new();
+    for row in &rows {
+        let name: String = row.get_as(0).unwrap_or_default();
+        if name.trim().is_empty() {
+            continue;
+        }
+        let key = name.to_ascii_lowercase();
+        agents.entry(key).or_insert_with(|| {
+            let last_active_ts = row
+                .get_as::<sqlmodel_core::Value>(3)
+                .ok()
+                .and_then(|value| value_to_micros(&value));
+            HandoffAgentInfo {
+                name,
+                program: row.get_as(1).unwrap_or_default(),
+                model: row.get_as(2).unwrap_or_default(),
+                last_active_ts,
+            }
+        });
+    }
+    Ok(agents)
+}
+
+fn fetch_handoff_active_reservations(
+    conn: &DbConn,
+    project_id: i64,
+    now_us: i64,
+) -> Result<Vec<HandoffReservationInfo>, CliError> {
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT fr.id,
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
+                        fr.path_pattern, fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts
+                 FROM file_reservations fr{active_reservation_join}
+                 LEFT JOIN agents a ON a.id = fr.agent_id
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
+                 ORDER BY fr.expires_ts ASC, fr.id ASC"
+            ),
+            &[Value::BigInt(project_id), Value::BigInt(now_us)],
+        )
+        .map_err(|error| {
+            CliError::Other(format!("handoff reservations query failed: {error}"))
+        })?;
+
+    let mut reservations = Vec::new();
+    for row in &rows {
+        let agent: String = row.get_as(1).unwrap_or_default();
+        if agent.trim().is_empty() {
+            continue;
+        }
+        let created_ts = row
+            .get_as::<sqlmodel_core::Value>(5)
+            .ok()
+            .and_then(|value| value_to_micros(&value));
+        let expires_ts = row
+            .get_as::<sqlmodel_core::Value>(6)
+            .ok()
+            .and_then(|value| value_to_micros(&value))
+            .unwrap_or(0);
+        reservations.push(HandoffReservationInfo {
+            id: row.get_as(0).unwrap_or_default(),
+            agent,
+            path: row.get_as(2).unwrap_or_default(),
+            exclusive: row.get_as::<i64>(3).unwrap_or(1) != 0,
+            reason: row.get_as(4).unwrap_or_default(),
+            created_ts,
+            expires_ts,
+        });
+    }
+    Ok(reservations)
+}
+
+fn reservation_reason_mentions_issue(reason: &str, issue_id: &str) -> bool {
+    let issue_id = issue_id.trim();
+    if issue_id.is_empty() {
+        return false;
+    }
+    reason
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        .any(|token| token.eq_ignore_ascii_case(issue_id))
+}
+
+fn handoff_reservations_for_issue(
+    reservations: &[HandoffReservationInfo],
+    owner_key: Option<&str>,
+    issue_id: &str,
+) -> Vec<HandoffReservationInfo> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut matched = Vec::new();
+    for reservation in reservations {
+        let matches_owner =
+            owner_key.is_some_and(|key| reservation.agent.eq_ignore_ascii_case(key));
+        let matches_reason = reservation_reason_mentions_issue(&reservation.reason, issue_id);
+        if (matches_owner || matches_reason) && seen.insert(reservation.id) {
+            matched.push(reservation.clone());
+        }
+    }
+    matched
+}
+
+fn fetch_handoff_mail_state(
+    conn: &DbConn,
+    project_id: i64,
+    thread_id: &str,
+    now_us: i64,
+) -> Result<HandoffMailState, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(DISTINCT m.id) AS message_count,
+                    COALESCE(SUM(CASE WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 1 ELSE 0 END), 0) AS ack_pending,
+                    COALESCE(SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
+                    COALESCE(MAX(m.created_ts), 0) AS latest_ts
+             FROM messages m
+             LEFT JOIN message_recipients mr ON mr.message_id = m.id
+             WHERE m.project_id = ? AND m.thread_id = ?",
+            &[Value::BigInt(project_id), Value::Text(thread_id.to_string())],
+        )
+        .map_err(|error| CliError::Other(format!("handoff mail query failed: {error}")))?;
+    let Some(row) = rows.first() else {
+        return Ok(HandoffMailState {
+            thread_id: thread_id.to_string(),
+            ..HandoffMailState::default()
+        });
+    };
+    let latest_ts = row.get_named::<i64>("latest_ts").unwrap_or(0);
+    Ok(HandoffMailState {
+        thread_id: thread_id.to_string(),
+        messages: row.get_named::<i64>("message_count").unwrap_or(0).max(0) as usize,
+        ack_required_pending: row.get_named::<i64>("ack_pending").unwrap_or(0).max(0) as usize,
+        unread: row.get_named::<i64>("unread_count").unwrap_or(0).max(0) as usize,
+        latest_message_at: (latest_ts > 0).then(|| mcp_agent_mail_db::micros_to_iso(latest_ts)),
+        latest_message_age_seconds: (latest_ts > 0)
+            .then(|| age_seconds_from_micros(now_us, latest_ts)),
+    })
+}
+
+fn handoff_owner_state(
+    agent: Option<&HandoffAgentInfo>,
+    now_us: i64,
+    active_cutoff_us: i64,
+) -> Option<HandoffOwnerState> {
+    let agent = agent?;
+    let status = match agent.last_active_ts {
+        Some(ts) if ts >= active_cutoff_us => "active",
+        Some(_) => "inactive",
+        None => "unknown",
+    }
+    .to_string();
+    Some(HandoffOwnerState {
+        name: agent.name.clone(),
+        program: agent.program.clone(),
+        model: agent.model.clone(),
+        last_active_ts: agent.last_active_ts.map(mcp_agent_mail_db::micros_to_iso),
+        last_active_age_seconds: agent
+            .last_active_ts
+            .map(|ts| age_seconds_from_micros(now_us, ts)),
+        last_active: agent
+            .last_active_ts
+            .map(|ts| format_age(age_seconds_from_micros(now_us, ts)))
+            .unwrap_or_else(|| "unknown".to_string()),
+        status,
+    })
+}
+
+fn handoff_reservation_views(
+    reservations: &[HandoffReservationInfo],
+    now_us: i64,
+) -> Vec<HandoffReservationView> {
+    reservations
+        .iter()
+        .map(|reservation| {
+            let remaining_seconds = remaining_seconds_from_micros(now_us, reservation.expires_ts);
+            HandoffReservationView {
+                agent: reservation.agent.clone(),
+                path: reservation.path.clone(),
+                exclusive: reservation.exclusive,
+                reason: reservation.reason.clone(),
+                created_age_seconds: reservation
+                    .created_ts
+                    .map(|ts| age_seconds_from_micros(now_us, ts)),
+                remaining_seconds,
+                remaining: format_remaining(remaining_seconds),
+            }
+        })
+        .collect()
+}
+
+fn handoff_action_rank(action: &str) -> u8 {
+    match action {
+        "blocked_by_reservation" => 0,
+        "ask_owner" => 1,
+        "takeover_candidate" => 2,
+        "reopen_candidate" => 3,
+        "needs_human_review" => 4,
+        "keep" => 5,
+        _ => 6,
+    }
+}
+
+fn handoff_safe_command(
+    action: &str,
+    project_slug: &str,
+    bead_root: &Path,
+    issue_id: &str,
+    owner: Option<&str>,
+) -> String {
+    let issue_arg = robot_shell_arg(issue_id);
+    let project_arg = robot_shell_arg(project_slug);
+    let bead_root_arg = robot_shell_arg(&bead_root.display().to_string());
+    let br_command = |command: String| format!("cd {bead_root_arg} && {command}");
+    match action {
+        "blocked_by_reservation" => owner.map_or_else(
+            || format!("am robot reservations --project {project_arg} --all --format json"),
+            |owner| {
+                format!(
+                    "am robot reservations --project {project_arg} --agent {} --all --format json",
+                    robot_shell_arg(owner)
+                )
+            },
+        ),
+        "ask_owner" => {
+            format!("am robot thread {issue_arg} --project {project_arg} --format json")
+        }
+        "takeover_candidate" | "reopen_candidate" => {
+            let command = if action == "takeover_candidate" {
+                format!("br update {issue_arg} --claim --json")
+            } else {
+                format!("br update {issue_arg} --status open --json")
+            };
+            br_command(command)
+        }
+        "keep" => br_command(format!("br show {issue_arg} --json")),
+        _ => format!("am robot handoff --project {project_arg} --include-fresh --format json"),
+    }
+}
+
+fn handoff_rationale(
+    action: &str,
+    owner: Option<&str>,
+    updated_age_seconds: Option<i64>,
+    reservation_count: usize,
+    mail: &HandoffMailState,
+) -> String {
+    let age = updated_age_seconds
+        .map(format_age)
+        .unwrap_or_else(|| "unknown age".to_string());
+    match action {
+        "blocked_by_reservation" => format!(
+            "Bead is stale ({age}), but {reservation_count} active reservation(s) still exist; coordinate before reopening."
+        ),
+        "ask_owner" => format!(
+            "Bead is stale ({age}) and has {} pending ack-required recipient row(s) in its mail thread; inspect or ask the owner first.",
+            mail.ack_required_pending
+        ),
+        "takeover_candidate" => format!(
+            "Bead is stale ({age}) and owner `{}` is not active by the configured threshold; inspect peer work before claiming it.",
+            owner.unwrap_or("unknown")
+        ),
+        "reopen_candidate" => {
+            format!(
+                "Bead is stale ({age}) and no owner could be inferred from assignee, owner, or comments."
+            )
+        }
+        "keep" => {
+            format!("Bead is not a safe handoff candidate under the configured thresholds ({age}).")
+        }
+        _ => "Bead needs manual review before any ownership change.".to_string(),
+    }
+}
+
+fn summarize_handoff_records(
+    total_in_progress: usize,
+    records: &[HandoffRecord],
+) -> HandoffSummary {
+    let mut summary = HandoffSummary {
+        total_in_progress,
+        shown: records.len(),
+        ..HandoffSummary::default()
+    };
+    for record in records {
+        match record.action.as_str() {
+            "keep" => summary.keep += 1,
+            "ask_owner" => summary.ask_owner += 1,
+            "takeover_candidate" => summary.takeover_candidates += 1,
+            "reopen_candidate" => summary.reopen_candidates += 1,
+            "blocked_by_reservation" => summary.blocked_by_reservation += 1,
+            "needs_human_review" => summary.needs_human_review += 1,
+            _ => summary.needs_human_review += 1,
+        }
+    }
+    summary
+}
+
+fn build_handoff(
+    scope: &ResolvedRobotProjectScope,
+    stale_minutes: u32,
+    active_minutes: u32,
+    fresh_comment_minutes: u32,
+    include_fresh: bool,
+    limit: Option<usize>,
+    explicit_dry_run: bool,
+) -> Result<(HandoffData, Vec<String>), CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let stale_cutoff_us = micros_ago(now_us, i64::from(stale_minutes) * MICROS_PER_MINUTE);
+    let active_cutoff_us = micros_ago(now_us, i64::from(active_minutes) * MICROS_PER_MINUTE);
+    let fresh_comment_cutoff_us =
+        micros_ago(now_us, i64::from(fresh_comment_minutes) * MICROS_PER_MINUTE);
+
+    let project_root =
+        resolve_handoff_project_root(project_human_key_sync(scope.conn(), scope.project_id)?)?;
+    let beads_jsonl = find_beads_issues_jsonl(&project_root).ok_or_else(|| {
+        CliError::InvalidArgument(format!(
+            "no .beads/issues.jsonl found at or above {}",
+            project_root.display()
+        ))
+    })?;
+    let bead_root = beads_jsonl
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(project_root.as_path())
+        .to_path_buf();
+    let issues = read_in_progress_beads(&beads_jsonl)?;
+    let total_in_progress = issues.len();
+    let agents = fetch_handoff_agents(scope.conn(), scope.project_id)?;
+    let active_reservations_all =
+        fetch_handoff_active_reservations(scope.conn(), scope.project_id, now_us)?;
+
+    let mut records = Vec::new();
+    for issue in issues {
+        let updated_ts = parse_handoff_timestamp_micros(issue.updated_at.as_deref());
+        let updated_age_seconds = updated_ts.map(|ts| age_seconds_from_micros(now_us, ts));
+        let stale = updated_ts.is_none_or(|ts| ts <= stale_cutoff_us);
+        let latest_comment = latest_handoff_comment(&issue.comments);
+        let latest_comment_ts = latest_comment
+            .and_then(|comment| parse_handoff_timestamp_micros(comment.created_at.as_deref()));
+        let has_fresh_comment = latest_comment_ts.is_some_and(|ts| ts >= fresh_comment_cutoff_us);
+        let inferred_owner = issue
+            .assignee
+            .clone()
+            .or_else(|| issue.owner.clone())
+            .or_else(|| latest_comment.and_then(|comment| comment.author.clone()));
+        let owner_key = inferred_owner
+            .as_ref()
+            .map(|owner| owner.to_ascii_lowercase());
+        let owner_agent = owner_key.as_ref().and_then(|key| agents.get(key));
+        let owner_state = handoff_owner_state(owner_agent, now_us, active_cutoff_us);
+        let owner_active = owner_state
+            .as_ref()
+            .is_some_and(|state| state.status == "active");
+        let owner_reservations = handoff_reservations_for_issue(
+            &active_reservations_all,
+            owner_key.as_deref(),
+            &issue.id,
+        );
+        let active_reservations = handoff_reservation_views(&owner_reservations, now_us);
+        let mail = fetch_handoff_mail_state(scope.conn(), scope.project_id, &issue.id, now_us)?;
+        let classification = classify_handoff(&HandoffClassificationInput {
+            stale,
+            owner_present: inferred_owner.is_some(),
+            owner_active,
+            has_active_reservation: !active_reservations.is_empty(),
+            has_fresh_comment,
+            has_ack_required_mail: mail.ack_required_pending > 0,
+        });
+        let action = classification.action.to_string();
+        let mut reason_codes: Vec<String> = classification
+            .reason_codes
+            .iter()
+            .map(|reason| (*reason).to_string())
+            .collect();
+        if updated_ts.is_none() {
+            reason_codes.push("missing_bead_updated_at".to_string());
+        }
+        let safe_command = handoff_safe_command(
+            &action,
+            &scope.project_slug,
+            &bead_root,
+            &issue.id,
+            inferred_owner.as_deref(),
+        );
+        let rationale = handoff_rationale(
+            &action,
+            inferred_owner.as_deref(),
+            updated_age_seconds,
+            active_reservations.len(),
+            &mail,
+        );
+        records.push(HandoffRecord {
+            id: issue.id,
+            title: issue.title,
+            status: issue.status,
+            updated_at: issue.updated_at,
+            updated_age_seconds,
+            stale,
+            assignee: issue.assignee,
+            owner: issue.owner,
+            inferred_owner,
+            owner_state,
+            recent_comments: recent_handoff_comments(&issue.comments, now_us),
+            active_reservations,
+            mail,
+            action,
+            reason_codes,
+            rationale,
+            safe_command,
+        });
+    }
+
+    if !include_fresh {
+        records.retain(|record| record.action != "keep");
+    }
+    records.sort_by(|left, right| {
+        handoff_action_rank(&left.action)
+            .cmp(&handoff_action_rank(&right.action))
+            .then_with(|| {
+                right
+                    .updated_age_seconds
+                    .unwrap_or(i64::MAX)
+                    .cmp(&left.updated_age_seconds.unwrap_or(i64::MAX))
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    records.truncate(limit.unwrap_or(ROBOT_HANDOFF_DEFAULT_LIMIT));
+
+    let summary = summarize_handoff_records(total_in_progress, &records);
+    let mut actions: Vec<String> = records
+        .iter()
+        .filter(|record| record.action != "keep")
+        .map(|record| record.safe_command.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if actions.is_empty() && !include_fresh && total_in_progress > 0 {
+        actions.push(format!(
+            "am robot handoff --project {} --include-fresh --format json",
+            robot_shell_arg(&scope.project_slug)
+        ));
+    }
+
+    Ok((
+        HandoffData {
+            mode: "stale_handoff_dashboard".to_string(),
+            read_only: true,
+            dry_run: true,
+            explicit_dry_run,
+            project_root: bead_root.display().to_string(),
+            beads_jsonl: beads_jsonl.display().to_string(),
+            stale_after_minutes: stale_minutes,
+            active_after_minutes: active_minutes,
+            fresh_comment_minutes,
+            summary,
+            records,
+        },
+        actions,
+    ))
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────
@@ -6037,13 +9013,13 @@ fn build_overview_with_snapshot_cache(
         }
     };
     let key = RobotOverviewSnapshotKey { db_identity };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_overview_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.projects.clone());
@@ -6058,7 +9034,7 @@ fn build_overview_with_snapshot_cache(
         key,
         RobotOverviewSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             projects: projects.clone(),
         },
     );
@@ -6070,11 +9046,13 @@ fn build_overview_with_snapshot_cache(
 fn build_analytics(
     conn: &DbConn,
     project_id: i64,
+    project_slug: &str,
     agent: Option<(i64, String)>,
 ) -> Result<Vec<AnomalyCard>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let mut anomalies = Vec::new();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
 
     // Check for ack SLA violations (>1h old unacked)
     let ack_overdue: i64 = conn
@@ -6101,64 +9079,38 @@ fn build_analytics(
             rationale: "Messages requiring acknowledgement have been pending over 1 hour"
                 .to_string(),
             remediation: "am robot inbox --ack-overdue".to_string(),
+            playbooks: vec![],
         });
     }
 
     // Check for reservation conflicts
-    let active_reservation_join_fr1 =
-        active_reservation_release_join_sql(has_release_ledger, "fr1", "rr1");
-    let active_reservation_join_fr2 =
-        active_reservation_release_join_sql(has_release_ledger, "fr2", "rr2");
-    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_predicate_fr1 = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr1",
-        "rr1",
-    );
-    let active_reservation_predicate_fr2 = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr2",
-        "rr2",
-    );
-    let conflict_rows = conn
-        .query_sync(
-            &format!(
-                "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2
-                 FROM file_reservations fr1{active_reservation_join_fr1}
-                 JOIN file_reservations fr2 ON fr1.id < fr2.id
-                   AND fr1.project_id = fr2.project_id
-                   AND fr1.agent_id != fr2.agent_id
-                 {active_reservation_join_fr2}
-                 WHERE fr1.project_id = ? AND fr1.\"exclusive\" = 1 AND fr2.\"exclusive\" = 1
-                   AND ({active_reservation_predicate_fr1}) AND ({active_reservation_predicate_fr2})
-                   AND fr1.expires_ts > ? AND fr2.expires_ts > ?"
-            ),
-            &[
-                Value::BigInt(project_id),
-                Value::BigInt(now_us),
-                Value::BigInt(now_us),
-            ],
-        )
-        .map_err(|e| CliError::Other(format!("analytics conflicts query failed: {e}")))?;
-    let mut conflict_count = 0;
-    for row in &conflict_rows {
-        let p1: String = row.get_named("p1").unwrap_or_default();
-        let p2: String = row.get_named("p2").unwrap_or_default();
-        if glob_matches(&p1, &p2) || glob_matches(&p2, &p1) || p1 == p2 {
-            conflict_count += 1;
-        }
-    }
+    let (reservation_data, _) = build_reservations(
+        conn,
+        project_id,
+        project_slug,
+        agent.clone(),
+        true,
+        false,
+        Some(10),
+    )?;
+    let conflict_count = reservation_data.conflicts.len();
     if conflict_count > 0 {
+        let remediation = reservation_data.playbooks.first().map_or_else(
+            || "am robot reservations --conflicts".to_string(),
+            |playbook| playbook.safe_command.clone(),
+        );
+        let rationale = reservation_data.playbooks.first().map_or_else(
+            || "Multiple agents hold exclusive reservations on overlapping paths".to_string(),
+            |playbook| playbook.summary.clone(),
+        );
         anomalies.push(AnomalyCard {
             severity: "error".to_string(),
             confidence: 1.0,
             category: "reservation_conflict".to_string(),
             headline: format!("{conflict_count} reservation conflict(s) detected"),
-            rationale: "Multiple agents hold exclusive reservations on overlapping paths"
-                .to_string(),
-            remediation: "am robot reservations --conflicts".to_string(),
+            rationale,
+            remediation,
+            playbooks: reservation_data.playbooks,
         });
     }
 
@@ -6215,6 +9167,7 @@ fn build_analytics(
             rationale: "Reservations nearing expiry may cause unprotected concurrent edits"
                 .to_string(),
             remediation: "am robot reservations --expiring=10".to_string(),
+            playbooks: vec![],
         });
     }
 
@@ -6245,6 +9198,7 @@ fn build_analytics(
             headline: format!("{} agent(s) idle >24h", idle_names.len()),
             rationale: format!("Agents inactive: {}", idle_names.join(", ")),
             remediation: "am robot agents".to_string(),
+            playbooks: vec![],
         });
     }
 
@@ -6264,6 +9218,7 @@ fn build_analytics(
                         entry.errors, entry.calls, entry.name
                     ),
                     remediation: "am robot metrics".to_string(),
+                    playbooks: vec![],
                 });
             }
         }
@@ -7025,13 +9980,13 @@ fn build_agents_with_snapshot_cache(
         active_only,
         sort_field: sort_field.map(str::to_string),
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_agents_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         return Ok(entry.agents.clone());
     }
@@ -7051,11 +10006,433 @@ fn build_agents_with_snapshot_cache(
         key,
         RobotAgentsSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             agents: agents.clone(),
         },
     );
     Ok(agents)
+}
+
+#[derive(Debug, Clone)]
+struct AgentLifecycleDbRow {
+    id: i64,
+    name: String,
+    program: String,
+    model: String,
+    last_active_ts: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveAgentProfile {
+    dir_name: String,
+    name: String,
+    program: Option<String>,
+    model: Option<String>,
+    path: PathBuf,
+}
+
+fn build_agent_lifecycle_diagnostics(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    project_human_key: &str,
+    storage_root: &Path,
+) -> Result<Vec<AgentLifecycleDiagnostic>, CliError> {
+    let project_arg = robot_shell_arg(project_slug);
+    let mut diagnostics = Vec::new();
+    let db_agents = fetch_agent_lifecycle_db_rows(conn, project_id)?;
+    let db_agents_by_name = db_agents
+        .iter()
+        .map(|agent| (agent.name.to_ascii_lowercase(), agent))
+        .collect::<HashMap<_, _>>();
+
+    append_duplicate_db_agent_diagnostics(&mut diagnostics, &db_agents, project_slug, &project_arg);
+    append_malformed_db_agent_diagnostics(&mut diagnostics, &db_agents, &project_arg);
+
+    if let Some(project_dir) = archive_project_dir_for_key(storage_root, project_human_key)
+        .or_else(|| archive_project_dir_for_key(storage_root, project_slug))
+    {
+        let archive_profiles = collect_archive_agent_profiles(&project_dir);
+        append_archive_profile_diagnostics(
+            &mut diagnostics,
+            &db_agents,
+            &db_agents_by_name,
+            &archive_profiles,
+            &project_arg,
+        );
+    } else if !db_agents.is_empty() {
+        diagnostics.push(AgentLifecycleDiagnostic {
+            reason_code: "archive_project_missing".to_string(),
+            severity: "warn".to_string(),
+            agent: "*".to_string(),
+            summary: "Archive project directory is missing for DB agents".to_string(),
+            detail: format!(
+                "Project `{project_slug}` has {} DB agent row(s), but no matching Git archive project directory was found under {}.",
+                db_agents.len(),
+                storage_root.display()
+            ),
+            evidence: format!("storage_root={}", storage_root.display()),
+            safe_command: "am doctor reconstruct --dry-run --json".to_string(),
+        });
+    }
+
+    append_pane_identity_diagnostics(
+        conn,
+        project_id,
+        project_human_key,
+        &db_agents_by_name,
+        &mut diagnostics,
+        &project_arg,
+    );
+
+    diagnostics.sort_by(|left, right| {
+        left.reason_code
+            .cmp(&right.reason_code)
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.evidence.cmp(&right.evidence))
+    });
+    Ok(diagnostics)
+}
+
+fn fetch_agent_lifecycle_db_rows(
+    conn: &DbConn,
+    project_id: i64,
+) -> Result<Vec<AgentLifecycleDbRow>, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT id, name, program, model, last_active_ts
+             FROM agents
+             WHERE project_id = ?
+             ORDER BY lower(name), last_active_ts DESC, id DESC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("agent lifecycle query failed: {e}")))?;
+
+    Ok(rows
+        .iter()
+        .map(|row| AgentLifecycleDbRow {
+            id: row.get_named("id").unwrap_or(0),
+            name: row.get_named("name").unwrap_or_default(),
+            program: row.get_named("program").unwrap_or_default(),
+            model: row.get_named("model").unwrap_or_default(),
+            last_active_ts: row.get_named("last_active_ts").unwrap_or(0),
+        })
+        .collect())
+}
+
+fn append_duplicate_db_agent_diagnostics(
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    db_agents: &[AgentLifecycleDbRow],
+    project_slug: &str,
+    project_arg: &str,
+) {
+    let mut groups = BTreeMap::<String, Vec<&AgentLifecycleDbRow>>::new();
+    for agent in db_agents {
+        groups
+            .entry(agent.name.to_ascii_lowercase())
+            .or_default()
+            .push(agent);
+    }
+    for agents in groups.values().filter(|agents| agents.len() > 1) {
+        let names = agents
+            .iter()
+            .map(|agent| format!("{}#{}", agent.name, agent.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let newest = agents
+            .iter()
+            .max_by_key(|agent| agent.last_active_ts)
+            .copied()
+            .unwrap_or(agents[0]);
+        diagnostics.push(AgentLifecycleDiagnostic {
+            reason_code: "duplicate_logical_agent".to_string(),
+            severity: "warn".to_string(),
+            agent: newest.name.clone(),
+            summary: "Duplicate case-insensitive DB agent rows".to_string(),
+            detail: format!(
+                "Project `{project_slug}` has {} DB rows for the same logical agent name; robot output keeps the newest row.",
+                agents.len()
+            ),
+            evidence: names,
+            safe_command: format!("am robot agents --project {project_arg} --format json"),
+        });
+    }
+}
+
+fn append_malformed_db_agent_diagnostics(
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    db_agents: &[AgentLifecycleDbRow],
+    project_arg: &str,
+) {
+    for agent in db_agents {
+        // Reserved operator/system identities (e.g. `HumanOverseer`) are
+        // deliberately not adjective+noun names; do not flag them (#243 Bug 3).
+        if mcp_agent_mail_core::models::is_reserved_operator_agent_name(&agent.name) {
+            continue;
+        }
+        if mcp_agent_mail_core::models::normalize_agent_name(&agent.name).is_none() {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "malformed_agent_name".to_string(),
+                severity: "warn".to_string(),
+                agent: agent.name.clone(),
+                summary: "Agent name does not match adjective+noun rules".to_string(),
+                detail: "The DB row is readable, but the name cannot be normalized by the current agent-name validator.".to_string(),
+                evidence: format!("agent_id={}", agent.id),
+                safe_command: format!(
+                    "am agents register --project {project_arg} --program {} --model {}",
+                    robot_shell_arg(&agent.program),
+                    robot_shell_arg(&agent.model)
+                ),
+            });
+        }
+    }
+}
+
+fn collect_archive_agent_profiles(project_dir: &Path) -> Vec<ArchiveAgentProfile> {
+    let agents_dir = project_dir.join("agents");
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return Vec::new();
+    };
+
+    let mut profiles = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path().join("profile.json");
+        if !path.is_file() {
+            profiles.push(ArchiveAgentProfile {
+                name: dir_name.clone(),
+                dir_name,
+                program: None,
+                model: None,
+                path,
+            });
+            continue;
+        }
+        let profile = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        profiles.push(ArchiveAgentProfile {
+            name: profile
+                .as_ref()
+                .and_then(|value| value.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&dir_name)
+                .to_string(),
+            dir_name,
+            program: profile
+                .as_ref()
+                .and_then(|value| value.get("program"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            model: profile
+                .as_ref()
+                .and_then(|value| value.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            path,
+        });
+    }
+    profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    profiles
+}
+
+fn append_archive_profile_diagnostics(
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    db_agents: &[AgentLifecycleDbRow],
+    db_agents_by_name: &HashMap<String, &AgentLifecycleDbRow>,
+    archive_profiles: &[ArchiveAgentProfile],
+    project_arg: &str,
+) {
+    let archive_by_name = archive_profiles
+        .iter()
+        .map(|profile| (profile.name.to_ascii_lowercase(), profile))
+        .collect::<HashMap<_, _>>();
+
+    for agent in db_agents {
+        let Some(profile) = archive_by_name.get(&agent.name.to_ascii_lowercase()) else {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "db_only_missing_profile".to_string(),
+                severity: "warn".to_string(),
+                agent: agent.name.clone(),
+                summary: "DB agent row has no archive profile artifact".to_string(),
+                detail: "The agent exists in SQLite but its Git-backed `agents/<name>/profile.json` artifact was not found.".to_string(),
+                evidence: format!("agent_id={}", agent.id),
+                safe_command: format!(
+                    "am agents register --project {project_arg} --program {} --model {} --name {}",
+                    robot_shell_arg(&agent.program),
+                    robot_shell_arg(&agent.model),
+                    robot_shell_arg(&agent.name)
+                ),
+            });
+            continue;
+        };
+
+        let mut mismatches = Vec::new();
+        if !profile.dir_name.eq_ignore_ascii_case(&agent.name) {
+            mismatches.push(format!("dir_name={}", profile.dir_name));
+        }
+        if let Some(program) = &profile.program
+            && !program.eq_ignore_ascii_case(&agent.program)
+        {
+            mismatches.push(format!("program={program}"));
+        }
+        if let Some(model) = &profile.model
+            && model != &agent.model
+        {
+            mismatches.push(format!("model={model}"));
+        }
+        if !mismatches.is_empty() {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "profile_metadata_mismatch".to_string(),
+                severity: "warn".to_string(),
+                agent: agent.name.clone(),
+                summary: "Archive profile metadata disagrees with the DB row".to_string(),
+                detail: "The profile artifact exists, but one or more fields differ from the current SQLite agent row.".to_string(),
+                evidence: format!("{}; path={}", mismatches.join(", "), profile.path.display()),
+                safe_command: format!(
+                    "am agents register --project {project_arg} --program {} --model {} --name {}",
+                    robot_shell_arg(&agent.program),
+                    robot_shell_arg(&agent.model),
+                    robot_shell_arg(&agent.name)
+                ),
+            });
+        }
+    }
+
+    for profile in archive_profiles {
+        if db_agents_by_name.contains_key(&profile.name.to_ascii_lowercase()) {
+            continue;
+        }
+        diagnostics.push(AgentLifecycleDiagnostic {
+            reason_code: "archive_only_profile".to_string(),
+            severity: "warn".to_string(),
+            agent: profile.name.clone(),
+            summary: "Archive profile has no matching DB agent row".to_string(),
+            detail: "The Git archive contains an agent profile that the current SQLite index does not list for this project.".to_string(),
+            evidence: profile.path.display().to_string(),
+            safe_command: "am doctor reconstruct --dry-run --json".to_string(),
+        });
+    }
+}
+
+fn append_pane_identity_diagnostics(
+    conn: &DbConn,
+    project_id: i64,
+    project_human_key: &str,
+    db_agents_by_name: &HashMap<String, &AgentLifecycleDbRow>,
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    project_arg: &str,
+) {
+    // Enumerate the LIVE pane-identity directory
+    // (`~/.config/agent-mail/identity/<project_hash>/`) and reconcile against the
+    // current `agents` table. Each alert carries the offending pane id, agent
+    // name, and the concrete backing file path so an operator can trace and
+    // remove an orphaned entry rather than chase a warning with no on-disk
+    // referent (#243 Bug 1).
+    let identities = mcp_agent_mail_core::list_identities_with_paths(project_human_key);
+    if identities.is_empty() {
+        return;
+    }
+
+    let mut panes_by_agent = BTreeMap::<String, Vec<(String, std::path::PathBuf)>>::new();
+    for (pane_id, agent_name, path) in &identities {
+        panes_by_agent
+            .entry(agent_name.to_ascii_lowercase())
+            .or_default()
+            .push((pane_id.clone(), path.clone()));
+
+        // Reserved operator/system identities (e.g. `HumanOverseer`) are not
+        // adjective+noun names by design; do not flag them (#243 Bug 3).
+        if !mcp_agent_mail_core::models::is_reserved_operator_agent_name(agent_name)
+            && mcp_agent_mail_core::models::normalize_agent_name(agent_name).is_none()
+        {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "malformed_pane_identity".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name.clone(),
+                summary: "Pane identity file points at a malformed agent name".to_string(),
+                detail: "The pane identity file is readable, but its agent name does not match the current validator.".to_string(),
+                evidence: format!("pane_id={pane_id}; agent={agent_name}; path={}", path.display()),
+                safe_command: format!("am robot agents --project {project_arg} --format json"),
+            });
+        }
+
+        if db_agents_by_name.contains_key(&agent_name.to_ascii_lowercase()) {
+            continue;
+        }
+
+        let other_projects = agent_projects_elsewhere(conn, project_id, agent_name);
+        if other_projects.is_empty() {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "pane_identity_unknown_agent".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name.clone(),
+                summary: "Pane identity file points at an unknown agent".to_string(),
+                detail: "The pane identity exists for this project, but the named agent is not registered in the project DB. Remove the stale file (path below) or re-register the agent.".to_string(),
+                evidence: format!("pane_id={pane_id}; agent={agent_name}; path={}", path.display()),
+                safe_command: format!("am agents register --project {project_arg} --program codex-cli --model unknown --name {}", robot_shell_arg(agent_name)),
+            });
+        } else {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "cross_project_identity_mismatch".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name.clone(),
+                summary: "Pane identity likely belongs to another project".to_string(),
+                detail: "The pane identity name is absent from this project but exists in another project.".to_string(),
+                evidence: format!(
+                    "pane_id={pane_id}; agent={agent_name}; path={}; other_projects={}",
+                    path.display(),
+                    other_projects.join(",")
+                ),
+                safe_command: format!("am agents register --project {project_arg} --program codex-cli --model unknown --name {}", robot_shell_arg(agent_name)),
+            });
+        }
+    }
+
+    for (agent_name, panes) in panes_by_agent {
+        if panes.len() > 1 {
+            let evidence = panes
+                .iter()
+                .map(|(pane_id, path)| format!("{pane_id} ({})", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "duplicate_pane_identity".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name,
+                summary: "Multiple pane identity files point at the same agent".to_string(),
+                detail: "This can indicate duplicate client sessions or stale pane identity files; diagnostics are read-only and did not remove anything. Each pane id and its backing file path is listed in the evidence.".to_string(),
+                evidence: format!("panes=[{evidence}]"),
+                safe_command: format!("am robot agents --project {project_arg} --format json"),
+            });
+        }
+    }
+}
+
+fn agent_projects_elsewhere(conn: &DbConn, project_id: i64, agent_name: &str) -> Vec<String> {
+    let rows = conn.query_sync(
+        "SELECT p.slug
+         FROM agents a
+         JOIN projects p ON p.id = a.project_id
+         WHERE a.project_id != ? AND a.name = ? COLLATE NOCASE
+         ORDER BY a.last_active_ts DESC, a.id DESC
+         LIMIT 3",
+        &[
+            Value::BigInt(project_id),
+            Value::Text(agent_name.to_string()),
+        ],
+    );
+    rows.ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get_named::<String>("slug").ok())
+        .collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7324,37 +10701,29 @@ fn fetch_robot_agent_contact_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
+    let approved_link_exists_sql = "\
+        SELECT 1 FROM agent_links link \
+        WHERE link.status = 'approved' \
+          AND (link.expires_ts IS NULL OR link.expires_ts <= 0 OR link.expires_ts > ?) \
+          AND ( \
+            (link.a_agent_id = m.sender_id AND link.b_agent_id = mr.agent_id) \
+            OR (link.b_agent_id = m.sender_id AND link.a_agent_id = mr.agent_id) \
+          )";
     let sql = format!(
-        "WITH approved_links AS ( \
-            SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
-            FROM agent_links \
-            WHERE status IN ('approved', 'accepted') \
-              AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
-            UNION \
-            SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
-            FROM agent_links \
-            WHERE status IN ('approved', 'accepted') \
-              AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
-         ) \
-         SELECT \
+        "SELECT \
             mr.agent_id AS agent_id, \
             SUM(CASE \
                     WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
                     WHEN m.sender_id = mr.agent_id THEN 1 \
-                    WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
+                    WHEN recipient.contact_policy = 'contacts_only' \
+                     AND EXISTS ({approved_link_exists_sql}) \
+                    THEN 1 \
                     ELSE 0 END) AS respected_count, \
             SUM(CASE \
                     WHEN recipient.contact_policy = 'contacts_only' \
                      AND m.sender_id != mr.agent_id \
-                     AND NOT EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
+                     AND NOT EXISTS ({approved_link_exists_sql}) \
+                    THEN 1 \
                     WHEN recipient.contact_policy = 'block_all' \
                      AND m.sender_id != mr.agent_id \
                     THEN 1 \
@@ -7380,13 +10749,28 @@ fn fetch_robot_agent_contact_stats(
     .map(|rows| {
         rows.into_iter()
             .map(|row| {
+                let agent_id = row
+                    .get_named::<i64>("agent_id")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(0).ok())
+                    .unwrap_or(0);
+                let respected_count = row
+                    .get_named::<i64>("respected_count")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(1).ok())
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                let violation_count = row
+                    .get_named::<i64>("violation_count")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(2).ok())
+                    .unwrap_or(0)
+                    .max(0) as u64;
                 (
-                    row.get_named::<i64>("agent_id").unwrap_or(0),
+                    agent_id,
                     RobotAgentContactStats {
-                        respected_count: row.get_named::<i64>("respected_count").unwrap_or(0).max(0)
-                            as u64,
-                        violation_count: row.get_named::<i64>("violation_count").unwrap_or(0).max(0)
-                            as u64,
+                        respected_count,
+                        violation_count,
                     },
                 )
             })
@@ -7404,35 +10788,59 @@ fn fetch_robot_agent_decision_counts(
     if agent_ids.is_empty() {
         return HashMap::new();
     }
+    // ATC experiences live in the sidecar (br-bvq1x.11.7), but agent identity
+    // lives in the mailbox DB — so the historic single-statement JOIN is split:
+    // count decisions per subject in the sidecar, then map subjects to the
+    // requested agent ids via the mailbox connection (preserving the original
+    // exact `agents.name = atc_experiences.subject` match). No sidecar => no
+    // decision history => empty map.
+    let Some(atc_conn) = open_local_atc_sidecar_conn() else {
+        return HashMap::new();
+    };
+    let subject_rows = match atc_conn.query_sync(
+        "SELECT subject, COUNT(*) AS decision_count \
+         FROM atc_experiences \
+         WHERE created_ts >= ? \
+         GROUP BY subject",
+        &[Value::BigInt(window_start)],
+    ) {
+        Ok(rows) => rows,
+        Err(_) => return HashMap::new(),
+    };
+    let mut counts_by_subject: HashMap<String, u64> = HashMap::new();
+    for row in &subject_rows {
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        if subject.is_empty() {
+            continue;
+        }
+        let count = row.get_named::<i64>("decision_count").unwrap_or(0).max(0) as u64;
+        *counts_by_subject.entry(subject).or_insert(0) += count;
+    }
+    if counts_by_subject.is_empty() {
+        return HashMap::new();
+    }
+
     let agent_ids_sql = agent_ids
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT a.id AS agent_id, COUNT(*) AS decision_count \
-         FROM atc_experiences e \
-         JOIN agents a ON a.name = e.subject AND a.project_id = ? \
-         WHERE a.id IN ({agent_ids_sql}) \
-           AND e.created_ts >= ? \
-         GROUP BY a.id"
+        "SELECT id AS agent_id, name FROM agents \
+         WHERE project_id = ? AND id IN ({agent_ids_sql})"
     );
-    conn.query_sync(
-        &sql,
-        &[Value::BigInt(project_id), Value::BigInt(window_start)],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| {
-                (
-                    row.get_named::<i64>("agent_id").unwrap_or(0),
-                    row.get_named::<i64>("decision_count").unwrap_or(0).max(0) as u64,
-                )
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    conn.query_sync(&sql, &[Value::BigInt(project_id)])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
+                    let name: String = row.get_named("name").unwrap_or_default();
+                    counts_by_subject.get(&name).map(|count| (agent_id, *count))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn median_micros(values: &mut [u64]) -> u64 {
@@ -7590,13 +10998,13 @@ fn build_projects_with_snapshot_cache(conn: &DbConn) -> Result<Vec<ProjectRow>, 
         }
     };
     let key = RobotProjectsSnapshotKey { db_identity };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_projects_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         return Ok(entry.projects.clone());
     }
@@ -7609,7 +11017,7 @@ fn build_projects_with_snapshot_cache(conn: &DbConn) -> Result<Vec<ProjectRow>, 
         key,
         RobotProjectsSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             projects: projects.clone(),
         },
     );
@@ -8159,7 +11567,12 @@ fn atc_live_endpoint_from_config(config: &mcp_agent_mail_core::Config) -> AtcLiv
     atc_live_endpoint_from_reader(|key| std::env::var(key).ok(), config)
 }
 
-fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRobotSnapshot> {
+/// Fetch and parse the raw `/mail/ws-state` JSON payload from a live server.
+///
+/// Shared transport for the ATC snapshot and the TUI loop-liveness probe
+/// (I2). All error messages name the resolved URL so an operator can tell
+/// exactly which endpoint was contacted.
+fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_json::Value> {
     let ws_state_url = endpoint.url.clone();
     let bearer_token = endpoint.bearer_token.clone();
     crate::context::run_async(async move {
@@ -8172,7 +11585,12 @@ fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRo
             headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         }
 
-        let cx = asupersync::Cx::for_testing();
+        // Use the runtime-backed ambient Cx installed by the enclosing
+        // `run_async` (Runtime::block_on) rather than the test-only
+        // `Cx::for_testing()` constructor, which is gated behind
+        // `test-internals` and must not be relied on in production.
+        let cx = asupersync::Cx::current()
+            .expect("run_async's Runtime::block_on installs an ambient Cx for the polled future");
         let request = Box::pin(crate::products_http_client().request(
             &cx,
             Method::Get,
@@ -8213,23 +11631,231 @@ fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRo
             )));
         }
 
-        let payload: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(|error| {
-                CliError::Other(format!(
-                    "invalid JSON in ws-state response from {ws_state_url}: {error}"
-                ))
-            })?;
-        let atc_payload = payload.get("atc").cloned().ok_or_else(|| {
+        serde_json::from_slice(&response.body).map_err(|error| {
             CliError::Other(format!(
-                "ws-state response from {ws_state_url} missing atc payload"
-            ))
-        })?;
-        serde_json::from_value(atc_payload).map_err(|error| {
-            CliError::Other(format!(
-                "invalid ATC snapshot payload from {ws_state_url}: {error}"
+                "invalid JSON in ws-state response from {ws_state_url}: {error}"
             ))
         })
     })
+}
+
+fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRobotSnapshot> {
+    let ws_state_url = endpoint.url.clone();
+    let payload = fetch_ws_state_payload(endpoint)?;
+    let atc_payload = payload.get("atc").cloned().ok_or_else(|| {
+        CliError::Other(format!(
+            "ws-state response from {ws_state_url} missing atc payload"
+        ))
+    })?;
+    serde_json::from_value(atc_payload).map_err(|error| {
+        CliError::Other(format!(
+            "invalid ATC snapshot payload from {ws_state_url}: {error}"
+        ))
+    })
+}
+
+/// Canonical headless fallback when the interactive TUI is frozen but the
+/// server process is still alive: running the server without the TUI keeps the
+/// MCP/API surface responsive while the render/input stall is investigated.
+pub(crate) const TUI_HEADLESS_FALLBACK_COMMAND: &str = "mcp-agent-mail serve --no-tui";
+
+/// Canonical non-interactive read-out an agent should run FIRST when the TUI
+/// looks frozen: `am tui-dump` returns the live situational snapshot the TUI
+/// renders (or a local SQLite fallback when the server is wedged) WITHOUT
+/// killing the process. This is the I6 (br-bvq1x.9.6) escape hatch the I1/I2
+/// heartbeat work points agents to.
+pub(crate) const TUI_FROZEN_READOUT_COMMAND: &str = "am tui-dump --format json";
+
+/// Liveness of one long-running server loop, derived from a `loop_heartbeats[]`
+/// entry of the `/mail/ws-state?system_health=1` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LoopLivenessEntry {
+    #[serde(rename = "loop")]
+    pub loop_name: String,
+    /// `alive` | `stalled` | `failing` | `unobserved`.
+    pub state: String,
+    pub stale: bool,
+    pub periodic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_seconds: Option<i64>,
+    pub consecutive_failures: u64,
+}
+
+/// Operator-ready classification of the live TUI/runtime loops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TuiLivenessReport {
+    /// `live` (server reachable) | `unreachable` (no live server / probe failed).
+    pub source: String,
+    /// `alive` | `stalled` | `unknown`.
+    pub overall: String,
+    pub loops: Vec<LoopLivenessEntry>,
+    pub stalled_loops: Vec<String>,
+    /// Set only when a freeze is suspected, so an agent has an immediate escape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless_fallback_command: Option<String>,
+    /// Non-interactive read-out an agent should run FIRST when a freeze is
+    /// suspected (I6: `am tui-dump`), set alongside `headless_fallback_command`
+    /// so the heartbeat surface points at the read-out *before* the restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readout_command: Option<String>,
+    pub detail: String,
+}
+
+impl TuiLivenessReport {
+    fn unreachable(detail: impl Into<String>) -> Self {
+        Self {
+            source: "unreachable".into(),
+            overall: "unknown".into(),
+            loops: Vec::new(),
+            stalled_loops: Vec::new(),
+            headless_fallback_command: None,
+            readout_command: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// `true` when a live server reports a frozen render/input/db-poll loop.
+    pub(crate) fn is_stalled(&self) -> bool {
+        self.source == "live" && self.overall == "stalled"
+    }
+}
+
+/// Classify a single server `loop_heartbeats[]` JSON entry into a liveness state.
+pub(crate) fn classify_loop_liveness_entry(entry: &serde_json::Value) -> LoopLivenessEntry {
+    let loop_name = entry
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let periodic = entry
+        .get("periodic")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let observed = entry
+        .get("observed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let stale = entry
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let consecutive_failures = entry
+        .get("consecutive_failures")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let age_seconds = entry
+        .get("age_micros")
+        .and_then(serde_json::Value::as_i64)
+        .map(|micros| micros / 1_000_000);
+    let state = if consecutive_failures > 0 {
+        "failing"
+    } else if !observed {
+        "unobserved"
+    } else if stale {
+        "stalled"
+    } else {
+        "alive"
+    }
+    .to_string();
+    LoopLivenessEntry {
+        loop_name,
+        state,
+        stale,
+        periodic,
+        age_seconds,
+        consecutive_failures,
+    }
+}
+
+/// Build a single operator-ready liveness verdict from the server's
+/// `loop_heartbeats` array. A render/input/db-poll loop that has gone stale or
+/// is failing flips `overall` to `stalled` and attaches the exact headless
+/// fallback command.
+pub(crate) fn tui_liveness_report_from_loop_heartbeats(
+    entries: &[serde_json::Value],
+) -> TuiLivenessReport {
+    if entries.is_empty() {
+        return TuiLivenessReport {
+            source: "live".into(),
+            overall: "unknown".into(),
+            loops: Vec::new(),
+            stalled_loops: Vec::new(),
+            headless_fallback_command: None,
+            readout_command: None,
+            detail: "server reachable but reported no loop heartbeats".into(),
+        };
+    }
+    let loops: Vec<LoopLivenessEntry> = entries.iter().map(classify_loop_liveness_entry).collect();
+    let stalled_loops: Vec<String> = loops
+        .iter()
+        .filter(|entry| entry.state == "stalled" || entry.state == "failing")
+        .map(|entry| entry.loop_name.clone())
+        .collect();
+    let overall = if stalled_loops.is_empty() {
+        "alive"
+    } else {
+        "stalled"
+    };
+    let headless_fallback_command = if stalled_loops.is_empty() {
+        None
+    } else {
+        Some(TUI_HEADLESS_FALLBACK_COMMAND.to_string())
+    };
+    // I6 (br-bvq1x.9.6): when a freeze is suspected, point agents at the
+    // non-interactive read-out FIRST (it returns state without killing the
+    // process) and only then at the headless restart.
+    let readout_command = if stalled_loops.is_empty() {
+        None
+    } else {
+        Some(TUI_FROZEN_READOUT_COMMAND.to_string())
+    };
+    let detail = if stalled_loops.is_empty() {
+        format!("{} loop(s) advancing", loops.len())
+    } else {
+        format!("stalled/failing loop(s): {}", stalled_loops.join(", "))
+    };
+    TuiLivenessReport {
+        source: "live".into(),
+        overall: overall.into(),
+        loops,
+        stalled_loops,
+        headless_fallback_command,
+        readout_command,
+        detail,
+    }
+}
+
+/// Append `system_health=1` so the ws-state response carries the loop
+/// heartbeats (the default poll payload omits the System Health section).
+fn ws_state_url_with_system_health(atc_url: &str) -> String {
+    if atc_url.contains("system_health=") {
+        atc_url.to_string()
+    } else {
+        format!("{atc_url}&system_health=1")
+    }
+}
+
+/// Best-effort fetch of the live server's TUI loop liveness. Never errors:
+/// transport/auth/parse failures map to an `unreachable` report so health
+/// surfaces stay non-fatal when no server is running.
+pub(crate) fn fetch_live_tui_liveness(config: &mcp_agent_mail_core::Config) -> TuiLivenessReport {
+    let base = atc_live_endpoint_from_config(config);
+    let endpoint = AtcLiveEndpoint {
+        url: ws_state_url_with_system_health(&base.url),
+        bearer_token: base.bearer_token,
+    };
+    match fetch_ws_state_payload(&endpoint) {
+        Ok(payload) => {
+            let entries = payload
+                .get("system_health")
+                .and_then(|section| section.get("loop_heartbeats"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            tui_liveness_report_from_loop_heartbeats(&entries)
+        }
+        Err(error) => TuiLivenessReport::unreachable(format!("live server not reachable: {error}")),
+    }
 }
 
 fn maybe_resolve_robot_scope(
@@ -8285,6 +11911,27 @@ fn fallback_atc_liveness(silence_secs: i64, probe_interval_secs: i64) -> (&'stat
     } else {
         ("dead", posterior_alive)
     }
+}
+
+/// Open a read-only canonical connection to the ATC telemetry sidecar
+/// (`atc.sqlite3`) for `am robot atc` local-fallback queries (br-bvq1x.11.7).
+///
+/// ATC experience/rollup tables are isolated in the sidecar (a sibling of the
+/// mailbox DB), so the local fallback must read them from there rather than the
+/// mailbox connection. Returns `None` when the sidecar does not exist (ATC never
+/// wrote, or the DB is `:memory:`) — callers then report empty ATC telemetry.
+fn open_local_atc_sidecar_conn() -> Option<mcp_agent_mail_db::CanonicalDbConn> {
+    let config = mcp_agent_mail_core::Config::from_env();
+    let resolved =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    if resolved.canonical_path == ":memory:" {
+        return None;
+    }
+    let atc_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&resolved.canonical_path);
+    if !Path::new(&atc_path).exists() {
+        return None;
+    }
+    mcp_agent_mail_db::CanonicalDbConn::open_file(atc_path.as_str()).ok()
 }
 
 fn build_local_atc_fallback_snapshot(
@@ -8349,7 +11996,12 @@ fn build_local_atc_fallback_snapshot(
     });
 
     let reservation_conflicts = atc_reservation_conflicts(scope, focus_agent)?;
-    let observability = atc_rollup_observability_from_conn(scope.conn())?;
+    // ATC rollups live in the sidecar (br-bvq1x.11.7); read them from there.
+    // No sidecar => no ATC telemetry yet => empty observability.
+    let observability = match open_local_atc_sidecar_conn() {
+        Some(atc_conn) => atc_rollup_observability_from_conn(&atc_conn)?,
+        None => AtcRobotObservability::default(),
+    };
     let note = if config.atc_enabled {
         format!(
             "Live ATC snapshot unavailable; using local DB heuristics with a {}s probe interval.",
@@ -8384,7 +12036,9 @@ fn build_local_atc_fallback_snapshot(
     ))
 }
 
-fn atc_rollup_observability_from_conn(conn: &DbConn) -> Result<AtcRobotObservability, CliError> {
+fn atc_rollup_observability_from_conn(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> Result<AtcRobotObservability, CliError> {
     let rows = match conn.query_sync(
         "SELECT stratum_key, total_count, resolved_count, censored_count, expired_count \
          FROM atc_experience_rollups ORDER BY stratum_key",
@@ -8451,6 +12105,319 @@ fn atc_rollup_observability_from_conn(conn: &DbConn) -> Result<AtcRobotObservabi
         .saturating_add(expired_total);
 
     Ok(observability)
+}
+
+fn atc_privacy_identifier_hash(value: &str) -> String {
+    if value.trim().is_empty() {
+        return "unscoped".to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"mcp-agent-mail-atc-privacy-report:v1\0");
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn atc_privacy_retention_windows() -> Vec<AtcPrivacyRetentionWindow> {
+    vec![
+        AtcPrivacyRetentionWindow {
+            artifact: "open_experience_rows",
+            sqlite_ttl_days: Some(30),
+            git_archive: "never",
+            enforced_by: "denylist",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "resolved_experience_rows",
+            sqlite_ttl_days: Some(365),
+            git_archive: "never",
+            enforced_by: "denylist",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "experience_rollups",
+            sqlite_ttl_days: Some(730),
+            git_archive: "never",
+            enforced_by: "denylist",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "evidence_ledger_entries",
+            sqlite_ttl_days: Some(30),
+            git_archive: "never",
+            enforced_by: "bounded_debug_tail",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "transparency_cards",
+            sqlite_ttl_days: Some(365),
+            git_archive: "never_folded",
+            enforced_by: "batched_audit",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "audit_summaries",
+            sqlite_ttl_days: Some(730),
+            git_archive: "archived",
+            enforced_by: "aggregated_only",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "feature_vectors",
+            sqlite_ttl_days: None,
+            git_archive: "never",
+            enforced_by: "parent_denylist",
+        },
+    ]
+}
+
+fn atc_privacy_schema_classification_summary() -> Vec<AtcPrivacySchemaClass> {
+    vec![
+        AtcPrivacySchemaClass {
+            category: "A_metadata",
+            risk: "none",
+            field_count: 16,
+            handling: "numeric_or_enum_metrics",
+        },
+        AtcPrivacySchemaClass {
+            category: "B_derived_hashed",
+            risk: "low",
+            field_count: 9,
+            handling: "constrained_or_hashed_identifiers",
+        },
+        AtcPrivacySchemaClass {
+            category: "C_pseudonymous_id",
+            risk: "medium",
+            field_count: 2,
+            handling: "hash_in_operator_reports",
+        },
+        AtcPrivacySchemaClass {
+            category: "D_content_validated",
+            risk: "high",
+            field_count: 3,
+            handling: "secret_scan_and_count_only_reporting",
+        },
+        AtcPrivacySchemaClass {
+            category: "F_timing",
+            risk: "low",
+            field_count: 2,
+            handling: "bucketized_feature_vector_metrics",
+        },
+    ]
+}
+
+fn atc_privacy_redaction_options() -> Vec<AtcPrivacyRedactionOption> {
+    vec![
+        AtcPrivacyRedactionOption {
+            action: "censor_suspected_secret_rows",
+            target_rows: "suspected_secret_rows",
+            effect: "mark rows as censored and retain count-only audit evidence",
+        },
+        AtcPrivacyRedactionOption {
+            action: "redact_category_d_payloads",
+            target_rows: "redaction_candidate_rows",
+            effect: "remove Category D payload columns before wider rollout",
+        },
+        AtcPrivacyRedactionOption {
+            action: "expire_legacy_unclassified_rows",
+            target_rows: "legacy_unclassified_rows",
+            effect: "drop stale legacy rows after classification and retention review",
+        },
+    ]
+}
+
+fn atc_privacy_report_unavailable() -> AtcPrivacyReportData {
+    AtcPrivacyReportData {
+        report_version: 1,
+        generated_at: mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::now_micros()),
+        scope: "all_atc_experiences",
+        source_table: "atc_experiences",
+        policy_doc: "docs/SPEC-atc-data-minimization.md",
+        totals: AtcPrivacyTotals {
+            total_rows: 0,
+            open_rows: 0,
+            resolved_rows: 0,
+            censored_rows: 0,
+            expired_rows: 0,
+            suspected_secret_rows: 0,
+            redacted_due_to_secret_rows: 0,
+            legacy_unclassified_rows: 0,
+            redaction_candidate_rows: 0,
+        },
+        privacy_classifications: std::collections::BTreeMap::new(),
+        projects: Vec::new(),
+        strata: Vec::new(),
+        retention_windows: atc_privacy_retention_windows(),
+        redaction_options: atc_privacy_redaction_options(),
+        schema_classification_summary: atc_privacy_schema_classification_summary(),
+        safety_notes: vec![
+            "ATC experience storage is unavailable or has not been migrated yet.",
+            "This report intentionally emits counts and hashes only; raw ATC content fields are never rendered.",
+        ],
+    }
+}
+
+fn atc_privacy_count(row: &sqlmodel_core::Row, name: &str) -> u64 {
+    row.get_named::<i64>(name).unwrap_or(0).max(0) as u64
+}
+
+fn atc_privacy_report_from_conn(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> Result<AtcPrivacyReportData, CliError> {
+    let candidate_sql = "CASE WHEN \
+        contained_suspected_secret = 1 \
+        OR privacy_classification IN ('legacy_unclassified', 'redacted_due_to_secret') \
+        OR NULLIF(TRIM(COALESCE(evidence_summary, '')), '') IS NOT NULL \
+        OR NULLIF(TRIM(COALESCE(outcome_json, '')), '') IS NOT NULL \
+        OR NULLIF(TRIM(COALESCE(context_json, '')), '') IS NOT NULL \
+        THEN 1 ELSE 0 END";
+
+    let totals_rows = match conn.query_sync(
+        &format!(
+            "SELECT \
+                COUNT(*) AS total_rows, \
+                SUM(CASE WHEN state = 'open' THEN 1 ELSE 0 END) AS open_rows, \
+                SUM(CASE WHEN state = 'resolved' THEN 1 ELSE 0 END) AS resolved_rows, \
+                SUM(CASE WHEN state = 'censored' THEN 1 ELSE 0 END) AS censored_rows, \
+                SUM(CASE WHEN state = 'expired' THEN 1 ELSE 0 END) AS expired_rows, \
+                SUM(CASE WHEN contained_suspected_secret = 1 THEN 1 ELSE 0 END) AS suspected_secret_rows, \
+                SUM(CASE WHEN privacy_classification = 'redacted_due_to_secret' THEN 1 ELSE 0 END) AS redacted_due_to_secret_rows, \
+                SUM(CASE WHEN privacy_classification = 'legacy_unclassified' THEN 1 ELSE 0 END) AS legacy_unclassified_rows, \
+                SUM({candidate_sql}) AS redaction_candidate_rows \
+             FROM atc_experiences"
+        ),
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("no such table")
+                || message.contains("atc_experiences")
+                || message.contains("no such column")
+            {
+                return Ok(atc_privacy_report_unavailable());
+            }
+            return Err(CliError::Other(format!("ATC privacy totals query failed: {error}")));
+        }
+    };
+
+    let totals_row = totals_rows.first();
+    let totals = if let Some(row) = totals_row {
+        AtcPrivacyTotals {
+            total_rows: atc_privacy_count(row, "total_rows"),
+            open_rows: atc_privacy_count(row, "open_rows"),
+            resolved_rows: atc_privacy_count(row, "resolved_rows"),
+            censored_rows: atc_privacy_count(row, "censored_rows"),
+            expired_rows: atc_privacy_count(row, "expired_rows"),
+            suspected_secret_rows: atc_privacy_count(row, "suspected_secret_rows"),
+            redacted_due_to_secret_rows: atc_privacy_count(row, "redacted_due_to_secret_rows"),
+            legacy_unclassified_rows: atc_privacy_count(row, "legacy_unclassified_rows"),
+            redaction_candidate_rows: atc_privacy_count(row, "redaction_candidate_rows"),
+        }
+    } else {
+        AtcPrivacyTotals {
+            total_rows: 0,
+            open_rows: 0,
+            resolved_rows: 0,
+            censored_rows: 0,
+            expired_rows: 0,
+            suspected_secret_rows: 0,
+            redacted_due_to_secret_rows: 0,
+            legacy_unclassified_rows: 0,
+            redaction_candidate_rows: 0,
+        }
+    };
+
+    let classification_rows = conn
+        .query_sync(
+            "SELECT privacy_classification, COUNT(*) AS row_count \
+             FROM atc_experiences \
+             GROUP BY privacy_classification \
+             ORDER BY privacy_classification",
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("ATC privacy class query failed: {error}")))?;
+    let mut privacy_classifications = std::collections::BTreeMap::new();
+    for row in &classification_rows {
+        let class: String = row
+            .get_named("privacy_classification")
+            .unwrap_or_else(|_| "unknown".to_string());
+        privacy_classifications.insert(class, atc_privacy_count(row, "row_count"));
+    }
+
+    let project_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT COALESCE(project_key, '') AS project_key, \
+                    COUNT(*) AS total_rows, \
+                    SUM(CASE WHEN contained_suspected_secret = 1 THEN 1 ELSE 0 END) AS suspected_secret_rows, \
+                    SUM({candidate_sql}) AS redaction_candidate_rows \
+                 FROM atc_experiences \
+                 GROUP BY COALESCE(project_key, '') \
+                 ORDER BY total_rows DESC, project_key \
+                 LIMIT 50"
+            ),
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("ATC privacy project query failed: {error}")))?;
+    let projects = project_rows
+        .iter()
+        .map(|row| {
+            let project_key: String = row.get_named("project_key").unwrap_or_default();
+            AtcPrivacyProjectData {
+                project_hash: atc_privacy_identifier_hash(&project_key),
+                total_rows: atc_privacy_count(row, "total_rows"),
+                suspected_secret_rows: atc_privacy_count(row, "suspected_secret_rows"),
+                redaction_candidate_rows: atc_privacy_count(row, "redaction_candidate_rows"),
+            }
+        })
+        .collect();
+
+    let stratum_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT \
+                    COALESCE(subsystem, 'unknown') || ':' || \
+                    COALESCE(effect_kind, 'unknown') || ':' || \
+                    COALESCE(state, 'unknown') AS stratum, \
+                    COUNT(*) AS total_rows, \
+                    SUM(CASE WHEN contained_suspected_secret = 1 THEN 1 ELSE 0 END) AS suspected_secret_rows, \
+                    SUM({candidate_sql}) AS redaction_candidate_rows \
+                 FROM atc_experiences \
+                 GROUP BY stratum \
+                 ORDER BY total_rows DESC, stratum \
+                 LIMIT 50"
+            ),
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("ATC privacy stratum query failed: {error}")))?;
+    let strata = stratum_rows
+        .iter()
+        .map(|row| AtcPrivacyStratumData {
+            stratum: row.get_named("stratum").unwrap_or_default(),
+            total_rows: atc_privacy_count(row, "total_rows"),
+            suspected_secret_rows: atc_privacy_count(row, "suspected_secret_rows"),
+            redaction_candidate_rows: atc_privacy_count(row, "redaction_candidate_rows"),
+        })
+        .collect();
+
+    Ok(AtcPrivacyReportData {
+        report_version: 1,
+        generated_at: mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::now_micros()),
+        scope: "all_atc_experiences",
+        source_table: "atc_experiences",
+        policy_doc: "docs/SPEC-atc-data-minimization.md",
+        totals,
+        privacy_classifications,
+        projects,
+        strata,
+        retention_windows: atc_privacy_retention_windows(),
+        redaction_options: atc_privacy_redaction_options(),
+        schema_classification_summary: atc_privacy_schema_classification_summary(),
+        safety_notes: vec![
+            "Project identifiers are domain-separated SHA-256 prefixes; raw project paths are not rendered.",
+            "Raw ATC subject, evidence_summary, outcome_json, context_json, and project_key values are never included in this report.",
+            "Rows counted as redaction candidates require operator review before broader ATC rollout.",
+        ],
+    })
 }
 
 fn build_unavailable_atc_snapshot(live_error: &str) -> AtcRobotSnapshot {
@@ -8893,6 +12860,8 @@ fn build_atc_data(
     focus_agent: Option<&str>,
     since: Option<&str>,
     stratum_filter: Option<&str>,
+    canary: Option<AtcCanaryReportSummary>,
+    privacy: Option<AtcPrivacyReportData>,
     summary_only: bool,
     limit: usize,
 ) -> AtcData {
@@ -8915,6 +12884,7 @@ fn build_atc_data(
         note: snapshot.note.clone(),
         since: since.map(ToString::to_string),
         stratum: stratum_filter.map(ToString::to_string),
+        canary,
         summary: show_summary.then(|| atc_summary_data(&snapshot, stratum_filter, limit)),
         decisions: show_decisions
             .then(|| atc_filtered_decisions(&snapshot, focus_agent, None, since_micros, limit)),
@@ -8930,6 +12900,7 @@ fn build_atc_data(
                 limit,
             )
         }),
+        privacy,
     }
 }
 
@@ -9638,45 +13609,298 @@ fn build_navigate(
 /// Execute a robot subcommand and print formatted output.
 pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
     validate_requested_robot_format(&args)?;
-    let format = OutputFormat::resolve(args.format, args.command.is_prose());
+    let format = OutputFormat::resolve(requested_robot_format(&args), args.command.is_prose());
     let cmd_name = args.command.name();
 
     let out = match args.command {
         RobotSubcommand::Status => {
             let mut phase = TailLatencyPhaseRecorder::new("robot_status");
             phase.mark("queue_wait");
-            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            phase.mark("scope_resolution");
+            match resolve_robot_scope(args.project.as_deref(), args.agent.as_deref()) {
+                Ok(scope) => {
+                    phase.mark("scope_resolution");
 
-            let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
-            let agent = scope.agent.clone();
-            let (data, actions) = build_status_with_snapshot_cache(
-                scope.conn(),
-                scope.project_id,
-                &scope.project_slug,
-                agent,
-                Some(&mut phase),
-            )?;
-            let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(scope.project_slug);
-            env._meta.agent = agent_name.clone();
-            if agent_name.is_none() {
-                env = env.with_alert(
-                    "info",
-                    "Agent not detected — inbox/reservation sections omitted. Use --agent to specify.",
-                    Some("am robot status --agent <NAME>".to_string()),
-                );
+                    let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
+                    let agent = scope.agent.clone();
+                    let (mut data, mut actions) = build_status_with_snapshot_cache(
+                        scope.conn(),
+                        scope.project_id,
+                        &scope.project_slug,
+                        agent,
+                        Some(&mut phase),
+                    )?;
+                    let config = mcp_agent_mail_core::Config::from_env();
+                    if let Ok(search_index) = robot_search_index_health_from_config(&config) {
+                        enrich_status_with_search_index(&mut data, &mut actions, search_index);
+                        phase.mark("search_index_health");
+                    }
+                    render_status_output(
+                        cmd_name,
+                        format,
+                        data,
+                        Some(scope.project_slug),
+                        agent_name,
+                        actions,
+                        phase,
+                    )?
+                }
+                Err(error) => {
+                    if let Some((data, actions, project_slug, agent_name)) =
+                        build_recovery_only_status(
+                            args.project.as_deref(),
+                            args.agent.as_deref(),
+                            &error,
+                        )
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "robot status emitted recovery-only snapshot after scope resolution failed"
+                        );
+                        phase.mark("scope_recovery_fallback");
+                        render_status_output(
+                            cmd_name,
+                            format,
+                            data,
+                            Some(project_slug),
+                            agent_name,
+                            actions,
+                            phase,
+                        )?
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
-            for a in actions {
-                env = env.with_action(&a);
+        }
+        RobotSubcommand::TuiDump => {
+            // I6 (br-bvq1x.9.6): the non-interactive freeze escape hatch. An
+            // agent that suspects the interactive TUI is frozen runs this to get
+            // the SAME situational snapshot WITHOUT killing the process (RULE 1).
+            //
+            // Strategy mirrors `am robot atc`: try the live `/mail/ws-state`
+            // snapshot the TUI itself renders (with `system_health=1` so the
+            // per-loop heartbeats are included), and fall back to a local SQLite
+            // read when the server/TUI is wedged or unreachable. The command is
+            // read-only and ALWAYS exits 0 so an agent can always read state.
+            #[derive(Serialize)]
+            struct TuiDumpData {
+                /// `live` | `local-fallback` | `unavailable`.
+                source: String,
+                /// Per-loop liveness verdict derived from the live snapshot (I1/I2).
+                tui_liveness: TuiLivenessReport,
+                /// Transport/auth/parse error that forced the local fallback.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                live_error: Option<String>,
+                /// Raw `/mail/ws-state` snapshot the TUI renders (source == live).
+                #[serde(skip_serializing_if = "Option::is_none")]
+                ws_state: Option<serde_json::Value>,
+                /// Local situational snapshot (source == local-fallback).
+                #[serde(skip_serializing_if = "Option::is_none")]
+                status: Option<Box<StatusData>>,
             }
-            let anomalies = env.data.anomalies.clone();
-            env = append_status_anomaly_alerts(env, &anomalies);
-            env = env.with_diagnostics(phase.snapshot("pre_render"));
-            let output = format_output(&env, format)?;
-            phase.mark("render_serialization");
-            emit_tail_latency_evidence(&phase.finish("ok"));
-            output
+
+            let config = mcp_agent_mail_core::Config::from_env();
+            let base = atc_live_endpoint_from_config(&config);
+            let endpoint = AtcLiveEndpoint {
+                url: ws_state_url_with_system_health(&base.url),
+                bearer_token: base.bearer_token,
+            };
+
+            match fetch_ws_state_payload(&endpoint) {
+                Ok(payload) => {
+                    // LIVE: the server (and its HTTP loop) is answering even if
+                    // the render/input loop is frozen. Dump the exact snapshot
+                    // and classify each loop so the agent sees which one stalled.
+                    tracing::debug!(event = "tui_dump.snapshot_source", source = "live_server");
+                    let entries = payload
+                        .get("system_health")
+                        .and_then(|section| section.get("loop_heartbeats"))
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let liveness = tui_liveness_report_from_loop_heartbeats(&entries);
+                    let stalled = liveness.is_stalled();
+                    let liveness_detail = liveness.detail.clone();
+                    let fallback_cmd = liveness.headless_fallback_command.clone();
+                    let mut env = RobotEnvelope::new(
+                        cmd_name,
+                        format,
+                        TuiDumpData {
+                            source: "live".into(),
+                            tui_liveness: liveness,
+                            live_error: None,
+                            ws_state: Some(payload),
+                            status: None,
+                        },
+                    );
+                    if stalled {
+                        env = env.with_alert(
+                            "warn",
+                            format!(
+                                "TUI/runtime loop appears frozen while the server is still running ({liveness_detail}). The live snapshot in this response is your read-out; the process is still serving MCP/API."
+                            ),
+                            fallback_cmd.clone(),
+                        );
+                        if let Some(command) = fallback_cmd.as_deref() {
+                            env = env.with_action(format!(
+                                "Snapshot captured without killing the process. If the freeze persists, restart headless with `{command}`"
+                            ));
+                        }
+                    }
+                    format_output(&env, format)?
+                }
+                Err(error) => {
+                    // FROZEN/UNREACHABLE: the live snapshot is gone (whole-process
+                    // wedge, timeout, or no server). Fall back to the local SQLite
+                    // situational snapshot so the agent still gets a read-out.
+                    let live_error = error.to_string();
+                    match resolve_robot_scope(args.project.as_deref(), args.agent.as_deref()) {
+                        Ok(scope) => {
+                            let agent_name = scope.agent.as_ref().map(|(_, name)| name.clone());
+                            let project_slug = scope.project_slug.clone();
+                            // Never exit non-zero on the freeze escape hatch: if the
+                            // DB opened/scope resolved but the situational snapshot
+                            // build itself fails, still return a structured read-out.
+                            match build_status_with_phase(
+                                scope.conn(),
+                                scope.project_id,
+                                &scope.project_slug,
+                                scope.agent.clone(),
+                                None,
+                            ) {
+                                Ok((status, actions)) => {
+                                    tracing::debug!(
+                                        event = "tui_dump.snapshot_source",
+                                        source = "local_db"
+                                    );
+                                    let mut env = RobotEnvelope::new(
+                                        cmd_name,
+                                        format,
+                                        TuiDumpData {
+                                            source: "local-fallback".into(),
+                                            tui_liveness: TuiLivenessReport::unreachable(format!(
+                                                "live server not reachable: {live_error}"
+                                            )),
+                                            live_error: Some(live_error.clone()),
+                                            ws_state: None,
+                                            status: Some(Box::new(status)),
+                                        },
+                                    );
+                                    env._meta.project = Some(project_slug);
+                                    env._meta.agent = agent_name;
+                                    env = env.with_alert(
+                                        "warn",
+                                        "Live TUI snapshot unavailable; surfaced the local SQLite situational snapshot instead",
+                                        Some(live_error.clone()),
+                                    );
+                                    for action in actions {
+                                        env = env.with_action(action);
+                                    }
+                                    format_output(&env, format)?
+                                }
+                                Err(status_error) => {
+                                    tracing::warn!(
+                                        error = %status_error,
+                                        "tui-dump local status build failed; returning degraded read-out"
+                                    );
+                                    let mut env = RobotEnvelope::new(
+                                        cmd_name,
+                                        format,
+                                        TuiDumpData {
+                                            source: "local-fallback".into(),
+                                            tui_liveness: TuiLivenessReport::unreachable(format!(
+                                                "live server not reachable: {live_error}"
+                                            )),
+                                            live_error: Some(live_error.clone()),
+                                            ws_state: None,
+                                            status: None,
+                                        },
+                                    );
+                                    env._meta.project = Some(project_slug);
+                                    env._meta.agent = agent_name;
+                                    env = env.with_alert(
+                                        "warn",
+                                        "Live TUI snapshot unavailable and the local situational snapshot could not be built",
+                                        Some(status_error.to_string()),
+                                    );
+                                    env = env.with_action(
+                                        "Inspect mailbox health: am doctor check --json",
+                                    );
+                                    format_output(&env, format)?
+                                }
+                            }
+                        }
+                        Err(scope_error) => {
+                            // No live snapshot and no plain scope: try the
+                            // recovery-only path (degraded/corrupt DB) before
+                            // declaring the read-out fully unavailable.
+                            if let Some((status, actions, project_slug, agent_name)) =
+                                build_recovery_only_status(
+                                    args.project.as_deref(),
+                                    args.agent.as_deref(),
+                                    &scope_error,
+                                )
+                            {
+                                tracing::debug!(
+                                    event = "tui_dump.snapshot_source",
+                                    source = "local_recovery"
+                                );
+                                let mut env = RobotEnvelope::new(
+                                    cmd_name,
+                                    format,
+                                    TuiDumpData {
+                                        source: "local-fallback".into(),
+                                        tui_liveness: TuiLivenessReport::unreachable(format!(
+                                            "live server not reachable: {live_error}"
+                                        )),
+                                        live_error: Some(live_error.clone()),
+                                        ws_state: None,
+                                        status: Some(Box::new(status)),
+                                    },
+                                );
+                                env._meta.project = Some(project_slug);
+                                env._meta.agent = agent_name;
+                                env = env.with_alert(
+                                    "warn",
+                                    "Live TUI snapshot unavailable; surfaced a recovery-only local snapshot",
+                                    Some(live_error.clone()),
+                                );
+                                for action in actions {
+                                    env = env.with_action(action);
+                                }
+                                format_output(&env, format)?
+                            } else {
+                                tracing::debug!(
+                                    event = "tui_dump.snapshot_source",
+                                    source = "unavailable"
+                                );
+                                let mut env = RobotEnvelope::new(
+                                    cmd_name,
+                                    format,
+                                    TuiDumpData {
+                                        source: "unavailable".into(),
+                                        tui_liveness: TuiLivenessReport::unreachable(format!(
+                                            "live server not reachable: {live_error}"
+                                        )),
+                                        live_error: Some(live_error.clone()),
+                                        ws_state: None,
+                                        status: None,
+                                    },
+                                );
+                                env = env.with_alert(
+                                    "warn",
+                                    "No live TUI snapshot and no resolvable local mailbox for a fallback read-out",
+                                    Some(live_error.clone()),
+                                );
+                                env = env.with_action(
+                                    "Point at a project with --project <abs-path>, or start the server: am serve-http",
+                                );
+                                format_output(&env, format)?
+                            }
+                        }
+                    }
+                }
+            }
         }
         RobotSubcommand::Inbox {
             urgent,
@@ -9689,59 +13913,61 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
             phase.set_include_bodies(include_bodies);
             phase.mark("queue_wait");
-            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            phase.mark("scope_resolution");
-            let (agent_id, agent_name_str) = scope.agent.clone().ok_or_else(|| {
-                CliError::InvalidArgument(
-                    "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME"
-                        .to_string(),
-                )
-            })?;
-
-            let result = build_inbox_with_snapshot_cache(
-                scope.conn(),
-                scope.project_id,
-                &scope.project_slug,
-                agent_id,
-                &agent_name_str,
+            let config = mcp_agent_mail_core::Config::from_env();
+            if let Some(request) = build_robot_inbox_server_request(
+                args.project.as_deref(),
+                args.agent.as_deref(),
                 urgent,
                 ack_overdue,
-                unread || (!urgent && !ack_overdue && !all),
+                unread,
                 all,
-                limit.unwrap_or(20),
+                limit,
                 include_bodies,
-                Some(&mut phase),
-            )?;
-
-            #[derive(Serialize)]
-            struct InboxData {
-                count: usize,
-                inbox: Vec<InboxEntry>,
+            )? {
+                match try_build_inbox_via_server(&request, &config)? {
+                    Some(result) => {
+                        phase.mark("server_fetch");
+                        render_inbox_result(
+                            cmd_name,
+                            format,
+                            result,
+                            request.project_key,
+                            request.agent_name,
+                            phase,
+                        )?
+                    }
+                    None => {
+                        phase.mark("server_fallback");
+                        render_local_inbox_result(
+                            cmd_name,
+                            format,
+                            args.project.as_deref(),
+                            args.agent.as_deref(),
+                            urgent,
+                            ack_overdue,
+                            unread,
+                            all,
+                            limit,
+                            include_bodies,
+                            phase,
+                        )?
+                    }
+                }
+            } else {
+                render_local_inbox_result(
+                    cmd_name,
+                    format,
+                    args.project.as_deref(),
+                    args.agent.as_deref(),
+                    urgent,
+                    ack_overdue,
+                    unread,
+                    all,
+                    limit,
+                    include_bodies,
+                    phase,
+                )?
             }
-
-            let count = result.entries.len();
-            phase.set_rows_returned(count);
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                InboxData {
-                    count,
-                    inbox: result.entries,
-                },
-            );
-            env._meta.project = Some(scope.project_slug);
-            env._meta.agent = Some(agent_name_str);
-            for (severity, headline, action) in result.alerts {
-                env = env.with_alert(severity, headline, action);
-            }
-            for a in result.actions {
-                env = env.with_action(&a);
-            }
-            env = env.with_diagnostics(phase.snapshot("pre_render"));
-            let output = format_output(&env, format)?;
-            phase.mark("render_serialization");
-            emit_tail_latency_evidence(&phase.finish("ok"));
-            output
         }
         RobotSubcommand::Thread { id, limit, since } => {
             let scope = resolve_robot_project_scope(args.project.as_deref())?;
@@ -9798,8 +14024,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 since.as_deref(),
                 20,
             )?;
+            let search_index = data.search_index.clone();
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = Some(project_slug);
+            env = enrich_envelope_with_search_index_alert(env, search_index.as_ref());
             format_output(&env, format)?
         }
         RobotSubcommand::Reservations {
@@ -9871,6 +14099,41 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 })
                 .collect();
 
+            // A5 (br-bvq1x.1.5): surface corruption-class metrics so agents and
+            // operators get trend visibility on integrity/classification events.
+            let corruption = mcp_agent_mail_core::global_metrics().corruption.snapshot();
+
+            // K5 (br-bvq1x.11.5): surface DB pool + FD backpressure so agents can
+            // distinguish pool/FD exhaustion from corruption and follow specific
+            // next steps instead of blind-retrying. The live gauges are
+            // process-local (see `ResourcePressure::scope`); the configured pool
+            // limits and inherited FD limits are environment-wide signals.
+            let pool_snapshot = mcp_agent_mail_core::global_metrics().db.snapshot();
+            let fd_snapshot = mcp_agent_mail_core::fd_metrics_snapshot();
+            let pool_cfg = mcp_agent_mail_db::pool::DbPoolConfig::from_env();
+            // br-5stvf: surface WBQ per-archive circuit-breaker + durability
+            // state alongside the K5 pool/FD resources so operators can see
+            // which archive tripped the breaker (and how often) instead of only
+            // a sticky boolean buried in logs.
+            let durability_degraded = mcp_agent_mail_storage::durability_degraded();
+            let wbq_circuit_breakers = mcp_agent_mail_storage::wbq_circuit_breaker_snapshot();
+            let resources = ResourcePressure {
+                scope: "current_process",
+                pool_max_connections: pool_cfg.max_connections,
+                pool_min_connections: pool_cfg.min_connections,
+                pool_acquire_timeout_ms: pool_cfg.acquire_timeout_ms,
+                pool: pool_snapshot.clone(),
+                fd: fd_snapshot.clone(),
+                repo_cache_entries: mcp_agent_mail_storage::repo_cache_len(),
+                durability_degraded,
+                wbq_circuit_breakers: wbq_circuit_breakers.clone(),
+            };
+            let mut backpressure = derive_backpressure_alerts(&pool_snapshot, &fd_snapshot);
+            backpressure.extend(derive_wbq_breaker_alerts(
+                durability_degraded,
+                &wbq_circuit_breakers,
+            ));
+
             #[derive(Serialize)]
             struct MetricsData {
                 total_calls: u64,
@@ -9878,6 +14141,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 error_rate_pct: f64,
                 avg_latency_ms: f64,
                 tools: Vec<MetricEntry>,
+                corruption: mcp_agent_mail_core::CorruptionMetricsSnapshot,
+                resources: ResourcePressure,
             }
 
             let mut env = RobotEnvelope::new(
@@ -9889,8 +14154,38 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     error_rate_pct: (error_rate * 100.0).round() / 100.0,
                     avg_latency_ms: (avg_latency * 100.0).round() / 100.0,
                     tools,
+                    corruption: corruption.clone(),
+                    resources,
                 },
             );
+
+            // Emit the specific pool/FD backpressure guidance (bead K5). These
+            // fire only on real threshold breaches, so a healthy process stays quiet.
+            for alert in &backpressure {
+                env = env.with_alert(alert.severity, alert.message.clone(), alert.action.clone());
+            }
+
+            // Alert when real corruption-class events have occurred (edit-blocking
+            // damage), and warn on any detection-source trips.
+            if corruption.corruption_class_total > 0 {
+                env = env.with_alert(
+                    "error",
+                    format!(
+                        "{} corruption-class error(s) classified since start; run `am doctor --json`",
+                        corruption.corruption_class_total
+                    ),
+                    Some("am doctor --json".to_string()),
+                );
+            } else if corruption.detections_total > 0 {
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "{} integrity detection(s) recorded since start",
+                        corruption.detections_total
+                    ),
+                    Some("am doctor health".to_string()),
+                );
+            }
 
             // Generate alerts for problematic tools
             for e in &snapshot {
@@ -9938,10 +14233,17 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             format_output(&env, format)?
         }
-        RobotSubcommand::Health => {
+        RobotSubcommand::Health { include_host } => {
             let mut probes: Vec<HealthProbe> = Vec::new();
             let config = mcp_agent_mail_core::Config::from_env();
             let mut db_conn: Option<DbConn> = None;
+            // J3 (br-bvq1x.10.3): capture the *effective* DB file that was actually
+            // opened so the runtime-identity block can name it (path/version
+            // confusion: agents could not tell which mailbox `am` resolved).
+            let mut db_file: Option<String> = None;
+            // E4 (br-bvq1x.5.4): on a DB failure, classify it (A2) and attach the
+            // safe-remediation contract so an agent knows what is safe to do.
+            let mut db_error_message: Option<String> = None;
 
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
@@ -9951,12 +14253,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 Ok((conn, opened_path)) => {
                     // Verify canonical DB reachability with a lightweight query.
                     let query_ok = conn.query_sync("SELECT 1", &[]).is_ok();
+                    db_file = Some(opened_path.clone());
                     if query_ok {
                         db_conn = Some(conn);
                     }
                     let detail = if query_ok {
                         format!("SQLite read-only connection healthy at {opened_path}")
                     } else {
+                        db_error_message =
+                            Some(format!("SQLite read-only query failed at {opened_path}"));
                         format!("SQLite read-only query failed at {opened_path}")
                     };
                     probes.push(HealthProbe {
@@ -9968,6 +14273,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     query_ok
                 }
                 Err(error) => {
+                    db_error_message = Some(error.to_string());
                     probes.push(HealthProbe {
                         name: "db_connectivity".into(),
                         status: "fail".into(),
@@ -10001,6 +14307,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let archive_db_parity_unhealthy = archive_db_parity.unhealthy;
             let archive_db_parity_degraded = archive_db_parity.degraded;
             probes.push(archive_db_parity.probe);
+
+            // 1e. Search V3 lexical index/backfill state (read-only).
+            let search_index = robot_search_index_health_from_config(&config);
+            let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
+                match search_index {
+                    Ok(snapshot) => {
+                        let status = search_index_probe_status(&snapshot);
+                        probes.push(HealthProbe {
+                            name: "search_index".into(),
+                            status: status.into(),
+                            latency_ms: 0.0,
+                            detail: search_index_probe_detail(&snapshot),
+                        });
+                        (Some(snapshot), status == "fail", status != "ok")
+                    }
+                    Err(error) => {
+                        probes.push(HealthProbe {
+                            name: "search_index".into(),
+                            status: "fail".into(),
+                            latency_ms: 0.0,
+                            detail: format!("Cannot inspect Search V3 lexical index: {error}"),
+                        });
+                        (None, true, true)
+                    }
+                };
 
             // 2. Circuit breaker status
             let db_health = mcp_agent_mail_db::db_health_status();
@@ -10103,34 +14434,166 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 },
             });
 
+            // 6. Host-pressure section (opt-in via --include-host).
+            //
+            // This stops agents from misclassifying host overload (full disk,
+            // exhausted inodes, scheduler saturation, memory pressure, an
+            // unwritable data dir) as Agent Mail corruption. It is intentionally
+            // kept OUT of the mailbox `overall` verdict — host pressure is not a
+            // mailbox fault — and surfaced as a distinct section + alert instead.
+            let host_report: Option<mcp_agent_mail_core::host_health::HostHealthReport> =
+                if include_host {
+                    let mut inputs = mcp_agent_mail_core::host_health::collect_inputs(&config);
+                    // Populate writer-PID liveness from the recovery lock when the
+                    // DB is file-backed (best-effort; absent => left unset).
+                    if let Ok(resolved) =
+                        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+                    {
+                        let db_path = std::path::PathBuf::from(&resolved.canonical_path);
+                        let recovery_lock =
+                            mcp_agent_mail_db::pool::inspect_mailbox_recovery_lock(&db_path);
+                        if let Some(pid) = recovery_lock.pid {
+                            inputs.writer_pid = Some(pid);
+                            inputs.writer_pid_alive = Some(recovery_lock.active);
+                        }
+                    }
+                    let report = mcp_agent_mail_core::host_health::evaluate(
+                        &inputs,
+                        &mcp_agent_mail_core::host_health::HostHealthThresholds::from_env(),
+                    );
+                    // Map host status into the probe vocabulary (ok/degraded);
+                    // host pressure is never a hard mailbox "fail".
+                    let probe_status = if report.status == "ok" {
+                        "ok"
+                    } else {
+                        "degraded"
+                    };
+                    let detail = if report.reasons.is_empty() {
+                        format!(
+                            "host_pressure_likely={}; no threshold breaches",
+                            report.host_pressure_likely
+                        )
+                    } else {
+                        format!(
+                            "host_pressure_likely={}; {}",
+                            report.host_pressure_likely,
+                            report.reasons.join("; ")
+                        )
+                    };
+                    probes.push(HealthProbe {
+                        name: "host".into(),
+                        status: probe_status.into(),
+                        latency_ms: 0.0,
+                        detail,
+                    });
+                    Some(report)
+                } else {
+                    None
+                };
+
+            // 7. TUI/runtime loop liveness (I2, br-bvq1x.9.2). Best-effort probe
+            // of the live server's per-loop heartbeats so a "freeze but still
+            // sort of running" symptom classifies into render/input/db-poll/
+            // mcp-api/coalescer state WITHOUT gdb. Unreachable (no live server)
+            // is NOT a mailbox fault and never degrades the verdict — only a
+            // reachable-but-stalled server does.
+            let tui_liveness = fetch_live_tui_liveness(&config);
+            let tui_liveness_stalled = tui_liveness.is_stalled();
+            let tui_liveness_status = if tui_liveness.source != "live" {
+                "skip"
+            } else if tui_liveness_stalled {
+                "degraded"
+            } else if tui_liveness.overall == "alive" {
+                "ok"
+            } else {
+                "skip"
+            };
+            probes.push(HealthProbe {
+                name: "tui_liveness".into(),
+                status: tui_liveness_status.into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "source={} overall={}; {}",
+                    tui_liveness.source, tui_liveness.overall, tui_liveness.detail
+                ),
+            });
+
+            // I4 (br-bvq1x.9.4): unified process-owner model — the single
+            // runtime-ownership surface (expected-service vs actual-process
+            // vs port-owner vs binary-path vs DB-path). Divergences and a
+            // supervisor respawn loop are degraded conditions.
+            let process_owner = crate::gather_process_owner_model(&config);
+            let process_owner_divergences =
+                crate::doctor::process_owner::classify_service_manager_divergences(&process_owner);
+            let process_owner_respawn = crate::doctor::process_owner::classify_supervisor_respawn(
+                &process_owner,
+                crate::doctor::process_owner::DEFAULT_RESPAWN_THRESHOLD,
+            );
+            let process_owner_has_python_shadow = process_owner.has_python_shadow();
+            let process_owner_degraded =
+                !process_owner_divergences.is_empty() || process_owner_respawn.is_some();
+
             // Overall health
             let overall = if !db_ok
                 || db_file_sanity_unhealthy
                 || db_schema_unhealthy
                 || archive_db_parity_unhealthy
+                || search_index_unhealthy
                 || backpressure_unhealthy
             {
                 "unhealthy"
             } else if db_file_sanity_degraded
                 || archive_db_parity_degraded
+                || search_index_degraded
                 || !integrity_ok
                 || !circuits_ok
                 || backpressure_degraded
                 || disk_probe_failed
                 || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok
+                || tui_liveness_stalled
+                || process_owner_degraded
             {
                 "degraded"
             } else {
                 "healthy"
             };
 
+            // J3 (br-bvq1x.10.3): always name the effective runtime identity so an
+            // agent (or operator) can tell exactly WHICH `am` binary it invoked and
+            // WHICH mailbox/server it is talking to — the path/version-confusion
+            // failure mode. Shared with `am doctor check` via
+            // `crate::runtime_identity_json` so both surfaces stay in lockstep.
             #[derive(Serialize)]
             struct HealthData {
                 overall: String,
                 health_level: String,
+                runtime_identity: serde_json::Value,
                 probes: Vec<HealthProbe>,
                 circuits: Vec<CircuitEntry>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                search_index: Option<LexicalBackfillHealth>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                host: Option<mcp_agent_mail_core::host_health::HostHealthReport>,
+                tui_liveness: TuiLivenessReport,
+                // Screen tick strategy resolved from AM_TUI_TICK_* config so
+                // operators can verify cadence configuration without a TUI
+                // session (Predictive Screen Tick Management, H.3/I.7).
+                tui_tick: serde_json::Value,
+                // I4: unified process-owner model (five runtime-ownership
+                // dimensions) plus the classified divergences/respawn loop.
+                process_owner: crate::doctor::process_owner::ProcessOwnerModel,
+                process_owner_divergences: Vec<crate::doctor::process_owner::ServiceDivergenceKind>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                supervisor_respawn: Option<crate::doctor::process_owner::SupervisorRespawnVerdict>,
             }
+
+            let runtime_identity = crate::runtime_identity_json(
+                &config.storage_root,
+                &config.database_url,
+                &config.http_host,
+                config.http_port,
+                db_file.as_deref(),
+            );
 
             #[derive(Serialize)]
             struct CircuitEntry {
@@ -10140,20 +14603,121 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 threshold: u32,
             }
 
+            // Capture host-pressure alert inputs before `host_report` is moved
+            // into the envelope payload.
+            let host_pressure_likely = host_report.as_ref().is_some_and(|r| r.host_pressure_likely);
+            let host_reasons_summary = host_report
+                .as_ref()
+                .map(|r| r.reasons.join("; "))
+                .unwrap_or_default();
+            let host_dir_unwritable = host_report
+                .as_ref()
+                .is_some_and(|r| r.db_dir_writable == Some(false));
+
+            // Capture TUI-liveness alert inputs before the report is moved into
+            // the envelope payload.
+            let tui_liveness_detail = tui_liveness.detail.clone();
+            let tui_liveness_fallback = tui_liveness.headless_fallback_command.clone();
+            // I6 (br-bvq1x.9.6): the non-interactive read-out an agent should run
+            // FIRST when a freeze is suspected (returns state without a kill).
+            let tui_liveness_readout = tui_liveness.readout_command.clone();
+
+            // I4: capture the process-owner alert inputs before the model and
+            // its verdicts are moved into the envelope payload. A respawn loop
+            // or a Python-shadow divergence is the most actionable; a plain
+            // bind/MainPID skew is a warning.
+            let process_owner_alert: Option<(&'static str, String)> = if process_owner_respawn
+                .is_some()
+            {
+                Some((
+                        "warn",
+                        "supervisor respawn loop: agent-mail keeps restarting (recurring crash hidden behind auto-restart)"
+                            .to_string(),
+                    ))
+            } else if !process_owner_divergences.is_empty() {
+                let severity = if process_owner_has_python_shadow {
+                    "error"
+                } else {
+                    "warn"
+                };
+                let summary = format!(
+                    "service-manager divergence: {}",
+                    process_owner_divergences
+                        .iter()
+                        .map(|d| d.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                Some((severity, summary))
+            } else {
+                None
+            };
+
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
                 HealthData {
                     overall: overall.into(),
                     health_level: health_str,
+                    runtime_identity,
                     probes,
                     circuits: circuit_entries,
+                    search_index: search_index_snapshot,
+                    host: host_report,
+                    tui_liveness,
+                    tui_tick: serde_json::json!({
+                        "strategy": config.resolved_tick_strategy_label(),
+                        "configured": config.tui_tick_strategy,
+                        "divisor": config.tui_tick_divisor,
+                        "persist": config.tui_tick_persist,
+                        "min_observations": config.tui_tick_min_observations,
+                        "decay_factor": config.tui_tick_decay_factor,
+                    }),
+                    process_owner,
+                    process_owner_divergences,
+                    supervisor_respawn: process_owner_respawn,
                 },
             );
 
+            if let Some((severity, summary)) = process_owner_alert {
+                env = env.with_alert(
+                    severity,
+                    summary,
+                    Some("am robot health --format json | jq .process_owner".to_string()),
+                );
+            }
+
             // Alerts
             if !db_ok {
-                env = env.with_alert("error", "Database connectivity probe failed", None);
+                // E4 (br-bvq1x.5.4): attach the safe-remediation contract derived
+                // from the classified DB failure (A2) and point the alert action at
+                // the recommended next command.
+                let remediation = db_error_message
+                    .as_deref()
+                    .map(RobotRemediation::from_db_error_message);
+                let action = remediation.as_ref().map(|r| r.recommended_command.clone());
+                env = env.with_alert("error", "Database connectivity probe failed", action);
+                if let Some(remediation) = remediation {
+                    env = env.with_remediation(remediation);
+                }
+            }
+            if host_dir_unwritable {
+                env = env.with_alert(
+                    "error",
+                    format!(
+                        "Data directory is not writable ({host_reasons_summary}). This is a host/permission fault, not Agent Mail corruption."
+                    ),
+                    None,
+                );
+            }
+            if host_pressure_likely {
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "Host pressure likely ({host_reasons_summary}). Investigate host resources (disk/inodes/load/memory) before assuming Agent Mail corruption."
+                    ),
+                    None,
+                );
             }
             if db_file_sanity_unhealthy {
                 env = env.with_alert("error", "Live sqlite file sanity probe failed", None);
@@ -10179,6 +14743,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     "Archive parity could not be fully proven from the current mailbox state",
                     None,
                 );
+            }
+            if search_index_unhealthy {
+                env = env.with_alert(
+                    "error",
+                    "Search V3 lexical index is unavailable or stale",
+                    None,
+                );
+            } else if search_index_degraded {
+                env = env.with_alert("warn", "Search V3 lexical index is not fully fresh", None);
             }
             if !circuits_ok && let Some(rec) = &db_health.recommendation {
                 env = env.with_alert("error", rec, None);
@@ -10211,15 +14784,40 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     None,
                 );
             }
+            if tui_liveness_stalled {
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "TUI/runtime loop appears frozen while the server is still running ({tui_liveness_detail}). Use the headless fallback to keep the MCP/API surface responsive."
+                    ),
+                    tui_liveness_fallback.clone(),
+                );
+            }
 
             // Actions
             if !db_ok {
                 env = env.with_action("Check DATABASE_URL env var and SQLite file accessibility");
             }
+            if tui_liveness_stalled && let Some(command) = tui_liveness_fallback.as_deref() {
+                let readout = tui_liveness_readout
+                    .as_deref()
+                    .unwrap_or(TUI_FROZEN_READOUT_COMMAND);
+                env = env.with_action(format!(
+                    "Suspected TUI freeze (server alive): read state now with `{readout}` (no process kill), then restart headless with `{command}`"
+                ));
+            }
+            if host_pressure_likely || host_dir_unwritable {
+                env = env.with_action(
+                    "Inspect the `host` section (free disk/inodes, load/cpu, memory, data-dir writability); relieve host pressure before assuming Agent Mail corruption",
+                );
+            }
             if db_schema_unhealthy || archive_db_parity_unhealthy {
                 env = env.with_action(
-                    "Run `am doctor check` and reconstruct from the Git archive before trusting mailbox reads",
+                    "Run `am doctor check` and `am doctor archive-verify --json` before reconstructing or trusting mailbox reads",
                 );
+            }
+            if search_index_degraded {
+                env = env.with_action("Run `am robot search <query>` to refresh Search V3 lexical backfill, then recheck `am robot health --format json`");
             }
             if config.integrity_check_interval_hours > 0
                 && mcp_agent_mail_db::is_full_check_due(config.integrity_check_interval_hours)
@@ -10280,7 +14878,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Analytics => {
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            let anomalies = build_analytics(scope.conn(), scope.project_id, scope.agent.clone())?;
+            let anomalies = build_analytics(
+                scope.conn(),
+                scope.project_id,
+                &scope.project_slug,
+                scope.agent.clone(),
+            )?;
             let config = mcp_agent_mail_core::Config::from_env();
             let topology = build_swarm_topology(
                 scope.conn(),
@@ -10332,16 +14935,46 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 health.as_deref(),
                 threshold,
             )?;
+            let project_human_key = project_human_key_sync(scope.conn(), scope.project_id)?
+                .unwrap_or_else(|| scope.project_slug.clone());
+            let diagnostics = build_agent_lifecycle_diagnostics(
+                scope.conn(),
+                scope.project_id,
+                &scope.project_slug,
+                &project_human_key,
+                &mcp_agent_mail_core::Config::get().storage_root,
+            )?;
 
             #[derive(Serialize)]
             struct AgentsData {
                 count: usize,
                 agents: Vec<AgentRow>,
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                diagnostics: Vec<AgentLifecycleDiagnostic>,
             }
 
             let count = agents.len();
-            let mut env = RobotEnvelope::new(cmd_name, format, AgentsData { count, agents });
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                AgentsData {
+                    count,
+                    agents,
+                    diagnostics: diagnostics.clone(),
+                },
+            );
             env._meta.project = Some(scope.project_slug);
+            let mut actions = HashSet::new();
+            for diagnostic in diagnostics {
+                env = env.with_alert(
+                    &diagnostic.severity,
+                    format!("{}: {}", diagnostic.reason_code, diagnostic.summary),
+                    Some(diagnostic.safe_command.clone()),
+                );
+                if actions.insert(diagnostic.safe_command.clone()) {
+                    env = env.with_action(diagnostic.safe_command);
+                }
+            }
             format_output(&env, format)?
         }
         RobotSubcommand::Contacts => {
@@ -10454,6 +15087,48 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             env._meta.project = resolved_project;
             format_output(&env, format)?
         }
+        RobotSubcommand::Handoff {
+            stale_minutes,
+            active_minutes,
+            fresh_comment_minutes,
+            include_fresh,
+            limit,
+            dry_run,
+        } => {
+            let scope = resolve_robot_project_scope(args.project.as_deref())?;
+            let (data, actions) = build_handoff(
+                &scope,
+                stale_minutes,
+                active_minutes,
+                fresh_comment_minutes,
+                include_fresh,
+                limit,
+                dry_run,
+            )?;
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = Some(scope.project_slug);
+            env = env.with_action(
+                "Read-only dashboard: inspect commands before running any ownership change",
+            );
+            for action in actions {
+                env = env.with_action(action);
+            }
+            if env.data.summary.blocked_by_reservation > 0 {
+                env = env.with_alert(
+                    "warn",
+                    "Some stale beads still have active file reservations",
+                    Some("Coordinate with the holder before reopening or editing".to_string()),
+                );
+            }
+            if env.data.summary.reopen_candidates > 0 || env.data.summary.takeover_candidates > 0 {
+                env = env.with_alert(
+                    "warn",
+                    "Handoff candidates are proposals only; no bead was reopened",
+                    Some("Run the proposed br update command only after checking reservations and peer work".to_string()),
+                );
+            }
+            format_output(&env, format)?
+        }
         RobotSubcommand::Atc {
             since,
             stratum,
@@ -10463,10 +15138,23 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let focus_agent = atc_focus_agent_name(args.agent.as_deref());
             let limit = atc_default_limit(limit);
             since.as_deref().map(parse_since_micros).transpose()?;
-            let live_endpoint =
-                atc_live_endpoint_from_config(&mcp_agent_mail_core::Config::from_env());
+            let config = mcp_agent_mail_core::Config::from_env();
+            let canary = load_latest_atc_canary_report(&config.storage_root);
+            let live_endpoint = atc_live_endpoint_from_config(&config);
             let maybe_scope =
                 maybe_resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            // ATC experiences live in the sidecar (br-bvq1x.11.7); the privacy
+            // report reads them from there. No sidecar => no report.
+            let privacy_report = maybe_scope.as_ref().and_then(|_scope| {
+                let atc_conn = open_local_atc_sidecar_conn()?;
+                match atc_privacy_report_from_conn(&atc_conn) {
+                    Ok(report) => Some(report),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to build ATC privacy report");
+                        None
+                    }
+                }
+            });
 
             let (snapshot, reservation_conflicts, project_slug, live_error) =
                 match fetch_live_atc_snapshot(&live_endpoint) {
@@ -10530,12 +15218,27 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 focus_agent.as_deref(),
                 since.as_deref(),
                 stratum.as_deref(),
+                canary,
+                privacy_report,
                 summary_only,
                 limit,
             );
 
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = project_slug;
+            let canary_alert = env
+                .data
+                .canary
+                .as_ref()
+                .filter(|canary| canary.verdict != "canary_passed")
+                .map(|canary| (canary.verdict.clone(), canary.artifact_path.clone()));
+            if let Some((verdict, artifact_path)) = canary_alert {
+                env = env.with_alert(
+                    "warn",
+                    format!("Latest ATC canary verdict: {verdict}"),
+                    Some(artifact_path),
+                );
+            }
             if let Some(error) = live_error {
                 let alert_summary = if env.data.source == "local_db" {
                     "Live ATC snapshot unavailable; using local DB fallback"
@@ -10603,6 +15306,28 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     .unwrap_or_else(|| "deterministic conservative fallback active".to_string());
                 env = env.with_alert("warn", "ATC fallback mode active", Some(detail));
             }
+            let privacy_alert = env.data.privacy.as_ref().and_then(|privacy| {
+                let suspected_secret_rows = privacy.totals.suspected_secret_rows;
+                let redaction_candidate_rows = privacy.totals.redaction_candidate_rows;
+                if suspected_secret_rows > 0 {
+                    Some((
+                        "ATC privacy report found suspected-secret rows",
+                        format!(
+                            "{suspected_secret_rows} suspected-secret row(s); inspect privacy.redaction_candidate_rows before live rollout"
+                        ),
+                    ))
+                } else if redaction_candidate_rows > 0 {
+                    Some((
+                        "ATC privacy report has redaction candidates",
+                        format!("{redaction_candidate_rows} row(s) require privacy review"),
+                    ))
+                } else {
+                    None
+                }
+            });
+            if let Some((message, detail)) = privacy_alert {
+                env = env.with_alert("warn", message, Some(detail));
+            }
             if let Some(age) = snapshot_age_micros {
                 tracing::debug!(event = "robot.atc.snapshot_age_micros", age_micros = age);
             }
@@ -10631,6 +15356,130 @@ mod tests {
 
     static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static ROBOT_COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // ── Degraded-mode queued-intent surface (br-bvq1x.8.3 / H3) ──────────────
+
+    fn queued_intents_test_config(dir: &Path) -> mcp_agent_mail_core::Config {
+        let mut config = mcp_agent_mail_core::Config::get();
+        config.storage_root = dir.to_path_buf();
+        config
+    }
+
+    fn pending_send_artifact_json(content_hash: &str, subject: &str) -> Value {
+        serde_json::json!({
+            "schema_version": "am.pending_send.v1",
+            "status": "UNSENT_UNTIL_REPLAY",
+            "content_hash": content_hash,
+            "created_ts": "2026-06-16T00:00:00Z",
+            "replay_command": format!("am mail replay-queued --artifact /tmp/{content_hash}.json"),
+            "sender_token_was_provided": false,
+            "sender_token_stored": false,
+            "envelope": {
+                "project_key": "/abs/project",
+                "sender": "GreenCastle",
+                "to": ["BlueLake"],
+                "cc": [],
+                "bcc": [],
+                "subject": subject,
+                "body_md": "done",
+                "attachment_paths": [],
+                "convert_images": null,
+                "importance": "high",
+                "ack_required": false,
+                "thread_id": null
+            },
+            "failure": {
+                "class": "ConnectionOrConfigError",
+                "repairable": true,
+                "safe_to_retry": true,
+                "safe_to_continue_read_only": true,
+                "blocks_edits": false,
+                "recommended_command": "am doctor repair",
+                "message": "database is locked"
+            }
+        })
+    }
+
+    #[test]
+    fn build_queued_intents_surfaces_ack_and_send() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = queued_intents_test_config(tmp.path());
+
+        // No durable intents on disk yet.
+        assert!(build_queued_intents_for_config(&config).is_empty());
+
+        // Queue an ack intent through the real durable-intent writer.
+        mcp_agent_mail_tools::degraded_intents::append_ack_intent(
+            &config,
+            "/abs/project",
+            "BlueLake",
+            1234,
+            "acknowledge_message",
+            "database disk image is malformed",
+        )
+        .expect("append ack intent");
+
+        // Drop a pending-send (UNSENT) artifact on disk.
+        let pending_dir = tmp.path().join("pending_sends");
+        std::fs::create_dir_all(&pending_dir).expect("mkdir pending_sends");
+        std::fs::write(
+            pending_dir.join("deadbeef.json"),
+            serde_json::to_vec_pretty(&pending_send_artifact_json("deadbeef", "closeout summary"))
+                .expect("serialize artifact"),
+        )
+        .expect("write pending send");
+
+        let intents = build_queued_intents_for_config(&config);
+        assert_eq!(
+            intents.len(),
+            2,
+            "expected one ack + one send intent: {intents:?}"
+        );
+
+        let ack = intents
+            .iter()
+            .find(|i| i.kind == "acknowledge_message")
+            .expect("ack intent present");
+        assert_eq!(ack.agent.as_deref(), Some("BlueLake"));
+        assert!(ack.summary.contains("1234"), "summary: {}", ack.summary);
+        assert!(
+            ack.replay.contains("automatic"),
+            "ack replays automatically: {}",
+            ack.replay
+        );
+
+        let send = intents
+            .iter()
+            .find(|i| i.kind == "send_message")
+            .expect("send intent present");
+        assert_eq!(send.agent.as_deref(), Some("GreenCastle"));
+        assert!(send.summary.contains("closeout summary"));
+        assert_eq!(
+            send.replay,
+            "am mail replay-queued --artifact /tmp/deadbeef.json"
+        );
+    }
+
+    #[test]
+    fn scan_pending_sends_skips_already_sent_artifacts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = queued_intents_test_config(tmp.path());
+        let pending_dir = tmp.path().join("pending_sends");
+        std::fs::create_dir_all(&pending_dir).expect("mkdir");
+        std::fs::write(
+            pending_dir.join("cafef00d.json"),
+            serde_json::to_vec(&pending_send_artifact_json("cafef00d", "x")).expect("serialize"),
+        )
+        .expect("write");
+        assert_eq!(scan_pending_send_intents(&config).len(), 1);
+
+        // A sibling `.sent.json` receipt marks the artifact as already sent.
+        std::fs::write(pending_dir.join("cafef00d.sent.json"), b"{}").expect("write receipt");
+        assert!(
+            scan_pending_send_intents(&config).is_empty(),
+            "a sent artifact must not appear as queued"
+        );
+    }
 
     fn setup_robot_status_snapshot_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -10720,6 +15569,94 @@ mod tests {
         (temp_dir, conn)
     }
 
+    #[test]
+    fn robot_contact_stats_only_treats_approved_links_as_respected() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_contact_stats.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                contact_policy TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_agent_id INTEGER NOT NULL,
+                b_agent_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                expires_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create links");
+
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, contact_policy) VALUES
+                (1, 1, 'open'),
+                (2, 1, 'contacts_only')",
+            &empty,
+        )
+        .expect("seed agents");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, created_ts)
+             VALUES (1, 1, 1, 100)",
+            &empty,
+        )
+        .expect("seed message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id)
+             VALUES (1, 1, 2)",
+            &empty,
+        )
+        .expect("seed recipient");
+        conn.query_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts)
+             VALUES (1, 1, 2, 'accepted', NULL)",
+            &empty,
+        )
+        .expect("seed stale link");
+
+        let stale_stats = fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000);
+        let stale = stale_stats.get(&2).expect("stale contact stats");
+        assert_eq!(stale.respected_count, 0);
+        assert_eq!(stale.violation_count, 1);
+
+        conn.query_sync("UPDATE agent_links SET status = 'approved'", &empty)
+            .expect("approve link");
+
+        let approved_stats = fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000);
+        let approved = approved_stats.get(&2).expect("approved contact stats");
+        assert_eq!(approved.respected_count, 1);
+        assert_eq!(approved.violation_count, 0);
+    }
+
     fn with_navigate_resource_env<F, T>(database_url: &str, storage_root: &str, f: F) -> T
     where
         F: FnOnce() -> T,
@@ -10745,6 +15682,11 @@ mod tests {
             &[
                 ("DATABASE_URL", database_url),
                 ("STORAGE_ROOT", storage_root),
+                // Pin the resolved server endpoint to an unused port so robot
+                // commands that best-effort probe a live server (e.g. `health`'s
+                // I2 TUI-liveness probe) deterministically see "unreachable"
+                // instead of contacting whatever real server is bound on 8765.
+                ("HTTP_PORT", "47351"),
             ],
             || handle_robot(args),
         );
@@ -10760,6 +15702,355 @@ mod tests {
     struct TestData {
         items: Vec<String>,
         count: usize,
+    }
+
+    fn handoff_classification(input: HandoffClassificationInput) -> HandoffClassification {
+        classify_handoff(&input)
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_requires_persisted_human_key() {
+        let err = resolve_handoff_project_root(None).expect_err("missing human_key must fail");
+        assert!(
+            err.to_string()
+                .contains("requires a persisted project human_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_rejects_missing_directory() {
+        let td = tempfile::tempdir().unwrap();
+        let missing = td.path().join("missing-project");
+        let err = resolve_handoff_project_root(Some(missing.display().to_string()))
+            .expect_err("missing project path must fail closed");
+        assert!(
+            err.to_string().contains("not an existing directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_rejects_relative_human_key() {
+        let err = resolve_handoff_project_root(Some("relative/project".to_string()))
+            .expect_err("relative project path must fail closed");
+        assert!(
+            err.to_string().contains("must be absolute"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_accepts_existing_directory() {
+        let td = tempfile::tempdir().unwrap();
+        let root = resolve_handoff_project_root(Some(td.path().display().to_string())).unwrap();
+        assert_eq!(root, td.path());
+    }
+
+    #[test]
+    fn classify_handoff_keeps_active_owner() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            owner_active: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "keep");
+        assert_eq!(result.reason_codes, vec!["owner_active"]);
+    }
+
+    #[test]
+    fn classify_handoff_marks_inactive_owner_takeover_candidate() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "takeover_candidate");
+        assert_eq!(result.reason_codes, vec!["owner_inactive"]);
+    }
+
+    #[test]
+    fn classify_handoff_blocks_on_active_reservation() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            has_active_reservation: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "blocked_by_reservation");
+        assert_eq!(result.reason_codes, vec!["active_file_reservation"]);
+    }
+
+    #[test]
+    fn classify_handoff_keeps_fresh_comment() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            has_fresh_comment: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "keep");
+        assert_eq!(result.reason_codes, vec!["fresh_comment"]);
+    }
+
+    #[test]
+    fn classify_handoff_asks_owner_for_ack_required_mail() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            has_ack_required_mail: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "ask_owner");
+        assert_eq!(result.reason_codes, vec!["ack_required_mail"]);
+    }
+
+    #[test]
+    fn classify_handoff_reopens_no_owner_stale_bead() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "reopen_candidate");
+        assert_eq!(result.reason_codes, vec!["no_owner"]);
+    }
+
+    #[test]
+    fn reservation_reason_mentions_bracketed_issue_id() {
+        assert!(reservation_reason_mentions_issue(
+            "[br-lmcob.15] forensic timeline",
+            "br-lmcob.15"
+        ));
+        assert!(reservation_reason_mentions_issue(
+            "handoff for br-idea-wizard-swarm-reliability-2ac6x.6",
+            "br-idea-wizard-swarm-reliability-2ac6x.6"
+        ));
+        assert!(!reservation_reason_mentions_issue(
+            "handoff for br-lmcob.150",
+            "br-lmcob.15"
+        ));
+    }
+
+    #[test]
+    fn handoff_reservations_include_bead_reason_without_owner() {
+        let reservations = vec![
+            HandoffReservationInfo {
+                id: 1,
+                agent: "OtherAgent".to_string(),
+                path: "crates/mcp-agent-mail-cli/src/robot.rs".to_string(),
+                exclusive: true,
+                reason: "working [br-lmcob.15]".to_string(),
+                created_ts: None,
+                expires_ts: 0,
+            },
+            HandoffReservationInfo {
+                id: 2,
+                agent: "OtherAgent".to_string(),
+                path: "README.md".to_string(),
+                exclusive: true,
+                reason: "unrelated".to_string(),
+                created_ts: None,
+                expires_ts: 0,
+            },
+        ];
+
+        let matched = handoff_reservations_for_issue(&reservations, None, "br-lmcob.15");
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, 1);
+        assert_eq!(matched[0].agent, "OtherAgent");
+    }
+
+    #[test]
+    fn fetch_handoff_active_reservations_ignores_expired_stale_claims() {
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let db_path = db_dir.path().join("handoff_expired_reservations.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open handoff db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                exclusive INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+             (1, 1, 1, 'stale/**', 1, 'working br-stale', ?, ?, NULL),
+             (2, 1, 1, 'active/**', 1, 'working br-active', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 2 * MICROS_PER_HOUR),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_HOUR),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + MICROS_PER_HOUR),
+            ],
+        )
+        .expect("insert reservations");
+
+        let reservations =
+            fetch_handoff_active_reservations(&conn, 1, now_us).expect("fetch reservations");
+
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].id, 2);
+        assert_eq!(reservations[0].reason, "working br-active");
+    }
+
+    #[test]
+    fn build_handoff_blocks_no_owner_bead_with_reason_reservation() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let beads_dir = project_dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let now_us = mcp_agent_mail_db::now_micros();
+        let stale_updated_at = mcp_agent_mail_db::micros_to_iso(now_us - 2 * MICROS_PER_HOUR);
+        let issue = serde_json::json!({
+            "id": "br-stale",
+            "title": "Stale handoff candidate",
+            "status": "in_progress",
+            "updated_at": stale_updated_at,
+            "comments": []
+        });
+        std::fs::write(beads_dir.join("issues.jsonl"), format!("{issue}\n"))
+            .expect("write issues jsonl");
+
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let db_path = db_dir.path().join("handoff.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open handoff db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                thread_id TEXT,
+                subject TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL DEFAULT 0,
+                importance TEXT NOT NULL DEFAULT 'normal'
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                exclusive INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'demo', ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                    project_dir.path().display().to_string(),
+                ),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+            ],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 1, 'crates/**', 1, 'working br-stale', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + MICROS_PER_HOUR),
+            ],
+        )
+        .expect("insert reservation");
+
+        let scope = ResolvedRobotProjectScope {
+            db: RobotDbHandle::from_conn(conn),
+            project_id: 1,
+            project_slug: "demo".to_string(),
+        };
+        let (data, _actions) =
+            build_handoff(&scope, 30, 30, 30, false, None, false).expect("build handoff");
+
+        assert_eq!(data.records.len(), 1);
+        assert_eq!(data.records[0].action, "blocked_by_reservation");
+        assert_eq!(data.records[0].active_reservations.len(), 1);
+        assert_eq!(data.records[0].active_reservations[0].agent, "OtherAgent");
+        assert_eq!(data.summary.blocked_by_reservation, 1);
     }
 
     fn sample_atc_snapshot() -> AtcRobotSnapshot {
@@ -10994,6 +16285,113 @@ mod tests {
     }
 
     #[test]
+    fn ws_state_url_with_system_health_appends_flag_once() {
+        assert_eq!(
+            ws_state_url_with_system_health("https://h:1/mail/ws-state?limit=1"),
+            "https://h:1/mail/ws-state?limit=1&system_health=1"
+        );
+        // Idempotent: never double-appends.
+        assert_eq!(
+            ws_state_url_with_system_health("https://h:1/mail/ws-state?limit=1&system_health=1"),
+            "https://h:1/mail/ws-state?limit=1&system_health=1"
+        );
+    }
+
+    #[test]
+    fn classify_loop_liveness_entry_maps_server_heartbeat_states() {
+        let alive = serde_json::json!({
+            "kind": "render", "periodic": true, "observed": true,
+            "stale": false, "age_micros": 1_000_000, "consecutive_failures": 0,
+        });
+        let entry = classify_loop_liveness_entry(&alive);
+        assert_eq!(entry.loop_name, "render");
+        assert_eq!(entry.state, "alive");
+        assert_eq!(entry.age_seconds, Some(1));
+
+        let stalled = serde_json::json!({
+            "kind": "render", "periodic": true, "observed": true,
+            "stale": true, "age_micros": 15_000_000, "consecutive_failures": 0,
+        });
+        assert_eq!(classify_loop_liveness_entry(&stalled).state, "stalled");
+
+        let failing = serde_json::json!({
+            "kind": "db_poll", "periodic": true, "observed": true,
+            "stale": false, "age_micros": 2_000_000, "consecutive_failures": 3,
+        });
+        assert_eq!(classify_loop_liveness_entry(&failing).state, "failing");
+
+        let unobserved = serde_json::json!({
+            "kind": "commit_coalescer", "periodic": false, "observed": false,
+            "stale": false, "age_micros": null, "consecutive_failures": 0,
+        });
+        let unobserved_entry = classify_loop_liveness_entry(&unobserved);
+        assert_eq!(unobserved_entry.state, "unobserved");
+        assert_eq!(unobserved_entry.age_seconds, None);
+    }
+
+    #[test]
+    fn tui_liveness_report_alive_when_all_loops_advance() {
+        let entries = vec![
+            serde_json::json!({"kind":"render","periodic":true,"observed":true,"stale":false,"age_micros":500_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"input","periodic":false,"observed":true,"stale":false,"age_micros":500_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"db_poll","periodic":true,"observed":true,"stale":false,"age_micros":3_000_000,"consecutive_failures":0}),
+        ];
+        let report = tui_liveness_report_from_loop_heartbeats(&entries);
+        assert_eq!(report.source, "live");
+        assert_eq!(report.overall, "alive");
+        assert!(report.stalled_loops.is_empty());
+        assert!(report.headless_fallback_command.is_none());
+        // I6: no freeze ⇒ no read-out escape hatch is advertised.
+        assert!(report.readout_command.is_none());
+        assert!(!report.is_stalled());
+    }
+
+    #[test]
+    fn tui_liveness_report_flags_stall_and_recommends_headless_fallback() {
+        // L3 stall fixture: the render loop has gone stale while input still ticks.
+        let entries = vec![
+            serde_json::json!({"kind":"render","periodic":true,"observed":true,"stale":true,"age_micros":20_000_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"input","periodic":false,"observed":true,"stale":false,"age_micros":300_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"db_poll","periodic":true,"observed":true,"stale":false,"age_micros":2_000_000,"consecutive_failures":0}),
+        ];
+        let report = tui_liveness_report_from_loop_heartbeats(&entries);
+        assert_eq!(report.overall, "stalled");
+        assert_eq!(report.stalled_loops, vec!["render".to_string()]);
+        assert!(report.is_stalled());
+        assert_eq!(
+            report.headless_fallback_command.as_deref(),
+            Some(TUI_HEADLESS_FALLBACK_COMMAND)
+        );
+        // I6 (br-bvq1x.9.6): a suspected freeze points agents at the
+        // non-interactive read-out FIRST (state without a process kill).
+        assert_eq!(
+            report.readout_command.as_deref(),
+            Some(TUI_FROZEN_READOUT_COMMAND)
+        );
+    }
+
+    #[test]
+    fn tui_liveness_report_unknown_when_no_heartbeats() {
+        let report = tui_liveness_report_from_loop_heartbeats(&[]);
+        assert_eq!(report.source, "live");
+        assert_eq!(report.overall, "unknown");
+        assert!(report.headless_fallback_command.is_none());
+        assert!(report.readout_command.is_none());
+        assert!(!report.is_stalled());
+    }
+
+    #[test]
+    fn tui_liveness_unreachable_is_non_fatal_with_no_recommendation() {
+        let report = TuiLivenessReport::unreachable("connection refused");
+        assert_eq!(report.source, "unreachable");
+        assert_eq!(report.overall, "unknown");
+        assert!(report.headless_fallback_command.is_none());
+        assert!(report.readout_command.is_none());
+        // An unreachable server must NOT read as a frozen TUI.
+        assert!(!report.is_stalled());
+    }
+
+    #[test]
     fn atc_live_endpoint_prefers_env_bearer_token_and_preserves_query_token() {
         let config = mcp_agent_mail_core::Config {
             http_bearer_token: Some("config-token".to_string()),
@@ -11042,6 +16440,8 @@ mod tests {
                 agent_b: "BetaAgent".to_string(),
                 path_b: "src/server/**".to_string(),
             }],
+            None,
+            None,
             None,
             None,
             None,
@@ -11167,6 +16567,39 @@ mod tests {
     }
 
     #[test]
+    fn build_atc_data_surfaces_latest_canary_report() {
+        let canary = AtcCanaryReportSummary {
+            status: "pass".to_string(),
+            verdict: "hold_live".to_string(),
+            artifact_path: "/tmp/atc/canary_report.json".to_string(),
+            quick_check: "ok".to_string(),
+            atc_rows: Some(0),
+            live_p95_ms: Some(13.0),
+            shadow_p95_ms: Some(12.5),
+            reason: "canary database recorded no ATC experience rows".to_string(),
+            recommendation: "keep live writes disabled".to_string(),
+            safe_command: Some("export AM_ATC_WRITE_MODE=shadow".to_string()),
+        };
+
+        let data = build_atc_data(
+            sample_atc_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(canary),
+            None,
+            true,
+            5,
+        );
+
+        let surfaced = data.canary.expect("canary report");
+        assert_eq!(surfaced.verdict, "hold_live");
+        assert_eq!(surfaced.artifact_path, "/tmp/atc/canary_report.json");
+        assert_eq!(surfaced.atc_rows, Some(0));
+    }
+
+    #[test]
     fn build_atc_data_summary_only_filters_since_and_stratum() {
         let data = build_atc_data(
             sample_atc_snapshot(),
@@ -11174,6 +16607,8 @@ mod tests {
             None,
             Some("1970-01-01T00:00:02Z"),
             Some("liveness:probe:0"),
+            None,
+            None,
             true,
             5,
         );
@@ -11230,7 +16665,17 @@ mod tests {
             ("conflict:release:2".to_string(), 6),
         ]);
 
-        let data = build_atc_data(snapshot, Vec::new(), None, None, Some("liveness"), true, 1);
+        let data = build_atc_data(
+            snapshot,
+            Vec::new(),
+            None,
+            None,
+            Some("liveness"),
+            None,
+            None,
+            true,
+            1,
+        );
         let summary = data.summary.expect("summary");
 
         assert_eq!(
@@ -11242,6 +16687,105 @@ mod tests {
             summary.experiences_open, 12,
             "aggregate should include all matching strata, not only displayed rows"
         );
+    }
+
+    fn setup_atc_privacy_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::CanonicalDbConn) {
+        // ATC experiences live in the sidecar, read via canonical SQLite
+        // (br-bvq1x.11.7), so the privacy report is exercised against a
+        // canonical connection here.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("atc.sqlite3");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE atc_experiences (
+                experience_id INTEGER PRIMARY KEY,
+                project_key TEXT,
+                subject TEXT,
+                subsystem TEXT,
+                effect_kind TEXT,
+                state TEXT,
+                evidence_summary TEXT,
+                outcome_json TEXT,
+                context_json TEXT,
+                contained_suspected_secret INTEGER NOT NULL DEFAULT 0,
+                privacy_classification TEXT NOT NULL DEFAULT 'legacy_unclassified'
+            )",
+            &empty,
+        )
+        .expect("create atc_experiences");
+        conn.query_sync(
+            "INSERT INTO atc_experiences (
+                experience_id, project_key, subject, subsystem, effect_kind, state,
+                evidence_summary, outcome_json, context_json,
+                contained_suspected_secret, privacy_classification
+            ) VALUES
+                (1, '/data/projects/private-client', 'AlphaAgent', 'liveness', 'probe', 'open',
+                 '', NULL, NULL, 0, 'metadata_only'),
+                (2, '/data/projects/private-client', 'SecretSubject', 'conflict', 'advisory', 'resolved',
+                 'secret message body from ticket', '{\"label\":\"PRIVATE_RAW_SUBJECT\"}', '{\"path\":\"/data/projects/private-client/src/secrets.rs\"}', 1, 'redacted_due_to_secret'),
+                (3, '/tmp/another-private-path', 'OtherAgent', 'liveness', 'probe', 'censored',
+                 '', NULL, NULL, 0, 'legacy_unclassified')",
+            &empty,
+        )
+        .expect("seed atc_experiences");
+        (temp_dir, conn)
+    }
+
+    #[test]
+    fn atc_privacy_report_counts_rows_without_leaking_raw_fields() {
+        let (_temp, conn) = setup_atc_privacy_test_db();
+        let report = atc_privacy_report_from_conn(&conn).expect("privacy report");
+
+        assert_eq!(report.totals.total_rows, 3);
+        assert_eq!(report.totals.open_rows, 1);
+        assert_eq!(report.totals.resolved_rows, 1);
+        assert_eq!(report.totals.censored_rows, 1);
+        assert_eq!(report.totals.suspected_secret_rows, 1);
+        assert_eq!(report.totals.redacted_due_to_secret_rows, 1);
+        assert_eq!(report.totals.legacy_unclassified_rows, 1);
+        assert_eq!(report.totals.redaction_candidate_rows, 2);
+        assert_eq!(
+            report.privacy_classifications.get("metadata_only").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            report
+                .privacy_classifications
+                .get("redacted_due_to_secret")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(report.projects.len(), 2);
+        assert!(
+            report
+                .projects
+                .iter()
+                .all(|project| project.project_hash != "/data/projects/private-client")
+        );
+        assert!(report.strata.iter().any(
+            |row| row.stratum == "conflict:advisory:resolved" && row.suspected_secret_rows == 1
+        ));
+
+        let json = serde_json::to_string(&report).expect("serialize report");
+        for forbidden in [
+            "/data/projects/private-client",
+            "/tmp/another-private-path",
+            "SecretSubject",
+            "secret message body",
+            "PRIVATE_RAW_SUBJECT",
+            "secrets.rs",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "privacy report leaked raw field `{forbidden}` in {json}"
+            );
+        }
+        assert!(json.contains("redaction_candidate_rows"));
+        assert!(json.contains("retention_windows"));
+        assert!(json.contains("redaction_options"));
+        assert!(json.contains("schema_classification_summary"));
     }
 
     #[test]
@@ -11667,6 +17211,138 @@ mod tests {
     }
 
     #[test]
+    fn robot_inbox_server_arguments_preserve_robot_filter_precedence() {
+        let default_request = RobotInboxServerRequest {
+            project_key: "/tmp/demo".into(),
+            agent_name: "BlueLake".into(),
+            urgent: false,
+            ack_overdue: false,
+            unread: true,
+            all: false,
+            limit: 20,
+            include_bodies: false,
+        };
+        let default_args = robot_inbox_server_arguments(&default_request);
+        assert_eq!(default_args["unread_only"], true);
+        assert_eq!(default_args["ack_overdue_only"], false);
+
+        let urgent_request = RobotInboxServerRequest {
+            urgent: true,
+            ack_overdue: true,
+            unread: false,
+            ..default_request.clone()
+        };
+        let urgent_args = robot_inbox_server_arguments(&urgent_request);
+        assert_eq!(urgent_args["urgent_only"], true);
+        assert_eq!(urgent_args["unread_only"], true);
+        assert_eq!(urgent_args["ack_overdue_only"], false);
+
+        let overdue_request = RobotInboxServerRequest {
+            urgent: false,
+            ack_overdue: true,
+            unread: false,
+            ..default_request.clone()
+        };
+        let overdue_args = robot_inbox_server_arguments(&overdue_request);
+        assert_eq!(overdue_args["unread_only"], false);
+        assert_eq!(overdue_args["ack_overdue_only"], true);
+
+        let all_request = RobotInboxServerRequest {
+            unread: false,
+            all: true,
+            ..default_request
+        };
+        let all_args = robot_inbox_server_arguments(&all_request);
+        assert_eq!(all_args["unread_only"], false);
+        assert_eq!(all_args["ack_overdue_only"], false);
+    }
+
+    #[test]
+    fn robot_inbox_server_payload_uses_read_and_ack_timestamps_for_priority() {
+        let now = mcp_agent_mail_db::now_micros();
+        let old = mcp_agent_mail_db::micros_to_iso(now - ACK_OVERDUE_THRESHOLD_US - 60_000_000);
+        let recent = mcp_agent_mail_db::micros_to_iso(now - 60_000_000);
+        let read = mcp_agent_mail_db::micros_to_iso(now - 30_000_000);
+        let payload = serde_json::json!([
+            {
+                "id": 2,
+                "subject": "Normal unread",
+                "from": "GreenCastle",
+                "importance": "normal",
+                "ack_required": false,
+                "created_ts": recent.clone(),
+                "thread_id": "normal-thread",
+                "kind": "to"
+            },
+            {
+                "id": 3,
+                "subject": "Ack overdue",
+                "from": "RedStone",
+                "importance": "normal",
+                "ack_required": true,
+                "created_ts": old.clone(),
+                "read_ts": read.clone(),
+                "thread_id": "ack-thread",
+                "kind": "to"
+            },
+            {
+                "id": 1,
+                "subject": "Urgent unread",
+                "from": "BlueLake",
+                "importance": "urgent",
+                "ack_required": true,
+                "created_ts": old.clone(),
+                "thread_id": "urgent-thread",
+                "kind": "to"
+            },
+            {
+                "id": 4,
+                "subject": "Read and acked",
+                "from": "SilverPeak",
+                "importance": "normal",
+                "ack_required": true,
+                "created_ts": old,
+                "read_ts": read.clone(),
+                "ack_ts": read,
+                "thread_id": "done-thread",
+                "kind": "to"
+            }
+        ]);
+        let request = RobotInboxServerRequest {
+            project_key: "/tmp/demo".into(),
+            agent_name: "BlueLake".into(),
+            urgent: false,
+            ack_overdue: false,
+            unread: true,
+            all: false,
+            limit: 10,
+            include_bodies: false,
+        };
+
+        let result = build_inbox_from_server_payload(&payload, &request).expect("server inbox");
+        let ids = result
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 3, 2]);
+        assert_eq!(result.entries[0].priority, "urgent");
+        assert_eq!(result.entries[1].priority, "ack-overdue");
+        assert_eq!(result.entries[1].ack_status, "overdue");
+        assert_eq!(result.alerts.len(), 1);
+
+        let overdue_request = RobotInboxServerRequest {
+            ack_overdue: true,
+            unread: false,
+            ..request
+        };
+        let overdue =
+            build_inbox_from_server_payload(&payload, &overdue_request).expect("overdue inbox");
+        assert_eq!(overdue.entries.len(), 1);
+        assert_eq!(overdue.entries[0].id, 3);
+    }
+
+    #[test]
     fn test_inbox_priority_ordering() {
         // Verify priority labels map correctly
         let labels = [
@@ -11766,7 +17442,12 @@ mod tests {
                     age: "3h ago".into(),
                 },
             ],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
             plan_diagnostic: None,
+            search_index: None,
             by_thread: vec![FacetEntry {
                 value: "FEAT-123".into(),
                 count: 2,
@@ -11799,11 +17480,39 @@ mod tests {
         assert!(!toon.is_empty());
     }
 
+    fn planner_search_result_row(
+        id: i64,
+        title: &str,
+        score: f64,
+        created_ts: i64,
+        thread_id: &str,
+        from_agent: &str,
+    ) -> mcp_agent_mail_db::search_planner::SearchResult {
+        use mcp_agent_mail_db::search_planner::{DocKind, SearchResult as PlannerSearchResult};
+
+        PlannerSearchResult {
+            doc_kind: DocKind::Message,
+            id,
+            project_id: Some(1),
+            title: title.into(),
+            body: "body".into(),
+            score: Some(score),
+            importance: Some("normal".into()),
+            ack_required: Some(false),
+            created_ts: Some(created_ts),
+            thread_id: Some(thread_id.into()),
+            from_agent: Some(from_agent.into()),
+            reason_codes: vec![],
+            score_factors: vec![],
+            redacted: false,
+            redaction_reason: None,
+            ..PlannerSearchResult::default()
+        }
+    }
+
     #[test]
     fn collect_search_rows_with_runner_pages_until_kind_matches_fill_limit() {
-        use mcp_agent_mail_db::search_planner::{
-            DocKind, SearchQuery, SearchResponse, SearchResult as PlannerSearchResult,
-        };
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_search_kind_paging.sqlite3");
@@ -11838,42 +17547,8 @@ mod tests {
             match query.cursor.as_deref() {
                 None => Ok(SearchResponse {
                     results: vec![
-                        PlannerSearchResult {
-                            doc_kind: DocKind::Message,
-                            id: 10,
-                            project_id: Some(1),
-                            title: "first".into(),
-                            body: "body".into(),
-                            score: Some(0.9),
-                            importance: Some("normal".into()),
-                            ack_required: Some(false),
-                            created_ts: Some(100),
-                            thread_id: Some("th-1".into()),
-                            from_agent: Some("Alpha".into()),
-                            reason_codes: vec![],
-                            score_factors: vec![],
-                            redacted: false,
-                            redaction_reason: None,
-                            ..PlannerSearchResult::default()
-                        },
-                        PlannerSearchResult {
-                            doc_kind: DocKind::Message,
-                            id: 20,
-                            project_id: Some(1),
-                            title: "second".into(),
-                            body: "body".into(),
-                            score: Some(0.8),
-                            importance: Some("normal".into()),
-                            ack_required: Some(false),
-                            created_ts: Some(200),
-                            thread_id: Some("th-2".into()),
-                            from_agent: Some("Beta".into()),
-                            reason_codes: vec![],
-                            score_factors: vec![],
-                            redacted: false,
-                            redaction_reason: None,
-                            ..PlannerSearchResult::default()
-                        },
+                        planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
+                        planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
                     ],
                     next_cursor: Some("cursor-2".into()),
                     explain: None,
@@ -11882,24 +17557,9 @@ mod tests {
                     audit: vec![],
                 }),
                 Some("cursor-2") => Ok(SearchResponse {
-                    results: vec![PlannerSearchResult {
-                        doc_kind: DocKind::Message,
-                        id: 30,
-                        project_id: Some(1),
-                        title: "third".into(),
-                        body: "body".into(),
-                        score: Some(0.7),
-                        importance: Some("normal".into()),
-                        ack_required: Some(false),
-                        created_ts: Some(300),
-                        thread_id: Some("th-3".into()),
-                        from_agent: Some("Gamma".into()),
-                        reason_codes: vec![],
-                        score_factors: vec![],
-                        redacted: false,
-                        redaction_reason: None,
-                        ..PlannerSearchResult::default()
-                    }],
+                    results: vec![planner_search_result_row(
+                        30, "third", 0.7, 300, "th-3", "Gamma",
+                    )],
                     next_cursor: None,
                     explain: None,
                     assistance: None,
@@ -11916,8 +17576,80 @@ mod tests {
             "should page until matching rows fill the limit"
         );
         assert_eq!(
-            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             vec![20, 30]
+        );
+        assert!(
+            rows.next_cursor.is_none(),
+            "final filtered page should not expose a cursor"
+        );
+    }
+
+    #[test]
+    fn collect_search_rows_with_runner_suppresses_cursor_when_filter_overflows_page() {
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("robot_search_kind_cursor_overflow.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind) VALUES
+                (1, 10, 1, 'cc'),
+                (2, 20, 1, 'to'),
+                (3, 30, 1, 'to'),
+                (4, 40, 1, 'to')",
+            &empty,
+        )
+        .expect("insert recipients");
+
+        let mut query = SearchQuery::messages("needle", 1);
+        query.limit = Some(search_page_limit(2, Some("to")));
+
+        let mut call_count = 0usize;
+        let rows = collect_search_rows_with_runner(&conn, query, Some("to"), 2, |query| {
+            call_count += 1;
+            assert!(
+                query.cursor.is_none(),
+                "collector should not fetch past the page that already filled the visible limit"
+            );
+            Ok(SearchResponse {
+                results: vec![
+                    planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
+                    planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
+                    planner_search_result_row(30, "third", 0.7, 300, "th-3", "Gamma"),
+                    planner_search_result_row(40, "fourth", 0.6, 400, "th-4", "Delta"),
+                ],
+                next_cursor: Some("cursor-after-page".into()),
+                explain: None,
+                assistance: None,
+                guidance: None,
+                audit: vec![],
+            })
+        })
+        .expect("collect kind-filtered rows");
+
+        assert_eq!(call_count, 1);
+        assert_eq!(
+            rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+        assert!(
+            rows.next_cursor.is_none(),
+            "cursor would skip the unreturned matching row from the current fetched page"
         );
     }
 
@@ -11928,6 +17660,7 @@ mod tests {
             last_check_ts: 2_000,
             checks_total: 5,
             failures_total: 2,
+            failures_since_last_ok: 1,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");
@@ -11938,16 +17671,21 @@ mod tests {
             last_check_ts: 2_000,
             checks_total: 5,
             failures_total: 2,
+            failures_since_last_ok: 0,
         });
         assert!(ok);
         assert_eq!(probe.status, "ok");
         assert!(probe.detail.contains("historical failures"));
+        // #164: a currently-healthy daemon with historical failures must read
+        // as clean, not current corruption.
+        assert!(probe.detail.contains("not current state"));
 
         let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
             last_ok_ts: 0,
             last_check_ts: 0,
             checks_total: 0,
             failures_total: 1,
+            failures_since_last_ok: 1,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");
@@ -11983,6 +17721,7 @@ mod tests {
                     granted_at: Some("55m ago".into()),
                 },
             ],
+            conflicting_active: vec![],
             conflicts: vec![ReservationConflict {
                 agent_a: "BlueLake".into(),
                 path_a: "src/auth/**".into(),
@@ -11997,6 +17736,30 @@ mod tests {
                 remaining: Some("5m \u{26a0}".into()),
                 granted_at: Some("55m ago".into()),
             }],
+            playbooks: vec![ReservationPlaybook {
+                id: "reservation-conflict-1".into(),
+                kind: "reservation_conflict".into(),
+                severity: "warn".into(),
+                confidence: 1.0,
+                title: "Coordinate exclusive reservation conflict".into(),
+                summary:
+                    "BlueLake holds `src/auth/**` and RedFox holds overlapping `src/auth/jwt.rs`"
+                        .into(),
+                holders: vec![
+                    ReservationPlaybookHolder {
+                        agent: "BlueLake".into(),
+                        path: "src/auth/**".into(),
+                    },
+                    ReservationPlaybookHolder {
+                        agent: "RedFox".into(),
+                        path: "src/auth/jwt.rs".into(),
+                    },
+                ],
+                safe_command: "am robot reservations --project proj --conflicts --all".into(),
+                suggested_subject: "[reservation-conflict] BlueLake / RedFox".into(),
+                suggested_body: "Please coordinate before editing overlapping reservations.".into(),
+            }],
+            forecast: None,
         };
 
         let json = serde_json::to_value(&data).unwrap();
@@ -12004,6 +17767,11 @@ mod tests {
         assert_eq!(json["conflicts"].as_array().unwrap().len(), 1);
         assert_eq!(json["conflicts"][0]["agent_a"], "BlueLake");
         assert_eq!(json["expiring_soon"].as_array().unwrap().len(), 1);
+        assert_eq!(json["playbooks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["playbooks"][0]["safe_command"],
+            "am robot reservations --project proj --conflicts --all"
+        );
     }
 
     #[test]
@@ -12139,6 +17907,7 @@ mod tests {
             headline: "5 messages overdue".into(),
             rationale: "Pending >1h".into(),
             remediation: "am robot inbox --ack-overdue".into(),
+            playbooks: vec![],
         };
         let v: Value = serde_json::to_value(&card).unwrap();
         assert_eq!(v["severity"], "error");
@@ -12159,6 +17928,7 @@ mod tests {
                 headline: "3 reservations expiring".into(),
                 rationale: "TTL < 15 min".into(),
                 remediation: "Renew reservations".into(),
+                playbooks: vec![],
             },
             AnomalyCard {
                 severity: "info".into(),
@@ -12167,6 +17937,7 @@ mod tests {
                 headline: "2 agents inactive".into(),
                 rationale: "No activity >1h".into(),
                 remediation: "Check agent status".into(),
+                playbooks: vec![],
             },
         ];
         let json = serde_json::to_string(&cards).unwrap();
@@ -12265,6 +18036,7 @@ mod tests {
                         headline: "10 overdue".into(),
                         rationale: "Pending >1h".into(),
                         remediation: "Acknowledge them".into(),
+                        playbooks: vec![],
                     },
                     AnomalyCard {
                         severity: "warn".into(),
@@ -12273,6 +18045,7 @@ mod tests {
                         headline: "2 expiring".into(),
                         rationale: "TTL < 15m".into(),
                         remediation: "Renew".into(),
+                        playbooks: vec![],
                     },
                 ],
             },
@@ -12659,7 +18432,12 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: vec![],
+            recommendations: vec![],
+            reservation_forecast: None,
             recovery: None,
+            queued_intents: Vec::new(),
+            search_index: None,
+            forensic_timeline: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"health\":\"ok\""));
@@ -12688,8 +18466,14 @@ mod tests {
                 headline: "2 acks overdue".into(),
                 rationale: "Pending acknowledgements".into(),
                 remediation: "am mail ack".into(),
+                playbooks: vec![],
             }],
+            recommendations: vec![],
+            reservation_forecast: None,
             recovery: None,
+            queued_intents: Vec::new(),
+            search_index: None,
+            forensic_timeline: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, data).with_alert(
             "warn",
@@ -12700,6 +18484,153 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["health"], "degraded");
         assert_eq!(v["_alerts"][0]["severity"], "warn");
+    }
+
+    fn recommendation_candidate(
+        category: &str,
+        command: &str,
+        confidence: f64,
+        observed_ts_us: i64,
+    ) -> OperatorRecommendationCandidate {
+        OperatorRecommendationCandidate {
+            category: category.to_string(),
+            action: format!("Do {category}"),
+            reason: format!("Reason for {category}"),
+            confidence,
+            affected: format!("affected:{category}"),
+            evidence: format!("robot://status/{category}"),
+            artifact: None,
+            safe_command: command.to_string(),
+            observed_ts_us,
+            stale_after_us: MICROS_PER_MINUTE,
+        }
+    }
+
+    #[test]
+    fn operator_recommendations_rank_dedupe_and_drop_stale_evidence() {
+        let now_us = 10 * MICROS_PER_MINUTE;
+        let recommendations = rank_operator_recommendations(
+            now_us,
+            vec![
+                recommendation_candidate("ack_sla", "am robot inbox --ack-overdue", 0.4, now_us),
+                recommendation_candidate("ack_sla", "am robot inbox --ack-overdue", 1.0, now_us),
+                recommendation_candidate("thread_activity", "am robot thread T-1", 0.8, now_us),
+                recommendation_candidate(
+                    "reservation_expiry",
+                    "am robot reservations --expiring 5",
+                    0.95,
+                    now_us - MICROS_PER_MINUTE - 1,
+                ),
+            ],
+            10,
+        );
+
+        assert_eq!(recommendations.len(), 2);
+        assert_eq!(recommendations[0].rank, 1);
+        assert_eq!(recommendations[0].category, "ack_sla");
+        assert_eq!(recommendations[0].confidence, 1.0);
+        assert_eq!(recommendations[1].rank, 2);
+        assert_eq!(recommendations[1].category, "thread_activity");
+        assert!(
+            recommendations
+                .iter()
+                .all(|rec| rec.category != "reservation_expiry"),
+            "stale evidence must suppress recommendations"
+        );
+    }
+
+    #[test]
+    fn operator_recommendations_redact_secret_markers() {
+        let now_us = mcp_agent_mail_db::now_micros();
+        let recommendations = rank_operator_recommendations(
+            now_us,
+            vec![OperatorRecommendationCandidate {
+                category: "mailbox_recovery".into(),
+                action: "Inspect token=super-secret-token&scope=mail".into(),
+                reason: "Authorization=Bearer abc123 should not leak".into(),
+                confidence: 0.9,
+                affected: "project:demo".into(),
+                evidence: "robot://status/recovery?api_key=abc123&mode=corrupt".into(),
+                artifact: Some("/tmp/bundle?secret=abc123&safe=true".into()),
+                safe_command: "am doctor check --json --password=hunter2".into(),
+                observed_ts_us: now_us,
+                stale_after_us: MICROS_PER_MINUTE,
+            }],
+            10,
+        );
+
+        let json = serde_json::to_string(&recommendations[0]).unwrap();
+        assert!(!json.contains("super-secret-token"));
+        assert!(!json.contains("abc123"));
+        assert!(!json.contains("hunter2"));
+        assert!(json.contains("[redacted]"));
+    }
+
+    #[test]
+    fn build_status_recommendations_emit_safe_proof_links() {
+        let now_us = mcp_agent_mail_db::now_micros();
+        let recommendations = build_status_recommendations(
+            "demo project",
+            Some("CobaltBay"),
+            2,
+            1,
+            &[ThreadSummary {
+                id: "thread-1".into(),
+                subject: "Latest".into(),
+                participants: 3,
+                messages: 4,
+                last_activity: "1m".into(),
+            }],
+            Some(&RecoveryStatus {
+                mode: "recovering".into(),
+                owner: "pid 100 (active)".into(),
+                next_action: "Recovery active; continue monitoring".into(),
+                bundle_path: Some("/tmp/forensics/bundle".into()),
+                elapsed_secs: Some(30),
+                elapsed_display: Some("30s".into()),
+                phase: "lock_held".into(),
+                stall_detected: false,
+                stall_reason: None,
+                deferred_write_backlog: None,
+                admission: None,
+            }),
+            now_us,
+        );
+
+        let categories: Vec<&str> = recommendations
+            .iter()
+            .map(|rec| rec.category.as_str())
+            .collect();
+        assert_eq!(
+            categories,
+            vec![
+                "ack_sla",
+                "reservation_expiry",
+                "mailbox_recovery",
+                "thread_activity",
+                "verification_lane"
+            ]
+        );
+        assert_eq!(
+            recommendations[0].safe_command,
+            "am robot inbox --project 'demo project' --agent CobaltBay --ack-overdue"
+        );
+        assert_eq!(
+            recommendations[0].evidence,
+            "robot://status/ack-overdue?project=demo project&agent=CobaltBay&count=2"
+        );
+        assert_eq!(
+            recommendations[2].artifact.as_deref(),
+            Some("/tmp/forensics/bundle")
+        );
+        assert_eq!(
+            recommendations[4].safe_command,
+            "am verify cargo-check --path . --agent CobaltBay --block-on-conflicts"
+        );
+        assert_eq!(
+            recommendations[4].evidence,
+            "robot://status/verification-lane?project=demo project&slot=verify-cargo-check"
+        );
     }
 
     #[test]
@@ -12853,6 +18784,108 @@ mod tests {
     }
 
     #[test]
+    fn build_status_surfaces_structured_operator_recommendations() {
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
+             VALUES (2, 1, 1, 'ack-thread', 'Ack overdue', ?, 1, 'high')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                now_us - ACK_OVERDUE_THRESHOLD_US - 1,
+            )],
+        )
+        .expect("insert overdue message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (2, 2, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert overdue recipient");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 2, 'crates/**', 1, 'test', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + MICROS_PER_MINUTE),
+            ],
+        )
+        .expect("insert expiring reservation");
+
+        let (status, actions) =
+            build_status(&conn, 1, "demo", Some((2, "Reader".into()))).expect("build status");
+
+        let categories: Vec<&str> = status
+            .recommendations
+            .iter()
+            .map(|recommendation| recommendation.category.as_str())
+            .collect();
+        assert!(categories.contains(&"ack_sla"));
+        assert!(categories.contains(&"reservation_expiry"));
+        assert!(categories.contains(&"thread_activity"));
+        assert!(categories.contains(&"verification_lane"));
+        assert!(
+            actions.contains(
+                &"am robot inbox --project demo --agent Reader --ack-overdue".to_string()
+            )
+        );
+        assert!(actions.contains(
+            &"am verify cargo-check --path . --agent Reader --block-on-conflicts".to_string()
+        ));
+
+        let json = serde_json::to_value(&status).expect("serialize status");
+        assert_eq!(json["recommendations"][0]["rank"], 1);
+        assert_eq!(json["recommendations"][0]["category"], "ack_sla");
+        assert!(
+            json["recommendations"][0]["safe_command"]
+                .as_str()
+                .unwrap()
+                .contains("--ack-overdue")
+        );
+    }
+
+    #[test]
+    fn build_status_reports_reservation_forecast() {
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, last_active_ts)
+             VALUES (3, 1, 'Writer', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert writer");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 2, 'crates/**', 1, 'reader', ?, ?, NULL),
+                (2, 1, 3, 'crates/mcp-agent-mail-cli/src/robot.rs', 1, 'writer', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 240_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 260_000_000),
+            ],
+        )
+        .expect("insert reservations");
+
+        let (status, _actions) =
+            build_status(&conn, 1, "demo", Some((2, "Reader".into()))).expect("build status");
+        let forecast = status
+            .reservation_forecast
+            .expect("status should include reservation forecast");
+        assert_eq!(forecast.expiry_herds[0].window, "0-5m");
+        assert_eq!(forecast.expiry_herds[0].count, 2);
+        assert_eq!(
+            forecast.expiry_herds[0].safe_command,
+            "am robot reservations --project demo --expiring 5 --all"
+        );
+        assert_eq!(forecast.conflict_hotspots[0].path, "crates/**");
+        assert_eq!(forecast.conflict_hotspots[0].conflict_pairs, 1);
+    }
+
+    #[test]
     fn build_status_snapshot_cache_reuses_fresh_generation() {
         let _guard = ROBOT_COMMAND_TEST_LOCK
             .lock()
@@ -12887,7 +18920,10 @@ mod tests {
             .into_iter()
             .map(|phase| phase.name)
             .collect();
-        assert!(phase_names.iter().any(|name| name == "snapshot_cache_hit"));
+        assert!(
+            phase_names.iter().any(|name| name == "snapshot_cache_hit"),
+            "expected cache hit phase, got {phase_names:?}"
+        );
         assert!(
             !phase_names.iter().any(|name| name == "sqlite_inbox_counts"),
             "fresh cache hits should skip the expensive status query pipeline"
@@ -13304,6 +19340,7 @@ mod tests {
             headline: "2 acks overdue".into(),
             rationale: "Pending acknowledgements".into(),
             remediation: "am robot inbox --ack-overdue".into(),
+            playbooks: vec![],
         }];
         let status = StatusData {
             health: "ok".into(),
@@ -13318,7 +19355,12 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: anomalies.clone(),
+            recommendations: vec![],
+            reservation_forecast: None,
             recovery: None,
+            queued_intents: Vec::new(),
+            search_index: None,
+            forensic_timeline: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, status).with_alert(
             "info",
@@ -13612,7 +19654,12 @@ mod tests {
             query: "authentication".into(),
             total_results: 10,
             results: vec![],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
             plan_diagnostic: None,
+            search_index: None,
             by_thread: vec![FacetEntry {
                 value: "AUTH-1".into(),
                 count: 5,
@@ -13638,7 +19685,12 @@ mod tests {
             query: "nonexistent".into(),
             total_results: 0,
             results: vec![],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
             plan_diagnostic: None,
+            search_index: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -13648,6 +19700,122 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_results"], 0);
         assert!(v["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn robot_search_envelope_alerts_on_degraded_search_index() {
+        let health = LexicalBackfillHealth {
+            state: "partial".into(),
+            db_identity: "/tmp/mail.sqlite3".into(),
+            index_dir: "/tmp/search_index".into(),
+            indexed_messages: 2,
+            source_messages: Some(5),
+            skipped_messages: 3,
+            last_backfill_at_micros: Some(123_456),
+            rebuild_in_progress: false,
+            active_db_identity: None,
+            stale_reason: Some("indexed message count 2 differs from source count 5".into()),
+            safe_remediation: Some("am robot search rollback".into()),
+        };
+        let data = SearchData {
+            query: "rollback".into(),
+            total_results: 0,
+            results: vec![],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
+            plan_diagnostic: None,
+            search_index: Some(health.clone()),
+            by_thread: vec![],
+            by_agent: vec![],
+            by_importance: vec![],
+        };
+
+        let env = enrich_envelope_with_search_index_alert(
+            RobotEnvelope::new("robot search", OutputFormat::Json, data),
+            Some(&health),
+        );
+        let json = serde_json::to_value(&env).unwrap();
+
+        assert_eq!(json["search_index"]["state"], "partial");
+        assert_eq!(json["_alerts"][0]["severity"], "warn");
+        assert_eq!(
+            json["_alerts"][0]["summary"],
+            "Search V3 lexical index state is partial"
+        );
+        assert_eq!(json["_alerts"][0]["action"], "am robot search rollback");
+        assert_eq!(json["_actions"][0], "am robot search rollback");
+
+        let toon = format_output(&env, OutputFormat::Toon).unwrap();
+        assert!(toon.contains("search_index"));
+        assert!(toon.contains("partial"));
+        assert!(toon.contains("am robot search rollback"));
+    }
+
+    #[test]
+    fn robot_search_explainability_metadata_does_not_leak_result_body_text() {
+        let sensitive_body = "secret body token should stay out of explainability metadata";
+        let data = SearchData {
+            query: "form:BlueLake rollback".into(),
+            total_results: 1,
+            results: vec![SearchResult {
+                id: 42,
+                relevance: 0.91,
+                from: "BlueLake".into(),
+                subject: "Rollback plan".into(),
+                thread: "br-search".into(),
+                snippet: sensitive_body.into(),
+                age: "1m".into(),
+            }],
+            route: Some(SearchRouteDiagnostic {
+                method: "hybrid_v3".into(),
+                normalized_query: Some("form:BlueLake rollback".into()),
+                used_like_fallback: false,
+                facet_count: 2,
+                facets_applied: vec!["engine:hybrid".into(), "project_id".into()],
+            }),
+            assistance: Some(mcp_agent_mail_db::QueryAssistance {
+                query_text: "form:BlueLake rollback".into(),
+                applied_filter_hints: Vec::new(),
+                did_you_mean: vec![mcp_agent_mail_db::query_assistance::DidYouMeanHint {
+                    token: "form:BlueLake".into(),
+                    suggested_field: "from".into(),
+                    value: "BlueLake".into(),
+                }],
+            }),
+            guidance: Some(mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+                summary: "No results found. 1 suggestion available to broaden your search.".into(),
+                suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+                    kind: "fix_typo".into(),
+                    label: "Did you mean \"from:BlueLake\"?".into(),
+                    detail: Some(
+                        "\"form:BlueLake\" is not a recognized field. Try \"from\" instead.".into(),
+                    ),
+                }],
+            }),
+            next_cursor: Some("s3feccccccccccccd:i42".into()),
+            plan_diagnostic: None,
+            search_index: None,
+            by_thread: vec![],
+            by_agent: vec![],
+            by_importance: vec![],
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert!(
+            serde_json::to_string(&json["results"])
+                .unwrap()
+                .contains(sensitive_body),
+            "test fixture must include body-derived result text so the leak check is meaningful"
+        );
+        for key in ["route", "assistance", "guidance"] {
+            let metadata = serde_json::to_string(&json[key]).unwrap();
+            assert!(
+                !metadata.contains(sensitive_body),
+                "{key} metadata must not contain body-derived result text"
+            );
+        }
     }
 
     #[test]
@@ -15161,6 +21329,134 @@ mod tests {
     }
 
     #[test]
+    fn build_agent_lifecycle_diagnostics_reports_identity_drift_without_deleting() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_agent_lifecycle.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        let project_key = temp_dir
+            .path()
+            .join("project-alpha")
+            .to_string_lossy()
+            .into_owned();
+        let storage_root = temp_dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("project-alpha");
+        let xdg_config_home = temp_dir.path().join("xdg-config");
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key)
+             VALUES (1, 'project-alpha', ?), (2, 'project-beta', '/tmp/project-beta')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                project_key.clone(),
+            )],
+        )
+        .expect("insert projects");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES
+                (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 1000),
+                (2, 1, 'bluelake', 'codex-cli', 'gpt-5', 2000),
+                (3, 1, 'bad_name', 'codex-cli', 'gpt-5', 1500),
+                (4, 2, 'SilverCove', 'codex-cli', 'gpt-5', 2500)",
+            &empty,
+        )
+        .expect("insert agents");
+
+        let blue_profile_dir = project_dir.join("agents").join("BlueLake");
+        let archive_only_dir = project_dir.join("agents").join("AmberValley");
+        std::fs::create_dir_all(&blue_profile_dir).expect("create blue profile dir");
+        std::fs::create_dir_all(&archive_only_dir).expect("create archive-only profile dir");
+        let blue_profile_path = blue_profile_dir.join("profile.json");
+        let archive_only_path = archive_only_dir.join("profile.json");
+        std::fs::write(
+            &blue_profile_path,
+            r#"{"name":"BlueLake","program":"old-cli","model":"gpt-5"}"#,
+        )
+        .expect("write blue profile");
+        std::fs::write(
+            &archive_only_path,
+            r#"{"name":"AmberValley","program":"codex-cli","model":"gpt-5"}"#,
+        )
+        .expect("write archive-only profile");
+
+        let xdg_config_home_text = xdg_config_home.to_string_lossy().into_owned();
+        let stale_identity_path = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", xdg_config_home_text.as_str())],
+            || {
+                mcp_agent_mail_core::write_identity(&project_key, "%1", "BlueLake")
+                    .expect("write pane 1");
+                mcp_agent_mail_core::write_identity(&project_key, "%2", "BlueLake")
+                    .expect("write pane 2");
+                mcp_agent_mail_core::write_identity(&project_key, "%3", "SilverCove")
+                    .expect("write pane 3");
+                mcp_agent_mail_core::write_identity(&project_key, "%4", "bad name")
+                    .expect("write pane 4")
+            },
+        );
+
+        let diagnostics = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", xdg_config_home_text.as_str())],
+            || {
+                build_agent_lifecycle_diagnostics(
+                    &conn,
+                    1,
+                    "project-alpha",
+                    &project_key,
+                    &storage_root,
+                )
+                .expect("build diagnostics")
+            },
+        );
+        let codes = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.reason_code.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(codes.contains("duplicate_logical_agent"));
+        assert!(codes.contains("malformed_agent_name"));
+        assert!(codes.contains("profile_metadata_mismatch"));
+        assert!(codes.contains("archive_only_profile"));
+        assert!(codes.contains("db_only_missing_profile"));
+        assert!(codes.contains("duplicate_pane_identity"));
+        assert!(codes.contains("cross_project_identity_mismatch"));
+        assert!(codes.contains("malformed_pane_identity"));
+        assert!(codes.contains("pane_identity_unknown_agent"));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.safe_command.contains("cleanup"))
+        );
+        assert!(blue_profile_path.exists());
+        assert!(archive_only_path.exists());
+        assert!(stale_identity_path.exists());
+    }
+
+    #[test]
     fn resolve_agent_id_finds_case_insensitive_agent() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_agent_resolve_case.sqlite3");
@@ -15407,6 +21703,43 @@ mod tests {
                 || err_text.contains("mailbox activity lock is busy"),
             "unexpected error: {err_text}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_archive_snapshot_canonicalizes_symlinked_tmpdir_for_sqlite_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real_tmpdir = dir.path().join("real-tmp");
+        let linked_tmpdir = dir.path().join("linked-tmp");
+        std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
+        symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let project_dir = storage_root.path().join("projects").join("demo-project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+
+        let linked_tmpdir = linked_tmpdir
+            .to_str()
+            .expect("linked tmpdir utf-8")
+            .to_string();
+        let handle = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", linked_tmpdir.as_str())],
+            || RobotDbHandle::open_archive_snapshot(storage_root.path()),
+        )
+        .expect("archive snapshot should canonicalize symlinked TMPDIR");
+
+        let rows = handle
+            .conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("query archive snapshot projects");
+        assert_eq!(rows[0].get_named::<i64>("cnt").unwrap_or(-1), 1);
     }
 
     #[test]
@@ -16000,14 +22333,14 @@ mod tests {
                 drop(local_conn);
 
                 let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-                let project_dir = storage_root.join("projects").join("unrelated-project");
+                let project_dir = storage_root.join("projects").join("demo-project");
                 let agent_dir = project_dir.join("agents").join("RiverStone");
                 let canonical_dir = project_dir.join("messages").join("2026").join("04");
                 std::fs::create_dir_all(&agent_dir).expect("create agent dir");
                 std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
                 std::fs::write(
                     project_dir.join("project.json"),
-                    r#"{"slug":"unrelated-project","human_key":"/tmp/unrelated-project","created_at":0}"#,
+                    r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
                 )
                 .expect("write project metadata");
                 std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
@@ -16608,6 +22941,7 @@ mod tests {
                 let handle_thread = std::thread::spawn(move || {
                     let args = RobotArgs {
                         format: Some(OutputFormat::Json),
+                        json: false,
                         project: Some("robot-lock".to_string()),
                         agent: None,
                         command: RobotSubcommand::Attachments,
@@ -16657,9 +22991,12 @@ mod tests {
         let value = run_robot_json_capture(
             RobotArgs {
                 format: Some(OutputFormat::Json),
+                json: false,
                 project: None,
                 agent: None,
-                command: RobotSubcommand::Health,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
             },
             &db_url,
             storage_root.to_string_lossy().as_ref(),
@@ -16686,6 +23023,687 @@ mod tests {
             rows.is_empty(),
             "robot health should not initialize schema tables in an uninitialized sqlite file"
         );
+    }
+
+    #[test]
+    fn robot_health_always_emits_runtime_identity() {
+        // J3 (br-bvq1x.10.3): every `am robot health` output must name the
+        // effective runtime identity so an agent can tell WHICH `am` binary it
+        // invoked and WHICH mailbox/server it resolved — the path/version-confusion
+        // failure mode. Present unconditionally (no flag).
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_identity.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let out = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        let id = out
+            .get("runtime_identity")
+            .expect("runtime_identity block must always be present");
+        for field in [
+            "binary_path",
+            "version",
+            "pid",
+            "storage_root",
+            "database_url",
+            "http_host",
+            "http_port",
+            "server_pids",
+        ] {
+            assert!(
+                id.get(field).is_some(),
+                "runtime_identity must carry `{field}`: {id:?}"
+            );
+        }
+        assert_eq!(
+            id.get("version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "runtime_identity.version must be the running binary's version"
+        );
+        assert_eq!(
+            id.get("database_url").and_then(|v| v.as_str()),
+            Some(db_url.as_str()),
+            "runtime_identity.database_url must be the effective DATABASE_URL"
+        );
+        assert!(
+            id.get("db_file")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.contains("robot_health_identity.sqlite3")),
+            "runtime_identity.db_file must name the effective DB file: {id:?}"
+        );
+        assert!(
+            id.get("server_pids").and_then(|v| v.as_array()).is_some(),
+            "server_pids must be an array (empty when no server is bound): {id:?}"
+        );
+    }
+
+    #[test]
+    fn robot_health_emits_tui_liveness_block_non_fatal_when_no_server() {
+        // I2 (br-bvq1x.9.2): `am robot health` always carries a tui_liveness
+        // block + probe. With no reachable server (test endpoint pinned to an
+        // unused port) it must report "unreachable"/"unknown" and NEVER flip the
+        // verdict to unhealthy — an absent server is not a frozen TUI.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_liveness.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let out = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        let liveness = out
+            .get("tui_liveness")
+            .expect("health output must carry a tui_liveness block");
+        assert_eq!(
+            liveness.get("source").and_then(|v| v.as_str()),
+            Some("unreachable")
+        );
+        assert_eq!(
+            liveness.get("overall").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
+        // No freeze recommendation when there is simply no server.
+        assert!(liveness.get("headless_fallback_command").is_none());
+
+        // The liveness probe itself must be a non-degrading "skip" when the
+        // server is unreachable (an absent server is not a frozen TUI). Other
+        // probes may legitimately mark this minimal mailbox degraded/unhealthy;
+        // that is unrelated to I2.
+        let probes = out
+            .get("probes")
+            .and_then(|v| v.as_array())
+            .expect("probes array");
+        let liveness_probe = probes
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("tui_liveness"))
+            .expect("tui_liveness probe must be present");
+        assert_eq!(
+            liveness_probe.get("status").and_then(|v| v.as_str()),
+            Some("skip"),
+            "unreachable liveness probe must not degrade health"
+        );
+    }
+
+    #[test]
+    fn tui_dump_returns_structured_snapshot_when_server_unreachable() {
+        // I6 (br-bvq1x.9.6): the freeze escape hatch MUST return a structured
+        // read-out and exit 0 regardless of TUI/server state. With the resolved
+        // endpoint pinned to an unused port (run_robot_json_capture forces
+        // HTTP_PORT=47351) the live `/mail/ws-state` fetch deterministically
+        // fails, so the command falls back to a local read-out instead of
+        // erroring or hanging — the agent never has to kill the process.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("tui_dump_fallback.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        // `run_robot_json_capture` asserts the command returned Ok (exit 0).
+        let out = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::TuiDump,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(
+            out.get("_meta")
+                .and_then(|m| m.get("command"))
+                .and_then(|v| v.as_str()),
+            Some("tui-dump"),
+        );
+        // No live server ⇒ never the "live" source, and never a raw ws_state dump.
+        let source = out
+            .get("source")
+            .and_then(|v| v.as_str())
+            .expect("tui-dump output must carry a source");
+        assert!(
+            matches!(source, "local-fallback" | "unavailable"),
+            "expected a local read-out source, got {source:?}"
+        );
+        assert!(
+            out.get("ws_state").is_none(),
+            "no live snapshot ⇒ ws_state must be absent"
+        );
+        // The transport failure that forced the fallback is always surfaced.
+        assert!(
+            out.get("live_error").and_then(|v| v.as_str()).is_some(),
+            "tui-dump must report the live_error that forced the fallback: {out:?}"
+        );
+        // The liveness verdict degrades to a non-fatal "unreachable"/"unknown".
+        let liveness = out
+            .get("tui_liveness")
+            .expect("tui-dump must carry a tui_liveness block");
+        assert_eq!(
+            liveness.get("source").and_then(|v| v.as_str()),
+            Some("unreachable")
+        );
+        assert_eq!(
+            liveness.get("overall").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
+        // An unreachable server is not a frozen TUI ⇒ no escape-hatch noise.
+        assert!(liveness.get("readout_command").is_none());
+        assert!(liveness.get("headless_fallback_command").is_none());
+    }
+
+    #[test]
+    fn remediation_operator_only_classifier_tags_dangerous_commands() {
+        // E4 (br-bvq1x.5.4): operator-only commands (state-mutating recovery +
+        // lifecycle + kill) must be tagged so agents never silently auto-apply.
+        for c in [
+            "am doctor repair",
+            "am doctor reconstruct",
+            "am doctor restore /x.bak",
+            "am doctor undo latest",
+            "am service restart",
+            "am service stop",
+            "am service uninstall",
+            "am clear-and-reset-everything",
+            "am doctor fix",
+            "kill 123",
+            "pkill am",
+        ] {
+            assert!(
+                remediation_command_is_operator_only(c),
+                "should be operator-only: {c}"
+            );
+        }
+        // Agent-may-auto-apply: read-only diagnostics, scoped per-FM fixes,
+        // list/dry-run rehearsals, and route-through-server guidance.
+        for c in [
+            "am doctor health",
+            "am doctor check --json",
+            "am doctor locks",
+            "am doctor --json",
+            "am robot status",
+            "am doctor fix --only fm-db-state-files-world-readable-storage-db",
+            "am doctor fix --list --json",
+            "am doctor --dry-run --fix",
+            "am doctor migrate --check",
+            "route the write through the running Agent Mail server",
+        ] {
+            assert!(
+                !remediation_command_is_operator_only(c),
+                "should be agent-safe: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn robot_remediation_from_db_error_reuses_a2_policy() {
+        // E4: the remediation contract reuses A2's classifier; a corruption-class
+        // message yields a non-empty recommended command, and A2's corruption
+        // recommendations are read-only diagnostics (agent-safe).
+        let rem = RobotRemediation::from_db_error_message("database disk image is malformed");
+        assert!(
+            !rem.recommended_command.is_empty(),
+            "recommended_command must be set"
+        );
+        assert!(
+            !rem.operator_only,
+            "a read-only diagnostic recommended_command must be agent-safe: {}",
+            rem.recommended_command
+        );
+    }
+
+    #[test]
+    fn coordination_verdict_distinguishes_three_degraded_scenarios() {
+        // H4 (br-bvq1x.8.4): each degraded scenario yields a DISTINCT verdict +
+        // message + fallback lane, derived from the A1/A2 classification.
+
+        // Scenario 1 (writes blocked): main-DB corruption -> do-not-edit.
+        let blocked = RobotRemediation::from_db_error_message("database disk image is malformed");
+        assert_eq!(blocked.coordination.verdict, "writes_blocked");
+        assert!(
+            blocked.coordination.message.contains("Do NOT edit"),
+            "writes_blocked message: {}",
+            blocked.coordination.message
+        );
+        assert!(blocked.blocks_edits);
+
+        // Scenario 2a (reads degraded, writes SAFE): FTS index corruption.
+        let reads_deg =
+            RobotRemediation::from_db_error_message("fts5 search index integrity check failed");
+        assert_eq!(reads_deg.coordination.verdict, "reads_degraded");
+        assert!(
+            !reads_deg.blocks_edits,
+            "reads_degraded must not block edits"
+        );
+        assert!(reads_deg.coordination.message.contains("WRITES ARE SAFE"));
+
+        // Scenario 3 (doctor blocked by a live owner).
+        let owner = RobotRemediation::from_db_error_message(
+            "mailbox mutation refused: another Agent Mail server owns this mailbox",
+        );
+        assert_eq!(owner.coordination.verdict, "doctor_blocked_by_live_owner");
+        assert!(owner.coordination.message.contains("live mailbox owner"));
+
+        // The three fallback lanes are mutually distinct.
+        assert_ne!(
+            blocked.coordination.fallback_lane,
+            reads_deg.coordination.fallback_lane
+        );
+        assert_ne!(
+            blocked.coordination.fallback_lane,
+            owner.coordination.fallback_lane
+        );
+        assert_ne!(
+            reads_deg.coordination.fallback_lane,
+            owner.coordination.fallback_lane
+        );
+    }
+
+    #[test]
+    fn robot_envelope_serializes_remediation_when_present_and_omits_when_absent() {
+        // E4 (br-bvq1x.5.4): the robot envelope carries the safe-remediation
+        // contract when attached (failure path) and OMITS it on success — so a
+        // healthy response is never polluted.
+        //
+        // This MUST go through the real `format_output` path (which serializes a
+        // `RobotEnvelopeView`, not the bare struct): an earlier revision dropped
+        // `_remediation` from that view, so `with_remediation` was silently lost on
+        // the wire even though a bare `serde_json::to_value(&env)` looked correct.
+        // The end-to-end DB-failure path is also covered by
+        // tests/e2e/test_cli_mcp_surface.sh (E4) against a real `am`.
+        let with = RobotEnvelope::new(
+            "robot health",
+            OutputFormat::Json,
+            serde_json::json!({ "overall": "unhealthy" }),
+        )
+        .with_remediation(RobotRemediation::from_db_error_message(
+            "database disk image is malformed",
+        ));
+        let rendered = format_output(&with, OutputFormat::Json).expect("render envelope");
+        let v: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        let rem = v
+            .get("_remediation")
+            .and_then(serde_json::Value::as_object)
+            .expect("_remediation must serialize through the real output view when attached");
+        for field in [
+            "recommended_command",
+            "operator_only",
+            "repairable",
+            "safe_to_retry",
+            "safe_to_continue_read_only",
+            "blocks_edits",
+        ] {
+            assert!(
+                rem.contains_key(field),
+                "_remediation must carry `{field}`: {rem:?}"
+            );
+        }
+        assert!(
+            rem.get("operator_only")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "operator_only must serialize as a bool: {rem:?}"
+        );
+
+        // Healthy envelope: no remediation attached -> the field is omitted.
+        let without = RobotEnvelope::new(
+            "robot health",
+            OutputFormat::Json,
+            serde_json::json!({ "overall": "healthy" }),
+        );
+        let rendered2 = format_output(&without, OutputFormat::Json).expect("render envelope");
+        let v2: serde_json::Value = serde_json::from_str(&rendered2).expect("valid JSON");
+        assert!(
+            v2.get("_remediation").is_none(),
+            "_remediation must be omitted on a healthy response: {v2}"
+        );
+    }
+
+    #[test]
+    fn robot_health_include_host_emits_host_section() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_host.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        // Without --include-host, the host section is omitted entirely.
+        let without_host = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+        assert!(
+            without_host.get("host").is_none(),
+            "host section must be absent without --include-host: {without_host:?}"
+        );
+
+        // With --include-host, the bounded host-pressure section is present with
+        // its conservative verdict and the listed fields.
+        let with_host = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health { include_host: true },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+        let host = with_host
+            .get("host")
+            .expect("host section present with --include-host");
+        assert!(
+            host.get("host_pressure_likely").is_some(),
+            "host section must carry the verdict: {host:?}"
+        );
+        assert!(
+            host.get("status").and_then(|v| v.as_str()).is_some(),
+            "host section must carry a status label: {host:?}"
+        );
+        // A `host` probe is also surfaced in the probes list.
+        let host_probe = with_host["probes"]
+            .as_array()
+            .expect("probes array")
+            .iter()
+            .find(|probe| probe["name"] == "host");
+        assert!(
+            host_probe.is_some(),
+            "expected a host probe in {with_host:?}"
+        );
+    }
+
+    // ---- K5 (br-bvq1x.11.5): pool/FD backpressure metrics ----
+
+    #[test]
+    fn robot_metrics_surfaces_pool_and_fd_resources() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_metrics_resources.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let value = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Metrics,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        let resources = value
+            .get("resources")
+            .expect("metrics output must carry a resources section (K5)");
+        assert_eq!(
+            resources["scope"], "current_process",
+            "live gauges must be honestly scoped to the querying process: {resources:?}"
+        );
+        // Configured pool limits are environment-wide and always present.
+        assert!(
+            resources["pool_max_connections"].as_u64().unwrap_or(0) > 0,
+            "configured pool max must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources.get("pool_acquire_timeout_ms").is_some(),
+            "configured acquire timeout must be surfaced: {resources:?}"
+        );
+        // Live pool gauges and FD pressure sub-objects must be present (even if
+        // zero / unavailable on this platform).
+        assert!(
+            resources["pool"].get("pool_utilization_pct").is_some(),
+            "pool gauges must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources.get("fd").is_some(),
+            "fd pressure must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources.get("repo_cache_entries").is_some(),
+            "repo-cache size must be surfaced: {resources:?}"
+        );
+        // br-5stvf: WBQ durability + circuit-breaker state must be surfaced.
+        assert!(
+            resources.get("durability_degraded").is_some(),
+            "durability_degraded must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources["wbq_circuit_breakers"].is_array(),
+            "wbq_circuit_breakers must be an array (empty when healthy): {resources:?}"
+        );
+    }
+
+    #[test]
+    fn derive_backpressure_alerts_quiet_when_healthy() {
+        let pool = mcp_agent_mail_core::DbMetricsSnapshot {
+            pool_total_connections: 10,
+            pool_active_connections: 1,
+            pool_utilization_pct: 10,
+            pool_pending_requests: 0,
+            pool_acquire_errors_total: 0,
+            ..Default::default()
+        };
+        let fd = mcp_agent_mail_core::FdMetricsSnapshot {
+            soft_limit: Some(1024),
+            hard_limit: Some(4096),
+            open_fds: Some(40),
+            utilization_pct: Some(3),
+        };
+        assert!(
+            derive_backpressure_alerts(&pool, &fd).is_empty(),
+            "a healthy process must produce no backpressure alerts"
+        );
+    }
+
+    #[test]
+    fn derive_backpressure_alerts_flags_pool_and_fd_exhaustion_with_next_steps() {
+        // Pool acquire errors -> hard exhaustion alert with the specific list.
+        let pool = mcp_agent_mail_core::DbMetricsSnapshot {
+            pool_total_connections: 4,
+            pool_active_connections: 4,
+            pool_utilization_pct: 100,
+            pool_pending_requests: 6,
+            pool_acquire_errors_total: 3,
+            ..Default::default()
+        };
+        // FD at 95% of soft limit -> imminent-exhaustion error.
+        let fd = mcp_agent_mail_core::FdMetricsSnapshot {
+            soft_limit: Some(1024),
+            hard_limit: Some(4096),
+            open_fds: Some(973),
+            utilization_pct: Some(95),
+        };
+        let alerts = derive_backpressure_alerts(&pool, &fd);
+        assert_eq!(alerts.len(), 2, "expected pool + fd alerts: {alerts:?}");
+
+        let pool_alert = &alerts[0];
+        assert_eq!(pool_alert.severity, "error");
+        assert!(
+            pool_alert
+                .message
+                .contains("connection pool has been exhausted"),
+            "pool alert must name the exhaustion: {pool_alert:?}"
+        );
+        assert!(
+            pool_alert.message.contains("reduce concurrent agents")
+                && pool_alert.message.contains("am doctor health")
+                && pool_alert.message.contains("TUI polling"),
+            "pool alert must carry the specific next-step list (K5): {pool_alert:?}"
+        );
+
+        let fd_alert = &alerts[1];
+        assert_eq!(fd_alert.severity, "error");
+        assert!(
+            fd_alert.message.contains("FD exhaustion is imminent")
+                && fd_alert.message.contains("ulimit -n"),
+            "fd alert must prescribe raising the fd limit: {fd_alert:?}"
+        );
+    }
+
+    #[test]
+    fn derive_backpressure_alerts_warns_on_pool_pressure_without_errors() {
+        let pool = mcp_agent_mail_core::DbMetricsSnapshot {
+            pool_total_connections: 10,
+            pool_active_connections: 9,
+            pool_utilization_pct: 90,
+            pool_pending_requests: 2,
+            pool_acquire_errors_total: 0,
+            ..Default::default()
+        };
+        let fd = mcp_agent_mail_core::FdMetricsSnapshot::default();
+        let alerts = derive_backpressure_alerts(&pool, &fd);
+        assert_eq!(alerts.len(), 1, "expected a single pool-pressure warning");
+        assert_eq!(alerts[0].severity, "warn");
+        assert!(
+            alerts[0].message.contains("under pressure")
+                && alerts[0].message.contains("reduce concurrent agents"),
+            "warning must carry the next-step list: {:?}",
+            alerts[0]
+        );
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_quiet_when_healthy() {
+        // No breakers + not degraded => silent.
+        assert!(derive_wbq_breaker_alerts(false, &[]).is_empty());
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_errors_on_tripped_breaker_naming_archive() {
+        let breakers = vec![mcp_agent_mail_storage::WbqCircuitBreakerArchive {
+            archive_key: "/root::proj-backend".to_string(),
+            consecutive_failures: 5,
+            trips_total: 2,
+            last_trip_micros: 1_700_000_000_000_000,
+        }];
+        let alerts = derive_wbq_breaker_alerts(true, &breakers);
+        assert_eq!(alerts.len(), 1, "a tripped breaker is one error alert");
+        assert_eq!(alerts[0].severity, "error");
+        assert!(
+            alerts[0].message.contains("/root::proj-backend")
+                && alerts[0].message.contains("tripped 2 time(s)"),
+            "alert must name the archive + trip count: {:?}",
+            alerts[0]
+        );
+        // durability_degraded must NOT double-report when a trip already explains it.
+        assert!(
+            !alerts
+                .iter()
+                .any(|a| a.message.contains("Durability is flagged degraded")),
+            "tripped breaker already explains the degrade; no duplicate flag: {alerts:?}"
+        );
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_warns_on_failures_without_trip() {
+        let breakers = vec![mcp_agent_mail_storage::WbqCircuitBreakerArchive {
+            archive_key: "/root::proj-x".to_string(),
+            consecutive_failures: 3,
+            trips_total: 0,
+            last_trip_micros: 0,
+        }];
+        let alerts = derive_wbq_breaker_alerts(false, &breakers);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "warn");
+        assert!(
+            alerts[0]
+                .message
+                .contains("3 consecutive WBQ drain failure")
+        );
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_surfaces_sticky_degrade_without_breaker_row() {
+        // Legacy degrade path: flag set but no per-archive breaker row.
+        let alerts = derive_wbq_breaker_alerts(true, &[]);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "warn");
+        assert!(alerts[0].message.contains("Durability is flagged degraded"));
+    }
+
+    #[test]
+    fn fd_metrics_snapshot_is_self_consistent() {
+        // The core helper is best-effort; assert internal consistency rather than
+        // exact values (which depend on the host's ulimit).
+        let fd = mcp_agent_mail_core::fd_metrics_snapshot();
+        if let (Some(open), Some(soft), Some(util)) =
+            (fd.open_fds, fd.soft_limit, fd.utilization_pct)
+        {
+            assert!(soft > 0, "a present soft limit must be positive");
+            let expected = (open.saturating_mul(100) / soft).min(100);
+            assert_eq!(
+                util, expected,
+                "utilization must equal open/soft*100 clamped"
+            );
+        }
     }
 
     #[test]
@@ -16716,9 +23734,12 @@ mod tests {
         let value = run_robot_json_capture(
             RobotArgs {
                 format: Some(OutputFormat::Json),
+                json: false,
                 project: None,
                 agent: None,
-                command: RobotSubcommand::Health,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
             },
             &db_url,
             storage_root.to_string_lossy().as_ref(),
@@ -16870,6 +23891,7 @@ mod tests {
         let value = run_robot_json_capture(
             RobotArgs {
                 format: Some(OutputFormat::Json),
+                json: false,
                 project: Some("/tmp/demo-project".to_string()),
                 agent: None,
                 command: RobotSubcommand::Search {
@@ -16940,6 +23962,22 @@ mod tests {
         assert_eq!(data.conflicts.len(), 1);
         assert_eq!(data.conflicts[0].agent_a, "Alice");
         assert_eq!(data.conflicts[0].agent_b, "Bob");
+        assert_eq!(data.playbooks.len(), 1);
+        assert_eq!(data.playbooks[0].kind, "reservation_conflict");
+        assert_eq!(
+            data.playbooks[0].safe_command,
+            "am robot reservations --project proj --conflicts --all"
+        );
+        assert!(
+            data.playbooks[0]
+                .suggested_body
+                .contains("Safe inspection command"),
+            "playbook should include operator-safe inspection guidance"
+        );
+        assert!(
+            !data.playbooks[0].safe_command.contains("force-release"),
+            "playbook must stay advisory and avoid forced release commands"
+        );
         assert_eq!(data.expiring_soon.len(), 1);
         assert_eq!(data.expiring_soon[0].agent.as_deref(), Some("Bob"));
         assert_eq!(
@@ -16978,6 +24016,89 @@ mod tests {
         assert_eq!(data.conflicts[0].path_a, "src/*/foo.rs");
         assert_eq!(data.conflicts[0].agent_b, "Bob");
         assert_eq!(data.conflicts[0].path_b, "src/bar/*.rs");
+        assert_eq!(data.playbooks.len(), 1);
+        assert_eq!(data.playbooks[0].holders.len(), 2);
+        assert_eq!(data.playbooks[0].holders[0].agent, "Alice");
+        assert_eq!(data.playbooks[0].holders[1].agent, "Bob");
+    }
+
+    #[test]
+    fn build_reservations_forecasts_expiry_herds_and_conflict_hotspots() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, 'a', ?, ?, NULL),
+                (2, 1, 2, 'src/lib.rs', 1, 'b', ?, ?, NULL),
+                (3, 1, 3, 'docs/**', 0, 'c', ?, ?, NULL),
+                (4, 1, 3, 'crates/**', 1, 'd', ?, ?, NULL),
+                (5, 1, 2, 'expired/**', 1, 'e', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 120_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 240_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 240_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 20 * MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+            ],
+        )
+        .expect("insert reservations");
+
+        let (data, _actions) =
+            build_reservations(&conn, 1, "proj with space", None, true, false, Some(10))
+                .expect("build reservations");
+
+        let forecast = data.forecast.expect("forecast should be present");
+        let immediate = forecast
+            .expiry_herds
+            .iter()
+            .find(|bucket| bucket.window == "0-5m")
+            .expect("0-5m expiry bucket");
+        assert_eq!(immediate.count, 3);
+        assert_eq!(immediate.agents, vec!["Alice", "Bob", "Carol"]);
+        assert!(immediate.paths.contains(&"src/**".to_string()));
+        assert!(!immediate.paths.contains(&"expired/**".to_string()));
+        assert_eq!(
+            immediate.safe_command,
+            "am robot reservations --project 'proj with space' --expiring 5 --all"
+        );
+        assert!(immediate.evidence.contains("count=3"));
+
+        let later = forecast
+            .expiry_herds
+            .iter()
+            .find(|bucket| bucket.window == "15-60m")
+            .expect("15-60m expiry bucket");
+        assert_eq!(later.count, 1);
+        assert_eq!(later.paths, vec!["crates/**"]);
+
+        let hotspot = forecast
+            .conflict_hotspots
+            .iter()
+            .find(|hotspot| hotspot.path == "src/**")
+            .expect("src conflict hotspot");
+        assert_eq!(hotspot.conflict_pairs, 1);
+        assert_eq!(hotspot.agents, vec!["Alice", "Bob"]);
+        assert_eq!(hotspot.overlapping_paths, vec!["src/lib.rs"]);
+        assert_eq!(
+            hotspot.safe_command,
+            "am robot reservations --project 'proj with space' --conflicts --all"
+        );
+        assert!(hotspot.evidence.contains("pairs=1"));
+        assert!(
+            forecast
+                .conflict_hotspots
+                .iter()
+                .all(|hotspot| !hotspot.agents.contains(&"Carol".to_string())),
+            "shared reservations must not create conflict hotspots: {:?}",
+            forecast.conflict_hotspots
+        );
     }
 
     #[test]
@@ -17020,6 +24141,157 @@ mod tests {
             "unexpected conflict agents: {:?}",
             data.conflicts[0]
         );
+        assert_eq!(data.playbooks.len(), 1);
+        assert!(
+            data.playbooks[0].summary.contains("[unknown-agent-1]"),
+            "playbook should preserve orphaned holder identity: {:?}",
+            data.playbooks[0]
+        );
+    }
+
+    #[test]
+    fn build_reservations_conflicts_view_keeps_all_active_authoritative() {
+        // #199: the conflict-focused view must not drop non-overlapping active
+        // leases from `all_active`. It exposes the overlap-only subset via the
+        // additive `conflicting_active` field instead.
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let expires = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000);
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL),
+                (3, 1, 3, 'docs/**', 1, 'c', 0, ?, NULL)",
+            &[expires.clone(), expires.clone(), expires],
+        )
+        .expect("insert reservations");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, true, Some(10))
+            .expect("build reservations");
+
+        // The non-overlapping docs/** lease must remain visible in all_active.
+        assert_eq!(
+            data.all_active.len(),
+            3,
+            "conflict view must keep every active lease in all_active: {:?}",
+            data.all_active
+        );
+        assert!(
+            data.all_active.iter().any(|e| e.path == "docs/**"),
+            "non-overlapping lease must survive the conflict view: {:?}",
+            data.all_active
+        );
+
+        // conflicting_active is the overlap-only projection (the two auth paths).
+        assert_eq!(
+            data.conflicting_active.len(),
+            2,
+            "{:?}",
+            data.conflicting_active
+        );
+        assert!(
+            data.conflicting_active
+                .iter()
+                .all(|e| e.path.starts_with("src/auth")),
+            "conflicting_active must contain only overlapping leases: {:?}",
+            data.conflicting_active
+        );
+        assert!(
+            !data.conflicting_active.iter().any(|e| e.path == "docs/**"),
+            "docs/** does not overlap and must be excluded from conflicting_active"
+        );
+        assert_eq!(data.conflicts.len(), 1);
+
+        // Serialized shape: both fields present and distinct.
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["all_active"].as_array().unwrap().len(), 3);
+        assert_eq!(json["conflicting_active"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn build_reservations_omits_playbooks_when_conflict_free() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'docs/**', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert non-conflicting reservations");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, true, false, Some(10))
+            .expect("build reservations");
+
+        assert!(data.conflicts.is_empty());
+        assert!(data.playbooks.is_empty());
+    }
+
+    #[test]
+    fn build_reservations_quotes_expiring_renew_actions() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 2, 'docs/my file.md', 1, 'b', 0, ?, NULL)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                now_us + 300_000_000,
+            )],
+        )
+        .expect("insert expiring reservation");
+
+        let (_data, actions) = build_reservations(
+            &conn,
+            1,
+            "/tmp/project with space",
+            Some((2, "Bob".to_string())),
+            false,
+            false,
+            Some(10),
+        )
+        .expect("build reservations");
+
+        assert_eq!(
+            actions,
+            vec![
+                "am file_reservations renew '/tmp/project with space' Bob --paths 'docs/my file.md' --extend-seconds 3600"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_reservations_omits_expired_conflict_playbooks() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+            ],
+        )
+        .expect("insert expired reservations");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, true, false, Some(10))
+            .expect("build reservations");
+
+        assert!(data.all_active.is_empty());
+        assert!(data.conflicts.is_empty());
+        assert!(data.playbooks.is_empty());
     }
 
     #[test]
@@ -17047,7 +24319,7 @@ mod tests {
         )
         .expect("insert conflicting reservations");
 
-        let anomalies = build_analytics(&conn, 1, None).expect("build analytics");
+        let anomalies = build_analytics(&conn, 1, "proj", None).expect("build analytics");
         let reservation_conflict = anomalies
             .iter()
             .find(|anomaly| anomaly.category == "reservation_conflict")
@@ -17058,6 +24330,15 @@ mod tests {
                 .contains("1 reservation conflict"),
             "unexpected anomaly headline: {}",
             reservation_conflict.headline
+        );
+        assert_eq!(reservation_conflict.playbooks.len(), 1);
+        assert_eq!(
+            reservation_conflict.playbooks[0].safe_command,
+            "am robot reservations --project proj --conflicts --all"
+        );
+        assert_eq!(
+            reservation_conflict.remediation,
+            "am robot reservations --project proj --conflicts --all"
         );
     }
 
@@ -17080,7 +24361,7 @@ mod tests {
         conn.query_sync("DELETE FROM agents WHERE id = 1", &[])
             .expect("delete holder agent row");
 
-        let anomalies = build_analytics(&conn, 1, None).expect("build analytics");
+        let anomalies = build_analytics(&conn, 1, "proj", None).expect("build analytics");
         let reservation_conflict = anomalies
             .iter()
             .find(|anomaly| anomaly.category == "reservation_conflict")
@@ -17091,6 +24372,41 @@ mod tests {
                 .contains("1 reservation conflict"),
             "unexpected anomaly headline: {}",
             reservation_conflict.headline
+        );
+        assert_eq!(reservation_conflict.playbooks.len(), 1);
+        assert!(
+            reservation_conflict.playbooks[0]
+                .summary
+                .contains("[unknown-agent-1]"),
+            "playbook should retain orphaned holder identity: {:?}",
+            reservation_conflict.playbooks[0]
+        );
+    }
+
+    #[test]
+    fn build_analytics_omits_expired_reservation_conflicts() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+            ],
+        )
+        .expect("insert expired conflicting reservations");
+
+        let anomalies = build_analytics(&conn, 1, "proj", None).expect("build analytics");
+
+        assert!(
+            !anomalies
+                .iter()
+                .any(|anomaly| anomaly.category == "reservation_conflict"),
+            "expired reservations must not emit conflict playbooks: {anomalies:?}"
         );
     }
 
@@ -18179,6 +25495,7 @@ mod tests {
     fn handle_robot_rejects_markdown_for_non_prose_command() {
         let err = handle_robot(RobotArgs {
             format: Some(OutputFormat::Markdown),
+            json: false,
             project: None,
             agent: None,
             command: RobotSubcommand::Status,
@@ -18403,6 +25720,7 @@ mod tests {
                 in_progress: true,
                 consecutive_failures: 2,
                 attempts_in_window: 3,
+                successes_in_window: 0,
                 suppressed: false,
             }),
         };
@@ -18489,6 +25807,7 @@ mod tests {
                 in_progress: false,
                 consecutive_failures: 5,
                 attempts_in_window: 5,
+                successes_in_window: 0,
                 suppressed: true,
             }),
         };
@@ -18548,6 +25867,8 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: vec![],
+            recommendations: vec![],
+            reservation_forecast: None,
             recovery: Some(RecoveryStatus {
                 mode: "recovering".into(),
                 owner: "pid 100 (active)".into(),
@@ -18561,6 +25882,9 @@ mod tests {
                 deferred_write_backlog: None,
                 admission: None,
             }),
+            queued_intents: Vec::new(),
+            search_index: None,
+            forensic_timeline: None,
         };
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["health"], "recovering");

@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*"]
 
 [workspace.package]
-version = "0.2.51"
+version = "0.3.24"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -27,32 +27,35 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.3.0", package = "fastmcp-rust" }
-fastmcp-core = "0.3.0"
-fastmcp-server = "0.3.0"
-fastmcp-transport = "0.3.0"
-fastmcp-protocol = "0.3.0"
+fastmcp = { version = "0.3.1", package = "fastmcp-rust" }
+fastmcp-core = "0.3.1"
+fastmcp-server = "0.3.1"
+fastmcp-transport = "0.3.1"
+fastmcp-protocol = "0.3.1"
 
-asupersync = { version = "0.3.1", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.3.9", features = ["tls-webpki-roots"] }
 
-sqlmodel = "0.2.1"
-sqlmodel-core = "0.2.1"
-sqlmodel-query = "0.2.1"
-sqlmodel-schema = "0.2.1"
-sqlmodel-session = "0.2.1"
-sqlmodel-pool = "0.2.1"
-sqlmodel-frankensqlite = "0.2.1"
-sqlmodel-sqlite = "0.2.1"
+sqlmodel = "0.3.0"
+sqlmodel-core = "0.3.0"
+sqlmodel-query = "0.3.0"
+sqlmodel-schema = "0.3.0"
+sqlmodel-session = "0.3.0"
+sqlmodel-pool = "0.3.0"
+sqlmodel-frankensqlite = "0.3.0"
+sqlmodel-sqlite = "0.3.0"
 
-ftui = "0.3.1"
-ftui-runtime = { version = "0.3.1", features = ["native-backend"] }
-ftui-extras = { version = "0.3.1", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
-ftui-widgets = { version = "0.3.1", features = ["debug-overlay", "regex-search"] }
-ftui-tty = "0.3.1"
-ftui-harness = "0.3.1"
-ftui-render = "0.3.1"
-beads_rust = "0.1.42"
-toon = { version = "0.2.2", package = "tru" }
+ftui = "0.5.0"
+ftui-runtime = { version = "0.5.0" }
+ftui-extras = { version = "0.5.0", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
+ftui-widgets = { version = "0.5.0", features = ["debug-overlay", "regex-search"] }
+ftui-tty = "0.5.0"
+ftui-harness = "0.5.0"
+ftui-render = "0.5.0"
+beads_rust = { version = "0.2.15", default-features = false }
+toon = { version = "0.2.3", package = "tru" }
+# GH#161: global allocator for the long-running serve-http daemon to avoid
+# glibc per-thread arena fragmentation (multi-GB retained RSS under load).
+mimalloc = "0.1"
 
 # Internal workspace crates
 mcp-agent-mail-core = { path = "crates/mcp-agent-mail-core" }
@@ -68,62 +71,65 @@ mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
-franken-agent-detection = "0.1.3"
+franken-agent-detection = "0.1.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-json5 = "0.4"
+toml = "1.1.2"
+toml_edit = "0.25"
+json5 = "1.3.1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
-comrak = { version = "0.50.0", default-features = false }
+comrak = { version = "0.54.0", default-features = false }
 include_dir = "0.7.4"
 minijinja = "2.15.1"
 ammonia = "4.1.2"
 regex = "1"
 unicode-normalization = "0.1"
-similar = "2"
-git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
+same-file = "1"
+similar = "3.1.1"
+git2 = { version = "0.21", features = ["vendored-libgit2", "vendored-openssl"] }
 glob = "0.3.3"
 globset = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
 hex = "0.4"
-base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["std"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+base64 = "0.23"
+ed25519-dalek = "3"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
 fs2 = "0.4"
 walkdir = "2"
-tantivy = "0.25"
+tantivy = "0.26.1"
 indexmap = "2"
-nix = "0.31.1"
+nix = "0.31.3"
+signal-hook = "0.4.4"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.
 #
 # Do not enable frankensearch's aggregate `hybrid`/`semantic` features here:
 # those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
 # Downstream crates opt into the exact no-Tokio subfeatures they need.
-frankensearch = { version = "0.3.0", path = "../frankensearch/frankensearch", default-features = false }
-frankensearch-core = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-fusion" }
+frankensearch = { version = "0.3.2", path = "../frankensearch/frankensearch", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-core" }
+frankensearch-embed = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
+frankensearch-index = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-index" }
+frankensearch-fusion = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
-wide = "1"
-safetensors = "0.7"
-tokenizers = "0.22"
+wide = "1.5.0"
+safetensors = "0.8"
+tokenizers = "0.23.1"
 rayon = "1"
 dirs = "6"
 smallvec = { version = "1", features = ["serde"] }
-atty = "0.2"
 
 # WASM dependencies
 serde-wasm-bindgen = "0.6"
@@ -148,7 +154,7 @@ debug = 2                # Full debug info for development
 [profile.release]
 lto = "thin"             # Cross-crate optimization (80% of full LTO, much faster compile)
 codegen-units = 1        # Single codegen unit for maximum optimization
-panic = "abort"          # No unwinding overhead (smaller + faster binary)
+panic = "unwind"         # Keep long-running server workers from aborting the process on panics
 opt-level = 3            # Maximum optimization for speed
 strip = "symbols"        # Remove debug symbols from production binary
 
@@ -156,10 +162,14 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Keep asupersync unified with the sibling frankensearch checkout. Its workspace
-# dependency is currently a path dependency on ../asupersync, so resolving our
-# direct crates.io dependency from the registry would split Cx/Outcome types.
-asupersync = { path = "../asupersync" }
+# Keep asupersync unified with the sibling checkouts. FrankenSearch
+# references asupersync via the absolute `/dp/asupersync`
+# path (fleet-wide symlink to the canonical checkout); we MUST use the
+# identical path string here or cargo treats `../asupersync` and
+# `/dp/asupersync` as two distinct packages and refuses the lock
+# ("package collision in the lockfile"). Single path string => single
+# Cx/Outcome universe.
+asupersync = { path = "/dp/asupersync" }
 #
 # fastmcp-rust is temporarily force-patched to the sibling checkout
 # until its own v0.3 release propagates to crates.io. The currently
@@ -179,31 +189,8 @@ fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
 fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
 
 beads_rust = { path = "../beads_rust" }
-# sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
-sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-macros = { path = "../sqlmodel_rust/crates/sqlmodel-macros" }
-sqlmodel-query = { path = "../sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "../sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
-sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
-fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-fsqlite-core = { path = "../frankensqlite/crates/fsqlite-core" }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
-fsqlite-error = { path = "../frankensqlite/crates/fsqlite-error" }
-fsqlite-vfs = { path = "../frankensqlite/crates/fsqlite-vfs" }
-fsqlite-wal = { path = "../frankensqlite/crates/fsqlite-wal" }
-fsqlite-pager = { path = "../frankensqlite/crates/fsqlite-pager" }
-fsqlite-mvcc = { path = "../frankensqlite/crates/fsqlite-mvcc" }
-fsqlite-btree = { path = "../frankensqlite/crates/fsqlite-btree" }
-fsqlite-ast = { path = "../frankensqlite/crates/fsqlite-ast" }
-fsqlite-parser = { path = "../frankensqlite/crates/fsqlite-parser" }
-fsqlite-planner = { path = "../frankensqlite/crates/fsqlite-planner" }
-fsqlite-vdbe = { path = "../frankensqlite/crates/fsqlite-vdbe" }
-fsqlite-func = { path = "../frankensqlite/crates/fsqlite-func" }
-# ftui patches needed until ftui v0.2.2 is published (local code uses newer APIs)
+franken-agent-detection = { path = "../franken_agent_detection" }
+# ftui patches keep the repo on the latest local /dp frankentui APIs.
 ftui = { path = "../frankentui/crates/ftui" }
 ftui-core = { path = "../frankentui/crates/ftui-core" }
 ftui-runtime = { path = "../frankentui/crates/ftui-runtime" }
@@ -217,3 +204,29 @@ ftui-style = { path = "../frankentui/crates/ftui-style" }
 ftui-text = { path = "../frankentui/crates/ftui-text" }
 ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
+tru = { path = "../toon_rust" }
+rich_rust = { path = "../rich_rust" }
+
+# FrankenSQLite is intentionally NOT path-patched.
+#
+# We resolve fsqlite 0.1.18 from crates.io. 0.1.19 was published 2026-07-26
+# but was cut from the v0.1.18 release lineage WITHOUT the 2026-07-21
+# durability wave (no NamespaceOpenIntent::ReadOnlyExisting, no ns-lifecycle
+# changes — verified by content-grep of the upstream v0.1.19 tag), so it does
+# not help br-29u5s/br-mmnyj and a bump has not been evaluated. The sibling
+# checkout is past v0.1.19 and under active development; keep resolving from
+# crates.io. Re-evaluate the pin when a release contains the ns-lifecycle
+# work (unblock probe: git grep ReadOnlyExisting <tag> -- crates/fsqlite-vfs
+# in the sibling repo).
+
+# --- rch OOM mitigation (2026-07-23) ---------------------------------------
+# The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the
+# 15-29GB rch workers, so rch fails the remote build and falls back to a LOCAL
+# compile on the trj orchestrator (load spikes + /data/tmp ENOSPC). These per-
+# package overrides cut per-rustc peak memory so it builds on the small workers
+# instead of flooding trj. Revert = delete this block.
+[profile.release.package."mcp-agent-mail-server"]
+codegen-units = 16
+
+[profile.dev.package."mcp-agent-mail-server"]
+debug = 1

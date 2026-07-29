@@ -21,9 +21,9 @@ set -euo pipefail
 # Safety: default to keeping temp dirs so the shared harness doesn't run `rm -rf`.
 : "${AM_E2E_KEEP_TMP:=1}"
 
-E2E_SUITE="${E2E_SUITE:-archive}"
+export E2E_SUITE="${E2E_SUITE:-archive}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -471,17 +471,23 @@ if [ -z "$CANON3" ] || [ ! -f "$CANON3" ]; then
 fi
 
 fm3="$(parse_frontmatter_json "$CANON3")"
-python3 - <<'PY' "$fm3" "$IMG_SHA1" >/dev/null
+python3 - <<'PY' "$fm3" "$IMG_SHA1" "$CANON3" >/dev/null
 import json, sys
 fm = json.loads(sys.argv[1])
 sha_expected = sys.argv[2]
+md_path = sys.argv[3]
 atts = fm.get("attachments") or []
 assert isinstance(atts, list) and atts, "expected non-empty attachments"
-sha = atts[0].get("sha1")
+att = atts[0]
+sha = att.get("sha1")
 assert sha == sha_expected, f"sha1 mismatch: {sha} != {sha_expected}"
-assert atts[0].get("data_base64"), "expected inline attachment to include data_base64"
+assert att.get("type") == "inline", f"expected inline attachment metadata, got {att.get('type')}"
+assert att.get("media_type") == "image/webp", f"expected image/webp metadata, got {att.get('media_type')}"
+assert "data_base64" not in att, "frontmatter metadata must not duplicate inline payload bytes"
+body = open(md_path, "r", encoding="utf-8").read().split("\n---\n", 1)[1]
+assert "data:image/webp;base64," in body, "expected markdown body to carry inline data URI"
 PY
-e2e_pass "inline attachment metadata matches sha1"
+e2e_pass "inline attachment body + metadata match sha1"
 
 MANIFEST_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/attachments/_manifests/${IMG_SHA1}.json"
 AUDIT_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/attachments/_audit/${IMG_SHA1}.log"

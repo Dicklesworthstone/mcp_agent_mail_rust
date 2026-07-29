@@ -209,6 +209,21 @@ cargo test -p mcp-agent-mail-conformance
 cargo test --workspace --all-features
 ```
 
+#### Orphan-safe runner (`cargo nextest run`)
+
+Prefer `cargo nextest run` for long or interruptible CI/fleet runs. `.config/nextest.toml`
+sets a per-test `slow-timeout` with `terminate-after`, so any test that wedges is SIGTERM→SIGKILL'd
+(by process group) after a few minutes instead of surviving as a multi-day PPID=1 orphan when the
+parent `cargo`/runner is killed (br-fec3r). Plain `cargo test` ignores this file and has no
+equivalent timeout knob, so a hung test under bare `cargo test` can still orphan — use nextest where
+that matters.
+
+```bash
+cargo nextest run --workspace            # default profile (4-min hard kill per test)
+cargo nextest run --profile ci           # CI profile (1 retry, shorter slow-warning cadence)
+cargo nextest run -p mcp-agent-mail-tools
+```
+
 ### End-to-End Tests
 
 ```bash
@@ -240,11 +255,11 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 | `mcp-agent-mail-db` | SQL queries, pool, cache coherency, FTS sanitization, stress tests (concurrent ops, pool exhaustion) |
 | `mcp-agent-mail-storage` | Git archive, commit coalescer, notification signals |
 | `mcp-agent-mail-guard` | Pre-commit reservation enforcement, symmetric fnmatch, archive reading, rename handling |
-| `mcp-agent-mail-tools` | 37 MCP tool implementations via conformance fixtures |
+| `mcp-agent-mail-tools` | 38 MCP tool implementations via conformance fixtures |
 | `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
 | `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
 | `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
-| `mcp-agent-mail-conformance` | Parity with Python reference (34 Python-parity tools + 3 Rust-native, 25 resources) |
+| `mcp-agent-mail-conformance` | Parity with Python reference (34 Python-parity tools + 4 Rust-native, 25 resources) |
 | `tests/e2e/` | Cross-component E2E via stdio/HTTP transport |
 
 ### Test Fixtures
@@ -259,9 +274,208 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ---
 
+## `am doctor` — World-Class Self-Healing Surface
+
+`am doctor` diagnoses and (with `--fix`) repairs Agent Mail's mailbox state. The world-class surface (added in commit `641990d8`, hardened in pass-2) provides reversible, hash-witnessed, agent-ergonomic remediation with strict scope isolation.
+
+### Verbs (counts drift fast — `am doctor fixers` / `capabilities --json` are authoritative)
+
+| Verb | Mutates? | Default exit |
+|------|----------|--------------|
+| `am doctor` (or `check`) | No | 0 healthy / 1 findings |
+| `am doctor drain` | No (read-only) | 0 |
+| `am doctor locks` (`--json`) | No (read-only owner intelligence — D1) | 0 |
+| `am doctor --fix` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
+| `am doctor --dry-run --fix` | No | 0 |
+| `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
+| `am doctor fix --only <fm-id> --list` | No | 0 |
+| `am doctor fix --list` | No | 0 |
+| `am doctor undo <run-id>` | Yes (restore-only) | 0 / 3 |
+| `am doctor reclaim` | Yes (consolidates stale debris) | 0 |
+| `am doctor capabilities --json` | No | 0 |
+| `am doctor fixers` | No | 0 |
+| `am doctor explain <id>` | No | 0 / 64 |
+| `am doctor robot-docs` | No | 0 |
+| `am doctor health` | No | 0 / 1 |
+| `am doctor ls` | No | 0 |
+| `am doctor triage` | No | 0 |
+| `am doctor selftest` | No | 0 / 1 |
+| `am doctor mcp-selftest` | No (live MCP probe — C2) | 0 / 1 |
+| `am doctor write-selftest` | No (write-path probe — C3) | 0 / 1 |
+| `am doctor support-bundle` (`--json`) | Writes a sanitized support bundle only (N2) | 0 |
+| `am doctor artifacts` | No (read-only run inventory) | 0 |
+
+Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
+
+**Supervised-owner guard (br-bvq1x.4.4 / D4):** `am doctor repair` and `am doctor reconstruct` now REFUSE (exit 3) when a live mailbox owner is present (owner class `live`/`wedged`/`unsafe-to-touch` from `am doctor locks`). They never ask you to kill `am`. The safe path: gracefully drain/stop the owner via your supervisor (`am service restart`, `systemctl --user stop ...`), confirm with `am doctor drain` (reports `safe_to_mutate`), then re-run — or pass `--allow-live-owner` if you have already drained it. Startup self-heal passes `--allow-live-owner` internally so boot behavior is unchanged.
+
+### Per-FM registry
+
+**The registry is the source of truth — these counts drift fast.**
+`am doctor fixers --format json` enumerates the live registry; for an
+exact current count run a quick scan of `op_pattern` / `auto_fixable`
+over `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`. As of
+2026-06-26 the registry holds **62 FMs, of which 25 are auto-fixable**
+(37 remain detect-only by design — they need operator-supplied truth,
+an authoritative-side policy decision, or a source fix).
+
+Illustrative auto-fix entries (one per Op variant):
+
+| FM id | Severity | Op | Subsystem |
+|-------|----------|----|-----------|
+| `fm-archive-state-files-missing-doctor-gitignore-entry` | P2 | `Op::AppendFile` | archive_state_files |
+| `fm-archive-state-files-stale-archive-lock-from-dead-pid` | P1 | `Op::Rename` | archive_state_files |
+| `fm-archive-state-files-unexpected-symlink-in-archive` | P1 | `Op::Rename` (symlink quarantine) | archive_state_files |
+| `fm-db-state-files-world-readable-storage-db` | P0 | `Op::Chmod` | db_state_files |
+| `fm-db-state-files-legacy-fts-residue` | P2 | `Op::DbExec` | db_state_files |
+| `fm-doctor-state-files-dangling-latest-symlink` | P2 | `Op::SymlinkAtomic` | doctor_state_files |
+| `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
+| `fm-db-state-files-reservation-db-archive-parity` | P1 | `Op::DbExec`/`Op::WriteFile`/`Op::Rename` (reconcile #112 holder+release drift; collision quarantine; path/exclusive/thread/unresolved-holder stay detect-only) | db_state_files |
+
+Op coverage across the 25 auto-fix FMs (2026-06-26): `Op::WriteFile`×7,
+`Op::Chmod`×5, `Op::Rename`×7 (incl. directory-tree, symlink, and
+stale duplicate reservation-artifact quarantine), `Op::DbExec`×4,
+`Op::AppendFile`×1, `Op::SymlinkAtomic`×1.
+`Op::DbExec` is live (e.g. dependency-ordered DROP of legacy FTS
+residue); `Op::DbMigrate` remains a bookkeeping marker (migration SQL
+runs via paired `Op::DbExec`). `Op::Rename` now quarantines whole
+directory trees and individual symlinks (the link is moved, never
+dereferenced), both hash-witnessed and `undo`-reversible.
+
+### When to run `am doctor`
+
+- **Before any session work touching the mailbox**: `am doctor health` (cheap; one line; exit 0/1)
+- **When agents report unexpected state** (stale locks, missing config, runtime issues): `am doctor --json` to see structured findings
+- **Before non-trivial repairs**: `am doctor --dry-run --fix` to preview the plan; then `am doctor --fix --yes` to apply
+- **If `--fix` went wrong**: `am doctor undo latest` (restores from `<repo>/.doctor/runs/<id>/backups/`)
+- **When you need to discover the doctor's contract programmatically**: `am doctor capabilities --json | jq`
+
+### Hard guarantees
+
+- **Detect-then-fix.** Detectors are pure; nothing writes without `--fix`.
+- **Single chokepoint.** Every disk write under `--fix` flows through `mutate()` in `crates/mcp-agent-mail-cli/src/doctor/mutate.rs`. The 7 canonical `Op` variants are the only writes allowed.
+- **No deletion.** Per RULE 1, doctor never deletes. `Op::Rename` to `<run-dir>/quarantine/<rel>` is the only "delete-equivalent" operation. `am doctor undo` restores from quarantine.
+- **Verbatim backups.** Before every mutation, the live file is byte-copied to `<run-dir>/backups/<rel>` and verified with `cmp_strict`. Hash-witnessed in `actions.jsonl`.
+- **Atomic writes.** All mutations use write-tmp-then-rename (or DB transactions). No in-place truncation. No half-written files visible to readers.
+- **Reversible.** `am doctor undo <run-id>` reads `actions.jsonl` in reverse and restores byte-identical from `backups/`. Verifies post-restore SHA-256 matches `before_hash`. Refuses to clobber files the user modified after the fix (post-restore `after_hash` check).
+- **Idempotent.** `--fix` then `--fix` → second run reports `actions_taken: 0`. `undo <run-id>` then `undo <run-id>` → second is a no-op via the `undo_complete` sentinel.
+- **Concurrency-safe.** Per-path advisory lock (`fs2::FileExt::try_lock_exclusive`) prevents concurrent writers stepping on each other. Per-run-id `undo.lock` prevents concurrent undo invocations from racing.
+- **Symlink-safe.** `mutate()` sets permissions on the tempfile fd before persist (defeats symlink-swap chmod attack). `undo` refuses to follow symlinks at the target (defeats symlink-redirect overwrite attack).
+- **Scope-bounded.** All writes refuse if path is outside `capabilities.write_scopes` (exit 4). `--dry-run` plan checks scopes before printing — never lies about would-be exit-4 refusals.
+- **Read-only by default.** Bare `am doctor` never mutates state.
+- **Stable JSON schema.** `--json` output always includes `schema_version`. `doctor_contract_version` documented in `capabilities --json`.
+- **Stdout = data, stderr = progress.** `am doctor --json | jq` is always safe.
+- **No file deletion.** Per RULE 1. Quarantine via `Op::Rename`.
+- **No destructive shell.** Per "Irreversible Git & Filesystem Actions" — no `rm -rf`, `git reset --hard`, `git clean -fd`.
+
+### Per-run artifacts
+
+Every `--fix` run creates `<repo>/.doctor/runs/<ISO>__<run-id>/`:
+
+```
+.doctor/runs/2026-05-09T16-30-15Z__abc123/
+├── report.json           # findings + summary; same shape as `--json` output
+├── report.md             # human-readable narrative
+├── actions.jsonl         # one line per mutate() call (before/after hashes)
+├── backups/              # verbatim per-file copies (preserves perms, mtime)
+├── stderr.log
+├── stdout.json
+└── undo.sh               # idempotent shell script wrapping `am doctor undo`
+```
+
+`<repo>/.doctor/latest` is an atomic symlink to the most recent run.
+
+`<repo>/.doctor/scorecard_history.jsonl` is the per-run trend timeseries.
+
+`.doctor/` is added to `.gitignore` automatically on first run.
+
+### Common workflows for agents
+
+```bash
+# Startup health probe (CI-safe; cheap)
+am doctor health
+
+# Full diagnose (offline by default)
+am doctor --json | jq '.findings[] | select(.severity == "P0")'
+
+# Plan-then-fix
+am doctor --dry-run --fix
+am doctor --fix --yes
+
+# Reverse a fix that went wrong
+am doctor undo latest                           # most recent
+am doctor ls                                    # see all runs
+am doctor undo 2026-05-09T16-30-15Z__abc123     # specific run
+
+# Discover the contract programmatically
+am doctor capabilities --json | jq '.detectors | length'
+am doctor capabilities --json | jq '.fm_fixers | map(.id)'      # per-FM registry
+am doctor capabilities --json | jq '.exit_codes | keys'
+```
+
+### Per-FM workflow (recommended for agents — passes 14-28)
+
+The legacy `am doctor --fix` runs every detector + fixer in a single pass; the per-FM verbs let an agent target one failure mode at a time with full chokepoint guarantees.
+
+```bash
+# Enumerate the registry
+am doctor fixers --format json | jq '.fixers[] | {id, severity, op_pattern}'
+
+# Single round-trip: every registered FM's detector, aggregated
+am doctor fix --list --json | jq '{total: .total_findings, per_fm: .per_fm, skipped: .skipped}'
+
+# Cheap pre-flight for one FM (no chokepoint, no run-dir)
+am doctor fix --only fm-archive-state-files-stale-archive-lock-from-dead-pid --list --json
+
+# Rehearse through the chokepoint (run-dir + actions.jsonl recorded; no exec)
+am doctor fix --only <fm-id> --dry-run
+
+# Apply one FM through the chokepoint (full backup + hash-witnessed + reversible)
+am doctor fix --only <fm-id> --yes
+
+# Drill into a finding or the registry's static contract for one FM
+am doctor explain <fm-id-or-finding-id>        # falls back to registry if no recent run
+
+# Verify the chokepoint primitives on this machine
+am doctor selftest --format json
+```
+
+The `--list` (without `--only`) returns `{mode: "list_all", per_fm: [...], skipped: [...]}`. The `skipped[]` array carries FMs whose detector requires inputs not currently available (e.g., `known-bad-git` skipped when `git` isn't on PATH, `wrong-mcp-url` skipped when no canonical URL can be resolved) — agents decide whether the missing input is recoverable.
+
+### Pre-commit hook integration (recommended; not auto-installed)
+
+```bash
+# .git/hooks/pre-commit
+#!/bin/sh
+am doctor health || {
+    echo "am doctor reports findings. Run: am doctor --json | jq" >&2
+    exit 1
+}
+```
+
+### Decision support
+
+The standalone `mcp_agent_mail_rust__doctor_workspace/` planning
+directory (taxonomy / dependency-graph / repair-specs that drove the
+original FM scaffolding) no longer exists. The live registry is now
+self-describing — derive everything from the code + the doctor's own
+reflection surface:
+
+- `am doctor fixers --format json` — the live FM registry (id,
+  severity, op_pattern, auto_fixable, one_line_description).
+- `am doctor capabilities --json` — write/read scopes, exit codes,
+  the canonical `Op` set, contract version.
+- `am doctor explain <fm-id>` — per-FM detector + fixer + remediation
+  envelope (the in-code successor to the old `repair_specs/fm-*.md`).
+- `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs` — the
+  `registry()` table (severity / subsystem / op_pattern) plus the
+  `dispatch_only` + `detect_only` wiring each FM needs.
+
+---
+
 ## MCP Agent Mail — This Project
 
-**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 37 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
+**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 38 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
 
 ### What It Does
 
@@ -283,7 +497,7 @@ MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
                                               │
                                     ┌─────────┼─────────┐
                                     ▼         ▼         ▼
-                               37 Tools   25 Resources   TUI
+                               38 Tools   25 Resources   TUI
                                     │         │
                               mcp-agent-mail-tools
                                     │
@@ -307,7 +521,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 37 MCP tool implementations
+│   ├── mcp-agent-mail-tools/               # 38 MCP tool implementations
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am)
@@ -334,13 +548,13 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
 | `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
-| `mcp-agent-mail-tools` | `src/` | 37 MCP tool implementations across 9 clusters |
+| `mcp-agent-mail-tools` | `src/` | 38 MCP tool implementations across 9 clusters |
 | `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
 | `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (16 screens) |
 | `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
 | `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
-### 37 MCP Tools (9 Clusters)
+### 38 MCP Tools (9 Clusters)
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
@@ -348,7 +562,7 @@ mcp_agent_mail_rust/
 | Identity | 6 | register_agent, create_agent_identity, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
 | Messaging | 5 | send_message, reply_message, fetch_inbox, acknowledge_message, mark_message_read |
 | Contacts | 4 | request_contact, respond_contact, list_contacts, set_contact_policy |
-| File Reservations | 4 | file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |
+| File Reservations | 5 | check_file_reservation_conflicts, file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |
 | Search | 2 | search_messages, summarize_thread |
 | Macros | 4 | macro_start_session, macro_prepare_thread, macro_contact_handshake, macro_file_reservation_cycle |
 | Product Bus | 5 | ensure_product, products_link, search_messages_product, fetch_inbox_product, summarize_thread_product |
@@ -489,7 +703,7 @@ Use it when you need structured snapshots quickly (especially in automated loops
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
 | `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
-| `am robot health` | Runtime/system diagnostics synthesis | `--format`, `--project`, `--agent` |
+| `am robot health` | Runtime/system diagnostics synthesis | `--format`, `--project`, `--agent`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
 | `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
 | `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |

@@ -33,6 +33,20 @@ fn setup_real_db(rt: &asupersync::runtime::Runtime, name: &str) -> (Cx, DbPool, 
             }
             other => panic!("migration unexpected outcome: {other:?}"),
         }
+        match mcp_agent_mail_db::schema::migrate_atc_runtime_canonical_followup(&cx, &init_conn)
+            .await
+        {
+            asupersync::Outcome::Ok(applied) => {
+                eprintln!(
+                    "[SETUP] Applied {} ATC follow-up migrations for {name}",
+                    applied.len()
+                );
+            }
+            asupersync::Outcome::Err(err) => {
+                panic!("ATC migration failed for {name}: {err}");
+            }
+            other => panic!("ATC migration unexpected outcome: {other:?}"),
+        }
     });
     drop(init_conn);
 

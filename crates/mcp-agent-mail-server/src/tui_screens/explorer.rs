@@ -1334,7 +1334,9 @@ fn recipient_names_by_message(
         "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name \
          FROM message_recipients mr \
          LEFT JOIN agents a ON a.id = mr.agent_id{where_clause} \
-         ORDER BY mr.message_id ASC, mr.id ASC"
+         ORDER BY mr.message_id ASC, \
+         CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END ASC, \
+         mr.agent_id ASC"
     );
 
     conn.query_sync(&sql, &params)
@@ -2571,11 +2573,12 @@ mod tests {
         .expect("create messages");
         conn.execute_raw(
             "CREATE TABLE message_recipients (
-                id INTEGER PRIMARY KEY,
                 message_id INTEGER NOT NULL,
                 agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'to',
                 read_ts INTEGER,
-                ack_ts INTEGER
+                ack_ts INTEGER,
+                PRIMARY KEY(message_id, agent_id)
             )",
         )
         .expect("create recipients");
@@ -2613,9 +2616,9 @@ mod tests {
                 (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
              VALUES
                 (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
-             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
-                (1, 10, 2, 1200, 1300),
-                (2, 10, 3, NULL, NULL);",
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 2, 1200, 1300),
+                (10, 3, NULL, NULL);",
         )
         .expect("seed inbound rows");
 
@@ -2638,6 +2641,30 @@ mod tests {
     }
 
     #[test]
+    fn recipient_names_by_message_orders_delivery_kinds_semantically() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO agents (id, name) VALUES
+                (1, 'BccAgent'),
+                (2, 'CcAgent'),
+                (3, 'ToAgent');
+             INSERT INTO message_recipients (message_id, agent_id, kind) VALUES
+                (10, 1, 'bcc'),
+                (10, 2, 'cc'),
+                (10, 3, 'to');",
+        )
+        .expect("seed recipient kinds");
+
+        let names = recipient_names_by_message(&conn, &[10]).expect("recipient lookup");
+
+        assert_eq!(
+            names.get(&10).map(String::as_str),
+            Some("ToAgent, CcAgent, BccAgent")
+        );
+    }
+
+    #[test]
     fn fetch_inbound_acknowledged_filter_uses_matching_recipient_subset_for_status() {
         let conn = DbConn::open_memory().expect("open memory db");
         create_explorer_query_schema(&conn);
@@ -2651,9 +2678,9 @@ mod tests {
                 (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
              VALUES
                 (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
-             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
-                (1, 10, 2, 1200, 1300),
-                (2, 10, 3, NULL, NULL);",
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 2, 1200, 1300),
+                (10, 3, NULL, NULL);",
         )
         .expect("seed inbound rows");
 
@@ -2682,9 +2709,9 @@ mod tests {
                 (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
              VALUES
                 (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
-             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
-                (1, 10, 2, 1200, 1300),
-                (2, 10, 3, NULL, NULL);",
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 2, 1200, 1300),
+                (10, 3, NULL, NULL);",
         )
         .expect("seed outbound rows");
 
@@ -2711,9 +2738,9 @@ mod tests {
                 (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
              VALUES
                 (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
-             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
-                (1, 10, 2, NULL, NULL),
-                (2, 10, 99, NULL, NULL);",
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 2, NULL, NULL),
+                (10, 99, NULL, NULL);",
         )
         .expect("seed inbound rows");
 
@@ -2738,8 +2765,8 @@ mod tests {
                 (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
              VALUES
                 (10, 1, 1, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
-             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
-                (1, 10, 2, NULL, NULL);",
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 2, NULL, NULL);",
         )
         .expect("seed outbound rows");
 
@@ -2762,8 +2789,8 @@ mod tests {
                 (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id)
              VALUES
                 (10, 1, 7, 'Deploy notice', 'Ship it', 'high', 1, 1000, 'br-10');
-             INSERT INTO message_recipients (id, message_id, agent_id, read_ts, ack_ts) VALUES
-                (1, 10, 99, NULL, NULL);
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 99, NULL, NULL);
              INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, \"exclusive\", expires_ts, released_ts)
              VALUES

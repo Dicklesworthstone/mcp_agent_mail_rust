@@ -894,12 +894,41 @@ fn stable_direct_surface_index_dir(pool: &DbPool) -> PathBuf {
         ));
     }
 
+    // Key by the canonical mailbox identity (storage root), not by
+    // `sqlite_identity_key`: snapshot-backed pools open a fresh temp copy of
+    // the mailbox per invocation, so a `path@generation` key minted a
+    // brand-new index dir and a FullRebuild on every query while leaking one
+    // directory per run (br-dvs6f). The storage root is the same identity the
+    // preferred shared `storage_root/search_index` route uses; stale docs
+    // from a replaced or drifted DB are dropped at query time by candidate
+    // canonicalization, exactly as on the shared route.
     let mut hasher = Sha256::new();
-    hasher.update(pool.sqlite_identity_key().as_bytes());
+    hasher.update(pool.storage_root().display().to_string().as_bytes());
     let digest = hex::encode(hasher.finalize());
-    std::env::temp_dir()
-        .join("mcp-agent-mail-search-index")
-        .join(digest)
+    stable_direct_surface_index_root().join(digest)
+}
+
+fn stable_direct_surface_index_root() -> PathBuf {
+    let owner = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .map(|value| sanitize_search_index_owner(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::process::id().to_string());
+    std::env::temp_dir().join(format!("mcp-agent-mail-search-index-{owner}"))
+}
+
+fn sanitize_search_index_owner(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn direct_surface_index_dir(pool: &DbPool) -> PathBuf {
@@ -908,6 +937,312 @@ fn direct_surface_index_dir(pool: &DbPool) -> PathBuf {
         return shared;
     }
     stable_direct_surface_index_dir(pool)
+}
+
+/// Read-only snapshot of the lexical Search V3 backfill/index state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LexicalBackfillHealth {
+    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`, `in_memory`, or `unavailable`.
+    pub state: String,
+    /// Current SQLite identity used to scope the process-global lexical bridge.
+    pub db_identity: String,
+    /// Index directory inspected for the persisted backfill state marker.
+    pub index_dir: String,
+    /// Message documents recorded in the persisted lexical index state.
+    pub indexed_messages: u64,
+    /// Message rows observed by the backfill when the marker was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_messages: Option<u64>,
+    /// Difference between source and indexed counts when the index is behind.
+    pub skipped_messages: u64,
+    /// Timestamp from the persisted backfill state marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_backfill_at_micros: Option<i64>,
+    /// Reserved for future active rebuild tracking; currently always false for read-only probes.
+    pub rebuild_in_progress: bool,
+    /// Process-global active SQLite identity, if the bridge was initialized in this process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_db_identity: Option<String>,
+    /// Human-readable reason when the state is not fresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Safe operator action for recovering from the reported state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_remediation: Option<String>,
+}
+
+impl LexicalBackfillHealth {
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self.state.as_str(), "fresh" | "in_memory")
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LexicalBackfillStateFile {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    db_path: String,
+    #[serde(default)]
+    db_fingerprint: Option<LexicalBackfillDbFingerprint>,
+    #[serde(default)]
+    db_stats: LexicalBackfillStateStats,
+    #[serde(default)]
+    index_stats: LexicalBackfillStateStats,
+    #[serde(default)]
+    updated_at_micros: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+struct LexicalBackfillDbFingerprint {
+    #[serde(default)]
+    len_bytes: u64,
+    #[serde(default)]
+    modified_micros: i64,
+    #[serde(default)]
+    device_id: Option<u64>,
+    #[serde(default)]
+    inode: Option<u64>,
+}
+
+impl LexicalBackfillDbFingerprint {
+    fn stable_file_id(&self) -> Option<(u64, u64)> {
+        Some((self.device_id?, self.inode?))
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LexicalBackfillStateStats {
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    max_id: u64,
+}
+
+fn read_lexical_backfill_state_file(
+    path: &std::path::Path,
+) -> Result<Option<LexicalBackfillStateFile>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let state = serde_json::from_str::<LexicalBackfillStateFile>(&raw)
+        .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
+    if state.schema_version != 1 {
+        return Err(format!(
+            "unsupported backfill state schema version {} in {}",
+            state.schema_version,
+            path.display()
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBackfillDbFingerprint> {
+    if db_path == ":memory:" {
+        return None;
+    }
+    let metadata = std::fs::metadata(db_path).ok()?;
+    #[cfg(unix)]
+    let (device_id, inode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let (device_id, inode) = (None, None);
+    let modified_micros = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|dur| i64::try_from(dur.as_micros()).ok())
+        .unwrap_or(0);
+    Some(LexicalBackfillDbFingerprint {
+        len_bytes: metadata.len(),
+        modified_micros,
+        device_id,
+        inode,
+    })
+}
+
+/// Inspect the Search V3 lexical index state without initializing or backfilling the bridge.
+#[must_use]
+pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
+    let sqlite_key = sqlite_key_for_pool(pool);
+    let index_dir = direct_surface_index_dir(pool);
+    let index_dir_display = index_dir.display().to_string();
+    let active_key = lexical_active_db_key()
+        .lock()
+        .map_or(None, |guard| guard.clone());
+
+    if pool.sqlite_path() == ":memory:" {
+        return LexicalBackfillHealth {
+            state: "in_memory".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(
+                "lexical backfill cannot inspect pooled sqlite:///:memory: contents".to_string(),
+            ),
+            safe_remediation: Some(
+                "Use file-backed storage for durable Search V3 lexical diagnostics".to_string(),
+            ),
+        };
+    }
+
+    let cached_bootstrap = lexical_bootstrap_state()
+        .lock()
+        .ok()
+        .and_then(|state| state.get(&sqlite_key).cloned());
+    if let Some(Err(error)) = cached_bootstrap {
+        return LexicalBackfillHealth {
+            state: "unavailable".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(error),
+            safe_remediation: Some("Retry search bootstrap or run `am doctor health`".to_string()),
+        };
+    }
+
+    let backfill_marker_present = has_run_lexical_backfill(&sqlite_key).unwrap_or(false);
+    let state_path = index_dir.join("backfill_state.json");
+    let state = match read_lexical_backfill_state_file(&state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            return LexicalBackfillHealth {
+                state: "unavailable".to_string(),
+                db_identity: sqlite_key,
+                index_dir: index_dir_display,
+                indexed_messages: 0,
+                source_messages: None,
+                skipped_messages: 0,
+                last_backfill_at_micros: None,
+                rebuild_in_progress: false,
+                active_db_identity: active_key,
+                stale_reason: Some(error),
+                safe_remediation: Some(
+                    "Run `am robot search <query>` to retry lexical bridge initialization"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+
+    let Some(state) = state else {
+        let reason = if backfill_marker_present {
+            "lexical backfill is marked complete in this process, but no persisted state marker exists"
+        } else {
+            "lexical backfill has not completed for this database"
+        };
+        return LexicalBackfillHealth {
+            state: "delayed".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(reason.to_string()),
+            safe_remediation: Some(
+                "Run `am robot search <query>` or wait for startup search backfill, then recheck `am robot health --format json`"
+                    .to_string(),
+            ),
+        };
+    };
+
+    let source_messages = state.db_stats.count;
+    let indexed_messages = state.index_stats.count;
+    let skipped_messages = source_messages.saturating_sub(indexed_messages);
+    let fingerprint_stale_reason = state.db_fingerprint.as_ref().and_then(|recorded| {
+        match sqlite_file_lexical_backfill_fingerprint(pool.sqlite_path()) {
+            Some(current) => match (recorded.stable_file_id(), current.stable_file_id()) {
+                (Some(recorded_id), Some(current_id)) if recorded_id != current_id => {
+                    Some(format!(
+                        "backfill marker database identity changed for {}",
+                        pool.sqlite_path()
+                    ))
+                }
+                (None, Some(_)) => Some(format!(
+                    "backfill marker database identity is missing for {}",
+                    pool.sqlite_path()
+                )),
+                (Some(_), None) => Some(format!(
+                    "backfill marker database identity is unavailable for {}",
+                    pool.sqlite_path()
+                )),
+                _ => None,
+            },
+            None => Some(format!(
+                "backfill marker database identity is unavailable for {}",
+                pool.sqlite_path()
+            )),
+        }
+    });
+    let stale_reason = if state.db_path != pool.sqlite_path() {
+        Some(format!(
+            "backfill marker belongs to {}, current database is {}",
+            state.db_path,
+            pool.sqlite_path()
+        ))
+    } else if let Some(reason) = fingerprint_stale_reason {
+        Some(reason)
+    } else if active_key
+        .as_deref()
+        .is_some_and(|active| active != sqlite_key.as_str())
+    {
+        Some(format!(
+            "process-global lexical bridge is active for a different database: {}",
+            active_key.as_deref().unwrap_or_default()
+        ))
+    } else if indexed_messages != source_messages {
+        Some(format!(
+            "indexed message count {indexed_messages} differs from source count {source_messages}"
+        ))
+    } else if state.index_stats.max_id != state.db_stats.max_id {
+        Some(format!(
+            "indexed max message id {} differs from source max id {}",
+            state.index_stats.max_id, state.db_stats.max_id
+        ))
+    } else {
+        None
+    };
+    let health_state = match stale_reason.as_deref() {
+        None => "fresh",
+        Some(reason) if reason.starts_with("backfill marker belongs") => "stale",
+        Some(reason) if reason.starts_with("backfill marker database identity") => "stale",
+        Some(reason) if reason.starts_with("process-global lexical bridge") => "stale",
+        Some(_) => "partial",
+    };
+
+    LexicalBackfillHealth {
+        state: health_state.to_string(),
+        db_identity: sqlite_key,
+        index_dir: index_dir_display,
+        indexed_messages,
+        source_messages: Some(source_messages),
+        skipped_messages,
+        last_backfill_at_micros: Some(state.updated_at_micros),
+        rebuild_in_progress: false,
+        active_db_identity: active_key,
+        stale_reason,
+        safe_remediation: (health_state != "fresh").then(|| {
+            "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string()
+        }),
+    }
 }
 
 fn map_bridge_bootstrap_error(err: &str) -> DbError {
@@ -1184,6 +1519,7 @@ impl SemanticBridge {
             let worker = refresh_worker.clone();
             std::thread::Builder::new()
                 .name("semantic-index-refresh".to_string())
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || worker.run())
                 .ok()
         };
@@ -1741,12 +2077,50 @@ fn build_two_tier_indexing_health(bridge: &TwoTierBridge) -> TwoTierIndexingHeal
     }
 }
 
+#[cfg(all(feature = "hybrid", test))]
+fn build_two_tier_indexing_health_from_context() -> TwoTierIndexingHealth {
+    let ctx = get_two_tier_context();
+    let config = ctx.config();
+    let mut metrics = TwoTierMetrics::default();
+    metrics.record_init(ctx.init_metrics().clone());
+
+    TwoTierIndexingHealth {
+        availability: ctx.availability().to_string(),
+        total_docs: 0,
+        quality_doc_count: 0,
+        quality_coverage_ratio: 0.0,
+        quality_coverage_percent: 0.0,
+        fast_dimension: config.fast_dimension,
+        quality_dimension: config.quality_dimension,
+        metrics: metrics.snapshot(),
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn build_uninitialized_two_tier_indexing_health() -> TwoTierIndexingHealth {
+    let config = TwoTierConfig::default();
+
+    TwoTierIndexingHealth {
+        availability: "not-initialized".to_string(),
+        total_docs: 0,
+        quality_doc_count: 0,
+        quality_coverage_ratio: 0.0,
+        quality_coverage_percent: 0.0,
+        fast_dimension: config.fast_dimension,
+        quality_dimension: config.quality_dimension,
+        metrics: TwoTierMetrics::default().snapshot(),
+    }
+}
+
 /// Snapshot current two-tier index health, including quality coverage.
 #[cfg(feature = "hybrid")]
 #[must_use]
 pub fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
-    let bridge = get_two_tier_bridge()?;
-    Some(build_two_tier_indexing_health(&bridge))
+    Some(
+        get_two_tier_bridge().map_or_else(build_uninitialized_two_tier_indexing_health, |bridge| {
+            build_two_tier_indexing_health(&bridge)
+        }),
+    )
 }
 
 #[cfg(not(feature = "hybrid"))]
@@ -1776,7 +2150,8 @@ pub const fn two_tier_metrics_snapshot() -> Option<()> {
 #[cfg(feature = "hybrid")]
 static TWO_TIER_BRIDGE: OnceLock<Option<Arc<TwoTierBridge>>> = OnceLock::new();
 #[cfg(feature = "hybrid")]
-static HYBRID_RERANKER: OnceLock<Option<Arc<fs::FlashRankReranker>>> = OnceLock::new();
+static HYBRID_RERANKER: OnceLock<Option<Arc<fs::SyncRerankerAdapter<fs::NativeReranker>>>> =
+    OnceLock::new();
 #[cfg(feature = "hybrid")]
 static FAST_ONLY_SEARCH_HINT_EMITTED: OnceLock<()> = OnceLock::new();
 
@@ -2829,7 +3204,7 @@ fn resolve_rerank_model_dir() -> Option<PathBuf> {
 }
 
 #[cfg(feature = "hybrid")]
-fn get_or_init_hybrid_reranker() -> Option<Arc<fs::FlashRankReranker>> {
+fn get_or_init_hybrid_reranker() -> Option<Arc<fs::SyncRerankerAdapter<fs::NativeReranker>>> {
     HYBRID_RERANKER
         .get_or_init(|| {
             let Some(model_dir) = resolve_rerank_model_dir() else {
@@ -2840,8 +3215,11 @@ fn get_or_init_hybrid_reranker() -> Option<Arc<fs::FlashRankReranker>> {
                 return None;
             };
 
-            match fs::FlashRankReranker::load(&model_dir) {
-                Ok(reranker) => Some(Arc::new(reranker)),
+            // NativeReranker (pure-Rust BERT cross-encoder) implements `SyncRerank`,
+            // not `Reranker` directly, so wrap it in `SyncRerankerAdapter` to satisfy
+            // the `&dyn Reranker` bound that `fs::rerank_step` requires downstream.
+            match fs::NativeReranker::load(&model_dir) {
+                Ok(reranker) => Some(Arc::new(fs::SyncRerankerAdapter(reranker))),
                 Err(error) => {
                     tracing::warn!(
                         target: "search.metrics",
@@ -2968,7 +3346,7 @@ async fn maybe_apply_hybrid_rerank(
     let mut fs_candidates = merged
         .iter()
         .map(|result| FsScoredResult {
-            doc_id: result.id.to_string(),
+            doc_id: result.id.to_string().into(),
             score: result.score.unwrap_or(0.0) as f32,
             source: fs::core::types::ScoreSource::Hybrid,
             index: None,
@@ -3634,98 +4012,11 @@ pub async fn execute_search(
     #[allow(deprecated)]
     if matches!(engine, SearchEngine::Legacy | SearchEngine::Shadow) {
         let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
-        let raw_results = if let Some(project_id) = query.project_id {
-            match crate::queries::search_messages(cx, pool, project_id, &query.text, limit).await {
-                Outcome::Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| SearchResult {
-                        doc_kind: DocKind::Message,
-                        id: row.id,
-                        project_id: Some(project_id),
-                        title: row.subject,
-                        body: row.body_md,
-                        score: None,
-                        importance: Some(row.importance),
-                        ack_required: Some(row.ack_required != 0),
-                        created_ts: Some(row.created_ts),
-                        thread_id: row.thread_id,
-                        from_agent: Some(row.from),
-                        from_agent_id: Some(row.sender_id),
-                        reason_codes: Vec::new(),
-                        score_factors: Vec::new(),
-                        redacted: false,
-                        redaction_reason: None,
-                        ..SearchResult::default()
-                    })
-                    .collect(),
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
-        } else if let Some(product_id) = query.product_id {
-            match crate::queries::search_messages_for_product(
-                cx,
-                pool,
-                product_id,
-                &query.text,
-                limit,
-            )
-            .await
-            {
-                Outcome::Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| SearchResult {
-                        doc_kind: DocKind::Message,
-                        id: row.id,
-                        project_id: Some(row.project_id),
-                        title: row.subject,
-                        body: row.body_md,
-                        score: None,
-                        importance: Some(row.importance),
-                        ack_required: Some(row.ack_required != 0),
-                        created_ts: Some(row.created_ts),
-                        thread_id: row.thread_id,
-                        from_agent: Some(row.from),
-                        from_agent_id: Some(row.sender_id),
-                        reason_codes: Vec::new(),
-                        score_factors: Vec::new(),
-                        redacted: false,
-                        redaction_reason: None,
-                        ..SearchResult::default()
-                    })
-                    .collect(),
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
-        } else {
-            match crate::queries::search_messages_global(cx, pool, &query.text, limit).await {
-                Outcome::Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| SearchResult {
-                        doc_kind: DocKind::Message,
-                        id: row.id,
-                        project_id: Some(row.project_id),
-                        title: row.subject,
-                        body: row.body_md,
-                        score: None,
-                        importance: Some(row.importance),
-                        ack_required: Some(row.ack_required != 0),
-                        created_ts: Some(row.created_ts),
-                        thread_id: row.thread_id,
-                        from_agent: Some(row.from),
-                        from_agent_id: Some(row.sender_id),
-                        reason_codes: Vec::new(),
-                        score_factors: Vec::new(),
-                        redacted: false,
-                        redaction_reason: None,
-                        ..SearchResult::default()
-                    })
-                    .collect(),
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
+        let raw_results = match legacy_sql_candidate_results(cx, pool, query, limit).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
         let raw_results =
             match canonicalize_message_results(cx, pool, query, raw_results, false).await {
@@ -3753,6 +4044,56 @@ pub async fn execute_search(
             cache.put(cache_key, val.clone());
         }
         return resp;
+    }
+
+    // GH#162: When reads are served from a reconstructed archive snapshot
+    // (durability_state=degraded_read_only), the process-global Search V3 lexical
+    // bridge stays bound to the *live* database, so this pool's lexical index is
+    // foreign/empty and the Tantivy candidate path would silently return [] for
+    // messages that exist in the snapshot's relational tables. `state == "stale"`
+    // from `lexical_backfill_health` is exactly the "index belongs to a different
+    // database than this pool" signal (path / identity / active-bridge mismatch).
+    // Fall back to the SQL message scan (same path the Legacy engine uses), which
+    // reads straight from THIS pool, so plain-keyword search keeps returning real
+    // results through the degraded window. Count drift ("partial"/"delayed") is NOT
+    // foreign and is handled by the existing backfill-on-empty retry below.
+    if matches!(
+        engine,
+        SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+    ) && lexical_index_is_foreign_to_pool(pool)
+    {
+        let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
+        let raw_results = match legacy_sql_candidate_results(cx, pool, query, limit).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let raw_results =
+            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+        let raw_results = apply_cursor_window(raw_results, query);
+        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+        let explain = if query.explain {
+            Some(build_v3_query_explain(query, engine, None))
+        } else {
+            None
+        };
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if options.track_telemetry {
+            record_query("search_service_lexical_sql_fallback", latency_us);
+        }
+        global_metrics()
+            .search
+            .record_legacy_query(latency_us, false);
+        // Deliberately NOT cached: the snapshot pool is ephemeral and this result
+        // reflects a transient degraded window; caching could leak a snapshot read
+        // into the post-recovery live cache.
+        return finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
     }
 
     if matches!(
@@ -3991,6 +4332,122 @@ pub async fn execute_search(
     Outcome::Err(DbError::Sqlite(format!(
         "search engine unavailable: {engine}"
     )))
+}
+
+/// Whether this pool's Search V3 lexical index belongs to a *different* database.
+///
+/// True is the reconstructed-archive-snapshot case (GH#162): the process-global
+/// Tantivy bridge cannot serve this pool, so lexical / hybrid candidate retrieval
+/// must fall back to a SQL message scan. `state == "stale"` is set by
+/// `lexical_backfill_health` exactly when the backfill marker / active bridge is
+/// bound to another database (path, file identity, or active-key mismatch); count
+/// drift surfaces as `"partial"`/`"delayed"`, which is not foreign.
+fn lexical_index_is_foreign_to_pool(pool: &DbPool) -> bool {
+    pool.sqlite_path() != ":memory:" && lexical_backfill_health(pool).state == "stale"
+}
+
+/// Plain-keyword SQL message scan shared by the `Legacy`/`Shadow` engines.
+///
+/// Also the GH#162 stale-lexical-index fallback: reads message candidates straight
+/// from the supplied pool (no Search V3 lexical bridge), so it keeps working when
+/// reads are served from a reconstructed archive snapshot whose lexical index was
+/// never built.
+async fn legacy_sql_candidate_results(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    limit: usize,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    if let Some(project_id) = query.project_id {
+        match crate::queries::search_messages(cx, pool, project_id, &query.text, limit).await {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                        ..SearchResult::default()
+                    })
+                    .collect(),
+            ),
+            Outcome::Err(err) => Outcome::Err(err),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    } else if let Some(product_id) = query.product_id {
+        match crate::queries::search_messages_for_product(cx, pool, product_id, &query.text, limit)
+            .await
+        {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(row.project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                        ..SearchResult::default()
+                    })
+                    .collect(),
+            ),
+            Outcome::Err(err) => Outcome::Err(err),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    } else {
+        match crate::queries::search_messages_global(cx, pool, &query.text, limit).await {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(row.project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                        ..SearchResult::default()
+                    })
+                    .collect(),
+            ),
+            Outcome::Err(err) => Outcome::Err(err),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    }
 }
 
 fn plan_param_to_value(param: &PlanParam) -> Value {
@@ -4308,8 +4765,496 @@ mod tests {
 
         let chosen = direct_surface_index_dir(&pool);
         assert_ne!(chosen, root.path().join("search_index"));
-        assert!(chosen.starts_with(std::env::temp_dir().join("mcp-agent-mail-search-index")));
+        assert!(chosen.starts_with(stable_direct_surface_index_root()));
         assert_eq!(chosen, stable_direct_surface_index_dir(&pool));
+    }
+
+    #[test]
+    fn stable_direct_surface_index_dir_is_stable_across_snapshot_copies() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("mailbox-root");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let pool_for = |db_name: &str| {
+            crate::DbPool::new(&crate::DbPoolConfig {
+                database_url: format!("sqlite:///{}", root.path().join(db_name).display()),
+                storage_root: Some(storage_root.clone()),
+                ..Default::default()
+            })
+            .expect("pool")
+        };
+
+        // Two different snapshot copies of the same mailbox (fresh temp sqlite
+        // path per invocation) must share one index dir so repeated local
+        // searches reuse and increment instead of FullRebuild + leak.
+        let first = stable_direct_surface_index_dir(&pool_for("snapshot-a.sqlite3"));
+        let second = stable_direct_surface_index_dir(&pool_for("snapshot-b.sqlite3"));
+        assert_eq!(first, second);
+
+        // A different mailbox (different storage root) must not collide.
+        let other_root = root.path().join("other-mailbox-root");
+        std::fs::create_dir_all(&other_root).expect("other storage root");
+        let other = stable_direct_surface_index_dir(
+            &crate::DbPool::new(&crate::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    root.path().join("snapshot-c.sqlite3").display()
+                ),
+                storage_root: Some(other_root),
+                ..Default::default()
+            })
+            .expect("pool"),
+        );
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn stable_direct_surface_index_root_is_user_scoped() {
+        let root = stable_direct_surface_index_root();
+        let name = root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("search index root name");
+        assert!(name.starts_with("mcp-agent-mail-search-index-"));
+        assert_ne!(name, "mcp-agent-mail-search-index");
+    }
+
+    fn write_backfill_health_state(
+        root: &std::path::Path,
+        db_path: &str,
+        db_count: u64,
+        db_max_id: u64,
+        index_count: u64,
+        index_max_id: u64,
+    ) {
+        let index_dir = root.join("search_index");
+        std::fs::create_dir_all(&index_dir).expect("search index dir");
+        if db_path != ":memory:" && !std::path::Path::new(db_path).exists() {
+            if let Some(parent) = std::path::Path::new(db_path).parent() {
+                std::fs::create_dir_all(parent).expect("db parent dir");
+            }
+            std::fs::write(db_path, b"lexical backfill health fixture")
+                .expect("db fingerprint fixture");
+        }
+        let db_fingerprint = sqlite_file_lexical_backfill_fingerprint(db_path).unwrap_or(
+            LexicalBackfillDbFingerprint {
+                len_bytes: 1,
+                modified_micros: 2,
+                device_id: None,
+                inode: None,
+            },
+        );
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "db_path": db_path,
+            "db_fingerprint": {
+                "len_bytes": db_fingerprint.len_bytes,
+                "modified_micros": db_fingerprint.modified_micros,
+                "device_id": db_fingerprint.device_id,
+                "inode": db_fingerprint.inode
+            },
+            "db_stats": {
+                "count": db_count,
+                "max_id": db_max_id
+            },
+            "message_watermark": {
+                "sequence": 3,
+                "max_id": db_max_id
+            },
+            "index_meta_fingerprint": {
+                "len_bytes": 4,
+                "modified_micros": 5
+            },
+            "index_stats": {
+                "count": index_count,
+                "max_id": index_max_id
+            },
+            "updated_at_micros": 123_456
+        });
+        std::fs::write(
+            index_dir.join("backfill_state.json"),
+            serde_json::to_string_pretty(&payload).expect("state json"),
+        )
+        .expect("write backfill state");
+    }
+
+    fn temp_file_pool(root: &std::path::Path, db_file: &str) -> DbPool {
+        let config = crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", root.join(db_file).display()),
+            storage_root: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        crate::DbPool::new(&config).expect("pool")
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_fresh_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "fresh");
+        assert_eq!(health.source_messages, Some(3));
+        assert_eq!(health.indexed_messages, 3);
+        assert_eq!(health.skipped_messages, 0);
+        assert!(health.stale_reason.is_none());
+        assert!(health.safe_remediation.is_none());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_partial_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 5, 11, 2, 8);
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "partial");
+        assert_eq!(health.source_messages, Some(5));
+        assert_eq!(health.indexed_messages, 2);
+        assert_eq!(health.skipped_messages, 3);
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("differs from source count"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_stale_after_reconstruct_db_path_change() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(
+            root.path(),
+            root.path()
+                .join("pre-reconstruct-mail.sqlite3")
+                .to_str()
+                .expect("utf8 path"),
+            3,
+            9,
+            3,
+            9,
+        );
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "stale");
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("backfill marker belongs"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn execute_search_falls_back_to_sql_when_lexical_index_is_foreign_snapshot() {
+        // GH#162: while reads are served from a reconstructed archive snapshot, the
+        // process-global Search V3 lexical bridge stays bound to the *live* DB, so
+        // this pool's lexical index is foreign (lexical_backfill_health == "stale").
+        // A plain-keyword Lexical-engine search must still return the matching
+        // message via the SQL fallback instead of silently returning [].
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mailbox.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = match crate::queries::ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/search-snapshot-fallback",
+            )
+            .await
+            {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let project_id = project.id.unwrap_or(0);
+            let sender = match crate::queries::register_agent(
+                &cx, &pool, project_id, "RedPeak", "coder", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register sender failed: {other:?}"),
+            };
+            let recipient = match crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "coder", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register recipient failed: {other:?}"),
+            };
+            let message = match crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap_or(0),
+                "Reconstruct plan for the auth refactor",
+                "Detailed migration plan body",
+                Some("br-search-snapshot"),
+                "high",
+                false,
+                "[]",
+                &[(recipient.id.unwrap_or(0), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+
+            // Mark the lexical index as foreign to this pool (the snapshot case):
+            // the backfill marker belongs to a *different* (pre-reconstruct) DB path.
+            write_backfill_health_state(
+                root.path(),
+                root.path()
+                    .join("pre-reconstruct-mailbox.sqlite3")
+                    .to_str()
+                    .expect("utf8 path"),
+                1,
+                1,
+                1,
+                1,
+            );
+            assert_eq!(
+                lexical_backfill_health(&pool).state,
+                "stale",
+                "precondition: lexical index must read as foreign/stale for this pool"
+            );
+
+            let query = SearchQuery::messages("plan", project_id);
+            let options = SearchOptions {
+                scope_ctx: None,
+                redaction_policy: None,
+                track_telemetry: false,
+                search_engine: Some(SearchEngine::Lexical),
+            };
+            let response = match execute_search(&cx, &pool, &query, &options).await {
+                Outcome::Ok(response) => response,
+                other => panic!("execute_search failed: {other:?}"),
+            };
+
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .any(|row| row.result.id == message.id.unwrap_or(0)),
+                "plain-keyword search over a foreign-lexical-index (snapshot) pool must \
+                 return the matching message via the SQL fallback, got {} results",
+                response.results.len()
+            );
+        });
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_ignores_same_file_timestamp_churn() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(pool.sqlite_path())
+                .expect("open db file for timestamp churn");
+            file.write_all(b"same-file-churn")
+                .expect("change same file metadata");
+            file.sync_all().expect("sync same file metadata change");
+        }
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "fresh");
+        assert!(health.stale_reason.is_none());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lexical_backfill_health_reports_stale_when_state_lacks_database_identity() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        let state_path = root.path().join("search_index").join("backfill_state.json");
+        let mut state_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_path).expect("read backfill state"),
+        )
+        .expect("parse backfill state");
+        state_json["db_fingerprint"]["device_id"] = serde_json::Value::Null;
+        state_json["db_fingerprint"]["inode"] = serde_json::Value::Null;
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state_json).expect("serialize adjusted state"),
+        )
+        .expect("write adjusted backfill state");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "stale");
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("database identity is missing"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_stale_after_same_path_database_identity_change() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        let replacement_identity_path = root.path().join("replacement-mail.sqlite3");
+        std::fs::write(
+            &replacement_identity_path,
+            b"same path, different database identity fixture",
+        )
+        .expect("replacement identity fixture");
+        let replacement_fingerprint = sqlite_file_lexical_backfill_fingerprint(
+            replacement_identity_path
+                .to_str()
+                .expect("replacement fixture path"),
+        )
+        .expect("replacement fingerprint");
+        let state_path = root.path().join("search_index").join("backfill_state.json");
+        let mut state_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_path).expect("read backfill state"),
+        )
+        .expect("parse backfill state");
+        state_json["db_fingerprint"]["device_id"] =
+            serde_json::json!(replacement_fingerprint.device_id);
+        state_json["db_fingerprint"]["inode"] = serde_json::json!(replacement_fingerprint.inode);
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state_json).expect("serialize adjusted state"),
+        )
+        .expect("write adjusted backfill state");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "stale");
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("database identity changed"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_unavailable_for_failed_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        let index_dir = root.path().join("search_index");
+        std::fs::create_dir_all(&index_dir).expect("search index dir");
+        std::fs::write(
+            index_dir.join("backfill_state.json"),
+            serde_json::json!({
+                "schema_version": 999,
+                "db_path": pool.sqlite_path(),
+            })
+            .to_string(),
+        )
+        .expect("write bad backfill state");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "unavailable");
+        assert_eq!(health.indexed_messages, 0);
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unsupported backfill state schema version"))
+        );
+        assert!(health.safe_remediation.is_some());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_delayed_without_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "delayed");
+        assert_eq!(health.source_messages, None);
+        assert_eq!(health.indexed_messages, 0);
+        assert!(health.safe_remediation.is_some());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_in_memory_pool() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "in_memory");
+        assert_eq!(health.source_messages, None);
+        assert!(health.db_identity.starts_with(":memory:@"));
+        reset_lexical_bootstrap_tracking();
     }
 
     #[test]
@@ -6683,6 +7628,27 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     #[test]
+    fn two_tier_indexing_health_uninitialized_snapshot_is_lightweight() {
+        let health = build_uninitialized_two_tier_indexing_health();
+
+        assert_eq!(health.availability, "not-initialized");
+        assert_eq!(health.total_docs, 0);
+        assert_eq!(health.quality_doc_count, 0);
+        assert!(health.quality_coverage_ratio.abs() < f32::EPSILON);
+        assert!(health.quality_coverage_percent.abs() < f32::EPSILON);
+        assert_eq!(
+            health.fast_dimension,
+            TwoTierConfig::default().fast_dimension
+        );
+        assert_eq!(
+            health.quality_dimension,
+            TwoTierConfig::default().quality_dimension
+        );
+        assert!(health.metrics.init.is_none());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
     fn two_tier_indexing_health_reports_quality_coverage() {
         let bridge = two_tier_test_bridge();
         let config = bridge.config.clone();
@@ -6718,6 +7684,21 @@ mod tests {
         assert_eq!(health.fast_dimension, config.fast_dimension);
         assert_eq!(health.quality_dimension, config.quality_dimension);
         assert!(!health.availability.is_empty());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn two_tier_indexing_health_from_context_reports_availability_without_docs() {
+        let health = build_two_tier_indexing_health_from_context();
+
+        assert!(!health.availability.is_empty());
+        assert_eq!(health.total_docs, 0);
+        assert_eq!(health.quality_doc_count, 0);
+        assert!(health.quality_coverage_ratio.abs() < f32::EPSILON);
+        assert!(health.quality_coverage_percent.abs() < f32::EPSILON);
+        assert!(health.fast_dimension > 0);
+        assert!(health.quality_dimension > 0);
+        assert!(health.metrics.init.is_some());
     }
 
     #[cfg(feature = "hybrid")]

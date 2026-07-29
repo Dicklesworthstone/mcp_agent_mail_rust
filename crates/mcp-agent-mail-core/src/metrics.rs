@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -139,7 +139,7 @@ pub struct Log2Histogram {
     max: AtomicU64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistogramSnapshot {
     pub count: u64,
     pub sum: u64,
@@ -422,6 +422,44 @@ pub struct DbMetrics {
     pub pool_peak_active_connections: GaugeU64,
     pub pool_over_80_since_us: GaugeU64,
     pub integrity_failures_total: Counter,
+    /// Count of runtime corruption triggers where file-level health probes
+    /// (canonical `SQLite` `quick_check` + `integrity_check`) report healthy.
+    /// These are bespoke-parser-only rejections: typically a record or page
+    /// shape the frankensqlite parser refuses but canonical `SQLite` accepts.
+    /// Each tick corresponds to a recovery attempt that was *skipped* (rather
+    /// than re-spinning the futile recovery loop) so the caller surfaces a
+    /// terminal error instead.
+    pub bespoke_parser_only_rejections_total: Counter,
+    /// Periodic maintenance op counts (bead K4): successful background
+    /// passive WAL checkpoints, `ANALYZE` runs, and `VACUUM` runs.
+    pub maintenance_checkpoint_runs_total: Counter,
+    pub maintenance_analyze_runs_total: Counter,
+    pub maintenance_vacuum_runs_total: Counter,
+    /// Count of background maintenance ops that errored (logged + retried next
+    /// cycle; never fatal to the request path).
+    pub maintenance_failures_total: Counter,
+    /// Wall-clock microsecond timestamp of the last successful run, per op, so
+    /// operators can confirm maintenance is actually firing on schedule.
+    pub maintenance_last_checkpoint_us: GaugeU64,
+    pub maintenance_last_analyze_us: GaugeU64,
+    pub maintenance_last_vacuum_us: GaugeU64,
+    /// Duration distribution across maintenance ops (microseconds).
+    pub maintenance_duration_us: Log2Histogram,
+    /// Verified last-known-healthy snapshot lifecycle (bead K2): snapshots
+    /// recorded as known-healthy (a full integrity check passed first), attempts
+    /// where that pre-record check failed (nothing recorded), and recoveries
+    /// served from a verified snapshot instead of an archive rebuild.
+    pub snapshot_created_total: Counter,
+    pub snapshot_verify_failures_total: Counter,
+    pub snapshot_restored_total: Counter,
+    /// Wall-clock microsecond timestamp of the last verified snapshot recorded.
+    pub last_verified_snapshot_us: GaugeU64,
+    /// I3 (br-bvq1x.9.3): count of `SQLite` connections dropped WITHOUT an
+    /// explicit `close()` (the engine emits a `fsqlite::runtime` `drop_close`
+    /// warning). A rising count is connection-lifecycle debt — the ts1 incident
+    /// paired it with ATC tick-budget overruns. Incremented by a tracing layer
+    /// in the server/CLI binaries; `0` until one is registered.
+    pub drop_close_total: Counter,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -437,6 +475,20 @@ pub struct DbMetricsSnapshot {
     pub pool_utilization_pct: u64,
     pub pool_over_80_since_us: u64,
     pub integrity_failures_total: u64,
+    pub bespoke_parser_only_rejections_total: u64,
+    pub maintenance_checkpoint_runs_total: u64,
+    pub maintenance_analyze_runs_total: u64,
+    pub maintenance_vacuum_runs_total: u64,
+    pub maintenance_failures_total: u64,
+    pub maintenance_last_checkpoint_us: u64,
+    pub maintenance_last_analyze_us: u64,
+    pub maintenance_last_vacuum_us: u64,
+    pub maintenance_duration_us: HistogramSnapshot,
+    pub snapshot_created_total: u64,
+    pub snapshot_verify_failures_total: u64,
+    pub snapshot_restored_total: u64,
+    pub last_verified_snapshot_us: u64,
+    pub drop_close_total: u64,
 }
 
 impl Default for DbMetrics {
@@ -452,6 +504,20 @@ impl Default for DbMetrics {
             pool_peak_active_connections: GaugeU64::new(),
             pool_over_80_since_us: GaugeU64::new(),
             integrity_failures_total: Counter::new(),
+            bespoke_parser_only_rejections_total: Counter::new(),
+            maintenance_checkpoint_runs_total: Counter::new(),
+            maintenance_analyze_runs_total: Counter::new(),
+            maintenance_vacuum_runs_total: Counter::new(),
+            maintenance_failures_total: Counter::new(),
+            maintenance_last_checkpoint_us: GaugeU64::new(),
+            maintenance_last_analyze_us: GaugeU64::new(),
+            maintenance_last_vacuum_us: GaugeU64::new(),
+            maintenance_duration_us: Log2Histogram::new(),
+            snapshot_created_total: Counter::new(),
+            snapshot_verify_failures_total: Counter::new(),
+            snapshot_restored_total: Counter::new(),
+            last_verified_snapshot_us: GaugeU64::new(),
+            drop_close_total: Counter::new(),
         }
     }
 }
@@ -461,13 +527,8 @@ impl DbMetrics {
     pub fn snapshot(&self) -> DbMetricsSnapshot {
         let pool_total_connections = self.pool_total_connections.load();
         let pool_active_connections = self.pool_active_connections.load();
-        let pool_utilization_pct = if pool_total_connections == 0 {
-            0
-        } else {
-            pool_active_connections
-                .saturating_mul(100)
-                .saturating_div(pool_total_connections)
-        };
+        let pool_utilization_pct =
+            percentage_clamped(pool_active_connections, pool_total_connections);
 
         DbMetricsSnapshot {
             pool_acquires_total: self.pool_acquires_total.load(),
@@ -481,8 +542,118 @@ impl DbMetrics {
             pool_utilization_pct,
             pool_over_80_since_us: self.pool_over_80_since_us.load(),
             integrity_failures_total: self.integrity_failures_total.load(),
+            bespoke_parser_only_rejections_total: self.bespoke_parser_only_rejections_total.load(),
+            maintenance_checkpoint_runs_total: self.maintenance_checkpoint_runs_total.load(),
+            maintenance_analyze_runs_total: self.maintenance_analyze_runs_total.load(),
+            maintenance_vacuum_runs_total: self.maintenance_vacuum_runs_total.load(),
+            maintenance_failures_total: self.maintenance_failures_total.load(),
+            maintenance_last_checkpoint_us: self.maintenance_last_checkpoint_us.load(),
+            maintenance_last_analyze_us: self.maintenance_last_analyze_us.load(),
+            maintenance_last_vacuum_us: self.maintenance_last_vacuum_us.load(),
+            maintenance_duration_us: self.maintenance_duration_us.snapshot(),
+            snapshot_created_total: self.snapshot_created_total.load(),
+            snapshot_verify_failures_total: self.snapshot_verify_failures_total.load(),
+            snapshot_restored_total: self.snapshot_restored_total.load(),
+            last_verified_snapshot_us: self.last_verified_snapshot_us.load(),
+            drop_close_total: self.drop_close_total.load(),
         }
     }
+}
+
+/// File-descriptor pressure for the current process, sampled live from the OS.
+///
+/// Unlike the pool gauges in [`DbMetricsSnapshot`] (which accumulate over a
+/// process's lifetime), these are read on demand — from `/proc/self/limits`
+/// and `/proc/self/fd` on Linux — so they stay meaningful even in a fresh,
+/// short-lived CLI process. The soft/hard limits reflect the inherited
+/// `ulimit -n` of the environment, so they are useful even when this
+/// particular process holds few descriptors. On non-Linux platforms the
+/// fields are `None` (the readers are best-effort and never fatal).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FdMetricsSnapshot {
+    /// Soft `RLIMIT_NOFILE` — the limit that actually bites. `None` if unknown.
+    pub soft_limit: Option<u64>,
+    /// Hard `RLIMIT_NOFILE` ceiling. `None` if unknown.
+    pub hard_limit: Option<u64>,
+    /// Approximate count of open file descriptors for this process.
+    pub open_fds: Option<u64>,
+    /// `open_fds / soft_limit` as a 0..=100 percentage. `None` when either
+    /// input is unavailable or the soft limit is zero.
+    pub utilization_pct: Option<u64>,
+}
+
+/// Read the soft/hard `RLIMIT_NOFILE` for the current process.
+///
+/// Linux parses `/proc/self/limits`; other platforms (and unreadable files)
+/// return `(None, None)`.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn read_fd_limits() -> (Option<u64>, Option<u64>) {
+    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
+        return (None, None);
+    };
+    for line in limits.lines() {
+        if let Some(rest) = line.strip_prefix("Max open files") {
+            let mut fields = rest.split_whitespace();
+            let soft = fields.next().and_then(|v| v.parse().ok());
+            let hard = fields.next().and_then(|v| v.parse().ok());
+            return (soft, hard);
+        }
+    }
+    (None, None)
+}
+
+/// Read the soft/hard `RLIMIT_NOFILE` for the current process (non-Linux stub).
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub fn read_fd_limits() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+/// Count open file descriptors for the current process.
+///
+/// Linux counts `/proc/self/fd` entries; other platforms (and unreadable
+/// directories) return `None`.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn count_open_fds() -> Option<u64> {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .and_then(|entries| u64::try_from(entries.count()).ok())
+}
+
+/// Count open file descriptors for the current process (non-Linux stub).
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub fn count_open_fds() -> Option<u64> {
+    None
+}
+
+/// Sample live file-descriptor pressure for the current process.
+#[must_use]
+pub fn fd_metrics_snapshot() -> FdMetricsSnapshot {
+    let (soft_limit, hard_limit) = read_fd_limits();
+    let open_fds = count_open_fds();
+    let utilization_pct = match (open_fds, soft_limit) {
+        (Some(open), Some(soft)) if soft > 0 => Some(percentage_clamped(open, soft)),
+        _ => None,
+    };
+    FdMetricsSnapshot {
+        soft_limit,
+        hard_limit,
+        open_fds,
+        utilization_pct,
+    }
+}
+
+#[inline]
+pub(crate) fn percentage_clamped(value: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+
+    let pct = (u128::from(value) * 100).saturating_div(u128::from(total));
+    u64::try_from(pct.min(100)).unwrap_or(100)
 }
 
 #[derive(Debug)]
@@ -496,6 +667,39 @@ pub struct StorageMetrics {
     pub wbq_peak_depth: GaugeU64,
     pub wbq_over_80_since_us: GaugeU64,
     pub wbq_queue_latency_us: Log2Histogram,
+    /// Microsecond timestamp of the most recent WBQ op that failed after
+    /// every retry was exhausted (i.e. the row enqueued via the API never
+    /// reached storage). Zero means "never". This is sticky — a later
+    /// successful drain does NOT clear it, because exhausted-retry means
+    /// a row was already lost and operator attention is required before
+    /// new writes should be accepted. Cleared by `am doctor` repair paths
+    /// only, after the operator confirms recovery. See #122.
+    pub wbq_last_unrecoverable_error_us: GaugeU64,
+    /// Monotonically-increasing count of WBQ ops that exhausted their
+    /// retry budget. Distinct from `wbq_errors_total`, which counts every
+    /// individual op failure (including transient ones that succeed on
+    /// retry). See #122.
+    pub wbq_unrecoverable_errors_total: Counter,
+    /// Ops salvaged from a dead drain thread's channel and re-enqueued into
+    /// the fresh channel at WBQ respawn (br-b9x63).
+    pub wbq_respawn_salvaged_total: Counter,
+    /// Ops known lost across a WBQ respawn: they were counted in the queue
+    /// depth before the drain thread died but could not be salvaged into the
+    /// fresh channel (br-b9x63).
+    pub wbq_respawn_lost_total: Counter,
+
+    /// Archive ops executed synchronously on the caller thread — the direct
+    /// reservation path (`write_op_sync_direct`) plus the WBQ-unavailable
+    /// fallback (`write_op_sync`). These never enter the queue, so they are
+    /// invisible to the `wbq_*` depth/queue-latency series (br-spy9z).
+    pub archive_direct_writes_total: Counter,
+    /// Direct/synchronous archive ops that failed after exhausting retries.
+    pub archive_direct_write_errors_total: Counter,
+    /// Caller-thread execution latency of direct/synchronous archive ops.
+    pub archive_direct_write_latency_us: Log2Histogram,
+    /// Direct archive ops skipped because disk pressure was critical
+    /// (reconcile-on-read heals the artifact once pressure clears).
+    pub archive_direct_skips_disk_critical_total: Counter,
 
     pub commit_enqueued_total: Counter,
     pub commit_drained_total: Counter,
@@ -544,6 +748,15 @@ pub struct StorageMetricsSnapshot {
     pub wbq_peak_depth: u64,
     pub wbq_over_80_since_us: u64,
     pub wbq_queue_latency_us: HistogramSnapshot,
+    pub wbq_last_unrecoverable_error_us: u64,
+    pub wbq_unrecoverable_errors_total: u64,
+    pub wbq_respawn_salvaged_total: u64,
+    pub wbq_respawn_lost_total: u64,
+
+    pub archive_direct_writes_total: u64,
+    pub archive_direct_write_errors_total: u64,
+    pub archive_direct_write_latency_us: HistogramSnapshot,
+    pub archive_direct_skips_disk_critical_total: u64,
 
     pub commit_enqueued_total: u64,
     pub commit_drained_total: u64,
@@ -670,6 +883,248 @@ impl SystemMetrics {
             tui_spin_watchdog_last_trip_us: self.tui_spin_watchdog_last_trip_us.load(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Corruption-class metrics (br-bvq1x.1.5 / A5)
+// ---------------------------------------------------------------------------
+
+/// Where a corruption/integrity signal was detected.
+///
+/// These are the probe sources that can surface a corruption-class condition.
+/// Counters are keyed by source so operators can tell a quick-check trip from
+/// an open-failure or a WAL/SHM mismatch instead of seeing one opaque total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptionDetectionSource {
+    /// `PRAGMA quick_check` reported a problem.
+    QuickCheck,
+    /// `PRAGMA integrity_check` (incremental or full) reported a problem.
+    IntegrityCheck,
+    /// Schema smoke probe (required tables/columns) failed.
+    SchemaSmoke,
+    /// A connection/open attempt failed in a way that looks like damage.
+    OpenFailure,
+    /// WAL/SHM sidecar state was inconsistent with the main DB.
+    WalShmMismatch,
+    /// `PRAGMA foreign_key_check` reported orphaned/inconsistent rows.
+    FkCheck,
+    /// FTS / search-index integrity check failed.
+    FtsCheck,
+}
+
+impl CorruptionDetectionSource {
+    /// Stable machine string for JSON/metric keys.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QuickCheck => "quick_check",
+            Self::IntegrityCheck => "integrity_check",
+            Self::SchemaSmoke => "schema_smoke",
+            Self::OpenFailure => "open_failure",
+            Self::WalShmMismatch => "wal_shm_mismatch",
+            Self::FkCheck => "fk_check",
+            Self::FtsCheck => "fts_check",
+        }
+    }
+}
+
+/// Corruption/integrity detection and classification counters.
+///
+/// All counters are process-global atomics, so they accumulate over the life
+/// of one process (most usefully the long-running server). Detection-source
+/// counters answer "where did we trip?"; per-class counters mirror the A1
+/// `DbErrorClass` taxonomy and answer "how do classified failures break
+/// down?"; the `last_*_us` gauges answer "when did this last happen?" (0 means
+/// never). These feed operator/agent trend visibility and the K3 circuit
+/// breaker instead of one-shot scary strings.
+#[derive(Debug, Default)]
+pub struct CorruptionMetrics {
+    // -- Detection-source counters --
+    pub quick_check_failures_total: Counter,
+    pub integrity_check_failures_total: Counter,
+    pub schema_smoke_failures_total: Counter,
+    pub open_failures_total: Counter,
+    pub wal_shm_mismatch_total: Counter,
+    pub fk_check_failures_total: Counter,
+    pub fts_check_failures_total: Counter,
+
+    // -- Per-typed-class (A1 `DbErrorClass`) counters --
+    pub class_main_db_btree_corruption_total: Counter,
+    pub class_wal_sidecar_corruption_total: Counter,
+    pub class_schema_drift_or_missing_tables_total: Counter,
+    pub class_engine_probe_limitation_total: Counter,
+    pub class_foreign_key_inconsistency_total: Counter,
+    pub class_fts_index_corruption_total: Counter,
+    pub class_connection_or_config_error_total: Counter,
+    pub class_busy_retryable_total: Counter,
+    pub class_fd_exhaustion_total: Counter,
+    pub class_pool_exhaustion_total: Counter,
+    pub class_live_owner_no_activity_lock_total: Counter,
+    pub class_host_pressure_total: Counter,
+    /// Classified error whose class string did not match any known A1 class
+    /// (guards against silent drift if the taxonomy grows).
+    pub class_unknown_total: Counter,
+
+    // -- Last-corruption timestamps (micros since epoch; 0 = never) --
+    /// Last time any detection source tripped.
+    pub last_detection_us: GaugeU64,
+    /// Last time any error was classified through `record_class`.
+    pub last_classified_us: GaugeU64,
+    /// Last time a class that blocks edits / indicates real corruption fired
+    /// (main-db / WAL-sidecar / schema-drift / FK / FTS corruption classes).
+    pub last_corruption_class_us: GaugeU64,
+}
+
+/// Serializable snapshot of [`CorruptionMetrics`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CorruptionMetricsSnapshot {
+    pub quick_check_failures_total: u64,
+    pub integrity_check_failures_total: u64,
+    pub schema_smoke_failures_total: u64,
+    pub open_failures_total: u64,
+    pub wal_shm_mismatch_total: u64,
+    pub fk_check_failures_total: u64,
+    pub fts_check_failures_total: u64,
+
+    pub class_main_db_btree_corruption_total: u64,
+    pub class_wal_sidecar_corruption_total: u64,
+    pub class_schema_drift_or_missing_tables_total: u64,
+    pub class_engine_probe_limitation_total: u64,
+    pub class_foreign_key_inconsistency_total: u64,
+    pub class_fts_index_corruption_total: u64,
+    pub class_connection_or_config_error_total: u64,
+    pub class_busy_retryable_total: u64,
+    pub class_fd_exhaustion_total: u64,
+    pub class_pool_exhaustion_total: u64,
+    pub class_live_owner_no_activity_lock_total: u64,
+    pub class_host_pressure_total: u64,
+    pub class_unknown_total: u64,
+
+    pub last_detection_us: u64,
+    pub last_classified_us: u64,
+    pub last_corruption_class_us: u64,
+
+    /// Convenience rollup: sum of all detection-source counters.
+    pub detections_total: u64,
+    /// Convenience rollup: sum of the classes that indicate real corruption
+    /// (main-db / WAL-sidecar / schema-drift / FK / FTS) — i.e. edit-blocking
+    /// damage, excluding transient busy/pool/FD/host-pressure classes.
+    pub corruption_class_total: u64,
+}
+
+impl CorruptionMetrics {
+    /// Record a corruption/integrity detection from a specific source.
+    pub fn record_detection(&self, source: CorruptionDetectionSource) {
+        self.record_detection_at(source, now_us_for_metrics());
+    }
+
+    /// [`Self::record_detection`] with an explicit timestamp (for tests).
+    pub fn record_detection_at(&self, source: CorruptionDetectionSource, now_us: u64) {
+        let counter = match source {
+            CorruptionDetectionSource::QuickCheck => &self.quick_check_failures_total,
+            CorruptionDetectionSource::IntegrityCheck => &self.integrity_check_failures_total,
+            CorruptionDetectionSource::SchemaSmoke => &self.schema_smoke_failures_total,
+            CorruptionDetectionSource::OpenFailure => &self.open_failures_total,
+            CorruptionDetectionSource::WalShmMismatch => &self.wal_shm_mismatch_total,
+            CorruptionDetectionSource::FkCheck => &self.fk_check_failures_total,
+            CorruptionDetectionSource::FtsCheck => &self.fts_check_failures_total,
+        };
+        counter.inc();
+        self.last_detection_us.set(now_us);
+    }
+
+    /// Record a classified error by its A1 `DbErrorClass::as_str()` value.
+    ///
+    /// Accepts the stable class string so the zero-dependency `core` crate
+    /// does not need to depend on the `db` crate that owns the enum.
+    pub fn record_class(&self, class: &str) {
+        self.record_class_at(class, now_us_for_metrics());
+    }
+
+    /// [`Self::record_class`] with an explicit timestamp (for tests).
+    pub fn record_class_at(&self, class: &str, now_us: u64) {
+        let (counter, is_corruption) = match class {
+            "main_db_btree_corruption" => (&self.class_main_db_btree_corruption_total, true),
+            "wal_sidecar_corruption" => (&self.class_wal_sidecar_corruption_total, true),
+            "schema_drift_or_missing_tables" => {
+                (&self.class_schema_drift_or_missing_tables_total, true)
+            }
+            "engine_probe_limitation" => (&self.class_engine_probe_limitation_total, false),
+            "foreign_key_inconsistency" => (&self.class_foreign_key_inconsistency_total, true),
+            "fts_index_corruption" => (&self.class_fts_index_corruption_total, true),
+            "connection_or_config_error" => (&self.class_connection_or_config_error_total, false),
+            "busy_retryable" => (&self.class_busy_retryable_total, false),
+            "fd_exhaustion" => (&self.class_fd_exhaustion_total, false),
+            "pool_exhaustion" => (&self.class_pool_exhaustion_total, false),
+            "live_owner_no_activity_lock" => (&self.class_live_owner_no_activity_lock_total, false),
+            "host_pressure" => (&self.class_host_pressure_total, false),
+            _ => (&self.class_unknown_total, false),
+        };
+        counter.inc();
+        self.last_classified_us.set(now_us);
+        if is_corruption {
+            self.last_corruption_class_us.set(now_us);
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> CorruptionMetricsSnapshot {
+        let detections_total = self.quick_check_failures_total.load()
+            + self.integrity_check_failures_total.load()
+            + self.schema_smoke_failures_total.load()
+            + self.open_failures_total.load()
+            + self.wal_shm_mismatch_total.load()
+            + self.fk_check_failures_total.load()
+            + self.fts_check_failures_total.load();
+        let corruption_class_total = self.class_main_db_btree_corruption_total.load()
+            + self.class_wal_sidecar_corruption_total.load()
+            + self.class_schema_drift_or_missing_tables_total.load()
+            + self.class_foreign_key_inconsistency_total.load()
+            + self.class_fts_index_corruption_total.load();
+        CorruptionMetricsSnapshot {
+            quick_check_failures_total: self.quick_check_failures_total.load(),
+            integrity_check_failures_total: self.integrity_check_failures_total.load(),
+            schema_smoke_failures_total: self.schema_smoke_failures_total.load(),
+            open_failures_total: self.open_failures_total.load(),
+            wal_shm_mismatch_total: self.wal_shm_mismatch_total.load(),
+            fk_check_failures_total: self.fk_check_failures_total.load(),
+            fts_check_failures_total: self.fts_check_failures_total.load(),
+
+            class_main_db_btree_corruption_total: self.class_main_db_btree_corruption_total.load(),
+            class_wal_sidecar_corruption_total: self.class_wal_sidecar_corruption_total.load(),
+            class_schema_drift_or_missing_tables_total: self
+                .class_schema_drift_or_missing_tables_total
+                .load(),
+            class_engine_probe_limitation_total: self.class_engine_probe_limitation_total.load(),
+            class_foreign_key_inconsistency_total: self
+                .class_foreign_key_inconsistency_total
+                .load(),
+            class_fts_index_corruption_total: self.class_fts_index_corruption_total.load(),
+            class_connection_or_config_error_total: self
+                .class_connection_or_config_error_total
+                .load(),
+            class_busy_retryable_total: self.class_busy_retryable_total.load(),
+            class_fd_exhaustion_total: self.class_fd_exhaustion_total.load(),
+            class_pool_exhaustion_total: self.class_pool_exhaustion_total.load(),
+            class_live_owner_no_activity_lock_total: self
+                .class_live_owner_no_activity_lock_total
+                .load(),
+            class_host_pressure_total: self.class_host_pressure_total.load(),
+            class_unknown_total: self.class_unknown_total.load(),
+
+            last_detection_us: self.last_detection_us.load(),
+            last_classified_us: self.last_classified_us.load(),
+            last_corruption_class_us: self.last_corruption_class_us.load(),
+
+            detections_total,
+            corruption_class_total,
+        }
+    }
+}
+
+/// Current wall-clock micros for metric timestamps, saturating to `u64`.
+fn now_us_for_metrics() -> u64 {
+    u64::try_from(crate::timestamps::now_micros()).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,6 +1844,15 @@ impl Default for StorageMetrics {
             wbq_peak_depth: GaugeU64::new(),
             wbq_over_80_since_us: GaugeU64::new(),
             wbq_queue_latency_us: Log2Histogram::new(),
+            wbq_last_unrecoverable_error_us: GaugeU64::new(),
+            wbq_unrecoverable_errors_total: Counter::new(),
+            wbq_respawn_salvaged_total: Counter::new(),
+            wbq_respawn_lost_total: Counter::new(),
+
+            archive_direct_writes_total: Counter::new(),
+            archive_direct_write_errors_total: Counter::new(),
+            archive_direct_write_latency_us: Log2Histogram::new(),
+            archive_direct_skips_disk_critical_total: Counter::new(),
 
             commit_enqueued_total: Counter::new(),
             commit_drained_total: Counter::new(),
@@ -1429,6 +1893,17 @@ impl StorageMetrics {
             wbq_peak_depth: self.wbq_peak_depth.load(),
             wbq_over_80_since_us: self.wbq_over_80_since_us.load(),
             wbq_queue_latency_us: self.wbq_queue_latency_us.snapshot(),
+            wbq_last_unrecoverable_error_us: self.wbq_last_unrecoverable_error_us.load(),
+            wbq_unrecoverable_errors_total: self.wbq_unrecoverable_errors_total.load(),
+            wbq_respawn_salvaged_total: self.wbq_respawn_salvaged_total.load(),
+            wbq_respawn_lost_total: self.wbq_respawn_lost_total.load(),
+
+            archive_direct_writes_total: self.archive_direct_writes_total.load(),
+            archive_direct_write_errors_total: self.archive_direct_write_errors_total.load(),
+            archive_direct_write_latency_us: self.archive_direct_write_latency_us.snapshot(),
+            archive_direct_skips_disk_critical_total: self
+                .archive_direct_skips_disk_critical_total
+                .load(),
 
             commit_enqueued_total: self.commit_enqueued_total.load(),
             commit_drained_total: self.commit_drained_total.load(),
@@ -1554,6 +2029,7 @@ pub struct GlobalMetrics {
     pub search: SearchMetrics,
     pub atc: AtcMetrics,
     pub canary: CanaryMetrics,
+    pub corruption: CorruptionMetrics,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1566,6 +2042,7 @@ pub struct GlobalMetricsSnapshot {
     pub search: SearchMetricsSnapshot,
     pub atc: AtcMetricsSnapshot,
     pub canary: CanaryMetricsSnapshot,
+    pub corruption: CorruptionMetricsSnapshot,
 }
 
 impl GlobalMetrics {
@@ -1580,6 +2057,7 @@ impl GlobalMetrics {
             search: self.search.snapshot(),
             atc: self.atc.snapshot(),
             canary: self.canary.snapshot(),
+            corruption: self.corruption.snapshot(),
         }
     }
 }
@@ -1594,6 +2072,36 @@ pub fn global_metrics() -> &'static GlobalMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fd_metrics_snapshot_shape_and_consistency() {
+        // K5 (br-bvq1x.11.5): the FD pressure snapshot feeds `am robot metrics`;
+        // keep its JSON shape stable and its utilization internally consistent.
+        let snap = fd_metrics_snapshot();
+        let json = serde_json::to_value(&snap).expect("serialize FdMetricsSnapshot");
+        for key in ["soft_limit", "hard_limit", "open_fds", "utilization_pct"] {
+            assert!(
+                json.get(key).is_some(),
+                "FdMetricsSnapshot must expose `{key}`: {json}"
+            );
+        }
+        if let (Some(open), Some(soft), Some(util)) =
+            (snap.open_fds, snap.soft_limit, snap.utilization_pct)
+        {
+            assert!(soft > 0, "a present soft limit must be positive");
+            assert_eq!(util, percentage_clamped(open, soft));
+            assert!(util <= 100, "utilization is a clamped percentage");
+        }
+    }
+
+    #[test]
+    fn fd_metrics_snapshot_default_is_all_none() {
+        let snap = FdMetricsSnapshot::default();
+        assert!(snap.soft_limit.is_none());
+        assert!(snap.hard_limit.is_none());
+        assert!(snap.open_fds.is_none());
+        assert!(snap.utilization_pct.is_none());
+    }
 
     #[test]
     fn log2_bucket_indexing_smoke() {
@@ -2160,6 +2668,21 @@ mod tests {
         assert_eq!(snap.pool_utilization_pct, 0);
     }
 
+    #[test]
+    fn db_metrics_snapshot_utilization_handles_large_values() {
+        let m = DbMetrics::default();
+
+        m.pool_total_connections.set(u64::MAX);
+        m.pool_active_connections.set(u64::MAX);
+        let snap = m.snapshot();
+        assert_eq!(snap.pool_utilization_pct, 100);
+
+        m.pool_total_connections.set(1);
+        m.pool_active_connections.set(u64::MAX);
+        let snap = m.snapshot();
+        assert_eq!(snap.pool_utilization_pct, 100);
+    }
+
     // ── SystemMetrics snapshot ────────────────────────────────────────
 
     #[test]
@@ -2352,5 +2875,108 @@ mod tests {
         let gm1 = super::global_metrics();
         let gm2 = super::global_metrics();
         assert!(std::ptr::eq(gm1, gm2));
+    }
+
+    // ── A5 (br-bvq1x.1.5): corruption-class metrics ───────────────────
+
+    #[test]
+    fn corruption_metrics_record_detection_by_source() {
+        let m = CorruptionMetrics::default();
+        m.record_detection_at(CorruptionDetectionSource::QuickCheck, 1_000);
+        m.record_detection_at(CorruptionDetectionSource::QuickCheck, 2_000);
+        m.record_detection_at(CorruptionDetectionSource::IntegrityCheck, 3_000);
+        m.record_detection_at(CorruptionDetectionSource::FkCheck, 4_000);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.quick_check_failures_total, 2);
+        assert_eq!(snap.integrity_check_failures_total, 1);
+        assert_eq!(snap.fk_check_failures_total, 1);
+        assert_eq!(snap.schema_smoke_failures_total, 0);
+        assert_eq!(snap.detections_total, 4);
+        // Last detection timestamp tracks the most recent record.
+        assert_eq!(snap.last_detection_us, 4_000);
+    }
+
+    #[test]
+    fn corruption_metrics_record_class_increments_typed_counters() {
+        let m = CorruptionMetrics::default();
+        // Real corruption classes feed corruption_class_total + the timestamp.
+        m.record_class_at("main_db_btree_corruption", 10);
+        m.record_class_at("fts_index_corruption", 20);
+        m.record_class_at("foreign_key_inconsistency", 30);
+        // Transient classes increment their counter but are NOT corruption.
+        m.record_class_at("busy_retryable", 40);
+        m.record_class_at("pool_exhaustion", 50);
+        // Unknown class string is captured separately (drift guard).
+        m.record_class_at("some_future_class", 60);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.class_main_db_btree_corruption_total, 1);
+        assert_eq!(snap.class_fts_index_corruption_total, 1);
+        assert_eq!(snap.class_foreign_key_inconsistency_total, 1);
+        assert_eq!(snap.class_busy_retryable_total, 1);
+        assert_eq!(snap.class_pool_exhaustion_total, 1);
+        assert_eq!(snap.class_unknown_total, 1);
+
+        // corruption_class_total counts only the edit-blocking corruption
+        // classes (3), not the transient/unknown ones.
+        assert_eq!(snap.corruption_class_total, 3);
+        // last_classified tracks every record; last_corruption_class only the
+        // real-corruption ones (most recent was fk at ts=30).
+        assert_eq!(snap.last_classified_us, 60);
+        assert_eq!(snap.last_corruption_class_us, 30);
+    }
+
+    #[test]
+    fn corruption_metrics_snapshot_serializes_with_stable_keys() {
+        let m = CorruptionMetrics::default();
+        m.record_detection_at(CorruptionDetectionSource::WalShmMismatch, 1);
+        m.record_class_at("schema_drift_or_missing_tables", 2);
+        let snap = m.snapshot();
+        let json = serde_json::to_value(&snap).expect("snapshot serializes");
+        assert_eq!(json["wal_shm_mismatch_total"], 1);
+        assert_eq!(json["class_schema_drift_or_missing_tables_total"], 1);
+        assert_eq!(json["detections_total"], 1);
+        assert_eq!(json["corruption_class_total"], 1);
+        assert!(json.get("last_detection_us").is_some());
+    }
+
+    #[test]
+    fn corruption_detection_source_strings_are_stable() {
+        assert_eq!(
+            CorruptionDetectionSource::QuickCheck.as_str(),
+            "quick_check"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::IntegrityCheck.as_str(),
+            "integrity_check"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::SchemaSmoke.as_str(),
+            "schema_smoke"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::OpenFailure.as_str(),
+            "open_failure"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::WalShmMismatch.as_str(),
+            "wal_shm_mismatch"
+        );
+        assert_eq!(CorruptionDetectionSource::FkCheck.as_str(), "fk_check");
+        assert_eq!(CorruptionDetectionSource::FtsCheck.as_str(), "fts_check");
+    }
+
+    #[test]
+    fn global_metrics_snapshot_includes_corruption_section() {
+        // The aggregate snapshot must carry the corruption section so it
+        // reaches `am robot metrics` / `tooling/metrics_core`.
+        let snap = GlobalMetrics::default().snapshot();
+        let json = serde_json::to_value(&snap).expect("global snapshot serializes");
+        assert!(
+            json.get("corruption").is_some(),
+            "global metrics snapshot must expose a corruption section"
+        );
+        assert_eq!(json["corruption"]["detections_total"], 0);
     }
 }

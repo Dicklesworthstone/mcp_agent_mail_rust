@@ -66,21 +66,23 @@ fn detect_github_pages(output_dir: &Path, git_remote: Option<&str>, hints: &mut 
         }
     }
 
-    // Check git remote
+    // Check git remote.
     if let Some(remote) = git_remote
         && remote.contains("github")
     {
         signals.push(format!("Git remote: {remote}"));
     }
 
-    // Check environment
-    if std::env::var("GITHUB_REPOSITORY").is_ok() {
-        signals.push("GITHUB_REPOSITORY env var set".to_string());
+    // Check if inside docs/ directory.
+    let inside_docs = is_inside_docs_dir(output_dir);
+    if inside_docs {
+        signals.push("Output inside docs/ directory".to_string());
     }
 
-    // Check if inside docs/ directory
-    if is_inside_docs_dir(output_dir) {
-        signals.push("Output inside docs/ directory".to_string());
+    // Ambient GitHub Actions variables are only useful when the output directory already has a
+    // local Pages signal. Otherwise random temp directories in CI look like GitHub Pages projects.
+    if std::env::var("GITHUB_REPOSITORY").is_ok() && !signals.is_empty() {
+        signals.push("GITHUB_REPOSITORY env var set".to_string());
     }
 
     if !signals.is_empty() {
@@ -105,7 +107,9 @@ fn detect_cloudflare_pages(
 ) {
     let mut signals = Vec::new();
 
-    if crate::git::find_ancestor_path(output_dir, "wrangler.toml").is_some() {
+    if crate::git::find_ancestor_path(output_dir, "wrangler.toml")
+        .is_some_and(|path| crate::is_real_file(&path))
+    {
         signals.push("wrangler.toml found".to_string());
     }
 
@@ -136,7 +140,9 @@ fn detect_cloudflare_pages(
 fn detect_netlify(output_dir: &Path, git_remote: Option<&str>, hints: &mut Vec<HostingHint>) {
     let mut signals = Vec::new();
 
-    if crate::git::find_ancestor_path(output_dir, "netlify.toml").is_some() {
+    if crate::git::find_ancestor_path(output_dir, "netlify.toml")
+        .is_some_and(|path| crate::is_real_file(&path))
+    {
         signals.push("netlify.toml found".to_string());
     }
 
@@ -329,6 +335,24 @@ mod tests {
         assert!(nl.is_some(), "netlify.toml should trigger netlify hint");
         let nl = nl.unwrap();
         assert!(nl.signals.iter().any(|s| s.contains("netlify.toml")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_netlify_toml_is_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("netlify.toml");
+        std::fs::write(&real, "[build]").unwrap();
+        symlink(&real, dir.path().join("netlify.toml")).unwrap();
+
+        let hints = detect_hosting_hints(dir.path());
+        assert!(
+            hints.iter().all(|hint| hint.id != "netlify"),
+            "symlinked netlify.toml should not trigger netlify hint"
+        );
     }
 
     #[cfg(unix)]

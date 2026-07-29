@@ -927,15 +927,15 @@ A key is only counted as "removed" if its value is non-empty (not `None`, `""`, 
 
 Three presets, selected by name (case-insensitive, default `"standard"`):
 
-| Preset | `redact_body` | `body_placeholder` | `drop_attachments` | `scrub_secrets` | `clear_ack_state` | `clear_recipients` | `clear_file_reservations` | `clear_agent_links` |
-|--------|:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **standard** | false | null | false | true | true | true | true | true |
-| **strict** | true | `"[Message body redacted]"` | true | true | true | true | true | true |
-| **archive** | false | null | false | false | false | false | false | false |
+| Preset | `redact_body` | `body_placeholder` | `drop_attachments` | `scrub_secrets` | `redact_project_paths` | `clear_ack_state` | `clear_recipients` | `clear_file_reservations` | `clear_agent_links` |
+|--------|:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **standard** | false | null | false | true | true | true | true | true | true |
+| **strict** | true | `"[Message body redacted]"` | true | true | true | true | true | true | true |
+| **archive** | false | null | false | false | false | false | false | false | false |
 
 **Preset descriptions:**
-- **standard**: Default redaction. Clear ack/read state, scrub common secrets (API keys, tokens); retain agent names, message bodies and attachments.
-- **strict**: High-scrub. Replace message bodies with placeholders and omit all attachments from the snapshot.
+- **standard**: Default redaction. Clear ack/read state, scrub common secrets (API keys, tokens), redact local project paths; retain agent names, message bodies and attachments.
+- **strict**: High-scrub. Replace message bodies with placeholders, omit all attachments from the snapshot, remove recipient metadata, and redact local project paths.
 - **archive**: Lossless snapshot for disaster recovery. Preserve everything while still running the standard cleanup pipeline.
 
 ### Step 1: `create_sqlite_snapshot(source, destination, checkpoint=true)`
@@ -992,9 +992,11 @@ bodies_redacted, attachments_cleared
 2. Count agents: `SELECT COUNT(*) FROM agents` → `agents_total`. Set `agents_pseudonymized = 0`.
 3. If `clear_ack_state`: `UPDATE messages SET ack_required = 0` → count = `ack_flags_cleared`.
 4. If `clear_recipients`: `UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL` → count = `recipients_cleared`.
+   If `drop_recipient_metadata`: delete `message_recipients`, reset `messages.recipients_json` to empty `to`/`cc`/`bcc` arrays, and clear `inbox_stats`.
 5. If `clear_file_reservations`: `DELETE FROM file_reservations` → count = `file_reservations_removed`.
 6. If `clear_agent_links`: `DELETE FROM agent_links` → count = `agent_links_removed`.
-7. Iterate all messages (`SELECT id, subject, body_md, attachments FROM messages`):
+7. If `redact_project_paths`: replace each `projects.human_key` with `[project path redacted: <slug>]`. Manifest `project_scope.included[].human_key` uses the same public label, and path-like requested identifiers are replaced with `[project identifier redacted]`.
+8. Iterate all messages (`SELECT id, subject, body_md, attachments FROM messages`):
    a. If `scrub_secrets`: apply secret regex patterns to `subject` and `body_md`, replacing matches with `[REDACTED]`.
    b. Parse `attachments` JSON (handle string or list; malformed → empty list).
    c. If `drop_attachments` and attachments non-empty: clear to `[]`, increment `attachments_cleared`.
@@ -1004,7 +1006,9 @@ bodies_redacted, attachments_cleared
       - Lists: recurse into each item.
    e. If `redact_body`: replace `body_md` with `body_placeholder` (default `"[Message body redacted]"`), increment `bodies_redacted`.
    f. Write back changed fields via UPDATE.
-8. Commit. Set `pseudonym_salt = preset_key`. Return ScrubSummary.
+9. Commit. Set `pseudonym_salt = preset_key`. Return ScrubSummary.
+
+Privacy regression fixtures should include message subjects and bodies, attachment metadata, bearer/API-token-looking strings, absolute local paths, recipients, contact links, reservations, and product/project links. Assertions must prove raw private strings are absent while public proof metadata remains, such as project slugs, scrub summaries, schema versions, product UIDs, and product-project link rows.
 
 ### Step 4: `build_search_indexes(snapshot_path) -> bool`
 

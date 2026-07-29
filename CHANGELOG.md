@@ -10,6 +10,449 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+---
+
+## [v0.3.23](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.23) — 2026-07-24 **[Release]**
+
+Reliability release. v0.3.22 aborted the daemon on Linux at production scale
+and made every DB read time out on macOS; both are fixed here. Upgrading is
+strongly recommended for anyone on v0.3.22.
+
+### Fixed
+
+- **Worker threads no longer run on Rust's 2 MiB default stack ([#202](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/202)).**
+  A stack overflow is not recoverable in Rust — the runtime aborts the process,
+  it cannot be caught, and every other thread's in-flight work dies with it.
+  `am-archive-read` ran the full archive reconstruction/salvage path on 2 MiB and
+  aborted the daemon on a production-scale mailbox (~2.6k agents / ~18.3k
+  messages), while the same code was fine driven from the main thread's 8 MiB
+  rlimit stack.
+
+  `am-archive-read` was not the only exposure: the operator dashboard's refresh
+  worker reaches the same path via `ObservabilitySyncDb::archive_snapshot` on a
+  1200 ms loop, so fixing only the reported thread would have left the daemon
+  abortable. Sizing is now uniform rather than rationed to threads that look
+  deep — a new `mcp_agent_mail_core::worker_stack` module holds one policy and
+  all 30 `thread::Builder` chains carry an explicit stack size. Thread stacks are
+  reserved address space committed lazily per page, so an untouched 32 MiB stack
+  costs ~0 resident memory.
+
+  Tunable via `MCP_AGENT_MAIL_WORKER_STACK_MB` (clamped 8..512; the legacy
+  `MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB` is still honored). `RUST_MIN_STACK` is
+  folded in explicitly, since `Builder::stack_size` would otherwise override it
+  and silently lower operators who had already raised it as a workaround.
+
+- **Archive-read snapshots no longer self-invalidate on macOS ([#203](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/203)).**
+  `run_build` required both the exact (content) and cheap (metadata) generations
+  to agree across its snapshot-decision probes — but the probes themselves open
+  the live database, and a FrankenSQLite open bumps the file's mtime on
+  macOS/APFS without changing a byte. The gate could never converge: every build
+  returned `Busy`, `acquire_if_needed` re-claimed in a tight loop, and every
+  DB-read tool call burned the full 30 s dispatch budget.
+
+  Publication now gates on exact-generation stability alone. This does not weaken
+  the [#198](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/198)
+  contract: writes are bracketed by `WriteGuard`, which advances both
+  `WRITER_EPOCH` and the slot invalidation epoch on entry *and* exit, and
+  publication is fenced on those epochs — so a write that landed and reverted
+  inside the probe window is still caught.
+
+- **`reply_message` no longer reports live messages as missing ([#204](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/204)).**
+  It was the only message surface gating on raw project-row equality, so a
+  mailbox carrying forked identity rows resolved a message everywhere except
+  there. Project identity is now compared via `resolve_project_path` —
+  filesystem canonicalization, which collapses exactly the
+  [#194](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/194)
+  aliases and nothing else. Notably *not* slug comparison: `slugify` collapses
+  every non-alphanumeric run to one dash, so `/srv/app-one` and `/srv/app_one`
+  share a slug, and using it would have admitted replies across distinct
+  projects.
+
+  The rejection now states that the id exists but is out of scope, without
+  naming the owning project — message ids are globally sequential, so echoing
+  the owner's key would let any agent enumerate ids to map projects it cannot
+  access.
+
+### Changed
+
+- ftui 0.5 `TerminalCapabilities`: true-colour detection moved onto the
+  `ColorDepth` enum.
+- Dependency refresh across ~184 packages; asupersync 0.3.9.
+- `docs/OPERATOR_RUNBOOK.md` gains a **Worker Thread Stacks** section covering
+  the sizing policy, the tunables, and the `RUST_MIN_STACK` interaction.
+
+### Known issues
+
+- The 120 s archive-read `BUILD_TIMEOUT` still exceeds the 30 s dispatch
+  timeout, so a build legitimately taking 31–120 s will still time the caller
+  out and invite a retry (noted in
+  [#203](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/203)).
+- FrankenSQLite remains on the published 0.1.18 rather than the newer sibling
+  checkout: `main` there is mid-async-refactor and does not compile.
+
+---
+
+## [v0.3.22](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.22) — 2026-07-22 **[Release]**
+
+### Recovery correctness and portable archives
+
+- Archive reconstruction now preserves project identities, agent recovery
+  fields, registration credentials, recipients, and migration continuity
+  across repeated recovery generations. Recovery candidates are validated with
+  canonical SQLite before promotion, and an unreadable prior generation plus
+  its sidecars is preserved under a receipted quarantine instead of being
+  mistaken for a disposable staging file (#186, #187, #191).
+- Export snapshot destinations are written and their FTS5 indexes finalized
+  with canonical SQLite on the disposable side of the pipeline. This prevents
+  FrankenSQLite's persistent pathname namespace from following a renamed
+  staging database, produces stock-SQLite-clean FTS5 artifacts, preserves
+  `reaper_exempt` and `registration_token` for full-fidelity archives, and
+  removes registration credentials from sharing presets.
+- Clean committed archive inventories are cached by Git generation, eliminating
+  repeated full-tree scans on archive-aware tool and resource reads while dirty
+  generations continue to bypass the cache (#192).
+
+### Runtime, identity, and operator safety
+
+- Non-MCP HTTP paths now run through a bounded blocking-dispatch pool, so a
+  `/mail` or 404 request cannot wedge the shared MCP listener. Startup WAL/SHM
+  forensic snapshots also have bounded retention (#184, #185).
+- Doctor adopts the live daemon's mailbox identity, diagnoses archive/DB parity
+  against the database actually being served, and detects live macOS file and
+  listener owners before authorizing mutation (#193, #195).
+- Filesystem case aliases collapse to one project identity on case-insensitive
+  filesystems, preventing split agents, orphaned reservations, and permanent
+  archive parity drift (#194).
+- ATC refreshes stream bounded population summaries instead of retaining an
+  ever-growing anonymous heap in a long-running daemon (#190).
+- A bounded, read-only `check_file_reservation_conflicts` tool now provides an
+  authoritative pre-edit conflict check with exact/glob/ancestor semantics,
+  fail-closed malformed-pattern handling, and no registration or cleanup side
+  effects. The implementation was independently mined from PR #196.
+
+### Installer and updater reliability
+
+- The installer supports stock macOS Bash 3.2 under `set -u`, persists a
+  complete installer copy for later managed uninstall after `curl | bash`, and
+  leaves any existing saved copy untouched if that persistence fetch fails
+  (#189).
+- `am update` recognizes and safely unwraps the nested release archives emitted
+  by older manual release tooling while retaining checksum and path-safety
+  validation (#188).
+
+### Migration robustness and build
+
+- A statistics-only `ANALYZE` migration whose target table is absent no longer
+  aborts `migrate_to_latest`. Previously, a database whose `atc_experiences`
+  table was missing (e.g. after a corrupt-page loss while the create/alter
+  migrations were already recorded applied) made `v16_analyze_atc_experiences`
+  hard-fail with "no such table", which wedged the whole server into DB-degraded
+  mode where every MCP write returned a generic "database error". The migration
+  runner now treats a missing-table `ANALYZE` as vacuously satisfied — it records
+  the migration and continues — since query-planner statistics change no schema
+  and no data (GH#185).
+- Build fix: `ConsoleCaps::from_capabilities` was updated for the current
+  `frankentui` API, whose `TerminalCapabilities` replaced the boolean
+  `true_color` field with a `color_depth: ColorDepth` enum.
+
+---
+
+## [v0.3.21](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.21) — 2026-07-10 **[Release]**
+
+### Fixed: the TUI no longer degrades into a mostly blank screen
+
+- The app-level Bayesian diff advisory no longer translates `Deferred` into an
+  `EssentialOnly` frame. That path did not defer terminal output; it erased most
+  of the model before FrankenTUI's real diff writer saw it.
+- The advisory frame budget now matches the TUI's 100 ms fast cadence instead of
+  retaining a stale 16.6 ms/60 fps threshold that classified healthy frames as
+  late.
+- The runtime load governor is pinned to full-fidelity rendering and the
+  conformal degradation gate is disabled for this operator console, so load
+  shedding cannot remove visible content.
+- The full traversal E2E now reconstructs the terminal with `pyte` and measures
+  visible cells. Pressure, resize, flash, and a 180-second/360-step soak therefore
+  fail on an actually blank screen rather than relying on emitted ANSI byte
+  counts. The release candidate recorded zero empty frames and zero low-visibility
+  soak samples.
+- FrankenTUI's native-only runtime now routes recoverable panic boundaries
+  through its backend-neutral cleanup API, fixing production builds that do not
+  enable the legacy crossterm backend. An isolated native-only CI feature gate
+  prevents workspace feature unification from masking this again.
+
+### Runtime, guard, and security hardening
+
+- Added configurable predictive TUI tick scheduling while retaining the full
+  rendering invariant above.
+- Migrated the workspace to Asupersync 0.3.7.
+- The pre-commit guard no longer depends on Python's private
+  `fnmatch.translate` output shape and fails closed on invalid glob compilation,
+  including Python 3.14 environments.
+- Registration-proof nonces are stored durably in the database, so replay
+  protection survives process restarts.
+
+---
+
+## [v0.3.14](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.14) — 2026-06-20 **[Release]**
+
+### Fixed: real on-disk `storage.sqlite3` corruption under multi-agent swarm load (#152, #156)
+
+The published v0.3.13 binary vendored a FrankenSQLite that predated two real
+engine fixes, so a busy `serve-http` host coordinating a multi-pane swarm could
+corrupt `storage.sqlite3` on disk (`2nd reference to page N` / `database disk
+image is malformed`), tripping archive reconstruction and the durability latch
+(agents experienced this as "agent mail crashed"). This release rebuilds against
+the fixed FrankenSQLite:
+
+- **frankensqlite #115** (`d1caefb5`) — concurrent-mode double-allocate of the
+  same page → `2nd reference to page`.
+- **frankensqlite #118** (`f28088b6`) — in-transaction `integrity_check` false
+  positive that drove the downstream reconstruct loop.
+- **FK/trigger INSERT placeholder canonicalization** (`ce846249`) — the
+  `expected canonicalized numbered placeholder` error on reused pooled
+  connections (surfaced as `request_contact` failures).
+
+The git-backed archive runs ahead of the SQLite index throughout, so existing
+data was always recoverable via `am doctor repair`; this release stops the
+corruption at its source.
+
+### `list_agents` bounded + reservation retention; reconcile defers under lock contention (#154, #151)
+
+- **`list_agents` is now bounded** (default/clamped limit + optional
+  `active_within_days` floor) and the slow active-reservation query was rewritten
+  to a non-correlated anti-join — reservation queries no longer hit the 30s
+  dispatch timeout (#154).
+- **`file_reservations` retention sweep** hard-prunes released/expired rows past a
+  configurable horizon (`FILE_RESERVATIONS_RETENTION_DAYS`, default 30); the git
+  archive retains the full audit trail (#154).
+- **Integrity reconcile defers under lock/busy contention** instead of escalating
+  to a spurious archive reconstruction — stopping the reconstruct storm on a busy
+  multi-writer mailbox (#151).
+
+### Fixed: 32-byte WAL false positive (doctor FAIL + startup re-quarantine + reconstruct cascade)
+
+Two real multi-agent-host incidents (ts1 + css, 2026-06-17) traced to the same
+root cause: a healthy live `serve-http` leaves an **idle 32-byte WAL** (exactly
+the SQLite WAL header, zero frames) between writes, and the size-only check
+treated any `1..=32` byte WAL as "header-only/truncated".
+
+- `am doctor health`/`check` **FALSE-FAILED** ("live mailbox needs repair: SQLite
+  WAL sidecar is header-only/truncated (32 bytes)") on a database the live server
+  opens and serves fine.
+- The startup self-heal **re-quarantined the valid WAL on every restart**, and on
+  one host the quarantine + a failed probe **cascaded into a full
+  reconstruct-from-archive**; repeated recovery events left ~19 GB of `doctor/`
+  diagnostic dumps.
+
+**Root cause:** a complete 32-byte WAL header with a *valid magic* is a frameless
+idle WAL the current engine opens **and checkpoints** without error (now pinned by
+`engine_opens_and_checkpoints_a_32_byte_header_only_wal`). The historical
+GH#99/#119 workaround that quarantined 32-byte WALs was guarding a *garbage*
+(all-zeros, **invalid-magic**) 32-byte WAL — the size check conflated the two.
+
+**Fix:** magic-aware classification. New
+`wal_classify::wal_sidecar_is_truncation_artifact(path)` treats `0`-byte and
+valid-magic-32-byte WALs as benign, and only `1..=31`-byte or invalid-magic
+32-byte WALs as removable artifacts. All six WAL quarantine/refusal sites (the
+pool startup self-heal, the five CLI startup/doctor sites including the
+"needs repair" health gate, and the `wal_shm_sidecar_drift` detector) plus
+`classify_wal_sidecar` now route through it. GH#99 is preserved — an invalid-magic
+32-byte WAL is still quarantined.
+
+### `am tui-dump` — non-interactive freeze escape hatch (br-bvq1x.9.6, I6)
+
+- **New `am tui-dump` command (also `am robot tui-dump`).** When the interactive
+  TUI looks frozen, agents previously had no safe read-out — and killing the
+  process is forbidden. `am tui-dump --format json` returns the *same*
+  situational snapshot the TUI renders: it fetches the live `/mail/ws-state`
+  payload (with `system_health=1`, so the per-loop heartbeat liveness verdict is
+  included and names the stalled loop) and falls back to a local SQLite
+  situational read when the whole process is wedged or unreachable. It is
+  read-only, classified so it **bypasses the mailbox-ownership refusal** (it must
+  work precisely when a live server owns the mailbox), and **always exits 0** so
+  an agent can always read state instead of resorting to a kill.
+- **Heartbeat surfaces now point at the read-out first.** The I1/I2 TUI
+  loop-liveness report (`am robot health`) carries a new `readout_command`
+  field and, on a suspected freeze, directs agents to run `am tui-dump` *before*
+  the headless restart (`mcp-agent-mail serve --no-tui`).
+
+---
+
+## [v0.3.13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.13) — 2026-06-15 **[Release]**
+
+Reliability batch focused on a real multi-agent-host incident: the ATC experience
+ledger growing unbounded and wedging startup, plus TUI/service coexistence. All
+changes are in the trusted-local, single-user model.
+
+### ATC experience ledger can no longer bloat the DB or wedge startup
+
+- **Hard-cap rotation for `atc_experiences` (br-78c6m).** A host accumulated a
+  2.41 GB `atc_experiences` table (629K open/unresolved rows in 6 days) that
+  pegged startup (full-ledger replay) so the server never bound its port. Root
+  cause: the row-ceiling sweep only evicted *terminal* (resolved/censored/
+  expired) rows, so an open/unresolved backlog was never bounded. The ceiling is
+  now a true hard cap — it evicts terminal rows first (rollups preserved), then
+  **force-rotates the oldest rows regardless of state** when an open backlog
+  still exceeds the cap. The default ceiling drops 250 000 → **50 000** and the
+  sweep cadence 1 h → **15 min**.
+
+### TUI ↔ managed-service coexistence
+
+- **Bare `am` coexists with the systemd/launchd service (br-2y10g).** Previously,
+  launching the interactive TUI while a managed service was serving the same
+  storage root dead-ended ("connect to it") because the restart-coordination lock
+  made the take-over path unreachable. Bare `am` now stops the *managed* service
+  for the interactive session and **restarts it on exit** (every exit path),
+  giving true coexistence — the service is the always-on headless backend and the
+  TUI is the occasional cockpit. (Stopping/restarting a managed service is
+  reversible, unlike killing a foreground peer.)
+
+### Startup, recovery & integrity reliability (`br-bvq1x`, `br-5mnkl`)
+
+- **Bind the HTTP listener before unbounded DB recovery (`br-5mnkl`).** A
+  degraded/oversized DB no longer blocks the listener bind; `/healthz` stays live
+  within the bind deadline while the DB recovers in the background and `/health`
+  reports `warming_up`/`unavailable` honestly.
+- **Single-owner restart-coordination lock for `am serve-http` (D5).** Racing
+  (re)starts for one storage root no longer kill each other's freshly-bound
+  servers.
+- **Commit coalescer self-heals a broken archive HEAD** instead of wedging
+  forever; **doctor** detects a HEAD pointing at a missing/corrupt object.
+- **Hard row ceiling groundwork for `atc_experiences` (br-bvq1x.11.6)** and
+  **last-known-healthy verified snapshot + snapshot-preferred recovery (K2)**.
+- **Canonical full-check fallback** stops the integrity guard false-flagging
+  `COLLATE NOCASE` indexes.
+- **Reconstruct preserves canonical message IDs** (verified + locked with a
+  golden test, G5).
+
+---
+
+## [v0.3.12](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.12) — 2026-06-14 **[Release]**
+
+Reliability-program (`br-bvq1x`) batch plus security-review hardening from [#149](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/149). All changes are in the trusted-local, single-user model; no behavior changes for the default loopback deployment.
+
+### Security review hardening ([#149](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/149))
+
+A thorough static security review (clean `cargo audit`; `#![forbid(unsafe_code)]` and fully-parameterized SQL confirmed) flagged a small set of self-contained, local-relevant hardening items. The prioritized ones are addressed:
+
+- **CSRF guard on the web UI (review #1).** Mutating `/mail/` POST routes (overseer-send, mark-read, …) now reject any request lacking `Content-Type: application/json` or carrying a cross-site `Origin`/`Referer`. The trust check uses an *exact* CORS-allowlist match (`cors_explicitly_allows`), not the permissive `cors_allows`, so the guard holds even under the dev-default empty origin list. The web UI always sends `application/json` + a same-origin `Origin`, so only forged cross-site requests are blocked; non-browser API clients (no `Origin`) pass.
+- **Baseline security response headers (review #10).** Every response — including auth-bypassed health routes and 401s — now carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` (so a browser `?token=` query string cannot leak via the `Referer` header to CDN scripts), and `X-Frame-Options: DENY`. A strict CSP is intentionally left to a reverse proxy, since the web UI loads CDN scripts.
+- **Non-loopback no-auth warning (review #2).** The server now logs a loud warning at startup when bound to a non-loopback host with no bearer token or JWT configured.
+- **`SECURITY.md` + Private Vulnerability Reporting.** Added a security policy documenting the trusted-local threat model, the confidential reporting channel (GitHub PVR, now enabled), the security posture, and the hardening knobs (`HTTP_BEARER_TOKEN`, `APP_ENVIRONMENT=production`, rate limiting, reverse proxy) for deployments exposed beyond loopback.
+
+The review's architectural items (self-asserted identity, client-chosen project keys, default-off auth/rate-limiting, permissive dev CORS) are by-design for the documented trusted-local model and are now explicitly documented as pre-exposure hardening steps rather than changed.
+
+### Reliability program (`br-bvq1x`)
+
+- **Corruption-specific circuit breaker (K3).** The DB layer distinguishes genuine corruption signatures from host-pressure-induced failures so the breaker no longer trips on transient overload.
+- **Loss-honest salvage/recover reporting (K1).** `am doctor` reconstruct/salvage paths report what was and was not recovered instead of implying a clean rebuild.
+- **Periodic SQLite maintenance (K4).** The off-hot-path integrity-guard worker now also runs passive WAL checkpoint + `ANALYZE` + `VACUUM` on independent cadences with a `journal_size_limit`, gated by `DB_MAINTENANCE_ENABLED` and per-op interval env vars.
+- **Pool/FD backpressure metrics (K5).** `am robot metrics` gains a `resources` section surfacing configured pool limits, live pool/FD gauges, and repo-cache size, with actionable backpressure alerts.
+- **Supervised-owner guard + `am doctor drain` (D4).** `am doctor repair`/`reconstruct` refuse (exit 3) when a live mailbox owner is present; `am doctor drain` reports `safe_to_mutate`. Startup self-heal passes `--allow-live-owner` internally, so boot behavior is unchanged.
+- **Host-pressure section in `am robot health` (J1).** Surfaces disk/inode/load/memory pressure so "Database corruption detected" under load can be correctly attributed to host overload rather than mailbox corruption.
+- **`health_check` decomposed into independent verdicts (C1)** plus **write-path + MCP-decode selftests (C2/C3).**
+
+---
+
+## [v0.3.2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.2) — 2026-05-21 **[Release]**
+
+**Fixes the `--no-auth` write regression that broke ntm-spawned sessions** ([#131](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/131)).
+
+`am serve-http --no-auth` is documented as "Disable bearer token authentication for this run (for local development)" — the v0.2.x contract being no auth required for *any* operation, reads and writes alike. v0.3.0/v0.3.1 regressed this: every mutating MCP tool call (`ensure_project`, `register_agent`, `send_message`, …) returned HTTP 403 Forbidden while read tools returned 200, breaking every ntm-spawned session that hardcodes `am serve-http --no-tui --no-auth` (including ntm's own startup `ensure_project`).
+
+- **Root cause**: `--no-auth` cleared only the bearer token, which disables the bearer/JWT gate but not the RBAC layer (`http_rbac_enabled` defaults true, default role `reader` is read-only). A change between v0.2.51 and v0.3.0 incidentally flipped the `http_allow_localhost_unauthenticated` default from `true` to `false`, so localhost requests stopped being classified `is_local_ok` and RBAC began 403-ing every write tool.
+- **Fix**: `--no-auth` now also enables `http_allow_localhost_unauthenticated` for that run, restoring the documented v0.2.x semantics. The global default stays `false`, so authenticated `serve-http` runs are unaffected, and `allow_local_unauthenticated` still requires an actual local peer address and rejects forwarded headers — remote callers remain unauthenticated-denied even under `--no-auth`.
+
+---
+
+## [v0.3.1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.1) — 2026-05-20 **[Release]**
+
+**Windows is now a fully-built platform** (`x86_64-pc-windows-msvc`), restoring 5-platform coverage. v0.3.0 shipped 4 platforms because the TUI and the `am doctor` subsystem didn't compile for Windows; this release ports both:
+
+- **TUI**: `mcp-agent-mail-server` now selects frankentui's crossterm-compat backend (`Program::with_config`) on non-Unix targets, since the native `ftui-tty` backend is `#[cfg(unix)]`. `ftui-tty`/`nix`/`native-backend` are gated to `[target.'cfg(unix)']`; `crossterm-compat` is used on Windows.
+- **`am doctor`**: new `doctor::platform` module centralizes the cross-platform mutation/backup primitives. The Unix paths are byte-identical; the Windows equivalents preserve the doctor's hardened guarantees — reparse-point refusal (the `O_NOFOLLOW` symlink-swap defense), fd-based permission setting, deterministic UTF-16 path hashing, and NTFS symlinks. All 45 Unix-only doctor sites now route through it or are cfg-gated.
+- **PID liveness on Windows** uses a conservative "assume alive unless positively dead" fallback (no `unsafe`/FFI, honoring the workspace `#![forbid(unsafe_code)]`), so the doctor never reclaims a lock from a process it cannot confirm dead.
+
+No Unix behavior changes. Same code, now cross-platform.
+
+---
+
+## [v0.3.0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.0) — 2026-05-20 **[Release]**
+
+First minor-version release. Consolidates all development since v0.2.46 (the prior CHANGELOG-versioned release) and supersedes the unpublished in-tree 0.2.47–0.2.54 version bumps. Headline changes:
+
+- **`am doctor` world-class self-healing surface** matured through the pass-35 series: dozens of new failure-mode (FM) detectors graduated from detect-only to reversible, hash-witnessed mutations (`Op::WriteFile` / `Op::Chmod` / `Op::Rename`) routed through the single `mutate()` chokepoint — covering archive-state, db-state, mcp-config, guard-install, secrets/env, identity/contacts, and runtime-process failure modes. See the per-FM dispatcher detail below.
+- **Search V3 refactor + v24 migration** dropping the recipient-cascade trigger, with search-dialect rollout and `git_binary` hardening.
+- **Write-behind-queue durability hardening**: storage refuses new writes after the WBQ exhausts its retries, recoverable via `am doctor repair`; the messages id allocator now advances past the archive at startup and post-reconstruct.
+- **Installer hardening** against PEP 420 namespace spoofing in Python detection.
+
+### `am doctor` — per-FM dispatcher surface (passes 14-32)
+
+The world-class doctor surface (added in commit `641990d8`, hardened in passes 1-13) gained a registry-backed per-FM dispatcher across passes 14-32. Every entry below is reachable from the CLI via `am doctor ...` or the library API in `crates/mcp-agent-mail-cli/src/doctor/`.
+
+**New verbs** (handbook count: 8 → 15)
+
+- `am doctor fixers [--format json|table]` — enumerate the FM registry (pass-14). JSON envelope schema `1.0`; table renderer for TTY.
+- `am doctor fix --only <fm-id>` — invoke a single registered FM through `mutate()` with full chokepoint guarantees (pass-15). Replaces the legacy multi-detector flow for targeted recovery.
+- `am doctor fix --only <fm-id> --list` — detect a single FM, no chokepoint exercised (pass-16). ~10× cheaper than `--dry-run`.
+- `am doctor fix --list` (without `--only`) — detect every registered FM in one round-trip (pass-24). Emits a `{ mode: "list_all", per_fm: [...], skipped: [...] }` envelope; `skipped[]` carries FMs missing required inputs with the missing-field name.
+- `am doctor explain <id>` registry fallback (pass-23) — when no recent run includes the id, falls back to `fixers::registry()` and emits the static `FixerSpec` under `mode: "registry"`. Agents can `explain` any registered FM cold without first running `--fix`.
+
+**FM registry** (9 entries as of pass-28)
+
+| FM id | Severity | Op | Subsystem |
+|-------|----------|----|-----------|
+| `fm-archive-state-files-missing-doctor-gitignore-entry` | P2 | `Op::AppendFile` | archive_state_files |
+| `fm-archive-state-files-stale-archive-lock-from-dead-pid` | P1 | `Op::Rename` | archive_state_files |
+| `fm-archive-state-files-stale-head-or-ref-update-lock` | P2 | `Op::Rename` | archive_state_files |
+| `fm-db-state-files-world-readable-storage-db` | P0 | `Op::Chmod` | db_state_files |
+| `fm-doctor-state-files-dangling-latest-symlink` | P2 | `Op::SymlinkAtomic` | doctor_state_files |
+| `fm-environment_toolchain-known-bad-git-no-override` | P0 | detect-only | environment_toolchain |
+| `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
+| `fm-runtime-processes-stale-listener-pid-hint` | P1 | `Op::Rename` | runtime_processes |
+| `fm-secrets_env_state-bak-tokens-readable` | P1 | `Op::Chmod` | secrets_env_state |
+
+Op coverage at FM level: 6 of 7 canonical Ops (Rename×3, Chmod×2, WriteFile×1, AppendFile×1, SymlinkAtomic×1, detect-only×1). `Op::DbExec`/`Op::DbMigrate` remain stubbed in the chokepoint pending `DbConn` plumbing.
+
+**Capabilities envelope** (`am doctor capabilities --json`)
+
+- Pass-17 added `fm_fixers: Vec<FixerSpec>` and `fm_fixer_count: usize` so agents discovering the contract see the per-FM registry without a second call to `am doctor fixers`. The pre-existing `fixers[]` field continues to enumerate the legacy multi-detector flow.
+
+**Drift-class closures** (three distinct duplicated-source-of-truth bugs fixed)
+
+- Pass-18: `world_readable_token_bak::BACKUP_SUFFIX_HINTS` promoted to `pub`. Handler's candidate-discovery list now references the module's canonical const directly — broadening the detector's accept-set automatically broadens the handler's enumeration.
+- Pass-19: `DispatchInputs.stale_seconds: u64` → `stale_seconds_override: Option<u64>`. Each stale-* FM now uses its own canonical `DEFAULT_STALE_SECONDS` (300/120/600s) instead of all inheriting archive-lock's 300s. Metamorphic drift test plants a 200s-old HEAD.lock and asserts ref-lock's 120s default flags it (pre-pass-19 the unified 300s would have missed).
+- Pass-20: `known_bad_git_no_override` now consults `mcp_agent_mail_core::git_binary::match_known_bad` instead of a hardcoded `["2.51.0"]` list. Operators extending `AM_EXTRA_KNOWN_BAD_GIT_JSON` automatically get the new entries flagged by `--only`; `KnownBadEntry.code` (e.g. `GIT_2_51_0_INDEX_RACE`) surfaces in finding evidence.
+
+**Chokepoint sovereignty** (pass-21, pass-22)
+
+- Pass-21 lifted `runs::ensure_gitignore_entry` into a proper FM-level fixer (`missing_gitignore_entry`) routed through `Op::AppendFile`, so the operation is verbatim-backed-up, hash-witnessed in `actions.jsonl`, and reversible via `am doctor undo`.
+- Pass-22 removed the side-effect call to `runs::ensure_gitignore_entry` from `handle_fix_only`. Unrelated `--only` invocations no longer silently mutate `.gitignore` (the regression test `dispatch_only_unrelated_fm_does_not_touch_gitignore` pins this).
+
+**Test infrastructure**
+
+- Pass-26: `dispatch_only_handles_every_registered_id` + `detect_only_handles_every_registered_id` iterate `fixers::registry()` and pin the invariant that every registered FM has matching dispatcher arms. Catches future "added to registry but not dispatched" regressions.
+- Pass-27: `doctor_handbook_contract.rs` (4 tests) pins the handbook's verb count, required topics (`mutate()`, `actions.jsonl`, `.doctor/runs/`, etc.), and per-FM workflow recipe.
+- Pass-29: `doctor_cli_smoke.rs` (5 tests) invokes the `am` binary via `std::process::Command` and verifies the JSON envelopes agents actually see (`fixers --format json`, `fix --list --json`, `explain` registry fallback, exit-code 64 for unknown ids, `fixers --format table` human readability).
+- Pass-31 + pass-32: `doctor_fm_round_trip.rs` (5 tests) asserts the full `plant → fix → undo → byte-identical` lifecycle for each distinct auto-fixable Op pattern (Rename, Chmod, AppendFile, WriteFile, SymlinkAtomic) at the FM-dispatch boundary.
+
+Test totals across the doctor surface (per-package, hermetic):
+
+| Suite | Tests |
+|-------|-------|
+| `doctor_fix_only_integration` | 16 |
+| `doctor_capabilities_contract` | 9 |
+| `doctor_cli_smoke` | 5-8 |
+| `doctor_fm_round_trip` | 5 |
+| `doctor_handbook_contract` | 4 |
+| `doctor_explain_fallback` | 3 |
+| `doctor_selftest_integration` | 1 |
+| Module tests across `fixers/*` | 60+ |
+
+**AGENTS.md refresh** (pass-30)
+
+`AGENTS.md`'s `am doctor` section grew from an 8-verb table to a 15-verb table, plus a new per-FM registry table (all 9 entries) and a new per-FM workflow recipe walking through enumerate → list-all → list-one → dry-run → fix → undo.
+
 ### Bug fixes
 
 - **`am doctor` reports listener CPU samples for verified Agent Mail servers
@@ -47,6 +490,15 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   to the requested version, with a v-prefix-stripping helper to avoid
   `vv0.2.50` foot-guns. Two regression tests pin the prefix-stripping
   behavior.
+
+### Performance
+
+- **Archive perf 3 completion-debt now has a baseline/delta artifact pipeline**
+  (`br-8qdh0.3`, follow-up to `br-8qdh0.6`). Added the `br-q8yaa`
+  capture-and-delta scripts plus a lightweight e2e contract so future archive
+  write fixes can publish `baseline_pre_fix_*`, `baseline_post_fix_*`, and
+  `fix_delta.json` artifacts covering batch-1, batch-10, batch-100,
+  batch-1000, single-attachment, and 30-agent-stress points.
 
 ---
 

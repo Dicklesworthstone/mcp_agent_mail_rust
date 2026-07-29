@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -785,8 +785,15 @@ impl Bundle {
 fn compute_sha256(path: &Path) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut buffer = [0u8; 65_536];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Classifies an artifact file by path.

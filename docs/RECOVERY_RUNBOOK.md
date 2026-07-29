@@ -20,6 +20,50 @@
 
 ---
 
+## Reconstruct/Promotion Refusal Loop (GH#208)
+
+**Symptoms**: `serve-http` restarts forever under a supervisor; every
+iteration logs `Startup detected mailbox database issues; reconstructing
+from archive`, followed by `reconstruction succeeded but final database
+promotion failed: recovery candidate ... would lose stable coordination
+keys ... refusing promotion`, exit 1.
+
+**Cause (fixed after v0.3.24)**: the promotion guard compared
+full-payload fingerprints, so state the archive legitimately cannot
+reproduce — registration tokens, per-recipient read/ack timestamps,
+contact/reservation lifecycle fields, normalized message serialization —
+counted as "loss" even when every coordination identity survived. One
+drifted message additionally cascaded into all of its recipient rows.
+Since the reconstruct trigger wanted `db ⊇ archive` while the guard
+wanted `candidate ⊇ db` per payload byte, a mailbox drifted in both
+directions could satisfy neither and the loop never terminated.
+
+**Current behavior**: the guard refuses only on *identity* loss
+(project slug + agent name; message stable key of
+project/sender/thread/subject/created_ts; recipient identity chained to
+the parent's identity digest; reservation lease key; contact
+endpoints). Volatile payload drift is reported as informational counts
+in the refusal text and the recovery receipt (`identity_*` fields), and
+a candidate that is an identity superset promotes. Index-only
+corruption (`wrong # of entries in index ...` from `integrity_check`)
+is additionally repaired in place with `REINDEX` before any
+reconstruction is attempted — including when `quick_check` alone looks
+clean.
+
+**On affected older versions (v0.3.22–v0.3.24)**:
+
+```bash
+systemctl --user stop agent-mail        # or your supervisor's stop
+sqlite3 storage.sqlite3 "REINDEX;"      # heals index-only corruption losslessly
+sqlite3 storage.sqlite3 "PRAGMA integrity_check;"   # expect: ok
+systemctl --user start agent-mail
+```
+
+If the loop persists because live and archive genuinely diverged,
+upgrade to a fixed build rather than hand-merging the candidate.
+
+---
+
 ## Git 2.51.0 Index Race
 
 **Symptoms** (any of):

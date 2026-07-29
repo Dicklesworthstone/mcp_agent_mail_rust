@@ -10,12 +10,11 @@
 
 use crate::error::DbError;
 use crate::models::{
-    AgentLinkRow, AgentRow, FileReservationRow, InboxStatsRow, MessageRecipientRow, MessageRow,
-    ProductRow, ProjectRow,
+    AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
+    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
-use asupersync::time::{sleep, wall_now};
 use asupersync::{CancelReason, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_core::{
@@ -36,8 +35,8 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
     pool.sqlite_identity_key()
 }
 
-static MESSAGE_WRITE_SERIALIZER: LazyLock<asupersync::sync::Mutex<()>> =
-    LazyLock::new(|| asupersync::sync::Mutex::new(()));
+static MESSAGE_WRITE_SERIALIZER: LazyLock<Arc<asupersync::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(asupersync::sync::Mutex::new(())));
 
 // =============================================================================
 // ATC Leader Lease types
@@ -364,9 +363,45 @@ async fn traw_execute(
 /// Generate a URL-safe slug from a human key (path).
 #[must_use]
 pub fn generate_slug(human_key: &str) -> String {
-    // Keep slug semantics identical to the legacy Python `_compute_project_slug` default behavior.
-    // (Collapses runs of non-alphanumerics into a single '-', trims '-', and uses "project" fallback.)
+    // Directory-mode slugs are based on the resolved real path when one exists,
+    // so symlink spellings for the same workspace converge on one project.
     mcp_agent_mail_core::compute_project_slug(human_key)
+}
+
+fn canonical_absolute_path_string(value: &str) -> Option<String> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    Some(
+        mcp_agent_mail_core::resolve_project_path(value)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+fn human_keys_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let Some(left_canonical) = canonical_absolute_path_string(left) else {
+        return false;
+    };
+    let Some(right_canonical) = canonical_absolute_path_string(right) else {
+        return false;
+    };
+    left_canonical == right_canonical
+}
+
+fn project_matches_human_key_alias(
+    project: &ProjectRow,
+    raw_human_key: &str,
+    resolved_human_key: &str,
+) -> bool {
+    project.human_key == raw_human_key
+        || project.human_key == resolved_human_key
+        || human_keys_equivalent(&project.human_key, raw_human_key)
+        || human_keys_equivalent(&project.human_key, resolved_human_key)
 }
 
 fn map_sql_error(e: &SqlError) -> DbError {
@@ -388,7 +423,29 @@ fn map_sql_outcome<T>(out: Outcome<T, SqlError>) -> Outcome<T, DbError> {
 }
 
 fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> {
-    ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
+    let id = row.get(0).and_then(value_as_i64);
+    let slug = row
+        .get(1)
+        .and_then(|value| match value {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| DbError::Internal("missing slug in project row".to_string()))?;
+    let human_key = row
+        .get(2)
+        .and_then(|value| match value {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| DbError::Internal("missing human_key in project row".to_string()))?;
+    let created_at = row.get(3).and_then(value_as_i64).unwrap_or(0);
+
+    Ok(ProjectRow {
+        id,
+        slug,
+        human_key,
+        created_at,
+    })
 }
 
 fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> ProjectRow {
@@ -727,9 +784,8 @@ pub const ACTIVE_RESERVATION_PREDICATE: &str = "(
               '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
         AND CAST(trim(file_reservations.released_ts) AS REAL) <= 0)
     ) \
-    AND NOT EXISTS (
-        SELECT 1 FROM file_reservation_releases
-        WHERE reservation_id = file_reservations.id
+    AND file_reservations.id NOT IN (
+        SELECT reservation_id FROM file_reservation_releases
     )
 )";
 
@@ -746,6 +802,46 @@ pub fn active_reservation_predicate_for(table_ref: &str) -> String {
     }
     ACTIVE_RESERVATION_PREDICATE.replace("file_reservations.", &format!("{table_ref}."))
 }
+
+/// The active-reservation predicate WITHOUT the sidecar release-ledger
+/// exclusion, adjusted for a table reference.
+///
+/// GH#180: [`ACTIVE_RESERVATION_PREDICATE`] ends in an uncorrelated
+/// `id NOT IN (SELECT reservation_id FROM file_reservation_releases)` anti-join.
+/// Under sqlmodel-frankensqlite's join execution that subquery is re-scanned per
+/// join row rather than materialized once, so an active-view query with a
+/// `LEFT JOIN agents` degrades to O(N·M) — ~25s on a 30k-row store (canonical
+/// SQLite materializes it and runs the same query in ~0.01s). The no-join paths
+/// are fine, so this cheap `released_ts`-only predicate is used by the join
+/// sites to fetch *candidate* rows; callers then subtract the released
+/// reservation IDs (see [`RELEASED_RESERVATION_IDS_SQL`]) in Rust for identical
+/// results without the O(N·M) blowup.
+#[must_use]
+pub fn active_reservation_candidate_predicate_for(table_ref: &str) -> String {
+    let table_ref = table_ref.trim().trim_end_matches('.');
+    let qualifier = if table_ref.is_empty() || table_ref == "file_reservations" {
+        "file_reservations.".to_string()
+    } else {
+        format!("{table_ref}.")
+    };
+    // ACTIVE_RESERVATION_LEGACY_PREDICATE references the bare `released_ts`
+    // column; qualify every occurrence with the requested table reference.
+    format!(
+        "({})",
+        ACTIVE_RESERVATION_LEGACY_PREDICATE
+            .replace("released_ts", &format!("{qualifier}released_ts"))
+    )
+}
+
+/// SQL that returns the reservation IDs recorded in the sidecar release ledger.
+///
+/// GH#180: fetch this set separately (a single-column scan, cheap in any engine)
+/// and subtract it from the candidate rows in Rust — this reproduces canonical
+/// SQLite's materialized `NOT IN` semantics without the per-join-row rescan.
+/// Reservation IDs are globally unique primary keys, so the unscoped ledger set
+/// is safe to subtract from project-scoped candidates.
+pub const RELEASED_RESERVATION_IDS_SQL: &str =
+    "SELECT reservation_id FROM file_reservation_releases";
 
 /// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `product_uid`, `name`, `created_at`.
@@ -1136,8 +1232,10 @@ pub struct AtcFeatureSchemaReprocessSummary {
 }
 
 /// Reprocess persisted ATC feature payloads to the current schema contract.
+// ATC experiences live in the dedicated sidecar DB (br-bvq1x.11.7); the
+// reprocess operates on a canonical connection to that sidecar.
 pub fn reprocess_atc_feature_schema(
-    conn: &crate::DbConn,
+    conn: &crate::CanonicalDbConn,
     project_key: Option<&str>,
     subject: Option<&str>,
     limit: usize,
@@ -1279,20 +1377,53 @@ pub(crate) async fn ensure_file_backed_atc_pool_initialized(
         }
         Err(error) => return Outcome::Err(error),
     };
-    match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => {
-            drop(conn);
-            match inspect_canonical_atc_schema(pool) {
-                Ok(missing_after) if missing_after.is_empty() => Outcome::Ok(()),
-                Ok(missing_after) => Outcome::Err(DbError::Internal(format!(
-                    "ATC schema initialization did not converge; missing before init: {}; still missing after init: {}",
-                    missing_before.join(", "),
-                    missing_after.join(", "),
-                ))),
-                Err(error) => Outcome::Err(error),
-            }
+
+    let conn = match open_canonical_atc_conn(pool, "initialize canonical ATC schema") {
+        Ok(conn) => conn,
+        Err(error) => return Outcome::Err(error),
+    };
+    // On first init the sidecar is a brand-new on-disk file; place it in WAL
+    // mode to match the mail DB's durability/concurrency posture. journal_mode
+    // is DB-wide and is intentionally omitted from PRAGMA_CONN_SETTINGS_SQL, so
+    // it must be applied here once during sidecar creation.
+    if let Err(error) = conn.execute_raw(crate::schema::PRAGMA_DB_INIT_SQL) {
+        close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
+        return Outcome::Err(DbError::Sqlite(format!(
+            "initialize canonical ATC schema: set sidecar db pragmas failed: {error}"
+        )));
+    }
+    // Keep the sidecar private (0600): like storage.sqlite3 it carries project
+    // keys, subjects, and evidence summaries (br-bvq1x.11.7). Best-effort — a
+    // chmod failure must not block ATC telemetry.
+    #[cfg(unix)]
+    if let Some(atc_path) = pool.atc_sqlite_path() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            std::fs::set_permissions(&atc_path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(
+                path = %atc_path,
+                error = %error,
+                "failed to restrict ATC sidecar permissions to 0600"
+            );
         }
-        Outcome::Err(error) => Outcome::Err(error),
+    }
+    let migration_result = crate::schema::migrate_atc_runtime_canonical_followup(cx, &conn).await;
+    close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
+
+    match migration_result {
+        Outcome::Ok(_) => match inspect_canonical_atc_schema(pool) {
+            Ok(missing_after) if missing_after.is_empty() => Outcome::Ok(()),
+            Ok(missing_after) => Outcome::Err(DbError::Internal(format!(
+                "ATC schema initialization did not converge; missing before init: {}; still missing after init: {}",
+                missing_before.join(", "),
+                missing_after.join(", "),
+            ))),
+            Err(error) => Outcome::Err(error),
+        },
+        Outcome::Err(error) => Outcome::Err(DbError::Sqlite(format!(
+            "initialize canonical ATC schema: {error}"
+        ))),
         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => Outcome::Panicked(payload),
     }
@@ -1355,8 +1486,37 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
     }
 }
 
-/// Commit the current transaction (single fsync in WAL mode).
+/// Commit the current transaction and publish file-backed writes to fresh handles.
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
+        Outcome::Ok(_) => {
+            if tracked.inner.path() != ":memory:" {
+                // FrankenSQLite can otherwise keep a successful COMMIT private
+                // to the pooled connection until a later close. The checkpoint
+                // gives post-commit probes and sibling processes the same view
+                // immediately after the write path returns.
+                if let Err(error) = tracked.inner.execute_raw("PRAGMA wal_checkpoint(PASSIVE)") {
+                    tracing::warn!(
+                        db_path = %tracked.inner.path(),
+                        error = %error,
+                        "post_commit_checkpoint_failed_after_successful_commit"
+                    );
+                }
+            }
+            Outcome::Ok(())
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// End a transaction that has only observed database state.
+///
+/// This intentionally bypasses [`commit_tx`]: that helper checkpoints the WAL
+/// after writes, while authoritative guard reads must not cause any durable
+/// database or WAL mutation of their own.
+async fn commit_read_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
 }
 
@@ -1376,6 +1536,29 @@ async fn rebuild_indexes(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<()
 /// Used for write paths that are sensitive to `BEGIN CONCURRENT` backend quirks.
 async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     map_sql_outcome(tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await).map(|_| ())
+}
+
+/// Begin a transaction that guarantees a fresh WAL snapshot for a read.
+///
+/// Writable pools keep Bug #85's `BEGIN IMMEDIATE`, which both re-pins the
+/// snapshot and serializes against an in-flight release. Query-only pools —
+/// every GH#198 read surface — cannot take a write lock ("attempt to write a
+/// readonly database" turned the file_reservations resource into a hard error,
+/// br-lwwq5), so fall back to an explicit deferred `BEGIN`: starting any new
+/// transaction re-pins the connection to the newest committed frame, which is
+/// all the freshness contract needs on a pool that can never write.
+async fn begin_fresh_snapshot_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    match begin_immediate_tx(cx, tracked).await {
+        Outcome::Err(error)
+            if {
+                let message = error.to_string().to_ascii_lowercase();
+                message.contains("readonly database") || message.contains("query_only")
+            } =>
+        {
+            map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await).map(|_| ())
+        }
+        out => out,
+    }
 }
 
 /// Rollback the current transaction (best-effort, errors ignored).
@@ -1441,9 +1624,9 @@ async fn durability_probe_query(
     }
 
     for attempt in 0..=DURABILITY_PROBE_MAX_RETRIES {
-        // Use a plain open — no recovery, no fallback paths.  Durability probes
-        // must be side-effect-free so they never trigger REINDEX or open a fallback
-        // database, which could make committed rows appear to vanish.
+        // Use a plain open — no recovery, no fallback paths. Durability probes
+        // must be side-effect-free so they never trigger REINDEX or open a
+        // fallback database, which could make committed rows appear to vanish.
         let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
             Ok(conn) => conn,
             Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
@@ -1467,7 +1650,7 @@ async fn durability_probe_query(
                     error = %e,
                     "durability probe hit transient busy, retrying"
                 );
-                durability_probe_backoff(attempt).await;
+                durability_probe_backoff(attempt);
             }
             _ => return out,
         }
@@ -1488,7 +1671,7 @@ fn is_probe_transient_busy(e: &DbError) -> bool {
 /// Exponential backoff for durability probe retries.
 ///
 /// Base: 25 ms, max: 200 ms (lightweight — probes should unblock quickly).
-async fn durability_probe_backoff(attempt: u32) {
+fn durability_probe_backoff(attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
@@ -1496,7 +1679,7 @@ async fn durability_probe_backoff(attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    let () = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
+    std::thread::sleep(config.delay_for_attempt(attempt));
 }
 
 /// Fetch an agent row directly from `SQLite` after commit to verify durability.
@@ -1509,11 +1692,13 @@ async fn verify_agent_visible_after_commit(
     project_id: i64,
     name: &str,
 ) -> Outcome<AgentRow, DbError> {
+    // GH#169: resolve the canonical (lowest-id) variant deterministically, the
+    // same row get_agent / register_agent reuse resolves.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               LIMIT 1";
+               ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
     let fresh_result = match durability_probe_query(cx, pool, sql, &params).await {
         Outcome::Ok(rows) => rows.first().map_or_else(
@@ -1535,67 +1720,17 @@ async fn verify_agent_visible_after_commit(
     {
         return fresh_result;
     }
-    match verify_agent_visible_on_pooled_handle(cx, pool, project_id, name).await {
-        Outcome::Ok(agent) => {
-            tracing::warn!(
-                project_id,
-                agent = %name,
-                fresh_error = %fresh_error,
-                "fresh durability probe missed committed agent visibility; pooled runtime handle confirmed row"
-            );
-            Outcome::Ok(agent)
-        }
-        Outcome::Err(pooled_error) => {
-            tracing::warn!(
-                project_id,
-                agent = %name,
-                fresh_error = %fresh_error,
-                pooled_error = %pooled_error,
-                "fresh and pooled agent visibility probes both failed after commit"
-            );
-            fresh_result
-        }
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    tracing::warn!(
+        project_id,
+        agent = %name,
+        fresh_error = %fresh_error,
+        "fresh durability probe missed committed agent visibility; refusing pooled-only confirmation"
+    );
+    fresh_result
 }
 
 fn is_agent_visibility_probe_consistency_error(error: &DbError) -> bool {
     matches!(error, DbError::Internal(message) if message.contains("agent row not visible after commit"))
-}
-
-async fn verify_agent_visible_on_pooled_handle(
-    cx: &Cx,
-    pool: &DbPool,
-    project_id: i64,
-    name: &str,
-) -> Outcome<AgentRow, DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-    let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
-               FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               LIMIT 1";
-    let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || {
-                Outcome::Err(DbError::Internal(format!(
-                    "agent row not visible after commit for {project_id}:{name}"
-                )))
-            },
-            |row| Outcome::Ok(decode_agent_row_indexed(row)),
-        ),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
 }
 
 fn normalize_expected_recipients(recipients: &[(i64, &str)]) -> Vec<(i64, String)> {
@@ -1611,6 +1746,7 @@ fn normalize_expected_recipients(recipients: &[(i64, &str)]) -> Vec<(i64, String
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MessageVisibilityProbeMode {
     FreshHandle,
+    #[cfg(test)]
     PooledHandle,
 }
 
@@ -1631,6 +1767,7 @@ async fn message_visibility_probe_query(
         MessageVisibilityProbeMode::FreshHandle => {
             durability_probe_query(cx, pool, sql, params).await
         }
+        #[cfg(test)]
         MessageVisibilityProbeMode::PooledHandle => {
             let conn = match acquire_conn(cx, pool).await {
                 Outcome::Ok(c) => c,
@@ -1677,6 +1814,41 @@ fn is_message_visibility_probe_consistency_error(error: &DbError) -> bool {
                 || message.contains("message recipient rows not visible after commit")
         }
         _ => false,
+    }
+}
+
+/// Is this ghost-success verdict specifically about the RECIPIENT rows (rather
+/// than the message row itself)?
+///
+/// GH#179: the writer's own post-commit sample can only refute the probe class
+/// it actually contradicts. A present message row refutes a message-row ghost,
+/// but says nothing about a recipient-rows ghost — recipient rows missing means
+/// the message is delivered to nobody, and reporting success there is the exact
+/// silent-loss class the probe exists to catch.
+fn is_recipient_visibility_probe_consistency_error(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Internal(message)
+            if message.contains("message recipient rows not visible after commit")
+    )
+}
+
+/// Does the writer's own post-commit sample independently refute this specific
+/// ghost-success verdict?
+///
+/// - Message-row ghost: refuted when the writer handle saw the message row.
+/// - Recipient-rows ghost: refuted only when the writer handle saw the message
+///   row AND the full expected recipient-row count.
+fn writer_sample_refutes_probe_verdict(
+    error: &DbError,
+    writer_counts: WriterPostCommitCounts,
+    expected_recipients: i64,
+) -> bool {
+    let message_confirmed = writer_counts.message_count == Some(1);
+    if is_recipient_visibility_probe_consistency_error(error) {
+        message_confirmed && writer_counts.recipient_count == Some(expected_recipients)
+    } else {
+        message_confirmed
     }
 }
 
@@ -1791,39 +1963,13 @@ async fn verify_message_recipients_visible_after_commit(
     {
         return fresh_result;
     }
-
-    match verify_message_recipients_visible_with_probe_mode(
-        cx,
-        pool,
+    tracing::warn!(
         project_id,
         message_id,
-        expected_recipients,
-        MessageVisibilityProbeMode::PooledHandle,
-    )
-    .await
-    {
-        Outcome::Ok(()) => {
-            tracing::warn!(
-                project_id,
-                message_id,
-                fresh_error = %fresh_error,
-                "fresh durability probe missed committed message visibility; pooled runtime handle confirmed rows"
-            );
-            Outcome::Ok(())
-        }
-        Outcome::Err(pooled_error) => {
-            tracing::warn!(
-                project_id,
-                message_id,
-                fresh_error = %fresh_error,
-                pooled_error = %pooled_error,
-                "fresh and pooled message visibility probes both failed after commit"
-            );
-            fresh_result
-        }
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
-    }
+        fresh_error = %fresh_error,
+        "fresh durability probe missed committed message visibility; refusing pooled-only confirmation"
+    );
+    fresh_result
 }
 
 async fn fetch_durable_atc_experience_by_decision_effect(
@@ -1909,14 +2055,44 @@ pub(crate) fn close_canonical_db_conn(conn: crate::CanonicalDbConn, context: &'s
     drop(conn);
 }
 
+/// Test-only relaxed-durability switch for canonical ATC sidecar connections.
+///
+/// Throwaway test pools grind hundreds of WAL fsyncs per proptest case at the
+/// production `synchronous = NORMAL` setting (br-j5l8s: one proptest alone
+/// took 380s standalone under host IO pressure). Tests that exercise rollup
+/// arithmetic — not durability — flip this so every ATC sidecar connection
+/// adds `synchronous = OFF`. Compiled out of production builds entirely.
+#[cfg(test)]
+pub(crate) static ATC_CONN_TEST_RELAXED_DURABILITY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn open_canonical_atc_conn(
     pool: &DbPool,
     purpose: &'static str,
 ) -> std::result::Result<crate::CanonicalDbConn, DbError> {
-    let conn = crate::CanonicalDbConn::open_file(pool.sqlite_path())
+    // ATC telemetry tables are isolated into a sidecar DB (atc.sqlite3), a
+    // sibling of the mailbox DB, so ATC churn/bloat/corruption can never reach
+    // storage.sqlite3's VACUUM/integrity/backup/size (br-bvq1x.11.7). The
+    // sidecar is opened only through canonical SQLite, which sidesteps the
+    // FrankenConnection page-corruption bug (br-q37ep) entirely.
+    let atc_path = pool.atc_sqlite_path().ok_or_else(|| {
+        DbError::Internal(format!(
+            "{purpose}: canonical ATC connection requested for an in-memory pool"
+        ))
+    })?;
+    let conn = crate::CanonicalDbConn::open_file(atc_path.as_str())
         .map_err(|error| DbError::Sqlite(format!("{purpose}: open failed: {error}")))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
         .map_err(|error| DbError::Sqlite(format!("{purpose}: init pragmas failed: {error}")))?;
+    #[cfg(test)]
+    if ATC_CONN_TEST_RELAXED_DURABILITY.load(std::sync::atomic::Ordering::Relaxed) {
+        conn.execute_raw("PRAGMA synchronous = OFF;")
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "{purpose}: relaxed test durability failed: {error}"
+                ))
+            })?;
+    }
     Ok(conn)
 }
 
@@ -3060,11 +3236,35 @@ fn release_atc_leader_lease_file_backed(
     result
 }
 
-fn is_hard_post_commit_probe_error(_error: &DbError) -> bool {
-    // Post-commit durability probes exist to prove that a write is query-visible
-    // from an independent handle before we report success. Any probe error means
-    // that proof failed, so none of these errors are advisory.
-    true
+fn is_hard_post_commit_probe_error(error: &DbError) -> bool {
+    // GH#179: a post-commit durability probe exists to prove a committed write is
+    // query-visible from an independent handle before we report success. A probe
+    // failure is only "hard" — i.e. positive proof the committed state is
+    // genuinely inconsistent and the row must be rolled back — when the probe
+    // actually RAN and observed the message row (or its recipient rows) to be
+    // absent/mismatched (a "ghost success").
+    //
+    // Every OTHER probe outcome — `SQLITE_BUSY` / "database is locked" / MVCC
+    // snapshot conflict / pool exhaustion / disk IO error / cancel / panic — is a
+    // probe *execution* failure. It says nothing about whether the committed row
+    // is durable; it only means we could not re-prove visibility from a fresh
+    // handle right now. Treating those as hard and deleting the already-committed
+    // `messages` / `message_recipients` rows is data loss under concurrent write
+    // pressure. Such errors are advisory: the committed row stays durable.
+    is_message_visibility_probe_consistency_error(error)
+}
+
+/// Decide whether a post-commit visibility-probe failure justifies destructive
+/// cleanup of the already-committed message.
+///
+/// GH#179: cleanup is only justified when the probe positively observed the
+/// committed state to be inconsistent (a ghost success, per
+/// [`is_hard_post_commit_probe_error`]) AND the writer's own post-commit sample
+/// did not independently confirm the message row landed. A transient/execution
+/// probe failure — or a probe failure contradicted by the writer's own
+/// confirmation that the row is present — must never delete committed data.
+fn post_commit_probe_requires_cleanup(error: &DbError, writer_confirms_durable: bool) -> bool {
+    is_hard_post_commit_probe_error(error) && !writer_confirms_durable
 }
 
 fn post_commit_probe_cancelled_error(operation: &'static str, detail: &str) -> DbError {
@@ -3457,13 +3657,48 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
 async fn run_with_mvcc_retry<T, F, Fut>(
     cx: &Cx,
     operation: &'static str,
+    op: F,
+) -> Outcome<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Outcome<T, DbError>>,
+{
+    run_with_mvcc_retry_with_budget(cx, operation, *MVCC_MAX_RETRIES, op).await
+}
+
+/// [`run_with_mvcc_retry`] with an explicit retry budget (testable core).
+///
+/// On budget exhaustion the final busy/MVCC error is wrapped in
+/// [`DbError::RetryBudgetExhausted`] so downstream envelopes can report the
+/// attempts made, the wall-clock time spent, and honest fallback guidance
+/// instead of advising yet another blind retry (br-bvq1x.4.3 / D3).
+async fn run_with_mvcc_retry_with_budget<T, F, Fut>(
+    _cx: &Cx,
+    operation: &'static str,
+    max: u32,
     mut op: F,
 ) -> Outcome<T, DbError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Outcome<T, DbError>>,
 {
-    let max = *MVCC_MAX_RETRIES;
+    // K3 (br-bvq1x.11.3): if the corruption circuit breaker is open, refuse the
+    // write immediately — without touching the database again — so agents stop
+    // hammering a corrupt store. Reads do not go through this wrapper, and the
+    // CLI/doctor sync path runs in a separate process, so recovery is never
+    // gated.
+    if let Some(refusal) = crate::corruption_circuit_breaker().refusal_error() {
+        return Outcome::Err(refusal);
+    }
+
+    let started = std::time::Instant::now();
+    let exhausted = |e: DbError| DbError::RetryBudgetExhausted {
+        operation,
+        attempts: max + 1,
+        budget: max + 1,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        inner: Box::new(e),
+    };
     for attempt in 0..=max {
         match op().await {
             Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
@@ -3475,7 +3710,7 @@ where
                     operation,
                     "MVCC write conflict, retrying whole transaction"
                 );
-                mvcc_backoff(cx, attempt).await;
+                mvcc_backoff(attempt);
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) && attempt < max => {
                 tracing::warn!(
@@ -3485,7 +3720,7 @@ where
                     operation,
                     "SQLite write contention, retrying whole transaction"
                 );
-                mvcc_backoff(cx, attempt).await;
+                mvcc_backoff(attempt);
             }
             Outcome::Err(e) if is_mvcc_error(&e) => {
                 MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3495,7 +3730,7 @@ where
                     operation,
                     "MVCC retries exhausted"
                 );
-                return Outcome::Err(e);
+                return Outcome::Err(exhausted(e));
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) => {
                 tracing::error!(
@@ -3504,9 +3739,17 @@ where
                     operation,
                     "SQLite write-contention retries exhausted"
                 );
-                return Outcome::Err(e);
+                return Outcome::Err(exhausted(e));
             }
-            other => return other,
+            other => {
+                // K3: a hard, edit-blocking corruption surfaced on the write
+                // path — trip the breaker so subsequent writes are refused
+                // until the database is verified healthy again.
+                if let Outcome::Err(ref e) = other {
+                    crate::corruption_circuit_breaker().observe_error(e);
+                }
+                return other;
+            }
         }
     }
 
@@ -3528,7 +3771,7 @@ where
 /// concurrent writers with ~4s each to all settle (see #98). The 3s
 /// ceiling (raised from 2s) lets later retries outlast the tail of WAL
 /// checkpoint stalls that occasionally stretch to 1-2s on busy disks.
-async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
+fn mvcc_backoff(attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
@@ -3536,7 +3779,7 @@ async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    let () = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
+    std::thread::sleep(config.delay_for_attempt(attempt));
 }
 
 /// Snapshot of MVCC retry metrics for health/diagnostics.
@@ -3576,7 +3819,9 @@ pub async fn ensure_project(
         ));
     }
 
-    let slug = generate_slug(human_key);
+    let identity = mcp_agent_mail_core::resolve_project_identity(human_key);
+    let slug = identity.slug;
+    let resolved_human_key = identity.human_key;
     let cache_scope = cache_scope_for_pool(pool);
 
     // Fast path: check cache first
@@ -3614,6 +3859,21 @@ pub async fn ensure_project(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
 
+    match find_project_in_inventory(cx, &tracked, |project| {
+        project_matches_human_key_alias(project, human_key, &resolved_human_key)
+    })
+    .await
+    {
+        Outcome::Ok(Some(row)) => {
+            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+            return Outcome::Ok(row);
+        }
+        Outcome::Ok(None) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
     // The row doesn't exist yet — we're about to INSERT. This is the only
     // path where the ephemeral-fixture guard should fire. Lookups of
     // already-existing rows (from the SELECT above or the cache) pass
@@ -3626,7 +3886,10 @@ pub async fn ensure_project(
     // bypassed the ephemeral-storage reroute (e.g., by calling this function
     // directly with a real DB pool). Set AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1
     // to opt out (real integration tests that need to register such paths).
-    if mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(human_key)
+    let raw_is_ephemeral = mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(human_key);
+    let resolved_is_ephemeral =
+        mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(&resolved_human_key);
+    if (raw_is_ephemeral || resolved_is_ephemeral)
         && !mcp_agent_mail_core::ephemeral::ephemeral_project_roots_allowed()
     {
         return Outcome::Err(DbError::invalid(
@@ -3645,7 +3908,7 @@ pub async fn ensure_project(
     let fresh = match run_with_mvcc_retry(cx, "ensure_project", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        let row = ProjectRow::new(slug.clone(), human_key.to_string());
+        let row = ProjectRow::new(slug.clone(), resolved_human_key.clone());
         let insert_sql = "INSERT INTO projects (slug, human_key, created_at) \
                           VALUES (?, ?, ?) ON CONFLICT(slug) DO NOTHING";
         let insert_params = [
@@ -3785,7 +4048,7 @@ pub async fn get_project_by_human_key(
                 }
             } else {
                 match find_project_in_inventory(cx, &tracked, |project| {
-                    project.human_key == human_key
+                    project_matches_human_key_alias(project, human_key, human_key)
                 })
                 .await
                 {
@@ -4032,7 +4295,7 @@ pub async fn register_agent(
                      registration_token \
                      FROM agents \
                      WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                     LIMIT 1";
+                     ORDER BY id ASC LIMIT 1";
     let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
     let existing_before = match durability_probe_query(cx, pool, fetch_sql, &fetch_params).await {
         Outcome::Ok(rows) => rows.first().map(decode_agent_row_indexed),
@@ -4287,11 +4550,14 @@ pub async fn create_agent(
 
             let task_desc = task_description.unwrap_or_default();
             let attach_pol = attachments_policy.unwrap_or("auto");
+            // GH#169: resolve the canonical (first-registered / lowest-id) row
+            // deterministically so the duplicate check matches what get_agent
+            // resolves; see the get_agent note for the full rationale.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                              registration_token \
                              FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                             LIMIT 1";
+                             ORDER BY id ASC LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
             // Fast duplicate check before insert.
@@ -4460,11 +4726,20 @@ pub async fn get_agent(
     let tracked = tracked(&*conn);
 
     // Optimized: filter by name directly in SQL (case-insensitive).
+    //
+    // GH#169: a case-insensitive lookup against a BINARY-unique `agents` table
+    // can match several case-variant rows (e.g. `BlueLake` and `bluelake`,
+    // created by a concurrent multi-pane registration race). `LIMIT 1` with no
+    // `ORDER BY` picks a row non-deterministically, so the same `agent_name`
+    // could resolve to a different `agent_id` over time — leaking file
+    // reservations (release resolves to a different id than grant did). Pin a
+    // stable canonical row: the first-registered (lowest `id`) variant. Grant
+    // and release then always resolve to the same row.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               LIMIT 1";
+               ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
@@ -4562,6 +4837,91 @@ pub async fn list_agents(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<AgentRow>, DbError> {
+    list_agents_bounded(cx, pool, project_id, None, None).await
+}
+
+/// Load the bounded, recent agent population needed by the ATC operator.
+///
+/// This deliberately performs one joined query for the entire mailbox. The
+/// previous `list_projects` + `list_agents(project_id)` loop created N+1 async
+/// query/runtime boundaries on every periodic ATC refresh; on a mailbox with
+/// hundreds of projects that dominated the operator tick and caused sustained
+/// allocator churn (GH#190).
+pub async fn list_atc_population_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    min_last_active_ts: i64,
+    limit: usize,
+) -> Outcome<Vec<AtcPopulationAgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql = "SELECT p.id, p.human_key, a.name, a.program, a.last_active_ts \
+               FROM agents AS a \
+               JOIN projects AS p ON p.id = a.project_id \
+               WHERE a.last_active_ts <= 0 OR a.last_active_ts >= ? \
+               ORDER BY a.last_active_ts DESC, a.id DESC \
+               LIMIT ?";
+    let params = [Value::BigInt(min_last_active_ts), Value::BigInt(limit)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let get_string = |row: &SqlRow, index: usize| {
+                row.get(index)
+                    .and_then(|value| match value {
+                        Value::Text(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            Outcome::Ok(
+                rows.iter()
+                    .map(|row| AtcPopulationAgentRow {
+                        project_id: row.get(0).and_then(value_as_i64).unwrap_or_default(),
+                        project_key: get_string(row, 1),
+                        name: get_string(row, 2),
+                        program: get_string(row, 3),
+                        last_active_ts: row.get(4).and_then(value_as_i64).unwrap_or_default(),
+                    })
+                    .collect(),
+            )
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// List a project's agents with an optional activity floor and result cap
+/// (GH#154 item 3).
+///
+/// `min_last_active_ts`: when `Some(floor)`, only agents whose `last_active_ts`
+/// is `>= floor` are returned (used to exclude agents idle past a retention
+/// horizon). `None` returns agents regardless of idle time.
+///
+/// `limit`: when `Some(n)`, at most `n` rows are returned *after* the
+/// case-insensitive name de-duplication, keeping the most-recently-active
+/// agents (the result is ordered `last_active_ts DESC, id DESC`). This bounds
+/// the tool response on long-lived projects that accumulate agents across many
+/// short-lived swarms (one reported project reached 1,119 agents / ~199 KB,
+/// enough to blow the calling agent's context window). `None` is unbounded
+/// (preserves the historical [`list_agents`] contract).
+///
+/// The activity filter and cap are applied in Rust (not SQL) so this keeps the
+/// "simple ordered scan + Rust-side de-dup" shape that deliberately avoids a
+/// FrankenSQLite window-function dependency during mailbox recovery.
+pub async fn list_agents_bounded(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    min_last_active_ts: Option<i64>,
+    limit: Option<usize>,
+) -> Outcome<Vec<AgentRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -4571,28 +4931,42 @@ pub async fn list_agents(
 
     let tracked = tracked(&*conn);
 
-    // Use raw SQL with explicit column order to avoid ORM decoding issues
+    // Use raw SQL with explicit column order to avoid ORM decoding issues.
+    // Keep this as a simple ordered scan: startup/TUI paths call this often,
+    // and case-insensitive de-duplication is cheap in Rust while avoiding a
+    // FrankenSQLite window-function dependency during mailbox recovery.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
-               FROM ( \
-                 SELECT id, project_id, name, program, model, task_description, \
-                        inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                        registration_token, \
-                        ROW_NUMBER() OVER ( \
-                            PARTITION BY name COLLATE NOCASE \
-                            ORDER BY last_active_ts DESC, id DESC \
-                        ) AS rn \
-                 FROM agents \
-                 WHERE project_id = ? \
-               ) dedup \
-               WHERE rn = 1 \
+               FROM agents \
+               WHERE project_id = ? \
                ORDER BY last_active_ts DESC, id DESC";
     let params = [Value::BigInt(project_id)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => {
-            let agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+            let mut agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+            agents.sort_by(|left, right| {
+                right
+                    .last_active_ts
+                    .cmp(&left.last_active_ts)
+                    .then_with(|| {
+                        right
+                            .id
+                            .unwrap_or_default()
+                            .cmp(&left.id.unwrap_or_default())
+                    })
+            });
+
+            let mut seen_names = HashSet::new();
+            agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
+
+            if let Some(floor) = min_last_active_ts {
+                agents.retain(|agent| agent.last_active_ts >= floor);
+            }
+            if let Some(cap) = limit {
+                agents.truncate(cap);
+            }
             Outcome::Ok(agents)
         }
         Outcome::Err(e) => Outcome::Err(e),
@@ -4802,6 +5176,118 @@ fn re_enqueue_touches(scope: &str, pending: &std::collections::HashMap<i64, i64>
     }
 }
 
+/// Outcome of attempting to consume a registration-proof nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceOutcome {
+    /// The nonce had not been seen before; it is now durably recorded.
+    Fresh,
+    /// The nonce was already consumed within its validity window (a replay).
+    Replayed,
+}
+
+/// Durably record a consumed registration-proof nonce, atomically detecting
+/// replays.
+///
+/// `issuer_key` is a stable string id for the trusted public key the proof was
+/// signed under (base64 of the 32-byte Ed25519 key). The `(issuer_key, nonce)`
+/// pair may be consumed at most once: the composite PRIMARY KEY on
+/// `proof_gate_consumed_nonces` makes the INSERT itself the atomic check — a
+/// fresh insert (rows-affected 1) is [`NonceOutcome::Fresh`], a conflict
+/// (rows-affected 0) is [`NonceOutcome::Replayed`]. Two racing consumes of the
+/// same nonce resolve correctly: one commits `Fresh`, the other's commit
+/// conflicts, retries, then sees the row and returns `Replayed`. Because the
+/// record lives in the shared database the guarantee survives process restarts
+/// and holds across processes, unlike an in-memory store.
+///
+/// Expired rows (`retain_until < now`) are pruned in the same transaction so the
+/// table stays bounded without a background sweeper.
+///
+/// The caller MUST fail closed on any non-`Ok` outcome: if the nonce cannot be
+/// durably recorded we cannot prove the proof is not being replayed, so
+/// registration must be refused.
+pub async fn consume_proof_nonce(
+    cx: &Cx,
+    pool: &DbPool,
+    issuer_key: &str,
+    nonce: &str,
+    retain_until: i64,
+    now: i64,
+) -> Outcome<NonceOutcome, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "consume_proof_nonce", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Prune expired nonces (housekeeping; keeps the table bounded).
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "DELETE FROM proof_gate_consumed_nonces WHERE retain_until < ?",
+                    &[Value::BigInt(now)],
+                )
+                .await
+            )
+        );
+
+        // Atomic replay check: INSERT the nonce; a conflict (already consumed)
+        // affects 0 rows, a fresh insert affects 1.
+        let affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "INSERT INTO proof_gate_consumed_nonces \
+                     (issuer_key, nonce, retain_until, consumed_at) \
+                     VALUES (?, ?, ?, ?) \
+                     ON CONFLICT(issuer_key, nonce) DO NOTHING",
+                    &[
+                        Value::Text(issuer_key.to_string()),
+                        Value::Text(nonce.to_string()),
+                        Value::BigInt(retain_until),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
+
+        let outcome = if affected >= 1 {
+            NonceOutcome::Fresh
+        } else {
+            NonceOutcome::Replayed
+        };
+
+        match commit_tx(cx, &tracked).await {
+            Outcome::Ok(()) => Outcome::Ok(outcome),
+            Outcome::Err(e) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                Outcome::Err(e)
+            }
+            Outcome::Cancelled(r) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                Outcome::Cancelled(r)
+            }
+            Outcome::Panicked(p) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                Outcome::Panicked(p)
+            }
+        }
+    })
+    .await
+}
+
 /// Update agent's `contact_policy`
 pub async fn set_agent_contact_policy(
     cx: &Cx,
@@ -4893,11 +5379,14 @@ pub async fn set_agent_contact_policy_by_name(
         let now = now_micros();
 
         // Resolve row first so we can preserve attachments_policy explicitly.
+        // GH#169: pin the same canonical (lowest-id) row get_agent resolves so a
+        // policy set here actually applies to the row reads resolve back to when
+        // case-variant duplicates exist.
         let current_sql = "SELECT id, project_id, name, program, model, task_description, \
                            inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                            registration_token \
                            FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                           ORDER BY last_active_ts DESC, id DESC LIMIT 1";
+                           ORDER BY id ASC LIMIT 1";
         let current_params = [
             Value::BigInt(project_id),
             Value::Text(normalized_name.to_string()),
@@ -5174,132 +5663,161 @@ pub async fn create_message(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Insert message using traw_execute and then fetch id.
-    let sql = "INSERT INTO messages \
-               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    let params = [
-        Value::BigInt(project_id),
-        Value::BigInt(sender_id),
-        thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
-        Value::Text(subject.to_string()),
-        Value::Text(body_md.to_string()),
-        Value::Text(importance.to_string()),
-        Value::BigInt(i64::from(ack_required)),
-        Value::BigInt(now),
-        Value::Text(attachments.to_string()),
-    ];
+    // mcp_agent_mail#176: allocate the canonical id from the process-wide
+    // monotonic allocator (see `create_message_with_recipients` for the full
+    // rationale) and insert it explicitly, so it can never be re-issued even
+    // when the live SQLite's durable AUTOINCREMENT fails to advance.
+    let id_allocator = pool.message_id_allocator();
+    let archive_seed = if id_allocator.needs_archive_seed() {
+        id_allocator.mark_archive_seeded();
+        crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
+    } else {
+        0
+    };
+    let db_floor = match read_messages_id_floor(cx, &tracked).await {
+        Outcome::Ok(floor) => floor,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let message_id = id_allocator.allocate(db_floor, archive_seed);
 
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
+    let row = match run_with_mvcc_retry(cx, "create_message", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    let message_id = try_in_tx!(
-        cx,
-        &tracked,
-        fetch_inserted_message_id_in_tx(
+        // Insert message with an explicit id (mcp_agent_mail#176).
+        let sql = "INSERT INTO messages \
+	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        let params = [
+            Value::BigInt(message_id),
+            Value::BigInt(project_id),
+            Value::BigInt(sender_id),
+            thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
+            Value::Text(subject.to_string()),
+            Value::Text(body_md.to_string()),
+            Value::Text(importance.to_string()),
+            Value::BigInt(i64::from(ack_required)),
+            Value::BigInt(now),
+            Value::Text(attachments.to_string()),
+        ];
+
+        try_in_tx!(
             cx,
             &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+
+        let row = MessageRow {
+            id: Some(message_id),
             project_id,
             sender_id,
-            subject,
-            body_md,
-            thread_id,
-            importance,
-            ack_required,
-            attachments,
-            now,
-            None,
-        )
-        .await
-    );
+            thread_id: thread_id.map(String::from),
+            subject: subject.to_string(),
+            body_md: body_md.to_string(),
+            importance: importance.to_string(),
+            ack_required: i64::from(ack_required),
+            created_ts: now,
+            recipients_json: "{}".to_string(),
+            attachments: attachments.to_string(),
+        };
 
-    let row = MessageRow {
-        id: Some(message_id),
-        project_id,
-        sender_id,
-        thread_id: thread_id.map(String::from),
-        subject: subject.to_string(),
-        body_md: body_md.to_string(),
-        importance: importance.to_string(),
-        ack_required: i64::from(ack_required),
-        created_ts: now,
-        recipients_json: "{}".to_string(),
-        attachments: attachments.to_string(),
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(row)
+    })
+    .await
+    {
+        Outcome::Ok(row) => row,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    if let Err(error) = index_created_message_best_effort(&conn, &row) {
+        tracing::warn!(
+            message_id = row.id.unwrap_or_default(),
+            error = %error,
+            "message committed but incremental search indexing failed"
+        );
+    }
     Outcome::Ok(row)
 }
 
-/// Resolve the message row inserted earlier in the current transaction.
+fn index_created_message_best_effort(
+    conn: &crate::DbConn,
+    row: &MessageRow,
+) -> std::result::Result<bool, String> {
+    let Some(message_id) = row.id else {
+        return Ok(false);
+    };
+    let project_slug = conn
+        .query_sync(
+            "SELECT slug FROM projects WHERE id = ? LIMIT 1",
+            &[Value::BigInt(row.project_id)],
+        )
+        .ok()
+        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
+        .unwrap_or_default();
+    let sender_name = conn
+        .query_sync(
+            "SELECT name FROM agents WHERE id = ? LIMIT 1",
+            &[Value::BigInt(row.sender_id)],
+        )
+        .ok()
+        .and_then(|rows| rows.first().and_then(|row| row.get_as::<String>(0).ok()))
+        .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
+
+    let message = crate::search_v3::IndexableMessage {
+        id: message_id,
+        project_id: row.project_id,
+        project_slug,
+        sender_name,
+        subject: row.subject.clone(),
+        body_md: row.body_md.clone(),
+        thread_id: row.thread_id.clone(),
+        importance: row.importance.clone(),
+        created_ts: row.created_ts,
+    };
+    crate::search_v3::index_message(&message)
+}
+
+/// Read the messages-table allocator floor: the larger of `MAX(id)` and the
+/// `sqlite_sequence` row for `messages`.
 ///
-/// We intentionally avoid `last_insert_rowid()` here. Under file-backed
-/// concurrent-writer load on the FrankenSQLite path, rowid lookup can drift
-/// and attach recipient inserts to the wrong message id. Looking the row back
-/// up by its exact inserted values keeps the lookup transaction-local and
-/// deterministic.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_inserted_message_id_in_tx(
-    cx: &Cx,
-    tracked: &TrackedConnection<'_>,
-    project_id: i64,
-    sender_id: i64,
-    subject: &str,
-    body_md: &str,
-    thread_id: Option<&str>,
-    importance: &str,
-    ack_required: bool,
-    attachments: &str,
-    created_ts: i64,
-    recipients_json: Option<&str>,
-) -> Outcome<i64, DbError> {
-    let sql = "SELECT id FROM messages \
-               WHERE project_id = ? \
-                 AND sender_id = ? \
-                 AND created_ts = ? \
-                 AND subject = ? \
-                 AND body_md = ? \
-                 AND importance = ? \
-                 AND ack_required = ? \
-                 AND attachments = ? \
-                 AND ((? IS NULL AND thread_id IS NULL) OR thread_id = ?) \
-                 AND (? IS NULL OR recipients_json = ?) \
-               ORDER BY id DESC LIMIT 1";
-    let thread_value =
-        thread_id.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
-    let recipients_json_value =
-        recipients_json.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
-    let params = vec![
-        Value::BigInt(project_id),
-        Value::BigInt(sender_id),
-        Value::BigInt(created_ts),
-        Value::Text(subject.to_string()),
-        Value::Text(body_md.to_string()),
-        Value::Text(importance.to_string()),
-        Value::BigInt(i64::from(ack_required)),
-        Value::Text(attachments.to_string()),
-        thread_value.clone(),
-        thread_value,
-        recipients_json_value.clone(),
-        recipients_json_value,
-    ];
-    let rows = match map_sql_outcome(traw_query(cx, tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+/// Used to seed/advance the process-wide [`MessageIdAllocator`](crate::id_floor::MessageIdAllocator)
+/// (mcp_agent_mail#176). A missing `sqlite_sequence` row (or table, on a
+/// brand-new database) is treated as `0` so it can never block message
+/// creation.
+async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<i64, DbError> {
+    let db_max = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT COALESCE(MAX(id), 0) AS v FROM messages",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let Some(message_id) = rows.first().and_then(row_first_i64) else {
-        return Outcome::Err(DbError::Internal(format!(
-            "message insert succeeded but deterministic id lookup failed for project_id={project_id} sender_id={sender_id} created_ts={created_ts}"
-        )));
+    let seq_val = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT COALESCE(seq, 0) AS v FROM sqlite_sequence WHERE name = 'messages'",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
+        // sqlite_sequence may be absent on a fresh DB; not an error here.
+        Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => 0,
     };
-    Outcome::Ok(message_id)
+    Outcome::Ok(db_max.max(seq_val))
 }
 
 /// Create a message AND insert all recipients in a single `SQLite` transaction.
@@ -5324,19 +5842,45 @@ pub async fn create_message_with_recipients(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<MessageRow, DbError> {
-    let _serializer_guard = match MESSAGE_WRITE_SERIALIZER.lock(cx).await {
-        Ok(guard) => guard,
-        Err(asupersync::sync::LockError::Cancelled) => {
-            return Outcome::Cancelled(CancelReason::user(
-                "create_message_with_recipients serializer lock cancelled",
-            ));
+    // Use the owned guard because this critical section intentionally spans
+    // async database and archive I/O. The borrowed guard is deliberately
+    // thread-affine, which would make this public future non-Send.
+    let _serializer_guard =
+        match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&MESSAGE_WRITE_SERIALIZER), cx)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(asupersync::sync::LockError::Cancelled) => {
+                return Outcome::Cancelled(CancelReason::user(
+                    "create_message_with_recipients serializer lock cancelled",
+                ));
+            }
+            Err(error) => {
+                return Outcome::Err(DbError::Internal(format!(
+                    "create_message_with_recipients serializer lock failed: {error}"
+                )));
+            }
+        };
+    // De-duplicate resolved recipient ids before any insert. The
+    // `message_recipients` primary key is `(message_id, agent_id)` — `kind` is
+    // NOT part of it — so the same agent appearing twice in `recipients` (e.g.
+    // once as `to` and once as `cc`, or a name that resolves to an already-listed
+    // id) would otherwise fail the second insert with a UNIQUE-constraint error
+    // and surface a *false* `isError` even though the message and every distinct
+    // recipient were persisted, prompting clients to retry and create duplicate
+    // messages (see #243 Bug 2). First occurrence wins, preserving order and the
+    // most-prominent kind.
+    let deduped_recipients: Vec<(i64, &str)> = {
+        let mut seen = std::collections::HashSet::with_capacity(recipients.len());
+        let mut out = Vec::with_capacity(recipients.len());
+        for &(agent_id, kind) in recipients {
+            if seen.insert(agent_id) {
+                out.push((agent_id, kind));
+            }
         }
-        Err(error) => {
-            return Outcome::Err(DbError::Internal(format!(
-                "create_message_with_recipients serializer lock failed: {error}"
-            )));
-        }
+        out
     };
+    let recipients = deduped_recipients.as_slice();
     let now = now_micros();
     let (row, writer_post_commit_counts) = {
         let conn = match acquire_conn(cx, pool).await {
@@ -5347,6 +5891,35 @@ pub async fn create_message_with_recipients(
         };
 
         let tracked = tracked(&*conn);
+
+        // mcp_agent_mail#176: allocate the canonical message id from the
+        // process-wide monotonic allocator rather than relying on the live
+        // SQLite's AUTOINCREMENT. While the database is held suspect
+        // (canonical-fallback mode, the #151 NOCASE family), the durable
+        // allocator can fail to advance per-write and re-issue an id the
+        // archive already considers canonical — the duplicate-canonical-file
+        // reject (#130) then trips a non-clearable durability latch. The
+        // allocator derives the next id as
+        // `max(in_memory_high_water, db_floor, archive_max) + 1` atomically,
+        // so consecutive creations can never collide regardless of which
+        // surface is authoritative. We compute it once here (under the global
+        // MESSAGE_WRITE_SERIALIZER) so MVCC retries of the transaction reuse a
+        // stable id.
+        let id_allocator = pool.message_id_allocator();
+        let archive_seed = if id_allocator.needs_archive_seed() {
+            id_allocator.mark_archive_seeded();
+            crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
+        } else {
+            0
+        };
+        let db_floor = match read_messages_id_floor(cx, &tracked).await {
+            Outcome::Ok(floor) => floor,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let message_id = id_allocator.allocate(db_floor, archive_seed);
+
         let row = match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
             create_message_with_recipients_tx(
                 cx,
@@ -5361,6 +5934,7 @@ pub async fn create_message_with_recipients(
                 attachments,
                 recipients,
                 now,
+                message_id,
             )
         })
         .await
@@ -5430,7 +6004,6 @@ pub async fn create_message_with_recipients(
     .await
     {
         Outcome::Ok(()) => None,
-        Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => Some(e),
         Outcome::Err(e) => Some(e),
         Outcome::Cancelled(_) => Some(post_commit_probe_cancelled_error(
             "create_message_with_recipients",
@@ -5443,18 +6016,51 @@ pub async fn create_message_with_recipients(
         )),
     };
     if let Some(error) = post_commit_probe_error {
-        let error =
-            annotate_message_visibility_error_with_writer_counts(error, writer_post_commit_counts);
-        return Outcome::Err(
-            cleanup_message_after_post_commit_probe_failure(
-                cx,
-                pool,
-                project_id,
-                message_id,
-                &recipient_agent_ids,
+        // GH#179: NEVER delete an already-committed message over a *probe*
+        // failure. The write transaction (guarded by `run_with_mvcc_retry`,
+        // ~20s budget) already committed; this fresh-handle probe only re-proves
+        // visibility. Destructive cleanup is justified ONLY when the probe
+        // positively observed a genuine inconsistency (a "ghost success" — the
+        // message/recipient rows absent, per `is_hard_post_commit_probe_error`)
+        // AND the writer's own post-commit sample did not independently confirm
+        // the message row landed. Transient busy/locked/MVCC/pool/IO failures —
+        // and cancel/panic — are advisory: the committed row stays durable and
+        // we return success, avoiding both the data loss and the compensating
+        // DELETE transaction that amplifies contention under swarm load.
+        //
+        // The writer's own sample can only refute the ghost class it actually
+        // contradicts: a present message row refutes a message-row ghost, but a
+        // recipient-rows ghost is refuted only when the writer also saw the full
+        // expected recipient-row count (otherwise "success" would deliver the
+        // message to nobody).
+        let expected_recipients =
+            i64::try_from(normalize_expected_recipients(recipients).len()).unwrap_or(i64::MAX);
+        let writer_confirms_durable = writer_sample_refutes_probe_verdict(
+            &error,
+            writer_post_commit_counts,
+            expected_recipients,
+        );
+        if post_commit_probe_requires_cleanup(&error, writer_confirms_durable) {
+            let error = annotate_message_visibility_error_with_writer_counts(
                 error,
-            )
-            .await,
+                writer_post_commit_counts,
+            );
+            return Outcome::Err(
+                cleanup_message_after_post_commit_probe_failure(
+                    cx,
+                    pool,
+                    project_id,
+                    message_id,
+                    &recipient_agent_ids,
+                    error,
+                )
+                .await,
+            );
+        }
+        log_advisory_post_commit_probe_error(
+            "create_message_with_recipients",
+            &format!("{project_id}:{message_id}"),
+            &error.to_string(),
         );
     }
 
@@ -5485,6 +6091,7 @@ async fn create_message_with_recipients_tx(
     attachments: &str,
     recipients: &[(i64, &str)],
     now: i64,
+    message_id: i64,
 ) -> Outcome<MessageRow, DbError> {
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
@@ -5495,21 +6102,20 @@ async fn create_message_with_recipients_tx(
     let mut bcc_names = Vec::new();
 
     if !recipients.is_empty() {
-        let ph = placeholders(recipients.len());
-        let lookup_sql = format!("SELECT id, name FROM agents WHERE id IN ({ph})");
-        let params: Vec<Value> = recipients
-            .iter()
-            .map(|(id, _)| Value::BigInt(*id))
-            .collect();
-        let agent_rows = try_in_tx!(
-            cx,
-            tracked,
-            map_sql_outcome(traw_query(cx, tracked, &lookup_sql, &params).await)
-        );
         let mut name_map = std::collections::HashMap::new();
-        for r in agent_rows {
-            if let (Ok(id), Ok(name)) = (r.get_as::<i64>(0), r.get_as::<String>(1)) {
-                name_map.insert(id, name);
+        for chunk in recipients.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let ph = placeholders(chunk.len());
+            let lookup_sql = format!("SELECT id, name FROM agents WHERE id IN ({ph})");
+            let params: Vec<Value> = chunk.iter().map(|(id, _)| Value::BigInt(*id)).collect();
+            let agent_rows = try_in_tx!(
+                cx,
+                tracked,
+                map_sql_outcome(traw_query(cx, tracked, &lookup_sql, &params).await)
+            );
+            for r in agent_rows {
+                if let (Ok(id), Ok(name)) = (r.get_as::<i64>(0), r.get_as::<String>(1)) {
+                    name_map.insert(id, name);
+                }
             }
         }
 
@@ -5531,11 +6137,19 @@ async fn create_message_with_recipients_tx(
     })
     .to_string();
 
-    // Insert message using traw_execute and then fetch id.
+    // Insert the message with an EXPLICIT id (mcp_agent_mail#176). We do not
+    // rely on AUTOINCREMENT + a deterministic read-back here: the id was
+    // allocated by the process-wide monotonic allocator in the caller, so it
+    // is guaranteed unique-and-increasing even when the live SQLite's durable
+    // allocator state fails to advance. Inserting an explicit rowid keeps the
+    // DB row id and the canonical archive filename in lockstep regardless of
+    // engine state. (Inserting an explicit id > the current sequence also
+    // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
+        Value::BigInt(message_id),
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
         thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
@@ -5552,26 +6166,6 @@ async fn create_message_with_recipients_tx(
         cx,
         tracked,
         map_sql_outcome(traw_execute(cx, tracked, sql, &params).await)
-    );
-
-    let message_id = try_in_tx!(
-        cx,
-        tracked,
-        fetch_inserted_message_id_in_tx(
-            cx,
-            tracked,
-            project_id,
-            sender_id,
-            subject,
-            body_md,
-            thread_id,
-            importance,
-            ack_required,
-            attachments,
-            now,
-            Some(&recipients_json_val),
-        )
-        .await
     );
 
     let row = MessageRow {
@@ -5591,7 +6185,16 @@ async fn create_message_with_recipients_tx(
     // Insert recipients one row at a time inside the same transaction.
     // This avoids a known multi-row INSERT + trigger path that can surface
     // spurious PRIMARY KEY conflicts in the franken sqlite engine.
-    let insert_recipient_sql = "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL)";
+    //
+    // `ON CONFLICT(message_id, agent_id) DO NOTHING` makes a re-driven insert
+    // idempotent (see #243 Bug 2): under busy/MVCC retry a partial re-drive of
+    // the recipient loop must not fail with a UNIQUE-constraint error that gets
+    // surfaced as a false `isError` after the message + all distinct recipients
+    // were already persisted. The caller de-duplicates recipient ids before this
+    // runs, so a genuinely-distinct recipient is never silently dropped; the
+    // post-commit visibility probe still verifies every distinct recipient is
+    // present, so a swallowed engine quirk cannot hide a missing row.
+    let insert_recipient_sql = "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL) ON CONFLICT(message_id, agent_id) DO NOTHING";
     for (agent_id, kind) in recipients {
         let params = [
             Value::BigInt(message_id),
@@ -6378,6 +6981,7 @@ pub async fn fetch_inbox(
             urgent_only,
             unread_only: false,
             ack_required_only: false,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -6404,6 +7008,7 @@ pub async fn fetch_inbox_metadata(
             urgent_only,
             unread_only: false,
             ack_required_only: false,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -6430,6 +7035,7 @@ pub async fn fetch_inbox_unread(
             urgent_only,
             unread_only: true,
             ack_required_only: false,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -6456,6 +7062,63 @@ pub async fn fetch_inbox_unread_metadata(
             urgent_only,
             unread_only: true,
             ack_required_only: false,
+            ack_overdue_before: None,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+        },
+    )
+    .await
+}
+
+pub async fn fetch_inbox_ack_overdue(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
+            body_policy: InboxBodyPolicy::Full,
+        },
+    )
+    .await
+}
+
+pub async fn fetch_inbox_ack_overdue_metadata(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -6480,6 +7143,7 @@ pub async fn fetch_inbox_ack_required(
             urgent_only: false,
             unread_only: false,
             ack_required_only: true,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -6504,6 +7168,7 @@ pub async fn fetch_inbox_ack_required_metadata(
             urgent_only: false,
             unread_only: false,
             ack_required_only: true,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -6521,6 +7186,7 @@ struct InboxQueryOptions {
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
+    ack_overdue_before: Option<i64>,
     body_policy: InboxBodyPolicy,
 }
 
@@ -6545,8 +7211,30 @@ async fn fetch_inbox_impl(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
-    let result = if matches!(options.body_policy, InboxBodyPolicy::Full) {
-        crate::sync::fetch_inbox_rows_from_conn(
+    let result = match (options.body_policy, options.ack_overdue_before) {
+        (InboxBodyPolicy::Full, Some(threshold)) => {
+            crate::sync::fetch_inbox_ack_overdue_rows_from_conn(
+                &conn,
+                project_id,
+                agent_id,
+                options.urgent_only,
+                since_ts,
+                limit,
+                threshold,
+            )
+        }
+        (InboxBodyPolicy::MetadataOnly, Some(threshold)) => {
+            crate::sync::fetch_inbox_ack_overdue_metadata_rows_from_conn(
+                &conn,
+                project_id,
+                agent_id,
+                options.urgent_only,
+                since_ts,
+                limit,
+                threshold,
+            )
+        }
+        (InboxBodyPolicy::Full, None) => crate::sync::fetch_inbox_rows_from_conn(
             &conn,
             project_id,
             agent_id,
@@ -6555,9 +7243,8 @@ async fn fetch_inbox_impl(
             options.ack_required_only,
             since_ts,
             limit,
-        )
-    } else {
-        crate::sync::fetch_inbox_metadata_rows_from_conn(
+        ),
+        (InboxBodyPolicy::MetadataOnly, None) => crate::sync::fetch_inbox_metadata_rows_from_conn(
             &conn,
             project_id,
             agent_id,
@@ -6566,7 +7253,7 @@ async fn fetch_inbox_impl(
             options.ack_required_only,
             since_ts,
             limit,
-        )
+        ),
     };
 
     match result {
@@ -7696,20 +8383,12 @@ pub async fn mark_message_read(
     run_with_mvcc_retry(cx, "mark_message_read", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Idempotent: set read_ts if NULL.  Also auto-acknowledge if the
-        // message has ack_required=1 — agents consistently fail to call
-        // acknowledge_message explicitly, so reading IS acknowledgment.
+        // Idempotent: set read_ts if NULL. Acknowledgements are intentionally
+        // separate state; callers must use acknowledge_message to set ack_ts.
         let sql = "UPDATE message_recipients \
-                   SET read_ts = COALESCE(read_ts, ?), \
-                       ack_ts = CASE \
-                           WHEN ack_ts IS NOT NULL THEN ack_ts \
-                           WHEN (SELECT m.ack_required FROM messages m \
-                                 WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                           ELSE ack_ts \
-                       END \
+                   SET read_ts = COALESCE(read_ts, ?) \
                    WHERE agent_id = ? AND message_id = ?";
         let params = [
-            Value::BigInt(now),
             Value::BigInt(now),
             Value::BigInt(agent_id),
             Value::BigInt(message_id),
@@ -7807,24 +8486,15 @@ pub async fn mark_messages_read_batch(
     run_with_mvcc_retry(cx, "mark_messages_read_batch", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Batch UPDATE: mark all messages read + auto-ack in one pass per chunk.
+        // Batch UPDATE: mark all messages read in one pass per chunk.
         for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
             let ph = placeholders(chunk.len());
-            // The SQL uses agent_id as the first two params (for read_ts, ack_ts),
-            // then agent_id again, then the message IDs.
             let sql = format!(
                 "UPDATE message_recipients \
-                 SET read_ts = COALESCE(read_ts, ?), \
-                     ack_ts = CASE \
-                         WHEN ack_ts IS NOT NULL THEN ack_ts \
-                         WHEN (SELECT m.ack_required FROM messages m \
-                               WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                         ELSE ack_ts \
-                     END \
+                 SET read_ts = COALESCE(read_ts, ?) \
                  WHERE agent_id = ? AND message_id IN ({ph})"
             );
-            let mut params = Vec::with_capacity(3 + chunk.len());
-            params.push(Value::BigInt(now));
+            let mut params = Vec::with_capacity(2 + chunk.len());
             params.push(Value::BigInt(now));
             params.push(Value::BigInt(agent_id));
             for &mid in chunk {
@@ -7880,40 +8550,65 @@ pub async fn mark_all_messages_read_in_project(
                         WHERE r.agent_id = ? AND r.read_ts IS NULL \
                         AND m.project_id = ?";
         let find_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-        let rows = match map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await) {
-            Outcome::Ok(r) => r,
-            Outcome::Err(e) => {
-                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                return Outcome::Err(e);
-            }
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+        // Route through try_in_tx! so the open BEGIN CONCURRENT is rolled back on
+        // cancel/panic too (the bare match previously only rolled back on Err,
+        // leaking a half-open transaction back into the pool on cancellation).
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
+        );
 
-        let count = rows.len();
-        if count > 0 {
-            // Mark unread messages as read, and auto-ack any with ack_required=1.
-            let sql = "UPDATE message_recipients \
-                       SET read_ts = ?, \
-                           ack_ts = CASE \
-                               WHEN ack_ts IS NOT NULL THEN ack_ts \
-                               WHEN (SELECT m.ack_required FROM messages m \
-                                     WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                               ELSE ack_ts \
-                           END \
-                       WHERE agent_id = ? AND read_ts IS NULL \
-                       AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
-            let params = [
-                Value::BigInt(now),
-                Value::BigInt(now),
-                Value::BigInt(agent_id),
-                Value::BigInt(project_id),
-            ];
-            try_in_tx!(
+        let mut message_ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(message_id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "unread inbox query returned a message without an integer id".to_string(),
+                ));
+            };
+            message_ids.push(message_id);
+        }
+
+        if !message_ids.is_empty() {
+            // Update the exact rows selected above. In addition to keeping the
+            // count truthful, bounded chunks avoid executor limits in large
+            // subquery-backed UPDATEs and keep the whole operation atomic.
+            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+                let ph = placeholders(chunk.len());
+                let sql = format!(
+                    "UPDATE message_recipients \
+                     SET read_ts = ? \
+                     WHERE agent_id = ? AND read_ts IS NULL \
+                     AND message_id IN ({ph})"
+                );
+                let mut params = Vec::with_capacity(2 + chunk.len());
+                params.push(Value::BigInt(now));
+                params.push(Value::BigInt(agent_id));
+                params.extend(chunk.iter().copied().map(Value::BigInt));
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+                );
+            }
+
+            // Do not report a successful bulk transition unless every row
+            // selected in this transaction is now read. A partial executor
+            // result must roll the entire transaction back rather than leave
+            // inbox state and the returned count out of sync.
+            let unread_after = try_in_tx!(
                 cx,
                 &tracked,
-                map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+                map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
             );
+            if !unread_after.is_empty() {
+                let remaining = unread_after.len();
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
+                )));
+            }
 
             // Rebuild inbox_stats from ground truth.
             try_in_tx!(
@@ -7928,7 +8623,8 @@ pub async fn mark_all_messages_read_in_project(
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
-        let count_i64 = i64::try_from(count).expect("message recipient count fits in i64");
+        let count_i64 =
+            i64::try_from(message_ids.len()).expect("message recipient count fits in i64");
         Outcome::Ok(count_i64)
     })
     .await
@@ -8260,15 +8956,18 @@ pub async fn get_inbox_stats(
 /// Rebuild `inbox_stats` for a single agent from ground truth, inside an
 /// already-open transaction.
 ///
-/// Uses DELETE + INSERT … SELECT to recompute counters from
-/// `message_recipients` joined with `messages`.  This is the canonical way to
-/// keep `inbox_stats` consistent — it is always correct regardless of whether
-/// `SQLite` triggers fire, partially fire, or are absent.
-fn is_missing_inbox_stats_table_error(error: &DbError) -> bool {
+/// Uses DELETE + per-agent aggregate reads + INSERT to recompute counters from
+/// `message_recipients` and `messages`. This is the canonical way to keep
+/// `inbox_stats` consistent regardless of whether SQLite triggers fire,
+/// partially fire, or are absent.
+fn is_tolerable_inbox_stats_rebuild_error(error: &DbError) -> bool {
     match error {
         DbError::Sqlite(message) => {
             let lowered = message.to_ascii_lowercase();
-            lowered.contains("no such table") && lowered.contains("inbox_stats")
+            (lowered.contains("no such table") && lowered.contains("inbox_stats"))
+                || (lowered.contains("inbox_stats")
+                    && lowered.contains("view")
+                    && lowered.contains("cannot modify"))
         }
         _ => false,
     }
@@ -8292,26 +8991,12 @@ async fn rebuild_agents_inbox_stats_in_tx(
     for chunk in unique_agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let placeholders = placeholders(chunk.len());
         let reset_sql = format!("DELETE FROM inbox_stats WHERE agent_id IN ({placeholders})");
-        let rebuild_sql = format!(
-            "INSERT INTO inbox_stats \
-             (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-             SELECT \
-                 r.agent_id, \
-                 COUNT(*) AS total_count, \
-                 SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-                 SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-                 MAX(m.created_ts) AS last_message_ts \
-             FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
-             WHERE r.agent_id IN ({placeholders}) \
-             GROUP BY r.agent_id"
-        );
 
         let params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
 
         match map_sql_outcome(traw_execute(cx, tracked, &reset_sql, &params).await) {
             Outcome::Ok(_) => {}
-            Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => {
+            Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
                 return Outcome::Ok(());
             }
             Outcome::Err(error) => return Outcome::Err(error),
@@ -8319,19 +9004,114 @@ async fn rebuild_agents_inbox_stats_in_tx(
             Outcome::Panicked(panic) => return Outcome::Panicked(panic),
         }
 
-        let rebuild_params = params.clone();
-        match map_sql_outcome(traw_execute(cx, tracked, &rebuild_sql, &rebuild_params).await) {
-            Outcome::Ok(_) => {}
-            Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => {
-                return Outcome::Ok(());
+        for agent_id in chunk {
+            let stats = match compute_agent_inbox_stats_in_tx(cx, tracked, *agent_id).await {
+                Outcome::Ok(stats) => stats,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+            };
+            let Some(stats) = stats else {
+                continue;
+            };
+            match insert_agent_inbox_stats_in_tx(cx, tracked, *agent_id, stats).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
+                    return Outcome::Ok(());
+                }
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(panic) => return Outcome::Panicked(panic),
             }
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
         }
     }
 
     Outcome::Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentInboxStatsRebuild {
+    total_count: i64,
+    unread_count: i64,
+    ack_pending_count: i64,
+    last_message_ts: Option<i64>,
+}
+
+async fn compute_agent_inbox_stats_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+) -> Outcome<Option<AgentInboxStatsRebuild>, DbError> {
+    let sql = "\
+        SELECT \
+            COUNT(*) AS total_count, \
+            SUM(CASE WHEN read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+            SUM(CASE \
+                WHEN ack_ts IS NULL \
+                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1) \
+                THEN 1 ELSE 0 END) AS ack_pending_count, \
+            (SELECT MAX(created_ts) \
+               FROM messages \
+              WHERE id IN (SELECT message_id \
+                             FROM message_recipients \
+                            WHERE agent_id = ?)) AS last_message_ts \
+        FROM message_recipients \
+        WHERE agent_id = ? \
+          AND message_id IN (SELECT id FROM messages)";
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            sql,
+            &[Value::BigInt(agent_id), Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    let Some(row) = rows.first() else {
+        return Outcome::Err(DbError::Internal(format!(
+            "inbox_stats rebuild returned no aggregate row for agent_id={agent_id}"
+        )));
+    };
+    let total_count = row.get(0).and_then(value_as_i64).unwrap_or(0);
+    if total_count == 0 {
+        return Outcome::Ok(None);
+    }
+    Outcome::Ok(Some(AgentInboxStatsRebuild {
+        total_count,
+        unread_count: row.get(1).and_then(value_as_i64).unwrap_or(0),
+        ack_pending_count: row.get(2).and_then(value_as_i64).unwrap_or(0),
+        last_message_ts: row.get(3).and_then(value_as_i64),
+    }))
+}
+
+async fn insert_agent_inbox_stats_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    stats: AgentInboxStatsRebuild,
+) -> Outcome<(), DbError> {
+    let sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         VALUES (?, ?, ?, ?, ?)";
+    let last_message_ts = stats.last_message_ts.map_or(Value::Null, Value::BigInt);
+    let params = [
+        Value::BigInt(agent_id),
+        Value::BigInt(stats.total_count),
+        Value::BigInt(stats.unread_count),
+        Value::BigInt(stats.ack_pending_count),
+        last_message_ts,
+    ];
+    match map_sql_outcome(traw_execute(cx, tracked, sql, &params).await) {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => Outcome::Panicked(panic),
+    }
 }
 
 /// Rebuild **all** rows in `inbox_stats` from ground truth.
@@ -8356,22 +9136,29 @@ pub async fn rebuild_all_inbox_stats(cx: &Cx, pool: &DbPool) -> Outcome<(), DbEr
         map_sql_outcome(traw_execute(cx, &tracked, delete_sql, &[]).await)
     );
 
-    let rebuild_sql = "\
-        INSERT INTO inbox_stats \
-            (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-        SELECT \
-            r.agent_id, \
-            COUNT(*) AS total_count, \
-            SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-            SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-            MAX(m.created_ts) AS last_message_ts \
-        FROM message_recipients r \
-        JOIN messages m ON m.id = r.message_id \
-        GROUP BY r.agent_id";
+    let agent_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT DISTINCT agent_id FROM message_recipients ORDER BY agent_id",
+                &[],
+            )
+            .await
+        )
+    );
+    let mut agent_ids = Vec::with_capacity(agent_rows.len());
+    for row in agent_rows {
+        if let Some(agent_id) = row.get(0).and_then(value_as_i64) {
+            agent_ids.push(agent_id);
+        }
+    }
     try_in_tx!(
         cx,
         &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, rebuild_sql, &[]).await)
+        rebuild_agents_inbox_stats_in_tx(cx, &tracked, &agent_ids).await
     );
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
@@ -8552,6 +9339,271 @@ fn reservation_descendant_prefix(norm: &str) -> Option<String> {
     }
 }
 
+/// One authoritative active reservation used by the read-only conflict guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationConflictSnapshotRow {
+    pub id: i64,
+    pub agent_id: i64,
+    pub agent_name: Option<String>,
+    pub path_pattern: String,
+    pub expires_ts: i64,
+}
+
+/// A project, canonical caller identity, and reservation set observed in one
+/// fresh database transaction.
+#[derive(Debug, Clone)]
+pub struct ReservationConflictSnapshot {
+    pub project: ProjectRow,
+    pub caller_agent_id: i64,
+    pub captured_ts: i64,
+    pub reservations: Vec<ReservationConflictSnapshotRow>,
+    /// True when the active reservation set exceeded the SQL-level row cap.
+    pub overflow: bool,
+}
+
+/// Capture the canonical inputs for a reservation conflict decision without
+/// registering identities, healing archives, releasing leases, or otherwise
+/// changing mailbox state.
+///
+/// The active-row bound is part of the SQL query (`limit + 1`), rather than a
+/// check performed after an unbounded materialization. Holder names are loaded
+/// in bounded chunks inside the same transaction. Resolving the caller to its
+/// canonical lowest-ID case-insensitive identity in that transaction ensures
+/// self-reservation filtering is keyed to an existing row rather than trusted
+/// caller-supplied text.
+pub async fn get_reservation_conflict_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project_key: &str,
+    caller_name: &str,
+    max_reservations: usize,
+) -> Outcome<ReservationConflictSnapshot, DbError> {
+    if max_reservations == 0 {
+        return Outcome::Err(DbError::invalid(
+            "max_reservations",
+            "reservation conflict snapshot limit must be positive",
+        ));
+    }
+
+    run_with_mvcc_retry(cx, "get_reservation_conflict_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+
+        // BEGIN IMMEDIATE is the established fresh-snapshot path for reservation
+        // reads (GH#85/#86). The transaction performs no table writes and ends
+        // through commit_read_tx, which deliberately skips the write-path WAL
+        // checkpoint. On query-only pools this degrades to a deferred BEGIN.
+        try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+        let captured_ts = now_micros();
+
+        let project_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, slug, human_key, created_at FROM projects \
+                     WHERE human_key = ? OR slug = ? \
+                     ORDER BY CASE WHEN human_key = ? THEN 0 ELSE 1 END, id ASC LIMIT 1",
+                    &[
+                        Value::Text(project_key.to_string()),
+                        Value::Text(project_key.to_string()),
+                        Value::Text(project_key.to_string()),
+                    ],
+                )
+                .await,
+            )
+        );
+        let Some(project_row) = project_rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Project", project_key));
+        };
+        let project = match decode_project_row(project_row) {
+            Ok(project) => project,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        let Some(project_id) = project.id.filter(|id| *id > 0) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "reservation conflict snapshot resolved invalid project id for {project_key}"
+            )));
+        };
+
+        let caller_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id FROM agents \
+                     WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                     ORDER BY id ASC LIMIT 1",
+                    &[
+                        Value::BigInt(project_id),
+                        Value::Text(caller_name.to_string()),
+                    ],
+                )
+                .await,
+            )
+        );
+        let Some(caller_row) = caller_rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Agent",
+                format!("{project_id}:{caller_name}"),
+            ));
+        };
+        let Some(caller_agent_id) = caller_row.get(0).and_then(value_as_i64) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "reservation conflict snapshot caller has no valid id".to_string(),
+            ));
+        };
+        let sql_limit = i64::try_from(max_reservations.saturating_add(1)).unwrap_or(i64::MAX);
+        let active_predicate = active_reservation_predicate_for("fr");
+        let reservation_sql = format!(
+            "SELECT fr.id, fr.agent_id, fr.path_pattern, fr.expires_ts \
+             FROM file_reservations AS fr \
+             WHERE fr.project_id = ? AND fr.\"exclusive\" = 1 \
+               AND {active_predicate} AND fr.expires_ts > ? \
+             ORDER BY fr.id ASC LIMIT ?"
+        );
+        let reservation_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    &reservation_sql,
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(captured_ts),
+                        Value::BigInt(sql_limit),
+                    ],
+                )
+                .await,
+            )
+        );
+
+        if reservation_rows.len() > max_reservations {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok(ReservationConflictSnapshot {
+                project,
+                caller_agent_id,
+                captured_ts,
+                reservations: Vec::new(),
+                overflow: true,
+            });
+        }
+
+        let mut undecoded = Vec::with_capacity(reservation_rows.len());
+        let mut holder_ids = Vec::with_capacity(reservation_rows.len());
+        for row in &reservation_rows {
+            let Some(id) = row.get(0).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "active reservation snapshot row has no valid id".to_string(),
+                ));
+            };
+            let Some(agent_id) = row.get(1).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "active reservation {id} has no valid agent id"
+                )));
+            };
+            let Some(path_pattern) = row.get(2).and_then(|value| match value {
+                Value::Text(path) => Some(path.clone()),
+                _ => None,
+            }) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "active reservation {id} has no valid path pattern"
+                )));
+            };
+            let Some(expires_ts) = row.get(3).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "active reservation {id} has no valid expiry"
+                )));
+            };
+            undecoded.push((id, agent_id, path_pattern, expires_ts));
+            holder_ids.push(agent_id);
+        }
+
+        holder_ids.sort_unstable();
+        holder_ids.dedup();
+        let mut holder_names = HashMap::with_capacity(holder_ids.len());
+        const HOLDER_QUERY_CHUNK: usize = 256;
+        for chunk in holder_ids.chunks(HOLDER_QUERY_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let holder_sql = format!(
+                "SELECT id, name FROM agents WHERE project_id = ? \
+                 AND id IN ({placeholders}) ORDER BY id ASC"
+            );
+            let mut params = Vec::with_capacity(chunk.len().saturating_add(1));
+            params.push(Value::BigInt(project_id));
+            params.extend(chunk.iter().copied().map(Value::BigInt));
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &holder_sql, &params).await)
+            );
+            for row in &rows {
+                let Some(agent_id) = row.get(0).and_then(value_as_i64) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(
+                        "reservation holder row has no valid id".to_string(),
+                    ));
+                };
+                let Some(name) = row.get(1).and_then(|value| match value {
+                    Value::Text(name) => Some(name.clone()),
+                    _ => None,
+                }) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "reservation holder {agent_id} has no valid name"
+                    )));
+                };
+                holder_names.insert(agent_id, name);
+            }
+        }
+
+        let reservations = undecoded
+            .into_iter()
+            .map(
+                |(id, agent_id, path_pattern, expires_ts)| ReservationConflictSnapshotRow {
+                    id,
+                    agent_id,
+                    agent_name: holder_names.get(&agent_id).cloned(),
+                    path_pattern,
+                    expires_ts,
+                },
+            )
+            .collect();
+
+        try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+        Outcome::Ok(ReservationConflictSnapshot {
+            project,
+            caller_agent_id,
+            captured_ts,
+            reservations,
+            overflow: false,
+        })
+    })
+    .await
+}
+
 /// Create file reservations
 #[allow(clippy::too_many_arguments)]
 pub async fn create_file_reservations(
@@ -8567,128 +9619,131 @@ pub async fn create_file_reservations(
     let now = now_micros();
     let expires = now.saturating_add(ttl_seconds.saturating_mul(1_000_000));
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
-    // Batch all reservation inserts in a single transaction (1 fsync instead of N).
-    // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-
-    let exclusive_filter = if exclusive {
-        ""
-    } else {
-        "AND \"exclusive\" = 1"
-    };
-
-    // Check for conflicting active reservations held by others to prevent TOCTOU races.
-    let conflict_sql = format!(
-        "SELECT path_pattern FROM file_reservations \
-         WHERE project_id = ? AND agent_id != ? \
-           AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
-           {exclusive_filter}"
-    );
-    let conflict_params = [
-        Value::BigInt(project_id),
-        Value::BigInt(agent_id),
-        Value::BigInt(now),
-    ];
-    let active_rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, &conflict_sql, &conflict_params).await)
-    );
-
-    let active_index = ReservationConflictIndex::build(
-        active_rows
-            .into_iter()
-            .filter_map(|row| row.get_named::<String>("path_pattern").ok()),
-    );
-
-    for path in paths {
-        let req_pat = CompiledPattern::cached(path);
-        if let Some(active_pat) = active_index.first_conflict(req_pat.as_ref()) {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::ResourceBusy(format!(
-                "Reservation conflict: '{}' overlaps with active exclusive reservation '{}'",
-                path,
-                active_pat.normalized()
-            )));
-        }
-    }
-
-    let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
-    for path in paths {
-        let mut row = FileReservationRow {
-            id: None,
-            project_id,
-            agent_id,
-            path_pattern: (*path).to_string(),
-            exclusive: i64::from(exclusive),
-            reason: reason.to_string(),
-            created_ts: now,
-            expires_ts: expires,
-            released_ts: None,
+    run_with_mvcc_retry(cx, "create_file_reservations", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        // Insert the row explicitly so this critical coordination path does not
-        // depend on macro-generated SQL shape.
-        let insert_sql = "INSERT INTO file_reservations \
-            (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)";
-        let insert_params = [
-            Value::BigInt(row.project_id),
-            Value::BigInt(row.agent_id),
-            Value::Text(row.path_pattern.clone()),
-            Value::BigInt(row.exclusive),
-            Value::Text(row.reason.clone()),
-            Value::BigInt(row.created_ts),
-            Value::BigInt(row.expires_ts),
+        let tracked = tracked(&*conn);
+
+        // Batch all reservation inserts in a single transaction (1 fsync instead of N).
+        // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        let exclusive_filter = if exclusive {
+            ""
+        } else {
+            "AND \"exclusive\" = 1"
+        };
+
+        // Check for conflicting active reservations held by others to prevent TOCTOU races.
+        let conflict_sql = format!(
+            "SELECT path_pattern FROM file_reservations \
+             WHERE project_id = ? AND agent_id != ? \
+               AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
+               {exclusive_filter}"
+        );
+        let conflict_params = [
+            Value::BigInt(project_id),
+            Value::BigInt(agent_id),
+            Value::BigInt(now),
         ];
-        try_in_tx!(
+        let active_rows = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+            map_sql_outcome(traw_query(cx, &tracked, &conflict_sql, &conflict_params).await)
         );
 
-        // Use connection-local rowid state to retrieve the ID for this exact insert.
-        // This avoids cross-transaction races that can happen with MAX(id).
-        let lookup_sql = "SELECT last_insert_rowid() AS id";
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, lookup_sql, &[]).await)
+        let active_index = ReservationConflictIndex::build(
+            active_rows
+                .into_iter()
+                .filter_map(|row| row.get_named::<String>("path_pattern").ok()),
         );
-        let Some(id_row) = rows.first() else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "file reservation insert succeeded but last_insert_rowid() returned no row for project_id={project_id} agent_id={agent_id} path={path}"
-            )));
-        };
-        let id: i64 = match id_row.get_named("id") {
-            Ok(v) => v,
-            Err(e) => {
+
+        for path in paths {
+            let req_pat = CompiledPattern::cached(path);
+            if let Some(active_pat) = active_index.first_conflict(req_pat.as_ref()) {
                 rollback_tx(cx, &tracked).await;
-                return Outcome::Err(map_sql_error(&e));
+                return Outcome::Err(DbError::ResourceBusy(format!(
+                    "Reservation conflict: '{}' overlaps with active exclusive reservation '{}'",
+                    path,
+                    active_pat.normalized()
+                )));
             }
-        };
-        if id <= 0 {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "file reservation insert succeeded but last_insert_rowid() returned invalid id={id} for project_id={project_id} agent_id={agent_id} path={path}"
-            )));
         }
-        row.id = Some(id);
-        out.push(row);
-    }
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(out)
+        let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut row = FileReservationRow {
+                id: None,
+                project_id,
+                agent_id,
+                path_pattern: (*path).to_string(),
+                exclusive: i64::from(exclusive),
+                reason: reason.to_string(),
+                created_ts: now,
+                expires_ts: expires,
+                released_ts: None,
+            };
+
+            // Insert the row explicitly so this critical coordination path does not
+            // depend on macro-generated SQL shape.
+            let insert_sql = "INSERT INTO file_reservations \
+                (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)";
+            let insert_params = [
+                Value::BigInt(row.project_id),
+                Value::BigInt(row.agent_id),
+                Value::Text(row.path_pattern.clone()),
+                Value::BigInt(row.exclusive),
+                Value::Text(row.reason.clone()),
+                Value::BigInt(row.created_ts),
+                Value::BigInt(row.expires_ts),
+            ];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+            );
+
+            // Use connection-local rowid state to retrieve the ID for this exact insert.
+            // This avoids cross-transaction races that can happen with MAX(id).
+            let lookup_sql = "SELECT last_insert_rowid() AS id";
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, lookup_sql, &[]).await)
+            );
+            let Some(id_row) = rows.first() else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "file reservation insert succeeded but last_insert_rowid() returned no row for project_id={project_id} agent_id={agent_id} path={path}"
+                )));
+            };
+            let id: i64 = match id_row.get_named("id") {
+                Ok(v) => v,
+                Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(map_sql_error(&e));
+                }
+            };
+            if id <= 0 {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "file reservation insert succeeded but last_insert_rowid() returned invalid id={id} for project_id={project_id} agent_id={agent_id} path={path}"
+                )));
+            }
+            row.id = Some(id);
+            out.push(row);
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(out)
+    })
+    .await
 }
 
 /// Get active file reservations for a project.
@@ -8703,8 +9758,19 @@ pub async fn get_active_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "get_active_reservations", || {
+        get_active_reservations_once(cx, pool, project_id)
+    })
+    .await
+}
+
+async fn get_active_reservations_once(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
     let now = now_micros();
-    let active_predicate = active_reservation_predicate_for("fr");
+    let candidate_predicate = active_reservation_candidate_predicate_for("fr");
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -8716,30 +9782,187 @@ pub async fn get_active_reservations(
     let tracked = tracked(&*conn);
 
     // Force a fresh WAL snapshot so we never read stale reservation state.
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    // On query-only pools this degrades to a deferred BEGIN.
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
-    let sql = format!(
+    // GH#180: fetch candidate active rows with the cheap `released_ts` predicate
+    // (no release-ledger join, no `NOT IN` subquery), then subtract the release
+    // ledger in Rust. This avoids the O(N·M) per-join-row rescan of the
+    // uncorrelated `NOT IN` subquery under sqlmodel-frankensqlite that made this
+    // a ~24s daemon-dispatch query on a 30k-row store, while producing identical
+    // results. Survivors are (by definition) absent from the release ledger, so
+    // their authoritative `released_ts` is `fr.released_ts`.
+    let candidate_sql = format!(
         "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+                fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts \
          FROM file_reservations fr \
-         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
-         WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ?"
+         WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ?"
     );
-    let params = [Value::BigInt(project_id), Value::BigInt(now)];
+    let candidate_params = [Value::BigInt(project_id), Value::BigInt(now)];
 
-    let result = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                match decode_file_reservation_row(&row) {
-                    Ok(decoded) => out.push(decoded),
-                    Err(e) => {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Err(e);
+    let mut candidates =
+        match map_sql_outcome(traw_query(cx, &tracked, &candidate_sql, &candidate_params).await) {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match decode_file_reservation_row(&row) {
+                        Ok(decoded) => out.push(decoded),
+                        Err(e) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(e);
+                        }
                     }
                 }
+                out
             }
-            Outcome::Ok(out)
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
+
+    let released_ids =
+        match map_sql_outcome(traw_query(cx, &tracked, RELEASED_RESERVATION_IDS_SQL, &[]).await) {
+            Outcome::Ok(rows) => {
+                let mut set = std::collections::HashSet::with_capacity(rows.len());
+                for row in &rows {
+                    if let Some(id) = row.get(0).and_then(value_as_i64) {
+                        set.insert(id);
+                    }
+                }
+                set
+            }
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
+
+    candidates.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
+
+    // Commit the read-only IMMEDIATE tx to release the write lock promptly.
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    Outcome::Ok(candidates)
+}
+
+/// Released reservations whose original TTL has not yet elapsed.
+///
+/// The authoritative release timestamp is resolved from either the base row
+/// or the release ledger (same GH#180 shape as [`get_active_reservations`]:
+/// cheap candidate scan, ledger merged in Rust).
+///
+/// These are exactly the rows whose stale-ACTIVE archive artifact would make
+/// the pre-commit guard report a wrong holder until `expires_ts` when the
+/// release-time artifact write was skipped (disk-critical backpressure) or
+/// lost (a crash between the DB release-commit and the archive write). The
+/// reconcile-on-read healer walks them so the archive converges on the next
+/// reservation access instead of at TTL expiry (br-74sxo).
+pub async fn list_released_unexpired_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "list_released_unexpired_reservations", || {
+        list_released_unexpired_reservations_once(cx, pool, project_id)
+    })
+    .await
+}
+
+async fn list_released_unexpired_reservations_once(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    // Force a fresh WAL snapshot so we never read stale reservation state.
+    // On query-only pools this degrades to a deferred BEGIN.
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+
+    let candidate_sql = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, \
+                fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts, \
+                fr.released_ts AS released_ts \
+         FROM file_reservations fr \
+         WHERE fr.project_id = ? AND fr.expires_ts > ?";
+    let candidate_params = [Value::BigInt(project_id), Value::BigInt(now)];
+
+    let mut candidates =
+        match map_sql_outcome(traw_query(cx, &tracked, candidate_sql, &candidate_params).await) {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match decode_file_reservation_row(&row) {
+                        Ok(decoded) => out.push(decoded),
+                        Err(e) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(e);
+                        }
+                    }
+                }
+                out
+            }
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
+
+    // Merge the release ledger so ledger-only releases (base row still NULL)
+    // resolve their authoritative released_ts, mirroring the reader contract
+    // of `apply_release_markers`.
+    let released_ts_by_id = match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            "SELECT reservation_id, released_ts FROM file_reservation_releases",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => {
+            let mut map = std::collections::HashMap::with_capacity(rows.len());
+            for row in &rows {
+                if let (Some(id), Some(released_ts)) = (
+                    row.get(0).and_then(value_as_i64),
+                    row.get(1).and_then(value_as_i64),
+                ) {
+                    map.insert(id, released_ts);
+                }
+            }
+            map
         }
         Outcome::Err(e) => {
             rollback_tx(cx, &tracked).await;
@@ -8757,7 +9980,16 @@ pub async fn get_active_reservations(
 
     // Commit the read-only IMMEDIATE tx to release the write lock promptly.
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    result
+
+    for row in &mut candidates {
+        if row.released_ts.is_none_or(|ts| ts <= 0)
+            && let Some(ledger_ts) = row.id.and_then(|id| released_ts_by_id.get(&id).copied())
+        {
+            row.released_ts = Some(ledger_ts);
+        }
+    }
+    candidates.retain(|row| row.released_ts.is_some_and(|ts| ts > 0));
+    Outcome::Ok(candidates)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8944,7 +10176,7 @@ pub fn release_reservations<'a>(
             return Outcome::Ok(released);
         }
 
-        let (reservations, target_ids) = {
+        let selected = run_with_mvcc_retry(cx, "release_reservations_select", || async {
             let conn = match acquire_conn(cx, pool).await {
                 Outcome::Ok(c) => c,
                 Outcome::Err(e) => return Outcome::Err(e),
@@ -8953,8 +10185,8 @@ pub fn release_reservations<'a>(
             };
 
             let tracked_conn = tracked(&*conn);
-            // Bulk release updates can touch many rows; use IMMEDIATE tx semantics
-            // for deterministic write visibility on FrankenSQLite.
+            // Bulk release scans use IMMEDIATE tx semantics for deterministic
+            // visibility on FrankenSQLite.
             try_in_tx!(
                 cx,
                 &tracked_conn,
@@ -9006,7 +10238,7 @@ pub fn release_reservations<'a>(
 
             if reservations.is_empty() {
                 try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
-                return Outcome::Ok(reservations);
+                return Outcome::Ok((reservations, Vec::<i64>::new()));
             }
 
             let target_ids: Vec<i64> = reservations.iter().filter_map(|row| row.id).collect();
@@ -9022,8 +10254,20 @@ pub fn release_reservations<'a>(
             // Commit the read transaction first, then delegate writes to the
             // per-id release path which is more stable on FrankenSQLite.
             try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
-            (reservations, target_ids)
+            Outcome::Ok((reservations, target_ids))
+        })
+        .await;
+
+        let (reservations, target_ids) = match selected {
+            Outcome::Ok(selected) => selected,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
+        if target_ids.is_empty() {
+            return Outcome::Ok(reservations);
+        }
+
         let released_markers =
             match release_reservations_by_ids_matching_expiry(cx, pool, &target_ids, None).await {
                 Outcome::Ok(markers) => markers,
@@ -9063,106 +10307,109 @@ async fn release_reservations_by_ids_with_expiry_constraint(
         return Outcome::Ok(Vec::new());
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(
-            traw_execute(
-                cx,
-                &tracked,
-                "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
-                    reservation_id INTEGER PRIMARY KEY,\
-                    released_ts INTEGER NOT NULL\
-                 )",
-                &[],
+    run_with_mvcc_retry(cx, "release_reservations_by_ids", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
+                        reservation_id INTEGER PRIMARY KEY,\
+                        released_ts INTEGER NOT NULL\
+                     )",
+                    &[],
+                )
+                .await
             )
-            .await
-        )
-    );
+        );
 
-    let mut release_marker = now_micros();
-    let mut released = Vec::with_capacity(ids.len());
+        let mut release_marker = now_micros();
+        let mut released = Vec::with_capacity(ids.len());
 
-    // Build the eligibility check: active reservation not already released.
-    // ACTIVE_RESERVATION_PREDICATE already includes the release-ledger
-    // exclusion, so no additional NOT IN clause is needed.
-    let mut check_sql = format!(
-        "SELECT 1 FROM file_reservations \
-         WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
-    );
-    match expiry_constraint {
-        ReleaseReservationExpiryConstraint::Any => {}
-        ReleaseReservationExpiryConstraint::OnOrBefore(_) => {
-            check_sql.push_str(" AND expires_ts <= ?");
-        }
-        ReleaseReservationExpiryConstraint::Exact(_) => {
-            check_sql.push_str(" AND expires_ts = ?");
-        }
-    }
-    check_sql.push_str(" LIMIT 1");
-
-    // Record the release in both the base row and the sidecar ledger. The
-    // sidecar remains the audit source, while the base row keeps active
-    // reservation predicates correct on same-process readers that have already
-    // materialized file_reservations.
-    let update_sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ?";
-    let insert_sql = "INSERT OR IGNORE INTO file_reservation_releases (reservation_id, released_ts) \
-         VALUES (?, ?)";
-
-    for id in ids {
-        let released_ts = release_marker;
-
-        // Step 1: Check eligibility.
-        let mut check_params: Vec<Value> = vec![Value::BigInt(*id)];
+        // Build the eligibility check: active reservation not already released.
+        // ACTIVE_RESERVATION_PREDICATE already includes the release-ledger
+        // exclusion, so no additional NOT IN clause is needed.
+        let mut check_sql = format!(
+            "SELECT 1 FROM file_reservations \
+             WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+        );
         match expiry_constraint {
             ReleaseReservationExpiryConstraint::Any => {}
-            ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
-            | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
-                check_params.push(Value::BigInt(expiry_cutoff));
+            ReleaseReservationExpiryConstraint::OnOrBefore(_) => {
+                check_sql.push_str(" AND expires_ts <= ?");
+            }
+            ReleaseReservationExpiryConstraint::Exact(_) => {
+                check_sql.push_str(" AND expires_ts = ?");
             }
         }
-        let eligible_rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &check_sql, &check_params).await)
-        );
-        if eligible_rows.is_empty() {
-            continue;
+        check_sql.push_str(" LIMIT 1");
+
+        // Record the release in both the base row and the sidecar ledger. The
+        // sidecar remains the audit source, while the base row keeps active
+        // reservation predicates correct on same-process readers that have
+        // already materialized file_reservations.
+        let update_sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ?";
+        let insert_sql = "INSERT OR IGNORE INTO file_reservation_releases (reservation_id, released_ts) \
+             VALUES (?, ?)";
+
+        for id in ids {
+            let released_ts = release_marker;
+
+            // Step 1: Check eligibility.
+            let mut check_params: Vec<Value> = vec![Value::BigInt(*id)];
+            match expiry_constraint {
+                ReleaseReservationExpiryConstraint::Any => {}
+                ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
+                | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
+                    check_params.push(Value::BigInt(expiry_cutoff));
+                }
+            }
+            let eligible_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &check_sql, &check_params).await)
+            );
+            if eligible_rows.is_empty() {
+                continue;
+            }
+
+            // Step 2: Update the base reservation row first.
+            let update_params = [Value::BigInt(released_ts), Value::BigInt(*id)];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
+            );
+
+            // Step 3: Record the release in the sidecar ledger.
+            let insert_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+            );
+
+            release_marker = release_marker.saturating_add(1);
+            released.push(ReleasedReservationMarker {
+                id: *id,
+                released_ts,
+            });
         }
 
-        // Step 2: Update the base reservation row first.
-        let update_params = [Value::BigInt(released_ts), Value::BigInt(*id)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
-        );
-
-        // Step 3: Record the release in the sidecar ledger.
-        let insert_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-        );
-
-        release_marker = release_marker.saturating_add(1);
-        released.push(ReleasedReservationMarker {
-            id: *id,
-            released_ts,
-        });
-    }
-
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(released)
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(released)
+    })
+    .await
 }
 
 /// Renew file reservations
@@ -9302,6 +10549,18 @@ pub async fn list_file_reservations(
     project_id: i64,
     active_only: bool,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "list_file_reservations", || {
+        list_file_reservations_once(cx, pool, project_id, active_only)
+    })
+    .await
+}
+
+async fn list_file_reservations_once(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    active_only: bool,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -9313,20 +10572,25 @@ pub async fn list_file_reservations(
 
     // Force a fresh WAL snapshot for active-only reads to avoid stale
     // reservation state after a release (Bug #85) or concurrent grant.
+    // Falls back to a deferred BEGIN on query-only pools (GH#198 read
+    // surfaces), where BEGIN IMMEDIATE is a readonly-database error.
     if active_only {
-        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
     }
 
     let (sql, params) = if active_only {
         let now = now_micros();
-        let active_predicate = active_reservation_predicate_for("fr");
+        // GH#180: candidate rows via the cheap `released_ts` predicate (no
+        // release-ledger join, no `NOT IN`); the ledger is subtracted in Rust
+        // below. Survivors are absent from the ledger, so `fr.released_ts` is
+        // their authoritative released_ts.
+        let candidate_predicate = active_reservation_candidate_predicate_for("fr");
         (
             format!(
                 "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                        fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+                        fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts \
                  FROM file_reservations fr \
-                 LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
-                 WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ? ORDER BY fr.id"
+                 WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ? ORDER BY fr.id"
             ),
             vec![Value::BigInt(project_id), Value::BigInt(now)],
         )
@@ -9357,7 +10621,7 @@ pub async fn list_file_reservations(
     };
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    let result = match rows_out {
+    let mut result = match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
@@ -9478,6 +10742,36 @@ pub async fn list_file_reservations(
 
     // Commit the read-only IMMEDIATE tx.
     if active_only {
+        // GH#180: subtract the sidecar release ledger in Rust (the candidate
+        // query above intentionally omits the O(N·M) `NOT IN` anti-join).
+        if let Outcome::Ok(rows) = &mut result {
+            let released_ids = match map_sql_outcome(
+                traw_query(cx, &tracked, RELEASED_RESERVATION_IDS_SQL, &[]).await,
+            ) {
+                Outcome::Ok(id_rows) => {
+                    let mut set = std::collections::HashSet::with_capacity(id_rows.len());
+                    for row in &id_rows {
+                        if let Some(id) = row.get(0).and_then(value_as_i64) {
+                            set.insert(id);
+                        }
+                    }
+                    set
+                }
+                Outcome::Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(p);
+                }
+            };
+            rows.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
+        }
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     }
     result
@@ -9492,6 +10786,17 @@ pub async fn list_unreleased_file_reservations(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "list_unreleased_file_reservations", || {
+        list_unreleased_file_reservations_once(cx, pool, project_id)
+    })
+    .await
+}
+
+async fn list_unreleased_file_reservations_once(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -9502,7 +10807,8 @@ pub async fn list_unreleased_file_reservations(
     let tracked = tracked(&*conn);
 
     // Force a fresh WAL snapshot (same rationale as get_active_reservations).
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    // On query-only pools this degrades to a deferred BEGIN.
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     let sql = format!(
         "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, \
@@ -10511,10 +11817,10 @@ pub async fn list_product_projects(
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                match ProjectRow::from_row(&r) {
+            for r in &rows {
+                match decode_project_row(r) {
                     Ok(row) => out.push(row),
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => return Outcome::Err(e),
                 }
             }
             Outcome::Ok(out)
@@ -10614,6 +11920,118 @@ pub async fn release_expired_reservations(
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
     }
+}
+
+/// Retention sweep: hard-`DELETE` released/expired file reservations whose
+/// release/expiry is older than `older_than_us` (GH#154 item 2).
+///
+/// Reservations are only ever *logically* released (a `file_reservation_releases`
+/// ledger row + `released_ts`), never physically removed by the normal lifecycle,
+/// so `file_reservations` grows without bound on a long-lived mailbox (one report
+/// observed ~30,000 rows over ~55 days with 0 active). That unbounded growth
+/// directly inflates the cost of every active-reservation scan that embeds
+/// [`ACTIVE_RESERVATION_PREDICATE`]. This sweep bounds the table.
+///
+/// A row is eligible when BOTH:
+///   1. it is NOT logically active under [`ACTIVE_RESERVATION_PREDICATE`]
+///      (i.e. it is released — has a ledger row, or a positive `released_ts`),
+///      AND
+///   2. its newest "settled" timestamp — `MAX(ledger.released_ts,
+///      file_reservations.released_ts, expires_ts)` — is `<= older_than_us`.
+///
+/// The git archive (`projects/<slug>/file_reservations/<id>.json`) retains the
+/// full audit history independently, so the DB delete is non-destructive to the
+/// durable record. Matching `file_reservation_releases` rows are removed in the
+/// same pass so the sidecar ledger cannot leak orphans. Returns the number of
+/// `file_reservations` rows deleted.
+///
+/// When `project_id` is `Some`, the sweep is scoped to that project; `None`
+/// sweeps across all projects. Deletes are batched by id to keep statements
+/// bounded.
+pub async fn prune_released_file_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: Option<i64>,
+    older_than_us: i64,
+) -> Outcome<u64, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    // Identify eligible reservation ids. We do NOT trust a correlated DELETE …
+    // WHERE NOT (active predicate); instead select ids first (mirrors
+    // release_expired_reservations) so the delete is a simple `id IN (...)`.
+    // The `file_reservations` table is intentionally NOT aliased here so the
+    // shared `ACTIVE_RESERVATION_PREDICATE` (which fully-qualifies
+    // `file_reservations.released_ts`) resolves unchanged.
+    let mut select_sql = String::from(
+        "SELECT file_reservations.id AS id FROM file_reservations \
+         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = file_reservations.id \
+         WHERE NOT (",
+    );
+    select_sql.push_str(ACTIVE_RESERVATION_PREDICATE);
+    select_sql.push_str(
+        ") AND MAX(COALESCE(rr.released_ts, 0), \
+                   CASE WHEN typeof(file_reservations.released_ts) IN ('integer','real') \
+                        THEN file_reservations.released_ts ELSE 0 END, \
+                   file_reservations.expires_ts) <= ?",
+    );
+    let mut params: Vec<Value> = Vec::with_capacity(2);
+    if let Some(pid) = project_id {
+        select_sql.push_str(" AND file_reservations.project_id = ?");
+        params.push(Value::BigInt(older_than_us));
+        params.push(Value::BigInt(pid));
+    } else {
+        params.push(Value::BigInt(older_than_us));
+    }
+
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(id) = row.get_named::<i64>("id") {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Outcome::Ok(0);
+    }
+
+    let mut deleted: u64 = 0;
+    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let chunk_params: Vec<Value> = chunk.iter().map(|id| Value::BigInt(*id)).collect();
+
+        // Delete the sidecar ledger rows first (no FK cascade is defined from
+        // file_reservation_releases → file_reservations), then the reservations.
+        let del_ledger = format!(
+            "DELETE FROM file_reservation_releases WHERE reservation_id IN ({placeholders})"
+        );
+        match map_sql_outcome(traw_execute(cx, &tracked, &del_ledger, &chunk_params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+
+        let del_res = format!("DELETE FROM file_reservations WHERE id IN ({placeholders})");
+        match map_sql_outcome(traw_execute(cx, &tracked, &del_res, &chunk_params).await) {
+            Outcome::Ok(affected) => deleted = deleted.saturating_add(affected),
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+
+    Outcome::Ok(deleted)
 }
 
 /// Fetch specific file reservations by their IDs.
@@ -11039,7 +12457,8 @@ pub async fn insert_system_agent(
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                           registration_token \
-                          FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1";
+                          FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                          ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
         let rows = try_in_tx!(
             cx,
@@ -12878,6 +14297,106 @@ mod tests {
         fn exit(&self, _span: &Id) {}
     }
 
+    // ── D3 (br-bvq1x.4.3): retry budget exhaustion wrapping ──────────
+
+    #[test]
+    fn mvcc_retry_exhaustion_wraps_error_with_budget_context() {
+        use asupersync::runtime::RuntimeBuilder;
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async move {
+            let outcome: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_op", 1, || async {
+                    Outcome::Err(DbError::ResourceBusy("database is locked".into()))
+                })
+                .await;
+            let Outcome::Err(err) = outcome else {
+                panic!("expected exhaustion error");
+            };
+            let DbError::RetryBudgetExhausted {
+                operation,
+                attempts,
+                budget,
+                elapsed_ms: _,
+                inner,
+            } = err
+            else {
+                panic!("expected RetryBudgetExhausted, got: {err}");
+            };
+            assert_eq!(operation, "test_op");
+            assert_eq!(attempts, 2);
+            assert_eq!(budget, 2);
+            assert!(matches!(*inner, DbError::ResourceBusy(_)));
+        });
+    }
+
+    #[test]
+    fn mvcc_retry_exhaustion_wraps_mvcc_conflicts_too() {
+        use asupersync::runtime::RuntimeBuilder;
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async move {
+            let outcome: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_mvcc_op", 0, || async {
+                    Outcome::Err(DbError::Sqlite(
+                        "write conflict on page 42: held by transaction 7".into(),
+                    ))
+                })
+                .await;
+            let Outcome::Err(err) = outcome else {
+                panic!("expected exhaustion error");
+            };
+            assert!(
+                matches!(
+                    err,
+                    DbError::RetryBudgetExhausted {
+                        attempts: 1,
+                        budget: 1,
+                        ..
+                    }
+                ),
+                "zero-retry budget still wraps with attempts=1: {err}"
+            );
+            // The wrapped error keeps the busy classification for envelopes.
+            assert_eq!(
+                err.classification().class,
+                crate::error::DbErrorClass::BusyRetryable
+            );
+        });
+    }
+
+    #[test]
+    fn mvcc_retry_success_and_non_busy_errors_pass_through_unwrapped() {
+        use asupersync::runtime::RuntimeBuilder;
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async move {
+            let ok: Outcome<u32, DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_ok", 1, || async { Outcome::Ok(7) })
+                    .await;
+            assert!(matches!(ok, Outcome::Ok(7)));
+
+            let not_busy: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_not_busy", 1, || async {
+                    Outcome::Err(DbError::not_found("Agent", "BlueLake"))
+                })
+                .await;
+            let Outcome::Err(err) = not_busy else {
+                panic!("expected error");
+            };
+            assert!(
+                matches!(err, DbError::NotFound { .. }),
+                "non-busy errors must not be wrapped: {err}"
+            );
+        });
+    }
+
     async fn set_agent_last_active_for_test(cx: &Cx, pool: &DbPool, agent_id: i64, ts: i64) {
         let conn = acquire_conn(cx, pool)
             .await
@@ -12940,6 +14459,73 @@ mod tests {
         row.get_named("cnt").expect("decode count")
     }
 
+    async fn count_projects_for_test(cx: &Cx, pool: &DbPool) -> i64 {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        let rows = map_sql_outcome(
+            traw_query(cx, &tracked, "SELECT COUNT(*) AS cnt FROM projects", &[]).await,
+        )
+        .into_result()
+        .expect("count projects");
+        let row = rows.first().expect("count row");
+        row.get_named("cnt").expect("decode count")
+    }
+
+    fn create_file_pool_with_schema_for_test(label: &str) -> (tempfile::TempDir, DbPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("{label}-{}.db", crate::timestamps::now_micros()));
+        let init_conn =
+            crate::DbConn::open_file(db_path.display().to_string()).expect("open schema db");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+        (dir, pool)
+    }
+
+    async fn insert_project_row_for_test(cx: &Cx, pool: &DbPool, row: &ProjectRow) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    Value::BigInt(row.id.expect("project row id")),
+                    Value::Text(row.slug.clone()),
+                    Value::Text(row.human_key.clone()),
+                    Value::BigInt(row.created_at),
+                ],
+            )
+            .await,
+        )
+        .into_result()
+        .expect("insert project row");
+    }
+
     #[test]
     fn cache_scope_for_pool_distinguishes_memory_pools() {
         let config = crate::pool::DbPoolConfig {
@@ -12960,16 +14546,17 @@ mod tests {
             .build()
             .expect("build runtime");
         let cx = asupersync::Cx::for_testing();
+        let suffix = format!("{}_{}", std::process::id(), now_micros());
 
         let cfg_a = crate::pool::DbPoolConfig {
-            database_url: "sqlite://file:mem_a?mode=memory&cache=shared".to_string(),
+            database_url: format!("sqlite://file:mem_a_{suffix}?mode=memory&cache=shared"),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
             ..Default::default()
         };
         let cfg_b = crate::pool::DbPoolConfig {
-            database_url: "sqlite://file:mem_b?mode=memory&cache=shared".to_string(),
+            database_url: format!("sqlite://file:mem_b_{suffix}?mode=memory&cache=shared"),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
@@ -13019,6 +14606,73 @@ mod tests {
                 "pool b should persist its own project row instead of reusing pool a cache"
             );
         });
+    }
+
+    #[test]
+    fn ensure_project_does_not_reuse_ids_from_replaced_file_pool() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("replaced-mailbox.sqlite3");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let human_key = "/data/projects/reconstructed-identity";
+        let identity = mcp_agent_mail_core::resolve_project_identity(human_key);
+
+        let conn = crate::DbConn::open_file(&db_path_text).expect("open seed database");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize seed schema");
+        conn.execute_raw(&format!(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (11, '{}', '{}', 1)",
+            identity.slug, identity.human_key
+        ))
+        .expect("insert original project identity");
+        drop(conn);
+
+        let config = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_text}"),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            run_migrations: false,
+            ..Default::default()
+        };
+        let old_pool =
+            DbPool::new_without_startup_init(&config).expect("create original pool generation");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let old_project = rt
+            .block_on(ensure_project(&cx, &old_pool, human_key))
+            .into_result()
+            .expect("cache original project");
+        assert_eq!(old_project.id, Some(11));
+        drop(old_pool);
+
+        let conn = crate::DbConn::open_file(&db_path_text).expect("open replacement database");
+        conn.execute_raw("DELETE FROM projects")
+            .expect("remove pre-reconstruction identities");
+        conn.execute_raw(&format!(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (29, '{}', '{}', 2)",
+            identity.slug, identity.human_key
+        ))
+        .expect("insert remapped project identity");
+        drop(conn);
+
+        let new_pool =
+            DbPool::new_without_startup_init(&config).expect("create replacement pool generation");
+        let remapped_project = rt
+            .block_on(ensure_project(&cx, &new_pool, human_key))
+            .into_result()
+            .expect("resolve project from replacement database");
+        assert_eq!(
+            remapped_project.id,
+            Some(29),
+            "a replacement pool must resolve the stable identity from SQLite instead of returning the retired generation's cached numeric id"
+        );
     }
 
     #[test]
@@ -13207,6 +14861,15 @@ mod tests {
             Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
         }
         (cx, pool, dir)
+    }
+
+    fn open_direct_repair_connection(db_path: &std::path::Path) -> crate::DbConn {
+        crate::open_sqlite_file_with_recovery(
+            db_path
+                .to_str()
+                .expect("direct repair connection path should be utf-8"),
+        )
+        .expect("open direct repair connection")
     }
 
     #[test]
@@ -13528,22 +15191,18 @@ mod tests {
                 "store-assigned id must be populated"
             );
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(41), Value::BigInt(99)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7); count them
+            // through a canonical connection to it.
+            let atc_conn = open_canonical_atc_conn(&pool, "count idempotent atc experiences")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(41), Value::BigInt(99)],
+                "count idempotent atc experiences",
             )
-            .into_result()
             .expect("count atc experiences");
+            close_canonical_db_conn(atc_conn, "count idempotent atc experiences");
 
             assert_eq!(rows.first().and_then(row_first_i64), Some(1));
         });
@@ -13619,22 +15278,17 @@ mod tests {
                 })
             ));
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(777), Value::BigInt(888)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7).
+            let atc_conn = open_canonical_atc_conn(&pool, "count after rejected insert")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(777), Value::BigInt(888)],
+                "count after rejected insert",
             )
-            .into_result()
             .expect("count experiences after rejected insert");
+            close_canonical_db_conn(atc_conn, "count after rejected insert");
             assert_eq!(rows.first().and_then(row_first_i64), Some(0));
         });
     }
@@ -13667,22 +15321,17 @@ mod tests {
 
             assert_eq!(first, second, "duplicate insert must return the same id");
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(901), Value::BigInt(902)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7).
+            let atc_conn = open_canonical_atc_conn(&pool, "count duplicate inserts")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(901), Value::BigInt(902)],
+                "count duplicate inserts",
             )
-            .into_result()
             .expect("count duplicate inserts");
+            close_canonical_db_conn(atc_conn, "count duplicate inserts");
             assert_eq!(rows.first().and_then(row_first_i64), Some(1));
         });
     }
@@ -13805,7 +15454,12 @@ mod tests {
             );
         });
 
-        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        // ATC experiences are isolated in the sidecar DB (br-bvq1x.11.7); seed
+        // and verify them through a canonical connection to that sidecar.
+        let conn = crate::CanonicalDbConn::open_file(
+            crate::pool::atc_sidecar_sqlite_path(db_path.to_string_lossy().as_ref()).as_str(),
+        )
+        .expect("open ATC sidecar");
         let rows = conn
             .query_sync(
                 "SELECT feature_schema_version, features_json, feature_ext_json \
@@ -13842,7 +15496,12 @@ mod tests {
         let (cx, pool, dir) = setup_test_pool("fetch_legacy_atc_feature_schema.db");
         let db_path = dir.path().join("fetch_legacy_atc_feature_schema.db");
 
-        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        // ATC experiences are isolated in the sidecar DB (br-bvq1x.11.7); seed
+        // and verify them through a canonical connection to that sidecar.
+        let conn = crate::CanonicalDbConn::open_file(
+            crate::pool::atc_sidecar_sqlite_path(db_path.to_string_lossy().as_ref()).as_str(),
+        )
+        .expect("open ATC sidecar");
         conn.execute_sync(
             "INSERT INTO atc_experiences (\
                 experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem,\
@@ -13935,7 +15594,12 @@ mod tests {
     fn reprocess_atc_feature_schema_rewrites_legacy_rows() {
         let (_cx, _pool, dir) = setup_test_pool("reprocess_atc_feature_schema.db");
         let db_path = dir.path().join("reprocess_atc_feature_schema.db");
-        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        // ATC experiences are isolated in the sidecar DB (br-bvq1x.11.7); seed
+        // and verify them through a canonical connection to that sidecar.
+        let conn = crate::CanonicalDbConn::open_file(
+            crate::pool::atc_sidecar_sqlite_path(db_path.to_string_lossy().as_ref()).as_str(),
+        )
+        .expect("open ATC sidecar");
 
         conn.execute_sync(
             "INSERT INTO atc_experiences (\
@@ -14189,24 +15853,20 @@ mod tests {
             .into_result()
             .expect("same-state suppressed retry");
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    &format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1"),
-                    &[Value::BigInt(
-                        i64::try_from(stored.experience_id).expect("experience id"),
-                    )],
-                )
-                .await,
+            // ATC experiences are isolated in the sidecar (br-bvq1x.11.7); verify
+            // through a canonical connection to it.
+            let atc_conn = open_canonical_atc_conn(&pool, "verify transition merged context")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                &format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1"),
+                &[Value::BigInt(
+                    i64::try_from(stored.experience_id).expect("experience id"),
+                )],
+                "verify transition merged context",
             )
-            .into_result()
             .expect("query stored experience");
+            close_canonical_db_conn(atc_conn, "verify transition merged context");
             let stored = decode_atc_experience_row(rows.first().expect("stored row"))
                 .expect("decode stored experience");
 
@@ -14253,8 +15913,6 @@ mod tests {
                     .and_then(serde_json::Value::as_str),
                 Some("suppressed")
             );
-
-            drop(conn);
 
             let invalid = transition_atc_experience(
                 &cx,
@@ -14342,23 +16000,21 @@ mod tests {
                 .into_result()
                 .expect("append seed experience");
 
-            let stale_conn = acquire_conn(&cx, &stale_pool)
-                .await
-                .into_result()
-                .expect("acquire stale snapshot connection");
-            let stale_tracked = tracked(&*stale_conn);
-            map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &stale_tracked,
-                    "SELECT experience_id FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(900), Value::BigInt(900)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7); prime a prior
+            // reader against it. Canonical connections are opened fresh per ATC
+            // op, so the transition below cannot inherit a stale snapshot from
+            // this reader — but we still exercise a prior reader to confirm the
+            // later transition observes the committed seed.
+            let stale_conn = open_canonical_atc_conn(&stale_pool, "prime stale atc reader")
+                .expect("open atc sidecar stale reader");
+            canonical_query_atc_rows(
+                &stale_conn,
+                "SELECT experience_id FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(900), Value::BigInt(900)],
+                "prime stale atc reader",
             )
-            .into_result()
             .expect("seed stale snapshot");
-            drop(stale_conn);
+            close_canonical_db_conn(stale_conn, "prime stale atc reader");
 
             let target = ExperienceRow {
                 experience_id: 0,
@@ -14794,6 +16450,143 @@ mod tests {
                 .expect("sqlite quick_check should succeed"),
             "reconstructed database must stay healthy after runtime ATC writes"
         );
+    }
+
+    /// br-bvq1x.11.7: ATC telemetry is isolated in the `atc.sqlite3` sidecar.
+    /// Verifies the chokepoint redirect (create + write + read on the sidecar),
+    /// that the primary mailbox DB never holds `atc_*` tables, and that the
+    /// sidecar is created with private (0600) permissions.
+    #[test]
+    fn atc_telemetry_is_isolated_in_sidecar_and_absent_from_main_db() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        // The sidecar path is the sibling atc.sqlite3.
+        let atc_path = pool
+            .atc_sqlite_path()
+            .expect("file-backed pool exposes a sidecar path");
+        assert!(
+            atc_path.ends_with("atc.sqlite3"),
+            "sidecar path should be atc.sqlite3: {atc_path}"
+        );
+        assert_ne!(atc_path, db_path.display().to_string());
+
+        let list_atc_tables = |path: &str| -> Vec<String> {
+            let conn =
+                crate::CanonicalDbConn::open_file(path).expect("open db for atc table probe");
+            let rows = conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name LIKE 'atc\\_%' ESCAPE '\\' ORDER BY name",
+                    &[],
+                )
+                .expect("query atc tables");
+            rows.into_iter()
+                .filter_map(|r| r.get_named::<String>("name").ok())
+                .collect()
+        };
+
+        // After init, the primary mailbox DB must have NO atc_* tables.
+        assert!(
+            list_atc_tables(db_path.to_str().expect("utf8 db path")).is_empty(),
+            "primary mailbox DB must not contain atc_* tables after init"
+        );
+
+        let row = ExperienceRow {
+            experience_id: 0,
+            decision_id: 777,
+            effect_id: 888,
+            trace_id: "trc-sidecar-iso".to_string(),
+            claim_id: "clm-sidecar-iso".to_string(),
+            evidence_id: "evi-sidecar-iso".to_string(),
+            state: ExperienceState::Planned,
+            subsystem: ExperienceSubsystem::Liveness,
+            decision_class: "liveness_transition".to_string(),
+            subject: "TealOtter".to_string(),
+            project_key: Some("/tmp/sidecar-iso".to_string()),
+            policy_id: Some("liveness-incumbent-r1".to_string()),
+            effect_kind: EffectKind::Probe,
+            action: "ProbeAgent".to_string(),
+            posterior: vec![("Alive".to_string(), 0.6), ("Dead".to_string(), 0.4)],
+            expected_loss: 1.0,
+            runner_up_action: Some("DeferProbe".to_string()),
+            runner_up_loss: Some(1.4),
+            evidence_summary: "sidecar isolation probe".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+            non_execution_reason: None,
+            outcome: None,
+            created_ts_micros: 1_700_000_300_000_000,
+            dispatched_ts_micros: None,
+            executed_ts_micros: None,
+            resolved_ts_micros: None,
+            features: Some(FeatureVector::zeroed()),
+            feature_ext: None,
+            context: None,
+        };
+        let stored_id = rt
+            .block_on(insert_experience(&cx, &pool, row))
+            .into_result()
+            .expect("insert ATC experience");
+        assert!(stored_id > 0, "experience id should be assigned");
+
+        // The write must land in the sidecar, which now exists with the schema.
+        assert!(
+            std::path::Path::new(&atc_path).exists(),
+            "sidecar file must exist after the first ATC write"
+        );
+        let sidecar_tables = list_atc_tables(&atc_path);
+        assert!(
+            sidecar_tables.contains(&"atc_experiences".to_string()),
+            "sidecar must contain atc_experiences: {sidecar_tables:?}"
+        );
+
+        // Read back through the chokepoint (also targets the sidecar).
+        let fetched = rt
+            .block_on(fetch_durable_atc_experience_by_id(
+                &cx,
+                &pool,
+                i64::try_from(stored_id).expect("id fits i64"),
+            ))
+            .into_result()
+            .expect("fetch ATC experience");
+        assert!(
+            fetched.is_some(),
+            "experience must be readable from the sidecar"
+        );
+
+        // The primary mailbox DB stays free of atc_* tables after ATC writes.
+        assert!(
+            list_atc_tables(db_path.to_str().expect("utf8 db path")).is_empty(),
+            "primary mailbox DB must remain free of atc_* tables after ATC writes"
+        );
+
+        // The sidecar is created private (0600) — same sensitivity as the mail DB.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&atc_path)
+                .expect("stat sidecar")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "ATC sidecar must be created with 0600 perms");
+        }
     }
 
     #[test]
@@ -15663,6 +17456,165 @@ mod tests {
     }
 
     #[test]
+    fn register_agent_runtime_migration_three_slash_url_is_fresh_handle_durable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_three_slash_runtime.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let cfg = crate::pool::DbPoolConfig {
+            database_url,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let project = ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/mcp-agent-mail-three-slash-durability",
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("three-slash durability"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+        });
+
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+        let verify =
+            crate::CanonicalDbConn::open_file(db_path_str).expect("open fresh canonical handle");
+        let project_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM projects \
+                 WHERE slug = 'data-projects-mcp-agent-mail-three-slash-durability'",
+                &[],
+            )
+            .expect("query fresh project count");
+        let agent_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM agents WHERE name = 'BlueLake'",
+                &[],
+            )
+            .expect("query fresh agent count");
+        assert_eq!(
+            project_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "project must be visible to a fresh canonical handle"
+        );
+        assert_eq!(
+            agent_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "agent must be visible to a fresh canonical handle"
+        );
+    }
+
+    #[test]
+    fn register_agent_runtime_migration_extra_slash_url_is_fresh_handle_durable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_extra_slash_runtime.db");
+        let database_url = format!("sqlite:////{}", db_path.display());
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let cfg = crate::pool::DbPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let project = ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/mcp-agent-mail-extra-slash-durability",
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("extra-slash durability"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+        });
+
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+        let verify =
+            crate::CanonicalDbConn::open_file(db_path_str).expect("open fresh canonical handle");
+        let project_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM projects \
+                 WHERE slug = 'data-projects-mcp-agent-mail-extra-slash-durability'",
+                &[],
+            )
+            .expect("query fresh project count");
+        let agent_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM agents WHERE name = 'BlueLake'",
+                &[],
+            )
+            .expect("query fresh agent count");
+        assert_eq!(
+            project_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "project must be visible to a fresh canonical handle"
+        );
+        assert_eq!(
+            agent_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "agent must be visible to a fresh canonical handle"
+        );
+        drop(pool);
+    }
+
+    #[test]
     fn register_agent_case_insensitive_reuses_existing_row() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -15748,6 +17700,385 @@ mod tests {
                 .into_result()
                 .expect("list agents");
             assert_eq!(agents.len(), 1);
+        });
+    }
+
+    #[test]
+    fn get_agent_resolves_case_variant_duplicates_deterministically() {
+        // GH#169: when a concurrent multi-pane registration race leaves two
+        // case-variant rows (e.g. `bluelake` and `BlueLake`) under the
+        // BINARY-unique agents table, get_agent must resolve EVERY casing to the
+        // same canonical (first-registered / lowest-id) row. Otherwise a file
+        // reservation granted under one resolved id can never be released via
+        // another casing (the lease leaks until TTL).
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("get_agent_case_variant_dedup.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        init_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        // Older DBs may lack the NOCASE guard, so case-variant rows can coexist.
+        init_conn
+            .execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+            .ok();
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-get-agent-dup-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            // First registration -> canonical lowest-id row.
+            let first = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "bluelake",
+                "codex-cli",
+                "gpt-5",
+                Some("first"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register bluelake");
+            let canonical_id = first.id.expect("first id");
+
+            // Inject a second, exact-case-variant row directly (the race that
+            // register_agent's NOCASE pre-check would otherwise have collapsed).
+            // Use the pool's own connection so the duplicate is guaranteed
+            // visible to the subsequent get_agent reads.
+            let now = now_micros();
+            let dup_sql = "INSERT INTO agents (project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                 VALUES (?, 'BlueLake', 'codex-cli', 'gpt-5', '', ?, ?, 'auto', 'auto', 0)";
+            let dup_params = [
+                Value::BigInt(project_id),
+                Value::BigInt(now),
+                Value::BigInt(now),
+            ];
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().expect("conn");
+                let tracked = tracked(&*conn);
+                map_sql_outcome(traw_execute(&cx, &tracked, dup_sql, &dup_params).await)
+                    .into_result()
+                    .expect("insert duplicate case variant");
+            }
+            // Clear any cached name->row mapping so resolution goes through SQL.
+            crate::read_cache().clear();
+
+            // Every casing must resolve to the canonical (lowest-id) row.
+            for casing in ["BlueLake", "bluelake", "BLUELAKE", "BlUeLaKe"] {
+                let resolved = get_agent(&cx, &pool, project_id, casing)
+                    .await
+                    .into_result()
+                    .unwrap_or_else(|e| panic!("get_agent({casing}) failed: {e:?}"));
+                assert_eq!(
+                    resolved.id,
+                    Some(canonical_id),
+                    "casing {casing:?} must resolve to the canonical lowest-id row"
+                );
+                crate::read_cache().clear();
+            }
+        });
+    }
+
+    #[test]
+    fn list_agents_deduplicates_case_insensitive_names_without_window_query() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("list_agents_case_dedup_no_window.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/list-agents-case-dedup")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                .expect("drop nocase unique index");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES \
+                 ({project_id}, 'BlueLake', 'codex-cli', 'gpt-5', 'older', 1, 10, 'auto', 'auto'), \
+                 ({project_id}, 'bluelake', 'codex-cli', 'gpt-5', 'newer', 2, 20, 'auto', 'auto'), \
+                 ({project_id}, 'GreenField', 'codex-cli', 'gpt-5', 'newest', 3, 30, 'auto', 'auto')"
+            ))
+            .expect("insert duplicate historical agents");
+            drop(conn);
+
+            let agents = list_agents(&cx, &pool, project_id)
+                .await
+                .into_result()
+                .expect("list agents");
+
+            assert_eq!(
+                agents.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+                vec!["GreenField", "bluelake"]
+            );
+            assert_eq!(agents.len(), 2);
+        });
+    }
+
+    #[test]
+    fn list_agents_bounded_applies_limit_and_activity_floor() {
+        // GH#154 item 3: list_agents_bounded must cap the result (keeping the
+        // most-recently-active agents) and optionally exclude agents idle past
+        // an activity floor, without changing the de-dup / ordering contract.
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("list_agents_bounded.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/list-agents-bounded")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // Five distinct agents with strictly increasing last_active_ts.
+            conn.execute_raw(&format!(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES \
+                 ({project_id}, 'Oldest', 'codex-cli', 'gpt-5', '', 1, 100, 'auto', 'auto'), \
+                 ({project_id}, 'Older',  'codex-cli', 'gpt-5', '', 1, 200, 'auto', 'auto'), \
+                 ({project_id}, 'Mid',    'codex-cli', 'gpt-5', '', 1, 300, 'auto', 'auto'), \
+                 ({project_id}, 'Newer',  'codex-cli', 'gpt-5', '', 1, 400, 'auto', 'auto'), \
+                 ({project_id}, 'Newest', 'codex-cli', 'gpt-5', '', 1, 500, 'auto', 'auto')"
+            ))
+            .expect("insert agents");
+            drop(conn);
+
+            // Unbounded: all five, most-recent first.
+            let all = list_agents_bounded(&cx, &pool, project_id, None, None)
+                .await
+                .into_result()
+                .expect("list all");
+            assert_eq!(
+                all.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer", "Mid", "Older", "Oldest"]
+            );
+
+            // Limit keeps the most-recently-active.
+            let capped = list_agents_bounded(&cx, &pool, project_id, None, Some(2))
+                .await
+                .into_result()
+                .expect("list capped");
+            assert_eq!(
+                capped.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer"]
+            );
+
+            // Activity floor excludes agents below the floor.
+            let recent = list_agents_bounded(&cx, &pool, project_id, Some(350), None)
+                .await
+                .into_result()
+                .expect("list recent");
+            assert_eq!(
+                recent.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer"]
+            );
+
+            // Floor + limit compose.
+            let recent_capped = list_agents_bounded(&cx, &pool, project_id, Some(150), Some(2))
+                .await
+                .into_result()
+                .expect("list recent capped");
+            assert_eq!(
+                recent_capped.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer"]
+            );
+        });
+    }
+
+    #[test]
+    fn atc_population_snapshot_joins_projects_and_bounds_recent_agents() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("atc_population_snapshot.db");
+
+        rt.block_on(async {
+            let first = ensure_project(&cx, &pool, "/tmp/atc-population-a")
+                .await
+                .into_result()
+                .expect("ensure first project");
+            let second = ensure_project(&cx, &pool, "/tmp/atc-population-b")
+                .await
+                .into_result()
+                .expect("ensure second project");
+            let first_id = first.id.expect("first project id");
+            let second_id = second.id.expect("second project id");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES \
+                 ({first_id}, 'Old',     'codex-cli',  'gpt-5', '', 1, 100, 'auto', 'auto'), \
+                 ({first_id}, 'RecentA', 'codex-cli',  'gpt-5', '', 1, 500, 'auto', 'auto'), \
+                 ({second_id}, 'RecentB','claude-code','opus',  '', 1, 300, 'auto', 'auto'), \
+                 ({second_id}, 'Unknown','claude-code','opus',  '', 1,   0, 'auto', 'auto')"
+            ))
+            .expect("insert population agents");
+            drop(conn);
+
+            let recent = list_atc_population_snapshot(&cx, &pool, 200, 10)
+                .await
+                .into_result()
+                .expect("load recent population");
+            assert_eq!(
+                recent.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+                vec!["RecentA", "RecentB", "Unknown"]
+            );
+            assert_eq!(recent[0].project_id, first_id);
+            assert_eq!(recent[0].project_key, "/tmp/atc-population-a");
+            assert_eq!(recent[1].project_id, second_id);
+            assert_eq!(recent[1].program, "claude-code");
+            assert_eq!(recent[2].last_active_ts, 0);
+
+            let capped = list_atc_population_snapshot(&cx, &pool, 200, 2)
+                .await
+                .into_result()
+                .expect("load capped population");
+            assert_eq!(
+                capped.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+                vec!["RecentA", "RecentB"]
+            );
+        });
+    }
+
+    #[test]
+    fn prune_released_file_reservations_deletes_old_released_keeps_active_and_recent() {
+        // GH#154 item 2: the retention sweep hard-DELETEs released/expired
+        // reservations past the horizon while preserving (a) still-active
+        // reservations and (b) recently-released ones, and removes the matching
+        // sidecar release-ledger rows.
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_released_reservations.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/prune-reservations")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let agent = register_agent(
+                &cx, &pool, project_id, "RedFox", "codex-cli", "gpt-5", Some("holder"),
+                Some("auto"), None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let old_release = now - 40 * day_us; // older than 30-day horizon
+            let recent_release = now - day_us; // within horizon
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // id 1: released long ago (eligible). id 2: released recently (keep).
+            // id 3: active (keep).
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                 VALUES \
+                 (1, {project_id}, {agent_id}, 'a.rs', 1, 'r', {old_release}, {old_release}, {old_release}), \
+                 (2, {project_id}, {agent_id}, 'b.rs', 1, 'r', {recent_release}, {recent_release}, {recent_release}), \
+                 (3, {project_id}, {agent_id}, 'c.rs', 1, 'r', {now}, {future}, NULL)",
+                future = now + 3600 * 1_000_000,
+            ))
+            .expect("insert reservations");
+            // Sidecar ledger row for the old released reservation.
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, {old_release})"
+            ))
+            .expect("insert release ledger");
+            drop(conn);
+
+            let older_than_us = now - 30 * day_us;
+            let deleted = prune_released_file_reservations(&cx, &pool, Some(project_id), older_than_us)
+                .await
+                .into_result()
+                .expect("prune");
+            assert_eq!(deleted, 1, "only the long-released reservation is pruned");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let remaining = conn
+                .query_sync("SELECT id FROM file_reservations ORDER BY id", &[])
+                .expect("select remaining");
+            let ids: Vec<i64> = remaining
+                .iter()
+                .filter_map(|r| r.get_named::<i64>("id").ok())
+                .collect();
+            assert_eq!(ids, vec![2, 3], "active + recently-released survive");
+            // The ledger row for the pruned reservation is gone.
+            let ledger = conn
+                .query_sync(
+                    "SELECT reservation_id FROM file_reservation_releases WHERE reservation_id = 1",
+                    &[],
+                )
+                .expect("select ledger");
+            assert!(ledger.is_empty(), "pruned reservation's ledger row is removed");
         });
     }
 
@@ -15971,6 +18302,210 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_project_collapses_symlink_and_realpath_aliases() {
+        use asupersync::runtime::RuntimeBuilder;
+        use std::os::unix::fs::symlink;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+                ("WORKTREES_ENABLED", "0"),
+                ("PROJECT_IDENTITY_MODE", "dir"),
+            ],
+            || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                let (dir, pool) = create_file_pool_with_schema_for_test("symlink-aliases");
+
+                let real = dir.path().join("real-project");
+                std::fs::create_dir_all(&real).expect("create real project");
+                let link = dir.path().join("project-link");
+                symlink(&real, &link).expect("create symlink");
+
+                let real_key = real.canonicalize().expect("canonical real");
+                let real_key = real_key.to_string_lossy().to_string();
+                let link_key = link.to_string_lossy().to_string();
+
+                rt.block_on(async {
+                    let from_link = ensure_project(&cx, &pool, &link_key)
+                        .await
+                        .into_result()
+                        .expect("ensure via link");
+                    let from_real = ensure_project(&cx, &pool, &real_key)
+                        .await
+                        .into_result()
+                        .expect("ensure via realpath");
+                    let by_raw_link = get_project_by_human_key(&cx, &pool, &link_key)
+                        .await
+                        .into_result()
+                        .expect("lookup by raw link");
+
+                    assert_eq!(from_link.id, from_real.id);
+                    assert_eq!(from_link.id, by_raw_link.id);
+                    assert_eq!(from_link.human_key, real_key);
+                    assert_eq!(from_real.human_key, real_key);
+                    assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
+                });
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_project_reuses_existing_raw_symlink_project_row() {
+        use asupersync::runtime::RuntimeBuilder;
+        use std::os::unix::fs::symlink;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+                ("WORKTREES_ENABLED", "0"),
+                ("PROJECT_IDENTITY_MODE", "dir"),
+            ],
+            || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                let (dir, pool) = create_file_pool_with_schema_for_test("raw-symlink-reuse");
+
+                let real = dir.path().join("real-project");
+                std::fs::create_dir_all(&real).expect("create real project");
+                let link = dir.path().join("project-link");
+                symlink(&real, &link).expect("create symlink");
+
+                let real_key = real.canonicalize().expect("canonical real");
+                let real_key = real_key.to_string_lossy().to_string();
+                let link_key = link.to_string_lossy().to_string();
+                let legacy_raw_slug = mcp_agent_mail_core::slugify(&link_key);
+                let legacy_row = ProjectRow::new(legacy_raw_slug.clone(), link_key.clone());
+                let legacy_row = ProjectRow {
+                    id: Some(41),
+                    ..legacy_row
+                };
+
+                rt.block_on(async {
+                    insert_project_row_for_test(&cx, &pool, &legacy_row).await;
+
+                    let ensured = ensure_project(&cx, &pool, &real_key)
+                        .await
+                        .into_result()
+                        .expect("ensure via realpath");
+                    let by_raw_link = get_project_by_human_key(&cx, &pool, &link_key)
+                        .await
+                        .into_result()
+                        .expect("lookup by raw link");
+
+                    assert_eq!(ensured.id, legacy_row.id);
+                    assert_eq!(ensured.slug, legacy_raw_slug);
+                    assert_eq!(ensured.human_key, link_key);
+                    assert_eq!(by_raw_link.id, legacy_row.id);
+                    assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn ensure_project_collapses_case_variants_when_filesystem_is_case_insensitive() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+                ("WORKTREES_ENABLED", "0"),
+                ("PROJECT_IDENTITY_MODE", "dir"),
+            ],
+            || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                let (dir, pool) = create_file_pool_with_schema_for_test("case-variant-aliases");
+                let stored = dir.path().join("ProjectRepo");
+                std::fs::create_dir_all(&stored).expect("create mixed-case project path");
+                let variant = dir.path().join("projectrepo");
+
+                if !variant.exists() {
+                    return;
+                }
+
+                rt.block_on(async {
+                    let from_stored = ensure_project(&cx, &pool, &stored.to_string_lossy())
+                        .await
+                        .into_result()
+                        .expect("ensure stored spelling");
+                    let from_variant = ensure_project(&cx, &pool, &variant.to_string_lossy())
+                        .await
+                        .into_result()
+                        .expect("ensure case variant");
+
+                    assert_eq!(from_stored.id, from_variant.id);
+                    assert_eq!(from_stored.slug, from_variant.slug);
+                    assert_eq!(from_stored.human_key, from_variant.human_key);
+                    assert!(from_stored.human_key.ends_with("ProjectRepo"));
+                    assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn project_lookup_tolerates_null_created_at_metadata() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("project_null_created_at.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open nullable project schema connection");
+        init_conn
+            .execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at INTEGER)")
+            .expect("create nullable project table");
+        init_conn
+            .execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, NULL)",
+                &[
+                    Value::BigInt(1),
+                    Value::Text("null-created-at".to_string()),
+                    Value::Text("/tmp/null-created-at".to_string()),
+                ],
+            )
+            .expect("insert project with missing created_at metadata");
+        crate::close_db_conn(init_conn, "project null created_at test init connection");
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool_without_startup_init(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let project = get_project_by_slug(&cx, &pool, "null-created-at")
+                .await
+                .into_result()
+                .expect("lookup project with nullable created_at metadata");
+
+            assert_eq!(project.id, Some(1));
+            assert_eq!(project.slug, "null-created-at");
+            assert_eq!(project.human_key, "/tmp/null-created-at");
+            assert_eq!(project.created_at, 0);
+        });
+    }
+
     #[test]
     fn list_thread_messages_limit_returns_latest_window_in_order() {
         use asupersync::runtime::RuntimeBuilder;
@@ -16048,6 +18583,214 @@ mod tests {
             assert_eq!(rows.len(), 2, "should return the requested window size");
             assert_eq!(rows[0].subject, "msg-3");
             assert_eq!(rows[1].subject, "msg-4");
+        });
+    }
+
+    #[test]
+    fn create_message_with_recipients_dedupes_duplicate_recipient_ids() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("dedupe_duplicate_recipients.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-dedupe-recip-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient_one = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient one");
+            let recipient_two = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "PurpleElk",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient two");
+
+            let sender_id = sender.id.expect("sender id");
+            let r1 = recipient_one.id.expect("recipient one id");
+            let r2 = recipient_two.id.expect("recipient two id");
+
+            // The same agent id (r1) appears twice — once as `to`, once as `cc` —
+            // alongside a second distinct recipient. The primary key is
+            // (message_id, agent_id), so without de-duplication the second insert
+            // of r1 fails UNIQUE and the call returns a false isError even though
+            // the message and every distinct recipient were persisted (#243 Bug 2).
+            let recipients = [(r1, "to"), (r2, "to"), (r1, "cc")];
+
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "dedupe-subject",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("create message with a duplicated recipient id must succeed");
+
+            let message_id = message.id.expect("message id");
+            let rows = list_message_recipients_by_message(&cx, &pool, project_id, message_id)
+                .await
+                .into_result()
+                .expect("list recipients");
+
+            assert_eq!(
+                rows.len(),
+                2,
+                "exactly one recipient row per distinct agent id"
+            );
+            let mut names: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["GreenStone".to_string(), "PurpleElk".to_string()],
+                "both distinct recipients persisted exactly once"
+            );
+        });
+    }
+
+    #[test]
+    fn create_message_recipients_json_preserves_request_order() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recipients_json_request_order.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recip-order-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let purple = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "PurpleElk",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register PurpleElk");
+            let green = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register GreenStone");
+
+            // Deliberately NON-alphabetical request order. The stored
+            // recipients_json must preserve it verbatim: the archive canonical
+            // artifact serializes the same resolved vectors, and reconstruct
+            // replays archive arrays as-is, so any sorting introduced on any
+            // of those surfaces re-creates the ts1 cosmetic reconstruct drift
+            // (br-ndc60).
+            let recipients = [
+                (purple.id.expect("purple id"), "to"),
+                (green.id.expect("green id"), "to"),
+                (sender.id.expect("sender id"), "cc"),
+            ];
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "order-subject",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&message.recipients_json).expect("recipients json");
+            assert_eq!(
+                parsed["to"],
+                serde_json::json!(["PurpleElk", "GreenStone"]),
+                "to-recipients must keep request order, not sort"
+            );
+            assert_eq!(parsed["cc"], serde_json::json!(["BlueLake"]));
         });
     }
 
@@ -17819,7 +20562,7 @@ mod tests {
         );
         assert!(
             crate::cache::read_cache()
-                .get_agent_scoped(pool.sqlite_path(), 1, "BlueLake")
+                .get_agent_scoped(&pool.sqlite_identity_key(), 1, "BlueLake")
                 .is_none(),
             "cleanup must invalidate cached agent rows"
         );
@@ -18072,6 +20815,84 @@ mod tests {
             }
 
             rollback_tx(&cx, &tracked).await;
+        });
+    }
+
+    #[test]
+    fn durability_probe_rejects_pooled_only_retained_autocommit_agent() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("pooled_only_retained_autocommit_agent.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-pooled-only-agent', 0)",
+            )
+            .expect("seed project");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire pooled conn");
+            conn.execute_raw("PRAGMA autocommit_retain = ON")
+                .expect("enable retained autocommit for regression setup");
+            if let Err(error) = conn.execute_raw("PRAGMA fsqlite.concurrent_mode = OFF") {
+                let message = error.to_string();
+                assert!(
+                    message.contains("unknown database fsqlite"),
+                    "force retained-autocommit candidate mode: {error}"
+                );
+                return;
+            }
+            conn.execute_raw(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 'BlueLake', 'codex-cli', 'gpt-5', 'pooled-only', 0, 0, 'auto', 'auto')",
+            )
+            .expect("park agent insert in retained autocommit state");
+            drop(conn);
+
+            let err = verify_agent_visible_after_commit(&cx, &pool, 1, "BlueLake")
+                .await
+                .into_result()
+                .expect_err("fresh durability probe must reject pooled-only retained rows");
+            match err {
+                asupersync::OutcomeError::Err(DbError::Internal(msg)) => {
+                    assert!(
+                        msg.contains("agent row not visible after commit"),
+                        "unexpected error: {msg}"
+                    );
+                }
+                other => panic!("expected internal durability error, got: {other:?}"),
+            }
         });
     }
 
@@ -18418,24 +21239,121 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_probe_errors_are_never_advisory() {
-        assert!(is_hard_post_commit_probe_error(&DbError::Sqlite(
-            "disk I/O error".to_string(),
-        )));
-        assert!(is_hard_post_commit_probe_error(&DbError::Pool(
+    fn post_commit_probe_transient_errors_are_advisory_consistency_errors_are_hard() {
+        // GH#179: transient / execution probe failures prove nothing about the
+        // durability of the already-committed row, so they must be advisory
+        // (never trigger destructive cleanup of committed data).
+        assert!(!is_hard_post_commit_probe_error(&DbError::Sqlite(
             "database is locked".to_string(),
         )));
-        assert!(is_hard_post_commit_probe_error(&DbError::PoolExhausted {
+        assert!(!is_hard_post_commit_probe_error(&DbError::Sqlite(
+            "disk I/O error".to_string(),
+        )));
+        assert!(!is_hard_post_commit_probe_error(&DbError::Pool(
+            "database is locked".to_string(),
+        )));
+        assert!(!is_hard_post_commit_probe_error(&DbError::PoolExhausted {
             message: "pool exhausted".to_string(),
             pool_size: 1,
             max_overflow: 0,
         }));
-        assert!(is_hard_post_commit_probe_error(&DbError::ResourceBusy(
-            "probe cancelled".to_string(),
+        assert!(!is_hard_post_commit_probe_error(&DbError::ResourceBusy(
+            "database is busy (snapshot conflict on pages: 5)".to_string(),
+        )));
+        // The cancel/panic wrapper errors are likewise advisory: a cancelled or
+        // panicked probe cannot prove the committed row is inconsistent.
+        assert!(!is_hard_post_commit_probe_error(
+            &post_commit_probe_cancelled_error("create_message_with_recipients", "1:42",)
+        ));
+        assert!(!is_hard_post_commit_probe_error(
+            &post_commit_probe_panicked_error("create_message_with_recipients", "1:42", "boom",)
+        ));
+        // Only a probe that RAN and observed a genuine ghost success is hard.
+        assert!(is_hard_post_commit_probe_error(&DbError::Internal(
+            "message row not visible after commit for message_id=1 project_id=1".to_string(),
         )));
         assert!(is_hard_post_commit_probe_error(&DbError::Internal(
-            "probe panicked".to_string(),
+            "message recipient rows not visible after commit for message_id=1: expected=2 actual=0"
+                .to_string(),
         )));
+    }
+
+    #[test]
+    fn post_commit_probe_requires_cleanup_only_on_proven_inconsistency() {
+        // GH#179 regression: a transient probe error after a committed write must
+        // NOT trigger cleanup, regardless of the writer's own sample.
+        let transient = DbError::Sqlite("database is locked".to_string());
+        assert!(!post_commit_probe_requires_cleanup(&transient, false));
+        assert!(!post_commit_probe_requires_cleanup(&transient, true));
+
+        // A genuine ghost-success verdict triggers cleanup only when the writer's
+        // own post-commit sample also failed to confirm the row is present.
+        let ghost = DbError::Internal(
+            "message recipient rows not visible after commit for message_id=1: expected=2 actual=0"
+                .to_string(),
+        );
+        assert!(post_commit_probe_requires_cleanup(&ghost, false));
+        // Writer confirms the message row landed → cross-handle visibility lag,
+        // not missing data → never delete.
+        assert!(!post_commit_probe_requires_cleanup(&ghost, true));
+    }
+
+    #[test]
+    fn writer_sample_refutation_is_scoped_to_the_probe_verdict_class() {
+        // GH#179 follow-up: the writer's own sample only refutes the ghost class
+        // it actually contradicts.
+        let message_ghost = DbError::Internal(
+            "message row not visible after commit for message_id=1 project_id=1".to_string(),
+        );
+        let recipient_ghost = DbError::Internal(
+            "message recipient rows not visible after commit for message_id=1: expected=2 actual=0"
+                .to_string(),
+        );
+        let both = WriterPostCommitCounts {
+            message_count: Some(1),
+            recipient_count: Some(2),
+        };
+        let message_only = WriterPostCommitCounts {
+            message_count: Some(1),
+            recipient_count: Some(0),
+        };
+        let none = WriterPostCommitCounts::default();
+
+        // A message-row ghost is refuted by the message row alone.
+        assert!(writer_sample_refutes_probe_verdict(&message_ghost, both, 2));
+        assert!(writer_sample_refutes_probe_verdict(
+            &message_ghost,
+            message_only,
+            2
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &message_ghost,
+            none,
+            2
+        ));
+
+        // A recipient-rows ghost needs the full expected recipient count too:
+        // a present message row with zero recipient rows is delivered to nobody.
+        assert!(writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            both,
+            2
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            message_only,
+            2
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            both,
+            3
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            none,
+            2
+        ));
     }
 
     #[test]
@@ -18850,7 +21768,7 @@ mod tests {
     }
 
     #[test]
-    fn create_message_with_recipients_pool_drop_surfaces_repeated_drop_close_warnings() {
+    fn create_message_with_recipients_pool_drop_closes_cleanly() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
 
@@ -18964,17 +21882,14 @@ mod tests {
                     assert_eq!(recipients[0].kind, "to");
                 });
 
-                // Dropping the pool currently tears down idle sqlmodel_pool
-                // connections without an explicit Connection::close(), which
-                // FrankenConnection surfaces as `drop_close`.
                 drop(pool);
             }
         });
 
-        assert!(
-            capture.drop_close_count() >= iterations,
-            "expected at least {iterations} pooled drop_close warnings after repeated message_recipients writes, saw {}",
-            capture.drop_close_count()
+        assert_eq!(
+            capture.drop_close_count(),
+            0,
+            "pooled connection teardown should close cleanly without drop_close warnings"
         );
     }
 
@@ -19240,7 +22155,7 @@ mod tests {
             assert_eq!(fetched.attachments_policy, "inline");
 
             let cached = crate::read_cache()
-                .get_agent_scoped(pool.sqlite_path(), project_id, "BlueLake")
+                .get_agent_scoped(&pool.sqlite_identity_key(), project_id, "BlueLake")
                 .expect("cache entry should be refreshed");
             assert_eq!(cached.contact_policy, "closed");
             assert_eq!(cached.attachments_policy, "inline");
@@ -20607,8 +23522,7 @@ mod tests {
                 .expect("link product");
 
             let db_path = dir.path().join("product_list_orphaned_project.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -20670,8 +23584,7 @@ mod tests {
                 .expect("link product");
 
             let db_path = dir.path().join("list_projects_product_orphaned.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -20733,8 +23646,7 @@ mod tests {
                 .expect("link product");
 
             let db_path = dir.path().join("get_project_by_slug_orphaned.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -20788,8 +23700,7 @@ mod tests {
                 .expect("link product");
 
             let db_path = dir.path().join("get_project_by_human_key_orphaned.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -20843,8 +23754,7 @@ mod tests {
                 .expect("link product");
 
             let db_path = dir.path().join("get_project_by_id_orphaned.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -20897,8 +23807,7 @@ mod tests {
                 .expect("link product");
 
             let db_path = dir.path().join("get_product_by_key_orphaned.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct product cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM products WHERE id = ?",
@@ -21359,15 +24268,34 @@ mod tests {
         );
         assert!(select_sql.contains("expires_ts <= ?"));
         assert!(!select_sql.contains("expires_ts < ?"));
-        assert!(select_sql.contains("NOT EXISTS"));
+        // #154 item 1: the release-ledger exclusion is an uncorrelated anti-join
+        // (`id NOT IN (SELECT reservation_id ...)`), not a correlated `NOT EXISTS`
+        // subquery FrankenSQLite routes to its slow in-memory interpreter.
+        assert!(select_sql.contains("NOT IN"));
+        assert!(!select_sql.contains("NOT EXISTS"));
     }
 
     #[test]
     fn active_reservation_predicate_for_alias_retargets_release_ledger_probe() {
         let aliased = active_reservation_predicate_for("fr");
-        assert!(aliased.contains("reservation_id = fr.id"));
-        assert!(!aliased.contains("reservation_id = file_reservations.id"));
+        // The uncorrelated ledger anti-join is retargeted to the alias.
+        assert!(aliased.contains("fr.id NOT IN"));
+        assert!(!aliased.contains("file_reservations.id NOT IN"));
+        assert!(aliased.contains("SELECT reservation_id FROM file_reservation_releases"));
         assert!(aliased.contains("fr.released_ts IS NULL"));
+    }
+
+    #[test]
+    fn active_reservation_predicate_avoids_correlated_subquery() {
+        // The correlated `NOT EXISTS (... WHERE reservation_id = file_reservations.id)`
+        // form degraded to ~5s on a 30k-row mailbox under FrankenSQLite (#154
+        // item 1: routed to the in-memory interpreter). The uncorrelated set
+        // form materializes the released set once.
+        assert!(ACTIVE_RESERVATION_PREDICATE.contains(
+            "file_reservations.id NOT IN (\n        SELECT reservation_id FROM file_reservation_releases"
+        ));
+        assert!(!ACTIVE_RESERVATION_PREDICATE.contains("NOT EXISTS"));
+        assert!(!ACTIVE_RESERVATION_PREDICATE.contains("WHERE reservation_id ="));
     }
 
     #[test]
@@ -21771,8 +24699,7 @@ mod tests {
             .expect("create message");
 
             let db_path = dir.path().join("global_inbox_orphaned_project.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -22063,7 +24990,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recipient_lookup_orphaned_agent.db");
+        let (cx, pool, dir) = setup_test_pool("recipient_lookup_orphaned_agent.db");
 
         rt.block_on(async {
             let base = now_micros();
@@ -22125,16 +25052,52 @@ mod tests {
             .expect("create message");
             let message_id = message.id.expect("message id");
 
-            cleanup_committed_agent_after_consistency_failure(
-                &cx,
-                &pool,
+            let db_path = dir.path().join("recipient_lookup_orphaned_agent.db");
+            let repair_conn = open_direct_repair_connection(&db_path);
+            let recipient_rows_before_delete = repair_conn
+                .query_sync(
+                    "SELECT COUNT(*) AS count FROM message_recipients WHERE message_id = ? AND agent_id = ?",
+                    &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+                )
+                .expect("count recipient rows before orphaning");
+            assert_eq!(
+                recipient_rows_before_delete[0]
+                    .get_named::<i64>("count")
+                    .unwrap_or(-1),
+                1,
+                "message creation must persist the message_recipients row"
+            );
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM agents WHERE id = ? AND project_id = ?",
+                    &[Value::BigInt(recipient_id), Value::BigInt(project_id)],
+                )
+                .expect("orphan recipient row");
+            repair_conn
+                .execute_sync(
+                    "INSERT OR IGNORE INTO message_recipients \
+                     (message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES (?, ?, 'to', NULL, NULL)",
+                    &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+                )
+                .expect("restore legacy orphaned recipient row fixture");
+            let recipient_rows = repair_conn
+                .query_sync(
+                    "SELECT COUNT(*) AS count FROM message_recipients WHERE message_id = ? AND agent_id = ?",
+                    &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+                )
+                .expect("count orphaned recipient rows");
+            assert_eq!(
+                recipient_rows[0].get_named::<i64>("count").unwrap_or(-1),
+                1,
+                "intentional orphan fixture must keep the message_recipients row"
+            );
+            crate::cache::read_cache().invalidate_agent_scoped(
+                &cache_scope_for_pool(&pool),
                 project_id,
-                recipient_id,
                 "BlueLake",
-            )
-            .await
-            .into_result()
-            .expect("orphan recipient row");
+                Some(recipient_id),
+            );
 
             let expected = format!("[unknown-agent-{recipient_id}]");
 
@@ -22377,8 +25340,7 @@ mod tests {
             .expect("create message");
 
             let db_path = dir.path().join("global_unread_orphaned_project.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -22618,8 +25580,7 @@ mod tests {
             .expect("create message");
 
             let db_path = dir.path().join("global_search_orphaned_project.db");
-            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
-                .expect("open direct project cleanup connection");
+            let repair_conn = open_direct_repair_connection(&db_path);
             repair_conn
                 .execute_sync(
                     "DELETE FROM projects WHERE id = ?",
@@ -22865,16 +25826,27 @@ mod tests {
             .build()
             .expect("build runtime");
         let cx = asupersync::Cx::for_testing();
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            mcp_agent_mail_core::timestamps::now_micros()
+        );
 
         let cfg_a = crate::pool::DbPoolConfig {
-            database_url: "sqlite://file:mem_a?mode=memory&cache=shared".to_string(),
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: Some(std::path::PathBuf::from(format!(
+                "/tmp/deferred-touch-scope-a-{unique}"
+            ))),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
             ..Default::default()
         };
         let cfg_b = crate::pool::DbPoolConfig {
-            database_url: "sqlite://file:mem_b?mode=memory&cache=shared".to_string(),
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: Some(std::path::PathBuf::from(format!(
+                "/tmp/deferred-touch-scope-b-{unique}"
+            ))),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
@@ -23296,7 +26268,7 @@ mod tests {
             };
             let snapshot = tracker.snapshot();
             assert!(
-                snapshot.total <= 6,
+                snapshot.total <= 7,
                 "batch acknowledge should use a fixed query count for a 100+ message wave, got {snapshot:?}"
             );
             assert_eq!(
@@ -23387,6 +26359,101 @@ mod tests {
     }
 
     #[test]
+    fn mark_message_read_keeps_ack_required_messages_pending() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_message_read_keeps_ack_pending.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-keeps-ack-pending")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Ack should stay pending after read",
+                "Body",
+                Some("mark-read-keeps-ack-pending"),
+                "normal",
+                true,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+            let message_id = message.id.expect("message id");
+
+            let read_ts = mark_message_read(&cx, &pool, recipient_id, message_id)
+                .await
+                .into_result()
+                .expect("mark message read");
+
+            let stats = get_inbox_stats(&cx, &pool, recipient_id)
+                .await
+                .into_result()
+                .expect("get inbox stats")
+                .expect("recipient stats row");
+            assert_eq!(stats.unread_count, 0);
+            assert_eq!(stats.ack_pending_count, 1);
+
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection for verification");
+            let rows = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients \
+                     WHERE agent_id = ? AND message_id = ?",
+                    &[Value::BigInt(recipient_id), Value::BigInt(message_id)],
+                )
+                .expect("query recipient row");
+            assert_eq!(rows.len(), 1, "expected one recipient row");
+            let row = rows.first().expect("recipient row");
+            let stored_read_ts: Option<i64> = row.get_named("read_ts").expect("read_ts");
+            let stored_ack_ts: Option<i64> = row.get_named("ack_ts").expect("ack_ts");
+            assert_eq!(stored_read_ts, Some(read_ts));
+            assert_eq!(stored_ack_ts, None);
+        });
+    }
+
+    #[test]
     fn mark_message_read_tolerates_missing_inbox_stats_table() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -23463,7 +26530,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_message_read_propagates_non_missing_inbox_stats_errors() {
+    fn mark_message_read_tolerates_non_missing_inbox_stats_errors() {
         use asupersync::runtime::RuntimeBuilder;
 
         let rt = RuntimeBuilder::current_thread()
@@ -23517,7 +26584,7 @@ mod tests {
                 &pool,
                 project_id,
                 sender.id.expect("sender id"),
-                "View-backed inbox_stats should fail loudly",
+                "View-backed inbox_stats should not block read state",
                 "Body",
                 Some("mark-read-inbox-stats-view"),
                 "normal",
@@ -23560,6 +26627,22 @@ mod tests {
                 ),
             }
         });
+    }
+
+    #[test]
+    fn inbox_stats_rebuild_error_filter_only_tolerates_known_compatibility_cases() {
+        assert!(is_tolerable_inbox_stats_rebuild_error(&DbError::Sqlite(
+            "no such table: inbox_stats".to_string()
+        )));
+        assert!(is_tolerable_inbox_stats_rebuild_error(&DbError::Sqlite(
+            "cannot modify inbox_stats because it is a view".to_string()
+        )));
+        assert!(!is_tolerable_inbox_stats_rebuild_error(&DbError::Sqlite(
+            "database is locked while executing DELETE FROM inbox_stats".to_string()
+        )));
+        assert!(!is_tolerable_inbox_stats_rebuild_error(&DbError::Sqlite(
+            "disk I/O error while updating inbox_stats".to_string()
+        )));
     }
 
     // ─── Property tests ───────────────────────────────────────────────────────

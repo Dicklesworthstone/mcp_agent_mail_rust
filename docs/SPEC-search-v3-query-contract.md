@@ -136,7 +136,7 @@ pub struct SearchQuery {
     #[serde(default)]
     pub ranking: RankingMode,
 
-    /// Maximum results to return (clamped to 1..=1000). Default: 50.
+    /// Maximum results to return (clamped to 1..=5000). Default: 50.
     pub limit: Option<usize>,
 
     /// Cursor for stable pagination (opaque token from previous result).
@@ -193,7 +193,7 @@ pub struct SearchQuery {
 | `mode` | `Lexical` | Identical to V2 behavior |
 | `doc_kind` | `Message` | Unchanged |
 | `ranking` | `Relevance` | Unchanged |
-| `limit` | 50 | Clamped 1..=1000 |
+| `limit` | 50 | Clamped 1..=5000 |
 | `rerank_top_k` | 100 | Clamped 10..=1000 |
 | `rrf_k` | 60 | Standard RRF constant |
 | `min_score` | None | No threshold (return all) |
@@ -207,7 +207,7 @@ pub struct SearchQuery {
    handles syntax errors by treating the query as a phrase.
 3. **Mode downgrade**: If requested mode's feature is unavailable, downgrade per
    fallback chain (section 1.2). Never error — always serve results.
-4. **Limit clamping**: `effective_limit() = limit.unwrap_or(50).clamp(1, 1000)`.
+4. **Limit clamping**: `effective_limit() = limit.unwrap_or(50).clamp(1, 5000)`.
 5. **rerank_top_k clamping**: `effective_rerank_top_k() = rerank_top_k.unwrap_or(100).clamp(10, 1000)`.
 6. **rrf_k clamping**: `effective_rrf_k() = rrf_k.unwrap_or(60).clamp(1, 1000)`.
 7. **Conflicting filters**: `sender_name` and `recipient_name` can be used together
@@ -427,7 +427,7 @@ search_messages(
     project_key: str,
     query: str,
     limit?: int,                # default 20, max 1000
-    offset?: int,               # default 0
+    offset?: int,               # default 0; offset + effective limit <= 5000
     ranking?: str,              # "relevance" | "recency"
     sender?: str,               # aliases: from_agent, sender_name
     importance?: str,           # comma-separated: low,normal,high,urgent

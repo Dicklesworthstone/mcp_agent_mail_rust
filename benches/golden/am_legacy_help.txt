@@ -1,0 +1,12 @@
+Legacy Python installation detection, migration/import, and status
+
+Usage: am legacy <COMMAND>
+
+Commands:
+  detect  Detect legacy Python installation markers and likely data locations
+  import  Import/migrate a legacy Python installation into Rust-native schema
+  status  Show status/history of legacy import receipts
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

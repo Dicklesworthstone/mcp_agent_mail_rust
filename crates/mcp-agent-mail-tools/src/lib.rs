@@ -23,15 +23,20 @@
     clippy::manual_ignore_case_cmp
 )]
 
+mod archive_read;
+
 pub mod build_slots;
 pub mod contacts;
+pub mod degraded_intents;
 pub mod identity;
 pub mod llm;
 pub mod macros;
 pub mod messaging;
 pub mod metrics;
 pub mod products;
+pub mod proof_gate;
 pub mod reservation_index;
+pub mod reservation_parity;
 pub mod reservations;
 pub mod resources;
 pub mod search;
@@ -48,6 +53,7 @@ pub use metrics::{
     slow_tools, tool_index, tool_meta, tool_metrics_snapshot, tool_metrics_snapshot_full,
 };
 pub use products::*;
+pub use reservation_parity::*;
 pub use reservations::*;
 pub use resources::*;
 pub use search::*;
@@ -56,12 +62,11 @@ pub mod tool_util {
     use fastmcp::McpErrorCode;
     use fastmcp::prelude::*;
     use mcp_agent_mail_core::Config;
-    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, create_pool, get_or_create_pool};
-    use serde_json::json;
-    use std::collections::BTreeSet;
+    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, get_or_create_pool};
+    use serde_json::{Map, Value, json};
+    use std::collections::{BTreeSet, VecDeque};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, LazyLock, Mutex};
 
     pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
     pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -185,56 +190,244 @@ pub mod tool_util {
         message.contains("not visible after commit")
     }
 
+    fn resource_busy_message(message: &str) -> String {
+        if mcp_agent_mail_db::is_mailbox_ownership_contention(message) {
+            format!(
+                "Resource is temporarily busy: a running Agent Mail server owns this mailbox. \
+                 Route this operation through that server (or stop it) instead of writing \
+                 directly. Detail: {message}"
+            )
+        } else {
+            "Resource is temporarily busy. Wait a moment and try again.".to_string()
+        }
+    }
+
+    fn db_error_classification_data(
+        classification: mcp_agent_mail_db::DbErrorClassification,
+    ) -> serde_json::Value {
+        json!({
+            "class": classification.class.as_str(),
+            "severity": classification.severity.as_str(),
+            "repairable": classification.repairable,
+            "safe_to_retry": classification.safe_to_retry,
+            "safe_to_continue_read_only": classification.safe_to_continue_read_only,
+            "blocks_edits": classification.blocks_edits,
+            "recommended_command": classification.recommended_command,
+        })
+    }
+
+    fn db_failure_envelope_data(envelope: &mcp_agent_mail_db::DbFailureEnvelope) -> Value {
+        serde_json::to_value(envelope).unwrap_or_else(|err| {
+            json!({
+                "schema_version": mcp_agent_mail_db::DB_FAILURE_ENVELOPE_SCHEMA_VERSION,
+                "serialization_error": err.to_string(),
+            })
+        })
+    }
+
+    fn db_error_data(
+        classification: mcp_agent_mail_db::DbErrorClassification,
+        failure_envelope: &mcp_agent_mail_db::DbFailureEnvelope,
+        extra: Value,
+    ) -> Value {
+        let mut object = match extra {
+            Value::Object(object) => object,
+            _ => Map::new(),
+        };
+        object.insert(
+            "db_error_classification".to_string(),
+            db_error_classification_data(classification),
+        );
+        object.insert(
+            "failure_envelope".to_string(),
+            db_failure_envelope_data(failure_envelope),
+        );
+        Value::Object(object)
+    }
+
+    /// Build the JSON retry-context block for a spent retry budget (D3).
+    fn retry_exhaustion_data(
+        operation: &'static str,
+        attempts: u32,
+        budget: u32,
+        elapsed_ms: u64,
+    ) -> Value {
+        json!({
+            "operation": operation,
+            "attempts_made": attempts,
+            "retry_budget": budget,
+            "elapsed_wait_ms": elapsed_ms,
+            "budget_exhausted": true,
+            "immediate_retry_useful": false,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
+        let classification = e.classification();
+        let failure_envelope = e.failure_envelope();
+        // A5 (br-bvq1x.1.5): record the typed class at the single chokepoint
+        // where a DB error is surfaced to a caller, so corruption-class trend
+        // counters (and the K3 circuit breaker) see every classified failure
+        // exactly once.
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_class(classification.class.as_str());
         match e {
+            // D3 (br-bvq1x.4.3): a bounded retry loop already spent its
+            // budget. Render an honest, class-distinct envelope that reports
+            // the attempts made and elapsed wait instead of advising another
+            // blind retry. Classification delegates to the wrapped error, so
+            // `classification.class` is the wrapped error's class.
+            DbError::RetryBudgetExhausted {
+                operation,
+                attempts,
+                budget,
+                elapsed_ms,
+                inner,
+            } => {
+                let inner_detail = inner.to_string();
+                let retry_data = retry_exhaustion_data(operation, attempts, budget, elapsed_ms);
+                match classification.class {
+                    mcp_agent_mail_db::DbErrorClass::FdExhaustion => {
+                        let freed = mcp_agent_mail_db::fd_eviction_freed(&inner_detail);
+                        let freed_zero = freed == Some(0);
+                        let message = if freed_zero {
+                            format!(
+                                "File descriptor limit exhausted and repo-cache eviction freed \
+                                 nothing after {attempts} attempts. Do NOT retry: close stale \
+                                 Agent Mail processes, raise the open-file limit (ulimit -n), \
+                                 or restart the owning server, then run `am doctor health`."
+                            )
+                        } else {
+                            format!(
+                                "File descriptor limit exhausted ({attempts} attempts over \
+                                 {elapsed_ms} ms). Close stale Agent Mail processes or raise \
+                                 the open-file limit, then retry once."
+                            )
+                        };
+                        legacy_tool_error(
+                            "RESOURCE_BUSY",
+                            message,
+                            !freed_zero,
+                            db_error_data(
+                                classification,
+                                &failure_envelope,
+                                json!({
+                                    "error_detail": inner_detail,
+                                    "resource_class": "file_descriptors",
+                                    "eviction_freed": freed,
+                                    "retry_exhaustion": retry_data,
+                                }),
+                            ),
+                        )
+                    }
+                    mcp_agent_mail_db::DbErrorClass::PoolExhaustion => legacy_tool_error(
+                        "DATABASE_POOL_EXHAUSTED",
+                        format!(
+                            "Database connection pool exhausted; the server already retried \
+                             {attempts} times over {elapsed_ms} ms. Reduce concurrent agents \
+                             or increase pool settings before retrying."
+                        ),
+                        true,
+                        db_error_data(
+                            classification,
+                            &failure_envelope,
+                            json!({
+                                "error_detail": inner_detail,
+                                "retry_exhaustion": retry_data,
+                            }),
+                        ),
+                    ),
+                    mcp_agent_mail_db::DbErrorClass::LiveOwnerNoActivityLock => legacy_tool_error(
+                        "RESOURCE_BUSY",
+                        format!(
+                            "Resource is busy: a running Agent Mail server owns this mailbox \
+                             and {attempts} direct-write attempts over {elapsed_ms} ms were \
+                             refused. Route this operation through that server instead of \
+                             retrying direct writes. Detail: {inner_detail}"
+                        ),
+                        true,
+                        db_error_data(
+                            classification,
+                            &failure_envelope,
+                            json!({
+                                "error_detail": inner_detail,
+                                "retry_exhaustion": retry_data,
+                            }),
+                        ),
+                    ),
+                    mcp_agent_mail_db::DbErrorClass::BusyRetryable => legacy_tool_error(
+                        "RESOURCE_BUSY",
+                        format!(
+                            "Resource is temporarily busy and the retry budget is exhausted \
+                             ({attempts} attempts over {elapsed_ms} ms). Do not immediately \
+                             retry: run `am doctor locks --json` to identify the lock holder, \
+                             wait for it to clear, then try once more."
+                        ),
+                        true,
+                        db_error_data(
+                            classification,
+                            &failure_envelope,
+                            json!({
+                                "error_detail": inner_detail,
+                                "retry_exhaustion": retry_data,
+                            }),
+                        ),
+                    ),
+                    // Corruption and config classes are never retried by the
+                    // bounded loops; if one ever arrives wrapped, fall back to
+                    // the wrapped error's own distinct envelope.
+                    _ => db_error_to_mcp_error(*inner),
+                }
+            }
             DbError::InvalidArgument { field, message } => legacy_tool_error(
                 "INVALID_ARGUMENT",
                 format!(
                     "Invalid argument value: {field}: {message}. Check that all parameters have valid values."
                 ),
                 true,
-                json!({
-                    "field": field,
-                    "error_detail": message,
-                }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "field": field,
+                        "error_detail": message,
+                    }),
+                ),
             ),
             DbError::NotFound { entity, identifier } => legacy_tool_error(
                 "NOT_FOUND",
                 format!("{entity} not found: {identifier}"),
                 true,
-                json!({
-                    "entity": entity,
-                    "identifier": identifier,
-                }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "entity": entity,
+                        "identifier": identifier,
+                    }),
+                ),
             ),
             DbError::Duplicate { entity, identifier } => legacy_tool_error(
                 "INVALID_ARGUMENT",
                 format!("{entity} already exists: {identifier}"),
                 true,
-                json!({
-                    "entity": entity,
-                    "identifier": identifier,
-                }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "entity": entity,
+                        "identifier": identifier,
+                    }),
+                ),
             ),
             DbError::Sqlite(ref message)
             | DbError::Schema(ref message)
             | DbError::Pool(ref message)
                 if e.is_corruption() =>
             {
-                // Attempt automatic recovery before reporting error.
-                if let Ok(pool) = get_db_pool()
-                    && matches!(pool.try_recover_from_corruption(message), Ok(true))
-                {
-                    return legacy_tool_error(
-                        "DATABASE_RECOVERED",
-                        "Database corruption was detected and the runtime was automatically recovered. \
-                         Please retry your operation.",
-                        true,
-                        json!({ "error_detail": message, "recovered": true }),
-                    );
-                }
                 let message = message.clone();
                 legacy_tool_error(
                     "DATABASE_CORRUPTION",
@@ -243,7 +436,56 @@ pub mod tool_util {
                          Run 'am doctor repair' or 'am doctor reconstruct' to recover."
                     ),
                     false,
-                    json!({ "error_detail": message }),
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                        }),
+                    ),
+                )
+            }
+            DbError::Sqlite(ref message)
+            | DbError::Schema(ref message)
+            | DbError::Pool(ref message)
+            | DbError::Internal(ref message)
+                if mcp_agent_mail_db::is_fd_exhaustion_error(message) =>
+            {
+                let message = message.clone();
+                // D3 (br-bvq1x.4.3): when the failing path reported that
+                // repo-cache eviction freed nothing, another retry will
+                // deterministically fail — stop advising it.
+                let freed = mcp_agent_mail_db::fd_eviction_freed(&message);
+                let freed_zero = freed == Some(0);
+                let (display, action) = if freed_zero {
+                    (
+                        "File descriptor limit exhausted and repo-cache eviction freed nothing. \
+                         Do NOT retry: close stale Agent Mail processes, raise the open-file \
+                         limit (ulimit -n), or restart the owning server, then run \
+                         `am doctor health`.",
+                        "do not retry; close stale Agent Mail processes, raise the open-file \
+                         limit, or restart the owning server",
+                    )
+                } else {
+                    (
+                        "File descriptor limit exhausted. Close stale Agent Mail processes or raise the open-file limit, then retry.",
+                        "close stale Agent Mail processes or raise the open-file limit, then retry",
+                    )
+                };
+                legacy_tool_error(
+                    "RESOURCE_BUSY",
+                    display,
+                    !freed_zero,
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                            "resource_class": "file_descriptors",
+                            "eviction_freed": freed,
+                            "recommended_action": action,
+                        }),
+                    ),
                 )
             }
             DbError::Sqlite(ref message)
@@ -252,24 +494,48 @@ pub mod tool_util {
                 if mcp_agent_mail_db::is_lock_error(message) =>
             {
                 let message = message.clone();
+                // #139: mailbox ownership contention (a long-running
+                // `am serve-http` daemon holds the activity lock and a direct
+                // mutation was refused) is still RESOURCE_BUSY, but the actionable
+                // hint differs from a transient SQLITE_BUSY: the caller should route
+                // the write through the running server rather than blindly retrying
+                // a direct write that will keep losing the ownership race.
                 legacy_tool_error(
                     "RESOURCE_BUSY",
-                    "Resource is temporarily busy. Wait a moment and try again.",
+                    resource_busy_message(&message),
                     true,
-                    json!({ "error_detail": message }),
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                        }),
+                    ),
                 )
             }
             DbError::Pool(message) => legacy_tool_error(
                 "DATABASE_POOL_EXHAUSTED",
                 "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
                 true,
-                json!({ "error_detail": message }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "error_detail": message,
+                    }),
+                ),
             ),
             DbError::Sqlite(message) | DbError::Schema(message) => legacy_tool_error(
                 "DATABASE_ERROR",
                 "A database error occurred. This may be a transient issue - try again.",
                 true,
-                json!({ "error_detail": message }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "error_detail": message,
+                    }),
+                ),
             ),
             DbError::Serialization(message) => {
                 // Python-parity hint selection based on error content
@@ -286,7 +552,11 @@ pub mod tool_util {
                     "TYPE_ERROR",
                     format!("Argument type mismatch: {message}.{hint}"),
                     true,
-                    json!({ "error_detail": message }),
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({ "error_detail": message }),
+                    ),
                 )
             }
             DbError::Internal(message) if is_retryable_post_commit_visibility_probe(&message) => {
@@ -294,14 +564,26 @@ pub mod tool_util {
                     "RESOURCE_BUSY",
                     "Resource is temporarily busy. Wait a moment and try again.",
                     true,
-                    json!({ "error_detail": message }),
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                        }),
+                    ),
                 )
             }
             DbError::Internal(message) => legacy_tool_error(
                 "UNHANDLED_EXCEPTION",
                 format!("Unexpected error (DbError): {message}"),
                 false,
-                json!({ "error_detail": message }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "error_detail": message,
+                    }),
+                ),
             ),
             DbError::PoolExhausted {
                 message,
@@ -311,17 +593,27 @@ pub mod tool_util {
                 "DATABASE_POOL_EXHAUSTED",
                 "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
                 true,
-                json!({
-                    "error_detail": message,
-                    "pool_size": pool_size,
-                    "max_overflow": max_overflow,
-                }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "error_detail": message,
+                        "pool_size": pool_size,
+                        "max_overflow": max_overflow,
+                    }),
+                ),
             ),
             DbError::ResourceBusy(message) => legacy_tool_error(
                 "RESOURCE_BUSY",
-                "Resource is temporarily busy. Wait a moment and try again.",
+                resource_busy_message(&message),
                 true,
-                json!({ "error_detail": message }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "error_detail": message,
+                    }),
+                ),
             ),
             DbError::CircuitBreakerOpen {
                 message,
@@ -334,12 +626,36 @@ pub mod tool_util {
                      Wait {reset_after_secs:.0}s before retrying."
                 ),
                 true,
-                json!({
-                    "error_detail": message,
-                    "failures": failures,
-                    "reset_after_secs": reset_after_secs,
-                }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "error_detail": message,
+                        "failures": failures,
+                        "reset_after_secs": reset_after_secs,
+                    }),
+                ),
             ),
+            DbError::IntegrityCorruption { message, details }
+                if classification.class == mcp_agent_mail_db::DbErrorClass::FtsIndexCorruption =>
+            {
+                legacy_tool_error(
+                    "DATABASE_ERROR",
+                    format!(
+                        "Search index corruption detected: {message}. \
+                         Run 'am doctor fix --list --json' to inspect repair options."
+                    ),
+                    true,
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                            "corruption_details": details,
+                        }),
+                    ),
+                )
+            }
             DbError::IntegrityCorruption { message, details } => legacy_tool_error(
                 "DATABASE_CORRUPTION",
                 format!(
@@ -347,10 +663,14 @@ pub mod tool_util {
                      The database may be corrupted; consider restoring from backup."
                 ),
                 false,
-                json!({
-                    "error_detail": message,
-                    "corruption_details": details,
-                }),
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "error_detail": message,
+                        "corruption_details": details,
+                    }),
+                ),
             ),
         }
     }
@@ -367,9 +687,105 @@ pub mod tool_util {
         }
     }
 
-    pub fn get_db_pool() -> McpResult<DbPool> {
+    /// Live database lease for mutation paths. The guard brackets pool
+    /// bootstrap and the caller's entire operation, invalidating archive-read
+    /// decisions on both entry and exit.
+    pub struct WriteDbPool {
+        pool: DbPool,
+        _guard: crate::archive_read::WriteGuard,
+    }
+
+    impl std::ops::Deref for WriteDbPool {
+        type Target = DbPool;
+
+        fn deref(&self) -> &Self::Target {
+            &self.pool
+        }
+    }
+
+    pub fn get_db_pool() -> McpResult<WriteDbPool> {
         let cfg = DbPoolConfig::from_env();
-        get_or_create_pool(&cfg).map_err(|e| McpError::internal_error(e.to_string()))
+        let sqlite_path =
+            if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+                None
+            } else {
+                Some(
+                    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                        .map_err(|error| McpError::internal_error(error.to_string()))?
+                        .canonical_path,
+                )
+            };
+        let storage_root = cfg
+            .storage_root
+            .clone()
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        let guard = crate::archive_read::WriteGuard::begin(
+            &storage_root,
+            sqlite_path.as_deref().map(Path::new),
+        );
+        let pool = get_or_create_pool(&cfg)
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        Ok(WriteDbPool {
+            pool,
+            _guard: guard,
+        })
+    }
+
+    /// Open the live mailbox for a read surface without migrations, recovery,
+    /// reconciliation, directory creation, or writer-generation changes.
+    pub(crate) fn get_live_read_db_pool() -> McpResult<DbPool> {
+        let mut cfg = DbPoolConfig::from_env();
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+            return get_or_create_pool(&cfg)
+                .map_err(|error| McpError::internal_error(error.to_string()));
+        }
+        cfg.run_migrations = false;
+        cfg.warmup_connections = 0;
+        mcp_agent_mail_db::create_query_only_pool(&cfg)
+            .map_err(|error| McpError::internal_error(error.to_string()))
+    }
+
+    /// Reuse a hot authoritative live pool for health reads without advancing
+    /// the writer generation. An initialized mailbox whose pool has merely
+    /// been dropped (the pool cache holds weak references) opens through the
+    /// zero-footprint query-only path: no migrations, recovery, warmup,
+    /// sqlite-family writes, or writer-generation changes (br-lg5dd). Only a
+    /// genuinely cold bootstrap — missing/empty sqlite file, or a memory
+    /// database with no live pool — remains bracketed because it may
+    /// initialize, migrate, or recover the mailbox.
+    pub(crate) fn get_authoritative_live_db_pool() -> McpResult<DbPool> {
+        let cfg = DbPoolConfig::from_env();
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
+            return Ok(pool);
+        }
+        let sqlite_path =
+            if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+                None
+            } else {
+                Some(
+                    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                        .map_err(|error| McpError::internal_error(error.to_string()))?
+                        .canonical_path,
+                )
+            };
+        let mailbox_initialized = sqlite_path
+            .as_deref()
+            .is_some_and(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0));
+        if mailbox_initialized {
+            return get_live_read_db_pool();
+        }
+        let storage_root = cfg
+            .storage_root
+            .clone()
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        let guard = crate::archive_read::WriteGuard::begin(
+            &storage_root,
+            sqlite_path.as_deref().map(Path::new),
+        );
+        let pool = get_or_create_pool(&cfg)
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        drop(guard);
+        Ok(pool)
     }
 
     fn read_pool_setup_error_to_mcp_error(message: String) -> McpError {
@@ -388,6 +804,160 @@ pub mod tool_util {
         messages: usize,
         max_message_id: i64,
         project_identities: BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadArchiveSignature {
+        storage_root: PathBuf,
+        head: git2::Oid,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadArchiveInventoryCacheEntry {
+        signature: ReadArchiveSignature,
+        inventory: mcp_agent_mail_db::ArchiveMessageInventory,
+    }
+
+    const READ_ARCHIVE_INVENTORY_CACHE_CAPACITY: usize = 8;
+
+    // Archive inventory scans parse every canonical message artifact. Cache a
+    // small number of clean, committed archive generations so independent
+    // mailbox roots do not evict one another on every read.
+    static READ_ARCHIVE_INVENTORY_CACHE: LazyLock<Mutex<VecDeque<ReadArchiveInventoryCacheEntry>>> =
+        LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+    #[cfg(test)]
+    static READ_ARCHIVE_INVENTORY_SCAN_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn read_archive_head(repo: &git2::Repository) -> Option<git2::Oid> {
+        repo.head()
+            .ok()?
+            .peel_to_commit()
+            .ok()
+            .map(|commit| commit.id())
+    }
+
+    /// Return a cacheable archive signature only when `projects/` is fully
+    /// represented by one stable commit. Any worktree, index, ignored, or
+    /// untracked state bypasses the cache because archive writes are durable in
+    /// the worktree before the asynchronous Git coalescer advances `HEAD`.
+    fn clean_read_archive_signature(storage_root: &Path) -> Option<ReadArchiveSignature> {
+        let canonical_root = storage_root.canonicalize().ok()?;
+        let repo = git2::Repository::open(&canonical_root).ok()?;
+        let canonical_workdir = repo.workdir()?.canonicalize().ok()?;
+        if canonical_workdir != canonical_root {
+            return None;
+        }
+
+        let head_before = read_archive_head(&repo)?;
+        let mut status_options = git2::StatusOptions::new();
+        status_options
+            .show(git2::StatusShow::IndexAndWorkdir)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(true)
+            .recurse_ignored_dirs(true)
+            .include_unmodified(false)
+            .exclude_submodules(false)
+            .pathspec("projects");
+        if !repo.statuses(Some(&mut status_options)).ok()?.is_empty() {
+            return None;
+        }
+        let head_after = read_archive_head(&repo)?;
+        if head_before != head_after {
+            return None;
+        }
+
+        Some(ReadArchiveSignature {
+            storage_root: canonical_root,
+            head: head_after,
+        })
+    }
+
+    fn scan_read_archive_inventory(
+        storage_root: &Path,
+    ) -> mcp_agent_mail_db::ArchiveMessageInventory {
+        #[cfg(test)]
+        READ_ARCHIVE_INVENTORY_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        mcp_agent_mail_db::scan_archive_message_inventory(storage_root)
+    }
+
+    fn cached_read_archive_inventory(
+        signature: &ReadArchiveSignature,
+    ) -> Option<mcp_agent_mail_db::ArchiveMessageInventory> {
+        let mut cache = READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = cache
+            .iter()
+            .position(|entry| entry.signature == *signature)?;
+        let entry = cache.remove(index)?;
+        let inventory = entry.inventory.clone();
+        cache.push_back(entry);
+        drop(cache);
+        Some(inventory)
+    }
+
+    fn cache_read_archive_inventory(
+        signature: ReadArchiveSignature,
+        inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
+    ) {
+        let mut cache = READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|entry| entry.signature.storage_root != signature.storage_root);
+        cache.push_back(ReadArchiveInventoryCacheEntry {
+            signature,
+            inventory: inventory.clone(),
+        });
+        while cache.len() > READ_ARCHIVE_INVENTORY_CACHE_CAPACITY {
+            cache.pop_front();
+        }
+        drop(cache);
+    }
+
+    pub(crate) fn read_archive_inventory(
+        storage_root: &Path,
+    ) -> mcp_agent_mail_db::ArchiveMessageInventory {
+        let Some(signature_before) = clean_read_archive_signature(storage_root) else {
+            return scan_read_archive_inventory(storage_root);
+        };
+        if let Some(inventory) = cached_read_archive_inventory(&signature_before) {
+            return inventory;
+        }
+
+        // Do not hold the cache mutex across filesystem I/O. Cache the result
+        // only when both HEAD and worktree cleanliness remain unchanged across
+        // the full scan; a concurrent writer otherwise gets the conservative
+        // uncached behavior on this and subsequent reads.
+        let inventory = scan_read_archive_inventory(storage_root);
+        if clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before) {
+            cache_read_archive_inventory(signature_before, &inventory);
+        }
+        inventory
+    }
+
+    #[cfg(test)]
+    fn reset_read_archive_inventory_cache() {
+        READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        READ_ARCHIVE_INVENTORY_SCAN_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn read_archive_inventory_scan_count() -> usize {
+        READ_ARCHIVE_INVENTORY_SCAN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn read_archive_inventory_cache_len() -> usize {
+        READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     fn query_read_db_inventory(
@@ -461,8 +1031,9 @@ pub mod tool_util {
         })
     }
 
-    fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
-        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    pub(crate) const fn read_archive_inventory_has_state(
+        archive: &mcp_agent_mail_db::ArchiveMessageInventory,
+    ) -> bool {
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
     }
 
@@ -474,16 +1045,16 @@ pub mod tool_util {
             || sqlite_path.starts_with(storage_root)
     }
 
-    fn read_archive_is_ahead(
+    pub(crate) fn read_archive_is_ahead(
         storage_root: &Path,
         sqlite_path: &Path,
         conn: &mcp_agent_mail_db::DbConn,
+        archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> Result<bool, String> {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
             return Ok(false);
         }
 
-        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
         }
@@ -492,7 +1063,7 @@ pub mod tool_util {
         let archive_message_count = archive.unique_message_ids;
         let archive_max_id = archive.latest_message_id.unwrap_or(0);
         let missing_archive_projects = mcp_agent_mail_db::archive_missing_project_identities(
-            &archive,
+            archive,
             &db_inventory.project_identities,
         );
 
@@ -514,18 +1085,23 @@ pub mod tool_util {
             || archive_metadata_ahead)
     }
 
-    static READ_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     pub struct ToolReadPool {
         pool: mcp_agent_mail_db::DbPool,
-        _snapshot_dir: Option<ReadSnapshotDirGuard>,
+        _snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
     }
 
     impl ToolReadPool {
         const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
             Self {
                 pool,
-                _snapshot_dir: None,
+                _snapshot: None,
+            }
+        }
+
+        fn snapshot(snapshot: Arc<crate::archive_read::SharedSnapshot>) -> Self {
+            Self {
+                pool: snapshot.pool(),
+                _snapshot: Some(snapshot),
             }
         }
     }
@@ -538,49 +1114,15 @@ pub mod tool_util {
         }
     }
 
-    struct ReadSnapshotDirGuard {
-        path: PathBuf,
-    }
-
-    impl ReadSnapshotDirGuard {
-        fn new(prefix: &str) -> std::io::Result<Self> {
-            let base = std::env::temp_dir();
-            let pid = std::process::id();
-            for _ in 0..32 {
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let counter = READ_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let path = base.join(format!("{prefix}{pid}_{nanos}_{counter}"));
-                match std::fs::create_dir(&path) {
-                    Ok(()) => return Ok(Self { path }),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "failed to allocate unique read snapshot directory",
-            ))
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for ReadSnapshotDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     /// Check whether the live `SQLite` database is suspect (`DegradedReadOnly` or
     /// worse) according to a fast mailbox verdict. Returns `true` when read
     /// surfaces should fall back to archive snapshots instead of the
     /// potentially corrupt live file.
-    fn live_db_is_suspect(database_url: &str, storage_root: &Path, sqlite_path: &Path) -> bool {
+    pub(crate) fn live_db_is_suspect(
+        database_url: &str,
+        storage_root: &Path,
+        sqlite_path: &Path,
+    ) -> bool {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
             return false;
         }
@@ -618,7 +1160,12 @@ pub mod tool_util {
         }
     }
 
-    fn open_read_db_pool() -> Result<Option<ToolReadPool>, String> {
+    fn open_read_db_pool(
+        cx: &asupersync::Cx,
+    ) -> Result<Option<ToolReadPool>, crate::archive_read::AcquireError> {
+        if cx.is_cancel_requested() {
+            return Err(crate::archive_read::AcquireError::Cancelled);
+        }
         let config = Config::from_env();
         if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
             return Ok(None);
@@ -626,98 +1173,45 @@ pub mod tool_util {
 
         let sqlite_path =
             mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
-                .map_err(|err| err.to_string())?
+                .map_err(|error| crate::archive_read::AcquireError::Failed(error.to_string()))?
                 .canonical_path;
         if sqlite_path == ":memory:" {
             return Ok(None);
         }
 
         let resolved_path = PathBuf::from(&sqlite_path);
-        let archive_has_state = archive_storage_root_is_authoritative_for_sqlite_path(
+        if !archive_storage_root_is_authoritative_for_sqlite_path(
             &config.storage_root,
             &resolved_path,
-        ) && read_archive_inventory_has_state(&config.storage_root);
-
-        // When the durability verdict says the live DB is suspect or worse,
-        // force archive-snapshot reads even if the archive isn't strictly
-        // "ahead" of the DB by row count.
-        let durability_forces_snapshot = archive_has_state
-            && live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
-
-        let use_archive_snapshot = if durability_forces_snapshot {
-            true
-        } else {
-            match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-                Ok(conn) => {
-                    let conn = mcp_agent_mail_db::guard_db_conn(
-                        conn,
-                        "tool_util::open_read_db_pool archive-ahead probe",
-                    );
-                    let archive_ahead =
-                        read_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
-                    drop(conn);
-                    match archive_ahead {
-                        Ok(true) => true,
-                        Err(error) if archive_has_state => {
-                            tracing::warn!(
-                                source = %resolved_path.display(),
-                                storage_root = %config.storage_root.display(),
-                                error = %error,
-                                "using archive-backed tool snapshot because the live sqlite inventory probe failed"
-                            );
-                            true
-                        }
-                        Ok(false) | Err(_) => false,
-                    }
-                }
-                Err(error) if archive_has_state => {
-                    tracing::warn!(
-                        source = %resolved_path.display(),
-                        storage_root = %config.storage_root.display(),
-                        error = %error,
-                        "using archive-backed tool snapshot because the live sqlite source could not be opened"
-                    );
-                    true
-                }
-                Err(_) => false,
-            }
-        };
-
-        if !use_archive_snapshot {
+        ) {
             return Ok(None);
         }
-
-        let snapshot_dir = ReadSnapshotDirGuard::new("agent-mail-tool-snapshot-")
-            .map_err(|err| err.to_string())?;
-        let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
-        if resolved_path.exists() {
-            mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-                &snapshot_db,
-                &config.storage_root,
-                Some(resolved_path.as_path()),
-            )
-            .map_err(|err| err.to_string())?;
-        } else {
-            mcp_agent_mail_db::reconstruct_from_archive(&snapshot_db, &config.storage_root)
-                .map_err(|err| err.to_string())?;
-        }
-        let pool = create_pool(&mcp_agent_mail_db::DbPoolConfig {
-            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_db),
-            storage_root: Some(config.storage_root),
-            ..Default::default()
-        })
-        .map_err(|err| err.to_string())?;
-        Ok(Some(ToolReadPool {
-            pool,
-            _snapshot_dir: Some(snapshot_dir),
-        }))
+        crate::archive_read::acquire_if_needed(
+            &config.storage_root,
+            &resolved_path,
+            &config.database_url,
+            cx,
+        )
+        .map(|snapshot| snapshot.map(ToolReadPool::snapshot))
     }
 
-    pub fn get_read_db_pool() -> McpResult<ToolReadPool> {
-        match open_read_db_pool() {
+    pub async fn get_read_db_pool(cx: &asupersync::Cx) -> McpResult<ToolReadPool> {
+        match open_read_db_pool(cx) {
             Ok(Some(pool)) => Ok(pool),
-            Ok(None) => get_db_pool().map(ToolReadPool::live),
-            Err(error) => Err(read_pool_setup_error_to_mcp_error(error)),
+            Ok(None) => get_live_read_db_pool().map(ToolReadPool::live),
+            Err(crate::archive_read::AcquireError::Cancelled) => Err(McpError::request_cancelled()),
+            Err(crate::archive_read::AcquireError::Busy(message)) => {
+                Err(db_error_to_mcp_error(DbError::ResourceBusy(message)))
+            }
+            Err(crate::archive_read::AcquireError::TimedOut(message)) => Err(legacy_tool_error(
+                "SNAPSHOT_TIMEOUT",
+                message,
+                true,
+                json!({"timeout_seconds": 120}),
+            )),
+            Err(crate::archive_read::AcquireError::Failed(message)) => {
+                Err(read_pool_setup_error_to_mcp_error(message))
+            }
         }
     }
 
@@ -1155,6 +1649,210 @@ pub mod tool_util {
 
         static READ_POOL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+        fn run_async<F, Fut, T>(f: F) -> T
+        where
+            F: FnOnce(asupersync::Cx) -> Fut,
+            Fut: std::future::Future<Output = T>,
+        {
+            let cx = asupersync::Cx::for_testing();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build test runtime");
+            runtime.block_on(f(cx))
+        }
+
+        #[test]
+        fn process_env_overrides_bypass_stale_dependency_config_cache() {
+            Config::reset_cached();
+            assert!(
+                !Config::get().worktrees_enabled,
+                "default test config should leave worktrees disabled"
+            );
+
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("WORKTREES_ENABLED", "true")],
+                || {
+                    assert!(
+                        Config::get().worktrees_enabled,
+                        "dependency users of with_process_env_overrides_for_test must not reuse stale cached Config"
+                    );
+                },
+            );
+
+            Config::reset_cached();
+        }
+
+        fn write_inventory_message(storage_root: &Path, file_id: i64, message_id: i64) {
+            let project_dir = storage_root.join("projects").join("cache-project");
+            let message_dir = project_dir.join("messages").join("2026").join("07");
+            std::fs::create_dir_all(&message_dir).expect("create message directory");
+            std::fs::write(
+                project_dir.join("project.json"),
+                r#"{"slug":"cache-project","human_key":"/cache-project"}"#,
+            )
+            .expect("write project metadata");
+            std::fs::write(
+                message_dir.join(format!("2026-07-14T00-00-00Z__cached__{file_id}.md")),
+                format!(
+                    r#"---json
+{{
+  "id": {message_id},
+  "from": "Alice",
+  "to": [],
+  "subject": "Cached",
+  "importance": "normal",
+  "created_ts": "2026-07-14T00:00:00Z"
+}}
+---
+
+body
+"#
+                ),
+            )
+            .expect("write canonical message");
+        }
+
+        fn commit_archive_tree(repo: &git2::Repository, message: &str) {
+            let mut index = repo.index().expect("open git index");
+            index
+                .add_all(["projects"], git2::IndexAddOption::DEFAULT, None)
+                .expect("stage archive tree");
+            index.write().expect("write git index");
+            let tree_id = index.write_tree().expect("write git tree");
+            let tree = repo.find_tree(tree_id).expect("load git tree");
+            let signature =
+                git2::Signature::now("test", "test@example.com").expect("build git signature");
+            let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents = parent.iter().collect::<Vec<_>>();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents,
+            )
+            .expect("commit archive tree");
+        }
+
+        #[test]
+        fn read_archive_inventory_cache_never_hides_uncommitted_archive_state() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "add first message");
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(read_archive_inventory_scan_count(), 1);
+
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                1,
+                "a clean, unchanged HEAD should reuse the cached inventory"
+            );
+
+            write_inventory_message(&storage_root, 2, 2);
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(read_archive_inventory_scan_count(), 2);
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                3,
+                "a dirty worktree must never populate or reuse the cache"
+            );
+
+            commit_archive_tree(&repo, "add second message");
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(read_archive_inventory_scan_count(), 4);
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(read_archive_inventory_scan_count(), 4);
+
+            write_inventory_message(&storage_root, 1, 9);
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(9)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                5,
+                "modifying a tracked archive artifact must bypass the cached HEAD"
+            );
+
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn read_archive_inventory_cache_is_bounded_and_scoped_by_canonical_root() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut roots = Vec::new();
+            for index in 0..=READ_ARCHIVE_INVENTORY_CACHE_CAPACITY {
+                let root = temp.path().join(format!("archive-{index}"));
+                let repo = git2::Repository::init(&root).expect("init archive");
+                let message_id = i64::try_from(index + 1).expect("small cache test index");
+                write_inventory_message(&root, message_id, message_id);
+                commit_archive_tree(&repo, "seed archive");
+                assert_eq!(
+                    read_archive_inventory(&root).latest_message_id,
+                    Some(message_id)
+                );
+                roots.push(root);
+            }
+
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY + 1
+            );
+            assert_eq!(
+                read_archive_inventory_cache_len(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY,
+                "the cache must evict its least-recently-used entry"
+            );
+
+            let newest_root = roots.last().expect("newest archive root");
+            assert_eq!(
+                read_archive_inventory(newest_root).latest_message_id,
+                Some(i64::try_from(roots.len()).expect("small cache test length"))
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY + 1,
+                "the newest independent root should remain cached"
+            );
+
+            let oldest_root = roots.first().expect("oldest archive root");
+            assert_eq!(
+                read_archive_inventory(oldest_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY + 2,
+                "reading the evicted root must perform a fresh scan"
+            );
+
+            reset_read_archive_inventory_cache();
+        }
+
         #[test]
         fn legacy_tool_error_sets_payload_shape() {
             let err = legacy_tool_error(
@@ -1234,6 +1932,10 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_POOL_EXHAUSTED");
             assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                "pool_exhaustion"
+            );
         }
 
         #[test]
@@ -1287,11 +1989,13 @@ pub mod tool_util {
                     .expect("insert overlapping project");
                     drop(conn);
 
-                    let pool = open_read_db_pool().expect("open read db pool");
-                    assert!(
-                        pool.is_none(),
-                        "default global archive should not force shared tool read snapshots for an external custom DB"
-                    );
+                    run_async(|cx| async move {
+                        let pool = open_read_db_pool(&cx).expect("open read db pool");
+                        assert!(
+                            pool.is_none(),
+                            "default global archive should not force shared tool read snapshots for an external custom DB"
+                        );
+                    });
                 },
             );
         }
@@ -1303,6 +2007,32 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
             assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_corruption_mapping_is_pure_with_live_pool() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let db_path = temp.path().join("live.sqlite3");
+            let database_url = format!("sqlite:///{}", db_path.display());
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("DATABASE_URL", database_url.as_str())],
+                || {
+                    Config::reset_cached();
+                    let _pool = get_db_pool().expect("live pool");
+
+                    let err = db_error_to_mcp_error(DbError::Schema(
+                        "database disk image is malformed".into(),
+                    ));
+                    let data = err.data.expect("expected data payload");
+                    assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
+                    assert_eq!(data["error"]["recoverable"], false);
+                },
+            );
         }
 
         #[test]
@@ -1335,10 +2065,78 @@ pub mod tool_util {
         }
 
         #[test]
+        fn db_error_to_mcp_error_maps_fd_exhaustion_as_resource_busy() {
+            // D3 (br-bvq1x.4.3): "Freed 0 cached repos" means eviction freed
+            // nothing, so the envelope must stop advising a blind retry.
+            let err = db_error_to_mcp_error(DbError::Internal(
+                "send_message retry failed: Too many open files. Freed 0 cached repos".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["recoverable"], false);
+            assert_eq!(data["error"]["data"]["resource_class"], "file_descriptors");
+            assert_eq!(data["error"]["data"]["eviction_freed"], 0);
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("File descriptor limit exhausted"));
+            assert!(msg.contains("Do NOT retry"), "non-retry guidance: {msg}");
+            let classification = &data["error"]["data"]["db_error_classification"];
+            assert_eq!(classification["class"], "fd_exhaustion");
+            assert_eq!(classification["safe_to_retry"], true);
+            assert_eq!(classification["blocks_edits"], true);
+            let fd = &data["error"]["data"]["failure_envelope"]["fd_pressure"];
+            assert_eq!(fd["eviction_freed"], 0);
+            assert_eq!(fd["immediate_retry_useful"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_fd_exhaustion_without_freed_zero_keeps_retry_advice() {
+            let err = db_error_to_mcp_error(DbError::Internal(
+                "open failed: Too many open files (os error 24)".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(data["error"]["data"]["eviction_freed"], Value::Null);
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("then retry"), "retry advice retained: {msg}");
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_does_not_map_bad_fd_as_exhaustion() {
+            let err = db_error_to_mcp_error(DbError::Internal("bad file descriptor".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "UNHANDLED_EXCEPTION");
+            assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
         fn db_error_to_mcp_error_maps_schema() {
-            let err = db_error_to_mcp_error(DbError::Schema("migration v4 failed".into()));
+            let err = db_error_to_mcp_error(DbError::Schema("no such table: messages".into()));
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                "schema_drift_or_missing_tables"
+            );
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["recommended_command"],
+                "am doctor migrate --check"
+            );
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_keeps_raw_schema_corruption_as_schema_drift() {
+            let err = db_error_to_mcp_error(DbError::Schema(
+                "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)"
+                    .into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                "schema_drift_or_missing_tables"
+            );
         }
 
         #[test]
@@ -1348,6 +2146,39 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
             assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_records_corruption_class_metric() {
+            // A5 (br-bvq1x.1.5): the surfacing chokepoint must feed the
+            // corruption-class counter. Use a delta (>= before + 1) so the
+            // assertion is correct even under concurrent test execution that
+            // shares the process-global metrics singleton.
+            let counter = &mcp_agent_mail_core::global_metrics()
+                .corruption
+                .class_main_db_btree_corruption_total;
+            let before = counter.load();
+            let _ =
+                db_error_to_mcp_error(DbError::Sqlite("database disk image is malformed".into()));
+            assert!(
+                counter.load() > before,
+                "main_db_btree_corruption counter should increment on a classified corruption error"
+            );
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_keeps_fts_integrity_repairable() {
+            let err = db_error_to_mcp_error(DbError::IntegrityCorruption {
+                message: "integrity failed".into(),
+                details: vec!["fts5 search index malformed".into()],
+            });
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+            assert_eq!(data["error"]["recoverable"], true);
+            let classification = &data["error"]["data"]["db_error_classification"];
+            assert_eq!(classification["class"], "fts_index_corruption");
+            assert_eq!(classification["safe_to_continue_read_only"], true);
+            assert_eq!(classification["blocks_edits"], false);
         }
 
         #[test]
@@ -1416,6 +2247,47 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
             assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_includes_structured_failure_envelope() {
+            let err = db_error_to_mcp_error(DbError::ResourceBusy("database is locked".into()));
+            let data = err.data.expect("expected data payload");
+            let envelope = &data["error"]["data"]["failure_envelope"];
+            assert_eq!(
+                envelope["schema_version"],
+                mcp_agent_mail_db::DB_FAILURE_ENVELOPE_SCHEMA_VERSION
+            );
+            assert_eq!(envelope["class"], "busy_retryable");
+            assert_eq!(envelope["severity"], "P2");
+            assert_eq!(envelope["error_code"], "RESOURCE_BUSY");
+            assert_eq!(envelope["policy"]["safe_to_retry"], true);
+            assert_eq!(envelope["policy"]["blocks_edits"], true);
+            assert_eq!(envelope["wal_mode"]["status"], "not_collected");
+            assert_eq!(
+                envelope["frankensqlite_probe"]["status"],
+                "classified_from_error"
+            );
+            assert!(envelope["process"]["pid"].as_u64().is_some());
+            assert!(envelope["sidecars"]["wal"].get("exists").is_some());
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                envelope["class"]
+            );
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_mailbox_owner_resource_busy_with_actionable_detail() {
+            let detail = "mailbox activity lock is busy for storage root /tmp/mailbox \
+                (exclusive lock /tmp/mailbox/.mailbox.activity.lock): another Agent Mail runtime \
+                is already active; owner hint: pid=17 mode=exclusive";
+            let err = db_error_to_mcp_error(DbError::ResourceBusy(detail.into()));
+            let data = err.data.expect("expected data payload");
+            let message = data["error"]["message"].as_str().unwrap();
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert!(message.contains("Route this operation through that server"));
+            assert!(message.contains("mailbox activity lock is busy"));
+            assert!(message.contains("pid=17"));
         }
 
         #[test]
@@ -1699,6 +2571,10 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("list_contacts", clusters::CONTACT),
     ("set_contact_policy", clusters::CONTACT),
     // File reservations
+    (
+        "check_file_reservation_conflicts",
+        clusters::FILE_RESERVATIONS,
+    ),
     ("file_reservation_paths", clusters::FILE_RESERVATIONS),
     ("release_file_reservations", clusters::FILE_RESERVATIONS),
     ("renew_file_reservations", clusters::FILE_RESERVATIONS),
@@ -1754,6 +2630,10 @@ mod tests {
         );
         assert_eq!(tool_cluster("send_message"), Some(clusters::MESSAGING));
         assert_eq!(tool_cluster("request_contact"), Some(clusters::CONTACT));
+        assert_eq!(
+            tool_cluster("check_file_reservation_conflicts"),
+            Some(clusters::FILE_RESERVATIONS)
+        );
         assert_eq!(
             tool_cluster("file_reservation_paths"),
             Some(clusters::FILE_RESERVATIONS)

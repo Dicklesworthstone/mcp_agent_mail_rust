@@ -790,10 +790,13 @@ e2e_case_banner "share preview smoke test"
 
 # Find a free port for preview
 PREVIEW_PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
+PREVIEW_LOG="${E2E_ARTIFACT_DIR}/case_15_preview_server.log"
 
 # Start preview in background
 set +e
-am_env "${AM_BIN}" share preview "${BUNDLE1}" --port "${PREVIEW_PORT}" --no-open-browser &
+DATABASE_URL="sqlite:////${DB_PATH}" \
+STORAGE_ROOT="${STORAGE_ROOT}" \
+"${AM_BIN}" share preview "${BUNDLE1}" --port "${PREVIEW_PORT}" --no-open-browser >"${PREVIEW_LOG}" 2>&1 &
 PREVIEW_PID=$!
 
 # Wait for port to be available
@@ -814,6 +817,15 @@ fi
 
 # Kill preview server
 kill "${PREVIEW_PID}" 2>/dev/null || true
+for _ in {1..20}; do
+    if ! kill -0 "${PREVIEW_PID}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if kill -0 "${PREVIEW_PID}" 2>/dev/null; then
+    kill -9 "${PREVIEW_PID}" 2>/dev/null || true
+fi
 wait "${PREVIEW_PID}" 2>/dev/null || true
 set -e
 

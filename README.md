@@ -12,7 +12,7 @@
 
 > "It's like Gmail for your coding agents!"
 
-A mail-like coordination layer for AI coding agents, exposed as an MCP server with 37 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
+A mail-like coordination layer for AI coding agents, exposed as an MCP server with 38 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
 
 **Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
@@ -42,7 +42,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Agent Configuration](#agent-configuration)
 - [Server Modes](#server-modes)
 - [Operator CLI Surface](#operator-cli-surface)
-- [The 37 MCP Tools](#the-37-mcp-tools)
+- [The 38 MCP Tools](#the-38-mcp-tools)
 - [TUI Operations Console](#tui-operations-console)
 - [Robot Mode (`am robot`)](#robot-mode-am-robot)
 - [File Reservations](#file-reservations-for-multi-agent-editing)
@@ -86,12 +86,12 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Asynchronous Messaging** | Threaded inbox/outbox with subjects, CC/BCC, acknowledgments, and importance levels |
 | **Token-Efficient** | Messages stored in a per-project archive, not in agent context windows |
 | **25 MCP Resources** | Read-only inbox, thread, reservation, tooling, identity, and attention views for cheap lookups |
-| **37 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
+| **38 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
 | **16-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, archive browsing, and ATC |
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
-| **Robot Mode** | 17 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
+| **Robot Mode** | 18 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
-| **Hybrid Search** | Search V3 via frankensearch with lexical, semantic, and hybrid routing |
+| **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing are controlled by the hybrid feature flag (`feature = "hybrid"`). |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
 | **Dual-Mode Interface** | MCP server (`mcp-agent-mail`) and operator CLI (`am`) share tools but enforce strict surface separation |
 
@@ -177,7 +177,7 @@ Agent Mail has been available since October 2025 and was designed around real mu
 
 **No "broadcast to all" mode.** Given the option, many agents will overuse broadcast-style messaging. That is the equivalent of default reply-all in email: lots of irrelevant noise and wasted context.
 
-**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 37 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
+**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 38 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
 
 **No git worktrees.** Worktrees can slow development velocity and create reconciliation debt when agents diverge. Agent Mail takes the opposite approach: keep agents in one shared space, surface conflicts quickly, and give them tools to coordinate through them.
 
@@ -236,13 +236,13 @@ Parallel agent work changes the economics of supervision. One human operator can
 
 **Mail metaphor, not chat.** Agents send discrete messages with subjects, recipients, and thread IDs. Work coordination is structured communication with clear intent, not a firehose. Imagine if your email system at work defaulted to reply-all every time; that's what chat-based coordination does, and it burns context fast.
 
-**Git as the source of truth.** Every message, agent profile, and reservation artifact lives as a file in a per-project Git repository. The entire communication history is human-auditable, diffable, and recoverable. SQLite is the fast index, not the authority.
+**SQLite for live state, Git for the durable ledger.** The accepted write path mutates SQLite first so inboxes, resources, TUI, web, and robot views see one fresh operational state. The same write then emits human-readable message, profile, and reservation artifacts into the per-project Git archive for audit and recovery.
 
 **Advisory, not mandatory.** File reservations are advisory leases, not hard locks. The pre-commit guard enforces them at commit time, but agents can always override if needed. Deadlocks become impossible while accidental conflicts still get caught. Reservations expire on a TTL, so crashed agents don't hold files hostage forever.
 
 **Resilient to agent death.** Agents die all the time: context windows overflow, sessions crash, memory gets wiped. Any agent can vanish without breaking the system. No ringleader agents, no single points of failure. Semi-persistent identities exist for coordination but don't create hard dependencies.
 
-**Dual persistence.** Human-readable Markdown in Git for auditability; SQLite for indexing plus Search V3 for fast lexical/semantic retrieval. Both stay in sync through the write pipeline.
+**Dual persistence.** Human-readable Markdown in Git for auditability; SQLite for live indexing plus Search V3 for fast lexical/semantic retrieval. Both stay in sync through the write pipeline.
 
 **Structured concurrency, no Tokio.** The entire async stack uses [asupersync](https://github.com/Dicklesworthstone/asupersync) with `Cx`-threaded structured concurrency. No orphan tasks, cancel-correct channels, and deterministic testing with virtual time.
 
@@ -321,7 +321,7 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect locally patched sibling checkouts in the parent directory for **seven** repos: `../asupersync`, `../fastmcp_rust`, `../beads_rust`, `../sqlmodel_rust`, `../frankensqlite`, `../frankentui`, and `../frankensearch`.
+Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect locally patched sibling checkouts in the parent directory for **eight** repos: `../asupersync`, `../fastmcp_rust`, `../beads_rust`, `../franken_agent_detection`, `../frankentui`, `../frankensearch`, `../toon_rust`, and `../rich_rust`. SQLmodel and FrankenSQLite resolve from crates.io.
 
 ### Platforms
 
@@ -512,7 +512,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Surface | Subcommands / form | What it is for |
 |---------|--------------------|----------------|
 | Runtime | `serve-http`, `serve-stdio`, `service install|status|logs|restart`, `check-inbox` | Start the server, run stdio MCP, manage a background service, or poll inbox state from hooks/editors |
-| Quality gates | `ci`, `lint`, `typecheck`, `bench` | Run the native quality pipeline and capture CLI/perf baselines |
+| Quality gates | `ci`, `verify`, `lint`, `typecheck`, `bench` | Run the native quality pipeline, build-slot-protected verification lanes, and CLI/perf baselines |
 | E2E and determinism | `e2e list|run|show`, `golden capture|verify|list`, `flake-triage scan|reproduce|detect` | Test transports and workflows, guard CLI output contracts, and triage flaky failures |
 | Share and deploy | `share export|update|preview|verify|decrypt|wizard|static-export`, `share deploy validate|tooling|verify|verify-live` | Build portable mailbox bundles, preview them, and validate live static deployments |
 | Archive and recovery | `archive save|list|restore`, `doctor check|archive-scan|archive-normalize|repair|backups|restore|reconstruct|fix` | Snapshot mailbox state, scan/archive hygiene, normalize safe archive debt, or repair/rebuild SQLite from the Git archive |
@@ -521,6 +521,25 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Platform and setup | `setup run|status`, `config set-port|show-port`, `amctl env`, `tooling ...`, `docs insert-blurbs` | Bootstrap connectors, inspect runtime config, introspect tool schemas/metrics/locks, and stamp docs |
 | Migration and lifecycle | `legacy detect|import|status`, `upgrade`, `migrate`, `self-update`, `am-run`, `guard ...` | Migrate Python installs, perform DB-format upgrades, run slot-aware build commands, and manage guard hooks |
 | Break-glass admin | `clear-and-reset-everything` | Fully reset local state after optional archival. Use sparingly. |
+
+### Setup Drift Reports
+
+`am setup status` is read-only. It inventories supported MCP clients, reports the
+current redacted server entry beside the expected entry, and labels drift such
+as `missing_file`, `legacy_stdio`, `stale_http_path`, `wrong_bearer_header`,
+`wrong_startup_timeout`, `duplicate_server_entries`, and `unsupported_config`.
+
+Use the reported remediation in two steps:
+
+```bash
+am setup status --format json
+am setup run --dry-run --project-dir "$PWD" --format toon
+am setup run --yes --project-dir "$PWD" --format toon
+```
+
+For bearer-header checks, pass `--token` to `am setup status` or expose the
+expected token through `HTTP_BEARER_TOKEN` / `config.env`; status output redacts
+token values.
 
 ### Family Detail
 
@@ -544,12 +563,13 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | `golden` | `capture`, `verify`, `list` |
 | `flake-triage` | `scan`, `reproduce`, `detect` |
 | `robot` | `status`, `inbox`, `timeline`, `overview`, `thread`, `search`, `message`, `navigate`, `reservations`, `metrics`, `health`, `analytics`, `agents`, `contacts`, `projects`, `attachments`, `atc` |
+| `verify` | `cargo-fmt`, `cargo-check`, `cargo-clippy`, `cargo-test`, `e2e-list`, `e2e-stdio`, `bench-quick`, `reliability-coverage` |
 | `legacy` | `detect`, `import`, `status` |
 | `service` | `install`, `uninstall`, `status`, `logs`, `restart` |
 
 ---
 
-## The 37 MCP Tools
+## The 38 MCP Tools
 
 ### 9 Clusters
 
@@ -559,7 +579,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Identity | 6 | `register_agent`, `create_agent_identity`, `whois`, `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents` |
 | Messaging | 5 | `send_message`, `reply_message`, `fetch_inbox`, `acknowledge_message`, `mark_message_read` |
 | Contacts | 4 | `request_contact`, `respond_contact`, `list_contacts`, `set_contact_policy` |
-| File Reservations | 4 | `file_reservation_paths`, `renew_file_reservations`, `release_file_reservations`, `force_release_file_reservation` |
+| File Reservations | 5 | `check_file_reservation_conflicts`, `file_reservation_paths`, `renew_file_reservations`, `release_file_reservations`, `force_release_file_reservation` |
 | Search | 2 | `search_messages`, `summarize_thread` |
 | Macros | 4 | `macro_start_session`, `macro_prepare_thread`, `macro_contact_handshake`, `macro_file_reservation_cycle` |
 | Product Bus | 5 | `ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product` |
@@ -628,7 +648,7 @@ Archive Browser note: use `Enter` to expand/preview, `Tab` to switch tree vs pre
 
 Non-interactive, agent-first CLI surface for TUI-equivalent situational awareness. Use it when you need structured snapshots quickly, especially in automated loops and when tokens matter.
 
-### 17 Subcommands
+### 18 Subcommands
 
 | Command | Purpose | Key flags |
 |---------|---------|-----------|
@@ -642,13 +662,14 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
 | `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
-| `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent` |
+| `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
 | `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
 | `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
 | `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
 | `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
 | `am robot atc` | Live ATC snapshot with local DB fallback when the server is unavailable | `--since`, `--stratum`, `--summary-only`, `--limit` |
+| `am robot handoff` | Read-only stale bead ownership and handoff dashboard | `--stale-minutes`, `--active-minutes`, `--fresh-comment-minutes`, `--include-fresh`, `--dry-run` |
 
 ### Output Formats
 
@@ -657,6 +678,8 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 - **`md`** (thread/message-focused): Human-readable narrative for deep context
 
 `am robot atc` reads the live ATC snapshot over `/mail/ws-state` when the local server is running and falls back to a local SQLite rollup/liveness view when that snapshot is unavailable. Use `--since` to trim recent decisions/executions, `--stratum` to focus open-stratum counts, and `--summary-only` for the compact health view.
+
+`am robot handoff` correlates in-progress beads with Agent Mail activity, active file reservations, thread mail, and recent comments. It is always read-only: reopen/takeover rows contain proposed `br update ... --status open --json` commands, but agents must inspect reservations, peer dirty work, and the related thread before running them.
 
 ### Agent Workflow Recipes
 
@@ -675,6 +698,10 @@ am robot thread br-123 --project /abs/path --agent AgentName --format md
 
 # Reservation safety check before edits
 am robot reservations --project /abs/path --agent AgentName --conflicts --expiring 30
+
+# Heavy verification recommendation with build-slot admission and rch
+am robot status --project /abs/path --agent AgentName --format json \
+  | jq '.recommendations[] | select(.category == "verification_lane")'
 ```
 
 ---
@@ -867,9 +894,11 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
+| `HTTP_ALLOWED_HOSTS` | (none) | Comma-separated extra `Host:` header values the HTTP listener accepts, in addition to the bind host, its loopback variant, and `localhost`. Set this (or pass repeatable `serve-http --allowed-host <HOST>`) to reach the `/mail` web UI via a hostname or reverse proxy instead of getting an HTTP 421. Empty by default (loopback-only). |
 | `DATABASE_URL` | `sqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
 | `AM_CACHE_PROFILE` | `balanced` | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB` | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
+| `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
 | `STORAGE_ROOT` | XDG-aware (see below) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer a per-run `STORAGE_ROOT` instead. |
 | `LOG_LEVEL` | `info` | Minimum log level |
@@ -887,13 +916,57 @@ All configuration via environment variables. The server reads them at startup vi
 | `AM_TUI_COACH_HINTS_ENABLED` | `true` | Enable contextual coach-hint notifications |
 | `AM_TUI_EFFECTS` | `true` | Enable text/animation effects |
 | `AM_TUI_AMBIENT` | `subtle` | Ambient mode (`off`/`subtle`/`full`) |
+| `AM_TUI_FULL_REDRAW_MAX_SECS` | `1.0` | Wall-clock bound (seconds) for a guaranteed full TUI redraw that repairs incremental-diff render desync; `<= 0` disables the bound |
 | `WORKTREES_ENABLED` | `false` | Build slots feature flag |
+| `INTEGRITY_CHECK_ON_STARTUP` | `true` | Run `PRAGMA integrity_check` during startup self-heal (set `false` to fast-unblock a degraded boot) |
+| `STARTUP_READINESS_BIND_TIMEOUT_SECS` | `20` | Max seconds to wait for DB readiness before binding the listener anyway (`/healthz` stays up while the DB warms) |
+| `DB_MAINTENANCE_ENABLED` | `true` | Enable the off-hot-path periodic SQLite maintenance worker (checkpoint/ANALYZE/VACUUM/journal-size cap) |
+| `DB_CHECKPOINT_INTERVAL_SECS` | `300` | Passive WAL checkpoint cadence (`0` disables that op) |
+| `DB_ANALYZE_INTERVAL_SECS` | `21600` | `ANALYZE` planner-stats refresh cadence (`0` disables) |
+| `DB_VACUUM_INTERVAL_SECS` | `86400` | `VACUUM` reclaim/defragment cadence (`0` disables) |
+| `DB_JOURNAL_SIZE_LIMIT_BYTES` | `268435456` | `journal_size_limit` WAL truncation cap (256 MiB) |
+| `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
+| `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 
 For operations guidance and troubleshooting, see
 [docs/OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md). For copy-paste operator
 recipes, see [docs/OPERATOR_COOKBOOK.md](docs/OPERATOR_COOKBOOK.md).
+
+### Registration Proof Gate (optional, off by default)
+
+By default Agent Mail uses a **self-asserted** identity model: any caller may
+`register_agent` under any well-formed name. That is the right trade-off for
+local, trusted, single-operator multi-agent coordination and remains the
+default — nothing changes unless you opt in.
+
+Deployments where agents come from **different operators or less-trusted
+sources** can require a cryptographic proof before any identity is persisted.
+When enabled, `register_agent` (and every other path that can implicitly
+create an agent row, including `send_message` / `request_contact`
+auto-registration and the CLI) demands a `registration_proof` argument: a JSON
+bundle binding the final agent name, project key, program, model, capability
+scope, an `issued_at`/`expires_at` window, and a single-use nonce, signed
+(Ed25519) by one of your configured trust anchors. Verification is
+**fail-closed**: a missing, malformed, untrusted, expired, replayed, or
+mismatched proof rejects the registration and writes nothing. Consumed nonces
+are persisted in the database, so replay protection survives server restarts.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AM_REGISTRATION_PROOF_GATE_ENABLED` | `false` | Master switch. Off = self-asserted identity (unchanged default). |
+| `AM_REGISTRATION_PROOF_TRUSTED_KEYS` | (empty) | Comma-separated base64 Ed25519 public keys (32 raw bytes each). Enabled with no keys = every registration fails closed. |
+| `AM_REGISTRATION_PROOF_MAX_LIFETIME_SECONDS` | `300` | Maximum allowed `expires_at - issued_at` window. |
+| `AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS` | `60` | Clock-skew tolerance for the validity window. |
+| `AM_REGISTRATION_PROOF_REQUIRE_NONCE` | `true` | Require and consume a single-use nonce per proof (replay protection). |
+
+The canonical signing bytes are explicit (domain-separation tag +
+newline-delimited `field=value` lines; capabilities sorted and de-duplicated),
+so issuers can be written in any language. Verification is expressed through a
+pluggable `ProofVerifier` trait (`crates/mcp-agent-mail-tools/src/proof_gate.rs`);
+the shipped implementation is the Ed25519 trust-anchor verifier, and external
+verifier backends can be added without touching registration call sites.
 
 ---
 
@@ -911,7 +984,7 @@ MCP Client / Operator / Browser
                      │
         ┌────────────┼────────────┬─────────────┐
         ▼            ▼            ▼             ▼
-   37 MCP Tools  25 Resources   TUI         Web UI
+   38 MCP Tools  25 Resources   TUI         Web UI
         │            │            │             │
         └────────────┴──────┬─────┴─────────────┘
                             ▼
@@ -938,7 +1011,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-search-core/         # Pluggable search traits
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 37 MCP tool implementations (9 clusters)
+│   ├── mcp-agent-mail-tools/               # 38 MCP tool implementations (9 clusters)
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (16 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
@@ -996,7 +1069,7 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 - **Write-behind cache** with dual-indexed ReadCache and deferred touch batching (30s flush)
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
-- **Search V3 via frankensearch** with lexical/semantic/hybrid routing and unified diagnostics
+- **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate, with portable/no-default builds retaining the deterministic lexical path.
 - **Conformance testing** against the Python reference implementation plus Rust-native extensions
 - **Advisory file reservations** with symmetric fnmatch, archive reading, and rename handling
 - **`#![forbid(unsafe_code)]`** across all crates
@@ -1089,7 +1162,7 @@ The important boundary is this: Git stores the durable human-auditable artifacts
 
 1. A resource read, robot command, TUI view, or web request asks for mailbox or tooling state.
 2. The server resolves scope: project, agent, product, thread, search query, or tooling view.
-3. For direct state, SQLite answers immediately. For search, Search V3 plans the query and executes the appropriate lexical, semantic, or hybrid route.
+3. For direct state, SQLite answers immediately. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is enabled.
 4. The result is rendered as MCP JSON, robot `toon`/`json`/`md`, TUI widgets, or HTML under `/mail/`.
 
 That consistency comes from a shared DB + archive + metrics pipeline. The TUI, web UI, robot CLI, and MCP resources are separate renderers over the same underlying state.
@@ -1101,10 +1174,10 @@ That consistency comes from a shared DB + archive + metrics pipeline. The TUI, w
 Search V3 is not an afterthought bolted onto mailbox rows. It is a dedicated query path with shared planning and diagnostics:
 
 - Queries are normalized, classified, and routed through a unified search service.
-- Lexical, semantic, and hybrid modes share the same top-level contract and diagnostics surface.
+- Lexical mode provides the baseline contract and diagnostics surface; semantic and hybrid modes extend that contract when the `hybrid` feature is enabled.
 - Candidate budgeting and fusion keep broad natural-language queries from exploding while preserving exact-match strength for identifiers and short phrases.
 - The same search path serves MCP tools, `am mail search`, `am robot search`, TUI search, and web UI search routes.
-- Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is the Search V3 path, not ad-hoc direct SQL fallback.
+- Empty or non-searchable queries route through a deterministic SQL plan before Search V3 candidate retrieval. Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is Search V3 plus that deterministic SQL plan, not a hidden FTS fallback.
 
 The dedicated `mcp-agent-mail-search-core` crate exists specifically so search planning and backends can evolve without entangling the rest of the mailbox stack.
 
@@ -1126,13 +1199,14 @@ These are the design rules that let many agents share one checkout without immed
 
 ## Consistency and Recovery Model
 
-- **Git is the artifact ledger.** Canonical messages, inbox/outbox copies, reservation files, and agent profiles are all written as files under per-project archives.
-- **SQLite is the acceleration layer.** It makes inbox fetches, searches, summaries, views, and robot/TUI/web queries fast.
+- **SQLite is the live operational state.** MCP tools, resources, the TUI, the web UI, and robot/CLI reads use SQLite for current inboxes, message IDs, read/ack state, reservations, agents, products, and search planning.
+- **Git is the durable artifact ledger.** Canonical messages, inbox/outbox copies, reservation files, and agent profiles are written as files under per-project archives so the mailbox remains human-auditable and recoverable.
+- **Concurrent writes are queued, not hand-merged.** Parallel agents can send to the same thread at the same time; the server/DB layer serializes the indexed mutations, and the archive write-behind queue plus commit coalescer batches the corresponding Git artifact writes. There is no workflow where two agents create a Git merge conflict and a human resolver has to pick the winning message.
 - **Repair is not reconstruct.** `am doctor repair` is the in-place hygiene path. `am doctor reconstruct` is the archive-first rebuild path when SQLite is no longer trustworthy.
 - **Backups are first-class.** `archive save`, doctor backups, and restore flows all exist because operational recovery is part of the product, not a manual afterthought.
 - **Stale lock cleanup is expected.** Guard hooks, archive lock management, and doctor checks assume agents crash and processes die unexpectedly.
 
-If the fast layer gets sick, the durable layer can rebuild it.
+If the live layer gets sick, the durable ledger can rebuild it.
 
 ---
 
@@ -1183,6 +1257,10 @@ am e2e run --project .                 # all suites
 am e2e run --project . stdio http      # selected suites
 am e2e run --project . --include tui_  # pattern include
 am e2e run --project . tui_full_traversal  # traversal + flash + soak regression gate
+am e2e run --project . --tag reliability --release-scorecard  # reliability release gate
+#   ^ runs every @tags: reliability suite (incl. the incident_corpus harness) and writes
+#     tests/artifacts/release_scorecard/<ts>/release_scorecard.json (per-suite rows +
+#     per-incident-class rows with anchors + a combined release_ready verdict)
 
 # Legacy compatibility shim (deprecated primary path)
 ./scripts/e2e_test.sh stdio
@@ -1193,7 +1271,30 @@ cargo bench -p mcp-agent-mail
 
 # Multi-agent builds: offload heavy cargo work through rch
 rch exec -- cargo check --workspace --all-targets
+
+# Shared-checkout verification lanes: acquire a build slot, run through rch, preserve logs
+am verify cargo-check --path . --agent AgentName --block-on-conflicts
+am verify cargo-clippy --path . --agent AgentName --block-on-conflicts
+am verify cargo-test --path . --agent AgentName --block-on-conflicts
+am verify e2e-stdio --path . --agent AgentName --block-on-conflicts
+am verify bench-quick --path . --agent AgentName --block-on-conflicts
 ```
+
+`am verify` is a thin `am-run` lane mapper. It always shows the exact command, uses a `verify-*` build slot even when `WORKTREES_ENABLED` is not set in the shell, routes cargo-heavy work through `rch exec -- ...`, and writes `command.json`, `stdout.log`, `stderr.log`, `exit_code.txt`, and `result.json` under `STORAGE_ROOT/artifacts/verify/<timestamp>-<lane>/` unless `--artifact-dir` is supplied.
+
+`result.json` includes `rch_proof.status`, `child_exit_code`, and the final proof `exit_code`. For `rch exec` lanes, a zero-exit child is only green when the captured output includes a positive remote-execution marker. Local fallback or missing remote proof fails closed, writes `rch_proof_failure.txt`, and best-effort captures `rch_status_workers.json` plus `rch_queue.json` so operators can distinguish a remote test failure from transport/sync/fleet degradation.
+
+Release evidence for robot/doctor fields must prove the installed `am` binary, not only the source-built test binary. For parity-sensitive fields such as `forensic_timeline`, search-index health, recovery status, artifact links, next actions, and redaction, run the installed-binary parity gate against the release candidate installed on the same host or remote worker:
+
+```bash
+AM_INSTALLED_BINARY_PARITY_BIN=/path/to/installed/am \
+  rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs \
+  installed_binary_parity_probe_compares_source_and_installed_am -- --ignored --nocapture
+```
+
+The gate writes `tests/artifacts/installed_binary_parity/<run>/parity_report.json` with one pass/fail row per required JSON path, redacted source/installed values, value-mismatch status, and redacted command metadata. If the candidate lacks fields that source tests rely on, or returns different required values, the report is red and the release is not closed. A local direct `am doctor check --json` or `am robot ... --format json` probe is useful for quick inspection, but it is not sufficient release evidence unless paired with this parity report and an `rch exec -- ...` cargo proof.
+
+Use `--dry-run` to inspect the lane without running it. Use `--no-block-on-conflicts` only when the slot conflict is understood and you intentionally want advisory behavior.
 
 ### E2E Entrypoint Policy (T9.9)
 
@@ -1263,7 +1364,9 @@ These numbers come from [`benches/BUDGETS.md`](benches/BUDGETS.md), which record
 | `am lint` | 457ms | < 1000ms |
 | `am typecheck` | 399ms | < 800ms |
 
-#### Search V3 Frankensearch Lexical Baselines (2026-02-18)
+#### Search V3 frankensearch lexical-tier baselines (2026-02-18)
+
+Tantivy is the lexical backend inside frankensearch; semantic and hybrid fusion are controlled by the `hybrid` feature.
 
 | Corpus size | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 |
 |-------------|--------------|--------------|--------------|------------|
@@ -1344,6 +1447,10 @@ am doctor reconstruct           # Rebuild SQLite from the Git archive (+ salvage
 am doctor fix --dry-run         # Preview all safe/automatic fixes
 am doctor fix --yes             # Apply them without prompting
 
+# Sanitized incident bundle for maintainer support
+am doctor support-bundle --json
+am doctor support-bundle --stdout-log /tmp/am.stdout --stderr-log /tmp/am.stderr --redact-subjects
+
 # Backup management
 am doctor backups               # List available backups
 am doctor restore /path/to/backup.sqlite3
@@ -1362,7 +1469,7 @@ What `check` inspects:
 | Search/index state | Legacy FTS artifact presence, rebuildability, and search-side schema hygiene |
 | Storage/runtime hygiene | Stale archive locks, WAL mode, expired reservations, writable storage root |
 
-`am doctor archive-scan` is the non-mutating hygiene report for the Git archive itself. `am doctor archive-normalize` is the non-destructive remediation path for safe archive debt: it only rewrites `project.json` when the canonical absolute `human_key` is already known, and it quarantines duplicate canonical message files instead of deleting them. `am doctor repair` is the in-place SQLite hygiene path: it creates a backup, captures a forensic bundle, cleans orphaned rows, rebuilds legacy FTS artifacts if they still exist, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it captures a forensic bundle, quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file while writing oversized warning sets to a report artifact instead of flooding the terminal. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
+`am doctor archive-scan` is the non-mutating hygiene report for the Git archive itself. `am doctor archive-normalize` is the non-destructive remediation path for safe archive debt: it only rewrites `project.json` when the canonical absolute `human_key` is already known, and it quarantines duplicate canonical message files instead of deleting them. `am doctor repair` is the in-place SQLite hygiene path: it creates a backup, captures a forensic bundle, cleans orphaned rows, rebuilds legacy FTS artifacts if they still exist, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it captures a forensic bundle, quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file while writing oversized warning sets to a report artifact instead of flooding the terminal. `am doctor support-bundle` creates a separate sanitized support artifact under `STORAGE_ROOT/doctor/support-bundles/`: it includes the current repair/reconstruct decision, schema/version shape, sidecar metadata, replay commands, redacted stdout/stderr when supplied, and sanitized copies of recent doctor reports. It deliberately omits raw SQLite files, canonical message files, message bodies, and attachments; pass `--redact-subjects` when subjects are sensitive. Review `manifest.json` before sharing because it lists every included file, redaction mode, source path class, and omitted evidence class. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
 
 ---
 
@@ -1375,9 +1482,14 @@ What `check` inspects:
 | Auth errors with JWT | Include bearer token with matching `kid` in the request header |
 | Port 8765 already in use | `am serve-http --port 9000` or stop the existing server |
 | TUI not rendering | Check `TUI_ENABLED=true` and that your terminal supports 256 colors |
+| TUI appears **frozen** (render/input stuck, but the process is still serving MCP/API) | Do **not** kill the process. Run the non-interactive freeze escape hatch `am tui-dump --format json`: it returns the same situational snapshot the TUI renders, fetched live from `/mail/ws-state` (including a per-loop liveness verdict that names the stalled loop) and falling back to a local SQLite read if the whole process is wedged. Always exits 0. `am robot health --format json` also classifies the stall and points at the same read-out. If the freeze persists, restart headless: `mcp-agent-mail serve --no-tui`. |
+| TUI shows **garbled / stale cells** (render corruption that clears on resize) | A guaranteed full redraw is bounded by wall clock: `AM_TUI_FULL_REDRAW_MAX_SECS` (default `1.0`s). Lower it (e.g. `0.25`) to repair incremental-diff desync faster, or set `<= 0` to disable the bound. Ensure you are on the latest build — confirm with `am --version` and reinstall via `./install-local.sh` if stale, since render fixes ship in the binary, not the running session. |
+| TUI becomes **mostly blank after running for a while** | Upgrade to `v0.3.21` or later and confirm with `am --version`. Older builds could mistake a healthy 100 ms frame for a missed 16.6 ms budget and then replace most content with an `EssentialOnly` frame. Current builds keep the console at full visual fidelity under load; `am e2e run --project . tui_full_traversal` verifies this against an emulated terminal screen. |
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
+| Tools time out / "Database corruption detected" under heavy load | Run `am robot health --include-host --format json` and read the `host` section. If `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, the problem is **host overload, not mailbox corruption** — relieve host pressure before reconstructing. |
+| `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. Fast unblock: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. |
 | Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
 | `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all --dry-run`. |
 
@@ -1407,7 +1519,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Local patched dependencies.** Building from source expects local sibling checkouts in the parent directory for **seven** repos: `asupersync`, `fastmcp_rust`, `beads_rust`, `sqlmodel_rust`, `frankensqlite`, `frankentui`, and `frankensearch`.
+- **Local patched dependencies.** Building from source expects local sibling checkouts in the parent directory for **eight** repos: `asupersync`, `fastmcp_rust`, `beads_rust`, `franken_agent_detection`, `frankentui`, `frankensearch`, `toon_rust`, and `rich_rust`. SQLmodel and FrankenSQLite resolve from crates.io.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
@@ -1417,7 +1529,7 @@ need to do anything.
 ## FAQ
 
 **Q: How is this different from the Python version?**
-A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite exercises 34 Python-parity tools plus 3 Rust-native Identity tools, and all 25 MCP resources, against captured fixtures — ensuring format parity with the Python reference where parity is meaningful.
+A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite exercises 34 Python-parity tools plus 4 Rust-native tools, and all 25 MCP resources, against captured fixtures — ensuring format parity with the Python reference where parity is meaningful.
 
 **Q: Do I need to run a separate server for each project?**
 A: No. One server handles multiple projects. Each project is identified by its absolute filesystem path as the `project_key`.
@@ -1432,7 +1544,7 @@ A: Yes. Use `request_contact` / `respond_contact` (or `macro_contact_handshake`)
 A: Yes. You can use a Max account with Agent Mail. Each agent session connects to the same MCP server regardless of subscription tier.
 
 **Q: What happens if the server crashes?**
-A: Git is the source of truth. SQLite indexes can be rebuilt from the Git archive. The commit coalescer uses a write-behind queue that flushes on graceful shutdown.
+A: SQLite is the normal live state and the Git archive is the durable audit/recovery ledger. On a clean shutdown the commit coalescer flushes queued archive writes; after corruption or unrecoverable drift, `am doctor reconstruct` can rebuild SQLite from the archive.
 
 **Q: How does this integrate with Beads?**
 A: Use the Beads issue ID (e.g., `br-123`) as the Mail `thread_id`. Beads owns task status/priority/dependencies; Agent Mail carries the conversations and audit trail. The installer can optionally set up Beads alongside Agent Mail.
@@ -1638,6 +1750,7 @@ Common pitfalls
 
 | Document | Purpose |
 |----------|---------|
+| [INDEX.md](docs/INDEX.md) | Navigation map for the docs tree |
 | [OPERATOR_COOKBOOK.md](docs/OPERATOR_COOKBOOK.md) | Canonical copy-paste operator recipes for setup, triage, reservations, messaging, share/export, and diagnostics |
 | [OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md) | Deployment, troubleshooting, diagnostics |
 | [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Dev setup, debugging, testing |

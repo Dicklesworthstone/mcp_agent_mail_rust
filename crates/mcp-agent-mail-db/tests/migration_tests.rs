@@ -59,7 +59,7 @@ fn seed_full_migration_fixture(conn: &DbConn) {
     .expect("insert product link");
     conn.query_sync(
         "INSERT INTO agent_links (a_project_id, a_agent_id, b_project_id, b_agent_id, status, created_ts, updated_ts, expires_ts)
-         VALUES (1, 1, 1, 1, 'accepted', '2026-02-24 15:30:00.123456', '2026-02-24 15:30:00', NULL)",
+         VALUES (1, 1, 1, 1, 'approved', '2026-02-24 15:30:00.123456', '2026-02-24 15:30:00', NULL)",
         &[],
     )
     .expect("insert agent link");

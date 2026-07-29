@@ -1,0 +1,109 @@
+{
+  "schema": "health_sweep_bench.v1",
+  "generated_at": "2026-05-11T02:24:36.033085940+00:00",
+  "command": "rch exec -- cargo bench -p mcp-agent-mail-server --bench health_sweep_bench",
+  "budgets": {
+    "unit": "microseconds",
+    "single_repo_100_commits": {
+      "p95": 200000,
+      "p99": 500000
+    },
+    "single_repo_1000_commits": {
+      "p95": 1500000,
+      "p99": null
+    },
+    "full_archive_50_projects_per_project": {
+      "p95": 200000,
+      "p99": null
+    }
+  },
+  "samples": [
+    {
+      "name": "single_project_100_commits",
+      "projects": 1,
+      "commits_per_project": 100,
+      "samples_us": [
+        398,
+        403,
+        403,
+        413,
+        421,
+        423,
+        449,
+        454,
+        464,
+        480,
+        482,
+        549,
+        552,
+        587,
+        1402
+      ],
+      "p50_us": 454,
+      "p95_us": 1402,
+      "p99_us": 1402,
+      "max_us": 1402,
+      "p95_per_project_us": 1402,
+      "budget_us": 200000,
+      "budget_passed": true
+    },
+    {
+      "name": "single_project_1000_commits",
+      "projects": 1,
+      "commits_per_project": 1000,
+      "samples_us": [
+        295,
+        426,
+        439,
+        458,
+        461,
+        461,
+        484,
+        490,
+        500,
+        505,
+        545,
+        557,
+        566,
+        568,
+        583
+      ],
+      "p50_us": 490,
+      "p95_us": 583,
+      "p99_us": 583,
+      "max_us": 583,
+      "p95_per_project_us": 583,
+      "budget_us": 1500000,
+      "budget_passed": true
+    },
+    {
+      "name": "full_archive_50_projects",
+      "projects": 50,
+      "commits_per_project": 1,
+      "samples_us": [
+        20695,
+        20995,
+        21601,
+        22142,
+        22348,
+        22449,
+        22695,
+        22821,
+        23143,
+        23172,
+        24133,
+        24904,
+        25231,
+        25811,
+        25909
+      ],
+      "p50_us": 22821,
+      "p95_us": 25909,
+      "p99_us": 25909,
+      "max_us": 25909,
+      "p95_per_project_us": 518,
+      "budget_us": 10000000,
+      "budget_passed": true
+    }
+  ]
+}

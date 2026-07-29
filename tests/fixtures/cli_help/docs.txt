@@ -1,3 +1,5 @@
+Generate and insert Agent Mail documentation blurbs
+
 Usage: am docs <COMMAND>
 
 Commands:

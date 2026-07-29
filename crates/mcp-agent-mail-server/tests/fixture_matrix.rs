@@ -582,6 +582,17 @@ fn validate_min(validations: &mut Vec<Validation>, check: &str, min: i64, actual
 
 // ── Scenario runner ─────────────────────────────────────────────────────
 
+fn seed_fixture<F: FnOnce(&mcp_agent_mail_db::DbConn)>(
+    conn: &mcp_agent_mail_db::DbConn,
+    seed_fn: F,
+) {
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .expect("begin fixture seed transaction");
+    seed_fn(conn);
+    conn.execute_raw("COMMIT")
+        .expect("commit fixture seed transaction");
+}
+
 fn run_scenario<F: FnOnce(&mcp_agent_mail_db::DbConn)>(
     name: &str,
     seed_fn: F,
@@ -591,7 +602,7 @@ fn run_scenario<F: FnOnce(&mcp_agent_mail_db::DbConn)>(
     let conn = env.conn();
 
     let seed_start = Instant::now();
-    seed_fn(&conn);
+    seed_fixture(&conn, seed_fn);
     let seed_duration = seed_start.elapsed();
 
     // Re-open connection for clean query state.
@@ -692,8 +703,6 @@ fn fixture_high_traffic() {
 #[test]
 fn fixture_seed_performance() {
     // Verify all scenarios seed within reasonable time budgets.
-    let env = FixtureEnv::new();
-
     let scenarios: Vec<(&str, Box<dyn FnOnce(&mcp_agent_mail_db::DbConn)>, u64)> = vec![
         ("baseline", Box::new(seed_baseline), 100),
         ("multi_project", Box::new(seed_multi_project), 200),
@@ -704,14 +713,11 @@ fn fixture_seed_performance() {
     let mut results = Vec::new();
 
     for (name, seed_fn, budget_ms) in scenarios {
-        let conn = env.conn();
-        // Reset DB for each scenario.
-        drop(conn);
         let fresh_env = FixtureEnv::new();
         let conn = fresh_env.conn();
 
         let start = Instant::now();
-        seed_fn(&conn);
+        seed_fixture(&conn, seed_fn);
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let passed = elapsed_ms <= budget_ms;
@@ -777,7 +783,7 @@ fn fixture_matrix_combined_report() {
         let conn = env.conn();
 
         let start = Instant::now();
-        seed_fn(&conn);
+        seed_fixture(&conn, seed_fn);
         let seed_ms = start.elapsed().as_millis() as u64;
 
         drop(conn);

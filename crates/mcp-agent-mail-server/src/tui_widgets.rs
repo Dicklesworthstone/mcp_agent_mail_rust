@@ -4632,7 +4632,7 @@ impl ChartDataProvider for ResourceProvider {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Number of distinct [`MailEventKind`] variants.
-const EVENT_KIND_COUNT: usize = 11;
+const EVENT_KIND_COUNT: usize = 12;
 
 /// All event kinds in a fixed order for consistent heatmap row assignment.
 const EVENT_KINDS: [MailEventKind; EVENT_KIND_COUNT] = [
@@ -4645,6 +4645,7 @@ const EVENT_KINDS: [MailEventKind; EVENT_KIND_COUNT] = [
     MailEventKind::AgentRegistered,
     MailEventKind::HttpRequest,
     MailEventKind::HealthPulse,
+    MailEventKind::GitSegfaultRetry,
     MailEventKind::ServerStarted,
     MailEventKind::ServerShutdown,
 ];
@@ -4660,6 +4661,7 @@ const EVENT_KIND_LABELS: [&str; EVENT_KIND_COUNT] = [
     "AgentReg",
     "HTTP",
     "Health",
+    "GitSegv",
     "SrvStart",
     "SrvStop",
 ];
@@ -7743,10 +7745,10 @@ mod tests {
     }
 
     #[test]
-    fn heatmap_provider_all_11_event_kinds_mapped() {
-        // Verify EVENT_KINDS has all 11 variants
-        assert_eq!(EVENT_KINDS.len(), 11);
-        assert_eq!(EVENT_KIND_LABELS.len(), 11);
+    fn heatmap_provider_all_event_kinds_mapped() {
+        // Verify the fixed mapping arrays stay aligned as event kinds are added.
+        assert_eq!(EVENT_KINDS.len(), EVENT_KIND_COUNT);
+        assert_eq!(EVENT_KIND_LABELS.len(), EVENT_KIND_COUNT);
         // Verify each kind maps to a unique index
         for (i, kind) in EVENT_KINDS.iter().enumerate() {
             assert_eq!(

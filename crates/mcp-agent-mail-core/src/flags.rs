@@ -591,7 +591,10 @@ pub fn toggle_bool_flag(
         }
     })?;
 
-    let refreshed = Config::from_env();
+    let mut refreshed = Config::from_env();
+    refreshed
+        .console_persist_path
+        .clone_from(&config.console_persist_path);
     Ok(flag_snapshot(&refreshed, flag))
 }
 

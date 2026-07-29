@@ -1,0 +1,8 @@
+Print the machine-readable CLI capabilities contract
+
+Usage: am capabilities [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format: table, json, or toon (default: table)
+      --json             Output JSON (shorthand for --format json)
+  -h, --help             Print help

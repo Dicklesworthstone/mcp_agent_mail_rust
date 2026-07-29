@@ -12,9 +12,9 @@
 #   Phase 3: Robot CLI integration with live server
 #   Phase 4: Cleanup
 
-E2E_SUITE="atc"
+export E2E_SUITE="atc"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../../scripts/e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -36,9 +36,9 @@ e2e_section "Phase 0: Robot ATC CLI"
 e2e_ensure_binary "am" >/dev/null
 export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
 
-# Test --help flags
-for flag in decisions liveness conflicts summary; do
-    if AM_INTERFACE_MODE=cli am robot atc --help 2>&1 | grep -q "${flag}"; then
+# Test --help flags for the current ATC robot snapshot surface.
+for flag in format since stratum project summary-only agent limit; do
+    if AM_INTERFACE_MODE=cli am robot atc --help 2>&1 | grep -q -- "--${flag}"; then
         e2e_pass "am robot atc --help shows --${flag} flag"
     else
         e2e_fail "am robot atc --help missing --${flag} flag"
@@ -79,6 +79,8 @@ mkdir -p "${ATC_STORAGE}"
 if e2e_start_server_with_logs "${ATC_DB}" "${ATC_STORAGE}" "atc_live" \
     "AM_ATC_ENABLED=true" \
     "AM_ATC_PROBE_INTERVAL_SECS=2" \
+    "HTTP_BEARER_TOKEN=" \
+    "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=1" \
     "HTTP_RBAC_ENABLED=0" \
     "HTTP_RATE_LIMIT_ENABLED=0"; then
     e2e_pass "Server started with ATC enabled (pid=${E2E_SERVER_PID})"
@@ -134,37 +136,40 @@ fi
 
 e2e_section "Phase 2: Agent registration and activity"
 
+ACTIVE_AGENT="RedFox"
+SILENT_AGENT="BluePeak"
+
 # Register 2 agents
-RESP=$(mcp_tool "register_agent" "{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"claude-code\",\"model\":\"opus\",\"name\":\"AlphaAgent\"}" 30)
+RESP=$(mcp_tool "register_agent" "{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"claude-code\",\"model\":\"opus\",\"name\":\"${ACTIVE_AGENT}\"}" 30)
 e2e_save_artifact "phase2_register_alpha.json" "$RESP"
 if echo "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "result" in d' 2>/dev/null; then
-    e2e_pass "AlphaAgent registered"
+    e2e_pass "${ACTIVE_AGENT} registered"
 else
-    e2e_fail "Failed to register AlphaAgent"
+    e2e_fail "Failed to register ${ACTIVE_AGENT}"
 fi
 
-RESP=$(mcp_tool "register_agent" "{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"codex-cli\",\"model\":\"o3\",\"name\":\"BetaAgent\"}" 31)
+RESP=$(mcp_tool "register_agent" "{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"codex-cli\",\"model\":\"o3\",\"name\":\"${SILENT_AGENT}\"}" 31)
 e2e_save_artifact "phase2_register_beta.json" "$RESP"
 if echo "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "result" in d' 2>/dev/null; then
-    e2e_pass "BetaAgent registered"
+    e2e_pass "${SILENT_AGENT} registered"
 else
-    e2e_fail "Failed to register BetaAgent"
+    e2e_fail "Failed to register ${SILENT_AGENT}"
 fi
 
 # Both agents send messages (simulating activity)
 for i in $(seq 1 5); do
-    mcp_tool "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"from_agent\":\"AlphaAgent\",\"to_agents\":[\"BetaAgent\"],\"subject\":\"Activity ping ${i}\",\"body\":\"Working on task ${i}\"}" "$((100 + i))" >/dev/null 2>&1
-    mcp_tool "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"from_agent\":\"BetaAgent\",\"to_agents\":[\"AlphaAgent\"],\"subject\":\"Reply ${i}\",\"body\":\"Acknowledged task ${i}\"}" "$((200 + i))" >/dev/null 2>&1
+    mcp_tool "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"sender_name\":\"${ACTIVE_AGENT}\",\"to\":[\"${SILENT_AGENT}\"],\"subject\":\"Activity ping ${i}\",\"body_md\":\"Working on task ${i}\"}" "$((100 + i))" >/dev/null 2>&1
+    mcp_tool "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"sender_name\":\"${SILENT_AGENT}\",\"to\":[\"${ACTIVE_AGENT}\"],\"subject\":\"Reply ${i}\",\"body_md\":\"Acknowledged task ${i}\"}" "$((200 + i))" >/dev/null 2>&1
     sleep 0.5
 done
 e2e_pass "Both agents exchanged 5 rounds of messages"
 
-# Stop BetaAgent (no more messages) — AlphaAgent continues
+# Stop the second agent (no more messages) — the first agent continues
 for i in $(seq 6 10); do
-    mcp_tool "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"from_agent\":\"AlphaAgent\",\"to_agents\":[\"BetaAgent\"],\"subject\":\"Activity ping ${i}\",\"body\":\"Still working on task ${i}\"}" "$((300 + i))" >/dev/null 2>&1
+    mcp_tool "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"sender_name\":\"${ACTIVE_AGENT}\",\"to\":[\"${SILENT_AGENT}\"],\"subject\":\"Activity ping ${i}\",\"body_md\":\"Still working on task ${i}\"}" "$((300 + i))" >/dev/null 2>&1
     sleep 1
 done
-e2e_pass "AlphaAgent continued sending; BetaAgent went silent"
+e2e_pass "${ACTIVE_AGENT} continued sending; ${SILENT_AGENT} went silent"
 
 # Wait for ATC probe interval to fire (2s probe + buffer)
 e2e_log "Waiting for ATC liveness detection cycle..."
@@ -175,29 +180,29 @@ ATC_STATUS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAI
 e2e_save_artifact "phase2_atc_status.json" "$ATC_STATUS"
 if [ -z "$ATC_STATUS" ]; then
     e2e_fail "ATC status query returned empty output"
-elif echo "$ATC_STATUS" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; assert "summary" in d' 2>/dev/null; then
-    e2e_pass "ATC status is live and includes summary data after agent activity"
+elif echo "$ATC_STATUS" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; s=d["summary"]; assert s["tracked_agents"] >= 2' 2>/dev/null; then
+    e2e_pass "ATC status is live and tracks registered agents after activity"
 else
     e2e_fail "ATC status is not live summary JSON: $(echo "$ATC_STATUS" | head -c 200)"
 fi
 
-# Check for liveness data
-ATC_LIVENESS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --liveness --format json 2>/dev/null || true)
-e2e_save_artifact "phase2_atc_liveness.json" "$ATC_LIVENESS"
-if [ -z "$ATC_LIVENESS" ]; then
-    e2e_fail "ATC liveness query returned empty output"
-elif echo "$ATC_LIVENESS" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; assert "liveness" in d and len(d["liveness"]) > 0' 2>/dev/null; then
-    e2e_pass "ATC liveness report is live and includes tracked agents"
+# Check summary-only projection.
+ATC_SUMMARY_ONLY=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --summary-only --format json 2>/dev/null || true)
+e2e_save_artifact "phase2_atc_summary_only.json" "$ATC_SUMMARY_ONLY"
+if [ -z "$ATC_SUMMARY_ONLY" ]; then
+    e2e_fail "ATC summary-only query returned empty output"
+elif echo "$ATC_SUMMARY_ONLY" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["source"] == "live"; assert "summary" in d; assert "decisions" not in d and "liveness" not in d and "conflicts" not in d' 2>/dev/null; then
+    e2e_pass "ATC summary-only projection suppresses detail sections"
 else
-    e2e_fail "ATC liveness report is not live liveness JSON: $(echo "$ATC_LIVENESS" | head -c 200)"
+    e2e_fail "ATC summary-only output is not the expected projection: $(echo "$ATC_SUMMARY_ONLY" | head -c 200)"
 fi
 
 # ── Phase 3: Robot CLI integration with live server ──────────────────
 
 e2e_section "Phase 3: Robot CLI with live DB"
 
-# Decisions report
-ATC_DECISIONS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --decisions --format json 2>/dev/null || true)
+# Default snapshot includes decisions.
+ATC_DECISIONS=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --format json 2>/dev/null || true)
 e2e_save_artifact "phase3_atc_decisions.json" "$ATC_DECISIONS"
 if [ -z "$ATC_DECISIONS" ]; then
     e2e_fail "ATC decisions query returned empty output"
@@ -208,7 +213,7 @@ else
 fi
 
 # Summary report
-ATC_SUMMARY=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --summary --format json 2>/dev/null || true)
+ATC_SUMMARY=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${ATC_DB}" AGENT_MAIL_URL="${E2E_SERVER_URL}" am robot atc --summary-only --format json 2>/dev/null || true)
 e2e_save_artifact "phase3_atc_summary.json" "$ATC_SUMMARY"
 if [ -z "$ATC_SUMMARY" ]; then
     e2e_fail "ATC summary query returned empty output"

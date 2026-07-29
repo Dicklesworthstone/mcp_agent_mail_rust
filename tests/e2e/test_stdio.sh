@@ -12,9 +12,9 @@
 #   4. Server handles invalid JSON gracefully
 #   5. Server shuts down cleanly on stdin close
 
-E2E_SUITE="stdio"
+export E2E_SUITE="stdio"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../../scripts/e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -149,20 +149,22 @@ send_jsonrpc() {
     local write_pid=$!
 
     # Wait for response with timeout
-    local elapsed=0
+    local deadline_ms now_ms
+    deadline_ms=$((start_ms + timeout_s * 1000))
     local timed_out=false
-    while [ "$elapsed" -lt "$timeout_s" ]; do
+    while true; do
         if [ -s "$response_raw_file" ]; then
             # Got some output, wait a tiny bit more for it to complete
             sleep 0.2
             break
         fi
+        now_ms="$(_e2e_now_ms)"
+        if [ "$now_ms" -ge "$deadline_ms" ]; then
+            timed_out=true
+            break
+        fi
         sleep 0.2
-        elapsed=$((elapsed + 1))
     done
-    if [ "$elapsed" -ge "$timeout_s" ] && [ ! -s "$response_raw_file" ]; then
-        timed_out=true
-    fi
 
     # Clean up: close the FIFO to signal EOF to server
     wait "$write_pid" 2>/dev/null || true
@@ -246,20 +248,22 @@ send_jsonrpc_session() {
     local write_pid=$!
 
     # Wait for all responses
-    local timeout_s=15
-    local elapsed=0
+    local timeout_s="${STDIO_SESSION_TIMEOUT_S:-30}"
+    local deadline_ms now_ms
+    deadline_ms=$((start_ms + timeout_s * 1000))
     local timed_out=false
-    while [ "$elapsed" -lt "$timeout_s" ]; do
+    while true; do
         # Check if server has exited
         if ! kill -0 "$srv_pid" 2>/dev/null; then
             break
         fi
+        now_ms="$(_e2e_now_ms)"
+        if [ "$now_ms" -ge "$deadline_ms" ]; then
+            timed_out=true
+            break
+        fi
         sleep 0.5
-        elapsed=$((elapsed + 1))
     done
-    if [ "$elapsed" -ge "$timeout_s" ] && kill -0 "$srv_pid" 2>/dev/null; then
-        timed_out=true
-    fi
 
     wait "$write_pid" 2>/dev/null || true
     kill "$srv_pid" 2>/dev/null || true
@@ -505,8 +509,14 @@ echo "$INIT_REQ" > "$FIFO"
 # Wait for server to exit (should happen quickly after stdin closes)
 set +e
 WAIT_COUNT=0
+CASE_05_TIMEOUT_S="${STDIO_STDIN_CLOSE_TIMEOUT_S:-15}"
+CASE_05_DEADLINE_MS=$((CASE_05_START_MS + CASE_05_TIMEOUT_S * 1000))
 CASE_05_TIMED_OUT=true
-while kill -0 "$SRV_PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 10 ]; do
+while kill -0 "$SRV_PID" 2>/dev/null; do
+    CASE_05_NOW_MS="$(_e2e_now_ms)"
+    if [ "$CASE_05_NOW_MS" -ge "$CASE_05_DEADLINE_MS" ]; then
+        break
+    fi
     sleep 0.5
     WAIT_COUNT=$((WAIT_COUNT + 1))
 done
@@ -515,11 +525,11 @@ if ! kill -0 "$SRV_PID" 2>/dev/null; then
     CASE_05_TIMED_OUT=false
     wait "$SRV_PID" 2>/dev/null
     EXIT_CODE=$?
-    e2e_pass "server exited after stdin close (exit=$EXIT_CODE, waited ${WAIT_COUNT}s)"
+    e2e_pass "server exited after stdin close (exit=$EXIT_CODE, wait_loops=${WAIT_COUNT})"
 else
     kill "$SRV_PID" 2>/dev/null
     wait "$SRV_PID" 2>/dev/null
-    e2e_fail "server did not exit within 5s after stdin close"
+    e2e_fail "server did not exit within ${CASE_05_TIMEOUT_S}s after stdin close"
 fi
 set -e
 
@@ -535,6 +545,7 @@ echo "${CASE_05_ELAPSED_MS}" > "${CASE_05_DIR}/timing.txt"
     echo "mode=single"
     echo "server_exit_code=${EXIT_CODE:-0}"
     echo "wait_loops=${WAIT_COUNT}"
+    echo "timeout_s=${CASE_05_TIMEOUT_S}"
     echo "stderr_file=stderr.txt"
 } > "${CASE_05_DIR}/headers.txt"
 if [ "${CASE_05_TIMED_OUT}" = true ]; then

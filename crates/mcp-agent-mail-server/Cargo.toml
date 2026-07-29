@@ -7,11 +7,15 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "MCP server (stdio + HTTP) for MCP Agent Mail"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
+publish = false
 
 [dependencies]
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 tracing.workspace = true
 jsonwebtoken.workspace = true
 base64.workspace = true
@@ -22,8 +26,7 @@ include_dir.workspace = true
 ftui.workspace = true
 ftui-extras.workspace = true
 ftui-render.workspace = true
-ftui-runtime = { workspace = true, features = ["stdio-capture"] }
-ftui-tty.workspace = true
+ftui-runtime = { workspace = true, features = ["stdio-capture", "state-persistence"] }
 ftui-widgets.workspace = true
 fastmcp.workspace = true
 fastmcp-core.workspace = true
@@ -36,12 +39,22 @@ glob.workspace = true
 walkdir.workspace = true
 sha2.workspace = true
 fs2.workspace = true
-nix = { workspace = true, features = ["fs"] }
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db", default-features = false }
 mcp-agent-mail-share = { path = "../mcp-agent-mail-share", default-features = false }
 mcp-agent-mail-storage = { path = "../mcp-agent-mail-storage", default-features = false }
 mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools", default-features = false }
+
+# Unix-only deps: the native ftui-tty TUI backend and nix syscalls. Gating them
+# here keeps them out of the Windows build, which uses the crossterm-compat
+# backend (Program::with_config) instead.
+[target.'cfg(unix)'.dependencies]
+ftui-runtime = { workspace = true, features = ["native-backend"] }
+ftui-tty.workspace = true
+nix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(not(unix))'.dependencies]
+ftui-runtime = { workspace = true, features = ["crossterm-compat"] }
 
 [features]
 default = [
@@ -58,10 +71,15 @@ portable = [
 ]
 
 [dev-dependencies]
+# Enable asupersync `test-internals` for TEST/BENCH builds only so tests can
+# construct `Cx::for_testing()`; the release build excludes dev-deps and keeps
+# the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 ftui-harness.workspace = true
+mcp-agent-mail-test-helpers.workspace = true
 
 [[bench]]
 name = "widget_bench"
@@ -69,6 +87,10 @@ harness = false
 
 [[bench]]
 name = "frame_bench"
+harness = false
+
+[[bench]]
+name = "health_sweep_bench"
 harness = false
 
 [lints]

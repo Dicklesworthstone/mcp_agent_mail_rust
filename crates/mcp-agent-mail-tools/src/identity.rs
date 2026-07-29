@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
+    get_read_db_pool, legacy_tool_error, resolve_project,
 };
 
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
@@ -103,7 +103,11 @@ async fn persist_agent_registration_token_with_retry(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0u64, |d| u64::from(d.subsec_nanos()));
         let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
-        asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms)).await;
+        // Thread sleep, NOT `asupersync::time::sleep` (GH#203 class): tools run
+        // under fastmcp's nested-block_on sync bridge, where runtime timer
+        // wheels are not pumped — an awaited timer sleep parks forever. The
+        // backoff is short and bounded, so blocking the thread is correct.
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         attempt = attempt.saturating_add(1);
     }
 }
@@ -119,32 +123,50 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
     };
     use mcp_agent_mail_db::pool::{
         MailboxOwnershipDisposition, inspect_mailbox_ownership, inspect_mailbox_recovery_lock,
-        resolve_mailbox_sqlite_path,
+        mailbox_owner_executable_deleted, resolve_mailbox_sqlite_path,
     };
 
     let resolved = resolve_mailbox_sqlite_path(&config.database_url).ok()?;
     let db_path = PathBuf::from(&resolved.canonical_path);
     let storage_root = &config.storage_root;
 
-    // Lightweight recovery-lock + ownership probes (no full verdict).
+    // Recovery status is included in the request-path health_check response, so
+    // keep the common healthy path bounded. Ownership discovery walks /proc and
+    // is only needed once we know we will actually surface recovery context.
     let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
-    let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
 
-    // Compute the full verdict to get the durability state.
+    // Compute a fast verdict to get the durability state without archive and
+    // ownership walks; full doctor/startup diagnostics still use the default
+    // verdict options.
     let verdict = compute_mailbox_verdict(
         &config.database_url,
         storage_root.as_path(),
         &VerdictOptions {
-            skip_integrity_check: true, // integrity is already probed elsewhere
-            ..VerdictOptions::default()
+            skip_integrity_check: true,
+            ..VerdictOptions::fast()
         },
     );
     let durability = DurabilityState::from_mailbox_state(verdict.state);
 
-    if durability == DurabilityState::Healthy && !recovery_lock.active {
+    // GH#166: a deleted/replaced executable can own the mailbox locks while the
+    // fast verdict still reads Healthy (fast verdicts skip the ownership walk).
+    // That state blocks direct reservation/recovery paths, so health_check must
+    // not report fully green. Probe the lock holders cheaply (no /proc/*/fd walk)
+    // and keep building recovery context when an owner runs a deleted executable.
+    let deleted_executable_owner =
+        mailbox_owner_executable_deleted(&db_path, storage_root.as_path());
+
+    if !recovery_lock.active
+        && !deleted_executable_owner
+        && (durability == DurabilityState::Healthy
+            || recovery_verdict_is_archive_lag_only(&verdict))
+    {
         return None;
     }
 
+    let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
+    let executable_deleted =
+        ownership.disposition == MailboxOwnershipDisposition::DeletedExecutable;
     let mode = durability.to_string();
 
     let owner = match ownership.disposition {
@@ -167,22 +189,30 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
         ),
     };
 
-    let next_action = match durability {
-        DurabilityState::Healthy => "No action required".to_string(),
-        DurabilityState::DegradedReadOnly => {
-            if recovery_lock.active {
-                "Recovery in progress; wait for completion or check recovery lock holder"
-                    .to_string()
-            } else {
-                "Run `am doctor repair` to attempt automatic recovery".to_string()
+    let next_action = if executable_deleted {
+        "Run `am service restart` to replace the deleted/stale owner executable \
+         (do not run `am doctor repair`; it refuses a live owner)"
+            .to_string()
+    } else {
+        match durability {
+            DurabilityState::Healthy => "No action required".to_string(),
+            DurabilityState::DegradedReadOnly => {
+                if recovery_lock.active {
+                    "Recovery in progress; wait for completion or check recovery lock holder"
+                        .to_string()
+                } else {
+                    "Run `am doctor repair` to attempt automatic recovery".to_string()
+                }
             }
-        }
-        DurabilityState::Recovering => recovery_lock.pid.map_or_else(
-            || "Recovery lock held but PID unknown; check for stale lock files".to_string(),
-            |pid| format!("Recovery active (pid {pid}); wait for completion or investigate stall"),
-        ),
-        DurabilityState::Corrupt => {
-            "Run `am doctor repair --yes` or restore from archive backup".to_string()
+            DurabilityState::Recovering => recovery_lock.pid.map_or_else(
+                || "Recovery lock held but PID unknown; check for stale lock files".to_string(),
+                |pid| {
+                    format!("Recovery active (pid {pid}); wait for completion or investigate stall")
+                },
+            ),
+            DurabilityState::Corrupt => {
+                "Run `am doctor repair --yes` or restore from archive backup".to_string()
+            }
         }
     };
 
@@ -196,7 +226,17 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
         bundle_path,
         recovery_lock_active: recovery_lock.active,
         recovery_lock_pid: recovery_lock.pid,
+        executable_deleted,
     })
+}
+
+fn recovery_verdict_is_archive_lag_only(verdict: &mcp_agent_mail_db::MailboxHealthVerdict) -> bool {
+    verdict.archive_drift.state == mcp_agent_mail_db::MailboxArchiveDriftState::DbAhead
+        && verdict
+            .probes
+            .iter()
+            .filter(|probe| !probe.passed)
+            .all(|probe| probe.name == "archive_db_parity")
 }
 
 /// Find the most recently created forensic bundle directory.
@@ -248,16 +288,35 @@ fn find_latest_forensic_bundle(
 }
 
 fn redact_database_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://")
-        && let Some((_creds, host)) = rest.rsplit_once('@')
-    {
-        return format!("{scheme}://****@{host}");
-    }
-    url.to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+    let authority = &url[authority_start..authority_end];
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}****{}",
+        &url[..authority_start],
+        &url[authority_start + at_pos..]
+    )
 }
 
 const fn us_to_ms_ceil(us: u64) -> u64 {
     us.saturating_add(999).saturating_div(1000)
+}
+
+fn percentage_clamped(value: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+
+    let pct = (u128::from(value) * 100).saturating_div(u128::from(total));
+    u64::try_from(pct.min(100)).unwrap_or(100)
 }
 
 const HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
@@ -268,6 +327,251 @@ const HEALTH_CHECK_REQUIRED_TABLES: &[&str] =
 pub struct SemanticReadinessResponse {
     pub status: String,
     pub detail: String,
+}
+
+/// One independent health verdict (br-bvq1x.3.1 / C1).
+///
+/// `health_check` is decomposed into several of these so a green top-level
+/// result can never coexist with a broken critical subsystem. Each carries a
+/// tri-state `status` (`green`/`yellow`/`red`), a human detail, and whether it
+/// is `critical` (a red critical verdict forces the top-level not-green).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthVerdict {
+    pub status: String,
+    pub detail: String,
+    pub critical: bool,
+}
+
+impl HealthVerdict {
+    fn new(
+        level: mcp_agent_mail_core::HealthLevel,
+        critical: bool,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: level.as_str().to_string(),
+            detail: detail.into(),
+            critical,
+        }
+    }
+
+    fn level(&self) -> mcp_agent_mail_core::HealthLevel {
+        match self.status.as_str() {
+            "red" => mcp_agent_mail_core::HealthLevel::Red,
+            "yellow" => mcp_agent_mail_core::HealthLevel::Yellow,
+            _ => mcp_agent_mail_core::HealthLevel::Green,
+        }
+    }
+}
+
+/// The decomposed, independent verdicts that roll up into the top-level
+/// `health_check` result. The top-level can never be greener than the weakest
+/// critical verdict here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthVerdicts {
+    /// JSON-RPC decode/protocol path is functional (sourced from C3 logic).
+    pub transport_health: HealthVerdict,
+    /// Database open/connectivity is healthy.
+    pub db_health: HealthVerdict,
+    /// The write path is usable: required schema present, not read-only/corrupt
+    /// (sourced from C2 logic).
+    pub write_health: HealthVerdict,
+    /// Search/archive semantic readiness (the legacy bundled check).
+    pub semantic_readiness: HealthVerdict,
+    /// Git archive vs `SQLite` index parity.
+    pub archive_db_parity: HealthVerdict,
+    /// The doctor surface can operate (storage root writable).
+    pub doctor_readiness: HealthVerdict,
+}
+
+impl HealthVerdicts {
+    const fn all(&self) -> [&HealthVerdict; 6] {
+        [
+            &self.transport_health,
+            &self.db_health,
+            &self.write_health,
+            &self.semantic_readiness,
+            &self.archive_db_parity,
+            &self.doctor_readiness,
+        ]
+    }
+
+    /// Names of the verdicts that are not green, worst first, so the response
+    /// can point at the failing subsystem.
+    fn failing_names(&self) -> Vec<String> {
+        let mut named: Vec<(&str, mcp_agent_mail_core::HealthLevel)> = Vec::new();
+        let labelled: [(&str, &HealthVerdict); 6] = [
+            ("transport_health", &self.transport_health),
+            ("db_health", &self.db_health),
+            ("write_health", &self.write_health),
+            ("semantic_readiness", &self.semantic_readiness),
+            ("archive_db_parity", &self.archive_db_parity),
+            ("doctor_readiness", &self.doctor_readiness),
+        ];
+        for (name, verdict) in labelled {
+            if verdict.level() != mcp_agent_mail_core::HealthLevel::Green {
+                named.push((name, verdict.level()));
+            }
+        }
+        named.sort_by_key(|entry| std::cmp::Reverse(entry.1 as u8));
+        named
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// The strict roll-up level: the worst of all critical verdicts (so a red
+    /// `db_health` or `write_health` can never present as green).
+    fn rollup_level(&self) -> mcp_agent_mail_core::HealthLevel {
+        self.all()
+            .into_iter()
+            .filter(|v| v.critical)
+            .map(HealthVerdict::level)
+            .max_by_key(|level| *level as u8)
+            .unwrap_or(mcp_agent_mail_core::HealthLevel::Green)
+    }
+}
+
+/// Which subsystem a failed `semantic_readiness` detail implicates. Classifies
+/// the stable detail strings emitted by `health_check_semantic_readiness` (the
+/// same approach the A1 taxonomy uses on DB error strings) so we can route a
+/// bundled failure to the right decomposed verdict without refactoring the
+/// probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticVerdictKind {
+    Ok,
+    Warn,
+    DbConnectivity,
+    SchemaMissing,
+    ArchiveParity,
+}
+
+fn classify_semantic_failure(status: &str, detail: &str) -> SemanticVerdictKind {
+    match status {
+        "ok" => SemanticVerdictKind::Ok,
+        "warn" => SemanticVerdictKind::Warn,
+        _ => {
+            let d = detail.to_ascii_lowercase();
+            if d.contains("missing required health_check tables") {
+                SemanticVerdictKind::SchemaMissing
+            } else if d.contains("archive inventory is ahead") {
+                SemanticVerdictKind::ArchiveParity
+            } else {
+                // Path resolution, missing file, connectivity probe, schema
+                // inspection failures all point at the DB open/connect surface.
+                SemanticVerdictKind::DbConnectivity
+            }
+        }
+    }
+}
+
+/// Lightweight `transport_health` probe (sourced from C3 / `am doctor
+/// mcp-selftest`): confirm the JSON-RPC decode path round-trips a canonical
+/// `initialize` envelope. Pure CPU; safe to run on every `health_check`. The
+/// authoritative transport check remains `am doctor mcp-selftest`.
+fn probe_transport_decode() -> Result<(), String> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05" },
+    });
+    let encoded =
+        serde_json::to_string(&request).map_err(|e| format!("JSON-RPC encode failed: {e}"))?;
+    let decoded: serde_json::Value =
+        serde_json::from_str(&encoded).map_err(|e| format!("JSON-RPC decode failed: {e}"))?;
+    if decoded.get("method").and_then(serde_json::Value::as_str) == Some("initialize") {
+        Ok(())
+    } else {
+        Err("JSON-RPC round-trip lost the method field".to_string())
+    }
+}
+
+/// Lightweight `doctor_readiness` probe: the storage root must exist as a
+/// directory for the doctor surface to operate. Non-mutating (no probe file).
+fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
+    let root = &config.storage_root;
+    if root.is_dir() {
+        Ok(())
+    } else if root.exists() {
+        Err(format!(
+            "storage root {} exists but is not a directory",
+            root.display()
+        ))
+    } else {
+        Err(format!(
+            "storage root {} does not exist yet",
+            root.display()
+        ))
+    }
+}
+
+/// Decompose the bundled health signals into the six independent verdicts
+/// (br-bvq1x.3.1 / C1). The strict roll-up over the critical verdicts is what
+/// prevents a green top-level result from coexisting with a broken write or
+/// transport path.
+fn compute_health_verdicts(
+    config: &Config,
+    pool_present: bool,
+    semantic: &SemanticReadinessResponse,
+) -> HealthVerdicts {
+    use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
+    let kind = classify_semantic_failure(&semantic.status, &semantic.detail);
+
+    let semantic_level = match semantic.status.as_str() {
+        "ok" => Green,
+        "warn" => Yellow,
+        _ => Red,
+    };
+    let semantic_readiness = HealthVerdict::new(semantic_level, false, semantic.detail.clone());
+
+    let db_health = if !pool_present {
+        HealthVerdict::new(Red, true, "database pool bootstrap failed")
+    } else if kind == SemanticVerdictKind::DbConnectivity {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else if kind == SemanticVerdictKind::Warn {
+        HealthVerdict::new(Yellow, true, semantic.detail.clone())
+    } else {
+        HealthVerdict::new(Green, true, "database open/connectivity healthy")
+    };
+
+    // write_health is the lightweight schema-writability proxy (C2-sourced):
+    // the required tables must be present to accept writes. Deeper write-path
+    // liveness is the authoritative `am doctor write-selftest`. The recovery
+    // mode is surfaced separately in the `recovery` field rather than gated
+    // here, because the fast recovery probe can report degraded for healthy
+    // external/test databases (the same false positive `semantic_readiness`
+    // skips).
+    let write_health = if kind == SemanticVerdictKind::SchemaMissing {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else {
+        HealthVerdict::new(Green, true, "write path schema present and writable")
+    };
+
+    let archive_db_parity = if kind == SemanticVerdictKind::ArchiveParity {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else {
+        HealthVerdict::new(Green, true, "git archive and sqlite index are aligned")
+    };
+
+    let transport_health = match probe_transport_decode() {
+        Ok(()) => HealthVerdict::new(Green, true, "JSON-RPC decode path functional"),
+        Err(detail) => HealthVerdict::new(Red, true, detail),
+    };
+
+    let doctor_readiness = match probe_doctor_readiness(config) {
+        Ok(()) => HealthVerdict::new(Green, false, "storage root writable; doctor can operate"),
+        Err(detail) => HealthVerdict::new(Yellow, false, detail),
+    };
+
+    HealthVerdicts {
+        transport_health,
+        db_health,
+        write_health,
+        semantic_readiness,
+        archive_db_parity,
+        doctor_readiness,
+    }
 }
 
 fn resolve_health_check_sqlite_path(database_url: &str) -> Result<Option<PathBuf>, String> {
@@ -609,6 +913,12 @@ pub struct HealthCheckResponse {
     pub http_host: String,
     pub http_port: u16,
     pub database_url: String,
+    /// Effective archive/storage root owned by this serving process.
+    ///
+    /// This is intentionally top-level (rather than only under the optional
+    /// disk sample) so diagnostic clients can always bind their database and
+    /// archive probes to the mailbox the daemon is actually serving.
+    pub storage_root: String,
     pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
@@ -624,6 +934,14 @@ pub struct HealthCheckResponse {
     pub two_tier_indexing: Option<mcp_agent_mail_db::search_service::TwoTierIndexingHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryStatusResponse>,
+    /// Decomposed independent verdicts (br-bvq1x.3.1 / C1). The top-level
+    /// `status`/`health_level` above is a strict roll-up that can never be
+    /// greener than the weakest critical verdict here.
+    pub verdicts: HealthVerdicts,
+    /// Names of the verdicts that are not green, worst-first, so consumers can
+    /// point directly at the failing subsystem.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failing_verdicts: Vec<String>,
 }
 
 /// Active recovery state surfaced in `health_check` when the mailbox is degraded or recovering.
@@ -643,6 +961,12 @@ pub struct RecoveryStatusResponse {
     /// PID of the process holding the recovery lock, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_lock_pid: Option<u32>,
+    /// Whether the lock-owning process is running a deleted/replaced executable.
+    ///
+    /// GH#166: mail still flows through the stale process, but direct
+    /// reservation/recovery paths refuse until a supervised restart.
+    #[serde(default)]
+    pub executable_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -809,7 +1133,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let pool = if semantic_readiness.status == "fail" {
         None
     } else {
-        match get_db_pool() {
+        match get_authoritative_live_db_pool() {
             Ok(pool) => {
                 pool.sample_pool_stats_now();
                 Some(pool)
@@ -843,20 +1167,39 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             .saturating_div(1_000_000)
     };
 
-    // Refresh the cached health level from live metrics
-    let (health_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+    // Refresh the cached health level (pressure-derived) from live metrics.
+    let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+
+    // C1 (br-bvq1x.3.1): decompose health into independent verdicts and roll up
+    // strictly, so a green top-level can never coexist with a broken critical
+    // subsystem (db/write/transport).
+    let recovery = build_recovery_status(config);
+    let verdicts = compute_health_verdicts(config, pool.is_some(), &semantic_readiness);
+    let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
+    // The top-level level can never be greener than the weakest critical
+    // verdict (or the live pressure level).
+    let mut effective_level = pressure_level.max(verdicts.rollup_level());
+    // GH#166: a deleted/replaced executable owning the mailbox locks blocks direct
+    // reservation/recovery paths even while mail still flows through the stale
+    // process. Never report fully green readiness in that state (status stays
+    // "ok" — it is degraded, not down — but health_level drops to at least yellow).
+    if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
+        effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Yellow);
+    }
+    let failing_verdicts = verdicts.failing_names();
 
     let response = HealthCheckResponse {
-        status: if semantic_readiness.status == "fail" {
+        status: if critical_red {
             "error".to_string()
         } else {
             "ok".to_string()
         },
-        health_level: health_level.to_string(),
+        health_level: effective_level.to_string(),
         environment: config.app_environment.to_string(),
         http_host: config.http_host.clone(),
         http_port: config.http_port,
         database_url: redact_database_url(&config.database_url),
+        storage_root: config.storage_root.display().to_string(),
         semantic_readiness,
         pool_utilization: pool.as_ref().map(|_| PoolUtilizationResponse {
             active: metrics.db.pool_active_connections,
@@ -879,15 +1222,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.wbq_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let wbq_utilization_pct = if metrics.storage.wbq_capacity == 0 {
-                0
-            } else {
-                metrics
-                    .storage
-                    .wbq_depth
-                    .saturating_mul(100)
-                    .saturating_div(metrics.storage.wbq_capacity)
-            };
+            let wbq_utilization_pct =
+                percentage_clamped(metrics.storage.wbq_depth, metrics.storage.wbq_capacity);
 
             let commit_over_80_for_s = if metrics.storage.commit_over_80_since_us == 0 {
                 0
@@ -896,15 +1232,10 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.commit_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let commit_utilization_pct = if metrics.storage.commit_soft_cap == 0 {
-                0
-            } else {
-                metrics
-                    .storage
-                    .commit_pending_requests
-                    .saturating_mul(100)
-                    .saturating_div(metrics.storage.commit_soft_cap)
-            };
+            let commit_utilization_pct = percentage_clamped(
+                metrics.storage.commit_pending_requests,
+                metrics.storage.commit_soft_cap,
+            );
 
             QueuesHealthResponse {
                 wbq: WbqQueueHealthResponse {
@@ -972,7 +1303,9 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         },
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
-        recovery: build_recovery_status(config),
+        recovery,
+        verdicts,
+        failing_verdicts,
     };
 
     serde_json::to_string(&response)
@@ -1074,6 +1407,8 @@ Check that all parameters have valid values."
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
 /// - `reaper_exempt`: Optional bool to exempt agent from the inactivity reaper (default: false)
+/// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
+///   caller pane explicitly; stdio callers may omit it.
 ///
 /// # Returns
 /// Agent profile with all fields
@@ -1086,7 +1421,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a random adjective+noun name is auto-generated.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenLake\", \"BlueDog\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- The whole point: names should be memorable identifiers, not role descriptions\n- Best practice: Omit the `name` parameter to auto-generate a valid name\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    MUST be a valid adjective+noun combination if provided (e.g., \"BlueLake\").\n    If omitted, a random valid name is auto-generated (RECOMMENDED).\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit valid name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"BlueLake\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Names MUST match the adjective+noun format or an error will be raised\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents."
+    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a random adjective+noun name is auto-generated.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenLake\", \"BlueDog\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- The whole point: names should be memorable identifiers, not role descriptions\n- Best practice: Omit the `name` parameter to auto-generate a valid name\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    MUST be a valid adjective+noun combination if provided (e.g., \"BlueLake\").\n    If omitted, a random valid name is auto-generated (RECOMMENDED).\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit valid name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"BlueLake\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Names MUST match the adjective+noun format or an error will be raised\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents.\n\nOptional cryptographic proof gate\n---------------------------------\nBy default registration is self-asserted (no proof needed). When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof` (a JSON\nstring binding identity, project_key, program, model, capability scope, issued_at,\nexpires_at, and a nonce, signed by a configured trust-anchor Ed25519 key). When the gate\nis enabled, registration fails closed (no agent is created) if the proof is missing,\nmalformed, untrusted, expired, replayed, or does not match the requested identity/scope."
 )]
 pub async fn register_agent(
     ctx: &McpContext,
@@ -1097,6 +1432,8 @@ pub async fn register_agent(
     task_description: Option<String>,
     attachments_policy: Option<String>,
     reaper_exempt: Option<bool>,
+    pane_id: Option<String>,
+    registration_proof: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -1133,7 +1470,13 @@ pub async fn register_agent(
         Some(n) => {
             let n = n.trim();
             if n.is_empty() {
-                generate_agent_name()
+                return Err(legacy_tool_error(
+                    "EMPTY_AGENT_NAME",
+                    "name cannot be empty. Omit the `name` parameter to auto-generate a valid \
+                     adjective+noun agent name.",
+                    true,
+                    json!({ "provided": n }),
+                ));
             } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(n) {
                 normalized
             } else {
@@ -1174,6 +1517,36 @@ Check that all parameters have valid values."
             }),
         ));
     }
+
+    // Optional cryptographic proof gate (off by default). When enabled via
+    // `[registration.proof_gate]` config, a valid signed proof bundle binding
+    // this exact identity/project/program/model/scope is required before any
+    // row is written; otherwise this fails closed. When disabled this is a
+    // no-op and registration keeps the self-asserted identity model unchanged.
+    // Placed AFTER name/policy resolution (so the proof is checked against the
+    // final agent name) and BEFORE the DB write (so a bad proof never
+    // registers). This is the chokepoint for every EXPLICIT registration entry
+    // point (macros call this function; the tool is re-exported once), and the
+    // ONLY place a `registration_proof` bundle is actually verified. The two
+    // IMPLICIT auto-register paths that cannot supply a proof —
+    // `messaging::resolve_or_register_agent` (send_message to an unknown
+    // recipient) and `contacts::resolve_or_register_sender` (request_contact
+    // with an unknown from_agent) — are separately guarded to FAIL CLOSED when
+    // the gate is enabled via `proof_gate::reject_auto_registration_if_enabled`,
+    // so the identity namespace has no ungated side door.
+    crate::proof_gate::enforce(
+        ctx.cx(),
+        &pool,
+        &crate::proof_gate::RegistrationRequest {
+            agent_name: &agent_name,
+            project_key: &project_key,
+            program: &program,
+            model: &model,
+            granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+            proof: registration_proof.as_deref(),
+        },
+    )
+    .await?;
 
     // Tool-layer retry wrapper for #98: `register_agent` is the entry tool
     // that every multi-agent swarm calls first, so it sees the tallest
@@ -1218,8 +1591,12 @@ Check that all parameters have valid values."
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0u64, |d| u64::from(d.subsec_nanos()));
             let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
-            asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms))
-                .await;
+            // Thread sleep, NOT `asupersync::time::sleep` (GH#203 class):
+            // tools run under fastmcp's nested-block_on sync bridge, where
+            // runtime timer wheels are not pumped — an awaited timer sleep
+            // parks forever. The backoff is short and bounded, so blocking
+            // the thread is correct.
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             attempt = attempt.saturating_add(1);
         }
     };
@@ -1299,9 +1676,11 @@ Check that all parameters have valid values."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) =
-        mcp_agent_mail_core::write_identity_current_pane(&project.human_key, &row.name)
-    {
+    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane(
+        &project.human_key,
+        pane_id.as_deref(),
+        &row.name,
+    ) {
         match result {
             Ok(path) => {
                 tracing::debug!("wrote pane identity file: {}", path.display());
@@ -1345,6 +1724,8 @@ Check that all parameters have valid values."
 /// - `name_hint`: Optional name hint (must be valid adjective+noun if provided)
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
+/// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
+///   caller pane explicitly; stdio callers may omit it.
 ///
 /// # Returns
 /// New agent profile
@@ -1352,8 +1733,12 @@ Check that all parameters have valid values."
 /// # Conformance
 /// Python-parity.
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MCP tool signatures mirror the public JSON-RPC schema"
+)]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```"
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed."
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -1363,6 +1748,8 @@ pub async fn create_agent_identity(
     name_hint: Option<String>,
     task_description: Option<String>,
     attachments_policy: Option<String>,
+    pane_id: Option<String>,
+    registration_proof: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -1399,7 +1786,13 @@ pub async fn create_agent_identity(
         Some(hint) => {
             let hint = hint.trim();
             if hint.is_empty() {
-                generate_agent_name()
+                return Err(legacy_tool_error(
+                    "EMPTY_AGENT_NAME",
+                    "name_hint cannot be empty. Omit the `name_hint` parameter to auto-generate \
+                     a valid adjective+noun agent name.",
+                    true,
+                    json!({ "provided": hint }),
+                ));
             } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(hint)
             {
                 normalized
@@ -1441,6 +1834,23 @@ Check that all parameters have valid values."
             }),
         ));
     }
+
+    // Optional cryptographic proof gate (off by default). Mirrors the gate on
+    // `register_agent` so this alternate registration entry point cannot be
+    // used to bypass it. No-op when disabled; fail-closed when enabled.
+    crate::proof_gate::enforce(
+        ctx.cx(),
+        &pool,
+        &crate::proof_gate::RegistrationRequest {
+            agent_name: &agent_name,
+            project_key: &project_key,
+            program: &program,
+            model: &model,
+            granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+            proof: registration_proof.as_deref(),
+        },
+    )
+    .await?;
 
     // Atomic insert-if-absent: eliminates TOCTOU race between a separate
     // get_agent check and register_agent upsert. Returns Duplicate if the
@@ -1554,9 +1964,11 @@ Choose a different name (or omit the name to auto-generate one)."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) =
-        mcp_agent_mail_core::write_identity_current_pane(&project.human_key, &row.name)
-    {
+    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane(
+        &project.human_key,
+        pane_id.as_deref(),
+        &row.name,
+    ) {
         match result {
             Ok(path) => {
                 tracing::debug!("wrote pane identity file: {}", path.display());
@@ -1623,7 +2035,7 @@ pub async fn whois(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
 
     let include_commits = include_recent_commits.unwrap_or(true);
     let limit_raw = commit_limit.unwrap_or(5);
@@ -1656,7 +2068,9 @@ pub async fn whois(
         let config = &Config::get();
         match mcp_agent_mail_storage::ensure_archive(config, &project.slug) {
             Ok(archive) => {
-                let path_filter = format!("projects/{}/agents/{}", project.slug, agent_row.name);
+                // Project-relative: get_recent_commits applies the
+                // projects/<slug>/ repo prefix itself.
+                let path_filter = format!("agents/{}", agent_row.name);
                 match mcp_agent_mail_storage::get_recent_commits(
                     &archive,
                     limit,
@@ -1756,7 +2170,7 @@ pub async fn resolve_pane_identity(
 
     let mut project_keys = vec![project_key.clone()];
     if !Path::new(&project_key).is_absolute()
-        && let Ok(pool) = get_read_db_pool()
+        && let Ok(pool) = get_read_db_pool(ctx.cx()).await
         && let Ok(project) = resolve_project(ctx, &pool, &project_key).await
         && project.human_key != project_key
     {
@@ -1842,16 +2256,52 @@ pub fn cleanup_pane_identities(
 ///
 /// # Conformance
 /// Rust-native.
+/// Hard safety cap on the number of agents `list_agents` will ever return, even
+/// when the caller passes no `limit` (GH#154 item 3). Long-lived projects
+/// accumulate agents across many short-lived swarms (one reported project
+/// reached 1,119 agents / a ~199 KB response, enough to blow the calling
+/// agent's context window). The query returns agents ordered most-recently-
+/// active first, so capping keeps the useful (recent) agents.
+const LIST_AGENTS_DEFAULT_MAX: usize = 250;
+
 #[tool(
-    description = "List all registered agents in a project.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy."
+    description = "List registered agents in a project, most-recently-active first.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nThe result is bounded to avoid blowing the calling agent's context window on long-lived projects that accumulate agents across many short-lived swarms: at most `limit` agents (default 250) are returned, optionally restricted to those active within `active_within_days`.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nlimit : Optional[int]\n    Maximum number of agents to return (most-recently-active first). Defaults to 250; values above 250 are clamped to 250.\nactive_within_days : Optional[int]\n    If provided, only return agents whose last_active_ts is within this many days. Omit to include all agents (subject to limit).\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy. Ordered by last_active_ts descending."
 )]
-pub async fn list_agents(ctx: &McpContext, project_key: String) -> McpResult<String> {
-    let pool = get_read_db_pool()?;
+pub async fn list_agents(
+    ctx: &McpContext,
+    project_key: String,
+    limit: Option<u32>,
+    active_within_days: Option<u32>,
+) -> McpResult<String> {
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
+    // Bound the response. A caller-supplied limit is honored but clamped to the
+    // safety cap; an omitted limit defaults to the cap.
+    let effective_limit = limit
+        .map_or(LIST_AGENTS_DEFAULT_MAX, |n| {
+            usize::try_from(n).unwrap_or(LIST_AGENTS_DEFAULT_MAX)
+        })
+        .clamp(1, LIST_AGENTS_DEFAULT_MAX);
+
+    let min_last_active_ts = active_within_days.and_then(|days| {
+        let now = mcp_agent_mail_core::timestamps::now_micros();
+        let window_us = i64::from(days)
+            .checked_mul(86_400)?
+            .checked_mul(1_000_000)?;
+        Some(now.saturating_sub(window_us))
+    });
+
     let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+        mcp_agent_mail_db::queries::list_agents_bounded(
+            ctx.cx(),
+            &pool,
+            project_id,
+            min_last_active_ts,
+            Some(effective_limit),
+        )
+        .await,
     )?;
 
     let entries: Vec<serde_json::Value> = agents
@@ -1881,6 +2331,179 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+
+    /// All-green decomposed verdicts, for response-serialization tests that
+    /// don't exercise the rollup logic.
+    fn green_test_verdicts() -> HealthVerdicts {
+        let g = |critical: bool| {
+            HealthVerdict::new(mcp_agent_mail_core::HealthLevel::Green, critical, "ok")
+        };
+        HealthVerdicts {
+            transport_health: g(true),
+            db_health: g(true),
+            write_health: g(true),
+            semantic_readiness: g(false),
+            archive_db_parity: g(true),
+            doctor_readiness: g(false),
+        }
+    }
+
+    // ── C1 (br-bvq1x.3.1): decomposed verdicts + strict roll-up ──────────
+
+    fn semantic(status: &str, detail: &str) -> SemanticReadinessResponse {
+        SemanticReadinessResponse {
+            status: status.into(),
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn classify_semantic_failure_routes_to_subsystems() {
+        assert_eq!(
+            classify_semantic_failure("ok", "aligned"),
+            SemanticVerdictKind::Ok
+        );
+        assert_eq!(
+            classify_semantic_failure("warn", "lock"),
+            SemanticVerdictKind::Warn
+        );
+        assert_eq!(
+            classify_semantic_failure(
+                "fail",
+                "sqlite schema missing required health_check tables: agents"
+            ),
+            SemanticVerdictKind::SchemaMissing
+        );
+        assert_eq!(
+            classify_semantic_failure(
+                "fail",
+                "archive inventory is ahead of the sqlite index (...)"
+            ),
+            SemanticVerdictKind::ArchiveParity
+        );
+        assert_eq!(
+            classify_semantic_failure(
+                "fail",
+                "sqlite connectivity probe failed during health_check: disk I/O error"
+            ),
+            SemanticVerdictKind::DbConnectivity
+        );
+    }
+
+    #[test]
+    fn rollup_takes_worst_critical_and_ignores_noncritical() {
+        use mcp_agent_mail_core::HealthLevel;
+        let mut v = green_test_verdicts();
+        // A non-critical yellow must NOT move the roll-up.
+        v.doctor_readiness = HealthVerdict::new(HealthLevel::Yellow, false, "missing");
+        assert_eq!(v.rollup_level(), HealthLevel::Green);
+        // A critical red drives the roll-up to red.
+        v.db_health = HealthVerdict::new(HealthLevel::Red, true, "down");
+        assert_eq!(v.rollup_level(), HealthLevel::Red);
+        // Failing names are worst-first and exclude the green verdicts.
+        let names = v.failing_names();
+        assert_eq!(names.first().map(String::as_str), Some("db_health"));
+        assert!(names.contains(&"doctor_readiness".to_string()));
+        assert!(!names.contains(&"write_health".to_string()));
+    }
+
+    #[test]
+    fn missing_tables_makes_write_health_red_and_names_it() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic(
+                "fail",
+                "sqlite schema missing required health_check tables: agents, messages",
+            ),
+        );
+        assert_eq!(verdicts.write_health.status, "red");
+        assert!(verdicts.write_health.critical);
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+        assert!(
+            verdicts
+                .failing_names()
+                .contains(&"write_health".to_string())
+        );
+    }
+
+    #[test]
+    fn connectivity_failure_makes_db_health_red() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic(
+                "fail",
+                "sqlite connectivity probe failed during health_check: file is not a database",
+            ),
+        );
+        assert_eq!(verdicts.db_health.status, "red");
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+    }
+
+    #[test]
+    fn archive_ahead_makes_parity_red() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic(
+                "fail",
+                "archive inventory is ahead of the sqlite index (archive projects=2 ...)",
+            ),
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "red");
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+    }
+
+    #[test]
+    fn pool_bootstrap_failure_makes_db_health_red() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            false,
+            &semantic("fail", "database pool bootstrap failed"),
+        );
+        assert_eq!(verdicts.db_health.status, "red");
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+    }
+
+    #[test]
+    fn all_healthy_rolls_up_green() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(&config, true, &semantic("ok", "aligned"));
+        assert_eq!(verdicts.db_health.status, "green");
+        assert_eq!(verdicts.write_health.status, "green");
+        assert_eq!(verdicts.transport_health.status, "green");
+        assert_eq!(verdicts.archive_db_parity.status, "green");
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+        assert!(
+            verdicts.failing_names().is_empty()
+                || !verdicts.failing_names().contains(&"db_health".to_string())
+        );
+    }
+
+    #[test]
+    fn transport_decode_probe_round_trips() {
+        assert!(probe_transport_decode().is_ok());
+    }
     use std::sync::{Mutex, OnceLock};
 
     static HEALTH_CHECK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1908,6 +2531,10 @@ mod tests {
         assert_eq!(
             redact_database_url("sqlite:///data/agent_mail.db"),
             "sqlite:///data/agent_mail.db"
+        );
+        assert_eq!(
+            redact_database_url("sqlite:///data/agent@mail.db"),
+            "sqlite:///data/agent@mail.db"
         );
     }
 
@@ -2001,6 +2628,7 @@ mod tests {
             http_host: "0.0.0.0".into(),
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
+            storage_root: "/data".into(),
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "aligned".into(),
@@ -2012,12 +2640,16 @@ mod tests {
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
+            verdicts: green_test_verdicts(),
+            failing_verdicts: vec![],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["semantic_readiness"]["status"], "ok");
         assert_eq!(json["http_port"], 8765);
+        assert_eq!(json["storage_root"], "/data");
+        assert_eq!(json["verdicts"]["db_health"]["status"], "green");
     }
 
     #[test]
@@ -2255,10 +2887,12 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_redirects_tmp_projects() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.allow_ephemeral_projects_in_default_storage = false;
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            allow_ephemeral_projects_in_default_storage: false,
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
         assert!(
@@ -2293,9 +2927,11 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_respects_deny_mode() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Deny;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Deny,
+            ..Config::default()
+        };
 
         // Deny mode treats all contexts as production, so no reroute
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
@@ -2304,9 +2940,11 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_deterministic_hash() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let r1 = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
         let r2 = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
@@ -2326,10 +2964,12 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_uses_custom_ephemeral_root() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
-        config.ephemeral_root = Some(PathBuf::from("/dev/shm/my-ephemeral"));
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ephemeral_root: Some(PathBuf::from("/dev/shm/my-ephemeral")),
+            ..Config::default()
+        };
 
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
         assert!(rerouted.is_some());
@@ -2342,9 +2982,11 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_skips_production_paths() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         // `cargo test` itself sets `RUST_TEST_THREADS`, which is a high-
         // confidence ephemeral signal, so going through
@@ -2445,6 +3087,14 @@ mod tests {
         assert!(result > 0);
     }
 
+    #[test]
+    fn percentage_clamped_handles_large_values() {
+        assert_eq!(percentage_clamped(0, 0), 0);
+        assert_eq!(percentage_clamped(50, 100), 50);
+        assert_eq!(percentage_clamped(u64::MAX, u64::MAX), 100);
+        assert_eq!(percentage_clamped(u64::MAX, 1), 100);
+    }
+
     // ── Response serialization — optional fields omitted ──
 
     #[test]
@@ -2456,6 +3106,7 @@ mod tests {
             http_host: "localhost".into(),
             http_port: 8765,
             database_url: "sqlite:///:memory:".into(),
+            storage_root: "/tmp/agent-mail-test".into(),
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "memory".into(),
@@ -2467,6 +3118,8 @@ mod tests {
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
+            verdicts: green_test_verdicts(),
+            failing_verdicts: vec![],
         };
         let json_str = serde_json::to_string(&r).unwrap();
         assert!(!json_str.contains("pool_utilization"));
@@ -2663,6 +3316,10 @@ body
                         .is_some_and(|detail| !detail.contains("archive inventory is ahead")),
                     "health_check should not false-fail on metadata-only archive drift when the DB has newer messages: {value}"
                 );
+                assert!(
+                    value.get("recovery").is_none(),
+                    "DB-ahead archive parity drift alone should not advertise recovery: {value}"
+                );
             },
         );
     }
@@ -2852,6 +3509,144 @@ body
     }
 
     #[test]
+    fn hot_health_check_does_not_advance_writer_epoch_or_touch_sqlite_family() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let db_path = temp.path().join("hot-health.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_value = storage_root.display().to_string();
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_value.as_str()),
+            ],
+            || {
+                Config::reset_cached();
+                let cx = Cx::for_testing();
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("test runtime");
+                let pool = get_db_pool().expect("bootstrap live pool");
+                let conn = match runtime.block_on(pool.acquire(&cx)) {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("bootstrap acquire failed: {error}"),
+                    Outcome::Cancelled(_) => panic!("bootstrap acquire was cancelled"),
+                    Outcome::Panicked(_) => panic!("bootstrap acquire panicked"),
+                };
+                drop(conn);
+                drop(pool);
+
+                let family = || {
+                    std::iter::once(db_path.clone())
+                        .chain(["-journal", "-wal", "-shm"].into_iter().map(|suffix| {
+                            let mut path = db_path.as_os_str().to_os_string();
+                            path.push(suffix);
+                            PathBuf::from(path)
+                        }))
+                        .map(|path| (path.clone(), std::fs::read(path).ok()))
+                        .collect::<Vec<_>>()
+                };
+                let before_family = family();
+                let before_epoch = crate::archive_read::writer_epoch_for_test();
+                let ctx = McpContext::new(cx, 1);
+                let response = health_check(&ctx).expect("hot health check");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("health response json");
+                assert_ne!(value["db_health"]["status"], "fail", "{value}");
+                assert_eq!(
+                    crate::archive_read::writer_epoch_for_test(),
+                    before_epoch,
+                    "hot health reads must not enter the durable-writer epoch"
+                );
+                // FrankenSQLite's process-global namespace retains a writer fd
+                // for the mailbox after the bootstrap pool drops; re-opening
+                // the path (even with SQLITE_OPEN_READ_ONLY) can drive
+                // WAL-checkpoint housekeeping through that fd, which rewrites
+                // only the main-db header change-counter fields (bytes 24..28
+                // and 92..96). That is engine-level durability housekeeping,
+                // not mailbox data mutation (br-mmnyj tracks the engine-side
+                // zero-footprint gap). Everything else must stay byte-for-byte
+                // unchanged: same family members, same sizes, identical data
+                // pages and sidecars.
+                let after_family = family();
+                let mask_change_counter = |bytes: &[u8]| {
+                    let mut masked = bytes.to_vec();
+                    for range in [24..28usize, 92..96usize] {
+                        if masked.len() >= range.end {
+                            masked[range].fill(0);
+                        }
+                    }
+                    masked
+                };
+                assert_eq!(after_family.len(), before_family.len());
+                for (index, ((before_path, before_bytes), (after_path, after_bytes))) in
+                    before_family.iter().zip(after_family.iter()).enumerate()
+                {
+                    assert_eq!(
+                        before_path, after_path,
+                        "family member order must be stable"
+                    );
+                    if index == 0 {
+                        let before = before_bytes
+                            .as_deref()
+                            .expect("bootstrap must have created the mailbox db");
+                        let after = after_bytes
+                            .as_deref()
+                            .expect("hot health read must not remove the mailbox db");
+                        assert_eq!(
+                            before.len(),
+                            after.len(),
+                            "hot health reads must not change the mailbox db size"
+                        );
+                        let first_diff = mask_change_counter(before)
+                            .iter()
+                            .zip(mask_change_counter(after).iter())
+                            .position(|(lhs, rhs)| lhs != rhs);
+                        assert_eq!(
+                            first_diff, None,
+                            "hot health reads must leave the mailbox db byte-for-byte \
+                             unchanged outside the header change-counter fields \
+                             (first divergent byte offset shown above)"
+                        );
+                    } else {
+                        assert_eq!(
+                            before_bytes,
+                            after_bytes,
+                            "hot health reads must leave sidecar {} byte-for-byte unchanged",
+                            before_path.display()
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn health_check_direct_sqlite_probe_uses_mailbox_runtime_engine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("health-check-engine.sqlite3");
+
+        let conn = open_health_check_sync_db_connection(&db_path)
+            .expect("health_check direct probe should open sqlite");
+        let type_name = std::any::type_name_of_val(&conn);
+
+        assert!(
+            type_name.contains("sqlmodel_frankensqlite"),
+            "health_check must use the normal SQLModel FrankenSQLite runtime, got {type_name}"
+        );
+        assert!(
+            type_name.contains("FrankenConnection"),
+            "health_check must use the FrankenSQLite connection type on the normal path: {type_name}"
+        );
+    }
+
+    #[test]
     fn list_agents_uses_archive_snapshot_when_live_db_is_stale() {
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");
@@ -2888,7 +3683,7 @@ body
                 rt.block_on(async {
                     let cx = Cx::for_testing();
                     let ctx = McpContext::new(cx.clone(), 1);
-                    let response = list_agents(&ctx, "/archive-project".to_string())
+                    let response = list_agents(&ctx, "/archive-project".to_string(), None, None)
                         .await
                         .expect("list_agents should succeed");
                     let value: serde_json::Value =

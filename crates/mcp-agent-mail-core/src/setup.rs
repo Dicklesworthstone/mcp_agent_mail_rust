@@ -46,6 +46,11 @@ pub enum AgentPlatform {
     Codex,
     Cursor,
     Gemini,
+    /// Antigravity (`agy`) — Google's successor to the retired Gemini CLI.
+    /// Reads MCP servers from `~/.gemini/config/mcp_config.json` (distinct from
+    /// Gemini's `~/.gemini/settings.json`), verified empirically against the
+    /// live agy 1.0.7 binary.
+    Antigravity,
     OpenCode,
     FactoryDroid,
     Cline,
@@ -60,6 +65,7 @@ impl AgentPlatform {
         Self::Codex,
         Self::Cursor,
         Self::Gemini,
+        Self::Antigravity,
         Self::OpenCode,
         Self::FactoryDroid,
         Self::Cline,
@@ -75,6 +81,7 @@ impl AgentPlatform {
             "codex" | "codex-cli" => Some(Self::Codex),
             "cursor" => Some(Self::Cursor),
             "gemini" | "gemini-cli" => Some(Self::Gemini),
+            "antigravity" | "agy" | "antigravity-cli" => Some(Self::Antigravity),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "factory" | "factory-droid" => Some(Self::FactoryDroid),
             "cline" => Some(Self::Cline),
@@ -92,6 +99,7 @@ impl AgentPlatform {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
             Self::OpenCode => "opencode",
             Self::FactoryDroid => "factory",
             Self::Cline => "cline",
@@ -108,11 +116,37 @@ impl AgentPlatform {
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor",
             Self::Gemini => "Gemini CLI",
+            Self::Antigravity => "Antigravity (agy)",
             Self::OpenCode => "OpenCode",
             Self::FactoryDroid => "Factory Droid",
             Self::Cline => "Cline",
             Self::Windsurf => "Windsurf",
             Self::GithubCopilot => "GitHub Copilot",
+        }
+    }
+
+    /// Project-relative config files this platform writes into `project_dir`
+    /// that may embed the bearer token (security issue #148: these MUST be
+    /// covered by the auto-generated `.gitignore` so `git add -A` never commits
+    /// a live credential). User-level files (e.g. `~/.codex/config.toml`,
+    /// `~/.claude.json`) are not project-tracked and excluded here.
+    #[must_use]
+    pub const fn project_local_secret_files(self) -> &'static [&'static str] {
+        match self {
+            // Neither Claude nor Codex writes a token-bearing file into the
+            // project dir. GH#168: Claude's MCP config now lives in
+            // `~/.claude.json` (home, not project-tracked) — the only file it
+            // writes into the project dir is `.claude/settings.json` (hooks),
+            // which carries no token. Codex only writes `~/.codex/config.toml`.
+            Self::Claude | Self::Codex => &[],
+            Self::Cursor => &["cursor.mcp.json"],
+            Self::Gemini => &["gemini.mcp.json"],
+            Self::Antigravity => &["agy.mcp.json"],
+            Self::OpenCode => &["opencode.json"],
+            Self::FactoryDroid => &["factory.mcp.json"],
+            Self::Cline => &["cline.mcp.json"],
+            Self::Windsurf => &["windsurf.mcp.json"],
+            Self::GithubCopilot => &[".vscode/mcp.json"],
         }
     }
 }
@@ -162,6 +196,16 @@ pub enum ConfigContent {
         server_name: &'static str,
         server_value: Value,
     },
+    /// Merge an MCP server entry into Claude Code's *local* (per-project) scope:
+    /// `projects.<project_path>.mcpServers.<server_name>` inside `~/.claude.json`
+    /// (GH#168). This mirrors what `claude mcp add` (default/local scope) writes,
+    /// and is one of the only locations the Claude Code v2.x runtime actually
+    /// reads MCP servers from. `settings.json`/`settings.local.json` are NOT.
+    ClaudeLocalScopeMcp {
+        project_path: String,
+        server_name: &'static str,
+        server_value: Value,
+    },
     /// Write complete JSON (for new files only).
     JsonFull(Value),
     /// Merge Claude Code hooks into settings.json.
@@ -183,6 +227,7 @@ pub struct SetupParams {
     pub path: String,
     pub token: String,
     pub project_dir: PathBuf,
+    pub home_dir_override: Option<PathBuf>,
     pub agents: Option<Vec<AgentPlatform>>,
     pub dry_run: bool,
     pub skip_user_config: bool,
@@ -199,6 +244,7 @@ impl Default for SetupParams {
             path: "/mcp/".to_string(),
             token: String::new(),
             project_dir: PathBuf::from("."),
+            home_dir_override: None,
             agents: None,
             dry_run: false,
             skip_user_config: false,
@@ -319,7 +365,7 @@ fn fill_random_bytes(bytes: &mut [u8]) -> Result<(), SetupError> {
         ));
     }
 
-    getrandom::getrandom(bytes).map_err(|error| {
+    getrandom::fill(bytes).map_err(|error| {
         SetupError::Other(format!(
             "CSPRNG failure: cannot generate secure token: {error}"
         ))
@@ -408,6 +454,18 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
     generate_token()
 }
 
+/// Resolve an existing bearer token without generating or writing a replacement.
+#[must_use]
+pub fn resolve_existing_token(explicit: Option<&str>, env_file: &Path) -> Option<String> {
+    if let Some(token) = explicit
+        && !token.is_empty()
+    {
+        return Some(token.to_string());
+    }
+    read_env_file_token(env_file)
+        .or_else(|| env_value_for_setup("HTTP_BEARER_TOKEN").filter(|token| !token.is_empty()))
+}
+
 /// Read `HTTP_BEARER_TOKEN=...` from a .env file.
 fn read_env_file_token(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -491,6 +549,45 @@ pub fn merge_mcp_server(
 
     let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
     let servers = obj.entry(servers_key).or_insert_with(|| json!({}));
+    let servers_obj = servers.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+
+    if matches!(server_name, "mcp-agent-mail" | "mcp_agent_mail") {
+        for alias in ["mcp-agent-mail", "mcp_agent_mail"] {
+            if alias != server_name {
+                servers_obj.remove(alias);
+            }
+        }
+    }
+    servers_obj.insert(server_name.to_string(), server_value);
+
+    Ok(serde_json::to_string_pretty(&doc)? + "\n")
+}
+
+/// Merge an MCP server entry into Claude Code's local (per-project) scope inside
+/// `~/.claude.json`: `projects.<project_path>.mcpServers.<server_name>` (GH#168).
+///
+/// All unrelated top-level keys (`numStartups`, other `projects`, the top-level
+/// user-scope `mcpServers`, …) are preserved. Idempotent: re-running replaces the
+/// entry in place and de-dupes the hyphen/underscore alias.
+pub fn merge_claude_local_scope_mcp(
+    existing: Option<&str>,
+    project_path: &str,
+    server_name: &str,
+    server_value: Value,
+) -> Result<String, SetupError> {
+    let mut doc: Value = match existing {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str(s)?,
+        _ => json!({}),
+    };
+
+    let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+    let projects = obj.entry("projects").or_insert_with(|| json!({}));
+    let projects_obj = projects.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+    let repo = projects_obj
+        .entry(project_path.to_string())
+        .or_insert_with(|| json!({}));
+    let repo_obj = repo.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+    let servers = repo_obj.entry("mcpServers").or_insert_with(|| json!({}));
     let servers_obj = servers.as_object_mut().ok_or(SetupError::NotJsonObject)?;
 
     if matches!(server_name, "mcp-agent-mail" | "mcp_agent_mail") {
@@ -793,33 +890,43 @@ fn parse_toml_section_header(line: &str) -> Option<&str> {
     line.strip_prefix('[')?.strip_suffix(']')
 }
 
-fn parse_toml_string_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let line = strip_toml_inline_comment(line);
-    let (lhs, rhs) = line.split_once('=')?;
-    if lhs.trim() != key {
-        return None;
-    }
-    let value = rhs.trim();
-    if let Some(value) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        return Some(value);
-    }
-    value.strip_prefix('\'')?.strip_suffix('\'')
-}
-
 // ---------------------------------------------------------------------------
 // Per-agent config generation
 // ---------------------------------------------------------------------------
 
 /// Build the standard MCP server JSON value for HTTP agents.
+///
+/// When `token` is empty (e.g. `am serve-http --no-auth`), no `Authorization`
+/// header is emitted at all — never write a `Bearer ` header with no/blank
+/// credential into a project-tracked config (security issue #148).
 fn standard_http_server_value(url: &str, token: &str) -> Value {
-    json!({
-        "type": "http",
-        "url": url,
-        "headers": {
-            "Authorization": format!("Bearer {token}")
-        }
-    })
+    if token.is_empty() {
+        json!({
+            "type": "http",
+            "url": url
+        })
+    } else {
+        json!({
+            "type": "http",
+            "url": url,
+            "headers": {
+                "Authorization": format!("Bearer {token}")
+            }
+        })
+    }
 }
+
+/// Build the `headers` object for an MCP server entry, omitting the
+/// `Authorization` header entirely when `token` is empty (issue #148).
+fn auth_headers_value(token: &str) -> Value {
+    if token.is_empty() {
+        json!({})
+    } else {
+        json!({ "Authorization": format!("Bearer {token}") })
+    }
+}
+
+const CODEX_STATUS_STARTUP_TIMEOUT_SECS: u64 = 30;
 
 /// Helper: create a simple project-local JSON merge action.
 fn project_local_action(
@@ -852,7 +959,11 @@ impl AgentPlatform {
         let url = params.server_url();
         let token = &params.token;
         let pdir = &params.project_dir;
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+        let home = params
+            .home_dir_override
+            .clone()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("~"));
 
         match self {
             Self::Claude => self.claude_actions(params, &url, token, pdir, &home),
@@ -876,7 +987,10 @@ impl AgentPlatform {
             Self::Codex => {
                 let mut key_values = vec![
                     ("url".into(), format!("\"{url}\"")),
-                    ("startup_timeout_sec".into(), "30".into()),
+                    (
+                        "startup_timeout_sec".into(),
+                        CODEX_STATUS_STARTUP_TIMEOUT_SECS.to_string(),
+                    ),
                 ];
                 if !token.is_empty() {
                     key_values.push((
@@ -897,6 +1011,7 @@ impl AgentPlatform {
                 }]
             }
             Self::Gemini => self.gemini_actions(params, &url, token, pdir, &home),
+            Self::Antigravity => self.antigravity_actions(params, &url, token, pdir, &home),
             Self::OpenCode => vec![project_local_action(
                 self,
                 pdir,
@@ -905,7 +1020,7 @@ impl AgentPlatform {
                 json!({
                     "type": "remote",
                     "url": url,
-                    "headers": { "Authorization": format!("Bearer {token}") },
+                    "headers": auth_headers_value(token),
                     "enabled": true
                 }),
                 "OpenCode project-local MCP config",
@@ -934,12 +1049,23 @@ impl AgentPlatform {
         pdir: &Path,
         home: &Path,
     ) -> Vec<ConfigAction> {
+        // GH#168: Claude Code v2.x reads MCP servers ONLY from `~/.claude.json`
+        // (top-level `mcpServers` = user scope; `projects.<abs>.mcpServers` =
+        // local/per-project scope) and project `.mcp.json` — NEVER from
+        // `settings.json`/`settings.local.json` (those are hooks/permissions).
+        // Writing the old location left every fresh `claude` instance with zero
+        // Agent Mail tools. Mirror `claude mcp add`: local scope per-project +
+        // user scope top-level, both in `~/.claude.json` (home, not git-tracked,
+        // so the bearer token never lands in the project working tree).
+        let claude_json = home.join(".claude.json");
+        let project_key = pdir.to_string_lossy().into_owned();
         let mut actions = vec![ConfigAction {
             platform: self,
-            file_path: pdir.join(".claude").join("settings.local.json"),
-            description: "Claude Code project-local MCP config (secrets)".into(),
-            content: ConfigContent::JsonMerge {
-                servers_key: "mcpServers",
+            file_path: claude_json.clone(),
+            description:
+                "Claude Code project-local MCP config (~/.claude.json local scope; secrets)".into(),
+            content: ConfigContent::ClaudeLocalScopeMcp {
+                project_path: project_key,
                 server_name: "mcp-agent-mail",
                 server_value: standard_http_server_value(url, token),
             },
@@ -949,8 +1075,9 @@ impl AgentPlatform {
         if !params.skip_user_config {
             actions.push(ConfigAction {
                 platform: self,
-                file_path: home.join(".claude").join("settings.json"),
-                description: "Claude Code user-level MCP config".into(),
+                file_path: claude_json,
+                description: "Claude Code user-level MCP config (~/.claude.json top-level mcpServers)"
+                    .into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
@@ -1026,7 +1153,7 @@ impl AgentPlatform {
             "mcpServers",
             json!({
                 "httpUrl": url,
-                "headers": { "Authorization": format!("Bearer {token}") }
+                "headers": auth_headers_value(token)
             }),
             "Gemini CLI project-local MCP config",
         )];
@@ -1035,6 +1162,59 @@ impl AgentPlatform {
                 platform: self,
                 file_path: home.join(".gemini").join("settings.json"),
                 description: "Gemini CLI user-level MCP config".into(),
+                content: ConfigContent::JsonMerge {
+                    servers_key: "mcpServers",
+                    server_name: "mcp-agent-mail",
+                    server_value: json!({ "httpUrl": url }),
+                },
+                permissions: 0o644,
+                backup: true,
+            });
+        }
+        actions
+    }
+
+    /// Antigravity (`agy`) MCP config actions.
+    ///
+    /// agy is the successor to the retired Gemini CLI and consumes the
+    /// gemini-compatible `mcpServers` schema, but from a DIFFERENT file:
+    /// the canonical user-level path is `~/.gemini/config/mcp_config.json`
+    /// (NOT Gemini's `~/.gemini/settings.json`). This was verified empirically
+    /// by stracing the live agy 1.0.7 binary, which opens
+    /// `~/.gemini/config/mcp_config.json` at session start and spawns the
+    /// configured stdio `command`. The HTTP form uses `httpUrl` + `headers`,
+    /// identical to Gemini's MCP entry shape.
+    ///
+    /// Token safety (issue #148): the user-level `mcp_config.json` carries NO
+    /// bearer token; only the project-local `agy.mcp.json` embeds the
+    /// `Authorization` header, and that file is force-added to `.gitignore`
+    /// via `project_local_secret_files()`.
+    fn antigravity_actions(
+        self,
+        params: &SetupParams,
+        url: &str,
+        token: &str,
+        pdir: &Path,
+        home: &Path,
+    ) -> Vec<ConfigAction> {
+        let mut actions = vec![project_local_action(
+            self,
+            pdir,
+            "agy.mcp.json",
+            "mcpServers",
+            json!({
+                "httpUrl": url,
+                "headers": auth_headers_value(token)
+            }),
+            "Antigravity (agy) project-local MCP config",
+        )];
+        if !params.skip_user_config {
+            actions.push(ConfigAction {
+                platform: self,
+                file_path: home.join(".gemini").join("config").join("mcp_config.json"),
+                description: "Antigravity (agy) user-level MCP config \
+                              (~/.gemini/config/mcp_config.json)"
+                    .into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
@@ -1062,7 +1242,7 @@ impl AgentPlatform {
             "mcpServers",
             json!({
                 "url": url,
-                "headers": { "Authorization": format!("Bearer {token}") }
+                "headers": auth_headers_value(token)
             }),
             "Factory Droid project-local MCP config",
         )];
@@ -1287,6 +1467,16 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
             server_name,
             server_value.clone(),
         )?,
+        ConfigContent::ClaudeLocalScopeMcp {
+            project_path,
+            server_name,
+            server_value,
+        } => merge_claude_local_scope_mcp(
+            existing.as_deref(),
+            project_path,
+            server_name,
+            server_value.clone(),
+        )?,
         ConfigContent::JsonFull(val) => serde_json::to_string_pretty(val)? + "\n",
         ConfigContent::HooksMerge {
             project_slug,
@@ -1370,16 +1560,27 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
         });
     }
 
-    // Ensure .gitignore has entries for secret files
+    // Ensure .gitignore has entries for secret files (security issue #148).
+    // Cover EVERY project-local token-bearing file that any configured platform
+    // can emit — not just `.env` + the Claude file — so an unsuspecting
+    // `git add -A` can never commit a live bearer credential. The previous
+    // hardcoded list left `cursor.mcp.json`, `gemini.mcp.json`,
+    // `factory.mcp.json`, `windsurf.mcp.json`, `cline.mcp.json`,
+    // `opencode.json`, and `.vscode/mcp.json` tracked.
     if !params.dry_run {
         let gitignore = params.project_dir.join(".gitignore");
-        // .env contains the bearer token — always gitignore it
-        let mut entries = vec![".env"];
-        // .claude/settings.local.json only exists for Claude
-        if platforms.contains(&AgentPlatform::Claude) {
-            entries.push(".claude/settings.local.json");
+        // .env contains the bearer token — always gitignore it.
+        let mut entries = vec![".env".to_string()];
+        for platform in &platforms {
+            for file in platform.project_local_secret_files() {
+                let entry = (*file).to_string();
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
         }
-        let _ = ensure_gitignore_entries(&gitignore, &entries);
+        let entry_refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let _ = ensure_gitignore_entries(&gitignore, &entry_refs);
     }
 
     results
@@ -1398,13 +1599,109 @@ pub struct AgentConfigStatus {
     pub config_files: Vec<ConfigFileStatus>,
 }
 
+/// Why a client config differs from the expected Agent Mail entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDriftReason {
+    Ok,
+    MissingFile,
+    MissingServerEntry,
+    LegacyStdio,
+    StaleHttpPath,
+    WrongBearerHeader,
+    WrongStartupTimeout,
+    DuplicateServerEntries,
+    UnsupportedConfig,
+}
+
+impl ConfigDriftReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::MissingFile => "missing_file",
+            Self::MissingServerEntry => "missing_server_entry",
+            Self::LegacyStdio => "legacy_stdio",
+            Self::StaleHttpPath => "stale_http_path",
+            Self::WrongBearerHeader => "wrong_bearer_header",
+            Self::WrongStartupTimeout => "wrong_startup_timeout",
+            Self::DuplicateServerEntries => "duplicate_server_entries",
+            Self::UnsupportedConfig => "unsupported_config",
+        }
+    }
+}
+
+impl fmt::Display for ConfigDriftReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Operator-facing severity for a setup drift finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDriftRisk {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+impl ConfigDriftRisk {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl fmt::Display for ConfigDriftRisk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Status of a single config file.
 #[derive(Debug, Serialize)]
 pub struct ConfigFileStatus {
+    #[serde(skip_serializing)]
     pub path: String,
+    #[serde(rename = "path")]
+    pub redacted_path: String,
     pub exists: bool,
     pub has_server_entry: bool,
     pub url_matches: bool,
+    pub expected_url: String,
+    pub actual_url: Option<String>,
+    pub entry_locations: Vec<String>,
+    pub current_entry: Option<Value>,
+    pub expected_entry: Value,
+    pub drift_reasons: Vec<ConfigDriftReason>,
+    pub primary_drift_reason: ConfigDriftReason,
+    pub risk: ConfigDriftRisk,
+    pub remediation: String,
+}
+
+impl ConfigFileStatus {
+    /// Treat this file's current URL as acceptable after a caller-specific override.
+    pub fn mark_url_matches(&mut self) {
+        self.url_matches = true;
+        self.drift_reasons
+            .retain(|reason| *reason != ConfigDriftReason::StaleHttpPath);
+        self.refresh_drift_summary();
+    }
+
+    fn refresh_drift_summary(&mut self) {
+        self.primary_drift_reason = primary_drift_reason(&self.drift_reasons);
+        self.risk = risk_for_drift_reasons(&self.drift_reasons);
+        if self.primary_drift_reason == ConfigDriftReason::Ok {
+            self.remediation = "no action".to_string();
+        }
+    }
 }
 
 /// Check config status for detected agents.
@@ -1427,19 +1724,7 @@ pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
             if matches!(action.content, ConfigContent::HooksMerge { .. }) {
                 continue;
             }
-            let exists = action.file_path.exists();
-            let (has_server, url_matches) = if exists {
-                check_config_file(&action.file_path, &url)
-            } else {
-                (false, false)
-            };
-
-            file_statuses.push(ConfigFileStatus {
-                path: action.file_path.display().to_string(),
-                exists,
-                has_server_entry: has_server,
-                url_matches,
-            });
+            file_statuses.push(config_file_status_for_action(action, params, &url));
         }
 
         statuses.push(AgentConfigStatus {
@@ -1453,65 +1738,693 @@ pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
     statuses
 }
 
+#[derive(Debug)]
+struct ConfigContentAnalysis {
+    has_server_entry: bool,
+    url_matches: bool,
+    actual_url: Option<String>,
+    entry_locations: Vec<String>,
+    current_entry: Option<Value>,
+    drift_reasons: Vec<ConfigDriftReason>,
+}
+
+fn config_file_status_for_action(
+    action: &ConfigAction,
+    params: &SetupParams,
+    expected_url: &str,
+) -> ConfigFileStatus {
+    let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+    let expected_entry =
+        redact_value_for_status(expected_entry_for_action(action), home.as_deref());
+    let expected_auth = expected_authorization_for_action(action, &params.token);
+    let expected_timeout = expected_startup_timeout_for_action(action);
+    let redacted_path = redact_path_for_status(&action.file_path, home.as_deref());
+
+    if !action.file_path.exists() {
+        let drift_reasons = vec![ConfigDriftReason::MissingFile];
+        return ConfigFileStatus {
+            path: action.file_path.display().to_string(),
+            redacted_path,
+            exists: false,
+            has_server_entry: false,
+            url_matches: false,
+            expected_url: expected_url.to_string(),
+            actual_url: None,
+            entry_locations: Vec::new(),
+            current_entry: None,
+            expected_entry,
+            primary_drift_reason: primary_drift_reason(&drift_reasons),
+            risk: risk_for_drift_reasons(&drift_reasons),
+            remediation: setup_status_remediation(action, params, &drift_reasons),
+            drift_reasons,
+        };
+    }
+
+    let analysis = std::fs::read_to_string(&action.file_path).map_or_else(
+        |_| ConfigContentAnalysis {
+            has_server_entry: false,
+            url_matches: false,
+            actual_url: None,
+            entry_locations: Vec::new(),
+            current_entry: None,
+            drift_reasons: vec![ConfigDriftReason::UnsupportedConfig],
+        },
+        |content| {
+            analyze_config_content(
+                &action.file_path,
+                &content,
+                expected_url,
+                expected_auth.as_deref(),
+                expected_timeout,
+                home.as_deref(),
+            )
+        },
+    );
+
+    ConfigFileStatus {
+        path: action.file_path.display().to_string(),
+        redacted_path,
+        exists: true,
+        has_server_entry: analysis.has_server_entry,
+        url_matches: analysis.url_matches,
+        expected_url: expected_url.to_string(),
+        actual_url: analysis.actual_url,
+        entry_locations: analysis.entry_locations,
+        current_entry: analysis.current_entry,
+        expected_entry,
+        primary_drift_reason: primary_drift_reason(&analysis.drift_reasons),
+        risk: risk_for_drift_reasons(&analysis.drift_reasons),
+        remediation: setup_status_remediation(action, params, &analysis.drift_reasons),
+        drift_reasons: analysis.drift_reasons,
+    }
+}
+
+fn analyze_config_content(
+    path: &Path,
+    content: &str,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    expected_startup_timeout: Option<u64>,
+    home: Option<&Path>,
+) -> ConfigContentAnalysis {
+    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        analyze_toml_config_content(
+            content,
+            expected_url,
+            expected_auth,
+            expected_startup_timeout,
+            home,
+        )
+    } else {
+        analyze_json_config_content(content, expected_url, expected_auth, home)
+    }
+}
+
 /// Check whether a config file contains our server entry and the URL matches.
+#[cfg(test)]
 fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return (false, false);
     };
 
-    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-        let mut in_target_section = false;
-        let mut has_section = false;
+    let analysis = analyze_config_content(path, &content, expected_url, None, None, None);
+    (analysis.has_server_entry, analysis.url_matches)
+}
 
-        for raw_line in content.lines() {
-            if let Some(section) = parse_toml_section_header(raw_line) {
-                in_target_section = matches!(
-                    section,
-                    "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
-                );
-                has_section |= in_target_section;
-                continue;
-            }
+struct JsonServerEntry<'a> {
+    container: &'static str,
+    server_name: &'static str,
+    entry: &'a Value,
+}
 
-            if !in_target_section {
-                continue;
-            }
-
-            if let Some(url) = parse_toml_string_value(raw_line, "url")
-                .or_else(|| parse_toml_string_value(raw_line, "httpUrl"))
-            {
-                return (true, urls_match_for_status(url, expected_url));
-            }
-        }
-
-        return (has_section, false);
-    }
-
-    let Ok(doc) = serde_json::from_str::<Value>(&content) else {
-        return (false, false);
+fn analyze_json_config_content(
+    content: &str,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+) -> ConfigContentAnalysis {
+    let Ok(doc) = serde_json::from_str::<Value>(content) else {
+        return ConfigContentAnalysis {
+            has_server_entry: false,
+            url_matches: false,
+            actual_url: None,
+            entry_locations: Vec::new(),
+            current_entry: None,
+            drift_reasons: vec![ConfigDriftReason::UnsupportedConfig],
+        };
     };
 
-    let mut has_server = false;
-    for key in &["mcpServers", "mcp", "servers", "mcp_servers"] {
-        if let Some(servers) = doc.get(key).and_then(|v| v.as_object()) {
-            for server_name in ["mcp-agent-mail", "mcp_agent_mail"] {
-                let Some(entry) = servers.get(server_name) else {
-                    continue;
-                };
-                has_server = true;
-                let url_match = entry
-                    .get("url")
-                    .or_else(|| entry.get("httpUrl"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| urls_match_for_status(u, expected_url));
-                if url_match {
-                    return (true, true);
-                }
-            }
+    if !doc.is_object() {
+        return ConfigContentAnalysis {
+            has_server_entry: false,
+            url_matches: false,
+            actual_url: None,
+            entry_locations: Vec::new(),
+            current_entry: None,
+            drift_reasons: vec![ConfigDriftReason::UnsupportedConfig],
+        };
+    }
+
+    let entries = collect_json_server_entries(&doc);
+    if entries.is_empty() {
+        return ConfigContentAnalysis {
+            has_server_entry: false,
+            url_matches: false,
+            actual_url: None,
+            entry_locations: Vec::new(),
+            current_entry: None,
+            drift_reasons: vec![ConfigDriftReason::MissingServerEntry],
+        };
+    }
+
+    let mut drift_reasons = Vec::new();
+    if entries.len() > 1 {
+        push_drift_reason(
+            &mut drift_reasons,
+            ConfigDriftReason::DuplicateServerEntries,
+        );
+    }
+
+    let url_matches = entries.iter().any(|entry| {
+        json_entry_url(entry.entry).is_some_and(|url| urls_match_for_status(url, expected_url))
+    });
+    let actual_url = entries
+        .iter()
+        .find_map(|entry| json_entry_url(entry.entry).map(str::to_string));
+    if !url_matches {
+        if entries
+            .iter()
+            .any(|entry| json_entry_has_legacy_stdio(entry.entry))
+        {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::LegacyStdio);
+        } else if actual_url.is_some() {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::StaleHttpPath);
+        } else {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::UnsupportedConfig);
         }
     }
 
-    (has_server, false)
+    if let Some(expected) = expected_auth {
+        let auth_matches = entries
+            .iter()
+            .any(|entry| json_entry_authorization(entry.entry) == Some(expected));
+        if !auth_matches {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::WrongBearerHeader);
+        }
+    }
+
+    let first = &entries[0];
+    let current_entry = Some(json!({
+        "container": first.container,
+        "server_name": first.server_name,
+        "entry": redact_value_for_status(first.entry.clone(), home),
+    }));
+    let entry_locations = entries
+        .iter()
+        .map(|entry| format!("{}.{}", entry.container, entry.server_name))
+        .collect();
+
+    ConfigContentAnalysis {
+        has_server_entry: true,
+        url_matches,
+        actual_url,
+        entry_locations,
+        current_entry,
+        drift_reasons,
+    }
+}
+
+fn collect_json_server_entries(doc: &Value) -> Vec<JsonServerEntry<'_>> {
+    let mut entries = Vec::new();
+    for container in ["mcpServers", "mcp", "servers", "mcp_servers"] {
+        let Some(servers) = doc.get(container).and_then(Value::as_object) else {
+            continue;
+        };
+        for server_name in ["mcp-agent-mail", "mcp_agent_mail"] {
+            let Some(entry) = servers.get(server_name) else {
+                continue;
+            };
+            entries.push(JsonServerEntry {
+                container,
+                server_name,
+                entry,
+            });
+        }
+    }
+    entries
+}
+
+fn json_entry_url(entry: &Value) -> Option<&str> {
+    entry
+        .get("url")
+        .or_else(|| entry.get("httpUrl"))
+        .and_then(Value::as_str)
+}
+
+fn json_entry_authorization(entry: &Value) -> Option<&str> {
+    entry
+        .get("headers")
+        .or_else(|| entry.get("http_headers"))
+        .and_then(Value::as_object)
+        .and_then(|headers| headers.get("Authorization"))
+        .and_then(Value::as_str)
+}
+
+fn json_entry_has_legacy_stdio(entry: &Value) -> bool {
+    entry.get("command").is_some()
+        || entry.get("args").is_some()
+        || entry
+            .get("transport")
+            .and_then(Value::as_str)
+            .is_some_and(|transport| transport.eq_ignore_ascii_case("stdio"))
+}
+
+#[derive(Debug)]
+struct TomlServerSection {
+    section: String,
+    entry: Map<String, Value>,
+    url: Option<String>,
+    authorization: Option<String>,
+    startup_timeout: Option<u64>,
+    legacy_stdio: bool,
+}
+
+fn analyze_toml_config_content(
+    content: &str,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    expected_startup_timeout: Option<u64>,
+    home: Option<&Path>,
+) -> ConfigContentAnalysis {
+    let sections = collect_toml_server_sections(content);
+    if sections.is_empty() {
+        return ConfigContentAnalysis {
+            has_server_entry: false,
+            url_matches: false,
+            actual_url: None,
+            entry_locations: Vec::new(),
+            current_entry: None,
+            drift_reasons: vec![ConfigDriftReason::MissingServerEntry],
+        };
+    }
+
+    let mut drift_reasons = Vec::new();
+    if sections.len() > 1 {
+        push_drift_reason(
+            &mut drift_reasons,
+            ConfigDriftReason::DuplicateServerEntries,
+        );
+    }
+
+    let url_matches = sections.iter().any(|section| {
+        section
+            .url
+            .as_deref()
+            .is_some_and(|url| urls_match_for_status(url, expected_url))
+    });
+    let actual_url = sections.iter().find_map(|section| section.url.clone());
+    if !url_matches {
+        if sections.iter().any(|section| section.legacy_stdio) {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::LegacyStdio);
+        } else if actual_url.is_some() {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::StaleHttpPath);
+        } else {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::UnsupportedConfig);
+        }
+    }
+
+    if let Some(expected) = expected_auth {
+        let auth_matches = sections
+            .iter()
+            .any(|section| section.authorization.as_deref() == Some(expected));
+        if !auth_matches {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::WrongBearerHeader);
+        }
+    }
+
+    if let Some(expected) = expected_startup_timeout {
+        let timeout_matches = sections
+            .iter()
+            .any(|section| section.startup_timeout == Some(expected));
+        if !timeout_matches {
+            push_drift_reason(&mut drift_reasons, ConfigDriftReason::WrongStartupTimeout);
+        }
+    }
+
+    let first = &sections[0];
+    let current_entry = Some(json!({
+        "section": first.section,
+        "entry": redact_value_for_status(Value::Object(first.entry.clone()), home),
+    }));
+    let entry_locations = sections
+        .iter()
+        .map(|section| section.section.clone())
+        .collect();
+
+    ConfigContentAnalysis {
+        has_server_entry: true,
+        url_matches,
+        actual_url,
+        entry_locations,
+        current_entry,
+        drift_reasons,
+    }
+}
+
+fn collect_toml_server_sections(content: &str) -> Vec<TomlServerSection> {
+    let mut sections = Vec::new();
+    let mut current_index: Option<usize> = None;
+
+    for raw_line in content.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            if matches!(
+                section,
+                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
+            ) {
+                sections.push(TomlServerSection {
+                    section: section.to_string(),
+                    entry: Map::new(),
+                    url: None,
+                    authorization: None,
+                    startup_timeout: None,
+                    legacy_stdio: false,
+                });
+                current_index = Some(sections.len() - 1);
+            } else {
+                current_index = None;
+            }
+            continue;
+        }
+
+        let Some(index) = current_index else {
+            continue;
+        };
+        let Some((key, value)) = parse_toml_key_value(raw_line) else {
+            continue;
+        };
+
+        match key.as_str() {
+            "url" | "httpUrl" => {
+                if let Some(url) = value.as_str() {
+                    sections[index].url = Some(url.to_string());
+                }
+            }
+            "http_headers" => {
+                sections[index].authorization = value
+                    .as_object()
+                    .and_then(|headers| headers.get("Authorization"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            "startup_timeout_sec" => {
+                sections[index].startup_timeout = value.as_u64();
+            }
+            "command" | "args" => {
+                sections[index].legacy_stdio = true;
+            }
+            "transport"
+                if value
+                    .as_str()
+                    .is_some_and(|transport| transport.eq_ignore_ascii_case("stdio")) =>
+            {
+                sections[index].legacy_stdio = true;
+            }
+            _ => {}
+        }
+        sections[index].entry.insert(key, value);
+    }
+
+    sections
+}
+
+fn parse_toml_key_value(line: &str) -> Option<(String, Value)> {
+    let line = strip_toml_inline_comment(line);
+    let (lhs, rhs) = line.split_once('=')?;
+    let key = lhs.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), toml_literal_to_json_value(rhs.trim())))
+}
+
+fn toml_literal_to_json_value(value: &str) -> Value {
+    if let Some(string) = parse_toml_quoted_literal(value) {
+        return Value::String(string);
+    }
+    if let Ok(number) = value.parse::<u64>() {
+        return json!(number);
+    }
+    if let Some(auth) = parse_toml_inline_authorization(value) {
+        return json!({ "Authorization": auth });
+    }
+    Value::String(value.to_string())
+}
+
+fn parse_toml_quoted_literal(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(value) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return Some(value.to_string());
+    }
+    value
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .map(str::to_string)
+}
+
+fn parse_toml_inline_authorization(value: &str) -> Option<String> {
+    let inner = value.trim().strip_prefix('{')?.strip_suffix('}')?;
+    for part in inner.split(',') {
+        let (key, raw_value) = part.split_once('=')?;
+        if key.trim() == "Authorization" {
+            return parse_toml_quoted_literal(raw_value.trim());
+        }
+    }
+    None
+}
+
+fn expected_entry_for_action(action: &ConfigAction) -> Value {
+    match &action.content {
+        ConfigContent::JsonMerge {
+            servers_key,
+            server_name,
+            server_value,
+        } => json!({
+            "container": servers_key,
+            "server_name": server_name,
+            "entry": server_value,
+        }),
+        ConfigContent::ClaudeLocalScopeMcp {
+            project_path,
+            server_name,
+            server_value,
+        } => json!({
+            "container": format!("projects.{project_path}.mcpServers"),
+            "server_name": server_name,
+            "entry": server_value,
+        }),
+        ConfigContent::JsonFull(value) => value.clone(),
+        ConfigContent::HooksMerge { .. } => json!({}),
+        ConfigContent::TomlSection {
+            section_header,
+            key_values,
+        } => {
+            let mut entry = Map::new();
+            for (key, value) in key_values {
+                entry.insert(key.clone(), toml_literal_to_json_value(value));
+            }
+            json!({
+                "section": section_header.trim_matches(['[', ']']),
+                "entry": entry,
+            })
+        }
+    }
+}
+
+fn expected_authorization_for_action(action: &ConfigAction, token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    match &action.content {
+        ConfigContent::JsonMerge { server_value, .. }
+        | ConfigContent::ClaudeLocalScopeMcp { server_value, .. } => {
+            json_entry_authorization(server_value).map(str::to_string)
+        }
+        ConfigContent::TomlSection { key_values, .. } => {
+            key_values.iter().find_map(|(key, value)| {
+                (key == "http_headers")
+                    .then(|| parse_toml_inline_authorization(value))
+                    .flatten()
+            })
+        }
+        ConfigContent::JsonFull(_) | ConfigContent::HooksMerge { .. } => None,
+    }
+}
+
+fn expected_startup_timeout_for_action(action: &ConfigAction) -> Option<u64> {
+    if action.platform != AgentPlatform::Codex {
+        return None;
+    }
+    match &action.content {
+        ConfigContent::TomlSection { key_values, .. } => {
+            key_values.iter().find_map(|(key, value)| {
+                (key == "startup_timeout_sec")
+                    .then(|| value.parse::<u64>().ok())
+                    .flatten()
+            })
+        }
+        ConfigContent::JsonMerge { .. }
+        | ConfigContent::ClaudeLocalScopeMcp { .. }
+        | ConfigContent::JsonFull(_)
+        | ConfigContent::HooksMerge { .. } => None,
+    }
+}
+
+fn redact_value_for_status(value: Value, home: Option<&Path>) -> Value {
+    redact_value_for_status_key(None, value, home)
+}
+
+fn redact_value_for_status_key(key: Option<&str>, value: Value, home: Option<&Path>) -> Value {
+    let key_lc = key.unwrap_or_default().to_ascii_lowercase();
+    match value {
+        Value::String(text) => {
+            if key_lc.contains("authorization")
+                || key_lc.contains("token")
+                || key_lc.contains("secret")
+            {
+                if text.trim_start().starts_with("Bearer ") {
+                    Value::String("Bearer <redacted>".to_string())
+                } else {
+                    Value::String("<redacted>".to_string())
+                }
+            } else if text.trim_start().starts_with("Bearer ") {
+                Value::String("Bearer <redacted>".to_string())
+            } else {
+                Value::String(redact_home_in_status_text(&text, home))
+            }
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| redact_value_for_status_key(key, value, home))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = redact_value_for_status_key(Some(&key), value, home);
+                    (key, value)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn redact_path_for_status(path: &Path, home: Option<&Path>) -> String {
+    redact_home_in_status_text(&path.display().to_string(), home)
+}
+
+fn redact_home_in_status_text(text: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return text.to_string();
+    };
+    let home = home.display().to_string();
+    if home.is_empty() || home == "/" {
+        return text.to_string();
+    }
+    if text == home {
+        return "~".to_string();
+    }
+    let prefix = format!("{home}/");
+    if let Some(rest) = text.strip_prefix(&prefix) {
+        return format!("~/{rest}");
+    }
+    text.replace(&prefix, "~/")
+}
+
+fn push_drift_reason(reasons: &mut Vec<ConfigDriftReason>, reason: ConfigDriftReason) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+fn primary_drift_reason(reasons: &[ConfigDriftReason]) -> ConfigDriftReason {
+    const PRIORITY: &[ConfigDriftReason] = &[
+        ConfigDriftReason::UnsupportedConfig,
+        ConfigDriftReason::MissingFile,
+        ConfigDriftReason::MissingServerEntry,
+        ConfigDriftReason::DuplicateServerEntries,
+        ConfigDriftReason::LegacyStdio,
+        ConfigDriftReason::StaleHttpPath,
+        ConfigDriftReason::WrongBearerHeader,
+        ConfigDriftReason::WrongStartupTimeout,
+    ];
+    PRIORITY
+        .iter()
+        .copied()
+        .find(|reason| reasons.contains(reason))
+        .unwrap_or(ConfigDriftReason::Ok)
+}
+
+fn risk_for_drift_reasons(reasons: &[ConfigDriftReason]) -> ConfigDriftRisk {
+    if reasons.is_empty() {
+        return ConfigDriftRisk::None;
+    }
+    if reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ConfigDriftReason::UnsupportedConfig
+                | ConfigDriftReason::DuplicateServerEntries
+                | ConfigDriftReason::WrongBearerHeader
+        )
+    }) {
+        return ConfigDriftRisk::High;
+    }
+    if reasons
+        .iter()
+        .all(|reason| *reason == ConfigDriftReason::WrongStartupTimeout)
+    {
+        return ConfigDriftRisk::Low;
+    }
+    ConfigDriftRisk::Medium
+}
+
+fn setup_status_remediation(
+    action: &ConfigAction,
+    params: &SetupParams,
+    reasons: &[ConfigDriftReason],
+) -> String {
+    if reasons.is_empty() {
+        return "no action".to_string();
+    }
+
+    let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+    let project_dir = redact_path_for_status(&params.project_dir, home.as_deref());
+    let args = format!(
+        "--agent {} --host {} --port {} --path {} --project-dir {}{}{}",
+        action.platform.slug(),
+        params.host,
+        params.port,
+        params.path,
+        project_dir,
+        if params.skip_user_config {
+            " --no-user-config"
+        } else {
+            ""
+        },
+        if params.skip_hooks { " --no-hooks" } else { "" }
+    );
+    let dry_run = format!("am setup run --dry-run {args}");
+    let fix = format!("am setup run --yes {args}");
+
+    if reasons.contains(&ConfigDriftReason::UnsupportedConfig) {
+        return format!("inspect unsupported config, then {dry_run}; {fix}");
+    }
+    if reasons.contains(&ConfigDriftReason::WrongBearerHeader) {
+        return format!("verify HTTP_BEARER_TOKEN/config.env token source, then {dry_run}; {fix}");
+    }
+    format!("{dry_run}; {fix}")
 }
 
 fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
@@ -1846,6 +2759,81 @@ mod tests {
     }
 
     #[test]
+    fn merge_claude_local_scope_mcp_creates_nested_path() {
+        // GH#168: from empty, builds projects.<path>.mcpServers.<name>.
+        let result = merge_claude_local_scope_mcp(
+            None,
+            "/abs/repo",
+            "mcp-agent-mail",
+            json!({"type": "http", "url": "http://127.0.0.1:8765/mcp/"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            doc["projects"]["/abs/repo"]["mcpServers"]["mcp-agent-mail"]["url"],
+            json!("http://127.0.0.1:8765/mcp/")
+        );
+    }
+
+    #[test]
+    fn merge_claude_local_scope_mcp_preserves_unrelated_keys() {
+        // Unrelated top-level keys, other projects, and the user-scope top-level
+        // mcpServers must all survive the merge.
+        let existing = r#"{
+  "numStartups": 7,
+  "mcpServers": { "other-user-server": { "url": "x" } },
+  "projects": {
+    "/other/repo": { "mcpServers": { "keep": { "url": "y" } } },
+    "/abs/repo": { "allowedTools": ["Bash"] }
+  }
+}"#;
+        let result = merge_claude_local_scope_mcp(
+            Some(existing),
+            "/abs/repo",
+            "mcp-agent-mail",
+            json!({"url": "z"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(doc["numStartups"], json!(7));
+        assert_eq!(doc["mcpServers"]["other-user-server"]["url"], json!("x"));
+        assert_eq!(
+            doc["projects"]["/other/repo"]["mcpServers"]["keep"]["url"],
+            json!("y")
+        );
+        // existing per-project keys preserved alongside the inserted server
+        assert_eq!(
+            doc["projects"]["/abs/repo"]["allowedTools"],
+            json!(["Bash"])
+        );
+        assert_eq!(
+            doc["projects"]["/abs/repo"]["mcpServers"]["mcp-agent-mail"]["url"],
+            json!("z")
+        );
+    }
+
+    #[test]
+    fn merge_claude_local_scope_mcp_idempotent_and_dedupes_alias() {
+        // Re-running replaces in place; the underscore alias is removed.
+        let seeded = r#"{"projects":{"/r":{"mcpServers":{"mcp_agent_mail":{"url":"old"}}}}}"#;
+        let result = merge_claude_local_scope_mcp(
+            Some(seeded),
+            "/r",
+            "mcp-agent-mail",
+            json!({"url": "new"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        let servers = doc["projects"]["/r"]["mcpServers"].as_object().unwrap();
+        assert!(
+            !servers.contains_key("mcp_agent_mail"),
+            "alias must be dropped"
+        );
+        assert_eq!(servers["mcp-agent-mail"]["url"], json!("new"));
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
     fn config_actions_cursor() {
         let params = SetupParams {
             host: "127.0.0.1".into(),
@@ -1873,6 +2861,172 @@ mod tests {
         }
     }
 
+    // ---- security issue #148: bearer token in *.mcp.json must be gitignored ----
+
+    /// Every project-local config file a platform writes that can embed a token
+    /// must be covered by the gitignore `run_setup` generates.
+    #[test]
+    fn run_setup_gitignore_covers_every_emitted_token_bearing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = SetupParams {
+            host: "127.0.0.1".into(),
+            port: 8765,
+            path: "/mcp/".into(),
+            token: "live-secret-token".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(AgentPlatform::ALL.to_vec()),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let _ = run_setup(&params);
+
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        let lines: Vec<&str> = gitignore.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(&".env"),
+            "gitignore must cover .env: {gitignore}"
+        );
+
+        // For every platform, every project-local token-bearing file it writes
+        // must appear in the generated .gitignore.
+        for platform in AgentPlatform::ALL {
+            for file in platform.project_local_secret_files() {
+                assert!(
+                    lines.contains(file),
+                    "gitignore is missing {file} (platform {platform}); contents:\n{gitignore}"
+                );
+            }
+        }
+        // Spot-check the high-risk filenames the old hardcoded list missed.
+        // (GH#168: Claude no longer writes a token-bearing file into the project
+        // dir — its MCP config lives in `~/.claude.json` — so it is no longer
+        // expected here.)
+        for expected in [
+            "cursor.mcp.json",
+            "gemini.mcp.json",
+            "factory.mcp.json",
+            "windsurf.mcp.json",
+            "cline.mcp.json",
+            "opencode.json",
+            ".vscode/mcp.json",
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "gitignore must cover {expected}: {gitignore}"
+            );
+        }
+    }
+
+    /// `project_local_secret_files()` must list exactly the project-dir files
+    /// each platform's `config_actions` actually writes (keep them in sync so a
+    /// new client doesn't leak a token). User-level (home) files are excluded.
+    #[test]
+    fn project_local_secret_files_matches_emitted_project_dir_actions() {
+        // home_dir MUST be outside project_dir, otherwise user-level configs
+        // (e.g. ~/.claude/settings.json) would appear nested under the project.
+        let proj_tmp = tempfile::tempdir().unwrap();
+        let home_tmp = tempfile::tempdir().unwrap();
+        let pdir = proj_tmp.path();
+        let home = home_tmp.path().to_path_buf();
+        for platform in AgentPlatform::ALL {
+            let params = SetupParams {
+                token: "tok".into(),
+                project_dir: pdir.to_path_buf(),
+                home_dir_override: Some(home.clone()),
+                agents: Some(vec![*platform]),
+                skip_user_config: false,
+                skip_hooks: false,
+                ..Default::default()
+            };
+            // Project-dir-relative file paths this platform writes.
+            let emitted: Vec<String> = platform
+                .config_actions(&params)
+                .iter()
+                .filter(|a| a.file_path.starts_with(pdir))
+                .filter_map(|a| {
+                    a.file_path
+                        .strip_prefix(pdir)
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                })
+                // Claude's hooks file (.claude/settings.json) is project-local
+                // but carries no token; the secret file is settings.local.json.
+                .filter(|rel| rel != ".claude/settings.json")
+                .collect();
+            let declared: Vec<String> = platform
+                .project_local_secret_files()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for rel in &emitted {
+                assert!(
+                    declared.contains(rel),
+                    "{platform}: project-local file {rel} is written but not declared in \
+                     project_local_secret_files() (would leak under git add -A)"
+                );
+            }
+        }
+    }
+
+    /// Under `--no-auth` (empty token), no `Authorization` header is written
+    /// into any project-local config — never a live or blank bearer credential.
+    #[test]
+    fn empty_token_writes_no_authorization_header() {
+        for platform in AgentPlatform::ALL {
+            let params = SetupParams {
+                token: String::new(),
+                project_dir: PathBuf::from("/tmp/p"),
+                home_dir_override: Some(PathBuf::from("/tmp/home")),
+                skip_user_config: true,
+                skip_hooks: true,
+                ..Default::default()
+            };
+            for action in platform.config_actions(&params) {
+                let serialized = match &action.content {
+                    ConfigContent::JsonMerge { server_value, .. }
+                    | ConfigContent::ClaudeLocalScopeMcp { server_value, .. } => {
+                        serde_json::to_string(server_value).unwrap()
+                    }
+                    ConfigContent::JsonFull(v) => serde_json::to_string(v).unwrap(),
+                    ConfigContent::TomlSection { key_values, .. } => key_values
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    ConfigContent::HooksMerge { .. } => String::new(),
+                };
+                assert!(
+                    !serialized.contains("Bearer") && !serialized.contains("Authorization"),
+                    "{platform} emitted an Authorization header with an empty token: {serialized}"
+                );
+            }
+        }
+    }
+
+    /// With a real token, the Authorization header IS present (regression guard
+    /// so the empty-token suppression doesn't strip auth from authed runs).
+    #[test]
+    fn nonempty_token_writes_authorization_header() {
+        let params = SetupParams {
+            token: "real-token".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Cursor.config_actions(&params);
+        let ConfigContent::JsonMerge {
+            server_value: value,
+            ..
+        } = &actions[0].content
+        else {
+            panic!("expected JsonMerge");
+        };
+        assert_eq!(value["headers"]["Authorization"], "Bearer real-token");
+    }
+
     #[test]
     fn config_actions_gemini_uses_http_url() {
         let params = SetupParams {
@@ -1889,6 +3043,92 @@ mod tests {
                 assert!(
                     server_value.get("type").is_none(),
                     "Gemini has no type field"
+                );
+            }
+            _ => panic!("expected JsonMerge"),
+        }
+    }
+
+    #[test]
+    fn config_actions_antigravity_uses_http_url_and_gemini_config_path() {
+        // bd-47kjh.7.2: agy reads ~/.gemini/config/mcp_config.json (verified by
+        // stracing the live agy 1.0.7 binary), NOT ~/.gemini/settings.json.
+        let home = PathBuf::from("/tmp/agyhome");
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            home_dir_override: Some(home.clone()),
+            skip_user_config: false,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Antigravity.config_actions(&params);
+        assert_eq!(actions.len(), 2, "project-local + user-level");
+
+        // Project-local agy.mcp.json carries httpUrl + the bearer header.
+        let project = &actions[0];
+        assert_eq!(project.file_path, PathBuf::from("/tmp/p/agy.mcp.json"));
+        match &project.content {
+            ConfigContent::JsonMerge {
+                servers_key,
+                server_value,
+                ..
+            } => {
+                assert_eq!(*servers_key, "mcpServers");
+                assert!(
+                    server_value.get("httpUrl").is_some(),
+                    "agy uses httpUrl (gemini-compatible schema)"
+                );
+                assert!(
+                    server_value.get("type").is_none(),
+                    "agy entry has no `type` field"
+                );
+                let auth = server_value
+                    .get("headers")
+                    .and_then(|h| h.get("Authorization"))
+                    .and_then(Value::as_str);
+                assert_eq!(auth, Some("Bearer tok"));
+            }
+            _ => panic!("expected JsonMerge for agy project-local config"),
+        }
+
+        // User-level config is ~/.gemini/config/mcp_config.json with NO token.
+        let user = &actions[1];
+        assert_eq!(
+            user.file_path,
+            home.join(".gemini").join("config").join("mcp_config.json"),
+            "agy user-level config must live at ~/.gemini/config/mcp_config.json"
+        );
+        match &user.content {
+            ConfigContent::JsonMerge { server_value, .. } => {
+                assert!(server_value.get("httpUrl").is_some());
+                assert!(
+                    server_value.get("headers").is_none(),
+                    "user-level agy config must NOT embed a bearer token (#148)"
+                );
+            }
+            _ => panic!("expected JsonMerge for agy user-level config"),
+        }
+    }
+
+    #[test]
+    fn config_actions_antigravity_writes_no_token_under_no_auth() {
+        // #148: empty token (am serve-http --no-auth) => no Authorization header
+        // written into the project-local agy.mcp.json.
+        let params = SetupParams {
+            token: String::new(),
+            project_dir: PathBuf::from("/tmp/p"),
+            home_dir_override: Some(PathBuf::from("/tmp/home")),
+            skip_user_config: true,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Antigravity.config_actions(&params);
+        assert_eq!(actions.len(), 1);
+        match &actions[0].content {
+            ConfigContent::JsonMerge { server_value, .. } => {
+                let headers = server_value.get("headers").expect("headers object");
+                assert!(
+                    headers.get("Authorization").is_none(),
+                    "no Authorization header may be written with an empty token"
                 );
             }
             _ => panic!("expected JsonMerge"),
@@ -2323,8 +3563,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_platform_all_has_nine() {
-        assert_eq!(AgentPlatform::ALL.len(), 9);
+    fn agent_platform_all_has_ten() {
+        // 9 original platforms + Antigravity (agy) for the gmi->agy migration
+        // (bd-47kjh.7.2).
+        assert_eq!(AgentPlatform::ALL.len(), 10);
+        assert!(AgentPlatform::ALL.contains(&AgentPlatform::Antigravity));
     }
 
     #[test]
@@ -2458,6 +3701,20 @@ http_headers = { Authorization = "Bearer tok" }
             AgentPlatform::from_slug("gemini-cli"),
             Some(AgentPlatform::Gemini)
         );
+        // Antigravity (agy) — primary slug + the agy / antigravity-cli aliases
+        // (matches the franken-agent-detection connector slug + aliases).
+        assert_eq!(
+            AgentPlatform::from_slug("antigravity"),
+            Some(AgentPlatform::Antigravity)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("agy"),
+            Some(AgentPlatform::Antigravity)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("antigravity-cli"),
+            Some(AgentPlatform::Antigravity)
+        );
         assert_eq!(
             AgentPlatform::from_slug("open-code"),
             Some(AgentPlatform::OpenCode)
@@ -2497,6 +3754,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(names.contains(&"Codex CLI"));
         assert!(names.contains(&"Cursor"));
         assert!(names.contains(&"Gemini CLI"));
+        assert!(names.contains(&"Antigravity (agy)"));
         assert!(names.contains(&"OpenCode"));
         assert!(names.contains(&"Factory Droid"));
         assert!(names.contains(&"Cline"));
@@ -2568,6 +3826,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert_eq!(params.path, "/mcp/");
         assert!(params.token.is_empty());
         assert_eq!(params.project_dir, PathBuf::from("."));
+        assert!(params.home_dir_override.is_none());
         assert!(!params.dry_run);
         assert!(!params.skip_user_config);
         assert!(!params.skip_hooks);
@@ -2713,13 +3972,23 @@ http_headers = { Authorization = "Bearer tok" }
         let actions = AgentPlatform::Claude.config_actions(&params);
         // project-local, user-level, hooks = 3 actions
         assert_eq!(actions.len(), 3);
-        assert!(
-            actions[0]
-                .file_path
-                .ends_with(".claude/settings.local.json")
-        );
-        assert!(actions[1].file_path.ends_with(".claude/settings.json"));
-        // Third action is hooks
+        // GH#168: project-local MCP config is the local scope inside ~/.claude.json.
+        assert!(actions[0].file_path.ends_with(".claude.json"));
+        assert!(matches!(
+            actions[0].content,
+            ConfigContent::ClaudeLocalScopeMcp { .. }
+        ));
+        // User-level MCP config is the top-level mcpServers inside ~/.claude.json.
+        assert!(actions[1].file_path.ends_with(".claude.json"));
+        assert!(matches!(
+            actions[1].content,
+            ConfigContent::JsonMerge {
+                servers_key: "mcpServers",
+                ..
+            }
+        ));
+        // Hooks still live in the project-local settings.json.
+        assert!(actions[2].file_path.ends_with(".claude/settings.json"));
         assert!(matches!(
             actions[2].content,
             ConfigContent::HooksMerge { .. }
@@ -2760,10 +4029,16 @@ http_headers = { Authorization = "Bearer tok" }
     #[test]
     fn run_setup_creates_gitignore_entries() {
         let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        // Cline writes a token-bearing project-local file (cline.mcp.json) that
+        // must be gitignored; pair it with Claude to exercise both.
         let params = SetupParams {
             token: "tok".into(),
             project_dir: tmp.path().to_path_buf(),
-            agents: Some(vec![AgentPlatform::Claude]),
+            // home_dir_override keeps the Claude write (GH#168: ~/.claude.json)
+            // off the real home during tests.
+            home_dir_override: Some(home.clone()),
+            agents: Some(vec![AgentPlatform::Claude, AgentPlatform::Cline]),
             skip_user_config: true,
             skip_hooks: true,
             project_slug: "test".into(),
@@ -2773,7 +4048,20 @@ http_headers = { Authorization = "Bearer tok" }
         let _ = run_setup(&params);
         let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap_or_default();
         assert!(gi.contains(".env"));
-        assert!(gi.contains(".claude/settings.local.json"));
+        // Cline's project-local token file is still gitignored.
+        assert!(gi.contains("cline.mcp.json"));
+        // GH#168: Claude's secret-bearing MCP config lands in ~/.claude.json
+        // (under the tmp home), NOT the project dir, and carries the token.
+        let claude_json = std::fs::read_to_string(home.join(".claude.json")).unwrap();
+        assert!(claude_json.contains("\"tok\"") || claude_json.contains("Bearer tok"));
+        assert!(claude_json.contains("mcp-agent-mail"));
+        // And nothing token-bearing was written into the project's .claude dir.
+        assert!(
+            !tmp.path()
+                .join(".claude")
+                .join("settings.local.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -2896,6 +4184,214 @@ http_headers = { Authorization = "Bearer tok" }
         let (has, matches) = check_config_file(&path, "http://a");
         assert!(!has);
         assert!(!matches);
+    }
+
+    #[test]
+    fn check_status_reports_ok_for_all_supported_platforms_in_temp_config_homes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("project");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir,
+            home_dir_override: Some(home_dir.clone()),
+            skip_hooks: true,
+            ..Default::default()
+        };
+
+        for platform in AgentPlatform::ALL {
+            for action in platform.config_actions(&params) {
+                if matches!(action.content, ConfigContent::HooksMerge { .. }) {
+                    continue;
+                }
+                write_config_atomic(&action).unwrap();
+            }
+        }
+
+        let statuses = check_status(&params);
+        assert_eq!(statuses.len(), AgentPlatform::ALL.len());
+        for status in statuses {
+            assert!(
+                !status.config_files.is_empty(),
+                "{} should have config files",
+                status.slug
+            );
+            for file in &status.config_files {
+                assert!(file.exists, "{status:?}");
+                assert!(file.has_server_entry, "{file:?}");
+                assert!(file.url_matches, "{file:?}");
+                assert_eq!(file.primary_drift_reason, ConfigDriftReason::Ok);
+                assert_eq!(file.risk, ConfigDriftRisk::None);
+                assert_eq!(file.remediation, "no action");
+                assert!(
+                    !serde_json::to_string(&file).unwrap().contains("tok"),
+                    "status JSON must redact bearer tokens"
+                );
+                if file.path.starts_with(&home_dir.display().to_string()) {
+                    assert!(
+                        file.redacted_path.starts_with("~/"),
+                        "home path should be redacted: {}",
+                        file.redacted_path
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn check_status_reports_missing_file_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
+        let file = first_setup_status_file(&params);
+        assert_eq!(file.primary_drift_reason, ConfigDriftReason::MissingFile);
+        assert!(file.drift_reasons.contains(&ConfigDriftReason::MissingFile));
+        assert_eq!(file.risk, ConfigDriftRisk::Medium);
+    }
+
+    #[test]
+    fn check_status_reports_legacy_stdio_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
+        std::fs::write(
+            params.project_dir.join("cline.mcp.json"),
+            r#"{"mcpServers":{"mcp-agent-mail":{"command":"mcp-agent-mail","args":[],"transport":"stdio"}}}"#,
+        )
+        .unwrap();
+        let file = first_setup_status_file(&params);
+        assert_eq!(file.primary_drift_reason, ConfigDriftReason::LegacyStdio);
+        assert!(file.drift_reasons.contains(&ConfigDriftReason::LegacyStdio));
+        assert!(!file.url_matches);
+        assert!(file.remediation.contains("am setup run --dry-run"));
+        assert!(file.remediation.contains("am setup run --yes"));
+    }
+
+    #[test]
+    fn check_status_reports_stale_http_path_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
+        std::fs::write(
+            params.project_dir.join("cline.mcp.json"),
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/api/","headers":{"Authorization":"Bearer tok"}}}}"#,
+        )
+        .unwrap();
+        let file = first_setup_status_file(&params);
+        assert_eq!(file.primary_drift_reason, ConfigDriftReason::StaleHttpPath);
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::StaleHttpPath)
+        );
+        assert_eq!(
+            file.actual_url.as_deref(),
+            Some("http://127.0.0.1:8765/api/")
+        );
+    }
+
+    #[test]
+    fn check_status_reports_wrong_bearer_header_drift_with_redacted_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
+        std::fs::write(
+            params.project_dir.join("cline.mcp.json"),
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer wrong"}}}}"#,
+        )
+        .unwrap();
+        let file = first_setup_status_file(&params);
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::WrongBearerHeader
+        );
+        assert_eq!(file.risk, ConfigDriftRisk::High);
+        let serialized = serde_json::to_string(&file).unwrap();
+        assert!(serialized.contains("Bearer <redacted>"));
+        assert!(!serialized.contains("Bearer wrong"));
+        assert!(!serialized.contains("Bearer tok"));
+    }
+
+    #[test]
+    fn check_status_reports_duplicate_server_entries_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
+        std::fs::write(
+            params.project_dir.join("cline.mcp.json"),
+            r#"{"mcpServers":{"mcp-agent-mail":{"url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"}},"mcp_agent_mail":{"url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"}}}}"#,
+        )
+        .unwrap();
+        let file = first_setup_status_file(&params);
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::DuplicateServerEntries
+        );
+        assert_eq!(file.entry_locations.len(), 2);
+    }
+
+    #[test]
+    fn check_status_reports_unsupported_config_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
+        std::fs::write(params.project_dir.join("cline.mcp.json"), "not json").unwrap();
+        let file = first_setup_status_file(&params);
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert_eq!(file.risk, ConfigDriftRisk::High);
+        assert!(file.remediation.starts_with("inspect unsupported config"));
+    }
+
+    #[test]
+    fn check_status_reports_wrong_codex_timeout_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Codex);
+        let codex_config = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".codex")
+            .join("config.toml");
+        std::fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            codex_config,
+            r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/mcp/"
+startup_timeout_sec = 5
+http_headers = { Authorization = "Bearer tok" }
+"#,
+        )
+        .unwrap();
+        let file = first_setup_status_file(&params);
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::WrongStartupTimeout
+        );
+        assert_eq!(file.risk, ConfigDriftRisk::Low);
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::WrongStartupTimeout)
+        );
+    }
+
+    fn setup_status_test_params(root: &Path, platform: AgentPlatform) -> SetupParams {
+        let project_dir = root.join("project");
+        let home_dir = root.join("home");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
+        SetupParams {
+            token: "tok".into(),
+            project_dir,
+            home_dir_override: Some(home_dir),
+            agents: Some(vec![platform]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        }
+    }
+
+    fn first_setup_status_file(params: &SetupParams) -> ConfigFileStatus {
+        let mut statuses = check_status(params);
+        let status = statuses.pop().unwrap();
+        status.config_files.into_iter().next().unwrap()
     }
 
     #[test]

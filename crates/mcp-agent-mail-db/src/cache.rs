@@ -8,7 +8,8 @@
 //!
 //! - Projects cached for 5 minutes (almost never change after creation)
 //! - Agents cached for 5 minutes (profile updates are infrequent)
-//! - Max 16,384 entries per category (~3.2 MB total at saturation)
+//! - Capacity is profile-driven via `AM_CACHE_PROFILE` and can be overridden
+//!   with `AM_READ_CACHE_ENTRIES_PER_CATEGORY`
 //! - Write-through: callers should call `invalidate_*` or `put_*` after mutations
 //! - Deferred touch: `touch_agent` timestamps are buffered and flushed in batches
 //!
@@ -28,23 +29,26 @@
 //! ## Metrics
 //!
 //! Lock-free atomic counters track cache hit/miss rates per category.
-//! Call `cache_metrics()` to get a snapshot.
+//! Call `cache_metrics()` to get a counter snapshot, and
+//! `ReadCache::footprint_estimate()` for a bounded-memory diagnostic snapshot.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
 use crate::s3fifo::S3FifoCache;
-use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
+use mcp_agent_mail_core::{Config, InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
 use serde::Serialize;
 
 const PROJECT_TTL: Duration = Duration::from_mins(5);
 const AGENT_TTL: Duration = Duration::from_mins(5);
 const INBOX_STATS_TTL: Duration = Duration::from_secs(30); // 30 sec (shorter: counters change often)
-const MAX_ENTRIES_PER_CATEGORY: usize = 16_384;
+#[cfg(test)]
+const DEFAULT_ENTRIES_PER_CATEGORY: usize = 16_384;
 /// Minimum interval between deferred touch flushes.
 const TOUCH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// Minimum accesses before adaptive TTL kicks in (2x base TTL).
@@ -56,6 +60,13 @@ const HIT_WRITE_MAINTENANCE_INTERVAL: u64 = 4;
 /// Shard key: `agent_id % NUM_TOUCH_SHARDS`. Reduces contention 16×
 /// compared to a single mutex at 100+ concurrent tool calls/sec.
 const NUM_TOUCH_SHARDS: usize = 16;
+const CACHE_INDEX_CATEGORY_COUNT: usize = 5;
+const PROJECT_BY_SLUG_KEY_BYTES: usize = size_of::<(u64, InternedStr)>();
+const PROJECT_BY_HUMAN_KEY_KEY_BYTES: usize = size_of::<(u64, InternedStr)>();
+const AGENT_BY_KEY_KEY_BYTES: usize = size_of::<(u64, i64, InternedStr)>();
+const AGENT_BY_ID_KEY_BYTES: usize = size_of::<(u64, i64)>();
+const INBOX_STATS_KEY_BYTES: usize = size_of::<(u64, i64)>();
+const DEFERRED_TOUCH_ENTRY_BYTES: usize = size_of::<((u64, i64), i64)>();
 
 #[inline]
 fn scope_fingerprint(scope: &str) -> u64 {
@@ -209,6 +220,7 @@ impl CacheMetrics {
     }
 
     /// Take a snapshot of the current metric values.
+    #[must_use]
     pub fn snapshot(&self) -> CacheMetricsSnapshot {
         CacheMetricsSnapshot {
             project_hits: self.project_hits.load(Ordering::Relaxed),
@@ -217,6 +229,15 @@ impl CacheMetrics {
             agent_misses: self.agent_misses.load(Ordering::Relaxed),
             inbox_stats_hits: self.inbox_stats_hits.load(Ordering::Relaxed),
             inbox_stats_misses: self.inbox_stats_misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Take a combined hit/miss and memory-footprint diagnostic snapshot.
+    #[must_use]
+    pub fn diagnostics_snapshot(&self, cache: &ReadCache) -> CacheDiagnosticsSnapshot {
+        CacheDiagnosticsSnapshot {
+            metrics: self.snapshot(),
+            footprint: cache.footprint_estimate(),
         }
     }
 }
@@ -254,7 +275,7 @@ pub struct ReadCache {
 
 impl ReadCache {
     fn new() -> Self {
-        Self::with_capacity(MAX_ENTRIES_PER_CATEGORY)
+        Self::with_capacity(Config::get().read_cache_entries_per_category)
     }
 
     fn with_capacity(capacity: usize) -> Self {
@@ -634,16 +655,41 @@ impl ReadCache {
     pub fn put_agent_scoped(&self, scope: &str, agent: &AgentRow) {
         let scope_fp = scope_fingerprint(scope);
         let shared = Arc::new(agent.clone());
-        let mut by_key = self.agents_by_key.write();
         let name_lower = agent.name.to_ascii_lowercase();
-        by_key.insert(
-            (scope_fp, agent.project_id, InternedStr::new(&name_lower)),
-            CacheEntry::new(Arc::clone(&shared)),
+        // br-r3rot: hold the by_key write lock for the ENTIRE operation —
+        // including the by_id insert below — not just the by_key insert. A
+        // concurrent `invalidate_agent_scoped` holds by_key across its by-key
+        // removal AND its by-id cleanup precisely so a put cannot interleave;
+        // that guarantee only holds if put is equally atomic. Releasing by_key
+        // early (the previous behavior) let invalidate's by-id scan run between
+        // this put's by_key work and its by_id insert, leaving a by_id entry
+        // with no by_key entry — a stale `get_agent_by_id` hit (dual-index
+        // desync). GH#169's `displaces_canonical` early-return widened the
+        // window: a displaced put writes ONLY by_id, guaranteeing the desync.
+        // Lock ordering rank 22 (by_key) -> 23 (by_id) is preserved.
+        let mut by_key = self.agents_by_key.write();
+        let key = (scope_fp, agent.project_id, InternedStr::new(&name_lower));
+        // GH#169: the name key is case-insensitive (matching SQL COLLATE
+        // NOCASE), so two case-variant rows from a registration race share
+        // it. Pin the mapping to the canonical (lowest-id) row — the same
+        // row resolved by `ORDER BY id ASC` in queries.rs — so a name lookup
+        // (e.g. resolving the caller for a reservation release) never
+        // resolves to a shadow duplicate after a `get_agent_by_id` on the
+        // higher-id variant cached it here. The same id (or no existing id)
+        // still refreshes; only a strictly-higher duplicate id is prevented
+        // from displacing the canonical mapping.
+        let displaces_canonical = matches!(
+            (agent.id, by_key.peek(&key).and_then(|e| e.value.id)),
+            (Some(new_id), Some(existing_id)) if existing_id < new_id
         );
+        if !displaces_canonical {
+            by_key.insert(key, CacheEntry::new(Arc::clone(&shared)));
+        }
         if let Some(id) = agent.id {
             let mut by_id = self.agents_by_id.write();
             by_id.insert((scope_fp, id), CacheEntry::new(shared));
         }
+        // by_key dropped here — atomic with the by_id insert above.
     }
 
     /// Bulk-insert agents into the cache (cache warming on startup).
@@ -755,8 +801,19 @@ impl ReadCache {
         let removed_id = by_key_cache.remove(&key).and_then(|a| a.value.id);
 
         let mut agent_ids_to_remove = Vec::new();
-        if let Some(agent_id) = id.or(removed_id) {
+        if let Some(agent_id) = id {
             agent_ids_to_remove.push(agent_id);
+        }
+        // Always clear the by-id entry the by-key cache actually pointed at. If
+        // the caller's `id` hint differs from `removed_id` (e.g. a name was
+        // re-registered under a new row id while the by-key cache still held the
+        // old one), trusting only the hint would orphan the real by-id entry and
+        // leave a stale `get_agent_by_id` hit. Over-invalidation is always safe
+        // (it can only cause a benign cache miss), so include both.
+        if let Some(rid) = removed_id
+            && Some(rid) != id
+        {
+            agent_ids_to_remove.push(rid);
         }
 
         if id.is_none() {
@@ -880,6 +937,88 @@ impl ReadCache {
             .collect();
         for key in to_remove {
             cache.remove(&key);
+        }
+    }
+
+    /// Invalidate every cached row and deferred touch for one database scope.
+    ///
+    /// Recovery can replace a SQLite file in place while assigning different
+    /// numeric ids to the same stable project and agent identities. Keeping
+    /// rows from the retired pool generation would then let a cache hit return
+    /// an id now owned by an unrelated project. This operation deliberately
+    /// over-invalidates the retired scope: a cache miss is safe, while a stale
+    /// identity hit can cross-link all subsequent writes.
+    pub fn invalidate_scope(&self, scope: &str) {
+        let scope_fp = scope_fingerprint(scope);
+
+        {
+            let mut cache = self.projects_by_slug.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .cloned()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.projects_by_human_key.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .cloned()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.agents_by_key.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _, _)| *entry_scope == scope_fp)
+                .cloned()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.agents_by_id.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .copied()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.inbox_stats.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .copied()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+
+        // Clear the optimistic flag before walking the shards. A concurrent
+        // enqueue after this store will restore it; any other scope left in a
+        // shard also restores it below.
+        self.has_pending.store(false, Ordering::Release);
+        let mut has_remaining = false;
+        for shard in &self.deferred_touch_shards {
+            let mut shard = shard.lock();
+            shard.retain(|(entry_scope, _), _| *entry_scope != scope_fp);
+            has_remaining |= !shard.is_empty();
+        }
+        if has_remaining {
+            self.has_pending.store(true, Ordering::Release);
         }
     }
 
@@ -1012,6 +1151,81 @@ impl ReadCache {
         }
     }
 
+    /// Return the configured per-category capacity.
+    #[must_use]
+    pub fn capacity_per_category(&self) -> usize {
+        self.projects_by_slug.read().capacity()
+    }
+
+    /// Return a best-effort resident footprint estimate for the live cache.
+    ///
+    /// This reports estimates rather than exact allocator usage: `HashMap`,
+    /// `VecDeque`, intern pools, and allocator slab overhead are
+    /// implementation-defined. Payload rows are counted once from their
+    /// canonical cache indexes so the dual slug/human-key and name/id indexes
+    /// do not double-count the shared `Arc` rows.
+    #[must_use]
+    pub fn footprint_estimate(&self) -> CacheFootprintEstimate {
+        let counts = self.entry_counts();
+        let project_payload_bytes = self.project_payload_bytes();
+        let agent_payload_bytes = self.agent_payload_bytes();
+        let inbox_stats_payload_bytes = counts
+            .inbox_stats
+            .saturating_mul(size_of::<CacheEntry<InboxStatsRow>>());
+        let index_entry_bytes = counts.index_entry_bytes();
+        let deferred_touch_entries = self.deferred_touch_entry_count();
+        let deferred_touch_bytes =
+            deferred_touch_entries.saturating_mul(DEFERRED_TOUCH_ENTRY_BYTES);
+        let total_estimated_bytes = project_payload_bytes
+            .saturating_add(agent_payload_bytes)
+            .saturating_add(inbox_stats_payload_bytes)
+            .saturating_add(index_entry_bytes)
+            .saturating_add(deferred_touch_bytes);
+        let capacity_per_category = self.capacity_per_category();
+        let max_live_entries =
+            CacheEntryCounts::max_live_entries_for_capacity(capacity_per_category);
+        let capacity_utilization_bp = counts.utilization_basis_points(capacity_per_category);
+
+        CacheFootprintEstimate {
+            counts,
+            capacity_per_category,
+            max_live_entries,
+            capacity_utilization_bp,
+            project_payload_bytes,
+            agent_payload_bytes,
+            inbox_stats_payload_bytes,
+            index_entry_bytes,
+            deferred_touch_entries,
+            deferred_touch_bytes,
+            total_estimated_bytes,
+        }
+    }
+
+    fn project_payload_bytes(&self) -> usize {
+        let cache = self.projects_by_slug.read();
+        cache
+            .keys()
+            .filter_map(|key| cache.peek(key))
+            .map(|entry| estimate_project_row_bytes(entry.value.as_ref()))
+            .sum()
+    }
+
+    fn agent_payload_bytes(&self) -> usize {
+        let cache = self.agents_by_key.read();
+        cache
+            .keys()
+            .filter_map(|key| cache.peek(key))
+            .map(|entry| estimate_agent_row_bytes(entry.value.as_ref()))
+            .sum()
+    }
+
+    fn deferred_touch_entry_count(&self) -> usize {
+        self.deferred_touch_shards
+            .iter()
+            .map(|shard| shard.lock().len())
+            .sum()
+    }
+
     /// Create a new standalone cache instance (for testing).
     #[must_use]
     pub fn new_for_testing() -> Self {
@@ -1048,11 +1262,107 @@ pub struct CacheEntryCounts {
     pub inbox_stats: usize,
 }
 
+impl CacheEntryCounts {
+    #[must_use]
+    pub fn total_live_entries(&self) -> usize {
+        self.projects_by_slug
+            .saturating_add(self.projects_by_human_key)
+            .saturating_add(self.agents_by_key)
+            .saturating_add(self.agents_by_id)
+            .saturating_add(self.inbox_stats)
+    }
+
+    #[must_use]
+    pub fn max_live_entries_for_capacity(capacity_per_category: usize) -> usize {
+        capacity_per_category.saturating_mul(CACHE_INDEX_CATEGORY_COUNT)
+    }
+
+    #[must_use]
+    pub fn utilization_basis_points(&self, capacity_per_category: usize) -> u64 {
+        let max_live_entries = Self::max_live_entries_for_capacity(capacity_per_category);
+        if max_live_entries == 0 {
+            return 0;
+        }
+
+        let basis_points =
+            (self.total_live_entries() as u128).saturating_mul(10_000) / (max_live_entries as u128);
+        u64::try_from(basis_points.min(10_000)).expect("basis points fit u64")
+    }
+
+    #[must_use]
+    fn index_entry_bytes(&self) -> usize {
+        self.projects_by_slug
+            .saturating_mul(PROJECT_BY_SLUG_KEY_BYTES + size_of::<CacheEntry<SharedProjectRow>>())
+            .saturating_add(self.projects_by_human_key.saturating_mul(
+                PROJECT_BY_HUMAN_KEY_KEY_BYTES + size_of::<CacheEntry<SharedProjectRow>>(),
+            ))
+            .saturating_add(
+                self.agents_by_key.saturating_mul(
+                    AGENT_BY_KEY_KEY_BYTES + size_of::<CacheEntry<SharedAgentRow>>(),
+                ),
+            )
+            .saturating_add(
+                self.agents_by_id.saturating_mul(
+                    AGENT_BY_ID_KEY_BYTES + size_of::<CacheEntry<SharedAgentRow>>(),
+                ),
+            )
+            .saturating_add(
+                self.inbox_stats
+                    .saturating_mul(INBOX_STATS_KEY_BYTES + size_of::<CacheEntry<InboxStatsRow>>()),
+            )
+    }
+}
+
+/// Best-effort read-cache memory diagnostic snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheFootprintEstimate {
+    pub counts: CacheEntryCounts,
+    pub capacity_per_category: usize,
+    pub max_live_entries: usize,
+    pub capacity_utilization_bp: u64,
+    pub project_payload_bytes: usize,
+    pub agent_payload_bytes: usize,
+    pub inbox_stats_payload_bytes: usize,
+    pub index_entry_bytes: usize,
+    pub deferred_touch_entries: usize,
+    pub deferred_touch_bytes: usize,
+    pub total_estimated_bytes: usize,
+}
+
+/// Operator-facing read-cache diagnostic snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheDiagnosticsSnapshot {
+    pub metrics: CacheMetricsSnapshot,
+    pub footprint: CacheFootprintEstimate,
+}
+
+fn estimate_project_row_bytes(row: &ProjectRow) -> usize {
+    size_of::<ProjectRow>()
+        .saturating_add(row.slug.len())
+        .saturating_add(row.human_key.len())
+}
+
+fn estimate_agent_row_bytes(row: &AgentRow) -> usize {
+    size_of::<AgentRow>()
+        .saturating_add(row.name.len())
+        .saturating_add(row.program.len())
+        .saturating_add(row.model.len())
+        .saturating_add(row.task_description.len())
+        .saturating_add(row.attachments_policy.len())
+        .saturating_add(row.contact_policy.len())
+}
+
 static READ_CACHE: OnceLock<ReadCache> = OnceLock::new();
 
 /// Get the global read cache instance.
 pub fn read_cache() -> &'static ReadCache {
     READ_CACHE.get_or_init(ReadCache::new)
+}
+
+/// Get a combined snapshot of global read-cache counters and footprint.
+#[must_use]
+pub fn cache_diagnostics_snapshot() -> CacheDiagnosticsSnapshot {
+    CACHE_METRICS.diagnostics_snapshot(read_cache())
 }
 
 #[cfg(test)]
@@ -1087,6 +1397,59 @@ mod tests {
             reaper_exempt: 0,
             registration_token: None,
         }
+    }
+
+    #[test]
+    fn invalidate_agent_with_mismatched_id_hint_clears_real_by_id_entry() {
+        // Regression: invalidating with an `id` hint that differs from the
+        // by-key cache's actual id must not orphan the real by-id entry.
+        let cache = ReadCache::new();
+        let agent = make_agent_with_id("BlueLake", 1, 10);
+        cache.put_agent(&agent);
+        assert!(cache.get_agent(1, "BlueLake").is_some());
+        assert!(cache.get_agent_by_id(10).is_some());
+
+        // Caller passes a stale/mismatched hint id (20) — not the cached id (10).
+        cache.invalidate_agent(1, "BlueLake", Some(20));
+
+        assert!(
+            cache.get_agent(1, "BlueLake").is_none(),
+            "by-key entry must be cleared"
+        );
+        assert!(
+            cache.get_agent_by_id(10).is_none(),
+            "the by-id entry for the actually-cached id (10) must not orphan when \
+             the invalidation hint (20) differs"
+        );
+    }
+
+    #[test]
+    fn put_agent_keeps_canonical_lowest_id_for_name() {
+        // GH#169: the case-insensitive name key shared by two case-variant rows
+        // must stay pinned to the canonical (lowest-id) row, so a later
+        // get_agent_by_id on the higher-id duplicate cannot poison name
+        // resolution (which would leak a file reservation: release would resolve
+        // a different id than grant did).
+        let cache = ReadCache::new();
+
+        // Canonical (first-registered) row, lowest id.
+        cache.put_agent(&make_agent_with_id("bluelake", 1, 10));
+        assert_eq!(cache.get_agent(1, "BlueLake").and_then(|a| a.id), Some(10));
+
+        // A higher-id case variant gets cached (e.g. resolving a reservation
+        // owner by id). It must NOT displace the canonical name mapping.
+        cache.put_agent(&make_agent_with_id("BlueLake", 1, 20));
+        assert_eq!(
+            cache.get_agent(1, "bluelake").and_then(|a| a.id),
+            Some(10),
+            "higher-id duplicate must not poison the canonical name key"
+        );
+        // The by-id cache still holds the duplicate under its own id.
+        assert_eq!(cache.get_agent_by_id(20).and_then(|a| a.id), Some(20));
+
+        // A re-put of the canonical (same id) still refreshes the name mapping.
+        cache.put_agent(&make_agent_with_id("bluelake", 1, 10));
+        assert_eq!(cache.get_agent(1, "BlueLake").and_then(|a| a.id), Some(10));
     }
 
     #[test]
@@ -1144,6 +1507,84 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_scope_removes_only_retired_pool_generation() {
+        let cache = ReadCache::new();
+        let old_scope = "sqlite:///mailbox.sqlite3@old";
+        let new_scope = "sqlite:///mailbox.sqlite3@new";
+
+        let mut old_project = make_project("shared-project");
+        old_project.id = Some(11);
+        let mut new_project = make_project("shared-project");
+        new_project.id = Some(29);
+        cache.put_project_scoped(old_scope, &old_project);
+        cache.put_project_scoped(new_scope, &new_project);
+
+        let old_agent = make_agent_with_id("BlueLake", 11, 101);
+        let new_agent = make_agent_with_id("BlueLake", 29, 202);
+        cache.put_agent_scoped(old_scope, &old_agent);
+        cache.put_agent_scoped(new_scope, &new_agent);
+        cache.put_inbox_stats_scoped(
+            old_scope,
+            &InboxStatsRow {
+                agent_id: 101,
+                total_count: 1,
+                unread_count: 1,
+                ack_pending_count: 0,
+                last_message_ts: Some(1),
+            },
+        );
+        cache.put_inbox_stats_scoped(
+            new_scope,
+            &InboxStatsRow {
+                agent_id: 202,
+                total_count: 2,
+                unread_count: 2,
+                ack_pending_count: 1,
+                last_message_ts: Some(2),
+            },
+        );
+        cache.enqueue_touch_scoped(old_scope, 101, 1);
+        cache.enqueue_touch_scoped(new_scope, 202, 2);
+
+        cache.invalidate_scope(old_scope);
+
+        assert!(
+            cache
+                .get_project_scoped(old_scope, "shared-project")
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_project_by_human_key_scoped(old_scope, "/data/shared-project")
+                .is_none()
+        );
+        assert!(cache.get_agent_scoped(old_scope, 11, "BlueLake").is_none());
+        assert!(cache.get_agent_by_id_scoped(old_scope, 101).is_none());
+        assert!(cache.get_inbox_stats_scoped(old_scope, 101).is_none());
+        assert!(cache.drain_touches_scoped(old_scope).is_empty());
+
+        assert_eq!(
+            cache
+                .get_project_scoped(new_scope, "shared-project")
+                .and_then(|project| project.id),
+            Some(29)
+        );
+        assert_eq!(
+            cache
+                .get_agent_scoped(new_scope, 29, "BlueLake")
+                .and_then(|agent| agent.id),
+            Some(202)
+        );
+        assert_eq!(
+            cache
+                .get_inbox_stats_scoped(new_scope, 202)
+                .map(|stats| stats.total_count),
+            Some(2)
+        );
+        assert_eq!(cache.drain_touches_scoped(new_scope).get(&202), Some(&2));
+    }
+
+    #[test]
     fn agent_invalidate() {
         let cache = ReadCache::new();
 
@@ -1184,10 +1625,18 @@ mod tests {
         cache.put_agent(&make_agent_with_id("RedCat", 2, 55));
         cache.put_agent(&make_agent_with_id("RedCat", 2, 56));
 
-        assert_eq!(cache.get_agent(2, "RedCat").unwrap().id, Some(56));
+        // GH#169 (br-ovk15): the case-insensitive name key stays pinned to the
+        // canonical (lowest-id) row, so the second put of a strictly-higher
+        // duplicate id (56) must NOT displace the name mapping — `get_agent`
+        // resolves the canonical id 55, not the last-written 56.
+        assert_eq!(cache.get_agent(2, "RedCat").unwrap().id, Some(55));
+        // Both rows remain individually addressable in the by-id index.
         assert!(cache.get_agent_by_id(55).is_some());
         assert!(cache.get_agent_by_id(56).is_some());
 
+        // Invalidating by name with no id hint must clear the name key AND
+        // every by-id entry matching (project, name) — both 55 and 56 — so no
+        // stale `get_agent_by_id` hit survives.
         cache.invalidate_agent(2, "RedCat", None);
         assert!(cache.get_agent(2, "RedCat").is_none());
         assert!(cache.get_agent_by_id(55).is_none());
@@ -1196,15 +1645,40 @@ mod tests {
 
     #[test]
     fn max_entries_respected() {
-        let cache = ReadCache::new();
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
 
-        for i in 0..MAX_ENTRIES_PER_CATEGORY + 10 {
+        for i in 0..DEFAULT_ENTRIES_PER_CATEGORY + 10 {
             let slug = format!("proj-{i}");
             cache.put_project(&make_project(&slug));
         }
 
         let map_len = cache.projects_by_slug.read().len();
-        assert!(map_len <= MAX_ENTRIES_PER_CATEGORY);
+        assert!(map_len <= DEFAULT_ENTRIES_PER_CATEGORY);
+    }
+
+    #[test]
+    fn read_cache_capacity_uses_cache_profile_default() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_CACHE_PROFILE", "high-memory")],
+            || {
+                let cache = ReadCache::new();
+                assert_eq!(cache.capacity_per_category(), 131_072);
+            },
+        );
+    }
+
+    #[test]
+    fn read_cache_capacity_override_is_clamped() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_CACHE_PROFILE", "high-memory"),
+                ("AM_READ_CACHE_ENTRIES_PER_CATEGORY", "1"),
+            ],
+            || {
+                let cache = ReadCache::new();
+                assert_eq!(cache.capacity_per_category(), 1_024);
+            },
+        );
     }
 
     #[test]
@@ -1487,6 +1961,198 @@ mod tests {
     }
 
     #[test]
+    fn footprint_estimate_empty_cache_is_zero() {
+        let cache = ReadCache::new();
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.counts.total_live_entries(), 0);
+        assert_eq!(footprint.project_payload_bytes, 0);
+        assert_eq!(footprint.agent_payload_bytes, 0);
+        assert_eq!(footprint.inbox_stats_payload_bytes, 0);
+        assert_eq!(footprint.index_entry_bytes, 0);
+        assert_eq!(footprint.deferred_touch_entries, 0);
+        assert_eq!(footprint.deferred_touch_bytes, 0);
+        assert_eq!(footprint.total_estimated_bytes, 0);
+    }
+
+    #[test]
+    fn footprint_estimate_tracks_live_rows_and_deferred_touches() {
+        let cache = ReadCache::new();
+        let project = make_project("p1");
+        let agent = make_agent("A1", 1);
+        let stats = InboxStatsRow {
+            agent_id: 42,
+            total_count: 7,
+            unread_count: 3,
+            ack_pending_count: 2,
+            last_message_ts: Some(123),
+        };
+
+        cache.put_project(&project);
+        cache.put_agent(&agent);
+        cache.put_inbox_stats(&stats);
+        assert!(!cache.enqueue_touch(42, 456));
+
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.counts.projects_by_slug, 1);
+        assert_eq!(footprint.counts.projects_by_human_key, 1);
+        assert_eq!(footprint.counts.agents_by_key, 1);
+        assert_eq!(footprint.counts.agents_by_id, 1);
+        assert_eq!(footprint.counts.inbox_stats, 1);
+        assert_eq!(
+            footprint.project_payload_bytes,
+            estimate_project_row_bytes(&project)
+        );
+        assert_eq!(
+            footprint.agent_payload_bytes,
+            estimate_agent_row_bytes(&agent)
+        );
+        assert_eq!(
+            footprint.inbox_stats_payload_bytes,
+            size_of::<CacheEntry<InboxStatsRow>>()
+        );
+        assert!(footprint.index_entry_bytes > 0);
+        assert_eq!(footprint.deferred_touch_entries, 1);
+        assert_eq!(footprint.deferred_touch_bytes, DEFERRED_TOUCH_ENTRY_BYTES);
+        assert_eq!(
+            footprint.total_estimated_bytes,
+            footprint
+                .project_payload_bytes
+                .saturating_add(footprint.agent_payload_bytes)
+                .saturating_add(footprint.inbox_stats_payload_bytes)
+                .saturating_add(footprint.index_entry_bytes)
+                .saturating_add(footprint.deferred_touch_bytes)
+        );
+    }
+
+    #[test]
+    fn footprint_estimate_counts_shared_payloads_once() {
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
+        let project = make_project("shared");
+        let agent = make_agent_with_id("SharedAgent", 7, 77);
+
+        cache.put_project(&project);
+        cache.put_agent(&agent);
+
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.counts.projects_by_slug, 1);
+        assert_eq!(footprint.counts.projects_by_human_key, 1);
+        assert_eq!(footprint.counts.agents_by_key, 1);
+        assert_eq!(footprint.counts.agents_by_id, 1);
+        assert_eq!(
+            footprint.capacity_per_category,
+            DEFAULT_ENTRIES_PER_CATEGORY
+        );
+        assert_eq!(
+            footprint.max_live_entries,
+            DEFAULT_ENTRIES_PER_CATEGORY.saturating_mul(CACHE_INDEX_CATEGORY_COUNT)
+        );
+        assert_eq!(
+            footprint.project_payload_bytes,
+            estimate_project_row_bytes(&project)
+        );
+        assert_eq!(
+            footprint.agent_payload_bytes,
+            estimate_agent_row_bytes(&agent)
+        );
+    }
+
+    #[test]
+    fn footprint_estimate_reports_capacity_utilization_budget() {
+        let cache = ReadCache::with_capacity(2);
+        let stats = InboxStatsRow {
+            agent_id: 42,
+            total_count: 7,
+            unread_count: 3,
+            ack_pending_count: 2,
+            last_message_ts: Some(123),
+        };
+
+        cache.put_project(&make_project("budget"));
+        cache.put_agent(&make_agent_with_id("BudgetAgent", 1, 42));
+        cache.put_inbox_stats(&stats);
+
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.capacity_per_category, 2);
+        assert_eq!(footprint.counts.total_live_entries(), 5);
+        assert_eq!(footprint.max_live_entries, 10);
+        assert_eq!(footprint.capacity_utilization_bp, 5_000);
+        assert_eq!(
+            footprint.counts.utilization_basis_points(2),
+            footprint.capacity_utilization_bp
+        );
+    }
+
+    #[test]
+    fn diagnostics_snapshot_combines_counters_and_footprint() {
+        let metrics = CacheMetrics::new();
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
+        let project = make_project("diag");
+
+        metrics.record_project_hit();
+        metrics.record_project_miss();
+        cache.put_project(&project);
+
+        let snapshot = metrics.diagnostics_snapshot(&cache);
+
+        assert_eq!(snapshot.metrics.project_hits, 1);
+        assert_eq!(snapshot.metrics.project_misses, 1);
+        assert_eq!(
+            snapshot.footprint.capacity_per_category,
+            DEFAULT_ENTRIES_PER_CATEGORY
+        );
+        assert_eq!(snapshot.footprint.counts.projects_by_slug, 1);
+        assert_eq!(snapshot.footprint.counts.projects_by_human_key, 1);
+        assert_eq!(
+            snapshot.footprint.project_payload_bytes,
+            estimate_project_row_bytes(&project)
+        );
+        assert!(snapshot.footprint.total_estimated_bytes > 0);
+    }
+
+    #[test]
+    fn diagnostics_snapshot_serializes_metrics_and_footprint_fields() {
+        let metrics = CacheMetrics::new();
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
+
+        metrics.record_agent_miss();
+        cache.put_agent(&make_agent("DiagAgent", 3));
+
+        let snapshot = metrics.diagnostics_snapshot(&cache);
+        let value = serde_json::to_value(&snapshot).expect("diagnostic snapshot serializes");
+
+        assert_eq!(value["metrics"]["agent_misses"], 1);
+        assert_eq!(
+            value["footprint"]["capacity_per_category"].as_u64(),
+            Some(
+                DEFAULT_ENTRIES_PER_CATEGORY
+                    .try_into()
+                    .expect("default cache capacity fits u64")
+            )
+        );
+        assert_eq!(
+            value["footprint"]["max_live_entries"].as_u64(),
+            Some(
+                DEFAULT_ENTRIES_PER_CATEGORY
+                    .saturating_mul(CACHE_INDEX_CATEGORY_COUNT)
+                    .try_into()
+                    .expect("default max cache entries fit u64")
+            )
+        );
+        assert_eq!(value["footprint"]["capacity_utilization_bp"], 0);
+        assert_eq!(value["footprint"]["counts"]["agents_by_key"], 1);
+        assert!(
+            value["footprint"]["total_estimated_bytes"]
+                .as_u64()
+                .expect("estimated bytes should serialize as a number")
+                > 0
+        );
+    }
+
+    #[test]
     fn inbox_stats_cache_metrics_recorded() {
         let cache = ReadCache::new();
         let before = CACHE_METRICS.snapshot();
@@ -1533,8 +2199,8 @@ mod tests {
             cache.put_agent(&make_agent_with_id(&name, 1, i));
         }
         let counts = cache.entry_counts();
-        assert!(counts.agents_by_key <= MAX_ENTRIES_PER_CATEGORY);
-        assert!(counts.agents_by_id <= MAX_ENTRIES_PER_CATEGORY);
+        assert!(counts.agents_by_key <= DEFAULT_ENTRIES_PER_CATEGORY);
+        assert!(counts.agents_by_id <= DEFAULT_ENTRIES_PER_CATEGORY);
     }
 
     #[test]

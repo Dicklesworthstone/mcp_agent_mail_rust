@@ -43,6 +43,13 @@ fn truncate(value: Value, length: Option<usize>) -> Value {
 
     let end = "...";
     let end_len = end.len();
+    if length < end_len {
+        let mut boundary = length;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        return Value::from(s[..boundary].to_string());
+    }
     let trunc_len = length.saturating_sub(end_len);
 
     // Find a char boundary.
@@ -199,6 +206,18 @@ mod tests {
         assert_eq!(result.to_string(), "abcde");
     }
 
+    #[test]
+    fn truncate_tiny_length_never_exceeds_limit() {
+        let result = truncate(Value::from("abcdef"), Some(2));
+        assert_eq!(result.to_string(), "ab");
+
+        let ellipsis = truncate(Value::from("abcdef"), Some(3));
+        assert_eq!(ellipsis.to_string(), "...");
+
+        let empty = truncate(Value::from("abcdef"), Some(0));
+        assert_eq!(empty.to_string(), "");
+    }
+
     // --- tojson ---
 
     #[test]
@@ -238,6 +257,42 @@ mod tests {
     fn render_missing_template_returns_error() {
         let err = render_template("nonexistent.html", serde_json::json!({}));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn archive_commit_template_renders_vec_trailers_and_empty_author() {
+        let html = render_template(
+            "archive_commit.html",
+            serde_json::json!({
+                "commit": {
+                    "sha": "abcdef1234567890abcdef1234567890abcdef12",
+                    "short_sha": "abcdef12",
+                    "author": "",
+                    "email": "",
+                    "date": "2026-06-01T00:00:00Z",
+                    "subject": "repair archive template",
+                    "body": "",
+                    "trailers": [["Co-Authored-By", "Agent <agent@example.com>"]],
+                    "files_changed": [{
+                        "path": "src/lib.rs",
+                        "change_type": "modified",
+                        "a_path": "src/lib.rs",
+                        "b_path": "src/lib.rs"
+                    }],
+                    "diff": "diff --git a/src/lib.rs b/src/lib.rs\n",
+                    "stats": {
+                        "files": 1,
+                        "insertions": 2,
+                        "deletions": 1
+                    }
+                }
+            }),
+        )
+        .expect("archive commit template should render");
+
+        assert!(html.contains(r#"<span class="text-sm font-bold">?</span>"#));
+        assert!(html.contains("Co-Authored-By:"));
+        assert!(html.contains("Agent &lt;agent@example.com&gt;"));
     }
 
     // --- ENV initialization ---

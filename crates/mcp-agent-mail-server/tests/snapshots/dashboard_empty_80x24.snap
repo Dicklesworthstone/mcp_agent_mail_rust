@@ -1,24 +1,24 @@
-Messages     Ack Pend     Locks        Agents       Contacts     Requests       
-0 ─          0 ─          0 ─          0 ─          0 ─          0 ─            
- [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                          
-No events yet.                                                                  
-Waiting for HTTP/tool/message traffic and health pulses.                        
-Enter opens Timeline/Search context when results are available.                 
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
+Messages   Ack Pend   Locks      Agents     Contacts   Requests   Avg Lat       
+Error %                                                                         
+╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────╮
+│                                                                              │
+│  [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                       │
+│ No events yet.                                                               │
+│ Waiting for HTTP/tool/message traffic and health pulses.                     │
+│ Enter opens Timeline/Search context when results are available.              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

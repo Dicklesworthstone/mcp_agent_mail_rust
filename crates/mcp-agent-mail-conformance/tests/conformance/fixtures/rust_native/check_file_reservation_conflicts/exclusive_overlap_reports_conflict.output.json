@@ -1,0 +1,24 @@
+{
+  "conflict_free": false,
+  "conflicts": [
+    {
+      "path": "src/lib.rs",
+      "holders": [
+        {
+          "agent": "StoneOwl",
+          "path_pattern": "src/**",
+          "exclusive": true,
+          "expires_ts": "__EXPIRES_TS__"
+        }
+      ]
+    }
+  ],
+  "clear_paths": ["docs/notes.md"],
+  "checked_paths": 2,
+  "total_conflicting_reservations": 1,
+  "output_truncated": false,
+  "project": "__PROJECT_HUMAN_KEY__",
+  "snapshot_ts": "__SNAPSHOT_TS__",
+  "authoritative_source": "database_snapshot",
+  "read_only": true
+}

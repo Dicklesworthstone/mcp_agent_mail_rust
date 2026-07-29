@@ -348,6 +348,8 @@ e2e_write_diagnostics_files "${BUNDLE_DIR}"
 e2e_write_transcript_summary "${BUNDLE_DIR}"
 e2e_write_repro_files "${BUNDLE_DIR}"
 e2e_write_forensic_indexes "${BUNDLE_DIR}"
+e2e_write_suite_manifest_json "${BUNDLE_DIR}"
+e2e_write_scenario_logs "${BUNDLE_DIR}"
 e2e_write_bundle_manifest "${BUNDLE_DIR}"
 
 # Check that the bundle references trace-events.v2
@@ -366,12 +368,22 @@ schema = trace.get("schema", "")
 if schema != "trace-events.v2":
     errors.append(f"artifacts.trace.events.schema={schema}, expected trace-events.v2")
 
+scenarios = bundle.get("artifacts", {}).get("scenarios", {})
+if scenarios.get("index", {}).get("schema") != "scenarios-index.v1":
+    errors.append("artifacts.scenarios.index.schema missing scenarios-index.v1")
+if scenarios.get("events", {}).get("schema") != "scenario-events.v1":
+    errors.append("artifacts.scenarios.events.schema missing scenario-events.v1")
+
 # Check that trace file entry in files array also has v2 schema
 for fe in bundle.get("files", []):
     if fe.get("path") == "trace/events.jsonl":
         fs = fe.get("schema", "")
         if fs != "trace-events.v2":
             errors.append(f"files[trace/events.jsonl].schema={fs}, expected trace-events.v2")
+    if fe.get("path") == "scenarios/scenarios.jsonl":
+        fs = fe.get("schema", "")
+        if fs != "scenario-events.v1":
+            errors.append(f"files[scenarios/scenarios.jsonl].schema={fs}, expected scenario-events.v1")
 
 if errors:
     for e in errors:
@@ -510,6 +522,8 @@ e2e_write_diagnostics_files "${COMPAT_DIR}"
 e2e_write_transcript_summary "${COMPAT_DIR}"
 e2e_write_repro_files "${COMPAT_DIR}"
 e2e_write_forensic_indexes "${COMPAT_DIR}"
+e2e_write_suite_manifest_json "${COMPAT_DIR}"
+e2e_write_scenario_logs "${COMPAT_DIR}"
 e2e_write_bundle_manifest "${COMPAT_DIR}"
 
 if e2e_validate_bundle_manifest "${COMPAT_DIR}"; then

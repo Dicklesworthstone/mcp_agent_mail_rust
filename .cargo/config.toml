@@ -20,6 +20,16 @@ rustflags = [
 # runner = "wasm-server-runner"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Cross-compilation: aarch64 Linux
+# ──────────────────────────────────────────────────────────────────────────────
+# Release artifacts for aarch64-unknown-linux-gnu are cross-built from an
+# x86_64 Linux host, so cargo needs the cross linker explicitly. Install with:
+#   rustup target add aarch64-unknown-linux-gnu
+#   apt install gcc-aarch64-linux-gnu
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Native Build Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 

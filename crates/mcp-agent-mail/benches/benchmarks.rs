@@ -1187,7 +1187,7 @@ fn command_output(command: &str, args: &[&str]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn perf_artifact_date() -> String {
+pub(crate) fn perf_artifact_date() -> String {
     command_output("date", &["-u", "+%F"]).unwrap_or_else(|| "unknown-date".to_string())
 }
 

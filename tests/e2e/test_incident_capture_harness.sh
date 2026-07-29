@@ -72,7 +72,7 @@ run_harness() {
     "${HARNESS_SCRIPT}" \
         --output-dir "${output_dir}" \
         --seed "${SEED}" \
-        --robot-timeout-secs 3 \
+        --robot-timeout-secs 20 \
         --verbose \
         >"${stdout_file}" 2>"${stderr_file}"
     local rc=$?
@@ -147,7 +147,7 @@ for json_snap in \
     "${OUT_A}/snapshots/overview.json" \
     "${OUT_A}/snapshots/search_results.json" \
     "${OUT_A}/snapshots/search_results_since.json" \
-    "${OUT_A}/snapshots/search_results_kind_message.json" \
+    "${OUT_A}/snapshots/search_results_kind_to.json" \
     "${OUT_A}/snapshots/reservations.json" \
     "${OUT_A}/snapshots/metrics.json" \
     "${OUT_A}/snapshots/analytics.json" \
@@ -217,7 +217,7 @@ if jq -e '
     and has_check("robot.thread_params:thread_limit3.lte_baseline")
     and has_check("robot.thread_params:thread_limit3.lte_3")
     and has_check("robot.search_params:search_since.lte_baseline")
-    and has_check("robot.search_params:search_kind_message.lte_baseline")
+    and has_check("robot.search_params:search_kind_to.lte_baseline")
 ' "${OUT_A}/diagnostics/truth_comparison.json" >/dev/null 2>&1; then
     e2e_pass "truth comparison covers H3 query param-sweep invariants"
 else

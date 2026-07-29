@@ -4,6 +4,15 @@
 
 #![forbid(unsafe_code)]
 
+// GH#161: use mimalloc as the global allocator so the long-running serve-http
+// daemon does not retain multiple GB of glibc per-thread arena memory under
+// sustained multi-agent load (each of ~39 runtime threads otherwise pins a
+// ~64 MiB secondary arena that glibc never returns to the OS, tripping
+// `memory_pressure=Critical` → `health_check` RED on a healthy mailbox).
+// Declaring the static needs no `unsafe`, so it stays `#![forbid(unsafe_code)]`.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
@@ -13,8 +22,14 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, env_value};
 use mcp_agent_mail_server::startup_checks::{self, PortStatus};
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Directive;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{Layer, fmt};
 
 /// Runtime interface mode selector for the `mcp-agent-mail` binary.
 ///
@@ -158,6 +173,201 @@ fn build_mcp_log_filter(suppress_runtime_logs_for_tui: bool) -> EnvFilter {
     filter
 }
 
+const GIT_LOCKED_TRACE_TARGET: &str = "mcp_agent_mail::git_locked";
+const GUARD_SEGFAULT_TRACE_TARGET: &str = "mcp_agent_mail::guard::segfault_retry";
+
+#[derive(Debug, Eq, PartialEq)]
+struct GitSegfaultRetryTraceEvent {
+    name: &'static str,
+    repo_slug: String,
+    attempt_n: u32,
+    signal: Option<i32>,
+    exhausted: bool,
+}
+
+impl GitSegfaultRetryTraceEvent {
+    fn from_event(event: &Event<'_>) -> Option<Self> {
+        let target = event.metadata().target();
+        if target != GIT_LOCKED_TRACE_TARGET && target != GUARD_SEGFAULT_TRACE_TARGET {
+            return None;
+        }
+
+        let mut fields = GitSegfaultRetryTraceFields::default();
+        event.record(&mut fields);
+        git_segfault_retry_trace_event_from_fields(target, &fields)
+    }
+}
+
+#[derive(Default)]
+struct GitSegfaultRetryTraceFields {
+    message: Option<String>,
+    repo: Option<String>,
+    attempt: Option<u64>,
+    signal: Option<i64>,
+}
+
+impl GitSegfaultRetryTraceFields {
+    fn record_string(&mut self, field: &Field, value: &str) {
+        let normalized = normalize_trace_field(value);
+        match field.name() {
+            "message" => self.message = Some(normalized),
+            "repo" => self.repo = Some(normalized),
+            _ => {}
+        }
+    }
+
+    fn record_int(&mut self, field: &Field, value: i64) {
+        match field.name() {
+            "attempt" => {
+                self.attempt = u64::try_from(value).ok();
+            }
+            "signal" => self.signal = Some(value),
+            _ => {}
+        }
+    }
+}
+
+impl Visit for GitSegfaultRetryTraceFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let value = format!("{value:?}");
+        match field.name() {
+            "message" | "repo" => self.record_string(field, &value),
+            "attempt" | "signal" => {
+                if let Ok(value) = normalize_trace_field(&value).parse::<i64>() {
+                    self.record_int(field, value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.record_string(field, value);
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.record_int(field, value);
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "attempt" {
+            self.attempt = Some(value);
+        }
+    }
+}
+
+struct GitSegfaultRetryTuiLayer;
+
+impl<S> Layer<S> for GitSegfaultRetryTuiLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if let Some(event) = GitSegfaultRetryTraceEvent::from_event(event) {
+            mcp_agent_mail_server::emit_git_segfault_retry_trace_event(
+                event.name,
+                event.repo_slug,
+                event.attempt_n,
+                event.signal,
+                event.exhausted,
+            );
+        }
+    }
+}
+
+/// Counts frankensqlite `drop_close` warnings into `db.drop_close_total`.
+///
+/// I3 (br-bvq1x.9.3): a `SQLite` connection dropped without explicit `close()`.
+/// Thin delegator; the detection logic lives in `mcp_agent_mail_server`.
+struct DropCloseCounterLayer;
+
+impl<S> Layer<S> for DropCloseCounterLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        mcp_agent_mail_server::note_possible_drop_close_event(event);
+    }
+}
+
+fn git_segfault_retry_trace_event_from_fields(
+    target: &str,
+    fields: &GitSegfaultRetryTraceFields,
+) -> Option<GitSegfaultRetryTraceEvent> {
+    let message = fields.message.as_deref()?;
+    let exhausted = match (target, message) {
+        (GIT_LOCKED_TRACE_TARGET, "git_segfault_retry_attempt")
+        | (GUARD_SEGFAULT_TRACE_TARGET, "guard_git_segfault_retry") => false,
+        (GIT_LOCKED_TRACE_TARGET, "git_segfault_retry_exhausted")
+        | (GUARD_SEGFAULT_TRACE_TARGET, "guard_git_segfault_retry_exhausted") => true,
+        _ => return None,
+    };
+    let name = if exhausted {
+        "git_segfault_retry_exhausted"
+    } else {
+        "git_segfault_retry_attempt"
+    };
+    let repo_slug = fields
+        .repo
+        .as_deref()
+        .map_or_else(|| "pre-commit-guard".to_string(), git_repo_slug);
+    let attempt_n = fields
+        .attempt
+        .and_then(|attempt| u32::try_from(attempt).ok())
+        .map_or(0, |attempt| attempt.saturating_add(1));
+    let signal = fields.signal.and_then(|signal| i32::try_from(signal).ok());
+
+    Some(GitSegfaultRetryTraceEvent {
+        name,
+        repo_slug,
+        attempt_n,
+        signal,
+        exhausted,
+    })
+}
+
+fn normalize_trace_field(value: &str) -> String {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn git_repo_slug(repo: &str) -> String {
+    let mut slug = String::with_capacity(repo.len());
+    let mut previous_dash = true;
+
+    for ch in repo.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else if matches!(ch, '_' | '.') {
+            ch
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if !previous_dash {
+                slug.push(next);
+                previous_dash = true;
+            }
+        } else {
+            slug.push(next);
+            previous_dash = false;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "unknown-repo".to_string()
+    } else {
+        slug
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "mcp-agent-mail")]
 #[command(
@@ -201,6 +411,13 @@ enum Commands {
         /// Disable the interactive TUI (headless/CI mode).
         #[arg(long)]
         no_tui: bool,
+
+        /// Additional `Host:` header value to accept (repeatable). The listener
+        /// always accepts the bind host, its loopback variant, and `localhost`;
+        /// use this to reach the server via a hostname or reverse proxy without
+        /// an HTTP 421. Merged with the `HTTP_ALLOWED_HOSTS` env var. See #146.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
 
         /// Read `HTTP_BEARER_TOKEN` fallback from this env file for `serve`.
         ///
@@ -480,6 +697,15 @@ fn main() {
 
     let cli = Cli::parse();
 
+    if let Some(Commands::External(external_args)) = &cli.command {
+        // Denial gate (ADR-001 Invariant 4, SPEC-denial-ux-contract).
+        // This path is intentionally before config loading and tracing setup so
+        // wrong-surface CLI commands cannot touch mailbox state.
+        let command = external_args.first().map_or("(unknown)", String::as_str);
+        render_denial(command);
+        std::process::exit(2);
+    }
+
     // Load configuration and stamp interface mode (binary-level, per ADR-001).
     let mut config = Config::from_env();
     config.interface_mode = InterfaceMode::Mcp;
@@ -490,10 +716,14 @@ fn main() {
         && config.tui_enabled
         && std::io::stdout().is_terminal();
     let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui);
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
+        .with_filter(filter);
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(GitSegfaultRetryTuiLayer)
+        .with(DropCloseCounterLayer)
         .init();
 
     if cli.verbose {
@@ -519,6 +749,7 @@ fn main() {
             path,
             transport,
             no_tui,
+            allowed_host,
             env_file,
             reuse_running,
             no_reuse_running,
@@ -534,6 +765,20 @@ fn main() {
             }
             if no_tui {
                 config.tui_enabled = false;
+            }
+            // Merge `--allowed-host` flags with any HTTP_ALLOWED_HOSTS env values
+            // (neither clobbers the other; deduped by the server's allow-list).
+            // See GitHub issue #146.
+            for extra in allowed_host {
+                let trimmed = extra.trim();
+                if !trimmed.is_empty()
+                    && !config
+                        .http_allowed_hosts
+                        .iter()
+                        .any(|existing| existing == trimmed)
+                {
+                    config.http_allowed_hosts.push(trimmed.to_string());
+                }
             }
             let resolved_path =
                 resolve_serve_http_path(path.as_deref(), transport, env_value("HTTP_PATH"));
@@ -633,7 +878,7 @@ fn main() {
             ftui_runtime::ftui_println!("{:#?}", config);
         }
         Some(Commands::External(external_args)) => {
-            // Denial gate (ADR-001 Invariant 4, SPEC-denial-ux-contract)
+            // Already handled before config loading.
             let command = external_args.first().map_or("(unknown)", String::as_str);
             render_denial(command);
             std::process::exit(2);
@@ -646,13 +891,19 @@ fn main() {
 /// Prints a clear error to stderr explaining that the command belongs in the
 /// CLI binary, with remediation hints.
 fn render_denial(command: &str) {
-    eprintln!(
-        "Error: \"{command}\" is not an MCP server command.\n\n\
-         Agent Mail is not a CLI.\n\
-         Agent Mail MCP server accepts: serve, config\n\
-         For operator CLI commands, use: am {command}\n\
-         Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ..."
-    );
+    eprintln!("Error: \"{command}\" is not an MCP server command.\n");
+    eprintln!("Agent Mail is not a CLI.");
+    eprintln!("Agent Mail MCP server accepts: serve, config");
+    if let Some(correction) = mcp_agent_mail_cli::mcp_tool_cli_correction(command) {
+        eprintln!("Corrected command:");
+        eprintln!("  CLI: {}", correction.cli);
+        if let Some(mcp_tool) = correction.mcp_tool {
+            eprintln!("  MCP tool: {mcp_tool}");
+        }
+    } else {
+        eprintln!("For operator CLI commands, use: am {command}");
+    }
+    eprintln!("Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ...");
 
     // Show tip only when a TTY is detected (human, not agent)
     let no_color = env::var_os("NO_COLOR").is_some();
@@ -757,6 +1008,69 @@ mod tests {
     }
 
     #[test]
+    fn git_segfault_trace_decoder_handles_core_attempt() {
+        let fields = GitSegfaultRetryTraceFields {
+            message: Some("git_segfault_retry_attempt".to_string()),
+            repo: Some("/data/projects/example repo/.git".to_string()),
+            attempt: Some(0),
+            signal: Some(11),
+        };
+
+        assert_eq!(
+            git_segfault_retry_trace_event_from_fields(GIT_LOCKED_TRACE_TARGET, &fields),
+            Some(GitSegfaultRetryTraceEvent {
+                name: "git_segfault_retry_attempt",
+                repo_slug: "data-projects-example-repo-.git".to_string(),
+                attempt_n: 1,
+                signal: Some(11),
+                exhausted: false,
+            })
+        );
+    }
+
+    #[test]
+    fn git_segfault_trace_decoder_handles_core_exhausted() {
+        let fields = GitSegfaultRetryTraceFields {
+            message: Some("git_segfault_retry_exhausted".to_string()),
+            repo: Some("/home/ubuntu/.mcp_agent_mail_git_mailbox_repo".to_string()),
+            attempt: None,
+            signal: None,
+        };
+
+        assert_eq!(
+            git_segfault_retry_trace_event_from_fields(GIT_LOCKED_TRACE_TARGET, &fields),
+            Some(GitSegfaultRetryTraceEvent {
+                name: "git_segfault_retry_exhausted",
+                repo_slug: "home-ubuntu-.mcp_agent_mail_git_mailbox_repo".to_string(),
+                attempt_n: 0,
+                signal: None,
+                exhausted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn git_segfault_trace_decoder_handles_guard_attempt_without_repo() {
+        let fields = GitSegfaultRetryTraceFields {
+            message: Some("guard_git_segfault_retry".to_string()),
+            repo: None,
+            attempt: Some(2),
+            signal: None,
+        };
+
+        assert_eq!(
+            git_segfault_retry_trace_event_from_fields(GUARD_SEGFAULT_TRACE_TARGET, &fields),
+            Some(GitSegfaultRetryTraceEvent {
+                name: "git_segfault_retry_attempt",
+                repo_slug: "pre-commit-guard".to_string(),
+                attempt_n: 3,
+                signal: None,
+                exhausted: false,
+            })
+        );
+    }
+
+    #[test]
     fn normalize_http_path_handles_presets_and_custom_paths() {
         assert_eq!(normalize_http_path("mcp"), "/mcp/");
         assert_eq!(normalize_http_path("/api"), "/api/");
@@ -822,6 +1136,40 @@ mod tests {
             Some(Commands::Serve { no_tui, .. }) => {
                 assert!(!no_tui);
             }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_command_allowed_host_repeatable_parsed() {
+        // #146: repeatable `--allowed-host` so the listener accepts non-loopback
+        // Host headers (reverse proxy / hostname) without an env var.
+        let cli = Cli::try_parse_from([
+            "mcp-agent-mail",
+            "serve",
+            "--allowed-host",
+            "mail.internal",
+            "--allowed-host",
+            "10.0.0.5",
+        ])
+        .expect("should parse");
+
+        match cli.command {
+            Some(Commands::Serve { allowed_host, .. }) => {
+                assert_eq!(
+                    allowed_host,
+                    vec!["mail.internal".to_string(), "10.0.0.5".to_string()]
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_command_allowed_host_defaults_empty() {
+        let cli = Cli::try_parse_from(["mcp-agent-mail", "serve"]).expect("should parse");
+        match cli.command {
+            Some(Commands::Serve { allowed_host, .. }) => assert!(allowed_host.is_empty()),
             other => panic!("expected Serve, got {other:?}"),
         }
     }
@@ -1082,6 +1430,42 @@ mod tests {
     fn no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["mcp-agent-mail"]).expect("should parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn command_correction_covers_protocol_and_cli_mismatch_names() {
+        let required = [
+            "send",
+            "send-message",
+            "send_message",
+            "reserve",
+            "file-reserve",
+            "file_reservation_paths",
+            "release_file_reservations",
+            "macro_start_session",
+            "fetch_inbox",
+            "inbox",
+            "reservations",
+            "whois",
+            "list_agents",
+            "acknowledge_message",
+        ];
+
+        for input in required {
+            assert!(
+                mcp_agent_mail_cli::mcp_tool_cli_correction(input).is_some(),
+                "missing correction for {input}"
+            );
+        }
+
+        for correction in mcp_agent_mail_cli::mcp_tool_cli_corrections() {
+            for input in correction.attempted_names {
+                let actual =
+                    mcp_agent_mail_cli::mcp_tool_cli_correction(input).expect("correction");
+                assert_eq!(actual.cli, correction.cli);
+                assert_eq!(actual.mcp_tool, correction.mcp_tool);
+            }
+        }
     }
 
     #[test]

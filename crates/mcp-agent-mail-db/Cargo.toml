@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Database layer for MCP Agent Mail"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
+publish = false
 
 [dependencies]
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
@@ -20,6 +23,7 @@ regex.workspace = true
 unicode-normalization.workspace = true
 sha2.workspace = true
 hex.workspace = true
+tempfile.workspace = true
 
 # frankensearch: two-tier hybrid search implementation (optional, for hybrid feature)
 frankensearch = { workspace = true, optional = true }
@@ -67,13 +71,23 @@ hybrid = [
     "frankensearch/hash",
     "frankensearch/model2vec",
     "frankensearch/lexical",
+    # Same shape as the `native` note below: `lexical` compiles
+    # frankensearch-lexical (which depends on tantivy unconditionally), but the
+    # umbrella crate's `TantivyIndex` re-export is cfg-gated on the separate
+    # `lexical-tantivy` feature. Enable it so `fs::TantivyIndex` resolves in
+    # search_fs_bridge.rs. This adds no dependency weight — `lexical` already
+    # pulls tantivy in.
+    "frankensearch/lexical-tantivy",
     "frankensearch/rerank",
+    # `rerank` compiles the pure-Rust NativeReranker (frankentorch) backend, but
+    # the umbrella crate's `NativeReranker` re-export is cfg-gated on the separate
+    # `native` feature; enable it so `fs::NativeReranker` resolves (br-nnar1).
+    "frankensearch/native",
     "dep:frankensearch-core",
     "dep:frankensearch-embed",
     "frankensearch-embed/hash",
     "frankensearch-embed/model2vec",
     "dep:frankensearch-fusion",
-    "frankensearch-fusion/lexical",
     "dep:frankensearch-index",
     "dep:half",
     "dep:wide",
@@ -87,11 +101,20 @@ loom-tests = []
 # Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)
 s3fifo = []
 
+[target.'cfg(windows)'.dependencies]
+# Stable file-identity check (std's windows_by_handle is still unstable).
+same-file.workspace = true
+
 [dev-dependencies]
+# asupersync `Cx::for_testing()` (the `Cx<cap::All>` constructor) is gated
+# behind `test-internals` (br-asupersync-2x6hbi) so production code cannot
+# forge a full-capability Cx. Enable it for TEST/BENCH builds only: the
+# release build excludes dev-dependencies, so the capability-security gate
+# stays intact for the shipped binary.
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
 loom.workspace = true
 proptest.workspace = true
-tempfile.workspace = true
 
 [[bench]]
 name = "cache_bench"

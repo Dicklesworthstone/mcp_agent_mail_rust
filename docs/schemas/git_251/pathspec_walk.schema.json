@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/pathspec_walk.schema.json",
+  "title": "pathspec walk event",
+  "description": "Structured tracing payload for reservation pathspec enumeration.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": [
+    "pathspec_walk_open_failed",
+    "pathspec_walk_cli_fallback_enabled"
+  ],
+  "x-drift-required-fields": [],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version", "pathspec_count"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "pathspec_count": { "type": "integer", "minimum": 0 },
+        "matched_paths": { "type": "integer", "minimum": 0 },
+        "repo": { "type": "string" },
+        "err": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

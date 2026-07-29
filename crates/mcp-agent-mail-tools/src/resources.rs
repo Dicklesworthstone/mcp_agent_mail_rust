@@ -18,16 +18,19 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
     tool_util::{
-        db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool,
-        parse_attachment_metadata_json, parse_recipients_json_value,
+        db_error_to_mcp_error, db_outcome_to_mcp_result, parse_attachment_metadata_json,
+        parse_recipients_json_value,
     },
 };
+
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
     if let Some((base, query)) = input.split_once('?') {
@@ -91,6 +94,16 @@ fn resource_sync_db_error_to_mcp_error(message: String) -> McpError {
     db_error_to_mcp_error(db_error)
 }
 
+fn resource_project_not_found_error() -> McpError {
+    McpError::new(McpErrorCode::InvalidParams, "Project not found")
+}
+
+fn is_missing_projects_table_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no such table") && lower.contains("projects")
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResourceReconcileInventory {
     projects: usize,
@@ -100,6 +113,7 @@ struct ResourceReconcileInventory {
     project_identities: std::collections::BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
 }
 
+#[cfg(test)]
 fn query_resource_db_inventory(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> Result<ResourceReconcileInventory, String> {
@@ -175,11 +189,7 @@ fn query_resource_db_inventory(
     })
 }
 
-fn resource_archive_inventory_has_state(storage_root: &Path) -> bool {
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
-}
-
+#[cfg(test)]
 fn resource_archive_is_ahead(
     storage_root: &Path,
     sqlite_path: &Path,
@@ -192,7 +202,7 @@ fn resource_archive_is_ahead(
         return Ok(false);
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    let archive = crate::tool_util::read_archive_inventory(storage_root);
     if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
         return Ok(false);
     }
@@ -222,56 +232,23 @@ fn resource_archive_is_ahead(
         || archive_metadata_ahead)
 }
 
-static RESOURCE_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct ResourceSnapshotDirGuard {
-    path: PathBuf,
-}
-
-impl ResourceSnapshotDirGuard {
-    fn new(prefix: &str) -> std::io::Result<Self> {
-        let base = std::env::temp_dir();
-        let pid = std::process::id();
-        for _ in 0..32 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let counter = RESOURCE_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = base.join(format!("{prefix}{pid}_{nanos}_{counter}"));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "failed to allocate unique resource snapshot directory",
-        ))
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for ResourceSnapshotDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 struct ResourceReadPool {
     pool: mcp_agent_mail_db::DbPool,
-    _snapshot_dir: Option<ResourceSnapshotDirGuard>,
+    _snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
 }
 
 impl ResourceReadPool {
     const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
         Self {
             pool,
-            _snapshot_dir: None,
+            _snapshot: None,
+        }
+    }
+
+    fn snapshot(snapshot: Arc<crate::archive_read::SharedSnapshot>) -> Self {
+        Self {
+            pool: snapshot.pool(),
+            _snapshot: Some(snapshot),
         }
     }
 }
@@ -284,143 +261,113 @@ impl std::ops::Deref for ResourceReadPool {
     }
 }
 
-/// Check whether the live `SQLite` database is suspect for resource reads.
-///
-/// Delegates to the fast mailbox verdict. When `DurabilityState` is
-/// `DegradedReadOnly` (or worse), resource reads should fall back to
-/// archive-based data instead of the potentially corrupt live file.
-fn resource_live_db_is_suspect(
-    database_url: &str,
-    storage_root: &Path,
-    sqlite_path: &Path,
-) -> bool {
-    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
-        storage_root,
-        sqlite_path,
-    ) {
-        return false;
+fn open_resource_read_pool(
+    cx: &asupersync::Cx,
+) -> Result<Option<ResourceReadPool>, crate::archive_read::AcquireError> {
+    if cx.is_cancel_requested() {
+        return Err(crate::archive_read::AcquireError::Cancelled);
     }
-
-    let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
-        database_url,
-        storage_root,
-        &mcp_agent_mail_db::VerdictOptions::fast(),
-    );
-    let durability = mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
-    if mcp_agent_mail_db::verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
-        &verdict,
-        sqlite_path,
-    ) {
-        tracing::info!(
-            verdict_state = %verdict.state,
-            durability_state = %durability,
-            "live SQLite is suspect; resource reads will prefer archive snapshots"
-        );
-        true
-    } else {
-        false
-    }
-}
-
-fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     let config = Config::from_env();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         return Ok(None);
     }
 
     let sqlite_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
-        .map_err(|err| err.to_string())?
+        .map_err(|error| crate::archive_read::AcquireError::Failed(error.to_string()))?
         .canonical_path;
     if sqlite_path == ":memory:" {
         return Ok(None);
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state = crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
         &config.storage_root,
         &resolved_path,
-    ) && resource_archive_inventory_has_state(&config.storage_root);
-
-    // When the durability verdict says the live DB is suspect or worse,
-    // force archive-snapshot reads even if the archive isn't strictly
-    // "ahead" of the DB by row count.
-    let durability_forces_snapshot = archive_has_state
-        && resource_live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
-
-    let use_archive_snapshot = if durability_forces_snapshot {
-        true
-    } else {
-        match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-            Ok(conn) => {
-                let conn = mcp_agent_mail_db::guard_db_conn(
-                    conn,
-                    "resources::open_read_db_pool archive-ahead probe",
-                );
-                let archive_ahead =
-                    resource_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
-                drop(conn);
-                match archive_ahead {
-                    Ok(true) => true,
-                    Err(error) if archive_has_state => {
-                        tracing::warn!(
-                            source = %resolved_path.display(),
-                            storage_root = %config.storage_root.display(),
-                            error = %error,
-                            "using archive-backed resource snapshot because the live sqlite inventory probe failed"
-                        );
-                        true
-                    }
-                    Ok(false) | Err(_) => false,
-                }
-            }
-            Err(error) if archive_has_state => {
-                tracing::warn!(
-                    source = %resolved_path.display(),
-                    storage_root = %config.storage_root.display(),
-                    error = %error,
-                    "using archive-backed resource snapshot because the live sqlite source could not be opened"
-                );
-                true
-            }
-            Err(_) => false,
-        }
-    };
-
-    if !use_archive_snapshot {
+    ) {
         return Ok(None);
     }
-
-    let snapshot_dir = ResourceSnapshotDirGuard::new("agent-mail-resource-snapshot-")
-        .map_err(|err| err.to_string())?;
-    let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
-    if resolved_path.exists() {
-        mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-            &snapshot_db,
-            &config.storage_root,
-            Some(resolved_path.as_path()),
-        )
-        .map_err(|err| err.to_string())?;
-    } else {
-        mcp_agent_mail_db::reconstruct_from_archive(&snapshot_db, &config.storage_root)
-            .map_err(|err| err.to_string())?;
-    }
-    let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
-        database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_db),
-        storage_root: Some(config.storage_root),
-        ..Default::default()
-    })
-    .map_err(|err| err.to_string())?;
-    Ok(Some(ResourceReadPool {
-        pool,
-        _snapshot_dir: Some(snapshot_dir),
-    }))
+    crate::archive_read::acquire_if_needed(
+        &config.storage_root,
+        &resolved_path,
+        &config.database_url,
+        cx,
+    )
+    .map(|snapshot| snapshot.map(ResourceReadPool::snapshot))
 }
 
-fn get_resource_db_pool() -> McpResult<ResourceReadPool> {
-    match open_resource_read_pool() {
+fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
+    let config = Config::from_env();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return crate::tool_util::get_live_read_db_pool().map(ResourceReadPool::live);
+    }
+
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))?;
+    let resolved_path = PathBuf::from(&resolved.canonical_path);
+    if !resolved_path.exists() {
+        return Err(resource_sync_db_error_to_mcp_error(format!(
+            "resource read-only sqlite source not found: {}",
+            resolved_path.display()
+        )));
+    }
+
+    let mut pool_config = mcp_agent_mail_db::DbPoolConfig::from_env();
+    // Resource handlers are read surfaces. They may inspect an existing live
+    // mailbox, but must not perform startup migrations or archive reconciliation.
+    pool_config.database_url =
+        if resolved.used_absolute_fallback || Path::new(&resolved.canonical_path).is_absolute() {
+            mcp_agent_mail_core::disk::sqlite_url_from_path(&resolved_path)
+        } else {
+            config.database_url
+        };
+    pool_config.storage_root = Some(config.storage_root);
+    pool_config.run_migrations = false;
+    pool_config.warmup_connections = 0;
+
+    mcp_agent_mail_db::create_query_only_pool(&pool_config)
+        .map(ResourceReadPool::live)
+        .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
+}
+
+fn resource_live_database_missing_without_archive_state() -> bool {
+    let config = Config::from_env();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return false;
+    }
+
+    let Ok(resolved) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+    else {
+        return false;
+    };
+    let resolved_path = PathBuf::from(&resolved.canonical_path);
+    let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
+    let archive_has_authoritative_state =
+        crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+            &config.storage_root,
+            &resolved_path,
+        ) && crate::tool_util::read_archive_inventory_has_state(&archive);
+    !resolved_path.exists() && !archive_has_authoritative_state
+}
+
+// Intentionally async despite containing no awaits: this is the resource
+// handlers' pool contract and every caller awaits it. The underlying
+// archive-read gate wait is deliberately thread-blocking since GH#203
+// (runtime timers are not pumped under the sync dispatch bridge).
+#[allow(clippy::unused_async)]
+async fn get_resource_db_pool(cx: &asupersync::Cx) -> McpResult<ResourceReadPool> {
+    match open_resource_read_pool(cx) {
         Ok(Some(pool)) => Ok(pool),
-        Ok(None) => get_db_pool().map(ResourceReadPool::live),
-        Err(error) => Err(resource_sync_db_error_to_mcp_error(error)),
+        Ok(None) => open_live_resource_read_pool(),
+        Err(crate::archive_read::AcquireError::Cancelled) => Err(McpError::request_cancelled()),
+        Err(crate::archive_read::AcquireError::Busy(message)) => {
+            Err(db_error_to_mcp_error(DbError::ResourceBusy(message)))
+        }
+        Err(crate::archive_read::AcquireError::TimedOut(message)) => Err(db_error_to_mcp_error(
+            DbError::ResourceBusy(format!("archive snapshot timed out: {message}")),
+        )),
+        Err(crate::archive_read::AcquireError::Failed(message)) => {
+            Err(resource_sync_db_error_to_mcp_error(message))
+        }
     }
 }
 
@@ -606,14 +553,51 @@ async fn resolve_existing_resource_project(
         ));
     }
 
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), pool).await)?;
-    projects
-        .into_iter()
-        .find(|project| {
-            project.slug.eq_ignore_ascii_case(&project_key) || project.human_key == project_key // human_key is a path — case-sensitive
-        })
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))
+    let conn = acquire_resource_conn(ctx.cx(), pool).await?;
+    let sql = "\
+        SELECT id, slug, human_key, created_at \
+          FROM projects \
+         WHERE slug = ? COLLATE NOCASE OR human_key = ? \
+         ORDER BY CASE \
+                    WHEN slug = ? THEN 0 \
+                    WHEN slug = ? COLLATE NOCASE THEN 1 \
+                    ELSE 2 \
+                  END, id \
+         LIMIT 1";
+    let params = [
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+    ];
+    let rows = conn.query_sync(sql, &params).map_err(|err| {
+        let message = err.to_string();
+        if is_missing_projects_table_error(&message) {
+            resource_project_not_found_error()
+        } else {
+            resource_sync_db_error_to_mcp_error(message)
+        }
+    })?;
+
+    let Some(row) = rows.first() else {
+        return Err(resource_project_not_found_error());
+    };
+    let slug = row
+        .get_named::<String>("slug")
+        .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
+    let human_key = row
+        .get_named::<String>("human_key")
+        .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
+    let created_at = row
+        .get_named::<i64>("created_at")
+        .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
+
+    Ok(mcp_agent_mail_db::ProjectRow {
+        id: row.get_named::<i64>("id").ok(),
+        slug,
+        human_key,
+        created_at,
+    })
 }
 
 // Float -> int casts saturate, but we treat out-of-range values as invalid timestamps.
@@ -775,7 +759,7 @@ pub struct AgentsListResponse {
 )]
 pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<String> {
     let (project_key, _query) = split_param_and_query(&project_key);
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
@@ -1090,13 +1074,13 @@ fn build_tool_directory() -> ToolDirectory {
                 },
                 ToolDirectoryEntry {
                     name: "fetch_inbox".to_string(),
-                    summary: "Poll recent messages for an agent with filters (urgent_only, since_ts).".to_string(),
+                    summary: "Poll recent messages for an agent with filters and record read receipts.".to_string(),
                     use_when: "After each work unit to ingest coordination updates.".to_string(),
                     related: vec!["mark_message_read".to_string(), "acknowledge_message".to_string()],
                     expected_frequency: "Frequent polling in agent loops.".to_string(),
-                    required_capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    required_capabilities: vec!["messaging".to_string(), "write".to_string()],
                     usage_examples: vec![ToolUsageExample { hint: "Poll".to_string(), sample: "fetch_inbox(project_key='backend', agent_name='BlueLake', since_ts='2025-10-24T00:00:00Z')".to_string() }],
-                    capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    capabilities: vec!["messaging".to_string(), "write".to_string()],
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
@@ -1105,9 +1089,9 @@ fn build_tool_directory() -> ToolDirectory {
                     use_when: "Clearing inbox notifications once reviewed.".to_string(),
                     related: vec!["acknowledge_message".to_string()],
                     expected_frequency: "Whenever FYI mail is processed.".to_string(),
-                    required_capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    required_capabilities: vec!["messaging".to_string(), "write".to_string()],
                     usage_examples: vec![ToolUsageExample { hint: "Read receipt".to_string(), sample: "mark_message_read(project_key='backend', agent_name='BlueLake', message_id=42)".to_string() }],
-                    capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    capabilities: vec!["messaging".to_string(), "write".to_string()],
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
@@ -1220,6 +1204,17 @@ fn build_tool_directory() -> ToolDirectory {
                     usage_examples: vec![ToolUsageExample { hint: "Lock file".to_string(), sample: "file_reservation_paths(project_key='backend', agent_name='BlueLake', paths=['src/app.py'], ttl_seconds=7200)".to_string() }],
                     capabilities: vec!["file_reservations".to_string(), "repository".to_string()],
                     complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "check_file_reservation_conflicts".to_string(),
+                    summary: "Check paths against active exclusive reservations in one authoritative read-only snapshot.".to_string(),
+                    use_when: "Guard-safe pre-edit, pre-commit, or pre-push conflict checks without mutating reservation state.".to_string(),
+                    related: vec!["file_reservation_paths".to_string(), "release_file_reservations".to_string()],
+                    expected_frequency: "Before edits or commits on contested surfaces.".to_string(),
+                    required_capabilities: vec!["file_reservations".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Pre-edit check".to_string(), sample: "check_file_reservation_conflicts(project_key='backend', agent_name='BlueLake', paths=['src/app.py'])".to_string() }],
+                    capabilities: vec!["file_reservations".to_string()],
+                    complexity: "low".to_string(),
                 },
                 ToolDirectoryEntry {
                     name: "release_file_reservations".to_string(),
@@ -2111,7 +2106,7 @@ fn apply_projects_list_query_options(
     description = "List all projects known to the server in creation order.\n\nWhen to use\n-----------\n- Discover available projects when a user provides only an agent name.\n- Build UIs that let operators switch context between projects.\n\nReturns\n-------\nlist[dict]\n    Each: { id, slug, human_key, created_at }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r2\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://projects\"}}\n```"
 )]
 pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let rows =
         db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
 
@@ -2139,7 +2134,7 @@ pub async fn projects_list_query(ctx: &McpContext, query: String) -> McpResult<S
     let params = parse_query(&query);
     let query_opts = parse_projects_list_query_options(&params)?;
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let rows =
         db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
 
@@ -2189,7 +2184,13 @@ pub struct ProjectDetailResponse {
 )]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug, _query) = split_param_and_query(&slug);
-    let pool = get_resource_db_pool()?;
+    let pool = match get_resource_db_pool(ctx.cx()).await {
+        Ok(pool) => pool,
+        Err(_) if resource_live_database_missing_without_archive_state() => {
+            return Err(resource_project_not_found_error());
+        }
+        Err(err) => return Err(err),
+    };
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug).await?;
 
@@ -2262,7 +2263,7 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
     }
 
     let (key, _query) = split_param_and_query(&key);
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let product =
         match mcp_agent_mail_db::queries::get_product_by_key(ctx.cx(), &pool, key.trim()).await {
             Outcome::Ok(product) => product,
@@ -2343,7 +2344,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -2458,7 +2459,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -2596,7 +2597,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3208,7 +3209,7 @@ fn mailbox_full_messages(
     description = "List recent messages in an agent's mailbox with commit metadata fields. When archive commit data is unavailable, the `commit.summary` explicitly says so.\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [{ id, subject, from, created_ts, importance, ack_required, kind, commit: {hexsha, summary} | null }] }"
 )]
 pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
     let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
     let messages = mailbox_simple_messages(
@@ -3235,7 +3236,7 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     description = "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers when no archive commit data is resolved."
 )]
 pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
     let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
     let messages = mailbox_full_messages(
@@ -3306,7 +3307,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3391,7 +3392,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3466,7 +3467,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3573,7 +3574,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3666,7 +3667,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3867,7 +3868,7 @@ fn reservation_pathspec_ls_files_libgit2(
 
     if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
         for se in statuses.iter() {
-            let Some(path_str) = se.path() else { continue };
+            let Ok(path_str) = se.path() else { continue };
             let candidate = repo_root.join(path_str);
             let modified_us = std::fs::metadata(&candidate)
                 .ok()
@@ -4434,7 +4435,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let (slug_str, query) = split_param_and_query(&slug);
     let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug_str).await?;
 
@@ -4459,6 +4460,16 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     // Cleanup: release any expired (TTL) reservations and any stale reservations.
     //
     // Parity with Python: this resource is allowed to perform best-effort cleanup.
+    //
+    // The mutations must NOT run on the resource pool: since GH#198 that pool
+    // is query-only (or an immutable snapshot), and a release attempt there
+    // fails with "attempt to write a readonly database" — which, propagated,
+    // turned this read surface into an error (br-lwwq5 surfaced this once the
+    // gate starvation was fixed). Cleanup writes take the normal write-path
+    // lease instead; if the mailbox cannot take writes right now, best-effort
+    // means serving the listing without cleanup, not failing the read.
+    let write_pool = crate::tool_util::get_db_pool().ok();
+    let cleanup_pool = write_pool.as_deref();
     let mut released_ids: Vec<i64> = Vec::with_capacity(8);
 
     // We only need agents map + mail cache for stale evaluation.
@@ -4484,11 +4495,12 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     // Expire TTL-elapsed reservations (released_ts=NULL AND expires_ts <= now).
     for row in all_rows.iter().filter(|r| r.expires_ts <= now_micros) {
+        let Some(write_db) = cleanup_pool else { break };
         let Some(id) = row.id else { continue };
         let updated = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::force_release_reservation(
                 ctx.cx(),
-                &pool,
+                write_db,
                 id,
                 Some(row.expires_ts),
             )
@@ -4502,6 +4514,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
     for row in all_rows.iter().filter(|r| r.expires_ts > now_micros) {
+        let Some(write_db) = cleanup_pool else { break };
         let Some(id) = row.id else { continue };
         let agent_last_active = agent_by_id
             .get(&row.agent_id)
@@ -4538,7 +4551,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             let updated = db_outcome_to_mcp_result(
                 mcp_agent_mail_db::queries::force_release_reservation(
                     ctx.cx(),
-                    &pool,
+                    write_db,
                     id,
                     Some(row.expires_ts),
                 )
@@ -4589,7 +4602,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         let updated = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::force_release_reservation(
                 ctx.cx(),
-                &pool,
+                write_db,
                 id,
                 Some(row.expires_ts),
             )
@@ -4601,6 +4614,9 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
         released_ids.push(id);
     }
+    // The cleanup mutations are done; release the write lease before the
+    // read-only artifact lookups and the final listing.
+    drop(write_pool);
 
     // Best-effort archive artifact writes for any releases.
     if !released_ids.is_empty() {
@@ -4826,9 +4842,25 @@ mod resource_shape_tests {
     where
         F: FnOnce() -> T,
     {
+        with_serialized_resources_env(&[], f)
+    }
+
+    fn with_serialized_resources_env<F, T>(extra_overrides: &[(&str, &str)], f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
         let _lock = RESOURCE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Other test modules can leave global WBQ state behind after their
+        // tempdirs have been dropped. Resource tests are serialized, so make the
+        // boundary explicit and then attribute any new degradation to this test.
+        mcp_agent_mail_storage::wbq_start();
+        mcp_agent_mail_storage::wbq_flush();
+        mcp_agent_mail_storage::flush_async_commits();
+        mcp_agent_mail_storage::clear_durability_degraded();
+
         let temp = tempfile::tempdir().expect("resource test tempdir");
         let storage_root = temp.path().join("storage-root");
         std::fs::create_dir_all(&storage_root).expect("resource test storage root");
@@ -4839,13 +4871,33 @@ mod resource_shape_tests {
             .expect("resource test storage root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            f,
-        )
+        let mut overrides = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        overrides.extend_from_slice(extra_overrides);
+
+        let (result, stats, degraded) =
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                mcp_agent_mail_storage::wbq_flush();
+                mcp_agent_mail_storage::flush_async_commits();
+                let stats = mcp_agent_mail_storage::wbq_stats();
+                let degraded = mcp_agent_mail_storage::durability_degraded();
+                mcp_agent_mail_storage::clear_durability_degraded();
+                (result, stats, degraded)
+            });
+
+        match result {
+            Ok(value) => {
+                assert!(
+                    !degraded,
+                    "resource test caused WBQ durability degradation after cleanup flush: {stats:?}"
+                );
+                value
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     fn run_async<F, Fut, T>(f: F) -> T
@@ -4860,7 +4912,7 @@ mod resource_shape_tests {
         rt.block_on(f(cx))
     }
 
-    fn write_archive_ahead_fixture() -> (PathBuf, PathBuf) {
+    fn write_archive_ahead_files() -> (PathBuf, PathBuf) {
         let config = Config::from_env();
         let storage_root = config.storage_root;
         let db_path = PathBuf::from(
@@ -4889,6 +4941,11 @@ mod resource_shape_tests {
         )
         .expect("write resource canonical message");
 
+        (storage_root, db_path)
+    }
+
+    fn write_archive_ahead_fixture() -> (PathBuf, PathBuf) {
+        let (storage_root, db_path) = write_archive_ahead_files();
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("open resource live db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
@@ -5130,6 +5187,19 @@ mod resource_shape_tests {
         serde_json::from_str(payload).expect("valid JSON")
     }
 
+    /// Seeding pool for tests: the plain live pool WITHOUT a `WriteGuard`
+    /// lease. `get_db_pool()` returns a `WriteDbPool` whose guard brackets
+    /// the holder's entire scope; keeping that lease alive across the read
+    /// assertions starves the archive-read gate's claim admission for the
+    /// full `BUILD_TIMEOUT` — 24 tests each burned the whole 120s deadline
+    /// (br-lwwq5). Production takes the lease per write operation and drops
+    /// it before reads; tests must do the same. The `.clone()` resolves via
+    /// `Deref<Target = DbPool>`, so the `WriteDbPool` temporary (and its
+    /// guard) drops at the end of this statement.
+    fn seed_pool() -> mcp_agent_mail_db::DbPool {
+        get_db_pool().expect("db pool").clone()
+    }
+
     struct PopulatedMailboxFixture {
         ctx: McpContext,
         project_ref: String,
@@ -5141,7 +5211,7 @@ mod resource_shape_tests {
     }
 
     async fn setup_populated_mailbox_fixture(cx: &Cx) -> PopulatedMailboxFixture {
-        let pool = get_db_pool().expect("db pool");
+        let pool = seed_pool();
         let project_key = format!("/tmp/resources-populated-{}", unique_suffix());
         let project = ensure_project(cx, &pool, &project_key).await;
         let project_id = project.id.unwrap_or(0);
@@ -5287,7 +5357,7 @@ mod resource_shape_tests {
     fn message_and_thread_resources_redact_bcc_recipients() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-bcc-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5406,7 +5476,7 @@ mod resource_shape_tests {
     fn empty_dataset_resources_return_expected_shapes() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-empty-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5622,7 +5692,7 @@ mod resource_shape_tests {
         with_serialized_resources(|| {
             run_async(|cx| async move {
                 let fixture = setup_populated_mailbox_fixture(&cx).await;
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let conn = match pool.acquire(&cx).await {
                     Outcome::Ok(c) => c,
                     Outcome::Err(err) => panic!("acquire failed: {err}"),
@@ -5669,7 +5739,7 @@ mod resource_shape_tests {
     fn resource_reads_do_not_create_projects_for_missing_absolute_paths() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let before = db_outcome_to_mcp_result(queries::list_projects(&cx, &pool).await)
                     .expect("projects before")
                     .len();
@@ -5694,7 +5764,7 @@ mod resource_shape_tests {
     fn inbox_and_outbox_reject_invalid_since_ts() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-invalid-since-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5731,7 +5801,7 @@ mod resource_shape_tests {
     fn urgent_unread_view_excludes_read_messages() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-urgent-read-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5753,23 +5823,15 @@ mod resource_shape_tests {
                 let message_id = message.id.unwrap_or(0);
                 let recipient_id = recipient.id.unwrap_or(0);
 
-                let conn = match pool.acquire(&cx).await {
-                    Outcome::Ok(c) => c,
-                    Outcome::Err(err) => panic!("acquire failed: {err}"),
-                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
-                    Outcome::Panicked(_) => panic!("acquire panicked"),
-                };
-                conn.execute_sync(
-                    "UPDATE message_recipients SET read_ts = ? WHERE message_id = ? AND agent_id = ?",
-                    &[
-                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
-                            mcp_agent_mail_db::now_micros(),
-                        ),
-                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
-                        mcp_agent_mail_db::sqlmodel::Value::BigInt(recipient_id),
-                    ],
-                )
-                .expect("mark message read");
+                // Mark read through the product API, not raw SQL: the write
+                // path owns read-cache invalidation, and a bare UPDATE leaves
+                // a stale recipient row that the read pools then serve
+                // (surfaced when br-lwwq5's gate starvation was fixed and
+                // these reads started completing).
+                match queries::mark_message_read(&cx, &pool, recipient_id, message_id).await {
+                    Outcome::Ok(_) => {}
+                    other => panic!("mark message read failed: {other:?}"),
+                }
 
                 let ctx = McpContext::new(cx.clone(), 1);
                 let project_ref = project.human_key.clone();
@@ -5813,6 +5875,8 @@ mod resource_shape_tests {
                         Some("resource visibility regression".to_string()),
                         None,
                         None,
+                        None,
+                        None,
                     )
                     .await
                     .expect("register_agent"),
@@ -5827,6 +5891,8 @@ mod resource_shape_tests {
                         "gpt-5".to_string(),
                         Some("GreenCastle".to_string()),
                         Some("resource visibility regression".to_string()),
+                        None,
+                        None,
                         None,
                     )
                     .await
@@ -5890,6 +5956,8 @@ mod resource_shape_tests {
                     Some("resource visibility regression".to_string()),
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -5900,6 +5968,8 @@ mod resource_shape_tests {
                     "gpt-5".to_string(),
                     Some("RedPeak".to_string()),
                     Some("resource visibility regression".to_string()),
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -5943,6 +6013,9 @@ mod resource_shape_tests {
                         None,
                         Some(10),
                         Some(true),
+                        None,
+                        None,
+                        None,
                         None,
                     )
                     .await
@@ -6010,6 +6083,9 @@ mod resource_shape_tests {
                         Some(10),
                         Some(true),
                         None,
+                        None,
+                        None,
+                        None,
                     )
                     .await
                     .expect("fetch sender inbox"),
@@ -6050,7 +6126,7 @@ mod resource_shape_tests {
     fn resources_preserve_attachment_metadata_objects() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-attachments-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6190,7 +6266,7 @@ mod resource_shape_tests {
     fn resources_surface_malformed_message_metadata() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-malformed-metadata-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6270,7 +6346,7 @@ mod resource_shape_tests {
     fn message_details_preserves_placeholder_when_sender_row_is_missing() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-orphaned-sender-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6331,7 +6407,7 @@ mod resource_shape_tests {
     fn agent_named_resources_use_case_insensitive_lookup() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-case-insensitive-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6452,7 +6528,7 @@ mod resource_shape_tests {
     fn project_scoped_resources_use_case_insensitive_project_slug_lookup() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-project-slug-case-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6627,7 +6703,7 @@ mod resource_shape_tests {
     fn thread_details_respects_include_bodies_toggle() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-thread-toggle-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6676,7 +6752,7 @@ mod resource_shape_tests {
     fn file_reservations_active_only_filters_released_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-reservations-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6766,7 +6842,7 @@ mod resource_shape_tests {
     fn file_reservations_missing_workspace_does_not_release_stale_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-missing-workspace-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6842,7 +6918,7 @@ mod resource_shape_tests {
     fn file_reservations_release_orphaned_holder_rows_when_other_signals_are_stale() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-orphaned-holder-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6877,6 +6953,23 @@ mod resource_shape_tests {
                     &[mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id)],
                 )
                 .expect("delete holder row");
+                conn.execute_sync(
+                    "INSERT OR REPLACE INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                     VALUES (?, ?, ?, 'src/**', 1, 'orphaned holder cleanup test', ?, ?, NULL)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(2_000_000),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_add(3_600_000_000),
+                        ),
+                    ],
+                )
+                .expect("restore orphaned reservation fixture");
                 drop(conn);
 
                 let ctx = McpContext::new(cx.clone(), 1);
@@ -6920,70 +7013,58 @@ mod resource_shape_tests {
 
     #[test]
     fn product_details_accepts_orphaned_product_placeholder() {
-        with_serialized_resources(|| {
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[("WORKTREES_ENABLED", "true")],
-                || {
-                    run_async(|cx| async move {
-                        let pool = get_db_pool().expect("db pool");
-                        let project_key =
-                            format!("/tmp/resources-orphaned-product-{}", unique_suffix());
-                        let project = ensure_project(&cx, &pool, &project_key).await;
-                        let project_id = project.id.unwrap_or(0);
+        with_serialized_resources_env(&[("WORKTREES_ENABLED", "true")], || {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let project_key = format!("/tmp/resources-orphaned-product-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
 
-                        let product = match queries::ensure_product(
-                            &cx,
-                            &pool,
-                            Some("prod-orphaned-resource"),
-                            Some("Orphaned Resource Product"),
-                        )
-                        .await
-                        {
-                            Outcome::Ok(product) => product,
-                            other => panic!("ensure product failed: {other:?}"),
-                        };
-                        let product_id = product.id.unwrap_or(0);
+                let product = match queries::ensure_product(
+                    &cx,
+                    &pool,
+                    Some("prod-orphaned-resource"),
+                    Some("Orphaned Resource Product"),
+                )
+                .await
+                {
+                    Outcome::Ok(product) => product,
+                    other => panic!("ensure product failed: {other:?}"),
+                };
+                let product_id = product.id.unwrap_or(0);
 
-                        match queries::link_product_to_projects(
-                            &cx,
-                            &pool,
-                            product_id,
-                            &[project_id],
-                        )
-                        .await
-                        {
-                            Outcome::Ok(_) => {}
-                            other => panic!("link product failed: {other:?}"),
-                        }
+                match queries::link_product_to_projects(&cx, &pool, product_id, &[project_id]).await
+                {
+                    Outcome::Ok(_) => {}
+                    other => panic!("link product failed: {other:?}"),
+                }
 
-                        let conn = match pool.acquire(&cx).await {
-                            Outcome::Ok(c) => c,
-                            Outcome::Err(err) => panic!("acquire failed: {err}"),
-                            Outcome::Cancelled(_) => panic!("acquire cancelled"),
-                            Outcome::Panicked(panic) => {
-                                panic!("acquire panicked: {}", panic.message())
-                            }
-                        };
-                        conn.execute_sync(
-                            "DELETE FROM products WHERE id = ?",
-                            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(product_id)],
-                        )
-                        .expect("delete product row");
-                        drop(conn);
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "DELETE FROM products WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(product_id)],
+                )
+                .expect("delete product row");
+                drop(conn);
 
-                        let ctx = McpContext::new(cx.clone(), 1);
-                        let placeholder = format!("[unknown-product-{product_id}]");
-                        let payload = product_details(&ctx, placeholder.clone())
-                            .await
-                            .expect("product details");
-                        let value = parse_json(&payload);
-                        assert_eq!(value["product_uid"].as_str(), Some(placeholder.as_str()));
-                        assert_eq!(value["name"].as_str(), Some(placeholder.as_str()));
-                        assert_eq!(value["projects"].as_array().map_or(0, Vec::len), 1);
-                        assert_eq!(value["projects"][0]["id"].as_i64(), Some(project_id));
-                    });
-                },
-            );
+                let ctx = McpContext::new(cx.clone(), 1);
+                let placeholder = format!("[unknown-product-{product_id}]");
+                let payload = product_details(&ctx, placeholder.clone())
+                    .await
+                    .expect("product details");
+                let value = parse_json(&payload);
+                assert_eq!(value["product_uid"].as_str(), Some(placeholder.as_str()));
+                assert_eq!(value["name"].as_str(), Some(placeholder.as_str()));
+                assert_eq!(value["projects"].as_array().map_or(0, Vec::len), 1);
+                assert_eq!(value["projects"][0]["id"].as_i64(), Some(project_id));
+            });
         });
     }
 
@@ -6993,7 +7074,7 @@ mod resource_shape_tests {
             run_async(|cx| async move {
                 mcp_agent_mail_storage::wbq_start();
 
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-release-artifacts-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -7097,6 +7178,36 @@ mod resource_shape_tests {
     }
 
     #[test]
+    fn tooling_directory_marks_read_receipt_tools_as_write_capability() {
+        let directory = build_tool_directory();
+        let find_tool = |name: &str| {
+            directory
+                .clusters
+                .iter()
+                .flat_map(|cluster| cluster.tools.iter())
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("tool directory should include {name}"))
+        };
+
+        for tool in [find_tool("fetch_inbox"), find_tool("mark_message_read")] {
+            assert!(
+                tool.required_capabilities
+                    .iter()
+                    .any(|capability| capability == "write"),
+                "{} should advertise write capability because it records read state",
+                tool.name
+            );
+            assert!(
+                tool.capabilities
+                    .iter()
+                    .any(|capability| capability == "write"),
+                "{} should expose write capability because it records read state",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
     fn resources_use_archive_snapshot_when_live_db_is_stale() {
         with_serialized_resources(|| {
             run_async(|cx: Cx| async move {
@@ -7157,6 +7268,30 @@ mod resource_shape_tests {
     }
 
     #[test]
+    fn resources_use_archive_snapshot_without_creating_missing_live_db() {
+        with_serialized_resources(|| {
+            run_async(|cx: Cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let (_storage_root, db_path) = write_archive_ahead_files();
+                assert!(
+                    !db_path.exists(),
+                    "fixture must leave the live sqlite path absent before the resource read"
+                );
+
+                let projects = parse_json(&projects_list(&ctx).await.expect("projects list"));
+                let projects_array = projects.as_array().expect("projects array");
+                assert_eq!(projects_array.len(), 1, "expected archive-backed project");
+                assert_eq!(projects_array[0]["slug"], "ahead-project");
+
+                assert!(
+                    !db_path.exists(),
+                    "read-only resource probe created the missing live sqlite database"
+                );
+            });
+        });
+    }
+
+    #[test]
     fn resources_keep_live_db_when_db_has_newer_messages_than_metadata_only_archive_drift() {
         with_serialized_resources(|| {
             run_async(|cx: Cx| async move {
@@ -7211,7 +7346,7 @@ mod resource_shape_tests {
                     incremental_check.details
                 );
 
-                let pool = open_resource_read_pool().expect("open resource read pool");
+                let pool = open_resource_read_pool(&cx).expect("open resource read pool");
                 assert!(
                     pool.is_none(),
                     "resource reads should stay on the live DB when only archive metadata is ahead"
@@ -7268,11 +7403,13 @@ mod resource_shape_tests {
                 .expect("insert overlapping project");
                 drop(conn);
 
-                let pool = open_resource_read_pool().expect("open resource read pool");
-                assert!(
-                    pool.is_none(),
-                    "default global archive should not force resource snapshots for an external custom DB"
-                );
+                run_async(|cx: Cx| async move {
+                    let pool = open_resource_read_pool(&cx).expect("open resource read pool");
+                    assert!(
+                        pool.is_none(),
+                        "default global archive should not force resource snapshots for an external custom DB"
+                    );
+                });
             },
         );
     }
@@ -7298,6 +7435,8 @@ mod resource_shape_tests {
                     Some("backend development".to_string()),
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .await
                 .expect("register_agent GreenLake");
@@ -7311,12 +7450,14 @@ mod resource_shape_tests {
                     Some("frontend work".to_string()),
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .await
                 .expect("register_agent BlueDog");
 
                 // Call list_agents tool
-                let result = crate::list_agents(&ctx, project_key.clone())
+                let result = crate::list_agents(&ctx, project_key.clone(), None, None)
                     .await
                     .expect("list_agents tool");
 

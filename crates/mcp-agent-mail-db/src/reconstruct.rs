@@ -29,16 +29,100 @@ use std::path::{Path, PathBuf};
 
 type DbConn = crate::CanonicalDbConn;
 
+fn open_read_only_salvage_db(path: &Path) -> DbResult<DbConn> {
+    let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy().into_owned())
+        .flags(sqlmodel_sqlite::OpenFlags::read_only());
+    let conn = DbConn::open(&config).map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct salvage: cannot open source {} read-only: {e}",
+            path.display()
+        ))
+    })?;
+    conn.execute_raw("PRAGMA query_only = ON;").map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct salvage: cannot enforce query-only source {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(conn)
+}
+
+/// Per-artifact size cap for archive reads during reconstruction (64 MiB).
+///
+/// Archive artifacts are read fully into memory; without a cap a single
+/// oversized file (a multi-GB message body, a crafted `profile.json`, …) OOMs
+/// the reconstruct path — which auto-runs on server-startup self-heal. The cap
+/// is generous relative to any legitimate mailbox artifact.
+const MAX_ARCHIVE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Keyset batch size for salvaging `messages` rows (br-5mnkl).
+///
+/// The salvage source on the automatic startup-recovery path is the unhealthy
+/// live mailbox itself, so `messages` (bodies included) can be multi-GB. A
+/// single full-table `SELECT` materializes every row into one `Vec<Row>` —
+/// the unbounded allocation that ballooned startup recovery. Keyset
+/// pagination bounds peak memory to one batch; the batch is kept small
+/// because each row carries a message body.
+const SALVAGE_MESSAGE_BATCH_ROWS: usize = 128;
+
+/// Keyset batch size for salvaging `message_recipients` rows (br-5mnkl).
+/// Rows are fixed-width (two ids, a kind, two timestamps), so a larger batch
+/// stays small in bytes while cutting per-batch query overhead.
+const SALVAGE_RECIPIENT_BATCH_ROWS: usize = 1024;
+
+/// Keyset batch size for id-only `messages` scans (br-5mnkl). Rows are a
+/// single `i64`, so the batch can be large.
+const DB_MESSAGE_ID_BATCH_ROWS: usize = 4096;
+
+/// Hard cap on itemized [`ReconstructStats::warnings`] entries (br-5mnkl).
+///
+/// Reconstruction pushes one warning per malformed/duplicate artifact, so a
+/// pathological archive (millions of broken files) could balloon the warning
+/// vector itself on the startup self-heal path. Beyond this cap warnings are
+/// counted in [`ReconstructStats::suppressed_warnings`] instead of itemized;
+/// all numeric counters remain exact.
+const MAX_ITEMIZED_WARNINGS: usize = 10_000;
+
+/// Read an archive text artifact with a bounded-memory cap (see
+/// [`MAX_ARCHIVE_ARTIFACT_BYTES`]). Returns an `InvalidData` error if the file
+/// exceeds the cap, which each call site already handles as a skippable read
+/// failure (so an oversized artifact is logged/counted rather than OOMing).
+fn read_archive_text_capped(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = String::new();
+    let read = file
+        .by_ref()
+        .take(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+        .read_to_string(&mut buf)?;
+    if read as u64 > MAX_ARCHIVE_ARTIFACT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive artifact exceeds {MAX_ARCHIVE_ARTIFACT_BYTES} byte cap: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 type SqliteDbConn = crate::CanonicalDbConn;
 
+// Fault-injection hooks for the salvage-merge rollback tests. These are
+// thread-local (not process-global): salvage merges run synchronously on the
+// arming test's own thread, and a process-global flag can be consumed by any
+// OTHER salvage-merge test running in parallel — which both disarms the
+// arming test (its merge then succeeds and `expect_err` fails) and detonates
+// an unrelated test with a forced error it never armed.
 #[cfg(test)]
-static FAIL_SALVAGE_MERGE_AFTER_PROJECTS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-static FAIL_SALVAGE_QUERY_MESSAGES: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FAIL_SALVAGE_MERGE_AFTER_PROJECTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FAIL_SALVAGE_QUERY_MESSAGES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
@@ -169,14 +253,120 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
     apply_snapshot_migrations(conn, schema::schema_migrations_base(), "base")
 }
 
-fn apply_atc_runtime_followup_after_snapshot(conn: &DbConn) -> DbResult<()> {
+/// Recreate the ATC schema family in the dedicated `atc.sqlite3` sidecar.
+///
+/// ATC telemetry is isolated into a sidecar DB next to the primary mailbox DB
+/// (br-bvq1x.11.7) and MUST NOT live in the primary mailbox DB — pool init drops
+/// any `atc_*` it finds there, and `reconstruct_with_agent_profile` asserts the
+/// rebuilt primary DB has no `atc_*` tables. `schema_migrations_base()` omits the
+/// ATC family (`atc_experiences` and its v17 ALTERs, `atc_leader_lease`,
+/// `atc_rollup_snapshots`, …) because FrankenConnection can't host it; at runtime
+/// the canonical follow-up runner applies that family to the sidecar. Since
+/// reconstruction rebuilds the primary DB, recreate the sidecar's ATC schema here
+/// too — otherwise the ATC subsystem has no tables to write to after recovery (the
+/// `v17` schema-surface regression). The sidecar opens through canonical SQLite
+/// (which can host the family); the migrations are ordered (`atc_experiences`
+/// created before its ALTERs) and the per-migration preflight skips anything
+/// already present. The tables come up empty (ATC state isn't archived), the
+/// correct post-recovery state. A `:memory:` target keeps ATC co-located, so there
+/// is no sidecar to build.
+pub(crate) fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()> {
+    let Some(primary) = primary_db_path.to_str() else {
+        return Ok(());
+    };
+    if primary == ":memory:" {
+        return Ok(());
+    }
+    let sidecar_path = crate::pool::atc_sidecar_sqlite_path(primary);
+    // Refuse a symlinked sidecar target, exactly like the primary reconstruct
+    // target and the salvage source: recovery must never write through a
+    // pre-planted link.
+    crate::pool::validate_sqlite_target_path(Path::new(&sidecar_path), "reconstruct ATC sidecar")
+        .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
+    match apply_atc_sidecar_schema(&sidecar_path) {
+        Ok(()) => Ok(()),
+        Err(first_error) if Path::new(&sidecar_path).exists() => {
+            // A pre-existing sidecar that cannot be opened/migrated (the disk
+            // incident that corrupted the primary DB usually hits its
+            // same-directory sibling too) must NOT wedge recovery of the
+            // PRIMARY mailbox: ATC telemetry is droppable by contract, while a
+            // fatal abort here blocks every reconstruct retry until a human
+            // intervenes. Quarantine the unusable sidecar by rename (never
+            // delete) and rebuild a fresh one; only a failure on the fresh
+            // file — a genuine environment problem — stays fatal.
+            let quarantine_path = format!("{sidecar_path}.quarantined-{}", crate::now_micros());
+            std::fs::rename(&sidecar_path, &quarantine_path).map_err(|rename_error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: ATC sidecar {sidecar_path} is unusable ({first_error}) and \
+                     could not be quarantined to {quarantine_path}: {rename_error}"
+                ))
+            })?;
+            tracing::warn!(
+                sidecar = %sidecar_path,
+                quarantine = %quarantine_path,
+                error = %first_error,
+                "reconstruct: quarantined unusable ATC sidecar; rebuilding a fresh one"
+            );
+            apply_atc_sidecar_schema(&sidecar_path).map_err(|retry_error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: rebuild ATC sidecar {sidecar_path} after quarantining the \
+                     unusable one at {quarantine_path}: {retry_error}"
+                ))
+            })
+        }
+        // No sidecar file on disk and creation still failed: a real environment
+        // problem (permissions, disk). A recovery that silently half-succeeds is
+        // worse than one that fails loudly, so this stays fatal.
+        Err(error) => Err(error),
+    }
+}
+
+/// Open (creating if needed) the ATC sidecar at `sidecar_path` and apply the
+/// canonical ATC follow-up migration set.
+///
+/// A sidecar created here gets the same posture as one created by the live
+/// runtime (`ensure_file_backed_atc_pool_initialized`): WAL journal mode via
+/// `PRAGMA_DB_INIT_SQL` and private 0600 permissions — it carries project keys,
+/// subjects, and evidence summaries just like `storage.sqlite3`.
+fn apply_atc_sidecar_schema(sidecar_path: &str) -> DbResult<()> {
+    let preexisting = Path::new(sidecar_path).exists();
+    let sidecar = DbConn::open_file(sidecar_path).map_err(|error| {
+        DbError::Sqlite(format!(
+            "reconstruct: open ATC sidecar {sidecar_path}: {error}"
+        ))
+    })?;
+    let _ = sidecar.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL);
+    if !preexisting {
+        // journal_mode is DB-wide and intentionally omitted from
+        // PRAGMA_CONN_SETTINGS_SQL; apply it once at sidecar creation, exactly
+        // like the runtime creation path.
+        sidecar
+            .execute_raw(schema::PRAGMA_DB_INIT_SQL)
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: set ATC sidecar db pragmas for {sidecar_path}: {error}"
+                ))
+            })?;
+        // Best-effort 0600, matching the runtime creation path: a chmod failure
+        // must not block recovery.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                std::fs::set_permissions(sidecar_path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(
+                    path = %sidecar_path,
+                    error = %error,
+                    "reconstruct: failed to restrict ATC sidecar permissions to 0600"
+                );
+            }
+        }
+    }
     apply_snapshot_migrations(
-        conn,
-        schema::schema_migrations_runtime_canonical_followup()
-            .into_iter()
-            .filter(|migration| schema::is_atc_runtime_canonical_migration(&migration.id))
-            .collect(),
-        "ATC runtime followup",
+        &sidecar,
+        schema::schema_migrations_atc_runtime_canonical_followup(),
+        "atc-sidecar-followup",
     )
 }
 
@@ -209,14 +399,25 @@ pub struct ReconstructStats {
     pub salvaged_agents: usize,
     /// Number of messages recovered only from a salvaged database.
     pub salvaged_messages: usize,
+    /// Number of salvaged messages whose source-local numeric id collided
+    /// with an archive message from another project and was remapped.
+    pub salvaged_message_id_remaps: usize,
     /// Number of recipient rows inserted or state rows updated from a salvaged database.
     pub salvaged_recipients: usize,
-    /// Number of ATC rollup rows restored from a salvaged database.
-    pub rollups_salvaged: usize,
+    /// Number of reservation rows inserted or state rows updated from a salvaged database.
+    pub salvaged_reservations: usize,
+    /// Number of terminal reservation-release ledger rows restored from a salvaged database.
+    pub salvaged_reservation_releases: usize,
     /// Number of archive files that failed to parse (skipped).
     pub parse_errors: usize,
-    /// Human-readable warnings collected during reconstruction.
+    /// Human-readable warnings collected during reconstruction. Itemization
+    /// is capped at [`MAX_ITEMIZED_WARNINGS`]; the overflow is counted in
+    /// `suppressed_warnings` (br-5mnkl).
     pub warnings: Vec<String>,
+    /// Number of warnings suppressed after `warnings` reached
+    /// [`MAX_ITEMIZED_WARNINGS`]. Counters stay exact; only the per-occurrence
+    /// itemization stops.
+    pub suppressed_warnings: usize,
     duplicate_canonical_id_set: BTreeSet<i64>,
 }
 
@@ -313,6 +514,18 @@ impl ArchiveMessageInventory {
 }
 
 impl ReconstructStats {
+    /// Push an itemized warning, or count it as suppressed once the
+    /// [`MAX_ITEMIZED_WARNINGS`] cap is reached (br-5mnkl). Every unbounded
+    /// per-artifact/per-row warning site must route through this so the
+    /// warning vector itself cannot balloon on the startup self-heal path.
+    fn push_warning(&mut self, warning: String) {
+        if self.warnings.len() < MAX_ITEMIZED_WARNINGS {
+            self.warnings.push(warning);
+        } else {
+            self.suppressed_warnings = self.suppressed_warnings.saturating_add(1);
+        }
+    }
+
     fn record_duplicate_canonical_message(&mut self, message_id: i64, file_path: &Path) {
         self.duplicate_canonical_message_files += 1;
         if self.duplicate_canonical_id_set.insert(message_id) {
@@ -398,20 +611,31 @@ impl std::fmt::Display for ReconstructStats {
                 self.cross_project_canonical_collisions
             )?;
         }
+        if self.suppressed_warnings > 0 {
+            write!(
+                f,
+                "; suppressed {} warning(s) past the {MAX_ITEMIZED_WARNINGS}-entry itemization cap",
+                self.suppressed_warnings
+            )?;
+        }
         if self.salvaged_projects > 0
             || self.salvaged_agents > 0
             || self.salvaged_messages > 0
+            || self.salvaged_message_id_remaps > 0
             || self.salvaged_recipients > 0
-            || self.rollups_salvaged > 0
+            || self.salvaged_reservations > 0
+            || self.salvaged_reservation_releases > 0
         {
             write!(
                 f,
-                "; salvaged {} projects, {} agents, {} messages ({} recipients/state updates, {} rollups)",
+                "; salvaged {} projects, {} agents, {} messages ({} numeric-id remaps, {} recipients/state updates, {} reservations, {} reservation releases)",
                 self.salvaged_projects,
                 self.salvaged_agents,
                 self.salvaged_messages,
+                self.salvaged_message_id_remaps,
                 self.salvaged_recipients,
-                self.rollups_salvaged
+                self.salvaged_reservations,
+                self.salvaged_reservation_releases
             )?;
         }
         Ok(())
@@ -747,11 +971,39 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
     if tables.is_empty() {
         return Ok(BTreeSet::new());
     }
-    let rows = conn.query_sync("SELECT id FROM messages", &[])?;
+    // br-5mnkl: keyset-paginated read — this scans the (possibly huge) live
+    // mailbox on the startup/self-heal drift-check path, and a full-table
+    // SELECT materializes every row at once. The first batch has no id floor
+    // so non-positive ids are still collected exactly as before; a batch that
+    // fails to advance the floor (undecodable trailing ids) terminates with
+    // the same silently-partial set the unchunked read produced.
     let mut ids = BTreeSet::new();
-    for row in rows {
-        if let Ok(id) = row.get_named::<i64>("id") {
-            ids.insert(id);
+    let mut floor: Option<i64> = None;
+    loop {
+        let (where_clause, params): (&str, Vec<Value>) = match floor {
+            Some(f) => (" WHERE id > ?", vec![Value::BigInt(f)]),
+            None => ("", Vec::new()),
+        };
+        let rows = conn.query_sync(
+            &format!(
+                "SELECT id FROM messages{where_clause} ORDER BY id LIMIT {DB_MESSAGE_ID_BATCH_ROWS}"
+            ),
+            &params,
+        )?;
+        if rows.is_empty() {
+            break;
+        }
+        let batch_len = rows.len();
+        let mut advanced = false;
+        for row in rows {
+            if let Ok(id) = row.get_named::<i64>("id") {
+                ids.insert(id);
+                floor = Some(id);
+                advanced = true;
+            }
+        }
+        if batch_len < DB_MESSAGE_ID_BATCH_ROWS || !advanced {
+            break;
         }
     }
     Ok(ids)
@@ -992,7 +1244,7 @@ fn scan_archive_project_identity(project_path: &Path) -> Option<MailboxProjectId
         .and_then(|name| name.to_str())
         .map(str::to_string);
     let project_json = project_path.join("project.json");
-    if let Ok(content) = std::fs::read_to_string(&project_json)
+    if let Ok(content) = read_archive_text_capped(&project_json)
         && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
     {
         return MailboxProjectIdentity::from_parts(
@@ -1115,7 +1367,7 @@ fn scan_project_archive_message_inventory(
 }
 
 fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
-    let content = std::fs::read_to_string(file_path)
+    let content = read_archive_text_capped(file_path)
         .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
     let Some(frontmatter) = extract_json_frontmatter(&content) else {
         return Ok(None);
@@ -1130,35 +1382,135 @@ fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
 
 /// Reconstruct the database from the Git archive at `storage_root`.
 ///
-/// Opens (or creates) a fresh `SQLite` database at `db_path`, runs schema
-/// migrations, then walks the archive to recover data.
+/// When archive content exists, opens (or creates) a fresh `SQLite` database at
+/// `db_path`, runs schema migrations, then walks the archive to recover data.
+/// Empty archive roots are reported without creating a target database.
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or if schema creation
 /// fails. Individual archive files that fail to parse are skipped (counted
 /// in `parse_errors`).
-#[allow(clippy::too_many_lines)]
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
+    reconstruct_from_archive_impl(db_path, storage_root, false)
+}
+
+fn ensure_unoccupied_reconstruction_target_family(db_path: &Path) -> DbResult<()> {
+    if db_path.as_os_str() == ":memory:" {
+        return Ok(());
+    }
+
+    for path in std::iter::once(db_path.to_path_buf()).chain(
+        ["-journal", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| crate::pool::sqlite_path_with_suffix(db_path, suffix)),
+    ) {
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: target family is already occupied at {}; reconstruction requires a fresh candidate path and never mutates an existing database generation",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn claim_fresh_reconstruction_target(db_path: &Path) -> DbResult<()> {
+    if db_path.as_os_str() == ":memory:" {
+        return Ok(());
+    }
+
+    ensure_unoccupied_reconstruction_target_family(db_path)?;
+
+    // The low-level reconstruction API owns only fresh candidates. `create_new`
+    // is the race-safe admission primitive: two builders can never both pass a
+    // check-then-open window and replay into the same SQLite file.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(db_path)
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct: failed to claim fresh candidate {}: {error}",
+                db_path.display()
+            ))
+        })?;
+
+    // Refuse sidecars that raced with candidate admission. The newly claimed
+    // empty main file is intentionally retained as evidence; callers allocate
+    // unique staging names and may quarantine failed candidates.
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = crate::pool::sqlite_path_with_suffix(db_path, suffix);
+        if std::fs::symlink_metadata(&sidecar).is_ok() {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: target sidecar appeared during fresh-candidate admission at {}; refusing to share a SQLite generation",
+                sidecar.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn reconstruct_from_archive_impl(
+    db_path: &Path,
+    storage_root: &Path,
+    create_empty_target: bool,
+) -> DbResult<ReconstructStats> {
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
         .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
-    if !is_real_directory(storage_root) {
-        stats.warnings.push(format!(
+    ensure_unoccupied_reconstruction_target_family(db_path)?;
+    let projects_dir = storage_root.join("projects");
+    let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
+    if is_real_directory(storage_root) {
+        if is_real_directory(&projects_dir) {
+            if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if !file_type.is_dir() || file_type.is_symlink() {
+                        continue;
+                    }
+                    let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from)
+                    else {
+                        continue;
+                    };
+                    project_dirs.push((slug, path));
+                }
+            }
+        } else {
+            stats.push_warning(format!(
+                "No projects directory found at {}",
+                projects_dir.display()
+            ));
+            if !create_empty_target {
+                return Ok(stats);
+            }
+        }
+    } else {
+        stats.push_warning(format!(
             "Storage root {} is missing or not a real directory",
             storage_root.display()
         ));
-        return Ok(stats);
+        if !create_empty_target {
+            return Ok(stats);
+        }
     }
-
-    let projects_dir = storage_root.join("projects");
-    if !is_real_directory(&projects_dir) {
-        stats.warnings.push(format!(
-            "No projects directory found at {}",
+    project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    if project_dirs.is_empty() {
+        stats.push_warning(format!(
+            "No project archives found under {}",
             projects_dir.display()
         ));
-        return Ok(stats);
+        if !create_empty_target {
+            return Ok(stats);
+        }
     }
+
+    claim_fresh_reconstruction_target(db_path)?;
 
     let db_str = db_path.to_string_lossy();
     let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
@@ -1210,6 +1562,13 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         // not duplicated.
         apply_base_migrations_after_snapshot(&conn)?;
 
+        // The ATC telemetry family is isolated in a fixed-name sibling
+        // `atc.sqlite3`. Candidate construction must never touch it: a staged
+        // candidate lives beside the current live database, so doing so would
+        // mutate live state before promotion and make concurrent candidates
+        // share a sidecar. The unified promotion boundary ensures the sidecar
+        // schema only after this candidate is durably committed as live.
+
         // Clean up any FTS artifacts that may have been left by prior migrations.
         // This mirrors `schema::enforce_runtime_fts_cleanup`, but uses canonical
         // SQLite so reconstruction is not coupled to runtime connection type.
@@ -1238,25 +1597,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         // Maps for deduplication: ((project_id, name) → agent_id)
         let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
 
-        // Phase 1: Discover projects
-        let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_dir() || file_type.is_symlink() {
-                    continue;
-                }
-                let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
-                    continue;
-                };
-                project_dirs.push((slug, path));
-            }
-        }
-        project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
-
+        // Phase 1: Replay projects discovered before opening the target DB.
         for (slug, project_path) in &project_dirs {
             let now = crate::now_micros();
             let human_key = read_project_human_key(project_path, slug, &mut stats);
@@ -1300,12 +1641,13 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
             }
         }
 
-        // Replay only the ATC runtime follow-up subset after the archive
-        // payload is loaded. Reconstruct intentionally leaves FTS-backed
-        // message trigger follow-ups to the next live startup, but the ATC
-        // schema family must exist immediately so the rebuilt database matches
-        // the live-server ATC contract.
-        apply_atc_runtime_followup_after_snapshot(&conn)?;
+        // ATC telemetry now lives in a dedicated sidecar DB (atc.sqlite3) that
+        // is NOT part of the Git archive (br-bvq1x.11.7). Reconstruct rebuilds
+        // the primary mailbox DB from the archive and intentionally materializes
+        // NO atc_* tables here. Sidecar schema application is deferred until
+        // promotion (its data is droppable telemetry and is never salvaged from
+        // the archive). Reconstruct intentionally also leaves FTS-backed message
+        // trigger follow-ups to the next live startup.
 
         // Rebuild all index b-trees to ensure consistency after bulk inserts.
         conn.execute_raw("REINDEX;")
@@ -1332,42 +1674,57 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     Ok(stats)
 }
 
-/// Reconstruct the database from the Git archive and then best-effort merge
-/// any additional durable state from a salvaged `SQLite` database.
+/// Reconstruct the database from the Git archive and merge any additional
+/// durable state from a salvaged `SQLite` database.
 ///
 /// This is intended for doctor/recovery flows where the primary database file
 /// was unhealthy, but a directly readable salvage database could still provide
 /// additional rows that never made it into the Git archive, including DB-only
 /// contact/product-bus metadata.
+///
+/// When a salvage path is supplied, probing and merging it are mandatory.
+/// Returning an apparently successful archive-only result when the path is
+/// missing, invalid, or unreadable — or when the merge fails — would silently
+/// discard coordination state and allow callers to promote an incomplete
+/// candidate. Callers that explicitly want archive-only recovery must pass
+/// `None`.
 pub fn reconstruct_from_archive_with_salvage(
     db_path: &Path,
     storage_root: &Path,
     salvage_db_path: Option<&Path>,
 ) -> DbResult<ReconstructStats> {
-    let mut stats = reconstruct_from_archive(db_path, storage_root)?;
-    if let Some(salvage_db_path) = salvage_db_path.filter(|path| is_real_file(path)) {
-        match probe_salvage_database_for_merge(salvage_db_path)
-            .and_then(|()| merge_salvaged_database(db_path, salvage_db_path, &mut stats))
-        {
-            Ok(()) => {}
-            Err(error) => stats.warnings.push(format!(
-                "Skipping best-effort salvage from {}: {error}",
+    if let Some(salvage_db_path) = salvage_db_path {
+        probe_salvage_database_for_merge(salvage_db_path).map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage source {} failed validation; refusing an archive-only candidate because DB-only coordination state could be lost: {error}",
                 salvage_db_path.display()
-            )),
-        }
+            ))
+        })?;
+    }
+
+    let mut stats =
+        reconstruct_from_archive_impl(db_path, storage_root, salvage_db_path.is_some())?;
+    if let Some(salvage_db_path) = salvage_db_path {
+        merge_salvaged_database(db_path, salvage_db_path, &mut stats).map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
+                salvage_db_path.display()
+            ))
+        })?;
     }
     Ok(stats)
 }
 
-fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
+pub(crate) fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
     crate::pool::validate_sqlite_target_path(path, "reconstruct salvage source")
         .map_err(|error| DbError::Sqlite(format!("reconstruct salvage: {error}")))?;
-    let conn = DbConn::open_file(path.to_string_lossy().as_ref()).map_err(|e| {
-        DbError::Sqlite(format!(
-            "reconstruct salvage: cannot open candidate {}: {e}",
+    if !is_real_file(path) {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct salvage: candidate {} does not exist or is not a regular file",
             path.display()
-        ))
-    })?;
+        )));
+    }
+    let conn = open_read_only_salvage_db(path)?;
     conn.query_sync("SELECT name FROM sqlite_master LIMIT 1", &[])
         .map_err(|e| {
             DbError::Sqlite(format!(
@@ -1416,14 +1773,14 @@ fn discover_agents(
         };
         let Some(agent_name) = normalized_archive_agent_name(Some(&raw_agent_name)) else {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Archive agent directory {} has empty/invalid name; skipping profile",
                 path.display()
             ));
             continue;
         };
         if agent_name != raw_agent_name {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Archive agent directory {} has non-canonical name {raw_agent_name:?}; normalizing to {agent_name:?}",
                 path.display()
             ));
@@ -1433,7 +1790,7 @@ fn discover_agents(
             continue;
         }
 
-        let profile_data = match std::fs::read_to_string(&profile_path) {
+        let profile_data = match read_archive_text_capped(&profile_path) {
             Ok(d) => d,
             Err(e) => {
                 stats.parse_errors += 1;
@@ -1459,7 +1816,7 @@ fn discover_agents(
         let agent_name = match profile_name {
             Some(profile_name) => {
                 if profile_name != agent_name {
-                    stats.warnings.push(format!(
+                    stats.push_warning(format!(
                         "Archive agent profile {} has name {profile_name:?} that disagrees with directory name {raw_agent_name:?}; using profile name",
                         profile_path.display()
                     ));
@@ -1608,7 +1965,7 @@ fn discover_messages(
                     return Err(e);
                 }
                 stats.parse_errors += 1;
-                stats.warnings.push(format!(
+                stats.push_warning(format!(
                     "Failed to reconstruct message from {}: {e}",
                     file_path.display()
                 ));
@@ -1628,7 +1985,7 @@ fn parse_and_insert_message(
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
-    let content = std::fs::read_to_string(file_path)
+    let content = read_archive_text_capped(file_path)
         .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
 
     // Parse JSON frontmatter between ---json and ---
@@ -1720,7 +2077,7 @@ fn parse_and_insert_message(
     let thread_id = raw_thread_id.and_then(|raw| {
         let normalized = sanitize_reconstructed_thread_id(raw);
         if normalized.as_deref() != Some(raw) {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Sanitized invalid thread_id {:?} in {} during reconstruction",
                 raw,
                 file_path.display()
@@ -1876,7 +2233,7 @@ fn normalize_salvaged_recipient_kind(
         "cc" => "cc".to_string(),
         "bcc" => "bcc".to_string(),
         _ => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage recipient for message {message_id} had invalid kind {trimmed:?}; defaulting to \"to\""
             ));
             "to".to_string()
@@ -1905,7 +2262,7 @@ fn normalize_archive_attachments_json(
             serde_json::Value::Array(values.clone()).to_string()
         }
         Some(_) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Archive message {message_label} has non-array attachments payload; preserving malformed attachment metadata sentinel"
             ));
             malformed_attachments_json()
@@ -1919,7 +2276,7 @@ fn normalize_archive_recipients_json(
     stats: &mut ReconstructStats,
 ) -> (String, Vec<String>, Vec<String>, Vec<String>) {
     if !reconstructed_recipients_payload_is_valid(msg) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Archive message {message_label} has non-canonical recipient payload; preserving malformed recipient metadata sentinel"
         ));
         return (
@@ -1953,13 +2310,13 @@ fn parse_salvaged_attachments_json(
     match serde_json::from_str::<serde_json::Value>(&attachments_json) {
         Ok(serde_json::Value::Array(values)) => serde_json::Value::Array(values).to_string(),
         Ok(_) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage message {message_id} has non-array attachments payload; preserving malformed attachment metadata sentinel"
             ));
             malformed_attachments_json()
         }
         Err(err) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage message {message_id} has invalid attachments payload; preserving malformed attachment metadata sentinel: {err}"
             ));
             malformed_attachments_json()
@@ -1994,14 +2351,14 @@ fn parse_salvaged_recipients_json(
     let parsed: serde_json::Value = match serde_json::from_str(&recipients_json) {
         Ok(parsed) => parsed,
         Err(err) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage message {message_id} has invalid recipients_json; preserving malformed recipient metadata sentinel: {err}"
             ));
             return malformed();
         }
     };
     if !reconstructed_recipients_payload_is_valid(&parsed) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage message {message_id} has non-canonical recipients_json; preserving malformed recipient metadata sentinel"
         ));
         return malformed();
@@ -2113,11 +2470,11 @@ fn parse_archived_file_reservation(
     file_path: &Path,
     stats: &mut ReconstructStats,
 ) -> Option<ArchivedFileReservation> {
-    let reservation_data = match std::fs::read_to_string(file_path) {
+    let reservation_data = match read_archive_text_capped(file_path) {
         Ok(data) => data,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot read reservation artifact {}: {e}",
                 file_path.display()
             ));
@@ -2129,7 +2486,7 @@ fn parse_archived_file_reservation(
         Ok(value) => value,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot parse reservation artifact {}: {e}",
                 file_path.display()
             ));
@@ -2144,7 +2501,7 @@ fn parse_archived_file_reservation(
         .map(str::to_string)
     else {
         stats.parse_errors += 1;
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reservation artifact {} is missing path_pattern/path",
             file_path.display()
         ));
@@ -2274,16 +2631,6 @@ fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
     }
 }
 
-fn message_id_exists(conn: &DbConn, message_id: i64) -> DbResult<bool> {
-    let rows = conn
-        .query_sync(
-            "SELECT 1 AS exists_flag FROM messages WHERE id = ? LIMIT 1",
-            &[Value::BigInt(message_id)],
-        )
-        .map_err(|e| DbError::Sqlite(format!("check message {message_id} existence: {e}")))?;
-    Ok(!rows.is_empty())
-}
-
 /// Return the `project_id` of a message row with the given canonical id, or
 /// `None` if no such row exists. Used during reconstruction to distinguish
 /// same-project duplicates from cross-project canonical-id collisions.
@@ -2299,6 +2646,23 @@ fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
             DbError::Sqlite(format!("decode project_id for message {message_id}: {e}"))
         })?;
         Ok(Some(pid))
+    } else {
+        Ok(None)
+    }
+}
+
+fn agent_project_id(conn: &DbConn, agent_id: i64) -> DbResult<Option<i64>> {
+    let rows = conn
+        .query_sync(
+            "SELECT project_id FROM agents WHERE id = ? LIMIT 1",
+            &[Value::BigInt(agent_id)],
+        )
+        .map_err(|e| DbError::Sqlite(format!("check agent {agent_id} project: {e}")))?;
+    if let Some(row) = rows.first() {
+        let project_id = row
+            .get_named::<i64>("project_id")
+            .map_err(|e| DbError::Sqlite(format!("decode project_id for agent {agent_id}: {e}")))?;
+        Ok(Some(project_id))
     } else {
         Ok(None)
     }
@@ -2341,7 +2705,7 @@ fn build_salvage_select(
         .filter(|column| !columns.contains(*column))
         .collect();
     if !missing_required.is_empty() {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage database {} table {table} missing required column(s): {}",
             salvage_db_path.display(),
             missing_required.join(", ")
@@ -2419,7 +2783,7 @@ fn build_salvage_agent_links_select(
         .filter(|column| !columns.contains(*column))
         .collect::<Vec<_>>()
         .join(", ");
-    stats.warnings.push(format!(
+    stats.push_warning(format!(
         "Salvage database {} table agent_links missing required columns for both current schema ({missing_current}) and legacy schema ({missing_legacy})",
         salvage_db_path.display()
     ));
@@ -2474,18 +2838,6 @@ fn synthetic_project_placeholder_human_key(slug: &str) -> String {
     format!("/{slug}")
 }
 
-fn placeholder_human_key_for_human_key(human_key: &str) -> Option<String> {
-    let trimmed = human_key.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let basename = Path::new(trimmed).file_name()?.to_str()?.trim();
-    if basename.is_empty() {
-        return None;
-    }
-    Some(format!("/{basename}"))
-}
-
 fn normalized_project_match_token(value: &str) -> Option<String> {
     let normalized = value
         .chars()
@@ -2513,126 +2865,41 @@ fn is_synthetic_project_placeholder(slug: &str, human_key: &str) -> bool {
     trimmed.is_empty() || trimmed == synthetic_project_placeholder_human_key(slug)
 }
 
-#[derive(Debug, Clone)]
-struct SalvageProjectIdentityRow {
-    id: i64,
-    slug: String,
-    human_key: String,
-    created_at: i64,
-}
-
-fn reconcile_placeholder_project_duplicates_after_salvage(
-    conn: &DbConn,
-    project_id_map: &mut HashMap<i64, i64>,
-    stats: &mut ReconstructStats,
-) -> DbResult<()> {
-    let rows = conn
-        .query_sync(
-            "SELECT id, slug, human_key, created_at FROM projects ORDER BY id",
-            &[],
-        )
-        .map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct salvage: query project rows for duplicate reconciliation: {e}"
-            ))
-        })?;
-
-    let mut placeholder_by_token: HashMap<String, SalvageProjectIdentityRow> = HashMap::new();
-    let mut placeholder_counts: HashMap<String, usize> = HashMap::new();
-    let mut canonical_counts: HashMap<String, usize> = HashMap::new();
-    let mut canonical_rows = Vec::new();
-
-    for row in &rows {
-        let Some(id) = row.get_named::<i64>("id").ok().filter(|value| *value > 0) else {
-            continue;
-        };
-        let slug = row.get_named::<String>("slug").unwrap_or_default();
-        let human_key = row.get_named::<String>("human_key").unwrap_or_default();
-        let created_at = row.get_named::<i64>("created_at").unwrap_or_default();
-        let identity = SalvageProjectIdentityRow {
-            id,
-            slug: slug.clone(),
-            human_key: human_key.clone(),
-            created_at,
-        };
-        if is_synthetic_project_placeholder(&slug, &human_key) {
-            if let Some(token) = normalized_project_match_token(&slug) {
-                *placeholder_counts.entry(token.clone()).or_insert(0) += 1;
-                placeholder_by_token.entry(token).or_insert(identity);
-            }
-        } else if Path::new(human_key.trim()).is_absolute()
-            && let Some(token) = project_basename_token_for_human_key(&human_key)
-        {
-            *canonical_counts.entry(token.clone()).or_insert(0) += 1;
-            canonical_rows.push((token, identity));
-        }
-    }
-
-    canonical_rows.sort_by_key(|(_, row)| row.created_at);
-
-    for (token, canonical) in canonical_rows {
-        if placeholder_counts.get(&token).copied().unwrap_or(0) != 1
-            || canonical_counts.get(&token).copied().unwrap_or(0) != 1
-        {
-            continue;
-        }
-        let Some(placeholder) = placeholder_by_token.get(&token).cloned() else {
-            continue;
-        };
-        if placeholder.id == canonical.id {
-            continue;
-        }
-
-        for mapped_project_id in project_id_map.values_mut() {
-            if *mapped_project_id == canonical.id {
-                *mapped_project_id = placeholder.id;
-            }
-        }
-
-        conn.execute_sync(
-            "DELETE FROM projects WHERE id = ?",
-            &[Value::BigInt(canonical.id)],
-        )
-        .map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct salvage: remove duplicate canonical project {}: {e}",
-                canonical.slug
-            ))
-        })?;
-
-        let merged_created_at =
-            merge_salvaged_created_at(placeholder.created_at, canonical.created_at);
-        conn.execute_sync(
-            "UPDATE projects SET slug = ?, human_key = ?, created_at = ? WHERE id = ?",
-            &[
-                Value::Text(canonical.slug.clone()),
-                Value::Text(canonical.human_key.clone()),
-                Value::BigInt(merged_created_at),
-                Value::BigInt(placeholder.id),
-            ],
-        )
-        .map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct salvage: promote placeholder project {} to canonical {}: {e}",
-                placeholder.slug, canonical.slug
-            ))
-        })?;
-        if stats.salvaged_projects > 0 {
-            stats.salvaged_projects -= 1;
-        }
-
-        placeholder_by_token.insert(
-            token,
-            SalvageProjectIdentityRow {
-                id: placeholder.id,
-                slug: canonical.slug,
-                human_key: canonical.human_key,
-                created_at: merged_created_at,
-            },
+/// Reconcile a slug-matched salvage row's identity against the archive-built
+/// target project.
+///
+/// Every production salvage source is the same mailbox's previous database
+/// (entry paths verify the storage root is authoritative for that sqlite
+/// path), and within one archive a slug names exactly one project directory.
+/// A differing non-placeholder human key therefore means the DB row drifted
+/// (e.g. the repo was moved) while `project.json` holds the canonical
+/// identity — the archive-side identity wins and the divergence is recorded
+/// loudly. Refusing outright here (as 4b8f156c briefly did) turned the
+/// reconcile self-heal into a hard failure and could never distinguish drift
+/// from genuine cross-project aliasing anyway; it also matches the promotion
+/// guard's GH#208 posture of refusing on identity loss only (br-uflow).
+fn validate_salvage_project_identity_match(
+    target_slug: &str,
+    target_human_key: &str,
+    salvaged_slug: &str,
+    salvaged_human_key: &str,
+) {
+    let target_is_placeholder = is_synthetic_project_placeholder(target_slug, target_human_key);
+    let salvage_is_placeholder =
+        is_synthetic_project_placeholder(salvaged_slug, salvaged_human_key);
+    if !target_is_placeholder
+        && !salvage_is_placeholder
+        && target_human_key.trim() != salvaged_human_key.trim()
+    {
+        tracing::warn!(
+            slug = salvaged_slug,
+            archive_human_key = target_human_key.trim(),
+            db_human_key = salvaged_human_key.trim(),
+            "reconstruct salvage: database project identity drifted from the archive's \
+             canonical project.json for the same slug; salvaging rows under the archive \
+             identity"
         );
     }
-
-    Ok(())
 }
 
 fn enrich_existing_project_from_salvage(
@@ -2666,6 +2933,12 @@ fn enrich_existing_project_from_salvage(
     let current_created_at = existing_row
         .get_named::<i64>("created_at")
         .unwrap_or_default();
+    validate_salvage_project_identity_match(
+        &current_slug,
+        &current_human_key,
+        salvaged_slug,
+        salvaged_human_key,
+    );
     let fallback_human_key = synthetic_project_placeholder_human_key(&current_slug);
     let current_is_placeholder =
         current_human_key.trim().is_empty() || current_human_key == fallback_human_key;
@@ -2726,11 +2999,14 @@ fn enrich_existing_agent_from_salvage(
     salvaged_last_active_ts: i64,
     salvaged_attachments_policy: &str,
     salvaged_contact_policy: &str,
+    salvaged_reaper_exempt: Option<bool>,
+    salvaged_registration_token: Option<&str>,
+    salvage_has_registration_token: bool,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     let existing_rows = conn
         .query_sync(
-            "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy \
+            "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token \
              FROM agents WHERE id = ? LIMIT 1",
             &[Value::BigInt(agent_id)],
         )
@@ -2757,6 +3033,23 @@ fn enrich_existing_agent_from_salvage(
     let current_attachments_policy_raw =
         existing_row.get_named::<String>("attachments_policy").ok();
     let current_contact_policy_raw = existing_row.get_named::<String>("contact_policy").ok();
+    let current_reaper_exempt = existing_row
+        .get_named::<i64>("reaper_exempt")
+        .is_ok_and(|value| value != 0);
+    let current_registration_token = existing_row
+        .get_named::<Option<String>>("registration_token")
+        .unwrap_or_default();
+    if salvage_has_registration_token
+        && let (Some(current), Some(salvaged)) = (
+            current_registration_token.as_deref(),
+            salvaged_registration_token,
+        )
+        && current != salvaged
+    {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct salvage: agent {name} has conflicting non-null registration tokens; refusing to bind credentials across ambiguous identities"
+        )));
+    }
     let existing_source = format!("existing agent row {agent_id} ({name})");
     let current_program = normalize_reconstructed_required_agent_field(
         current_program_raw.as_deref(),
@@ -2829,6 +3122,12 @@ fn enrich_existing_agent_from_salvage(
         } else {
             current_contact_policy.clone()
         };
+    let next_reaper_exempt = salvaged_reaper_exempt.unwrap_or(current_reaper_exempt);
+    let next_registration_token = if salvage_has_registration_token {
+        salvaged_registration_token.map(str::to_string)
+    } else {
+        current_registration_token.clone()
+    };
 
     if next_program != current_program
         || next_model != current_model
@@ -2837,6 +3136,8 @@ fn enrich_existing_agent_from_salvage(
         || next_last_active_ts != current_last_active_ts
         || next_attachments_policy != current_attachments_policy
         || next_contact_policy != current_contact_policy
+        || next_reaper_exempt != current_reaper_exempt
+        || next_registration_token != current_registration_token
     {
         conn.execute_sync(
             "UPDATE agents SET \
@@ -2846,7 +3147,9 @@ fn enrich_existing_agent_from_salvage(
                  inception_ts = ?, \
                  last_active_ts = ?, \
                  attachments_policy = ?, \
-                 contact_policy = ? \
+                 contact_policy = ?, \
+                 reaper_exempt = ?, \
+                 registration_token = ? \
              WHERE id = ?",
             &[
                 Value::Text(next_program),
@@ -2856,6 +3159,8 @@ fn enrich_existing_agent_from_salvage(
                 Value::BigInt(next_last_active_ts),
                 Value::Text(next_attachments_policy),
                 Value::Text(next_contact_policy),
+                Value::BigInt(i64::from(next_reaper_exempt)),
+                next_registration_token.map_or(Value::Null, Value::Text),
                 Value::BigInt(agent_id),
             ],
         )
@@ -2882,31 +3187,31 @@ fn merge_salvaged_database(
                 target_db_path.display()
             ))
         })?;
-    let salvage_conn =
-        DbConn::open_file(salvage_db_path.to_string_lossy().as_ref()).map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct salvage: cannot open salvage {}: {e}",
-                salvage_db_path.display()
-            ))
-        })?;
+    let salvage_conn = open_read_only_salvage_db(salvage_db_path)?;
 
     let has_projects = table_exists(&salvage_conn, "projects")?;
     let has_agents = table_exists(&salvage_conn, "agents")?;
     let has_messages = table_exists(&salvage_conn, "messages")?;
     let has_recipients = table_exists(&salvage_conn, "message_recipients")?;
     let has_agent_links = table_exists(&salvage_conn, "agent_links")?;
+    let has_file_reservations = table_exists(&salvage_conn, "file_reservations")?;
+    let has_file_reservation_releases = table_exists(&salvage_conn, "file_reservation_releases")?;
     let has_products = table_exists(&salvage_conn, "products")?;
     let has_product_project_links = table_exists(&salvage_conn, "product_project_links")?;
+    let has_proof_gate_consumed_nonces = table_exists(&salvage_conn, "proof_gate_consumed_nonces")?;
 
     if !(has_projects
         || has_agents
         || has_messages
         || has_recipients
         || has_agent_links
+        || has_file_reservations
+        || has_file_reservation_releases
         || has_products
-        || has_product_project_links)
+        || has_product_project_links
+        || has_proof_gate_consumed_nonces)
     {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage database {} contained none of the expected mail/product tables",
             salvage_db_path.display()
         ));
@@ -2921,20 +3226,25 @@ fn merge_salvaged_database(
     let merge_result: DbResult<()> = (|| {
         let mut project_id_map: HashMap<i64, i64> = HashMap::new();
         let mut agent_id_map: HashMap<i64, i64> = HashMap::new();
+        let mut message_id_map: HashMap<i64, i64> = HashMap::new();
+        let mut reservation_id_map: HashMap<i64, i64> = HashMap::new();
         let mut product_id_map: HashMap<i64, i64> = HashMap::new();
-
         if has_projects {
             let project_columns = table_columns(&salvage_conn, "projects")?;
-            let Some(project_select) = build_salvage_select(
+            let project_select = build_salvage_select(
                 "projects",
                 &project_columns,
                 &["id", "slug"],
                 &["human_key", "created_at"],
                 stats,
                 salvage_db_path,
-            ) else {
-                return Ok(());
-            };
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: projects schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
             let project_rows = salvage_conn
                 .query_sync(
                     &format!("SELECT {project_select} FROM projects ORDER BY id"),
@@ -2945,22 +3255,24 @@ fn merge_salvaged_database(
                 })?;
 
             for row in &project_rows {
-                let Some(source_project_id) =
-                    row.get_named::<i64>("id").ok().filter(|value| *value > 0)
-                else {
-                    continue;
-                };
-                let slug = row
-                    .get_named::<String>("slug")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                let source_project_id = row.get_named::<i64>("id").map_err(|e| {
+                    DbError::Sqlite(format!("reconstruct salvage: decode project id: {e}"))
+                })?;
+                if source_project_id <= 0 {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: project has non-positive id {source_project_id}"
+                    )));
+                }
+                let slug = row.get_named::<String>("slug").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode slug for project {source_project_id}: {e}"
+                    ))
+                })?;
+                let slug = slug.trim().to_string();
                 if slug.is_empty() {
-                    stats.warnings.push(format!(
-                        "Salvage database {} had a project row with empty slug; skipping",
-                        salvage_db_path.display()
-                    ));
-                    continue;
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: project {source_project_id} has an empty stable slug"
+                    )));
                 }
 
                 let human_key = row
@@ -2984,14 +3296,18 @@ fn merge_salvaged_database(
                     project_id_map.insert(source_project_id, target_project_id);
                     continue;
                 }
-                if let Some(placeholder_human_key) = placeholder_human_key_for_human_key(&human_key)
-                    && let Ok(target_project_id) = query_last_insert_or_existing_id(
-                        &target_conn,
-                        "projects",
-                        "human_key",
-                        &placeholder_human_key,
-                    )
-                {
+                // A basename-only match (for example `/shared` versus
+                // `/srv/team-a/shared`) is not a stable project identity. Two
+                // unrelated repositories routinely share a basename, and
+                // merging them here would remap every salvaged child row to
+                // the wrong project. Only exact slug or exact canonical
+                // human-key matches may reuse an existing target row.
+                if let Ok(target_project_id) = query_last_insert_or_existing_id(
+                    &target_conn,
+                    "projects",
+                    "human_key",
+                    &human_key,
+                ) {
                     enrich_existing_project_from_salvage(
                         &target_conn,
                         target_project_id,
@@ -3021,14 +3337,8 @@ fn merge_salvaged_database(
                 stats.salvaged_projects += 1;
             }
 
-            reconcile_placeholder_project_duplicates_after_salvage(
-                &target_conn,
-                &mut project_id_map,
-                stats,
-            )?;
-
             #[cfg(test)]
-            if FAIL_SALVAGE_MERGE_AFTER_PROJECTS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if FAIL_SALVAGE_MERGE_AFTER_PROJECTS.with(|hook| hook.replace(false)) {
                 return Err(DbError::Sqlite(
                     "reconstruct salvage: forced failure after projects".to_string(),
                 ));
@@ -3037,7 +3347,7 @@ fn merge_salvaged_database(
 
         if has_agents {
             let agent_columns = table_columns(&salvage_conn, "agents")?;
-            let Some(agent_select) = build_salvage_select(
+            let agent_select = build_salvage_select(
                 "agents",
                 &agent_columns,
                 &["id", "project_id", "name"],
@@ -3049,12 +3359,18 @@ fn merge_salvaged_database(
                     "last_active_ts",
                     "attachments_policy",
                     "contact_policy",
+                    "reaper_exempt",
+                    "registration_token",
                 ],
                 stats,
                 salvage_db_path,
-            ) else {
-                return Ok(());
-            };
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: agents schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
             let agent_rows = salvage_conn
                 .query_sync(
                     &format!("SELECT {agent_select} FROM agents ORDER BY id"),
@@ -3063,36 +3379,35 @@ fn merge_salvaged_database(
                 .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: query agents: {e}")))?;
 
             for row in &agent_rows {
-                let Some(source_agent_id) =
-                    row.get_named::<i64>("id").ok().filter(|value| *value > 0)
-                else {
-                    continue;
-                };
-                let Some(source_project_id) = row
-                    .get_named::<i64>("project_id")
-                    .ok()
-                    .filter(|value| *value > 0)
-                else {
-                    continue;
-                };
-                let Some(&target_project_id) = project_id_map.get(&source_project_id) else {
-                    stats.warnings.push(format!(
-                    "Salvage agent {source_agent_id} referenced missing project id {source_project_id}; skipping"
-                ));
-                    continue;
-                };
+                let source_agent_id = row.get_named::<i64>("id").map_err(|e| {
+                    DbError::Sqlite(format!("reconstruct salvage: decode agent id: {e}"))
+                })?;
+                if source_agent_id <= 0 {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: agent has non-positive id {source_agent_id}"
+                    )));
+                }
+                let source_project_id = row.get_named::<i64>("project_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode project_id for agent {source_agent_id}: {e}"
+                    ))
+                })?;
+                let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: agent {source_agent_id} referenced unmapped project id {source_project_id}"
+                    ))
+                })?;
 
-                let name = row
-                    .get_named::<String>("name")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                let name = row.get_named::<String>("name").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode name for agent {source_agent_id}: {e}"
+                    ))
+                })?;
+                let name = name.trim().to_string();
                 if name.is_empty() {
-                    stats.warnings.push(format!(
-                        "Salvage database {} had an agent row with empty name; skipping",
-                        salvage_db_path.display()
-                    ));
-                    continue;
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: agent {source_agent_id} has an empty stable name"
+                    )));
                 }
 
                 let salvaged_program_raw = row.get_named::<String>("program").ok();
@@ -3109,6 +3424,29 @@ fn merge_salvaged_database(
                 let salvaged_attachments_policy_raw =
                     row.get_named::<String>("attachments_policy").ok();
                 let salvaged_contact_policy_raw = row.get_named::<String>("contact_policy").ok();
+                let salvaged_reaper_exempt = if agent_columns.contains("reaper_exempt") {
+                    Some(
+                        row.get_named::<i64>("reaper_exempt")
+                            .map_err(|e| {
+                                DbError::Sqlite(format!(
+                                    "reconstruct salvage: decode reaper_exempt for agent {source_agent_id}: {e}"
+                                ))
+                            })?
+                            != 0,
+                    )
+                } else {
+                    None
+                };
+                let salvaged_registration_token = if agent_columns.contains("registration_token") {
+                    row.get_named::<Option<String>>("registration_token")
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: decode registration_token for agent {source_agent_id}: {e}"
+                            ))
+                        })?
+                } else {
+                    None
+                };
                 let salvage_agent_source = format!("salvage agent row {source_agent_id} ({name})");
                 let salvaged_program = normalize_reconstructed_required_agent_field(
                     salvaged_program_raw.as_deref(),
@@ -3148,8 +3486,8 @@ fn merge_salvaged_database(
                 target_conn
                 .execute_sync(
                     "INSERT OR IGNORE INTO agents \
-                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     &[
                         Value::BigInt(target_project_id),
                         Value::Text(name.clone()),
@@ -3160,6 +3498,10 @@ fn merge_salvaged_database(
                         Value::BigInt(salvaged_last_active_ts),
                         Value::Text(salvaged_attachments_policy.clone()),
                         Value::Text(salvaged_contact_policy.clone()),
+                        Value::BigInt(i64::from(salvaged_reaper_exempt.unwrap_or(false))),
+                        salvaged_registration_token
+                            .clone()
+                            .map_or(Value::Null, Value::Text),
                     ],
                 )
                 .map_err(|e| {
@@ -3189,256 +3531,744 @@ fn merge_salvaged_database(
                         salvaged_last_active_ts,
                         &salvaged_attachments_policy,
                         &salvaged_contact_policy,
+                        salvaged_reaper_exempt,
+                        salvaged_registration_token.as_deref(),
+                        agent_columns.contains("registration_token"),
                         stats,
                     )?;
                 }
             }
         }
 
-        if has_agent_links {
-            if project_id_map.is_empty() || agent_id_map.is_empty() {
-                stats.warnings.push(format!(
-                "Salvage database {} had agent_links rows but missing project/agent state prevented contact recovery",
-                salvage_db_path.display()
-            ));
-            } else {
-                let agent_link_columns = table_columns(&salvage_conn, "agent_links")?;
-                if let Some(agent_link_select) =
-                    build_salvage_agent_links_select(&agent_link_columns, stats, salvage_db_path)
-                {
-                    let agent_link_rows = salvage_conn
-                        .query_sync(
-                            &format!(
-                                "SELECT {agent_link_select} FROM agent_links \
-                             ORDER BY a_project_id, a_agent_id, b_project_id, b_agent_id"
-                            ),
-                            &[],
-                        )
-                        .map_err(|e| {
-                            DbError::Sqlite(format!("reconstruct salvage: query agent_links: {e}"))
-                        })?;
+        if has_file_reservations {
+            let reservation_columns = table_columns(&salvage_conn, "file_reservations")?;
+            let reservation_select = build_salvage_select(
+                "file_reservations",
+                &reservation_columns,
+                &[
+                    "id",
+                    "project_id",
+                    "agent_id",
+                    "path_pattern",
+                    "exclusive",
+                    "reason",
+                    "created_ts",
+                    "expires_ts",
+                ],
+                &["released_ts"],
+                stats,
+                salvage_db_path,
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: file_reservations schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
+            let reservation_rows = salvage_conn
+                .query_sync(
+                    &format!("SELECT {reservation_select} FROM file_reservations ORDER BY id"),
+                    &[],
+                )
+                .map_err(|e| {
+                    DbError::Sqlite(format!("reconstruct salvage: query file_reservations: {e}"))
+                })?;
+            if !reservation_rows.is_empty()
+                && (project_id_map.is_empty() || agent_id_map.is_empty())
+            {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct salvage: {} has file_reservations rows but stable project/agent identity maps are unavailable",
+                    salvage_db_path.display()
+                )));
+            }
 
-                    for row in &agent_link_rows {
-                        let Some(source_origin_ids) = row
-                            .get_named::<i64>("a_project_id")
-                            .ok()
-                            .filter(|value| *value > 0)
-                            .zip(
-                                row.get_named::<i64>("a_agent_id")
-                                    .ok()
-                                    .filter(|value| *value > 0),
-                            )
-                        else {
-                            continue;
-                        };
-                        let Some(source_peer_ids) = row
-                            .get_named::<i64>("b_project_id")
-                            .ok()
-                            .filter(|value| *value > 0)
-                            .zip(
-                                row.get_named::<i64>("b_agent_id")
-                                    .ok()
-                                    .filter(|value| *value > 0),
-                            )
-                        else {
-                            continue;
-                        };
+            for row in &reservation_rows {
+                let source_reservation_id = row.get_named::<i64>("id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode file reservation id: {e}"
+                    ))
+                })?;
+                if source_reservation_id <= 0 {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: file reservation has non-positive id {source_reservation_id}"
+                    )));
+                }
+                let source_project_id = row.get_named::<i64>("project_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode project_id for reservation {source_reservation_id}: {e}"
+                    ))
+                })?;
+                let source_agent_id = row.get_named::<i64>("agent_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode agent_id for reservation {source_reservation_id}: {e}"
+                    ))
+                })?;
+                let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: reservation {source_reservation_id} referenced unmapped project id {source_project_id}"
+                    ))
+                })?;
+                let target_agent_id = *agent_id_map.get(&source_agent_id).ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: reservation {source_reservation_id} referenced unmapped agent id {source_agent_id}"
+                    ))
+                })?;
+                if agent_project_id(&target_conn, target_agent_id)? != Some(target_project_id) {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: reservation {source_reservation_id} maps agent {source_agent_id} outside project {source_project_id}; refusing cross-project ownership"
+                    )));
+                }
 
-                        let Some(target_origin_ids) = project_id_map
-                            .get(&source_origin_ids.0)
-                            .copied()
-                            .zip(agent_id_map.get(&source_origin_ids.1).copied())
-                        else {
-                            continue;
-                        };
-                        let Some(target_peer_ids) = project_id_map
-                            .get(&source_peer_ids.0)
-                            .copied()
-                            .zip(agent_id_map.get(&source_peer_ids.1).copied())
-                        else {
-                            continue;
-                        };
+                let path_pattern = row
+                    .get_named::<String>("path_pattern")
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode path_pattern for reservation {source_reservation_id}: {e}"
+                        ))
+                    })?
+                    .trim()
+                    .to_string();
+                if path_pattern.is_empty() {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: reservation {source_reservation_id} has an empty path_pattern"
+                    )));
+                }
+                let exclusive = i64::from(
+                    row.get_named::<i64>("exclusive").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode exclusive for reservation {source_reservation_id}: {e}"
+                        ))
+                    })? != 0,
+                );
+                let reason = row.get_named::<String>("reason").unwrap_or_default();
+                let created_ts = row.get_named::<i64>("created_ts").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode created_ts for reservation {source_reservation_id}: {e}"
+                    ))
+                })?;
+                let expires_ts = row.get_named::<i64>("expires_ts").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode expires_ts for reservation {source_reservation_id}: {e}"
+                    ))
+                })?;
+                let released_ts = row.get_named::<i64>("released_ts").ok();
 
+                // Numeric ids are local to the source database. Resolve the
+                // logical reservation exclusively through remapped stable
+                // project/agent identities plus its immutable path/time key.
+                let existing_rows = target_conn
+                    .query_sync(
+                        "SELECT id, exclusive, reason, expires_ts, released_ts \
+                         FROM file_reservations \
+                         WHERE project_id = ? AND agent_id = ? AND path_pattern = ? AND created_ts = ? \
+                         ORDER BY id",
+                        &[
+                            Value::BigInt(target_project_id),
+                            Value::BigInt(target_agent_id),
+                            Value::Text(path_pattern.clone()),
+                            Value::BigInt(created_ts),
+                        ],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: resolve reservation {source_reservation_id} by stable identity: {e}"
+                        ))
+                    })?;
+                if existing_rows.len() > 1 {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: reservation {source_reservation_id} has {} target rows for the same stable ownership key; refusing ambiguous promotion",
+                        existing_rows.len()
+                    )));
+                }
+
+                let target_reservation_id = if let Some(existing) = existing_rows.first() {
+                    let target_reservation_id = existing.get_named::<i64>("id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode target reservation id: {e}"
+                        ))
+                    })?;
+                    let current_exclusive =
+                        i64::from(existing.get_named::<i64>("exclusive").unwrap_or(1) != 0);
+                    let current_reason = existing.get_named::<String>("reason").unwrap_or_default();
+                    let current_expires_ts = existing
+                        .get_named::<i64>("expires_ts")
+                        .unwrap_or(expires_ts);
+                    let current_released_ts = existing.get_named::<i64>("released_ts").ok();
+                    if current_exclusive != exclusive {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: reservation {source_reservation_id} conflicts with target reservation {target_reservation_id} on exclusive ownership for the same stable key"
+                        )));
+                    }
+                    if !current_reason.is_empty() && !reason.is_empty() && current_reason != reason
+                    {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: reservation {source_reservation_id} conflicts with target reservation {target_reservation_id} on reason metadata for the same stable key"
+                        )));
+                    }
+                    if current_released_ts.is_some()
+                        && released_ts.is_some()
+                        && current_released_ts != released_ts
+                    {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: reservation {source_reservation_id} conflicts with target reservation {target_reservation_id} on terminal release timestamp"
+                        )));
+                    }
+                    let merged_reason = if current_reason.is_empty() {
+                        reason.clone()
+                    } else {
+                        current_reason.clone()
+                    };
+                    let merged_expires_ts = current_expires_ts.max(expires_ts);
+                    let merged_released_ts = current_released_ts.or(released_ts);
+                    if merged_reason != current_reason
+                        || merged_expires_ts != current_expires_ts
+                        || merged_released_ts != current_released_ts
+                    {
                         target_conn
+                            .execute_sync(
+                                "UPDATE file_reservations SET reason = ?, expires_ts = ?, released_ts = ? WHERE id = ?",
+                                &[
+                                    Value::Text(merged_reason),
+                                    Value::BigInt(merged_expires_ts),
+                                    merged_released_ts.map_or(Value::Null, Value::BigInt),
+                                    Value::BigInt(target_reservation_id),
+                                ],
+                            )
+                            .map_err(|e| {
+                                DbError::Sqlite(format!(
+                                    "reconstruct salvage: merge reservation {source_reservation_id} state: {e}"
+                                ))
+                            })?;
+                        stats.salvaged_reservations += 1;
+                    }
+                    target_reservation_id
+                } else {
+                    target_conn
                         .execute_sync(
-                            "INSERT OR IGNORE INTO agent_links \
-                             (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO file_reservations \
+                             (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                             &[
-                                Value::BigInt(target_origin_ids.0),
-                                Value::BigInt(target_origin_ids.1),
-                                Value::BigInt(target_peer_ids.0),
-                                Value::BigInt(target_peer_ids.1),
-                                Value::Text(
-                                    row.get_named::<String>("status")
-                                        .unwrap_or_else(|_| "pending".to_string()),
-                                ),
-                                Value::Text(row.get_named::<String>("reason").unwrap_or_default()),
-                                Value::BigInt(
-                                    row.get_named::<i64>("created_ts")
-                                        .unwrap_or_else(|_| crate::now_micros()),
-                                ),
-                                Value::BigInt(
-                                    row.get_named::<i64>("updated_ts")
-                                        .unwrap_or_else(|_| crate::now_micros()),
-                                ),
-                                row.get_named::<i64>("expires_ts")
-                                    .map_or(Value::Null, Value::BigInt),
+                                Value::BigInt(target_project_id),
+                                Value::BigInt(target_agent_id),
+                                Value::Text(path_pattern),
+                                Value::BigInt(exclusive),
+                                Value::Text(reason),
+                                Value::BigInt(created_ts),
+                                Value::BigInt(expires_ts),
+                                released_ts.map_or(Value::Null, Value::BigInt),
                             ],
                         )
                         .map_err(|e| {
                             DbError::Sqlite(format!(
-                                "reconstruct salvage: insert agent_link \
-                                 {}/{}->{}/{}: {e}",
-                                source_origin_ids.0,
-                                source_origin_ids.1,
-                                source_peer_ids.0,
-                                source_peer_ids.1
+                                "reconstruct salvage: insert reservation {source_reservation_id}: {e}"
                             ))
                         })?;
+                    stats.salvaged_reservations += 1;
+                    query_last_insert_rowid(&target_conn)?
+                };
+                reservation_id_map.insert(source_reservation_id, target_reservation_id);
+            }
+        }
+
+        if has_file_reservation_releases {
+            if !has_file_reservations {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct salvage: {} has file_reservation_releases without file_reservations",
+                    salvage_db_path.display()
+                )));
+            }
+            let release_columns = table_columns(&salvage_conn, "file_reservation_releases")?;
+            let release_select = build_salvage_select(
+                "file_reservation_releases",
+                &release_columns,
+                &["reservation_id", "released_ts"],
+                &[],
+                stats,
+                salvage_db_path,
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: file_reservation_releases schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
+            let release_rows = salvage_conn
+                .query_sync(
+                    &format!(
+                        "SELECT {release_select} FROM file_reservation_releases ORDER BY reservation_id"
+                    ),
+                    &[],
+                )
+                .map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: query file_reservation_releases: {e}"
+                    ))
+                })?;
+            for row in &release_rows {
+                let source_reservation_id =
+                    row.get_named::<i64>("reservation_id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode release reservation_id: {e}"
+                        ))
+                    })?;
+                let released_ts = row.get_named::<i64>("released_ts").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode release timestamp for reservation {source_reservation_id}: {e}"
+                    ))
+                })?;
+                let target_reservation_id =
+                    *reservation_id_map.get(&source_reservation_id).ok_or_else(|| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: release references unmapped reservation id {source_reservation_id}"
+                        ))
+                    })?;
+                let existing_release_rows = target_conn
+                    .query_sync(
+                        "SELECT released_ts FROM file_reservation_releases WHERE reservation_id = ?",
+                        &[Value::BigInt(target_reservation_id)],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query release for target reservation {target_reservation_id}: {e}"
+                        ))
+                    })?;
+                if let Some(existing) = existing_release_rows.first() {
+                    let current_released_ts = existing.get_named::<i64>("released_ts").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode target release for reservation {target_reservation_id}: {e}"
+                        ))
+                    })?;
+                    if current_released_ts != released_ts {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: reservation {source_reservation_id} has conflicting terminal release ledger timestamps ({released_ts} versus {current_released_ts})"
+                        )));
                     }
+                    continue;
+                }
+                let legacy_release_rows = target_conn
+                    .query_sync(
+                        "SELECT released_ts FROM file_reservations WHERE id = ?",
+                        &[Value::BigInt(target_reservation_id)],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query legacy release state for reservation {target_reservation_id}: {e}"
+                        ))
+                    })?;
+                if let Some(legacy_release) = legacy_release_rows
+                    .first()
+                    .and_then(|existing| existing.get_named::<i64>("released_ts").ok())
+                    && legacy_release != released_ts
+                {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: reservation {source_reservation_id} has conflicting row/ledger release timestamps ({legacy_release} versus {released_ts})"
+                    )));
+                }
+                target_conn
+                    .execute_sync(
+                        "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)",
+                        &[
+                            Value::BigInt(target_reservation_id),
+                            Value::BigInt(released_ts),
+                        ],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: insert release for reservation {source_reservation_id}: {e}"
+                        ))
+                    })?;
+                stats.salvaged_reservation_releases += 1;
+            }
+        }
+
+        if has_agent_links {
+            let agent_link_columns = table_columns(&salvage_conn, "agent_links")?;
+            let agent_link_select =
+                build_salvage_agent_links_select(&agent_link_columns, stats, salvage_db_path)
+                    .ok_or_else(|| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: agent_links schema is incomplete in {}",
+                            salvage_db_path.display()
+                        ))
+                    })?;
+            let agent_link_rows = salvage_conn
+                .query_sync(
+                    &format!(
+                        "SELECT {agent_link_select} FROM agent_links \
+                         ORDER BY a_project_id, a_agent_id, b_project_id, b_agent_id"
+                    ),
+                    &[],
+                )
+                .map_err(|e| {
+                    DbError::Sqlite(format!("reconstruct salvage: query agent_links: {e}"))
+                })?;
+            if !agent_link_rows.is_empty() && (project_id_map.is_empty() || agent_id_map.is_empty())
+            {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct salvage: {} has agent_links rows but stable project/agent identity maps are unavailable",
+                    salvage_db_path.display()
+                )));
+            }
+
+            for row in &agent_link_rows {
+                let source_origin_project_id =
+                    row.get_named::<i64>("a_project_id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode agent_link origin project: {e}"
+                        ))
+                    })?;
+                let source_origin_agent_id = row.get_named::<i64>("a_agent_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode agent_link origin agent: {e}"
+                    ))
+                })?;
+                let source_peer_project_id = row.get_named::<i64>("b_project_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode agent_link peer project: {e}"
+                    ))
+                })?;
+                let source_peer_agent_id = row.get_named::<i64>("b_agent_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode agent_link peer agent: {e}"
+                    ))
+                })?;
+                let target_origin_project_id = *project_id_map
+                    .get(&source_origin_project_id)
+                    .ok_or_else(|| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: agent_link references unmapped origin project {source_origin_project_id}"
+                        ))
+                    })?;
+                let target_origin_agent_id = *agent_id_map
+                    .get(&source_origin_agent_id)
+                    .ok_or_else(|| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: agent_link references unmapped origin agent {source_origin_agent_id}"
+                        ))
+                    })?;
+                let target_peer_project_id = *project_id_map
+                    .get(&source_peer_project_id)
+                    .ok_or_else(|| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: agent_link references unmapped peer project {source_peer_project_id}"
+                        ))
+                    })?;
+                let target_peer_agent_id =
+                    *agent_id_map.get(&source_peer_agent_id).ok_or_else(|| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: agent_link references unmapped peer agent {source_peer_agent_id}"
+                        ))
+                    })?;
+                if agent_project_id(&target_conn, target_origin_agent_id)?
+                    != Some(target_origin_project_id)
+                    || agent_project_id(&target_conn, target_peer_agent_id)?
+                        != Some(target_peer_project_id)
+                {
+                    return Err(DbError::Sqlite(
+                        "reconstruct salvage: agent_link ownership crosses a stable project boundary"
+                            .to_string(),
+                    ));
+                }
+
+                let link_status = row
+                    .get_named::<String>("status")
+                    .unwrap_or_else(|_| "pending".to_string());
+                let reason = row.get_named::<String>("reason").unwrap_or_default();
+                let created_ts = row
+                    .get_named::<i64>("created_ts")
+                    .unwrap_or_else(|_| crate::now_micros());
+                let updated_ts = row.get_named::<i64>("updated_ts").unwrap_or(created_ts);
+                let expires_ts = row.get_named::<i64>("expires_ts").ok();
+                if created_ts <= 0 || updated_ts < created_ts {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: agent_link {source_origin_project_id}/{source_origin_agent_id}->{source_peer_project_id}/{source_peer_agent_id} has invalid timestamp ordering ({created_ts}, {updated_ts})"
+                    )));
+                }
+
+                let existing_links = target_conn
+                    .query_sync(
+                        "SELECT id FROM agent_links \
+                         WHERE a_project_id = ? AND a_agent_id = ? \
+                           AND b_project_id = ? AND b_agent_id = ? LIMIT 2",
+                        &[
+                            Value::BigInt(target_origin_project_id),
+                            Value::BigInt(target_origin_agent_id),
+                            Value::BigInt(target_peer_project_id),
+                            Value::BigInt(target_peer_agent_id),
+                        ],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query existing agent_link: {e}"
+                        ))
+                    })?;
+                if existing_links.len() > 1 {
+                    return Err(DbError::Sqlite(
+                        "reconstruct salvage: multiple target agent_links share the same stable endpoint quartet"
+                            .to_string(),
+                    ));
+                }
+                let state_values = [
+                    Value::Text(link_status),
+                    Value::Text(reason),
+                    Value::BigInt(created_ts),
+                    Value::BigInt(updated_ts),
+                    expires_ts.map_or(Value::Null, Value::BigInt),
+                ];
+                if let Some(existing) = existing_links.first() {
+                    let target_link_id = existing.get_named::<i64>("id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode existing agent_link id: {e}"
+                        ))
+                    })?;
+                    let mut values = state_values.to_vec();
+                    values.push(Value::BigInt(target_link_id));
+                    target_conn
+                        .execute_sync(
+                            "UPDATE agent_links SET status = ?, reason = ?, created_ts = ?, updated_ts = ?, expires_ts = ? WHERE id = ?",
+                            &values,
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: restore state for agent_link {target_link_id}: {e}"
+                            ))
+                        })?;
+                } else {
+                    let mut values = vec![
+                        Value::BigInt(target_origin_project_id),
+                        Value::BigInt(target_origin_agent_id),
+                        Value::BigInt(target_peer_project_id),
+                        Value::BigInt(target_peer_agent_id),
+                    ];
+                    values.extend(state_values);
+                    target_conn
+                        .execute_sync(
+                            "INSERT INTO agent_links \
+                             (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            &values,
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: insert agent_link {source_origin_project_id}/{source_origin_agent_id}->{source_peer_project_id}/{source_peer_agent_id}: {e}"
+                            ))
+                        })?;
                 }
             }
         }
 
         if has_products {
             let product_columns = table_columns(&salvage_conn, "products")?;
-            if let Some(product_select) = build_salvage_select(
+            let product_select = build_salvage_select(
                 "products",
                 &product_columns,
                 &["id", "product_uid", "name"],
                 &["created_at"],
                 stats,
                 salvage_db_path,
-            ) {
-                let product_rows = salvage_conn
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: products schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
+            let product_rows = salvage_conn
+                .query_sync(
+                    &format!("SELECT {product_select} FROM products ORDER BY id"),
+                    &[],
+                )
+                .map_err(|e| {
+                    DbError::Sqlite(format!("reconstruct salvage: query products: {e}"))
+                })?;
+
+            for row in &product_rows {
+                let source_product_id = row.get_named::<i64>("id").map_err(|e| {
+                    DbError::Sqlite(format!("reconstruct salvage: decode product id: {e}"))
+                })?;
+                if source_product_id <= 0 {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: product has non-positive id {source_product_id}"
+                    )));
+                }
+                let product_uid = row.get_named::<String>("product_uid").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode uid for product {source_product_id}: {e}"
+                    ))
+                })?;
+                let product_uid = product_uid.trim().to_string();
+                if product_uid.is_empty() {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: product {source_product_id} has an empty stable uid"
+                    )));
+                }
+                let name = row.get_named::<String>("name").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode name for product {source_product_id}: {e}"
+                    ))
+                })?;
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: product {source_product_id} has an empty name"
+                    )));
+                }
+
+                let uid_rows = target_conn
                     .query_sync(
-                        &format!("SELECT {product_select} FROM products ORDER BY id"),
-                        &[],
-                    )
-                    .map_err(|e| {
-                        DbError::Sqlite(format!("reconstruct salvage: query products: {e}"))
-                    })?;
-
-                for row in &product_rows {
-                    let Some(source_product_id) =
-                        row.get_named::<i64>("id").ok().filter(|value| *value > 0)
-                    else {
-                        continue;
-                    };
-                    let product_uid = row
-                        .get_named::<String>("product_uid")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    if product_uid.is_empty() {
-                        stats.warnings.push(format!(
-                        "Salvage database {} had a product row with empty product_uid; skipping",
-                        salvage_db_path.display()
-                    ));
-                        continue;
-                    }
-                    let name = row
-                        .get_named::<String>("name")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    if name.is_empty() {
-                        stats.warnings.push(format!(
-                            "Salvage database {} had a product row with empty name; skipping",
-                            salvage_db_path.display()
-                        ));
-                        continue;
-                    }
-
-                    target_conn
-                    .execute_sync(
-                        "INSERT OR IGNORE INTO products (product_uid, name, created_at) VALUES (?, ?, ?)",
-                        &[
-                            Value::Text(product_uid.clone()),
-                            Value::Text(name.clone()),
-                            Value::BigInt(
-                                row.get_named::<i64>("created_at")
-                                    .unwrap_or_else(|_| crate::now_micros()),
-                            ),
-                        ],
+                        "SELECT id, name FROM products WHERE product_uid = ? LIMIT 2",
+                        &[Value::Text(product_uid.clone())],
                     )
                     .map_err(|e| {
                         DbError::Sqlite(format!(
-                            "reconstruct salvage: insert product {product_uid}: {e}"
+                            "reconstruct salvage: query product uid {product_uid}: {e}"
+                        ))
+                    })?;
+                let name_rows = target_conn
+                    .query_sync(
+                        "SELECT id, product_uid FROM products WHERE name = ? LIMIT 2",
+                        &[Value::Text(name.clone())],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query product name {name:?}: {e}"
                         ))
                     })?;
 
-                    let target_product_id = query_last_insert_or_existing_id(
+                let target_product_id = if let Some(existing) = uid_rows.first() {
+                    let existing_id = existing.get_named::<i64>("id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode existing product {product_uid} id: {e}"
+                        ))
+                    })?;
+                    let existing_name = existing.get_named::<String>("name").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode existing product {product_uid} name: {e}"
+                        ))
+                    })?;
+                    if existing_name.trim() != name {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: stable product uid {product_uid:?} has conflicting names {:?} and {name:?}; refusing ambiguous product identity",
+                            existing_name.trim()
+                        )));
+                    }
+                    if let Some(named) = name_rows.first() {
+                        let named_id = named.get_named::<i64>("id").map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: decode product name {name:?} id: {e}"
+                            ))
+                        })?;
+                        if named_id != existing_id {
+                            return Err(DbError::Sqlite(format!(
+                                "reconstruct salvage: product uid {product_uid:?} and name {name:?} resolve to different target rows; refusing cross-binding"
+                            )));
+                        }
+                    }
+                    existing_id
+                } else {
+                    if let Some(existing) = name_rows.first() {
+                        let existing_uid = existing
+                            .get_named::<String>("product_uid")
+                            .unwrap_or_default();
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: product name {name:?} is already bound to stable uid {:?}, not {product_uid:?}; refusing name-based identity fallback",
+                            existing_uid.trim()
+                        )));
+                    }
+                    target_conn
+                        .execute_sync(
+                            "INSERT INTO products (product_uid, name, created_at) VALUES (?, ?, ?)",
+                            &[
+                                Value::Text(product_uid.clone()),
+                                Value::Text(name.clone()),
+                                Value::BigInt(
+                                    row.get_named::<i64>("created_at")
+                                        .unwrap_or_else(|_| crate::now_micros()),
+                                ),
+                            ],
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: insert product {product_uid}: {e}"
+                            ))
+                        })?;
+                    query_last_insert_or_existing_id(
                         &target_conn,
                         "products",
                         "product_uid",
                         &product_uid,
-                    )
-                    .or_else(|_| {
-                        query_last_insert_or_existing_id(&target_conn, "products", "name", &name)
-                    })?;
-                    product_id_map.insert(source_product_id, target_product_id);
-                }
+                    )?
+                };
+                product_id_map.insert(source_product_id, target_product_id);
             }
         }
 
         if has_product_project_links {
-            if product_id_map.is_empty() || project_id_map.is_empty() {
-                stats.warnings.push(format!(
-                "Salvage database {} had product_project_links rows but missing product/project state prevented product link recovery",
-                salvage_db_path.display()
-            ));
-            } else {
-                let product_link_columns = table_columns(&salvage_conn, "product_project_links")?;
-                if let Some(product_link_select) = build_salvage_select(
-                    "product_project_links",
-                    &product_link_columns,
-                    &["product_id", "project_id"],
-                    &["created_at"],
-                    stats,
-                    salvage_db_path,
-                ) {
-                    let product_link_rows = salvage_conn
-                        .query_sync(
-                            &format!(
-                                "SELECT {product_link_select} FROM product_project_links \
+            let product_link_columns = table_columns(&salvage_conn, "product_project_links")?;
+            let product_link_select = build_salvage_select(
+                "product_project_links",
+                &product_link_columns,
+                &["product_id", "project_id"],
+                &["created_at"],
+                stats,
+                salvage_db_path,
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: product_project_links schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
+            let product_link_rows = salvage_conn
+                .query_sync(
+                    &format!(
+                        "SELECT {product_link_select} FROM product_project_links \
                              ORDER BY product_id, project_id"
-                            ),
-                            &[],
-                        )
-                        .map_err(|e| {
-                            DbError::Sqlite(format!(
-                                "reconstruct salvage: query product_project_links: {e}"
-                            ))
-                        })?;
+                    ),
+                    &[],
+                )
+                .map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: query product_project_links: {e}"
+                    ))
+                })?;
+            if !product_link_rows.is_empty()
+                && (product_id_map.is_empty() || project_id_map.is_empty())
+            {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct salvage: {} has product_project_links rows but stable product/project identity maps are unavailable",
+                    salvage_db_path.display()
+                )));
+            }
 
-                    for row in &product_link_rows {
-                        let Some(source_product_id) = row
-                            .get_named::<i64>("product_id")
-                            .ok()
-                            .filter(|value| *value > 0)
-                        else {
-                            continue;
-                        };
-                        let Some(source_project_id) = row
-                            .get_named::<i64>("project_id")
-                            .ok()
-                            .filter(|value| *value > 0)
-                        else {
-                            continue;
-                        };
+            for row in &product_link_rows {
+                let source_product_id = row.get_named::<i64>("product_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode product_project_link product id: {e}"
+                    ))
+                })?;
+                let source_project_id = row.get_named::<i64>("project_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode product_project_link project id: {e}"
+                    ))
+                })?;
+                let target_product_id = *product_id_map
+                            .get(&source_product_id)
+                            .ok_or_else(|| {
+                                DbError::Sqlite(format!(
+                                    "reconstruct salvage: product_project_link references unmapped product {source_product_id}"
+                                ))
+                            })?;
+                let target_project_id = *project_id_map
+                            .get(&source_project_id)
+                            .ok_or_else(|| {
+                                DbError::Sqlite(format!(
+                                    "reconstruct salvage: product_project_link references unmapped project {source_project_id}"
+                                ))
+                            })?;
 
-                        let Some(&target_product_id) = product_id_map.get(&source_product_id)
-                        else {
-                            continue;
-                        };
-                        let Some(&target_project_id) = project_id_map.get(&source_project_id)
-                        else {
-                            continue;
-                        };
-
-                        target_conn
+                target_conn
                         .execute_sync(
                             "INSERT OR IGNORE INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)",
                             &[
@@ -3456,8 +4286,113 @@ fn merge_salvaged_database(
                                  {source_product_id}->{source_project_id}: {e}"
                             ))
                         })?;
-                    }
+            }
+        }
+
+        if has_proof_gate_consumed_nonces {
+            let nonce_columns = table_columns(&salvage_conn, "proof_gate_consumed_nonces")?;
+            let nonce_select = build_salvage_select(
+                "proof_gate_consumed_nonces",
+                &nonce_columns,
+                &["issuer_key", "nonce", "retain_until", "consumed_at"],
+                &[],
+                stats,
+                salvage_db_path,
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: proof_gate_consumed_nonces schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
+            let nonce_rows = salvage_conn
+                .query_sync(
+                    &format!(
+                        "SELECT {nonce_select} FROM proof_gate_consumed_nonces ORDER BY issuer_key, nonce"
+                    ),
+                    &[],
+                )
+                .map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: query proof_gate_consumed_nonces: {e}"
+                    ))
+                })?;
+
+            for row in &nonce_rows {
+                let issuer_key = row
+                    .get_named::<String>("issuer_key")
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode proof nonce issuer key: {e}"
+                        ))
+                    })?
+                    .trim()
+                    .to_string();
+                let nonce = row
+                    .get_named::<String>("nonce")
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode proof nonce value: {e}"
+                        ))
+                    })?
+                    .trim()
+                    .to_string();
+                if issuer_key.is_empty() || nonce.is_empty() {
+                    return Err(DbError::Sqlite(
+                        "reconstruct salvage: consumed proof nonce has an empty stable issuer/nonce key"
+                            .to_string(),
+                    ));
                 }
+                let retain_until = row.get_named::<i64>("retain_until").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode retain_until for proof nonce: {e}"
+                    ))
+                })?;
+                let consumed_at = row.get_named::<i64>("consumed_at").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode consumed_at for proof nonce: {e}"
+                    ))
+                })?;
+                let existing = target_conn
+                    .query_sync(
+                        "SELECT retain_until, consumed_at FROM proof_gate_consumed_nonces \
+                         WHERE issuer_key = ? AND nonce = ? LIMIT 2",
+                        &[Value::Text(issuer_key.clone()), Value::Text(nonce.clone())],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query existing consumed proof nonce: {e}"
+                        ))
+                    })?;
+                if let Some(existing) = existing.first() {
+                    let current_retain_until = existing
+                        .get_named::<i64>("retain_until")
+                        .unwrap_or_default();
+                    let current_consumed_at =
+                        existing.get_named::<i64>("consumed_at").unwrap_or_default();
+                    if current_retain_until != retain_until || current_consumed_at != consumed_at {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: consumed proof nonce ({issuer_key:?}, {nonce:?}) has conflicting durable timestamps; refusing to weaken replay prevention"
+                        )));
+                    }
+                    continue;
+                }
+                target_conn
+                    .execute_sync(
+                        "INSERT INTO proof_gate_consumed_nonces \
+                         (issuer_key, nonce, retain_until, consumed_at) VALUES (?, ?, ?, ?)",
+                        &[
+                            Value::Text(issuer_key),
+                            Value::Text(nonce),
+                            Value::BigInt(retain_until),
+                            Value::BigInt(consumed_at),
+                        ],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: insert consumed proof nonce: {e}"
+                        ))
+                    })?;
             }
         }
 
@@ -3466,7 +4401,7 @@ fn merge_salvaged_database(
 
         if has_messages {
             let message_columns = table_columns(&salvage_conn, "messages")?;
-            if let Some(message_select) = build_salvage_select(
+            let message_select = build_salvage_select(
                 "messages",
                 &message_columns,
                 &["id", "project_id", "sender_id"],
@@ -3482,61 +4417,90 @@ fn merge_salvaged_database(
                 ],
                 stats,
                 salvage_db_path,
-            ) {
-                #[cfg(test)]
-                if FAIL_SALVAGE_QUERY_MESSAGES.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    return Err(DbError::Sqlite(
-                        "reconstruct salvage: query messages: Query error: database disk image is malformed"
-                            .to_owned(),
-                    ));
-                }
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: messages schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
+            #[cfg(test)]
+            if FAIL_SALVAGE_QUERY_MESSAGES.with(|hook| hook.replace(false)) {
+                return Err(DbError::Sqlite(
+                    "reconstruct salvage: query messages: Query error: database disk image is malformed"
+                        .to_owned(),
+                ));
+            }
 
+            // br-5mnkl: keyset-paginated read — see SALVAGE_MESSAGE_BATCH_ROWS.
+            // The first batch has no id floor so non-positive ids (which the
+            // strict salvage contract refuses) still sort first, surface, and
+            // fail closed exactly as the previous full-table read did.
+            let mut message_keyset_floor: Option<i64> = None;
+            loop {
+                let (message_where, message_params): (&str, Vec<Value>) = match message_keyset_floor
+                {
+                    Some(floor) => (" WHERE id > ?", vec![Value::BigInt(floor)]),
+                    None => ("", Vec::new()),
+                };
                 let message_rows = salvage_conn
                     .query_sync(
-                        &format!("SELECT {message_select} FROM messages ORDER BY id"),
-                        &[],
+                        &format!(
+                            "SELECT {message_select} FROM messages{message_where} \
+                             ORDER BY id LIMIT {SALVAGE_MESSAGE_BATCH_ROWS}"
+                        ),
+                        &message_params,
                     )
                     .map_err(|e| {
                         DbError::Sqlite(format!("reconstruct salvage: query messages: {e}"))
                     })?;
+                if message_rows.is_empty() {
+                    break;
+                }
 
                 for row in &message_rows {
-                    let Some(message_id) =
-                        row.get_named::<i64>("id").ok().filter(|value| *value > 0)
-                    else {
-                        continue;
-                    };
-                    if message_id_exists(&target_conn, message_id)? {
-                        continue;
+                    let source_message_id = row.get_named::<i64>("id").map_err(|e| {
+                        DbError::Sqlite(format!("reconstruct salvage: decode message id: {e}"))
+                    })?;
+                    if source_message_id <= 0 {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: message has non-positive id {source_message_id}"
+                        )));
+                    }
+                    message_keyset_floor = Some(source_message_id);
+                    let source_project_id = row.get_named::<i64>("project_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode project_id for message {source_message_id}: {e}"
+                    ))
+                })?;
+                    let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: message {source_message_id} referenced unmapped project id {source_project_id}"
+                    ))
+                })?;
+                    let source_sender_id = row.get_named::<i64>("sender_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode sender_id for message {source_message_id}: {e}"
+                    ))
+                })?;
+                    let target_sender_id = *agent_id_map.get(&source_sender_id).ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: message {source_message_id} referenced unmapped sender id {source_sender_id}"
+                    ))
+                })?;
+                    if agent_project_id(&target_conn, target_sender_id)? != Some(target_project_id)
+                    {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: message {source_message_id} maps sender {source_sender_id} outside project {source_project_id}; refusing cross-project ownership"
+                        )));
                     }
 
-                    let Some(source_project_id) = row
-                        .get_named::<i64>("project_id")
-                        .ok()
-                        .filter(|value| *value > 0)
-                    else {
+                    if message_project_id(&target_conn, source_message_id)?
+                        == Some(target_project_id)
+                    {
+                        message_id_map.insert(source_message_id, source_message_id);
                         continue;
-                    };
-                    let Some(&target_project_id) = project_id_map.get(&source_project_id) else {
-                        stats.warnings.push(format!(
-                        "Salvage message {message_id} referenced missing project id {source_project_id}; skipping"
-                    ));
-                        continue;
-                    };
-
-                    let Some(source_sender_id) = row
-                        .get_named::<i64>("sender_id")
-                        .ok()
-                        .filter(|value| *value > 0)
-                    else {
-                        continue;
-                    };
-                    let Some(&target_sender_id) = agent_id_map.get(&source_sender_id) else {
-                        stats.warnings.push(format!(
-                        "Salvage message {message_id} referenced missing sender id {source_sender_id}; skipping"
-                    ));
-                        continue;
-                    };
+                    }
 
                     let thread_id = row
                         .get_named::<String>("thread_id")
@@ -3546,157 +4510,224 @@ fn merge_salvaged_database(
                     let (recipients_json, to_names, cc_names, bcc_names) =
                         parse_salvaged_recipients_json(
                             row.get_named::<String>("recipients_json").ok(),
-                            message_id,
+                            source_message_id,
                             stats,
                         );
                     let attachments = parse_salvaged_attachments_json(
                         row.get_named::<String>("attachments").ok(),
-                        message_id,
+                        source_message_id,
                         stats,
                     );
-
-                    target_conn
-                    .execute_sync(
-                        "INSERT OR IGNORE INTO messages \
-                         (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        &[
-                            Value::BigInt(message_id),
-                            Value::BigInt(target_project_id),
-                            Value::BigInt(target_sender_id),
-                            thread_value,
-                            Value::Text(row.get_named::<String>("subject").unwrap_or_default()),
-                            Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
-                            Value::Text(
-                                row.get_named::<String>("importance")
-                                    .unwrap_or_else(|_| "normal".to_string()),
-                            ),
-                            Value::BigInt(i64::from(
-                                row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
-                            )),
-                            Value::BigInt(
-                                row.get_named::<i64>("created_ts")
-                                    .unwrap_or_else(|_| crate::now_micros()),
-                            ),
-                            Value::Text(recipients_json),
-                            Value::Text(attachments),
-                        ],
-                    )
-                    .map_err(|e| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: insert message {message_id}: {e}"
-                        ))
-                    })?;
+                    let values = [
+                        Value::BigInt(target_project_id),
+                        Value::BigInt(target_sender_id),
+                        thread_value,
+                        Value::Text(row.get_named::<String>("subject").unwrap_or_default()),
+                        Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
+                        Value::Text(
+                            row.get_named::<String>("importance")
+                                .unwrap_or_else(|_| "normal".to_string()),
+                        ),
+                        Value::BigInt(i64::from(
+                            row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
+                        )),
+                        Value::BigInt(
+                            row.get_named::<i64>("created_ts")
+                                .unwrap_or_else(|_| crate::now_micros()),
+                        ),
+                        Value::Text(recipients_json),
+                        Value::Text(attachments),
+                    ];
+                    let existing_project_id = message_project_id(&target_conn, source_message_id)?;
+                    let target_message_id = if let Some(existing_project_id) = existing_project_id {
+                        target_conn
+                        .execute_sync(
+                            "INSERT INTO messages \
+                             (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            &values,
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: remap cross-project message {source_message_id}: {e}"
+                            ))
+                        })?;
+                        let remapped_id = query_last_insert_rowid(&target_conn)?;
+                        stats.salvaged_message_id_remaps += 1;
+                        stats.push_warning(format!(
+                        "Salvage message id {source_message_id} belonged to remapped project {target_project_id}, but the archive candidate already used that numeric id for project {existing_project_id}; preserved it as message {remapped_id}"
+                    ));
+                        remapped_id
+                    } else {
+                        let mut values_with_id = Vec::with_capacity(values.len() + 1);
+                        values_with_id.push(Value::BigInt(source_message_id));
+                        values_with_id.extend(values);
+                        target_conn
+                        .execute_sync(
+                            "INSERT INTO messages \
+                             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            &values_with_id,
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: insert message {source_message_id}: {e}"
+                            ))
+                        })?;
+                        source_message_id
+                    };
+                    message_id_map.insert(source_message_id, target_message_id);
                     stats.salvaged_messages += 1;
 
-                    for name in &to_names {
-                        let agent_id = ensure_agent_exists(
-                            &target_conn,
-                            target_project_id,
-                            name,
-                            &mut reconstructed_recipient_agent_ids,
-                        )?;
-                        insert_recipient(&target_conn, message_id, agent_id, "to")?;
-                        stats.salvaged_recipients += 1;
-                        recipient_json_updates.insert(message_id);
+                    for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")]
+                    {
+                        for name in names {
+                            let agent_id = ensure_agent_exists(
+                                &target_conn,
+                                target_project_id,
+                                name,
+                                &mut reconstructed_recipient_agent_ids,
+                            )?;
+                            insert_recipient(&target_conn, target_message_id, agent_id, kind)?;
+                            stats.salvaged_recipients += 1;
+                            recipient_json_updates.insert(target_message_id);
+                        }
                     }
-                    for name in &cc_names {
-                        let agent_id = ensure_agent_exists(
-                            &target_conn,
-                            target_project_id,
-                            name,
-                            &mut reconstructed_recipient_agent_ids,
-                        )?;
-                        insert_recipient(&target_conn, message_id, agent_id, "cc")?;
-                        stats.salvaged_recipients += 1;
-                        recipient_json_updates.insert(message_id);
-                    }
-                    for name in &bcc_names {
-                        let agent_id = ensure_agent_exists(
-                            &target_conn,
-                            target_project_id,
-                            name,
-                            &mut reconstructed_recipient_agent_ids,
-                        )?;
-                        insert_recipient(&target_conn, message_id, agent_id, "bcc")?;
-                        stats.salvaged_recipients += 1;
-                        recipient_json_updates.insert(message_id);
-                    }
+                }
+                if message_rows.len() < SALVAGE_MESSAGE_BATCH_ROWS {
+                    break;
                 }
             }
         }
 
         if has_recipients {
             let recipient_columns = table_columns(&salvage_conn, "message_recipients")?;
-            if let Some(recipient_select) = build_salvage_select(
+            let recipient_select = build_salvage_select(
                 "message_recipients",
                 &recipient_columns,
                 &["message_id", "agent_id", "kind"],
                 &["read_ts", "ack_ts"],
                 stats,
                 salvage_db_path,
-            ) {
+            )
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: message_recipients schema is incomplete in {}",
+                    salvage_db_path.display()
+                ))
+            })?;
+            // br-5mnkl: keyset-paginated read — one row per recipient of every
+            // message in the mailbox, so a full-table SELECT is unbounded.
+            // Every product schema has declared `message_recipients` as an
+            // ordinary rowid table (its composite PRIMARY KEY never uses
+            // WITHOUT ROWID) and SQLite rowids are >= 1, so a floor of 0 is
+            // exact and no row can be skipped or double-read across batches
+            // even when a legacy salvage source carries duplicate
+            // (message_id, agent_id) pairs. Per-row handling is
+            // order-independent, so rowid order is as deterministic as the
+            // previous composite ORDER BY.
+            let mut recipient_rowid_floor = 0i64;
+            loop {
                 let recipient_rows = salvage_conn
-                .query_sync(
-                    &format!(
-                        "SELECT {recipient_select} FROM message_recipients ORDER BY message_id, agent_id, kind"
-                    ),
-                    &[],
-                )
-                .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: query recipients: {e}")))?;
+                    .query_sync(
+                        &format!(
+                            "SELECT rowid AS salvage_rowid, {recipient_select} \
+                             FROM message_recipients WHERE rowid > ? \
+                             ORDER BY rowid LIMIT {SALVAGE_RECIPIENT_BATCH_ROWS}"
+                        ),
+                        &[Value::BigInt(recipient_rowid_floor)],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!("reconstruct salvage: query recipients: {e}"))
+                    })?;
+                if recipient_rows.is_empty() {
+                    break;
+                }
 
                 for row in &recipient_rows {
-                    let Some(message_id) = row
-                        .get_named::<i64>("message_id")
-                        .ok()
-                        .filter(|value| *value > 0)
-                    else {
-                        continue;
-                    };
-                    if !message_id_exists(&target_conn, message_id)? {
-                        continue;
+                    recipient_rowid_floor = row.get_named::<i64>("salvage_rowid").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode recipient salvage rowid: {e}"
+                        ))
+                    })?;
+                    let source_message_id = row.get_named::<i64>("message_id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode recipient message_id: {e}"
+                        ))
+                    })?;
+                    let source_agent_id = row.get_named::<i64>("agent_id").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode agent_id for message {source_message_id}: {e}"
+                    ))
+                })?;
+                    let target_agent_id = *agent_id_map.get(&source_agent_id).ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: recipient for message {source_message_id} references unmapped agent id {source_agent_id}"
+                    ))
+                })?;
+                    let target_agent_project_id = agent_project_id(&target_conn, target_agent_id)?
+                    .ok_or_else(|| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: mapped target agent {target_agent_id} is missing"
+                        ))
+                    })?;
+                    let target_message_id = *message_id_map.get(&source_message_id).ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: recipient references unmapped source-local message id {source_message_id}; refusing to attach state without a decoded salvage message identity"
+                    ))
+                })?;
+                    let target_message_project_id = message_project_id(
+                    &target_conn,
+                    target_message_id,
+                )?
+                .ok_or_else(|| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: mapped target message {target_message_id} is missing"
+                    ))
+                })?;
+                    if target_agent_project_id != target_message_project_id {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: recipient agent {source_agent_id} for message {source_message_id} maps outside the message project; refusing cross-project recipient state"
+                        )));
                     }
-
-                    let Some(source_agent_id) = row
-                        .get_named::<i64>("agent_id")
-                        .ok()
-                        .filter(|value| *value > 0)
-                    else {
-                        continue;
-                    };
-                    let Some(&target_agent_id) = agent_id_map.get(&source_agent_id) else {
-                        continue;
-                    };
                     let raw_kind = row.get_named::<String>("kind").ok();
-                    let kind =
-                        normalize_salvaged_recipient_kind(raw_kind.as_deref(), message_id, stats);
+                    let kind = normalize_salvaged_recipient_kind(
+                        raw_kind.as_deref(),
+                        target_message_id,
+                        stats,
+                    );
                     let read_ts = row.get_named::<i64>("read_ts").ok();
                     let ack_ts = row.get_named::<i64>("ack_ts").ok();
-                    recipient_json_updates.insert(message_id);
+                    recipient_json_updates.insert(target_message_id);
 
                     let existing_rows = target_conn
                     .query_sync(
-                        "SELECT read_ts, ack_ts FROM message_recipients \
-                         WHERE message_id = ? AND agent_id = ? AND kind = ? LIMIT 1",
+                        "SELECT kind, read_ts, ack_ts FROM message_recipients \
+                         WHERE message_id = ? AND agent_id = ? LIMIT 2",
                         &[
-                            Value::BigInt(message_id),
+                            Value::BigInt(target_message_id),
                             Value::BigInt(target_agent_id),
-                            Value::Text(kind.clone()),
                         ],
                     )
                     .map_err(|e| {
                         DbError::Sqlite(format!(
-                            "reconstruct salvage: query recipient state for message {message_id}: {e}"
+                            "reconstruct salvage: query recipient state for message {source_message_id}->{target_message_id}: {e}"
                         ))
                     })?;
+
+                    if existing_rows.len() > 1 {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: message {target_message_id} and agent {target_agent_id} have multiple rows despite their stable recipient primary key"
+                        )));
+                    }
 
                     if existing_rows.is_empty() {
                         target_conn
                         .execute_sync(
-                            "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
                              VALUES (?, ?, ?, ?, ?)",
                             &[
-                                Value::BigInt(message_id),
+                                Value::BigInt(target_message_id),
                                 Value::BigInt(target_agent_id),
                                 Value::Text(kind),
                                 read_ts.map_or(Value::Null, Value::BigInt),
@@ -3705,7 +4736,7 @@ fn merge_salvaged_database(
                         )
                         .map_err(|e| {
                             DbError::Sqlite(format!(
-                                "reconstruct salvage: insert recipient for message {message_id}: {e}"
+                                "reconstruct salvage: insert recipient for message {source_message_id}->{target_message_id}: {e}"
                             ))
                         })?;
                         stats.salvaged_recipients += 1;
@@ -3713,32 +4744,45 @@ fn merge_salvaged_database(
                     }
 
                     let existing_row = &existing_rows[0];
-                    let current_read_ts = existing_row.get_named::<i64>("read_ts").ok();
-                    let current_ack_ts = existing_row.get_named::<i64>("ack_ts").ok();
-                    if current_read_ts.is_none() && read_ts.is_some()
-                        || current_ack_ts.is_none() && ack_ts.is_some()
-                    {
+                    let current_kind = existing_row.get_named::<String>("kind").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage: decode recipient kind for message {target_message_id}: {e}"
+                    ))
+                })?;
+                    if current_kind != kind {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: recipient ({target_message_id}, {target_agent_id}) has conflicting kinds {current_kind:?} and {kind:?}; refusing a primary-key collision"
+                        )));
+                    }
+                    let current_read_ts = existing_row
+                        .get_named::<Option<i64>>("read_ts")
+                        .unwrap_or_default();
+                    let current_ack_ts = existing_row
+                        .get_named::<Option<i64>>("ack_ts")
+                        .unwrap_or_default();
+                    if current_read_ts != read_ts || current_ack_ts != ack_ts {
                         target_conn
                         .execute_sync(
                             "UPDATE message_recipients SET \
-                                 read_ts = COALESCE(read_ts, ?), \
-                                 ack_ts = COALESCE(ack_ts, ?) \
-                             WHERE message_id = ? AND agent_id = ? AND kind = ?",
+                                 read_ts = ?, ack_ts = ? \
+                             WHERE message_id = ? AND agent_id = ?",
                             &[
                                 read_ts.map_or(Value::Null, Value::BigInt),
                                 ack_ts.map_or(Value::Null, Value::BigInt),
-                                Value::BigInt(message_id),
+                                Value::BigInt(target_message_id),
                                 Value::BigInt(target_agent_id),
-                                Value::Text(kind),
                             ],
                         )
                         .map_err(|e| {
                             DbError::Sqlite(format!(
-                                "reconstruct salvage: update recipient state for message {message_id}: {e}"
+                                "reconstruct salvage: update recipient state for message {source_message_id}->{target_message_id}: {e}"
                             ))
                         })?;
                         stats.salvaged_recipients += 1;
                     }
+                }
+                if recipient_rows.len() < SALVAGE_RECIPIENT_BATCH_ROWS {
+                    break;
                 }
             }
         }
@@ -3747,77 +4791,67 @@ fn merge_salvaged_database(
             sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
         }
 
-        if table_exists(&salvage_conn, "atc_experience_rollups")? {
-            let rollup_cols = table_columns(&salvage_conn, "atc_experience_rollups")?;
-            let has_stratum = rollup_cols
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case("stratum_key"));
-            if has_stratum {
-                let rollup_rows = salvage_conn
-                    .query_sync(
-                        "SELECT stratum_key, total_count, resolved_count, censored_count, \
-                         expired_count, correct_count, incorrect_count, total_regret, total_loss, \
-                         ewma_loss, ewma_weight FROM atc_experience_rollups ORDER BY stratum_key",
-                        &[],
-                    )
-                    .unwrap_or_default();
-                let now_ts = crate::timestamps::now_micros();
-                for row in &rollup_rows {
-                    let stratum_key = row.get_named::<String>("stratum_key").unwrap_or_default();
-                    if stratum_key.is_empty() {
-                        continue;
-                    }
-                    let total = row.get_named::<i64>("total_count").unwrap_or(0);
-                    let resolved = row.get_named::<i64>("resolved_count").unwrap_or(0);
-                    let censored = row.get_named::<i64>("censored_count").unwrap_or(0);
-                    let expired = row.get_named::<i64>("expired_count").unwrap_or(0);
-                    let correct = row.get_named::<i64>("correct_count").unwrap_or(0);
-                    let incorrect = row.get_named::<i64>("incorrect_count").unwrap_or(0);
-                    let regret = row.get_named::<f64>("total_regret").unwrap_or(0.0);
-                    let loss = row.get_named::<f64>("total_loss").unwrap_or(0.0);
-                    let ewma = row.get_named::<f64>("ewma_loss").unwrap_or(0.0);
-                    let weight = row.get_named::<f64>("ewma_weight").unwrap_or(0.0);
-                    let upsert_result = target_conn.execute_sync(
-                        "INSERT INTO atc_experience_rollups \
-                         (stratum_key, subsystem, effect_kind, risk_tier, \
-                          total_count, resolved_count, censored_count, expired_count, \
-                          correct_count, incorrect_count, total_regret, total_loss, \
-                          ewma_loss, ewma_weight, delay_sum_micros, delay_count, delay_max_micros, \
-                          last_updated_ts) \
-                         VALUES (?, '', '', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?) \
-                         ON CONFLICT(stratum_key) DO UPDATE SET \
-                          total_count = MAX(total_count, excluded.total_count), \
-                          resolved_count = MAX(resolved_count, excluded.resolved_count), \
-                          censored_count = MAX(censored_count, excluded.censored_count), \
-                          expired_count = MAX(expired_count, excluded.expired_count), \
-                          correct_count = MAX(correct_count, excluded.correct_count), \
-                          incorrect_count = MAX(incorrect_count, excluded.incorrect_count), \
-                          total_regret = MAX(total_regret, excluded.total_regret), \
-                          total_loss = MAX(total_loss, excluded.total_loss), \
-                          ewma_loss = CASE WHEN excluded.ewma_weight > ewma_weight \
-                                      THEN excluded.ewma_loss ELSE ewma_loss END, \
-                          ewma_weight = MAX(ewma_weight, excluded.ewma_weight), \
-                          last_updated_ts = MAX(last_updated_ts, excluded.last_updated_ts)",
-                        &[
-                            Value::Text(stratum_key),
-                            Value::BigInt(total),
-                            Value::BigInt(resolved),
-                            Value::BigInt(censored),
-                            Value::BigInt(expired),
-                            Value::BigInt(correct),
-                            Value::BigInt(incorrect),
-                            Value::Double(regret),
-                            Value::Double(loss),
-                            Value::Double(ewma),
-                            Value::Double(weight),
-                            Value::BigInt(now_ts),
-                        ],
-                    );
-                    if upsert_result.is_ok() {
-                        stats.rollups_salvaged += 1;
-                    }
-                }
-            }
+        // ATC telemetry now lives in the independent sidecar DB (atc.sqlite3),
+        // which salvage/reconstruct never replaces (br-bvq1x.11.7). The rebuilt
+        // primary mailbox DB has no atc_* tables, so there is nothing to salvage
+        // here; the sidecar's rollups persist untouched across recovery and ATC
+        // telemetry is, by design, droppable/resettable — which is why
+        // ReconstructStats carries no rollup-salvage counter (br-j9prb).
+
+        let cross_project_reservations = target_conn
+            .query_sync(
+                "SELECT fr.id AS id \
+                 FROM file_reservations fr \
+                 JOIN agents a ON a.id = fr.agent_id \
+                 WHERE fr.project_id <> a.project_id LIMIT 1",
+                &[],
+            )
+            .map_err(|e| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: verify reservation ownership: {e}"
+                ))
+            })?;
+        if let Some(row) = cross_project_reservations.first() {
+            let reservation_id = row.get_named::<i64>("id").unwrap_or_default();
+            return Err(DbError::Sqlite(format!(
+                "reconstruct salvage: reservation {reservation_id} is attached to an agent from another project; refusing promotion"
+            )));
+        }
+
+        let cross_project_recipients = target_conn
+            .query_sync(
+                "SELECT mr.message_id AS message_id, mr.agent_id AS agent_id \
+                 FROM message_recipients mr \
+                 JOIN messages m ON m.id = mr.message_id \
+                 JOIN agents a ON a.id = mr.agent_id \
+                 WHERE m.project_id <> a.project_id LIMIT 1",
+                &[],
+            )
+            .map_err(|e| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: verify recipient ownership: {e}"
+                ))
+            })?;
+        if let Some(row) = cross_project_recipients.first() {
+            let message_id = row.get_named::<i64>("message_id").unwrap_or_default();
+            let agent_id = row.get_named::<i64>("agent_id").unwrap_or_default();
+            return Err(DbError::Sqlite(format!(
+                "reconstruct salvage: recipient agent {agent_id} is attached to message {message_id} from another project; refusing promotion"
+            )));
+        }
+
+        let foreign_key_failures = target_conn
+            .query_sync("PRAGMA foreign_key_check", &[])
+            .map_err(|e| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: run post-merge foreign_key_check: {e}"
+                ))
+            })?;
+        if !foreign_key_failures.is_empty() {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct salvage: post-merge foreign_key_check reported {} violation(s); refusing promotion",
+                foreign_key_failures.len()
+            )));
         }
 
         target_conn
@@ -3840,7 +4874,7 @@ fn merge_salvaged_database(
     }
     drop(target_conn);
     if let Err(e) = crate::pool::wal_checkpoint_truncate_path(target_db_path) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage merge committed, but WAL checkpoint failed for {}: {e}",
             target_db_path.display()
         ));
@@ -3863,7 +4897,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
     let fallback = synthetic_project_placeholder_human_key(slug);
 
     if !is_real_file(&metadata_path) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Missing {}; using fallback human_key '{}'",
             metadata_path.display(),
             fallback
@@ -3871,11 +4905,11 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         return fallback;
     }
 
-    let metadata_str = match std::fs::read_to_string(&metadata_path) {
+    let metadata_str = match read_archive_text_capped(&metadata_path) {
         Ok(s) => s,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot read {}: {e}; using fallback human_key '{}'",
                 metadata_path.display(),
                 fallback
@@ -3888,7 +4922,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         Ok(v) => v,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot parse {}: {e}; using fallback human_key '{}'",
                 metadata_path.display(),
                 fallback
@@ -3904,7 +4938,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         .filter(|s| !s.is_empty())
     else {
         stats.parse_errors += 1;
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Missing/empty human_key in {}; using fallback human_key '{}'",
             metadata_path.display(),
             fallback
@@ -3914,7 +4948,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
 
     if !Path::new(human_key).is_absolute() {
         stats.parse_errors += 1;
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Non-absolute human_key '{}' in {}; using fallback human_key '{}'",
             human_key,
             metadata_path.display(),
@@ -3930,7 +4964,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         .filter(|s| !s.is_empty())
         && metadata_slug != slug
     {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Project metadata slug mismatch in {}: dir slug='{}', metadata slug='{}'",
             metadata_path.display(),
             slug,
@@ -4016,7 +5050,7 @@ fn normalize_reconstructed_required_agent_field(
     };
     let normalized = raw.trim();
     if normalized.is_empty() {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reconstruct {source} had empty {field}; defaulting to {fallback:?}"
         ));
         fallback.to_string()
@@ -4037,7 +5071,7 @@ fn normalize_reconstructed_attachments_policy(
     if VALID_RECONSTRUCTED_ATTACHMENTS_POLICIES.contains(&normalized.as_str()) {
         normalized
     } else {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reconstruct {source} had invalid attachments_policy {raw:?}; defaulting to \"auto\""
         ));
         "auto".to_string()
@@ -4056,7 +5090,7 @@ fn normalize_reconstructed_contact_policy(
     if VALID_RECONSTRUCTED_CONTACT_POLICIES.contains(&normalized.as_str()) {
         normalized
     } else {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reconstruct {source} had invalid contact_policy {raw:?}; defaulting to \"auto\""
         ));
         "auto".to_string()
@@ -4603,10 +5637,13 @@ mod tests {
             salvaged_projects: 0,
             salvaged_agents: 0,
             salvaged_messages: 0,
+            salvaged_message_id_remaps: 0,
             salvaged_recipients: 0,
-            rollups_salvaged: 0,
+            salvaged_reservations: 0,
+            salvaged_reservation_releases: 0,
             parse_errors: 3,
             warnings: vec![],
+            suppressed_warnings: 0,
             duplicate_canonical_id_set: BTreeSet::new(),
         };
         let display = stats.to_string();
@@ -4660,6 +5697,79 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_empty_projects_directory_does_not_create_database() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.projects, 0);
+        assert_eq!(stats.agents, 0);
+        assert_eq!(stats.messages, 0);
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("No project archives found")),
+            "empty projects dir should be reported as empty archive content: {:?}",
+            stats.warnings
+        );
+        assert!(
+            !db_path.exists(),
+            "empty archive reconstruct should not create a database file"
+        );
+    }
+
+    #[test]
+    fn reconstruct_refuses_an_existing_target_without_mutating_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing.sqlite3");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("demo")).unwrap();
+
+        let existing = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        existing
+            .execute_raw("CREATE TABLE sentinel (value TEXT NOT NULL); INSERT INTO sentinel VALUES ('original')")
+            .unwrap();
+        drop(existing);
+        crate::pool::wal_checkpoint_truncate_path(&db_path).unwrap();
+
+        let error = reconstruct_from_archive(&db_path, &storage_root)
+            .expect_err("low-level reconstruct must never reuse a live/partial target");
+        assert!(
+            error.to_string().contains("fresh candidate path"),
+            "unexpected error: {error}"
+        );
+        let existing = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = existing
+            .query_sync("SELECT value FROM sentinel", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("value").unwrap(), "original");
+    }
+
+    #[test]
+    fn reconstruct_candidate_does_not_touch_live_sibling_atc_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let candidate = tmp.path().join("candidate.sqlite3");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("demo")).unwrap();
+        let atc_sidecar = tmp.path().join("atc.sqlite3");
+        let sentinel = b"live-atc-sidecar-must-remain-byte-identical";
+        std::fs::write(&atc_sidecar, sentinel).unwrap();
+
+        reconstruct_from_archive(&candidate, &storage_root)
+            .expect("fresh candidate reconstruction should succeed");
+
+        assert_eq!(
+            std::fs::read(&atc_sidecar).unwrap(),
+            sentinel,
+            "candidate construction must never open, migrate, quarantine, or replace the fixed-name live ATC sidecar"
+        );
+    }
+
+    #[test]
     fn reconstruct_with_agent_profile() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("test.db");
@@ -4696,10 +5806,17 @@ mod tests {
             "reconstructed database should be healthy for canonical sqlite",
         );
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        // ATC telemetry now lives in the dedicated sidecar DB (atc.sqlite3),
+        // which is independent of the Git archive and untouched by reconstruct
+        // (br-bvq1x.11.7). The rebuilt primary mailbox DB must therefore contain
+        // NO atc_* tables.
+        // `_` in LIKE matches the literal underscore here (no ESCAPE needed);
+        // there are no non-`atc_` tables that would be falsely matched, and the
+        // assertion only cares that the set is empty.
         let atc_tables = conn
             .query_sync(
                 "SELECT name FROM sqlite_master \
-                 WHERE type = 'table' AND name IN ('atc_experiences', 'atc_experience_rollups') \
+                 WHERE type = 'table' AND name LIKE 'atc_%' \
                  ORDER BY name",
                 &[],
             )
@@ -4707,32 +5824,11 @@ mod tests {
             .into_iter()
             .filter_map(|row| row.get_named::<String>("name").ok())
             .collect::<Vec<_>>();
-        assert_eq!(
-            atc_tables,
-            vec![
-                "atc_experience_rollups".to_string(),
-                "atc_experiences".to_string()
-            ],
-            "reconstruct should materialize ATC base tables required by the live server"
+        assert!(
+            atc_tables.is_empty(),
+            "reconstruct must NOT materialize atc_* tables in the primary mailbox DB \
+             (ATC telemetry is isolated in the atc.sqlite3 sidecar); found: {atc_tables:?}"
         );
-        let rollup_columns = conn
-            .query_sync("PRAGMA table_info(atc_experience_rollups)", &[])
-            .expect("query ATC rollup columns")
-            .into_iter()
-            .filter_map(|row| row.get_named::<String>("name").ok())
-            .collect::<HashSet<_>>();
-        for required in [
-            "ewma_loss",
-            "ewma_weight",
-            "delay_sum_micros",
-            "delay_count",
-            "delay_max_micros",
-        ] {
-            assert!(
-                rollup_columns.contains(required),
-                "reconstruct should preserve ATC rollup column {required}"
-            );
-        }
     }
 
     #[test]
@@ -5305,7 +6401,7 @@ body
 
     #[cfg(unix)]
     #[test]
-    fn reconstruct_with_salvage_skips_symlinked_salvage_parent() {
+    fn reconstruct_with_salvage_fails_closed_for_symlinked_salvage_parent() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -5325,62 +6421,56 @@ body
             .unwrap();
         drop(salvage_conn);
 
+        let error =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect_err("a rejected salvage path must block archive-only reconstruction");
+        assert!(
+            error.to_string().contains("symlinked path")
+                && error
+                    .to_string()
+                    .contains("refusing an archive-only candidate"),
+            "expected a fail-closed symlink error, got {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "a rejected salvage path must not create a promotable candidate"
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_keeps_same_basename_projects_and_children_distinct() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed.db");
+        let salvage_db_path = tmp.path().join("salvage.db");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("shared")).unwrap();
+
+        let salvage = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage
+            .execute_raw(&schema::init_schema_sql_base())
+            .unwrap();
+        // Deliberately collide the source numeric project id with the archive
+        // candidate's first project id. Stable identity, never row id or
+        // basename, must decide ownership of every salvaged child.
+        salvage
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                     (1, 'srv-team-shared', '/srv/team/shared', 1); \
+                 INSERT INTO agents \
+                     (id, project_id, name, program, model, task_description, \
+                      inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                     VALUES \
+                     (7, 1, 'CanonicalAgent', 'codex-cli', 'test', '', 1, 2, 'auto', 'auto');",
+            )
+            .unwrap();
+        drop(salvage);
+
         let stats =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-                .expect(
-                    "symlinked salvage parents should be skipped without failing reconstruction",
-                );
-        assert!(
-            stats
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("symlinked path")),
-            "expected symlink warning, got {:?}",
-            stats.warnings
-        );
-        assert_eq!(stats.salvaged_projects, 0);
-    }
+                .expect("stable-key salvage should preserve both repositories");
+        assert_eq!(stats.salvaged_projects, 1);
 
-    #[test]
-    fn reconcile_placeholder_project_duplicates_promotes_archive_project_id() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let db_path = tmp.path().join("reconstructed.db");
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
-        conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
-
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
-            &[
-                Value::BigInt(1),
-                Value::Text("flywheel_connectors".to_string()),
-                Value::Text("/flywheel_connectors".to_string()),
-                Value::BigInt(10),
-            ],
-        )
-        .unwrap();
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
-            &[
-                Value::BigInt(2),
-                Value::Text("users-jemanuel-projects-flywheel-connectors".to_string()),
-                Value::Text("/Users/jemanuel/projects/flywheel_connectors".to_string()),
-                Value::BigInt(1),
-            ],
-        )
-        .unwrap();
-
-        let mut project_id_map = HashMap::from([(100_i64, 2_i64)]);
-        let mut stats = ReconstructStats {
-            salvaged_projects: 1,
-            ..ReconstructStats::default()
-        };
-
-        reconcile_placeholder_project_duplicates_after_salvage(
-            &conn,
-            &mut project_id_map,
-            &mut stats,
-        )
-        .expect("duplicate reconciliation should succeed");
 
         let rows = conn
             .query_sync(
@@ -5388,85 +6478,7 @@ body
                 &[],
             )
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get_named::<i64>("id").unwrap(),
-            1_i64,
-            "salvage database should promote project id"
-        );
-        assert_eq!(
-            rows[0].get_named::<String>("slug").unwrap(),
-            "users-jemanuel-projects-flywheel-connectors"
-        );
-        assert_eq!(
-            rows[0].get_named::<String>("human_key").unwrap(),
-            "/Users/jemanuel/projects/flywheel_connectors"
-        );
-        assert_eq!(
-            rows[0].get_named::<i64>("created_at").unwrap(),
-            1_i64,
-            "salvage database should promote project created_at"
-        );
-    }
-
-    #[test]
-    fn reconcile_placeholder_project_duplicates_skips_ambiguous_basename_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let db_path = tmp.path().join("reconstructed.db");
-        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
-        conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
-
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
-            &[
-                Value::BigInt(1),
-                Value::Text("shared".to_string()),
-                Value::Text("/shared".to_string()),
-                Value::BigInt(10),
-            ],
-        )
-        .unwrap();
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
-            &[
-                Value::BigInt(2),
-                Value::Text("tmp-one-shared".to_string()),
-                Value::Text("/tmp/one/shared".to_string()),
-                Value::BigInt(1),
-            ],
-        )
-        .unwrap();
-        conn.query_sync(
-            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
-            &[
-                Value::BigInt(3),
-                Value::Text("var-two-shared".to_string()),
-                Value::Text("/var/two/shared".to_string()),
-                Value::BigInt(2),
-            ],
-        )
-        .unwrap();
-
-        let mut project_id_map = HashMap::from([(100_i64, 2_i64), (101_i64, 3_i64)]);
-        let mut stats = ReconstructStats {
-            salvaged_projects: 2,
-            ..ReconstructStats::default()
-        };
-
-        reconcile_placeholder_project_duplicates_after_salvage(
-            &conn,
-            &mut project_id_map,
-            &mut stats,
-        )
-        .expect("ambiguous duplicate reconciliation should leave distinct canonical rows alone");
-
-        let rows = conn
-            .query_sync(
-                "SELECT id, slug, human_key, created_at FROM projects ORDER BY id",
-                &[],
-            )
-            .unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
         assert_eq!(
             rows[0].get_named::<String>("slug").unwrap(),
@@ -5476,30 +6488,37 @@ body
             rows[0].get_named::<String>("human_key").unwrap(),
             "/shared".to_string()
         );
-        assert_eq!(rows[0].get_named::<i64>("created_at").unwrap(), 10);
+        assert!(rows[0].get_named::<i64>("created_at").unwrap() > 0);
         assert_eq!(rows[1].get_named::<i64>("id").unwrap(), 2);
         assert_eq!(
             rows[1].get_named::<String>("slug").unwrap(),
-            "tmp-one-shared".to_string()
+            "srv-team-shared".to_string()
         );
         assert_eq!(
             rows[1].get_named::<String>("human_key").unwrap(),
-            "/tmp/one/shared".to_string()
+            "/srv/team/shared".to_string()
         );
         assert_eq!(rows[1].get_named::<i64>("created_at").unwrap(), 1);
-        assert_eq!(rows[2].get_named::<i64>("id").unwrap(), 3);
+
+        let agent_rows = conn
+            .query_sync(
+                "SELECT p.slug AS project_slug, p.human_key AS project_human_key \
+                 FROM agents AS a JOIN projects AS p ON p.id = a.project_id \
+                 WHERE a.name = 'CanonicalAgent'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(agent_rows.len(), 1);
         assert_eq!(
-            rows[2].get_named::<String>("slug").unwrap(),
-            "var-two-shared".to_string()
+            agent_rows[0].get_named::<String>("project_slug").unwrap(),
+            "srv-team-shared"
         );
         assert_eq!(
-            rows[2].get_named::<String>("human_key").unwrap(),
-            "/var/two/shared".to_string()
+            agent_rows[0]
+                .get_named::<String>("project_human_key")
+                .unwrap(),
+            "/srv/team/shared"
         );
-        assert_eq!(rows[2].get_named::<i64>("created_at").unwrap(), 2);
-        assert_eq!(project_id_map.get(&100), Some(&2));
-        assert_eq!(project_id_map.get(&101), Some(&3));
-        assert_eq!(stats.salvaged_projects, 2);
     }
 
     #[test]
@@ -5633,6 +6652,76 @@ Hello Bob, this is a test message.
                 .get_named::<String>("name")
                 .expect("second recipient name"),
             "Bob"
+        );
+    }
+
+    #[test]
+    fn reconstruct_preserves_nontrivial_canonical_message_id() {
+        // br-bvq1x.7.5 (G5) golden, before/after: a single archived message
+        // carrying a non-trivial canonical id (904) must land in a *fresh*
+        // (empty) DB under that exact id. Under AUTOINCREMENT the first
+        // inserted row would otherwise be re-keyed to 1, so asserting the row
+        // id == 904 cleanly distinguishes canonical-identity preservation
+        // (`INSERT OR REPLACE ... (id, ...)`) from SQLite reassigning the id.
+        // `reconstruct_with_message` only exercises id 1, which is ambiguous
+        // (autoincrement would also pick 1); this is the dedicated regression
+        // guard for the preservation path.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"test","model":"test","inception_ts":"2026-02-22T12:00:00Z","last_active_ts":"2026-02-22T12:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let msg_content = r#"---json
+{
+  "id": 904,
+  "from": "Alice",
+  "to": ["Bob"],
+  "thread_id": "TEST-904",
+  "subject": "Canonical id golden",
+  "importance": "normal",
+  "ack_required": false,
+  "created_ts": "2026-02-22T12:00:00Z",
+  "attachments": []
+}
+---
+
+Body for the canonical id golden test.
+"#;
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__canonical-id-golden__904.md"),
+            msg_content,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.parse_errors, 0);
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT id, subject FROM messages", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one message should be reconstructed");
+        assert_eq!(
+            rows[0].get_named::<i64>("id").expect("message id"),
+            904,
+            "reconstruct must preserve the canonical message id, not re-key it via autoincrement"
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("subject")
+                .expect("message subject"),
+            "Canonical id golden"
         );
     }
 
@@ -6394,7 +7483,9 @@ archive body
         salvage_conn
             .query_sync(
                 "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
-                 VALUES (2, 100, 10, 'DB-only', 'db body', 2)",
+                 VALUES
+                    (1, 100, 10, 'Archive copy', 'archive body', 1),
+                    (2, 100, 10, 'DB-only', 'db body', 2)",
                 &[],
             )
             .unwrap();
@@ -6419,6 +7510,56 @@ archive body
         assert_eq!(stats.salvaged_recipients, 2);
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let identity_rows = conn
+            .query_sync(
+                "SELECT p.id AS project_id, a.id AS agent_id
+                 FROM agents a
+                 JOIN projects p ON p.id = a.project_id
+                 WHERE p.human_key = '/test-project' AND a.name = 'Bob'",
+                &[],
+            )
+            .expect("query reconstructed recipient identity");
+        assert_eq!(identity_rows.len(), 1);
+        let reconstructed_project_id = identity_rows[0]
+            .get_named::<i64>("project_id")
+            .expect("project id");
+        let reconstructed_bob_id = identity_rows[0]
+            .get_named::<i64>("agent_id")
+            .expect("agent id");
+        assert_ne!(
+            reconstructed_bob_id, 11,
+            "the fixture must exercise numeric agent-id renumbering"
+        );
+        let runtime_conn = crate::DbConn::open_file(db_path.to_str().unwrap())
+            .expect("open reconstructed mailbox through the runtime engine");
+        let inbox = crate::sync::fetch_inbox_rows_from_conn(
+            &runtime_conn,
+            reconstructed_project_id,
+            reconstructed_bob_id,
+            false,
+            false,
+            false,
+            None,
+            25,
+        )
+        .expect("fetch inbox through the production query after reconstruction");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].message.subject, "Archive copy");
+        assert!(
+            crate::sync::fetch_inbox_rows_from_conn(
+                &runtime_conn,
+                reconstructed_project_id,
+                11,
+                false,
+                false,
+                false,
+                None,
+                25,
+            )
+            .expect("query stale source-local numeric id")
+            .is_empty(),
+            "delivery must follow the reconstructed stable identity, not the obsolete numeric id"
+        );
         let message_rows = conn
             .query_sync(
                 "SELECT id, subject, recipients_json FROM messages ORDER BY id",
@@ -6492,6 +7633,508 @@ archive body
         );
     }
 
+    /// br-5mnkl: the salvage reads are keyset-paginated so the startup
+    /// self-heal path can never materialize the whole `messages` /
+    /// `message_recipients` tables at once. This exercises multiple batch
+    /// boundaries for both tables and proves no row is dropped or
+    /// double-merged at the seams.
+    #[test]
+    fn salvage_merge_pages_large_tables_across_keyset_batches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_paged.db");
+        let salvage_db_path = tmp.path().join("salvage_paged.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).expect("create archive agent dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":0}"#,
+        )
+        .expect("write project.json");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-02-22T00:00:00Z","last_active_ts":"2026-02-22T00:00:00Z"}"#,
+        )
+        .expect("write profile.json");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL,
+                    subject TEXT,
+                    body_md TEXT,
+                    created_ts INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE message_recipients (
+                    message_id INTEGER NOT NULL,
+                    agent_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    read_ts INTEGER,
+                    ack_ts INTEGER
+                )",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (100, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name) VALUES
+                    (10, 100, 'Alice'),
+                    (11, 100, 'Bob'),
+                    (12, 100, 'Carol'),
+                    (13, 100, 'Dave'),
+                    (14, 100, 'Erin')",
+                &[],
+            )
+            .unwrap();
+
+        // 2 full message batches + a partial third; 4 recipients per message
+        // crosses the (larger) recipient batch size at a non-aligned offset.
+        let message_count = SALVAGE_MESSAGE_BATCH_ROWS * 2 + 7;
+        let recipient_agent_ids = [11i64, 12, 13, 14];
+        let recipient_count = message_count * recipient_agent_ids.len();
+        assert!(
+            recipient_count > SALVAGE_RECIPIENT_BATCH_ROWS,
+            "fixture must force at least two recipient batches"
+        );
+        let message_values = (1..=message_count)
+            .map(|id| format!("({id}, 100, 10, 'subject {id}', 'body {id}', {id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        salvage_conn
+            .query_sync(
+                &format!(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES {message_values}"
+                ),
+                &[],
+            )
+            .unwrap();
+        let recipient_values = (1..=message_count)
+            .flat_map(|message_id| {
+                recipient_agent_ids.iter().map(move |agent_id| {
+                    format!("({message_id}, {agent_id}, 'to', {message_id}, NULL)")
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        salvage_conn
+            .query_sync(
+                &format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES {recipient_values}"
+                ),
+                &[],
+            )
+            .unwrap();
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("paged salvage merge should succeed");
+        assert_eq!(stats.salvaged_messages, message_count);
+        assert_eq!(stats.salvaged_recipients, recipient_count);
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let count_row = |sql: &str| -> i64 {
+            conn.query_sync(sql, &[]).expect("count query")[0]
+                .get_named::<i64>("n")
+                .expect("count value")
+        };
+        assert_eq!(
+            count_row("SELECT COUNT(*) AS n FROM messages"),
+            i64::try_from(message_count).unwrap(),
+            "every salvaged message must survive the batch seams exactly once"
+        );
+        assert_eq!(
+            count_row("SELECT COUNT(*) AS n FROM message_recipients"),
+            i64::try_from(recipient_count).unwrap(),
+            "every salvaged recipient must survive the batch seams exactly once"
+        );
+        assert_eq!(
+            count_row("SELECT COUNT(DISTINCT message_id) AS n FROM message_recipients"),
+            i64::try_from(message_count).unwrap(),
+        );
+        // Boundary rows: the last message of a full batch and the first of the
+        // next batch must both exist with intact content and recipient state.
+        for boundary_id in [
+            i64::try_from(SALVAGE_MESSAGE_BATCH_ROWS).unwrap(),
+            i64::try_from(SALVAGE_MESSAGE_BATCH_ROWS + 1).unwrap(),
+            i64::try_from(message_count).unwrap(),
+        ] {
+            let subject_rows = conn
+                .query_sync(
+                    "SELECT subject FROM messages WHERE id = ?",
+                    &[Value::BigInt(boundary_id)],
+                )
+                .expect("boundary subject query");
+            assert_eq!(subject_rows.len(), 1, "message {boundary_id} must exist");
+            assert_eq!(
+                subject_rows[0]
+                    .get_named::<String>("subject")
+                    .expect("subject"),
+                format!("subject {boundary_id}")
+            );
+            let read_rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS n FROM message_recipients WHERE message_id = ? AND read_ts = ?",
+                    &[Value::BigInt(boundary_id), Value::BigInt(boundary_id)],
+                )
+                .expect("boundary recipient query");
+            assert_eq!(
+                read_rows[0].get_named::<i64>("n").expect("count"),
+                i64::try_from(recipient_agent_ids.len()).unwrap(),
+                "recipient state for message {boundary_id} must survive intact"
+            );
+        }
+    }
+
+    /// br-5mnkl: `collect_db_message_ids` is keyset-paginated; an exact
+    /// batch-multiple table (including non-positive ids, which only the
+    /// floorless first batch can see) must round-trip completely.
+    #[test]
+    fn collect_db_message_ids_pages_exact_batch_multiple_with_nonpositive_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ids_paged.db");
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        // -3, 0, and 1..=(BATCH-2): exactly one full batch, so the pager must
+        // issue a second (empty) probe and terminate without dropping rows.
+        let positive_max = i64::try_from(DB_MESSAGE_ID_BATCH_ROWS - 2).unwrap();
+        let values = std::iter::once("(-3)".to_string())
+            .chain(std::iter::once("(0)".to_string()))
+            .chain((1..=positive_max).map(|id| format!("({id})")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.query_sync(&format!("INSERT INTO messages (id) VALUES {values}"), &[])
+            .unwrap();
+        drop(conn);
+
+        let ids = collect_db_message_ids(&db_path).expect("collect ids");
+        assert_eq!(ids.len(), DB_MESSAGE_ID_BATCH_ROWS);
+        assert!(
+            ids.contains(&-3),
+            "floorless first batch must keep negative ids"
+        );
+        assert!(ids.contains(&0), "floorless first batch must keep id 0");
+        assert!(ids.contains(&positive_max));
+    }
+
+    /// br-5mnkl: the warning vector itself must stay bounded on pathological
+    /// archives; overflow is counted, not itemized, and surfaced in Display.
+    #[test]
+    fn push_warning_caps_itemization_and_counts_suppressed() {
+        let mut stats = ReconstructStats::default();
+        for i in 0..(MAX_ITEMIZED_WARNINGS + 7) {
+            stats.push_warning(format!("warning {i}"));
+        }
+        assert_eq!(stats.warnings.len(), MAX_ITEMIZED_WARNINGS);
+        assert_eq!(stats.suppressed_warnings, 7);
+        assert_eq!(stats.warnings[0], "warning 0");
+        assert_eq!(
+            stats.warnings[MAX_ITEMIZED_WARNINGS - 1],
+            format!("warning {}", MAX_ITEMIZED_WARNINGS - 1)
+        );
+        let display = stats.to_string();
+        assert!(
+            display.contains("suppressed 7 warning(s)"),
+            "display must surface the suppressed count, got: {display}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_remaps_cross_project_message_id_and_recipient_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_message_collision.db");
+        let salvage_db_path = tmp.path().join("salvage_message_collision.db");
+        let storage_root = tmp.path().join("storage");
+
+        let archive_project = storage_root.join("projects").join("archive-project");
+        let archive_agent = archive_project.join("agents").join("Alice");
+        let archive_messages = archive_project.join("messages").join("2026").join("07");
+        std::fs::create_dir_all(&archive_agent).expect("create archive agent");
+        std::fs::create_dir_all(&archive_messages).expect("create archive messages");
+        std::fs::write(
+            archive_project.join("project.json"),
+            r#"{"slug":"archive-project","human_key":"/archive-project","created_at":1}"#,
+        )
+        .expect("write archive project");
+        std::fs::write(
+            archive_agent.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":1,"last_active_ts":2}"#,
+        )
+        .expect("write archive agent");
+        std::fs::write(
+            archive_messages.join("2026-07-17T12-00-00Z__archive__7.md"),
+            r#"---json
+{"id":7,"from":"Alice","to":[],"subject":"Archive message","importance":"normal","created_ts":"2026-07-17T12:00:00Z","attachments":[]}
+---
+
+archive body
+"#,
+        )
+        .expect("write archive message");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init salvage schema");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+                    (500, 'db-project', '/db-project', 1);
+                 INSERT INTO agents
+                    (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                    VALUES
+                    (600, 500, 'Bob', 'coder', 'test', '', 1, 2, 'auto', 'auto'),
+                    (601, 500, 'Carol', 'coder', 'test', '', 1, 2, 'auto', 'auto');
+                 INSERT INTO messages
+                    (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments)
+                    VALUES
+                    (7, 500, 600, 'DB-only message', 'db body', 'urgent', 1, 3,
+                     '{\"to\":[\"Carol\"],\"cc\":[],\"bcc\":[]}', '[]');
+                 INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                    VALUES (7, 601, 'to', 4, 5);",
+            )
+            .expect("seed colliding DB-only message");
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("cross-project numeric message collision should be remapped");
+        assert_eq!(stats.salvaged_messages, 1);
+        assert_eq!(stats.salvaged_message_id_remaps, 1);
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let message_rows = conn
+            .query_sync(
+                "SELECT m.id, p.slug, a.name AS sender, m.subject
+                 FROM messages m
+                 JOIN projects p ON p.id = m.project_id
+                 JOIN agents a ON a.id = m.sender_id
+                 ORDER BY p.slug",
+                &[],
+            )
+            .expect("query reconstructed messages");
+        assert_eq!(message_rows.len(), 2);
+        let db_row = message_rows
+            .iter()
+            .find(|row| row.get_named::<String>("slug").ok().as_deref() == Some("db-project"))
+            .expect("DB-only message survived");
+        assert_ne!(db_row.get_named::<i64>("id").unwrap(), 7);
+        assert_eq!(db_row.get_named::<String>("sender").unwrap(), "Bob");
+        assert_eq!(
+            db_row.get_named::<String>("subject").unwrap(),
+            "DB-only message"
+        );
+
+        let recipient_rows = conn
+            .query_sync(
+                "SELECT mp.slug AS message_project, ap.slug AS agent_project,
+                        a.name, mr.read_ts, mr.ack_ts
+                 FROM message_recipients mr
+                 JOIN messages m ON m.id = mr.message_id
+                 JOIN projects mp ON mp.id = m.project_id
+                 JOIN agents a ON a.id = mr.agent_id
+                 JOIN projects ap ON ap.id = a.project_id
+                 WHERE m.subject = 'DB-only message'",
+                &[],
+            )
+            .expect("query remapped recipient state");
+        assert_eq!(recipient_rows.len(), 1);
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("message_project")
+                .unwrap(),
+            "db-project"
+        );
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("agent_project")
+                .unwrap(),
+            "db-project"
+        );
+        assert_eq!(
+            recipient_rows[0].get_named::<String>("name").unwrap(),
+            "Carol"
+        );
+        assert_eq!(recipient_rows[0].get_named::<i64>("read_ts").unwrap(), 4);
+        assert_eq!(recipient_rows[0].get_named::<i64>("ack_ts").unwrap(), 5);
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_preserves_active_reservations_and_release_ledger() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_reservations.db");
+        let salvage_db_path = tmp.path().join("salvage_reservations.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).expect("create archive agent");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":1}"#,
+        )
+        .expect("write archive project");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":1,"last_active_ts":2}"#,
+        )
+        .expect("write archive agent");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init salvage schema");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                    VALUES (100, 'test-project', '/test-project', 1);
+                 INSERT INTO agents
+                    (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                    VALUES (200, 100, 'Alice', 'coder', 'test', '', 1, 2, 'auto', 'auto');
+                 INSERT INTO file_reservations
+                    (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+                    VALUES
+                    (900, 100, 200, 'src/active/**', 1, 'active work', 10, 1000, NULL),
+                    (901, 100, 200, 'src/released/**', 0, 'finished work', 20, 2000, NULL);
+                 INSERT INTO file_reservation_releases (reservation_id, released_ts)
+                    VALUES (901, 250);",
+            )
+            .expect("seed reservation continuity state");
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("reservation continuity should be salvaged through stable identities");
+        assert_eq!(stats.salvaged_reservations, 2);
+        assert_eq!(stats.salvaged_reservation_releases, 1);
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT p.slug, a.id AS agent_id, a.name, fr.path_pattern, fr.exclusive, fr.reason,
+                        fr.created_ts, fr.expires_ts,
+                        COALESCE(rr.released_ts, fr.released_ts) AS effective_released_ts
+                 FROM file_reservations fr
+                 JOIN projects p ON p.id = fr.project_id
+                 JOIN agents a ON a.id = fr.agent_id
+                 LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id
+                 ORDER BY fr.path_pattern",
+                &[],
+            )
+            .expect("query salvaged reservations");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "test-project");
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "Alice");
+        assert_ne!(
+            rows[0].get_named::<i64>("agent_id").unwrap(),
+            200,
+            "the fixture must prove reservation ownership survives numeric agent-id renumbering"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("path_pattern").unwrap(),
+            "src/active/**"
+        );
+        assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("reason").unwrap(),
+            "active work"
+        );
+        assert_eq!(rows[0].get_named::<i64>("created_ts").unwrap(), 10);
+        assert_eq!(rows[0].get_named::<i64>("expires_ts").unwrap(), 1000);
+        assert!(rows[0].get_named::<i64>("effective_released_ts").is_err());
+        assert_eq!(
+            rows[1].get_named::<i64>("effective_released_ts").unwrap(),
+            250
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_rolls_back_ambiguous_reservation_ownership() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_reservation_collision.db");
+        let salvage_db_path = tmp.path().join("salvage_reservation_collision.db");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).expect("archive root");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init salvage schema");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                    VALUES (100, 'db-only-project', '/db-only-project', 1);
+                 INSERT INTO agents
+                    (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                    VALUES (200, 100, 'Alice', 'coder', 'test', '', 1, 2, 'auto', 'auto');
+                 INSERT INTO file_reservations
+                    (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+                    VALUES
+                    (900, 100, 200, 'src/**', 1, 'same key', 10, 1000, NULL),
+                    (901, 100, 200, 'src/**', 0, 'same key', 10, 1000, NULL);",
+            )
+            .expect("seed ambiguous reservation ownership");
+
+        let error =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect_err("ambiguous stable reservation ownership must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with target reservation")
+                && error.to_string().contains("exclusive ownership")
+                && error
+                    .to_string()
+                    .contains("refusing to promote the archive-only candidate"),
+            "unexpected fail-closed error: {error}"
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let project_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM projects WHERE slug = 'db-only-project'",
+                &[],
+            )
+            .expect("query rollback state");
+        assert_eq!(project_rows[0].get_named::<i64>("count").unwrap(), 0);
+        let reservation_rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM file_reservations", &[])
+            .expect("query rolled-back reservations");
+        assert_eq!(reservation_rows[0].get_named::<i64>("count").unwrap(), 0);
+    }
+
     #[test]
     fn reconstruct_with_salvage_preserves_agent_links_and_product_bus_rows() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6541,7 +8184,7 @@ archive body
         salvage_conn
             .query_sync(
                 "INSERT INTO agent_links (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)
-                 VALUES (100, 10, 100, 11, 'accepted', 'carry contact state', 7, 8, 9)",
+                 VALUES (100, 10, 100, 11, 'approved', 'carry contact state', 7, 8, 9)",
                 &[],
             )
             .expect("insert agent link");
@@ -6573,7 +8216,7 @@ archive body
             contact_rows[0]
                 .get_named::<String>("status")
                 .expect("status"),
-            "accepted"
+            "approved"
         );
         assert_eq!(
             contact_rows[0]
@@ -6637,18 +8280,18 @@ archive body
             )
             .expect("insert salvage agent");
 
-        FAIL_SALVAGE_MERGE_AFTER_PROJECTS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let stats =
+        FAIL_SALVAGE_MERGE_AFTER_PROJECTS.with(|hook| hook.set(true));
+        let error =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-                .expect("forced late salvage failure should not abort archive reconstruction");
+                .expect_err("forced late salvage failure must block candidate promotion");
         assert!(
-            stats
-                .warnings
-                .iter()
-                .any(|warning| warning
-                    .contains("reconstruct salvage: forced failure after projects")),
-            "warnings should include forced salvage failure: {:?}",
-            stats.warnings
+            error
+                .to_string()
+                .contains("reconstruct salvage: forced failure after projects")
+                && error
+                    .to_string()
+                    .contains("refusing to promote the archive-only candidate"),
+            "error should include the merge failure and fail-closed invariant: {error}"
         );
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
@@ -6669,18 +8312,10 @@ archive body
             agent_count, 0,
             "failed salvage merge should not leak partially inserted agents"
         );
-        assert_eq!(
-            stats.salvaged_projects, 0,
-            "rolled-back salvage merge should not report salvaged projects"
-        );
-        assert_eq!(
-            stats.salvaged_agents, 0,
-            "rolled-back salvage merge should not report salvaged agents"
-        );
     }
 
     #[test]
-    fn reconstruct_with_salvage_skips_corrupt_source_when_message_query_fails() {
+    fn reconstruct_with_salvage_fails_closed_when_message_query_is_corrupt() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("reconstructed_corrupt_salvage.db");
         let salvage_db_path = tmp.path().join("salvage_corrupt_message_scan.db");
@@ -6743,17 +8378,22 @@ archive body
             )
             .unwrap();
 
-        FAIL_SALVAGE_QUERY_MESSAGES.store(true, std::sync::atomic::Ordering::SeqCst);
-        let stats =
+        FAIL_SALVAGE_QUERY_MESSAGES.with(|hook| hook.set(true));
+        let error =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-                .expect("corrupt salvage source should not abort archive reconstruction");
+                .expect_err("corrupt salvage source must block candidate promotion");
 
         assert!(
-            stats.warnings.iter().any(|warning| warning.contains(
+            error.to_string().contains(
                 "reconstruct salvage: query messages: Query error: database disk image is malformed"
-            )),
-            "warnings should include corrupt message query failure: {:?}",
-            stats.warnings
+            ),
+            "error should include corrupt message query failure: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to promote the archive-only candidate"),
+            "error should explain the fail-closed continuity invariant: {error}"
         );
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
@@ -6763,19 +8403,31 @@ archive body
         let message_count: i64 = message_rows[0].get_named("cnt").expect("message count");
         assert_eq!(
             message_count, 0,
-            "corrupt salvage source should not leak DB-only messages"
+            "failed salvage transaction must not leak DB-only messages"
         );
-        assert_eq!(
-            stats.salvaged_projects, 0,
-            "failed salvage attempt should not report rolled-back projects"
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_fails_closed_when_supplied_path_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_missing_salvage.db");
+        let salvage_db_path = tmp.path().join("missing-salvage.db");
+        let storage_root = tmp.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("archive root");
+
+        let error =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect_err("a supplied missing salvage path must block candidate promotion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing an archive-only candidate"),
+            "error should explain the fail-closed continuity invariant: {error}"
         );
-        assert_eq!(
-            stats.salvaged_agents, 0,
-            "failed salvage attempt should not report rolled-back agents"
-        );
-        assert_eq!(
-            stats.salvaged_messages, 0,
-            "failed salvage attempt should not report rolled-back messages"
+        assert!(
+            !db_path.exists(),
+            "a failed salvage probe must not create a promotable candidate"
         );
     }
 

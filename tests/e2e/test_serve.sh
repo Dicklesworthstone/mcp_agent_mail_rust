@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-WRAPPER_SUITE="serve"
+export WRAPPER_SUITE="serve"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tests/e2e/test_helpers.sh
 source "${SCRIPT_DIR}/test_helpers.sh"
 wrapper_exec "${SCRIPT_DIR}/../../scripts/e2e_serve.sh"
-

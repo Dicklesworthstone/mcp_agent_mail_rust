@@ -1153,9 +1153,10 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
     if !path.exists() {
         return None;
     }
-    let conn = match sqlmodel_frankensqlite::FrankenConnection::open_file(
-        path.display().to_string(),
-    ) {
+    // Signature inspection can run against live mailbox files during startup
+    // and upgrade probes, so keep it on the runtime DbConn alias rather than
+    // reaching directly into FrankenSQLite.
+    let conn = match DbConn::open_file(path.display().to_string()) {
         Ok(v) => v,
         Err(_) => {
             return Some(LegacyDbSignature {

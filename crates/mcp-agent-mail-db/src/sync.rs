@@ -75,6 +75,7 @@ pub fn fetch_inbox_rows_from_conn(
             urgent_only,
             unread_only,
             ack_required_only,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -101,6 +102,59 @@ pub fn fetch_inbox_metadata_rows_from_conn(
             urgent_only,
             unread_only,
             ack_required_only,
+            ack_overdue_before: None,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_inbox_ack_overdue_rows_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(
+        conn,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxFetchOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
+            body_policy: InboxBodyPolicy::Full,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_inbox_ack_overdue_metadata_rows_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(
+        conn,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxFetchOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -117,6 +171,7 @@ struct InboxFetchOptions {
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
+    ack_overdue_before: Option<i64>,
     body_policy: InboxBodyPolicy,
 }
 
@@ -153,6 +208,10 @@ fn fetch_inbox_rows_from_conn_impl(
     }
     if options.ack_required_only {
         sql.push_str(" AND m.ack_required = 1 AND r.ack_ts IS NULL");
+    }
+    if let Some(threshold) = options.ack_overdue_before {
+        sql.push_str(" AND m.ack_required = 1 AND r.ack_ts IS NULL AND m.created_ts < ?");
+        params.push(Value::BigInt(threshold));
     }
     if let Some(ts) = since_ts {
         sql.push_str(" AND m.created_ts > ?");
@@ -297,6 +356,77 @@ fn is_missing_inbox_stats_table_error(message: &str) -> bool {
     lowered.contains("no such table") && lowered.contains("inbox_stats")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SyncAgentInboxStatsRebuild {
+    total_count: i64,
+    unread_count: i64,
+    ack_pending_count: i64,
+    last_message_ts: Option<i64>,
+}
+
+fn compute_agent_inbox_stats_sync(
+    conn: &DbConn,
+    agent_id: i64,
+) -> Result<Option<SyncAgentInboxStatsRebuild>, DbError> {
+    let sql = "\
+        SELECT \
+            COUNT(*) AS total_count, \
+            SUM(CASE WHEN read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+            SUM(CASE \
+                WHEN ack_ts IS NULL \
+                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1) \
+                THEN 1 ELSE 0 END) AS ack_pending_count, \
+            (SELECT MAX(created_ts) \
+               FROM messages \
+              WHERE id IN (SELECT message_id \
+                             FROM message_recipients \
+                            WHERE agent_id = ?)) AS last_message_ts \
+        FROM message_recipients \
+        WHERE agent_id = ? \
+          AND message_id IN (SELECT id FROM messages)";
+    let rows = conn
+        .query_sync(sql, &[Value::BigInt(agent_id), Value::BigInt(agent_id)])
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    let row = rows.first().ok_or_else(|| {
+        DbError::Internal(format!(
+            "inbox_stats rebuild returned no aggregate row for agent_id={agent_id}"
+        ))
+    })?;
+    let total_count = row.get_named::<i64>("total_count").unwrap_or(0);
+    if total_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(SyncAgentInboxStatsRebuild {
+        total_count,
+        unread_count: row.get_named::<i64>("unread_count").unwrap_or(0),
+        ack_pending_count: row.get_named::<i64>("ack_pending_count").unwrap_or(0),
+        last_message_ts: row.get_named::<i64>("last_message_ts").ok(),
+    }))
+}
+
+fn insert_agent_inbox_stats_sync(
+    conn: &DbConn,
+    agent_id: i64,
+    stats: SyncAgentInboxStatsRebuild,
+) -> Result<(), DbError> {
+    let sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         VALUES (?, ?, ?, ?, ?)";
+    let last_message_ts = stats.last_message_ts.map_or(Value::Null, Value::BigInt);
+    conn.execute_sync(
+        sql,
+        &[
+            Value::BigInt(agent_id),
+            Value::BigInt(stats.total_count),
+            Value::BigInt(stats.unread_count),
+            Value::BigInt(stats.ack_pending_count),
+            last_message_ts,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| DbError::Sqlite(e.to_string()))
+}
+
 fn rebuild_agent_inbox_stats_sync(conn: &DbConn, agent_id: i64) -> Result<(), DbError> {
     let params = [Value::BigInt(agent_id)];
     match conn.execute_sync("DELETE FROM inbox_stats WHERE agent_id = ?", &params) {
@@ -310,20 +440,11 @@ fn rebuild_agent_inbox_stats_sync(conn: &DbConn, agent_id: i64) -> Result<(), Db
         }
     }
 
-    let rebuild_sql = "INSERT INTO inbox_stats \
-         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-         SELECT \
-             r.agent_id, \
-             COUNT(*) AS total_count, \
-             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-             MAX(m.created_ts) AS last_message_ts \
-         FROM message_recipients r \
-         JOIN messages m ON m.id = r.message_id \
-         WHERE r.agent_id = ? \
-         GROUP BY r.agent_id";
-    match conn.execute_sync(rebuild_sql, &params) {
-        Ok(_) => Ok(()),
+    let Some(stats) = compute_agent_inbox_stats_sync(conn, agent_id)? else {
+        return Ok(());
+    };
+    match insert_agent_inbox_stats_sync(conn, agent_id, stats) {
+        Ok(()) => Ok(()),
         Err(err) => {
             let message = err.to_string();
             if is_missing_inbox_stats_table_error(&message) {
@@ -335,39 +456,62 @@ fn rebuild_agent_inbox_stats_sync(conn: &DbConn, agent_id: i64) -> Result<(), Db
     }
 }
 
+/// Messages changed by a synchronous batch mark-read operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkMessagesReadBatch {
+    /// Timestamp written to each updated recipient row.
+    pub read_ts: i64,
+    /// Message IDs whose recipient rows were previously unread and were updated.
+    pub message_ids: Vec<i64>,
+}
+
 fn mark_messages_read_batch_sync_conn(
     conn: &DbConn,
     agent_id: i64,
     message_ids: &[i64],
-) -> Result<(), DbError> {
+) -> Result<Option<MarkMessagesReadBatch>, DbError> {
     if message_ids.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut unique_message_ids = message_ids.to_vec();
     unique_message_ids.sort_unstable();
     unique_message_ids.dedup();
+    let read_ts = crate::now_micros();
 
     begin_sync_write_tx(conn)?;
 
-    let result = (|| -> Result<(), DbError> {
-        let now = crate::now_micros();
+    let result = (|| -> Result<Vec<i64>, DbError> {
+        let mut updated_message_ids = Vec::new();
         for chunk in unique_message_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
-            let sql = format!(
-                "UPDATE message_recipients \
-                 SET read_ts = COALESCE(read_ts, ?), \
-                     ack_ts = CASE \
-                         WHEN ack_ts IS NOT NULL THEN ack_ts \
-                         WHEN (SELECT m.ack_required FROM messages m \
-                               WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                         ELSE ack_ts \
-                     END \
-                 WHERE agent_id = ? AND message_id IN ({})",
+            let select_sql = format!(
+                "SELECT DISTINCT message_id FROM message_recipients \
+                 WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({})",
                 placeholders(chunk.len())
             );
-            let mut params = Vec::with_capacity(3 + chunk.len());
-            params.push(Value::BigInt(now));
-            params.push(Value::BigInt(now));
+            let mut select_params = Vec::with_capacity(1 + chunk.len());
+            select_params.push(Value::BigInt(agent_id));
+            for &message_id in chunk {
+                select_params.push(Value::BigInt(message_id));
+            }
+            for row in conn
+                .query_sync(&select_sql, &select_params)
+                .map_err(|e| DbError::Sqlite(e.to_string()))?
+            {
+                let message_id = row
+                    .get_named::<i64>("message_id")
+                    .map_err(|e| DbError::Sqlite(e.to_string()))?;
+                updated_message_ids.push(message_id);
+            }
+
+            let sql = format!(
+                "UPDATE message_recipients \
+                 SET read_ts = ? \
+                 WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut params = Vec::with_capacity(2 + chunk.len());
+            params.push(Value::BigInt(read_ts));
             params.push(Value::BigInt(agent_id));
             for &message_id in chunk {
                 params.push(Value::BigInt(message_id));
@@ -376,13 +520,21 @@ fn mark_messages_read_batch_sync_conn(
                 .map_err(|e| DbError::Sqlite(e.to_string()))?;
         }
 
-        rebuild_agent_inbox_stats_sync(conn, agent_id)
+        rebuild_agent_inbox_stats_sync(conn, agent_id)?;
+        updated_message_ids.sort_unstable();
+        updated_message_ids.dedup();
+        Ok(updated_message_ids)
     })();
 
     match result {
-        Ok(()) => {
+        Ok(updated_message_ids) => {
             commit_sync_write_tx(conn)?;
-            Ok(())
+            Ok(
+                (!updated_message_ids.is_empty()).then_some(MarkMessagesReadBatch {
+                    read_ts,
+                    message_ids: updated_message_ids,
+                }),
+            )
         }
         Err(err) => {
             rollback_sync_write_tx(conn);
@@ -400,7 +552,11 @@ pub fn mark_messages_read_batch_sync(
     sqlite_path: &str,
     agent_id: i64,
     message_ids: &[i64],
-) -> Result<(), DbError> {
+) -> Result<Option<MarkMessagesReadBatch>, DbError> {
+    if message_ids.is_empty() {
+        return Ok(None);
+    }
+
     let conn = open_sync_conn(sqlite_path)?;
     let result = mark_messages_read_batch_sync_conn(&conn, agent_id, message_ids);
     crate::close_db_conn(conn, "mark_messages_read_batch_sync connection");
@@ -1144,6 +1300,13 @@ mod tests {
             &[Value::BigInt(recipient_id), Value::BigInt(pid)],
         )
         .unwrap();
+        conn.execute_sync(
+            "INSERT OR IGNORE INTO message_recipients \
+             (message_id, agent_id, kind, read_ts, ack_ts) \
+             VALUES (?, ?, 'to', NULL, NULL)",
+            &[Value::BigInt(msg_id), Value::BigInt(recipient_id)],
+        )
+        .unwrap();
 
         sync_message_recipients_json(&conn, msg_id).expect("sync recipients_json");
 
@@ -1434,12 +1597,18 @@ mod tests {
         )
         .unwrap();
 
-        mark_messages_read_batch_sync_conn(
+        let batch = mark_messages_read_batch_sync_conn(
             &conn,
             recipient_id,
             &[plain_message_id, ack_message_id, ack_message_id],
         )
-        .unwrap();
+        .unwrap()
+        .expect("non-empty batch should return the written rows");
+        assert_eq!(
+            batch.message_ids,
+            vec![ack_message_id, plain_message_id],
+            "batch helper should report the message IDs it updated"
+        );
 
         let rows = conn
             .query_sync(
@@ -1450,15 +1619,18 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2, "expected two recipient rows");
 
-        let first = &rows[0];
-        let second = &rows[1];
+        let first = rows.first().expect("first recipient row");
+        let second = rows.get(1).expect("second recipient row");
         let first_message_id = first.get_named::<i64>("message_id").unwrap();
         let second_message_id = second.get_named::<i64>("message_id").unwrap();
 
         for row in [first, second] {
-            assert!(
-                row.get_named::<i64>("read_ts").is_ok(),
-                "read_ts should be populated after sync batch mark-read"
+            let read_ts = row
+                .get_named::<i64>("read_ts")
+                .expect("read_ts should be populated after sync batch mark-read");
+            assert_eq!(
+                read_ts, batch.read_ts,
+                "batch helper should report the timestamp it wrote"
             );
         }
 
@@ -1473,8 +1645,8 @@ mod tests {
             first
         };
         assert!(
-            ack_row.get_named::<i64>("ack_ts").is_ok(),
-            "ack_required message should auto-ack on read"
+            ack_row.get_named::<i64>("ack_ts").is_err(),
+            "ack_required message should remain pending acknowledgement after mark-read"
         );
         assert!(
             plain_row.get_named::<i64>("ack_ts").is_err(),
@@ -1492,6 +1664,114 @@ mod tests {
             .expect("inbox_stats row should exist");
         assert_eq!(stats_row.get_named::<i64>("total_count").unwrap(), 2);
         assert_eq!(stats_row.get_named::<i64>("unread_count").unwrap(), 0);
-        assert_eq!(stats_row.get_named::<i64>("ack_pending_count").unwrap(), 0);
+        assert_eq!(stats_row.get_named::<i64>("ack_pending_count").unwrap(), 1);
+    }
+
+    #[test]
+    fn mark_messages_read_batch_sync_conn_returns_none_when_no_rows_match() {
+        let conn = test_conn();
+
+        let read_ts = mark_messages_read_batch_sync_conn(&conn, 42, &[100, 101])
+            .expect("no matching rows should still be a successful no-op");
+
+        assert_eq!(read_ts, None);
+    }
+
+    #[test]
+    fn mark_messages_read_batch_sync_conn_returns_none_when_rows_already_read() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let sender_id = insert_agent(&conn, pid, "Sender");
+        let recipient_id = insert_agent(&conn, pid, "Recipient");
+        let message_id = insert_message(&conn, pid, sender_id, "already-read");
+        let existing_read_ts = 1_770_354_000_000_000;
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts) \
+             VALUES (?1, ?2, 'to', ?3)",
+            &[
+                Value::BigInt(message_id),
+                Value::BigInt(recipient_id),
+                Value::BigInt(existing_read_ts),
+            ],
+        )
+        .expect("insert already-read recipient row");
+
+        let read_ts = mark_messages_read_batch_sync_conn(&conn, recipient_id, &[message_id])
+            .expect("already-read rows should remain a successful no-op");
+
+        assert_eq!(read_ts, None);
+        let stored_read_ts = conn
+            .query_sync(
+                "SELECT read_ts FROM message_recipients WHERE message_id = ?1 AND agent_id = ?2",
+                &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+            )
+            .expect("select read_ts")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("read_ts").ok())
+            .expect("read_ts should remain populated");
+        assert_eq!(stored_read_ts, existing_read_ts);
+    }
+
+    #[test]
+    fn mark_messages_read_batch_sync_conn_reports_only_rows_it_updates() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let sender_id = insert_agent(&conn, pid, "Sender");
+        let recipient_id = insert_agent(&conn, pid, "Recipient");
+        let updated_message_id = insert_message(&conn, pid, sender_id, "updated");
+        let already_read_message_id = insert_message(&conn, pid, sender_id, "already-read");
+        let missing_message_id = 99_999;
+        let existing_read_ts = 1_770_354_000_000_000;
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+            &[
+                Value::BigInt(updated_message_id),
+                Value::BigInt(recipient_id),
+            ],
+        )
+        .expect("insert unread recipient row");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts) \
+             VALUES (?1, ?2, 'to', ?3)",
+            &[
+                Value::BigInt(already_read_message_id),
+                Value::BigInt(recipient_id),
+                Value::BigInt(existing_read_ts),
+            ],
+        )
+        .expect("insert already-read recipient row");
+
+        let batch = mark_messages_read_batch_sync_conn(
+            &conn,
+            recipient_id,
+            &[
+                updated_message_id,
+                already_read_message_id,
+                missing_message_id,
+            ],
+        )
+        .expect("partial update should succeed")
+        .expect("one row should be updated");
+
+        assert_eq!(batch.message_ids, vec![updated_message_id]);
+    }
+
+    #[test]
+    fn mark_messages_read_batch_sync_empty_ids_does_not_create_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sqlite_path = dir.path().join("mailbox.sqlite3");
+        let sqlite_path_str = sqlite_path
+            .to_str()
+            .expect("temporary sqlite path should be valid UTF-8");
+
+        let read_ts = mark_messages_read_batch_sync(sqlite_path_str, 42, &[])
+            .expect("empty batch is a no-op");
+        assert_eq!(read_ts, None);
+
+        assert!(
+            !sqlite_path.exists(),
+            "empty mark-read batch should not create or open a live DB"
+        );
     }
 }

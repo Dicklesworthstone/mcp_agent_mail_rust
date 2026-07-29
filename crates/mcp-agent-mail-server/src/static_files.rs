@@ -140,20 +140,24 @@ fn executable_web_candidates(exe_parent: &Path) -> Vec<PathBuf> {
     // Keep legacy-style source-tree probing, but only when an ancestor looks like
     // the project root. This avoids serving unrelated `~/web` trees when the
     // binary is installed under locations like `~/.local/bin`.
-    exe_parent
-        .ancestors()
-        .take(3)
-        .filter(|ancestor| looks_like_source_tree_root(ancestor))
-        .map(|ancestor| ancestor.join("web"))
-        .collect()
+    web_candidates_from_ancestors(exe_parent, 3)
 }
 
 fn current_dir_web_candidates(cwd: &Path) -> Vec<PathBuf> {
-    cwd.ancestors()
-        .take(10)
-        .filter(|ancestor| looks_like_source_tree_root(ancestor))
-        .map(|ancestor| ancestor.join("web"))
-        .collect()
+    web_candidates_from_ancestors(cwd, 10)
+}
+
+fn web_candidates_from_ancestors(start: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for ancestor in start.ancestors().take(max_depth) {
+        if is_shared_ancestor_boundary(ancestor) {
+            break;
+        }
+        if looks_like_source_tree_root(ancestor) {
+            candidates.push(ancestor.join("web"));
+        }
+    }
+    candidates
 }
 
 fn looks_like_source_tree_root(path: &Path) -> bool {
@@ -207,6 +211,24 @@ fn is_real_directory(path: &Path) -> bool {
 fn is_real_file(path: &Path) -> bool {
     !path_existing_prefix_has_symlink(path)
         && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+#[cfg(unix)]
+fn is_shared_ancestor_boundary(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        if !metadata.file_type().is_dir() {
+            return false;
+        }
+        let mode = metadata.permissions().mode();
+        mode & 0o1000 != 0 && mode & 0o002 != 0
+    })
+}
+
+#[cfg(not(unix))]
+fn is_shared_ancestor_boundary(_path: &Path) -> bool {
+    false
 }
 
 fn normalized_relative_path(relative: &str) -> Option<PathBuf> {
@@ -442,6 +464,42 @@ mod tests {
 
         let candidates = current_dir_web_candidates(&nested);
         assert!(candidates.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_dir_web_candidates_do_not_trust_sticky_shared_root_markers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::write(shared.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let candidates = current_dir_web_candidates(&shared);
+        assert!(
+            candidates.is_empty(),
+            "shared sticky directories must not be trusted as project roots"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_dir_web_candidates_still_detect_project_inside_sticky_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let project = shared.join("project");
+        let nested = project.join("crates/server");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let candidates = current_dir_web_candidates(&nested);
+        assert_eq!(candidates, vec![project.join("web")]);
     }
 
     #[test]

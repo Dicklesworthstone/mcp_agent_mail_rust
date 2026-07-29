@@ -10,6 +10,7 @@
 
 pub mod agent_detect;
 pub mod agent_health;
+pub mod am_version;
 pub mod atc_adaptation;
 pub mod atc_admissibility;
 pub mod atc_assumptions;
@@ -46,6 +47,7 @@ pub mod flake_triage;
 pub mod git_binary;
 pub mod git_cmd;
 pub mod git_lock;
+pub mod host_health;
 pub mod identity;
 pub mod intern;
 pub mod kpi;
@@ -63,6 +65,7 @@ pub mod slo;
 pub mod test_harness;
 pub mod timestamps;
 pub mod toon;
+pub mod worker_stack;
 
 #[cfg(test)]
 pub mod proptest_generators;
@@ -93,6 +96,11 @@ pub use atc_retention::{
     POLICY_SNAPSHOT_HOT_DAYS, REPLAY_DISCOVERABILITY_REQUIREMENTS,
     RESOLVED_EXPERIENCE_DROP_AFTER_DAYS, RESOLVED_EXPERIENCE_FULL_FIDELITY_DAYS, ROLLUP_LIVE_DAYS,
     STALE_REGIME_AFTER_DAYS, StoragePlane, retention_rule,
+};
+pub use atc_user_surfaces::{
+    ATC_CANARY_REPORT_DIR_ENV, ATC_CANARY_REPORT_DIR_NAME, ATC_CANARY_REPORT_FILE_NAME,
+    ATC_CANARY_REPORT_PATH_ENV, AtcCanaryReportSummary, load_atc_canary_report_path,
+    load_latest_atc_canary_report,
 };
 pub use backpressure::{
     CapacityAction, CapacityGovernorDecision, HealthLevel, HealthSignals, cached_health_level,
@@ -140,7 +148,9 @@ pub use git_lock::{
     DEFAULT_FLOCK_TIMEOUT_SECS, GitRepoLocks, ReentrancyGuard, RepoFlock, admin_dir_for,
     canonicalize_repo, sentinel_path,
 };
-pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
+pub use identity::{
+    ProjectIdentity, compute_project_slug, resolve_project_identity, resolve_project_path, slugify,
+};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};
 pub use kpi::{
     AckPressureKpi, AnomalyAlert, AnomalyKind, AnomalySeverity, AnomalyThresholds, ContentionKpi,
@@ -169,9 +179,11 @@ pub use mcp_config::{
 };
 pub use memory::{MemoryPressure, MemorySample};
 pub use metrics::{
-    CanaryMetrics, CanaryMetricsSnapshot, Counter, DbMetricsSnapshot, GaugeI64, GaugeU64,
+    CanaryMetrics, CanaryMetricsSnapshot, CorruptionDetectionSource, CorruptionMetrics,
+    CorruptionMetricsSnapshot, Counter, DbMetricsSnapshot, FdMetricsSnapshot, GaugeI64, GaugeU64,
     GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, Log2Histogram,
-    StorageMetricsSnapshot, ToolsMetricsSnapshot, global_metrics,
+    StorageMetricsSnapshot, ToolsMetricsSnapshot, count_open_fds, fd_metrics_snapshot,
+    global_metrics, read_fd_limits,
 };
 pub use models::{
     Agent, AgentLink, ConsistencyMessageRef, ConsistencyReport, FileReservation,
@@ -182,8 +194,9 @@ pub use models::{
 };
 pub use pane_identity::{
     canonical_identity_path, cleanup_all_stale_identities, cleanup_stale_identities,
-    get_composite_tmux_pane_id, list_identities, resolve_identity, resolve_identity_current_pane,
-    resolve_identity_with_path, write_identity, write_identity_current_pane,
+    get_composite_tmux_pane_id, list_identities, list_identities_with_paths, resolve_identity,
+    resolve_identity_current_pane, resolve_identity_with_optional_pane, resolve_identity_with_path,
+    write_identity, write_identity_current_pane, write_identity_with_optional_pane,
 };
 pub use search_types::{
     DateRange, DocChange, DocId, DocKind, Document, ExplainComposerConfig, ExplainReasonCode,
@@ -203,3 +216,4 @@ pub use toon::{
     apply_resource_format, apply_tool_format, apply_toon_format, looks_like_toon_rust_encoder,
     parse_toon_stats, resolve_encoder, resolve_output_format, run_encoder, validate_encoder,
 };
+pub use worker_stack::{worker_stack_size, worker_thread};

@@ -1250,7 +1250,7 @@ fn golden_zero_results() {
     eprintln!("golden_zero_results: 5 assertions passed");
 }
 
-/// Score monotonicity: within a single query, scores should be non-increasing.
+/// Score monotonicity: within a single query, relevance scores should be non-increasing.
 #[test]
 fn golden_score_monotonicity() {
     let corpus = build_corpus();
@@ -1268,14 +1268,13 @@ fn golden_score_monotonicity() {
             continue;
         }
 
-        // FTS5 BM25 scores: lower = more relevant (ASC ordering)
-        // So scores should be non-decreasing
+        // Search V3 normalizes relevance so higher scores are better.
         for i in 1..snap.results.len() {
             let prev = snap.results[i - 1].score;
             let curr = snap.results[i].score;
             assert!(
-                prev <= curr + SCORE_TOLERANCE,
-                "Score monotonicity violated for '{}' at rank {}: {:.4} > {:.4}",
+                prev + SCORE_TOLERANCE >= curr,
+                "Score monotonicity violated for '{}' at rank {}: {:.4} < {:.4}",
                 q.label,
                 i + 1,
                 prev,

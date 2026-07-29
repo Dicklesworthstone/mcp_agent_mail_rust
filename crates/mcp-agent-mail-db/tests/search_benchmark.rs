@@ -1020,19 +1020,21 @@ fn explain_metadata_quality() {
     let explain = response
         .explain
         .expect("explain should be present when requested");
-    assert!(
-        explain.method.ends_with("_v3"),
-        "message search should report a V3 engine method, got {}",
-        explain.method
+    assert_eq!(
+        explain.method, "like_fallback",
+        "filter-heavy message search should use the SQL correctness path"
     );
     assert!(
-        !explain.used_like_fallback,
-        "V3 message search should not report LIKE fallback"
+        explain.used_like_fallback,
+        "filter-heavy message search should report the SQL fallback path"
     );
     assert!(explain.facet_count >= 2); // project_id + importance
     assert!(explain.facets_applied.contains(&"importance".to_string()));
     assert!(explain.facets_applied.contains(&"project_id".to_string()));
-    assert_eq!(explain.sql, "-- v3 pipeline (non-SQL result assembly)");
+    assert!(
+        explain.sql.contains("messages"),
+        "SQL fallback explain should include the generated query"
+    );
 }
 
 /// Test agent search doc kind.

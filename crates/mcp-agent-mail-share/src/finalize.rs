@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::queries::UNKNOWN_SENDER_DISPLAY;
+use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
 
 use crate::ShareError;
 
@@ -39,13 +39,18 @@ pub struct FinalizeResult {
 /// Returns `true` if FTS5 was available and the index was created.
 /// Returns `false` if FTS5 is not compiled into SQLite (graceful fallback).
 pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
-    let conn = open_conn(snapshot_path)?;
+    // FTS5 shadow tables are part of SQLite's on-disk format.  Build them with
+    // canonical SQLite so exported snapshots remain consumable by stock SQLite
+    // and do not inherit FrankenSQLite's still-incomplete FTS5 writer behavior.
+    // The live Agent Mail runtime remains on FrankenSQLite; this connection is
+    // scoped only to the disposable export image.
+    let conn = open_canonical_conn(snapshot_path)?;
     build_search_indexes_with_conn(&conn)
 }
 
-fn build_search_indexes_with_conn(conn: &Conn) -> Result<bool, ShareError> {
+fn build_search_indexes_with_conn(conn: &CanonicalDbConn) -> Result<bool, ShareError> {
     // Check if thread_id column exists
-    let has_thread_id = column_exists(conn, "messages", "thread_id")?;
+    let has_thread_id = canonical_column_exists(conn, "messages", "thread_id")?;
 
     // Create FTS5 virtual table
     let create_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
@@ -87,7 +92,7 @@ fn build_search_indexes_with_conn(conn: &Conn) -> Result<bool, ShareError> {
         "thread_key",
         "created_ts",
     ] {
-        if !column_exists(conn, "fts_messages", col)? {
+        if !canonical_column_exists(conn, "fts_messages", col)? {
             needs_rebuild = true;
             break;
         }
@@ -695,17 +700,68 @@ fn prepare_rebuilt_snapshot_storage(
     let temp_dir = tempfile::Builder::new()
         .prefix("am-share-finalize-")
         .tempdir_in(parent)?;
+    let source_copy = temp_dir.path().join("mailbox.source.sqlite3");
+    stage_snapshot_source(&snapshot_path, &source_copy)?;
     let rebuilt_path = temp_dir.path().join("mailbox.sqlite3");
 
-    crate::snapshot::rebuild_sqlite_snapshot_with_pragmas(
-        &snapshot_path,
+    crate::snapshot::rebuild_sqlite_snapshot_with_profiles(
+        &source_copy,
         &rebuilt_path,
         false,
-        &["PRAGMA journal_mode='DELETE'", "PRAGMA page_size=1024"],
+        crate::snapshot::SnapshotSourceProfile::CanonicalExport,
+        crate::snapshot::SnapshotDestinationProfile::PortableExport,
     )?;
 
     let backup_path = temp_dir.path().join("mailbox.backup.sqlite3");
     Ok((temp_dir, rebuilt_path, backup_path))
+}
+
+fn stage_snapshot_source(snapshot_path: &Path, staged_path: &Path) -> Result<(), ShareError> {
+    std::fs::copy(snapshot_path, staged_path).map_err(|error| {
+        ShareError::Io(std::io::Error::other(format!(
+            "failed to stage SQLite snapshot {} at {}: {error}",
+            snapshot_path.display(),
+            staged_path.display()
+        )))
+    })?;
+
+    for suffix in SQLITE_SNAPSHOT_SIDECAR_SUFFIXES {
+        let mut source_sidecar_os = snapshot_path.as_os_str().to_os_string();
+        source_sidecar_os.push(suffix);
+        let source_sidecar = std::path::PathBuf::from(source_sidecar_os);
+        match std::fs::symlink_metadata(&source_sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                let mut staged_sidecar_os = staged_path.as_os_str().to_os_string();
+                staged_sidecar_os.push(suffix);
+                let staged_sidecar = std::path::PathBuf::from(staged_sidecar_os);
+                std::fs::copy(&source_sidecar, &staged_sidecar).map_err(|error| {
+                    ShareError::Io(std::io::Error::other(format!(
+                        "failed to stage SQLite snapshot sidecar {} at {}: {error}",
+                        source_sidecar.display(),
+                        staged_sidecar.display()
+                    )))
+                })?;
+            }
+            // Never follow a sidecar symlink. A successful rebuild publishes a
+            // self-contained database and removes the stale link; a failed
+            // rebuild leaves the original snapshot and link untouched.
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(ShareError::Io(std::io::Error::other(format!(
+                    "refusing to stage non-file SQLite snapshot sidecar {}",
+                    source_sidecar.display()
+                ))));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ShareError::Io(std::io::Error::other(format!(
+                    "failed to inspect SQLite snapshot sidecar {}: {error}",
+                    source_sidecar.display()
+                ))));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn prepare_post_finalize_rollback_snapshot(
@@ -824,6 +880,14 @@ fn open_conn(path: &Path) -> Result<Conn, ShareError> {
     })
 }
 
+fn open_canonical_conn(path: &Path) -> Result<CanonicalDbConn, ShareError> {
+    let path = crate::require_real_share_sqlite_path(path)?;
+    let path_str = path.display().to_string();
+    CanonicalDbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open {path_str} with canonical SQLite: {e}"),
+    })
+}
+
 fn sql_err(e: impl std::fmt::Display) -> ShareError {
     ShareError::Sqlite {
         message: e.to_string(),
@@ -864,6 +928,22 @@ fn column_exists(conn: &Conn, table: &str, column: &str) -> Result<bool, ShareEr
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
+}
+
+fn canonical_column_exists(
+    conn: &CanonicalDbConn,
+    table: &str,
+    column: &str,
+) -> Result<bool, ShareError> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("PRAGMA table_info({table}) failed: {e}"),
+        })?;
+    Ok(rows.iter().any(|row| {
+        row.get_named::<String>("name")
+            .is_ok_and(|name| name == column)
+    }))
 }
 
 #[cfg(test)]
@@ -1262,6 +1342,7 @@ mod tests {
         conn.execute_raw("DELETE FROM messages WHERE id >= 1000")
             .unwrap();
         drop(conn);
+        checkpoint_test_db_and_remove_sidecars(&db);
 
         let before = file_size(&db);
         finalize_snapshot_for_export(&db).unwrap();
@@ -1341,6 +1422,31 @@ mod tests {
         let rows = conn.query_sync("PRAGMA journal_mode", &[]).unwrap();
         let mode: String = rows[0].get_named("journal_mode").unwrap();
         assert_eq!(mode, "delete");
+    }
+
+    #[test]
+    fn full_finalize_pipeline_produces_canonically_healthy_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let result = finalize_export_db(&db).expect("finalize export database");
+        assert!(result.fts_enabled, "canonical SQLite should provide FTS5");
+
+        let conn = CanonicalDbConn::open_file(db.display().to_string())
+            .expect("open finalized export with canonical SQLite");
+        for (pragma, column) in [
+            ("PRAGMA quick_check", "quick_check"),
+            ("PRAGMA integrity_check", "integrity_check"),
+        ] {
+            let rows = conn
+                .query_sync(pragma, &[])
+                .unwrap_or_else(|error| panic!("{pragma} should execute: {error}"));
+            let details = rows
+                .iter()
+                .filter_map(|row| row.get_named::<String>(column).ok())
+                .collect::<Vec<_>>();
+            assert_eq!(details, ["ok"], "{pragma} reported corruption");
+        }
     }
 
     #[test]

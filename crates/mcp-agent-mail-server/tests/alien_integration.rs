@@ -11,11 +11,15 @@ use std::time::Duration;
 
 use ftui::layout::Rect;
 use ftui::widgets::Widget;
-use ftui::{Frame, GraphemePool};
+use ftui::{Event, Frame, GraphemePool, KeyCode, KeyEvent};
+use ftui_runtime::program::Model;
+use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::bocpd::BocpdDetector;
 use mcp_agent_mail_core::conformal::ConformalPredictor;
 use mcp_agent_mail_core::evidence_ledger::{EvidenceLedgerEntry, evidence_ledger};
 use mcp_agent_mail_db::s3fifo::S3FifoCache;
+use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_decision::{BayesianDiffStrategy, DiffAction, FrameState};
 use mcp_agent_mail_server::tui_widgets::{DisclosureLevel, TransparencyWidget};
 
@@ -243,6 +247,124 @@ fn alien_e2e_bayesian_layout_integration() {
     assert!(
         (sum - 1.0).abs() < 1e-6,
         "posterior should sum to 1.0; got {sum}"
+    );
+}
+
+/// 4b. Public app render-loop wiring for the Bayesian diff strategy.
+///
+/// Runs the real `MailAppModel::view()` path so the test observes the app-level
+/// safe-mode shadow decision, frame audit hook, and outcome evidence ledger
+/// records through the same surface the TUI runtime calls.
+#[test]
+fn alien_e2e_bayesian_render_loop_telemetry_from_mail_app_view() {
+    const FRAME_COUNT: usize = 128;
+    const FRAME_COUNT_U32: u32 = 128;
+    const BASE_WIDTH: u16 = 80;
+    const BASE_HEIGHT: u16 = 24;
+
+    let state = TuiSharedState::new(&Config::default());
+    let mut model = MailAppModel::new(state);
+    let _ = model.init();
+    let start_seq = evidence_ledger()
+        .recent(1)
+        .first()
+        .map_or(0, |entry| entry.seq);
+
+    let mut pool = GraphemePool::new();
+    let mut shadow_incremental_frames = 0usize;
+    let mut resize_full_frames = 0usize;
+
+    for index in 0..FRAME_COUNT {
+        let resize_frame = index > 0 && index % 37 == 0;
+        let width = if resize_frame {
+            BASE_WIDTH + 8
+        } else {
+            BASE_WIDTH
+        };
+        let height = BASE_HEIGHT;
+
+        if resize_frame {
+            let _ = model.update(MailMsg::Terminal(Event::Resize { width, height }));
+        } else if index % 19 == 0 {
+            let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Tab))));
+        }
+
+        let mut frame = Frame::new(width, height, &mut pool);
+        model.view(&mut frame);
+
+        let telemetry = model.diff_telemetry();
+        assert_eq!(
+            telemetry.last_action,
+            DiffAction::Full,
+            "safe-mode render path must continue to apply Full frames"
+        );
+        assert!(
+            (0.0..=1.0).contains(&telemetry.last_change_ratio),
+            "change ratio must remain bounded: {}",
+            telemetry.last_change_ratio
+        );
+
+        if telemetry.last_shadow_action == DiffAction::Incremental {
+            shadow_incremental_frames += 1;
+        }
+        if resize_frame && telemetry.last_action == DiffAction::Full {
+            resize_full_frames += 1;
+        }
+    }
+
+    let telemetry = model.diff_telemetry();
+    assert!(
+        telemetry.safe_mode,
+        "default rollout should remain in safe shadow mode"
+    );
+    assert!(
+        !telemetry.first_frame_pending,
+        "first-frame full guard should be consumed by the first view()"
+    );
+    assert_eq!(
+        telemetry.full_diff_audit_counter, FRAME_COUNT_U32,
+        "each view() call should complete the diff audit accounting"
+    );
+    assert_eq!(telemetry.deferred_frames, 0);
+    assert_eq!(telemetry.consecutive_audit_mismatches, 0);
+    assert!(
+        shadow_incremental_frames > 0,
+        "shadow strategy should observe stable frames and choose Incremental"
+    );
+    assert!(
+        resize_full_frames > 0,
+        "resize frames should stay on the Full render path"
+    );
+
+    let outcome_entries: Vec<_> = evidence_ledger()
+        .query("tui.diff_strategy.outcome", FRAME_COUNT + 32)
+        .into_iter()
+        .filter(|entry| entry.seq > start_seq)
+        .collect();
+    assert!(
+        outcome_entries.len() >= FRAME_COUNT,
+        "render loop should emit one outcome entry per frame; got {}",
+        outcome_entries.len()
+    );
+    assert!(
+        outcome_entries.iter().any(|entry| {
+            entry
+                .evidence
+                .get("shadow_action")
+                .and_then(serde_json::Value::as_str)
+                == Some("incremental")
+        }),
+        "outcome evidence should include the Bayesian shadow action"
+    );
+    assert!(
+        outcome_entries.iter().all(|entry| {
+            entry
+                .evidence
+                .get("audit_mismatch")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        }),
+        "safe-mode render loop should not record visual diff mismatches"
     );
 }
 

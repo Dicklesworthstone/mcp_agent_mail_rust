@@ -313,10 +313,10 @@ fi
 
 # 1f. fetch_inbox description
 FI_DESC="$(extract_tool_description "$TOOLS_RESP" "fetch_inbox")"
-if echo "$FI_DESC" | grep -qF "Retrieve recent messages for an agent without mutating"; then
+if echo "$FI_DESC" | grep -qF "Retrieve recent messages for an agent and mark returned messages read."; then
     e2e_pass "fetch_inbox description prefix"
 else
-    e2e_fail "fetch_inbox description prefix" "${FI_DESC:0:120}" "Retrieve recent messages..."
+    e2e_fail "fetch_inbox description prefix" "${FI_DESC:0:120}" "Retrieve recent messages for an agent and mark returned messages read."
 fi
 
 # ===========================================================================

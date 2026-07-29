@@ -124,7 +124,7 @@ pub fn from_fs_scored_results(
 pub fn to_fs_scored_result(result: &crate::search_two_tier::ScoredResult) -> FsScoredResult {
     use frankensearch::core::types::ScoreSource;
     FsScoredResult {
-        doc_id: doc_id_to_string(result.doc_id),
+        doc_id: doc_id_to_string(result.doc_id).into(),
         score: result.score,
         source: ScoreSource::SemanticFast,
         index: None,
@@ -349,7 +349,7 @@ mod tests {
         use frankensearch::core::types::ScoreSource;
 
         let fs_result = FsScoredResult {
-            doc_id: "123".to_string(),
+            doc_id: "123".to_string().into(),
             score: 0.95,
             source: ScoreSource::SemanticFast,
             index: None,
@@ -375,7 +375,7 @@ mod tests {
         use frankensearch::core::types::ScoreSource;
 
         let fs_result = FsScoredResult {
-            doc_id: "not-a-u64".to_string(),
+            doc_id: "not-a-u64".to_string().into(),
             score: 0.5,
             source: ScoreSource::Hybrid,
             index: None,
@@ -397,7 +397,7 @@ mod tests {
 
         fn make(id: &str, score: f32) -> FsScoredResult {
             FsScoredResult {
-                doc_id: id.to_string(),
+                doc_id: id.to_string().into(),
                 score,
                 source: ScoreSource::SemanticFast,
                 index: None,

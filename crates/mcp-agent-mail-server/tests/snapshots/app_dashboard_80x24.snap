@@ -1,24 +1,24 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-Messages     Ack Pend     Locks        Agents       Contacts     Requests       
-0 ─          0 ─          0 ─          0 ─          0 ─          0 ─            
- [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                          
-No events yet.                                                                  
-Waiting for HTTP/tool/message traffic and health pulses.                        
-Enter opens Timeline/Search context when results are available.                 
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
- Dashboard api up:0m00s                                             LIVE [^P] ? 
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search               >
+Messages   Ack Pend   Locks      Agents     Contacts   Requests   Avg Lat       
+Error %                                                                         
+╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────╮
+│                                                                              │
+│  [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                       │
+│ No events yet.                                                               │
+│ Waiting for HTTP/tool/message traffic and health pulses.                     │
+│ Enter opens Timeline/Search context when results are available.              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ Dashboard mcp up:0m00s                                            LIVE [^P] F1 

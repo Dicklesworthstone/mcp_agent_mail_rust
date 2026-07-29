@@ -19,8 +19,8 @@
 //! | `tool_latency_p95_ms` | `snapshot.tool_latency_us.p95 / 1000` | ms |
 //! | `tool_latency_p99_ms` | `snapshot.tool_latency_us.p99 / 1000` | ms |
 //! | `pool_acquire_p95_ms` | `snapshot.db.pool_acquire_latency_us.p95 / 1000` | ms |
-//! | `pool_utilization_pct` | `active_conns × 100 / total_conns` | % |
-//! | `wbq_utilization_pct` | `wbq_depth × 100 / wbq_capacity` | % |
+//! | `pool_utilization_pct` | `min(100, active_conns × 100 / total_conns)` | % |
+//! | `wbq_utilization_pct` | `min(100, wbq_depth × 100 / wbq_capacity)` | % |
 //! | `ack_pending` | last recorded pending ack gauge | count |
 //! | `ack_overdue` | last recorded overdue ack gauge | count |
 //! | `reservation_active` | last recorded active reservation gauge | count |
@@ -36,7 +36,9 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::metrics::{GlobalMetricsSnapshot, HistogramSnapshot, global_metrics};
+use crate::metrics::{
+    GlobalMetricsSnapshot, HistogramSnapshot, global_metrics, percentage_clamped,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -476,15 +478,7 @@ fn compute_kpi(window: KpiWindow, old: &Sample, new: &Sample) -> KpiSnapshot {
 
     // -- Contention --
     let wbq_cap = m_new.storage.wbq_capacity;
-    let wbq_utilization_pct = if wbq_cap == 0 {
-        0
-    } else {
-        m_new
-            .storage
-            .wbq_depth
-            .saturating_mul(100)
-            .saturating_div(wbq_cap)
-    };
+    let wbq_utilization_pct = percentage_clamped(m_new.storage.wbq_depth, wbq_cap);
 
     let reservation_conflicts_in_window = new
         .reservation_conflicts_total
@@ -1627,9 +1621,9 @@ pub fn quick_insight_feed() -> InsightFeed {
 mod tests {
     use super::*;
     use crate::metrics::{
-        AtcMetricsSnapshot, CanaryMetricsSnapshot, DbMetricsSnapshot, GlobalMetricsSnapshot,
-        HistogramSnapshot, HttpMetricsSnapshot, SearchMetricsSnapshot, StorageMetricsSnapshot,
-        SystemMetricsSnapshot, ToolsMetricsSnapshot,
+        AtcMetricsSnapshot, CanaryMetricsSnapshot, CorruptionMetricsSnapshot, DbMetricsSnapshot,
+        GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, SearchMetricsSnapshot,
+        StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
     };
     use std::sync::Mutex;
     use std::thread;
@@ -1700,6 +1694,8 @@ mod tests {
                 pool_utilization_pct: 50,
                 pool_over_80_since_us: 0,
                 integrity_failures_total: 0,
+                bespoke_parser_only_rejections_total: 0,
+                ..DbMetricsSnapshot::default()
             },
             storage: StorageMetricsSnapshot {
                 wbq_enqueued_total: tool_calls,
@@ -1711,6 +1707,14 @@ mod tests {
                 wbq_peak_depth: 50,
                 wbq_over_80_since_us: 0,
                 wbq_queue_latency_us: make_histogram(100, 500, 1000),
+                wbq_last_unrecoverable_error_us: 0,
+                wbq_unrecoverable_errors_total: 0,
+                wbq_respawn_salvaged_total: 0,
+                wbq_respawn_lost_total: 0,
+                archive_direct_writes_total: 0,
+                archive_direct_write_errors_total: 0,
+                archive_direct_write_latency_us: zero_histogram(),
+                archive_direct_skips_disk_critical_total: 0,
 
                 commit_enqueued_total: commit_drained + 5,
                 commit_drained_total: commit_drained,
@@ -1755,6 +1759,7 @@ mod tests {
             search: SearchMetricsSnapshot::default(),
             atc: AtcMetricsSnapshot::default(),
             canary: CanaryMetricsSnapshot::default(),
+            corruption: CorruptionMetricsSnapshot::default(),
         }
     }
 
@@ -2057,6 +2062,42 @@ mod tests {
 
         let kpi = compute_kpi(KpiWindow::OneMin, &old, &new);
         assert_eq!(kpi.contention.wbq_utilization_pct, 0);
+    }
+
+    #[test]
+    fn wbq_utilization_clamps_and_handles_large_values() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let mut metrics = make_snapshot(0, 0, 0, 0, 0, 0);
+        metrics.storage.wbq_capacity = u64::MAX;
+        metrics.storage.wbq_depth = u64::MAX;
+
+        let old = Sample {
+            taken_at: t0,
+            metrics: make_snapshot(0, 0, 0, 0, 0, 0),
+            ack_pending: 0,
+            ack_overdue: 0,
+            reservation_active: 0,
+            reservation_conflicts_total: 0,
+            messages_sent_total: 0,
+        };
+        let mut new = Sample {
+            taken_at: t1,
+            metrics,
+            ack_pending: 0,
+            ack_overdue: 0,
+            reservation_active: 0,
+            reservation_conflicts_total: 0,
+            messages_sent_total: 0,
+        };
+
+        let kpi = compute_kpi(KpiWindow::OneMin, &old, &new);
+        assert_eq!(kpi.contention.wbq_utilization_pct, 100);
+
+        new.metrics.storage.wbq_capacity = 1;
+        new.metrics.storage.wbq_depth = u64::MAX;
+        let kpi = compute_kpi(KpiWindow::OneMin, &old, &new);
+        assert_eq!(kpi.contention.wbq_utilization_pct, 100);
     }
 
     #[test]

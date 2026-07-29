@@ -157,7 +157,7 @@ fn resolve_holder_lease_path(slot_path: &Path, agent_name: &str, branch: Option<
 fn compute_branch(repo_path: &str) -> Option<String> {
     let repo = git2::Repository::discover(repo_path).ok()?;
     let head = repo.head().ok()?;
-    head.shorthand().map(str::to_string)
+    head.shorthand().ok().map(str::to_string)
 }
 
 fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<BuildSlotLease> {

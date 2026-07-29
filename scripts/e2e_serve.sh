@@ -24,7 +24,7 @@ set -euo pipefail
 
 E2E_SUITE="${E2E_SUITE:-serve}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -85,16 +85,25 @@ start_am_server() {
 
     local server_log="${E2E_ARTIFACT_DIR}/server_${label}.log"
     (
-        export DATABASE_URL="sqlite:////${db_path}"
-        export STORAGE_ROOT="${storage_root}"
-        export HOME="${home_dir}"
-        export HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED="0"
-        export HTTP_HOST="127.0.0.1"
-        export HTTP_PORT="${port}"
+        exec 63>&- || true
         if [ "${AM_SERVER_SUBCOMMAND}" = "start" ]; then
-            "${AM_BIN}" start --host 127.0.0.1 --port "${port}" --no-tui "$@"
+            exec env \
+                "DATABASE_URL=sqlite:////${db_path}" \
+                "STORAGE_ROOT=${storage_root}" \
+                "HOME=${home_dir}" \
+                "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0" \
+                "HTTP_HOST=127.0.0.1" \
+                "HTTP_PORT=${port}" \
+                "${AM_BIN}" start --host 127.0.0.1 --port "${port}" --no-tui "$@"
         else
-            "${AM_BIN}" serve-http --host 127.0.0.1 --port "${port}" "$@"
+            exec env \
+                "DATABASE_URL=sqlite:////${db_path}" \
+                "STORAGE_ROOT=${storage_root}" \
+                "HOME=${home_dir}" \
+                "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=0" \
+                "HTTP_HOST=127.0.0.1" \
+                "HTTP_PORT=${port}" \
+                "${AM_BIN}" serve-http --host 127.0.0.1 --port "${port}" "$@"
         fi
     ) >"${server_log}" 2>&1 &
     echo $!

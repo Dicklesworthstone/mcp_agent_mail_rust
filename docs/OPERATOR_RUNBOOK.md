@@ -208,9 +208,15 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 Use the web overseer form when humans need to redirect active agents quickly:
 
 1. Open `/mail/{project}/overseer/compose`.
-2. Select recipients and write subject/body (optionally set `thread_id`).
-3. Submit to send a high-importance message as `HumanOverseer`.
-4. Agents receive it through normal inbox resources/tools and can reply in-thread.
+2. Select explicit recipients, enter the intervention reason, and write subject/body
+   (optionally set `thread_id`).
+3. For multiple recipients, confirm the final recipient list before sending.
+4. Submit to send a high-importance message as `HumanOverseer`.
+5. Agents receive it through normal inbox resources/tools and can reply in-thread.
+
+The overseer route rejects broadcast-style sends and unknown recipients. The
+response and structured audit event include the `HumanOverseer` marker, reason,
+recipient list, thread id, and contact-policy-bypass flag.
 
 ### 4.6 Agent Network Graph Interpretation (Contacts)
 
@@ -259,8 +265,9 @@ is used in hot paths.
 | `DATABASE_POOL_TIMEOUT`        | `15` (seconds)        | Pool acquisition timeout         |
 | `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
+| `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
 | `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run `PRAGMA quick_check` at boot |
-| `INTEGRITY_CHECK_INTERVAL_HOURS` | `24`               | Periodic full integrity check    |
+| `INTEGRITY_CHECK_INTERVAL_HOURS` | `1`                | Periodic full integrity check    |
 
 ### HTTP Server
 
@@ -271,6 +278,7 @@ is used in hot paths.
 | `HTTP_PATH`                           | `/mcp/`       | Base path                      |
 | `HTTP_BEARER_TOKEN`                   | (none)        | Bearer auth token              |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED`| `false`       | Skip auth for 127.0.0.1       |
+| `HTTP_ALLOWED_HOSTS`                  | (none)        | Comma-separated extra `Host:` header values the listener accepts (additive to the bind host, its loopback variant, and `localhost`). Needed to reach `/mail` via a hostname or reverse proxy without an HTTP 421. Same as repeatable `serve-http --allowed-host`. |
 
 ### Storage
 
@@ -291,6 +299,43 @@ is used in hot paths.
 | `MEMORY_WARNING_MB`             | `2048`  | RSS warning threshold (MB)         |
 | `MEMORY_CRITICAL_MB`            | `4096`  | RSS critical threshold (MB)        |
 | `MEMORY_FATAL_MB`               | `8192`  | RSS fatal threshold (MB)           |
+| `AM_HEALTH_SWEEP_ENABLED`       | `true`  | Enable periodic read-only git ref-integrity sweeps |
+| `AM_HEALTH_SWEEP_INTERVAL_SEC`  | `900`   | Seconds between git ref-integrity sweep cycles |
+| `AM_HEALTH_SWEEP_BATCH`         | `5`     | Registered projects checked per sweep cycle |
+
+### Worker Thread Stacks
+
+A stack overflow is **not recoverable** in Rust: the runtime prints
+`fatal runtime error: stack overflow` and aborts the process. It cannot be
+caught, and every other thread's in-flight work dies with it. Rust gives
+spawned threads a 2 MiB stack by default while the main thread inherits the
+process rlimit (usually 8 MiB), which is how GH#202 aborted the daemon — the
+`am-archive-read` worker ran the archive reconstruction/salvage path on 2 MiB
+at production scale.
+
+Every worker thread this project spawns is therefore given an explicit 32 MiB
+stack from a single shared policy, rather than sizing only the threads that
+look deep. Thread stacks are reserved address space committed lazily per page,
+so an untouched 32 MiB stack costs approximately zero resident memory; the
+whole fleet of workers reserves well under a gigabyte of a 128 TiB address
+space. Leaving these at their defaults is correct for essentially all
+deployments.
+
+| Variable                                     | Default | Description                          |
+|----------------------------------------------|---------|--------------------------------------|
+| `MCP_AGENT_MAIL_WORKER_STACK_MB`             | `32`    | Stack (MiB) for every spawned worker thread, clamped to 8..512. A value below the floor is clamped up rather than honored, so the GH#202 abort cannot be reintroduced by a stray small setting. |
+| `MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB`      | —       | Legacy alias for the above, honored so existing GH#202 workarounds keep working. Prefer the new name. |
+| `MCP_AGENT_MAIL_READ_SNAPSHOT_EXACT_AUDIT_MS`| `1000`  | Interval between exact (content-hash) generation audits, capped at 30s |
+
+`RUST_MIN_STACK` is also honored: the worker stack is the larger of the
+configured value and `RUST_MIN_STACK`. `Builder::stack_size` normally overrides
+`RUST_MIN_STACK` in std, so this is folded in deliberately — an operator who
+already raised it as a GH#202 workaround keeps that headroom instead of being
+silently lowered to the built-in default.
+
+Note this bounds *deep* recursion, not *unbounded* recursion. A call chain that
+recurses proportionally to mailbox or archive size would still exhaust any
+fixed stack; that has to be fixed in the recursion itself.
 
 ### TUI
 
@@ -530,12 +575,26 @@ mv "$SROOT/projects/<slug>/.git/index.lock" \
 # Check disk usage (adjust path to your STORAGE_ROOT)
 du -sh "${STORAGE_ROOT:-${XDG_DATA_HOME:-~/.local/share}/mcp-agent-mail/git_mailbox_repo}/"
 
-# Clean old archives
-# (retention system handles this automatically if enabled)
+# Inventory proof artifacts before cleanup
+am doctor artifacts --json | jq '{totals, disk, largest_roots, warnings}'
+
+# Archive reviewed artifacts manually; am doctor artifacts never deletes
+tar -C <parent> -czf /tmp/<root>.tgz <root>
+mkdir -p <storage-root>/doctor/archive-quarantine/manual
+mv <reviewed-stale-root> <storage-root>/doctor/archive-quarantine/manual/
 
 # Adjust thresholds
 DISK_SPACE_WARNING_MB=200 DISK_SPACE_CRITICAL_MB=50 am serve-http
 ```
+
+`am doctor artifacts` is the safe retention governor for proof artifacts:
+it reports repo test/perf/e2e roots, CLI failure artifacts, refactor ledgers,
+doctor reports, forensic bundles, quarantine roots, recovery backups, and
+per-project attachment roots. The command is read-only. It includes retention
+classes, byte/file totals, the largest exact roots, disk pressure state, and
+manual remediation guidance. Cleanup remains an operator action: archive or
+quarantine reviewed evidence only after preserving anything needed for a
+postmortem, regression proof, release gate, or user-facing support thread.
 
 ### Deployment Validation (`verify-live`)
 

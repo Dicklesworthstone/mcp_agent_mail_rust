@@ -5,7 +5,7 @@
 //! - DB queries used by workers (ACK TTL scanning)
 //! - Retention/quota with real filesystem layout
 
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 
 // ---------------------------------------------------------------------------
 // Config gating tests
@@ -90,17 +90,35 @@ fn list_unacknowledged_messages_empty_db() {
     use fastmcp_core::block_on;
     use mcp_agent_mail_db::{DbPoolConfig, create_pool, queries};
 
-    let pool_config = DbPoolConfig::from_env();
-    let pool = create_pool(&pool_config).expect("create pool");
-    let cx = Cx::for_testing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("ack_ttl_empty.sqlite3");
+    let database_url = format!("sqlite:///{}", db_path.display());
+    let storage_root = tmp.path().join("storage");
+    let storage_root = storage_root.display().to_string();
 
-    // On a fresh DB, there should be no unacknowledged messages.
-    let result = block_on(async { queries::list_unacknowledged_messages(&cx, &pool).await });
+    with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root.as_str()),
+        ],
+        || {
+            Config::reset_cached();
+            let pool_config = DbPoolConfig::from_env();
+            let pool = create_pool(&pool_config).expect("create pool");
+            let cx = Cx::for_testing();
 
-    match result {
-        Outcome::Ok(rows) => assert!(rows.is_empty(), "fresh DB should have no unacked messages"),
-        other => panic!("unexpected result: {other:?}"),
-    }
+            // On a fresh DB, there should be no unacknowledged messages.
+            let result =
+                block_on(async { queries::list_unacknowledged_messages(&cx, &pool).await });
+
+            match result {
+                Outcome::Ok(rows) => {
+                    assert!(rows.is_empty(), "fresh DB should have no unacked messages");
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

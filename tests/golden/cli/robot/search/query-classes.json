@@ -1,0 +1,471 @@
+{
+  "_meta": {
+    "command": "robot search query-classes",
+    "timestamp": "2026-01-02T03:04:05Z",
+    "format": "json",
+    "version": "1.0",
+    "project": "/workspace/project-alpha",
+    "agent": "RedFox"
+  },
+  "query_classes": [
+    {
+      "class": "empty_query",
+      "data": {
+        "query": "",
+        "total_results": 0,
+        "results": [],
+        "route": {
+          "method": "empty_query",
+          "used_like_fallback": false,
+          "facet_count": 0
+        },
+        "guidance": {
+          "summary": "No search terms provided. Enter a word, quoted phrase, thread id, or agent name.",
+          "suggestions": [
+            {
+              "kind": "enter_search_terms",
+              "label": "Enter search terms",
+              "detail": "Examples: `rollback`, `\"build plan\"`, `thread:br-123`, or `from:BlueLake`."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "class": "exact_message_id",
+      "data": {
+        "query": "id:2048",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 2048,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Exact message lookup",
+            "thread": "br-search-golden",
+            "snippet": "Result selected by exact message id.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "sql_plan",
+          "normalized_query": "id:2048",
+          "used_like_fallback": true,
+          "facet_count": 2,
+          "facets_applied": [
+            "engine:lexical",
+            "project_id"
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    },
+    {
+      "class": "quoted_phrase",
+      "data": {
+        "query": "\"build plan\"",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 201,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Build plan",
+            "thread": "br-search-golden",
+            "snippet": "Quoted phrase matched the subject.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "hybrid_v3",
+          "normalized_query": "\"build plan\"",
+          "used_like_fallback": false,
+          "facet_count": 2,
+          "facets_applied": [
+            "engine:hybrid",
+            "project_id"
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    },
+    {
+      "class": "malformed_filter_typo",
+      "data": {
+        "query": "form:BlueLake rollback",
+        "total_results": 0,
+        "results": [],
+        "route": {
+          "method": "hybrid_v3",
+          "normalized_query": "form:BlueLake rollback",
+          "used_like_fallback": false,
+          "facet_count": 2,
+          "facets_applied": [
+            "engine:hybrid",
+            "project_id"
+          ]
+        },
+        "assistance": {
+          "query_text": "form:BlueLake rollback",
+          "did_you_mean": [
+            {
+              "token": "form:BlueLake",
+              "suggested_field": "from",
+              "value": "BlueLake"
+            }
+          ]
+        },
+        "guidance": {
+          "summary": "No results found. 1 suggestion available to broaden your search.",
+          "suggestions": [
+            {
+              "kind": "fix_typo",
+              "label": "Did you mean \"from:BlueLake\"?",
+              "detail": "\"form:BlueLake\" is not a recognized field. Try \"from\" instead."
+            }
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 0
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 0
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 0
+          }
+        ]
+      }
+    },
+    {
+      "class": "canonical_thread_filter",
+      "data": {
+        "query": "thread:br-123 migration",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 203,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Migration plan",
+            "thread": "br-123",
+            "snippet": "Schema migration checklist and owner handoff.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "hybrid_v3",
+          "normalized_query": "migration",
+          "used_like_fallback": false,
+          "facet_count": 3,
+          "facets_applied": [
+            "engine:hybrid",
+            "project_id",
+            "thread_id"
+          ]
+        },
+        "assistance": {
+          "query_text": "migration",
+          "applied_filter_hints": [
+            {
+              "field": "thread",
+              "value": "br-123"
+            }
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    },
+    {
+      "class": "importance_filter",
+      "data": {
+        "query": "urgent deployment",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 205,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Urgent deployment",
+            "thread": "br-search-golden",
+            "snippet": "Importance-constrained deployment thread.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "hybrid_v3",
+          "normalized_query": "urgent deployment",
+          "used_like_fallback": false,
+          "facet_count": 3,
+          "facets_applied": [
+            "engine:hybrid",
+            "project_id",
+            "importance"
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    },
+    {
+      "class": "since_filter",
+      "data": {
+        "query": "incident",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 206,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Incident follow-up",
+            "thread": "br-search-golden",
+            "snippet": "Recent incident note after the since boundary.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "hybrid_v3",
+          "normalized_query": "incident",
+          "used_like_fallback": false,
+          "facet_count": 3,
+          "facets_applied": [
+            "engine:hybrid",
+            "project_id",
+            "time_range_min"
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    },
+    {
+      "class": "broad_natural_language",
+      "data": {
+        "query": "why did the archive repair run this morning",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 207,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Archive repair root cause",
+            "thread": "br-search-golden",
+            "snippet": "Natural-language query routed through hybrid search.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "hybrid_v3",
+          "normalized_query": "why did the archive repair run this morning",
+          "used_like_fallback": false,
+          "facet_count": 2,
+          "facets_applied": [
+            "engine:hybrid",
+            "project_id"
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    },
+    {
+      "class": "boolean_query",
+      "data": {
+        "query": "rollback AND migration",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 208,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Rollback migration",
+            "thread": "br-search-golden",
+            "snippet": "Boolean query preserved for lexical matching.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "lexical_v3",
+          "normalized_query": "rollback AND migration",
+          "used_like_fallback": false,
+          "facet_count": 2,
+          "facets_applied": [
+            "engine:lexical",
+            "project_id"
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    },
+    {
+      "class": "prefix_query",
+      "data": {
+        "query": "migrat*",
+        "total_results": 1,
+        "results": [
+          {
+            "id": 209,
+            "relevance": 0.91,
+            "from": "BlueLake",
+            "subject": "Migration prefix",
+            "thread": "br-search-golden",
+            "snippet": "Prefix query expands to migration-family terms.",
+            "age": "2m"
+          }
+        ],
+        "route": {
+          "method": "lexical_v3",
+          "normalized_query": "migrat*",
+          "used_like_fallback": false,
+          "facet_count": 2,
+          "facets_applied": [
+            "engine:lexical",
+            "project_id"
+          ]
+        },
+        "by_thread": [
+          {
+            "value": "br-search-golden",
+            "count": 1
+          }
+        ],
+        "by_agent": [
+          {
+            "value": "BlueLake",
+            "count": 1
+          }
+        ],
+        "by_importance": [
+          {
+            "value": "normal",
+            "count": 1
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -237,6 +237,7 @@ fn extract_slug_from_ensure_project_response(project_json: &str) -> String {
 fn error_code_catalog_is_stable() {
     let actual = collect_declared_error_codes();
     let expected: BTreeSet<String> = [
+        "ACK_INTENT_WRITE_FAILED",
         "AGENT_NOT_FOUND",
         "ARCHIVE_ERROR",
         "BROADCAST_DISABLED",
@@ -247,30 +248,42 @@ fn error_code_catalog_is_stable() {
         "DATABASE_CORRUPTION",
         "DATABASE_ERROR",
         "DATABASE_POOL_EXHAUSTED",
-        "DATABASE_RECOVERED",
         "DISK_FULL",
+        "DURABILITY_DEGRADED",
+        "EMPTY_AGENT_NAME",
         "EMPTY_MODEL",
         "EMPTY_PATHS",
         "EMPTY_PROGRAM",
         "FEATURE_DISABLED",
         "IDENTITY_NOT_FOUND",
+        "INCONSISTENT_STATE",
+        "INVALID_AGENT_NAME",
         "INVALID_ARGUMENT",
         "INVALID_LIMIT",
         "INVALID_PATH",
         "INVALID_PATHS",
+        "INVALID_PATH_PATTERN",
+        "INVALID_PROJECT_KEY",
         "INVALID_THREAD_ID",
         "INVALID_TIMESTAMP",
+        "MALFORMED_ACTIVE_RESERVATION",
         "MISSING_FIELD",
         "MISSING_PANE_ID",
         "NOT_FOUND",
+        "PATH_TOO_LONG",
+        "PAYLOAD_TOO_LARGE",
         "RECIPIENT_NOT_FOUND",
+        "RELEASE_INTENT_WRITE_FAILED",
         "RESERVATION_ACTIVE",
+        "RESERVATION_SNAPSHOT_TOO_LARGE",
         "RESOURCE_BUSY",
         "SENDER_TOKEN_MISMATCH",
+        "SNAPSHOT_TIMEOUT",
         "SUSPICIOUS_PATTERN",
         "TOO_MANY_PATHS",
         "TYPE_ERROR",
         "UNHANDLED_EXCEPTION",
+        "UNRESOLVED_RESERVATION_HOLDER",
     ]
     .into_iter()
     .map(str::to_string)
@@ -328,6 +341,8 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             Some("error code parity".to_string()),
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("empty program must fail");
@@ -341,6 +356,8 @@ fn validation_and_lookup_errors_have_expected_envelope_shape() {
             String::new(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
+            None,
             None,
             None,
         )
@@ -478,6 +495,8 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
             "gpt-5".to_string(),
             Some("BlueLake".to_string()),
             Some("error code parity".to_string()),
+            None,
+            None,
             None,
             None,
         )

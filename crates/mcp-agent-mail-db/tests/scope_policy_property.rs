@@ -30,6 +30,15 @@ use mcp_agent_mail_db::search_scope::{
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+fn fixture_sender_id(project_id: i64, from_agent: &str) -> i64 {
+    match (project_id, from_agent) {
+        (_, "SelfAgent") => 10,
+        (_, "SomeAgent") => 50,
+        (_, "Foreign") | (2, "BlueLake") => 30,
+        _ => 20,
+    }
+}
+
 fn msg(id: i64, project_id: i64, from_agent: &str) -> SearchResult {
     SearchResult {
         doc_kind: DocKind::Message,
@@ -43,6 +52,7 @@ fn msg(id: i64, project_id: i64, from_agent: &str) -> SearchResult {
         created_ts: Some(1_700_000_000_000_000),
         thread_id: Some(format!("thread-{id}")),
         from_agent: Some(from_agent.to_string()),
+        from_agent_id: Some(fixture_sender_id(project_id, from_agent)),
         reason_codes: Vec::new(),
         score_factors: Vec::new(),
         redacted: false,
@@ -736,11 +746,11 @@ fn adversarial_self_referential_viewer() {
     });
 
     let dec = evaluate_scope(&result, &ctx);
-    // Recipient check triggers first (before policy check)
+    // Sender check triggers first when the viewer both sent and received it.
     assert_eq!(dec.verdict, ScopeVerdict::Allow);
     assert_eq!(
         dec.reason,
-        mcp_agent_mail_db::search_scope::ScopeReason::IsRecipient
+        mcp_agent_mail_db::search_scope::ScopeReason::IsSender
     );
 }
 

@@ -965,7 +965,47 @@ fn integrity_check_ok(path: &Path) -> CliResult<bool> {
         .first()
         .and_then(|r| r.get_named::<String>("integrity_check").ok())
         .unwrap_or_default();
-    Ok(value == "ok")
+    if value == "ok" {
+        return Ok(true);
+    }
+
+    // #153 defect 1: the one-shot migration gate failed closed on a
+    // canonical-clean DB. The bespoke (frankensqlite) engine diverges from
+    // canonical SQLite on shapes canonical accepts — most notably the
+    // `agents(project_id, name COLLATE NOCASE)` unique index it false-flags
+    // (#151/#152). The runtime integrity guard already reconciles such a
+    // verdict against canonical SQLite (`reconcile_with_canonical` in
+    // mcp-agent-mail-db::pool); the migration gate did not, so a freshly
+    // migrated DB that canonical `PRAGMA integrity_check`/`quick_check` both
+    // accept was reported as a hard failure (no receipt, operator steered away
+    // from a migration that in fact succeeded).
+    //
+    // Mirror the runtime contract here: a non-`ok` bespoke verdict is only a
+    // failure if canonical SQLite also rejects the file. Drop the bespoke
+    // connection first so the canonical engine opens the file cleanly.
+    drop(conn);
+    match mcp_agent_mail_db::pool::sqlite_compatibility_read_path_is_healthy(path) {
+        Ok(true) => {
+            tracing::warn!(
+                path = %path.display(),
+                primary_verdict = %value,
+                "legacy import integrity gate: bespoke engine rejected the migrated DB but canonical SQLite accepts it; treating as healthy"
+            );
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(e) => {
+            // Canonical second opinion could not run. Fail closed: preserve the
+            // bespoke rejection rather than invent health we cannot confirm.
+            tracing::warn!(
+                path = %path.display(),
+                primary_verdict = %value,
+                canonical_error = %e,
+                "legacy import integrity gate: bespoke engine rejected the migrated DB and canonical fallback could not run"
+            );
+            Ok(false)
+        }
+    }
 }
 
 fn query_core_table_counts(path: &Path) -> CliResult<BTreeMap<String, i64>> {

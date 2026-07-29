@@ -154,7 +154,7 @@ pub fn detect_missing_refs(repo_path: &Path) -> Result<Vec<PrunableRef>, git2::E
                 (Some(obj.id()), "peeled")
             } else if let Some(target) = reference.target() {
                 (Some(target), "direct-target")
-            } else if let Some(sym) = reference.symbolic_target() {
+            } else if let Ok(Some(sym)) = reference.symbolic_target() {
                 // Symbolic ref that points to something; peel through
                 // one level. If the pointed-to ref doesn't exist we
                 // handle that as its own finding (the direct ref).

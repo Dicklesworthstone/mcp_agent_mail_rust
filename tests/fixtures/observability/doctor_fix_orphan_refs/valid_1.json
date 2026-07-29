@@ -1,0 +1,20 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "info",
+  "target": "mcp_agent_mail::doctor::fix_orphan_refs",
+  "name": "fix_orphan_refs_done",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "doctor.fix_orphan_refs",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 45,
+    "outcome": "success",
+    "git_version": "libgit2",
+    "op": "scan",
+    "apply": false,
+    "dry_run": true,
+    "findings": 0,
+    "pruned": 0,
+    "errors": 0
+  }
+}

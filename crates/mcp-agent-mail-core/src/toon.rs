@@ -307,7 +307,7 @@ fn encoder_result_cache_key(
     // Format: "<cmd_len>:<cmd>|<stats>|<payload_len>:<sha1(payload)>"
     let mut payload_hasher = Sha1::new();
     payload_hasher.update(json_payload.as_bytes());
-    let payload_sha1 = format!("{:x}", payload_hasher.finalize());
+    let payload_sha1 = crate::identity::bytes_to_lower_hex(payload_hasher.finalize());
 
     let mut key = String::with_capacity(command_key.len() + payload_sha1.len() + 48);
     key.push_str(&command_key.len().to_string());

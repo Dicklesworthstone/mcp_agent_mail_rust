@@ -54,6 +54,19 @@ fn write_login_profile(path: &Path, local_bin: &Path) {
     std::fs::write(path, contents).expect("write shell profile");
 }
 
+fn write_version_shim(path: &Path, binary: &str, version: &str) {
+    let contents = format!("#!/bin/sh\nprintf '%s\\n' '{binary} {version}'\n");
+    std::fs::write(path, contents).expect("write version shim");
+    #[cfg(unix)]
+    set_executable(path);
+}
+
+fn write_empty_ps_shim(path: &Path) {
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("write ps shim");
+    #[cfg(unix)]
+    set_executable(path);
+}
+
 fn read_fixture(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -93,14 +106,77 @@ fn canonicalize_json(v: &Value) -> Value {
 
 fn normalize_json(v: Value, tmp_root: &Path) -> Value {
     let tmp = tmp_root.to_string_lossy().to_string();
-    fn walk(v: Value, tmp: &str) -> Value {
+    // Slugify the FULL doctor-repo path with the product's own slug function:
+    // deriving it from the tempdir basename alone assumed tempdirs live at
+    // /tmp-style roots, but rch workers point TMPDIR inside the synced repo
+    // checkout (br-yceqd) and the slug then carries the repo-path prefix
+    // (`data-projects-...-rch-tmp-...`), leaving un-normalized residue.
+    let tmp_slug = Some(mcp_agent_mail_core::slugify(
+        &tmp_root.join("doctor_repo").to_string_lossy(),
+    ));
+    let search_index_root = std::env::temp_dir()
+        .join("mcp-agent-mail-search-index")
+        .to_string_lossy()
+        .to_string();
+
+    fn normalize_string(
+        s: String,
+        tmp: &str,
+        tmp_slug: Option<&str>,
+        search_index_root: &str,
+    ) -> String {
+        let mut normalized = s.replace(tmp, "<TMP_ROOT>");
+        if let Some(slug) = tmp_slug {
+            normalized = normalized.replace(slug, "<TMP_DOCTOR_PROJECT_SLUG>");
+        }
+        while let Some(start) = normalized.find("tmp-tmp") {
+            let suffix_offset = start + "tmp-tmp".len();
+            let Some(relative_end) = normalized[suffix_offset..].find("-doctor-repo") else {
+                break;
+            };
+            let end = suffix_offset + relative_end + "-doctor-repo".len();
+            normalized.replace_range(start..end, "<TMP_DOCTOR_PROJECT_SLUG>");
+        }
+        normalized = normalized.replace(
+            "data-<TMP_DOCTOR_PROJECT_SLUG>",
+            "<TMP_DOCTOR_PROJECT_SLUG>",
+        );
+        for root in [search_index_root, "/tmp/mcp-agent-mail-search-index"] {
+            if let Some(rest) = normalized.strip_prefix(root)
+                && search_index_hash_suffix(rest).is_some()
+            {
+                return "<SEARCH_INDEX_ROOT>/<HASH>".to_string();
+            }
+        }
+        normalized
+    }
+
+    fn search_index_hash_suffix(rest: &str) -> Option<&str> {
+        let sep = rest
+            .char_indices()
+            .find_map(|(idx, ch)| matches!(ch, '/' | '\\').then_some(idx))?;
+        let (scope, hash_with_sep) = rest.split_at(sep);
+        let hash = &hash_with_sep[1..];
+        if hash.is_empty() || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return None;
+        }
+        (scope.is_empty() || scope.starts_with('-')).then_some(hash)
+    }
+
+    fn walk(v: Value, tmp: &str, tmp_slug: Option<&str>, search_index_root: &str) -> Value {
         match v {
-            Value::String(s) => Value::String(s.replace(tmp, "<TMP_ROOT>")),
-            Value::Array(arr) => Value::Array(arr.into_iter().map(|x| walk(x, tmp)).collect()),
+            Value::String(s) => {
+                Value::String(normalize_string(s, tmp, tmp_slug, search_index_root))
+            }
+            Value::Array(arr) => Value::Array(
+                arr.into_iter()
+                    .map(|x| walk(x, tmp, tmp_slug, search_index_root))
+                    .collect(),
+            ),
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, val) in map {
-                    out.insert(k, walk(val, tmp));
+                    out.insert(k, walk(val, tmp, tmp_slug, search_index_root));
                 }
                 if let Some(check_name) = out.get("check").and_then(Value::as_str) {
                     match check_name {
@@ -143,13 +219,115 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                                 Value::String("<SERVER_PROCESS_CPU_SUMMARY>".to_string()),
                             );
                         }
+                        "db_file_sanity"
+                            if out.get("detail").and_then(Value::as_str).is_some_and(
+                                |detail| {
+                                    detail.starts_with("quick_check OK (")
+                                        && detail.ends_with(" bytes)")
+                                },
+                            ) =>
+                        {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("quick_check OK (<DB_BYTES> bytes)".to_string()),
+                            );
+                        }
+                        "binary_version" | "server_binary_version" => {
+                            if let Some(candidates) =
+                                out.get_mut("candidates").and_then(Value::as_array_mut)
+                            {
+                                for candidate in candidates {
+                                    if let Some(obj) = candidate.as_object_mut() {
+                                        obj.insert(
+                                            "parsed_version".to_string(),
+                                            Value::String("<PACKAGE_VERSION>".to_string()),
+                                        );
+                                        if let Some(source) =
+                                            obj.get("source").and_then(Value::as_str)
+                                            && source == "path"
+                                            && let Some(path) =
+                                                obj.get("path").and_then(Value::as_str)
+                                        {
+                                            let name = if path.ends_with("/mcp-agent-mail") {
+                                                "mcp-agent-mail"
+                                            } else {
+                                                "am"
+                                            };
+                                            obj.insert(
+                                                "version_line".to_string(),
+                                                Value::String(format!("{name} <PACKAGE_VERSION>")),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(detail) = out.get("detail").and_then(Value::as_str) {
+                                let normalized =
+                                    detail.replace(env!("CARGO_PKG_VERSION"), "<PACKAGE_VERSION>");
+                                out.insert("detail".to_string(), Value::String(normalized));
+                            }
+                            out.insert(
+                                "source_version".to_string(),
+                                Value::String("<PACKAGE_VERSION>".to_string()),
+                            );
+                        }
+                        "git_binary_path" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String(
+                                    "git <GIT_VERSION> at git is not on the known-bad list"
+                                        .to_string(),
+                                ),
+                            );
+                            out.insert(
+                                "version".to_string(),
+                                Value::String("<GIT_VERSION>".to_string()),
+                            );
+                        }
                         _ => {}
                     }
+                }
+                if out
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "sqlite_db")
+                    && out
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .is_some_and(|detail| detail.starts_with("bytes="))
+                {
+                    out.insert(
+                        "detail".to_string(),
+                        Value::String("bytes=<DB_BYTES>".to_string()),
+                    );
                 }
                 if out.contains_key("generated_at") {
                     out.insert(
                         "generated_at".to_string(),
                         Value::String("<GENERATED_AT>".to_string()),
+                    );
+                }
+                if out.contains_key("binary_version") {
+                    out.insert(
+                        "binary_version".to_string(),
+                        Value::String("<PACKAGE_VERSION>".to_string()),
+                    );
+                }
+                if out.contains_key("running_exe") {
+                    out.insert(
+                        "running_exe".to_string(),
+                        Value::String("<RUNNING_EXE>".to_string()),
+                    );
+                }
+                // J3 (br-bvq1x.10.3): the runtime_identity block names the live
+                // binary_path/pid/version/server_pids — inherently non-deterministic
+                // per run/release. Its structure is asserted by the dedicated
+                // doctor_check_json_always_includes_runtime_identity test; redact it
+                // to a stable marker here so the JSON-stability snapshot stays stable.
+                if out.contains_key("runtime_identity") {
+                    out.insert(
+                        "runtime_identity".to_string(),
+                        Value::String("<RUNTIME_IDENTITY>".to_string()),
                     );
                 }
                 Value::Object(out)
@@ -158,7 +336,36 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
         }
     }
 
-    walk(canonicalize_json(&v), &tmp)
+    walk(
+        canonicalize_json(&v),
+        &tmp,
+        tmp_slug.as_deref(),
+        &search_index_root,
+    )
+}
+
+#[test]
+fn normalize_json_redacts_user_scoped_search_index_roots() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let value = serde_json::json!({
+        "old": "/tmp/mcp-agent-mail-search-index/abcdef",
+        "scoped": "/tmp/mcp-agent-mail-search-index-880489/abcdef",
+        "not_hash": "/tmp/mcp-agent-mail-search-index-880489/not-a-hash",
+    });
+
+    let normalized = normalize_json(value, tmp.path());
+    assert_eq!(
+        normalized["old"],
+        Value::String("<SEARCH_INDEX_ROOT>/<HASH>".to_string())
+    );
+    assert_eq!(
+        normalized["scoped"],
+        Value::String("<SEARCH_INDEX_ROOT>/<HASH>".to_string())
+    );
+    assert_eq!(
+        normalized["not_hash"],
+        Value::String("/tmp/mcp-agent-mail-search-index-880489/not-a-hash".to_string())
+    );
 }
 
 #[derive(Debug)]
@@ -172,6 +379,24 @@ struct TestEnv {
 impl TestEnv {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Hermeticity (br-m105n, br-yceqd idiom): the tempdir may sit INSIDE a
+        // real repo checkout (rch workers point TMPDIR at <repo>/.rch-tmp), so
+        // any ancestor walk from a fixture cwd — detect_project_root() for
+        // `archive list`, git upward discovery, marker discovery — would escape
+        // the fixture into the real repo and change command output. Make the
+        // tempdir root a deterministic discovery boundary on every environment:
+        //  - sticky + world-writable (mode 1777, like /tmp) makes it an
+        //    is_shared_ancestor_boundary(), stopping marker walks;
+        //  - a garbage `.git` FILE aborts git upward discovery for cwds under
+        //    the tempdir that are not themselves git repos.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(tmp.path().join(".git"), "not a gitfile\n")
+                .expect("write boundary gitfile");
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o1777))
+                .expect("mark tmp root as shared-ancestor boundary");
+        }
         let db_path = tmp.path().join("mailbox.sqlite3");
         let home_dir = tmp.path().join("home");
         let doctor_repo = tmp.path().join("doctor_repo");
@@ -186,6 +411,12 @@ impl TestEnv {
         std::fs::copy(am_bin(), &installed_am).expect("copy am into hermetic home");
         #[cfg(unix)]
         set_executable(&installed_am);
+        write_version_shim(
+            &local_bin.join("mcp-agent-mail"),
+            "mcp-agent-mail",
+            env!("CARGO_PKG_VERSION"),
+        );
+        write_empty_ps_shim(&local_bin.join("ps"));
 
         write_login_profile(&home_dir.join(".bash_profile"), &local_bin);
         write_login_profile(&home_dir.join(".profile"), &local_bin);
@@ -259,12 +490,43 @@ impl TestEnv {
             ),
             ("LANG".to_string(), "C.UTF-8".to_string()),
             ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            // Pin beads discovery to a deterministically-absent workspace.
+            // Without this, doctor's beads_issue_awareness check walks up from
+            // the tempdir-nested cwd; rch workers point TMPDIR inside the
+            // synced repo checkout (.rch-tmp), so the walk escapes the fixture
+            // into the real repo's .beads and flips the check to "ok" — and the
+            // status feeds summary/finding-count aggregates, which the JSON
+            // normalizer cannot patch point-wise (br-m105n).
+            (
+                "BEADS_DIR".to_string(),
+                self.tmp
+                    .path()
+                    .join("no_beads_workspace")
+                    .display()
+                    .to_string(),
+            ),
             // Force server tool calls (products) to fail fast so we exercise local fallbacks.
             ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
             ("HTTP_PORT".to_string(), "1".to_string()),
             ("HTTP_PATH".to_string(), "/mcp/".to_string()),
+            // Widen the doctor version-probe budget: the hermetic-home copy of
+            // am is the real (large) binary, and a cold start on a host
+            // saturated by compile load can blow the default 3s budget,
+            // flipping doctor_check ok->warn through the same aggregate
+            // fields br-m105n pinned for beads (br-uxmqz).
+            (
+                "AM_DOCTOR_VERSION_PROBE_TIMEOUT_SECS".to_string(),
+                "15".to_string(),
+            ),
         ]
     }
+}
+
+fn close_and_checkpoint_seeded_db(conn: mcp_agent_mail_db::DbConn, db_path: &Path, context: &str) {
+    conn.close_sync()
+        .unwrap_or_else(|e| panic!("{context}: close seeded database: {e}"));
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
+        .unwrap_or_else(|e| panic!("{context}: checkpoint seeded database: {e}"));
 }
 
 fn seed_cli_json_db(db_path: &Path, root: &Path) -> (String, String) {
@@ -471,6 +733,8 @@ fn seed_cli_json_db(db_path: &Path, root: &Path) -> (String, String) {
     )
     .unwrap();
 
+    close_and_checkpoint_seeded_db(conn, db_path, "seed_cli_json_db");
+
     ("abc123".to_string(), "GreenCastle".to_string())
 }
 
@@ -494,6 +758,8 @@ fn seed_cli_json_db_product_only(db_path: &Path) -> String {
         ],
     )
     .unwrap();
+
+    close_and_checkpoint_seeded_db(conn, db_path, "seed_cli_json_db_product_only");
 
     "deadbeef".to_string()
 }
@@ -594,6 +860,8 @@ fn seed_cli_acks_db(db_path: &Path, root: &Path) -> (String, String, i64) {
         ],
     )
     .unwrap();
+
+    close_and_checkpoint_seeded_db(conn, db_path, "seed_cli_acks_db");
 
     ("proj-alpha".to_string(), "GreenCastle".to_string(), msg_id)
 }
@@ -743,7 +1011,8 @@ fn cli_json_snapshots() {
         &["list-projects", "--include-agents", "--json"],
     );
 
-    // archive list uses detect_project_root(), so run from a git-less tmp root.
+    // archive list uses detect_project_root(); the tmp root is a pinned
+    // discovery boundary (see TestEnv::new), so detection stops there.
     assert_json_snapshot(
         &env_empty_archive,
         "archive_list_empty",

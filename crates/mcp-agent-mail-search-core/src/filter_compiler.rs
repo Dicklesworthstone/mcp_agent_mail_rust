@@ -582,7 +582,9 @@ mod tests {
             let query = compiled.apply_to(Box::new(tantivy::query::AllQuery) as Box<dyn Query>);
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(100)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(100).order_by_score())
+                .unwrap();
             hits.iter()
                 .map(|(_score, addr)| {
                     let doc: TantivyDocument = searcher.doc(*addr).unwrap();
@@ -824,7 +826,9 @@ mod tests {
 
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&result, &TopDocs::with_limit(100)).unwrap();
+            let hits = searcher
+                .search(&result, &TopDocs::with_limit(100).order_by_score())
+                .unwrap();
             assert_eq!(hits.len(), 3);
         }
 
@@ -985,7 +989,7 @@ mod tests {
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
             let hits = searcher
-                .search(&wrapped, &TopDocs::with_limit(100))
+                .search(&wrapped, &TopDocs::with_limit(100).order_by_score())
                 .unwrap();
             assert_eq!(hits.len(), 1);
             let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();

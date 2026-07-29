@@ -22,15 +22,24 @@ background and TUI-specific troubleshooting.
 cd /abs/path/project
 am setup run --dry-run --yes --project-dir "$PWD" --format toon
 am setup status --format toon
+am setup status --format json
 ```
 
 **Expected output:** A dry-run summary showing which config files would be
 written or skipped, followed by a status report for the detected shell/editor
-integration.
+integration. Status output includes `primary_drift_reason`, `risk`, current and
+expected server entries, and a remediation command. Tokens are redacted.
 
 **Troubleshooting:** If the detected host, port, or path are wrong for this
-checkout, rerun with `--host`, `--port`, or `--path`. When the dry run looks
-correct, rerun `am setup run` without `--dry-run` to apply it.
+checkout, rerun with `--host`, `--port`, or `--path`. For bearer-header drift,
+provide the expected token with `--token` or through `HTTP_BEARER_TOKEN` /
+`config.env`. When the dry run looks correct, apply the exact same target with
+an explicit fix command:
+
+```bash
+am setup run --dry-run --project-dir "$PWD" --format toon
+am setup run --yes --project-dir "$PWD" --format toon
+```
 
 ## 2. Start a local HTTP server on a custom port [stateful]
 
@@ -234,6 +243,24 @@ am mail send \
 **Expected output:** A delivery summary showing the message was queued for the
 explicit recipient and attached to the requested thread.
 
+**Sender token (proving identity):** `am mail send` accepts a per-agent
+`sender_token`. If `--from` was registered with `am agents register` or
+`am macros start-session`, the token is persisted locally and reused
+automatically — no extra flags needed. To supply it explicitly without echoing
+the raw secret into shell history, prefer one of:
+
+```bash
+# From a file (contents trimmed):
+am mail send ... --sender-token-file ~/.config/mcp-agent-mail/sender.token
+
+# From the environment (not visible in `ps`/history):
+AGENT_MAIL_SENDER_TOKEN="$(cat ~/.config/mcp-agent-mail/sender.token)" \
+  am mail send ...
+```
+
+Resolution precedence: `--sender-token` (discouraged — visible in the process
+list) > `--sender-token-file` > `AGENT_MAIL_SENDER_TOKEN` > persisted identity.
+
 **Troubleshooting:** If the recipient is unknown, confirm the exact agent name
 with `am agents list --project "$PROJECT"`. Do not look for a broadcast flag;
 targeted delivery is the only supported path.
@@ -288,16 +315,54 @@ PROJECT=/abs/path/project
 
 am doctor check "$PROJECT" --format toon
 am doctor backups --format toon
+
+# Reliability diagnostics (all read-only; run before any mutating repair):
+am doctor health --format json        # one-line multi-verdict health rollup
+am doctor locks --json                # owner intelligence: who holds the mailbox (live/wedged/stale)
+am doctor drain                       # is it safe_to_mutate right now? (no live owner)
+am doctor mcp-selftest --format json  # live MCP round-trip self-test
+am doctor reclaim --dry-run           # preview consolidation of stale .doctor run debris
+am doctor support-bundle --json       # sanitized incident bundle for maintainer triage (no raw DB/bodies)
 ```
 
 **Expected output:** `doctor check` reports archive or database problems, and
 `doctor backups` lists any available backup snapshots or recovery artifacts.
+`doctor locks` / `doctor drain` tell you whether a live `am` still owns the
+mailbox — `repair` and `reconstruct` refuse while a live owner is present, so
+drain it via your supervisor first (never kill `am` directly).
 
 **Troubleshooting:** If the mailbox lock is busy, wait for the current archive
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
 
-## 14. Capture a quick benchmark baseline [read-only]
+## 14. Plan archive pack maintenance [read-only]
+
+**Goal:** Measure mailbox archive bloat without changing the Git archive.
+
+```bash
+am doctor pack-archive --plan
+am doctor pack-archive --plan --json
+git -C "$STORAGE_ROOT" count-objects -vH
+```
+
+**Expected output:** The planner reports global archive size, per-project
+archive sizes, loose-object and packfile counts, pack ages, top artifact
+categories, threshold verdicts, and exact safe follow-up commands.
+
+**Safety:** The planner is read-only. It never runs `git maintenance`, never
+prunes objects, and never deletes user data. If the verdict recommends action,
+preserve the JSON output as evidence before running the stateful command:
+
+```bash
+am doctor pack-archive --json
+```
+
+`pack-archive` uses Git's loose-object and incremental-repack maintenance. That
+can rewrite packfiles and temporarily increase disk usage while Git builds new
+packs, but it does not prune live archive data. Do not run lower-level cleanup
+commands unless a human has separately approved the exact command and risk.
+
+## 15. Capture a quick benchmark baseline [read-only]
 
 **Goal:** Get a fast performance snapshot before or after a change.
 

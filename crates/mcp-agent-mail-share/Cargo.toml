@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Share/export pipeline for MCP Agent Mail archives"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
+publish = false
 
 [dependencies]
 serde.workspace = true
@@ -20,7 +23,6 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 zip.workspace = true
 include_dir.workspace = true
-atty.workspace = true
 mcp-agent-mail-core = { workspace = true }
 mcp-agent-mail-db = { workspace = true, default-features = false }
 sqlmodel-core.workspace = true

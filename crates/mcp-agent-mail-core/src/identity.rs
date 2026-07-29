@@ -7,11 +7,14 @@ use crate::config::ProjectIdentityMode;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 // `use std::process::Command;` removed under br-8ujfs.3.4 (C4); all
 // git invocations now go through `crate::git_cmd::GitCmd`.
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryInfo {
@@ -40,8 +43,16 @@ pub struct ProjectIdentity {
 fn sha1_hex(text: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(text.as_bytes());
-    let digest = hasher.finalize();
-    format!("{digest:x}")
+    bytes_to_lower_hex(hasher.finalize())
+}
+
+pub(crate) fn bytes_to_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn short_sha1(text: &str, n: usize) -> String {
@@ -139,7 +150,71 @@ pub fn slugify(value: &str) -> String {
     }
 }
 
-fn resolve_path(human_key: &str) -> PathBuf {
+fn folded_filesystem_name(name: &OsStr) -> Option<String> {
+    Some(name.to_str()?.nfkc().flat_map(char::to_lowercase).collect())
+}
+
+/// Find the spelling stored in one directory for a canonicalized component.
+///
+/// `realpath(3)` preserves caller-provided casing on common case-insensitive
+/// filesystems (notably default macOS APFS). Directory iteration is the
+/// portable source of the stored spelling. Exact names always win. A folded
+/// fallback is accepted only when both paths identify the same file, which
+/// keeps distinct case-sensitive entries separate.
+fn stored_directory_entry_name(parent: &Path, requested: &OsStr) -> Option<OsString> {
+    let requested_folded = folded_filesystem_name(requested)?;
+    let requested_path = parent.join(requested);
+    let mut identity_match = None;
+
+    for entry in std::fs::read_dir(parent).ok()?.filter_map(Result::ok) {
+        let entry_name = entry.file_name();
+        if entry_name == requested {
+            return Some(entry_name);
+        }
+        if folded_filesystem_name(&entry_name).as_deref() != Some(requested_folded.as_str()) {
+            continue;
+        }
+        if !same_file::is_same_file(entry.path(), &requested_path).unwrap_or(false) {
+            continue;
+        }
+        // Ambiguity is possible with hard links. Fail closed rather than
+        // selecting an arbitrary display identity.
+        if identity_match.is_some() {
+            return None;
+        }
+        identity_match = Some(entry_name);
+    }
+
+    identity_match
+}
+
+fn recover_stored_path_spelling(canonical: &Path) -> PathBuf {
+    let mut recovered = PathBuf::new();
+    for component in canonical.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => recovered.push(prefix.as_os_str()),
+            std::path::Component::RootDir => recovered.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return canonical.to_path_buf(),
+            std::path::Component::Normal(requested) => {
+                let stored = stored_directory_entry_name(&recovered, requested)
+                    .unwrap_or_else(|| requested.to_os_string());
+                recovered.push(stored);
+            }
+        }
+    }
+    recovered
+}
+
+/// Resolve a project path to one stable filesystem spelling.
+///
+/// Existing paths are canonicalized and then rewritten with the directory
+/// entry names stored by the filesystem. This extra spelling recovery is
+/// required on case-insensitive filesystems whose canonicalization API
+/// preserves caller-provided casing. Missing paths retain the historical
+/// absolute-path fallback.
+#[must_use]
+pub fn resolve_project_path(human_key: &str) -> PathBuf {
     let expanded = shellexpand::tilde(human_key).into_owned();
     let path = PathBuf::from(expanded);
     if path.is_absolute() {
@@ -147,6 +222,7 @@ fn resolve_path(human_key: &str) -> PathBuf {
             return cached;
         }
         if let Ok(canonical) = std::fs::canonicalize(&path) {
+            let canonical = recover_stored_path_spelling(&canonical);
             resolve_path_cache_insert(&path, &canonical);
             return canonical;
         }
@@ -154,15 +230,29 @@ fn resolve_path(human_key: &str) -> PathBuf {
         resolve_path_cache_remove(&path);
         return path;
     }
-    std::fs::canonicalize(&path).unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(path)
-        }
-    })
+    std::fs::canonicalize(&path).map_or_else(
+        |_| {
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(path)
+            }
+        },
+        |canonical| recover_stored_path_spelling(&canonical),
+    )
+}
+
+fn dir_mode_slug_source(human_key: &str) -> String {
+    let expanded = shellexpand::tilde(human_key).into_owned();
+    let path = PathBuf::from(&expanded);
+    if path.is_absolute() {
+        return resolve_project_path(&expanded)
+            .to_string_lossy()
+            .to_string();
+    }
+    human_key.to_string()
 }
 
 /// Invoke git with the given args in `repo`, returning trimmed stdout.
@@ -410,14 +500,14 @@ const fn mode_to_str(mode: ProjectIdentityMode) -> &'static str {
 pub fn compute_project_slug(human_key: &str) -> String {
     let config = &Config::get();
     if !config.worktrees_enabled {
-        return slugify(human_key);
+        return slugify(&dir_mode_slug_source(human_key));
     }
 
     let mode = config.project_identity_mode;
     if mode == ProjectIdentityMode::Dir {
-        return slugify(human_key);
+        return slugify(&dir_mode_slug_source(human_key));
     }
-    let target_path = resolve_path(human_key);
+    let target_path = resolve_project_path(human_key);
     if !target_path.exists() {
         return slugify(human_key);
     }
@@ -477,7 +567,7 @@ pub fn compute_project_slug(human_key: &str) -> String {
             }
             slugify(human_key)
         }
-        ProjectIdentityMode::Dir => slugify(human_key),
+        ProjectIdentityMode::Dir => slugify(&dir_mode_slug_source(human_key)),
     }
 }
 
@@ -486,12 +576,12 @@ static IDENTITY_CACHE: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn fallback_identity(
-    human_key: &str,
+    _human_key: &str,
     target_str: &str,
     identity_mode_used: &str,
 ) -> ProjectIdentity {
     ProjectIdentity {
-        slug: slugify(human_key),
+        slug: slugify(target_str),
         identity_mode_used: identity_mode_used.to_string(),
         canonical_path: target_str.to_string(),
         human_key: target_str.to_string(),
@@ -510,7 +600,7 @@ fn fallback_identity(
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
-    let target_path = resolve_path(human_key);
+    let target_path = resolve_project_path(human_key);
     let target_str = target_path.to_string_lossy().to_string();
 
     let cache = IDENTITY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -1129,10 +1219,93 @@ mod tests {
     }
 
     #[test]
+    fn stored_path_spelling_uses_directory_entry_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("ProjectRepo");
+        let nested = project.join("SourceTree");
+        std::fs::create_dir_all(&nested).expect("create mixed-case project path");
+
+        let resolved = resolve_project_path(&nested.to_string_lossy());
+        assert_eq!(resolved, nested.canonicalize().expect("canonical path"));
+        assert_eq!(
+            resolved.file_name().and_then(OsStr::to_str),
+            Some("SourceTree")
+        );
+        assert_eq!(
+            resolved
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str),
+            Some("ProjectRepo")
+        );
+    }
+
+    #[test]
+    fn case_variant_paths_converge_when_filesystem_is_case_insensitive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stored = tmp.path().join("ProjectRepo");
+        std::fs::create_dir_all(&stored).expect("create mixed-case project path");
+        let variant = tmp.path().join("projectrepo");
+
+        // This contract is meaningful only on a case-insensitive filesystem.
+        // Linux CI normally takes this branch; macOS and Windows release-host
+        // tests execute the assertions below.
+        if !variant.exists() {
+            return;
+        }
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("WORKTREES_ENABLED", "0"), ("PROJECT_IDENTITY_MODE", "dir")],
+            || {
+                let stored_identity = resolve_project_identity(&stored.to_string_lossy());
+                let variant_identity = resolve_project_identity(&variant.to_string_lossy());
+                assert_eq!(stored_identity.human_key, variant_identity.human_key);
+                assert_eq!(
+                    stored_identity.canonical_path,
+                    variant_identity.canonical_path
+                );
+                assert_eq!(stored_identity.slug, variant_identity.slug);
+                assert_eq!(stored_identity.project_uid, variant_identity.project_uid);
+                assert!(stored_identity.human_key.ends_with("ProjectRepo"));
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_dir_identity_collapses_symlink_to_realpath() {
+        use std::os::unix::fs::symlink;
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("WORKTREES_ENABLED", "0"), ("PROJECT_IDENTITY_MODE", "dir")],
+            || {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let real = tmp.path().join("real-project");
+                std::fs::create_dir_all(&real).expect("create real project");
+                let link = tmp.path().join("project-link");
+                symlink(&real, &link).expect("create symlink");
+
+                let real_key = real.canonicalize().expect("canonical real");
+                let real_key = real_key.to_string_lossy().to_string();
+                let link_key = link.to_string_lossy().to_string();
+
+                let real_slug = compute_project_slug(&real_key);
+                let link_slug = compute_project_slug(&link_key);
+                assert_eq!(real_slug, link_slug);
+
+                let identity = resolve_project_identity(&link_key);
+                assert_eq!(identity.slug, real_slug);
+                assert_eq!(identity.human_key, real_key);
+                assert_eq!(identity.canonical_path, real_key);
+            },
+        );
+    }
+
+    #[test]
     fn resolve_path_absolute_missing_returns_input_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("does-not-exist");
-        let resolved = resolve_path(&missing.display().to_string());
+        let resolved = resolve_project_path(&missing.display().to_string());
         assert_eq!(resolved, missing);
     }
 
@@ -1164,7 +1337,7 @@ mod tests {
         let link = tmp.path().join("link");
         symlink(&target_a, &link).expect("symlink to target a");
 
-        let first = resolve_path(&link.display().to_string());
+        let first = resolve_project_path(&link.display().to_string());
         assert_eq!(first, target_a.canonicalize().expect("canonical a"));
 
         std::fs::remove_file(&link).expect("remove old link");
@@ -1172,7 +1345,7 @@ mod tests {
 
         std::thread::sleep(RESOLVE_PATH_CACHE_FRESHNESS + Duration::from_millis(10));
 
-        let second = resolve_path(&link.display().to_string());
+        let second = resolve_project_path(&link.display().to_string());
         assert_eq!(second, target_b.canonicalize().expect("canonical b"));
     }
 }

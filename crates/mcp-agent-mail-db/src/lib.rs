@@ -1,7 +1,7 @@
 //! Database layer for MCP Agent Mail
 //!
 //! This crate provides:
-//! - `SQLite` database operations via `sqlmodel` on frankensqlite
+//! - SQLite database operations via `sqlmodel` on FrankenSQLite
 //! - Connection pooling
 //! - Schema migrations
 //! - Search V3 retrieval integration (frankensearch lexical/semantic/hybrid)
@@ -36,10 +36,13 @@
 pub mod archive_anomaly;
 pub mod atc_queries;
 pub mod cache;
+pub mod circuit_breaker;
 pub mod coalesce;
 pub mod error;
 pub mod forensics;
+pub mod id_floor;
 pub mod integrity;
+pub mod invariants;
 pub mod mail_explorer;
 pub mod mailbox_verdict;
 pub mod migrate;
@@ -49,6 +52,8 @@ pub mod queries;
 pub mod query_assistance;
 pub mod query_plan_diagnostics;
 pub mod reconstruct;
+pub mod recovery_breaker;
+pub mod recovery_retention;
 pub mod retry;
 pub mod s3fifo;
 pub mod schema;
@@ -72,9 +77,11 @@ pub mod search_service;
 pub mod search_updater;
 #[cfg(feature = "tantivy-engine")]
 pub mod search_v3;
+pub mod snapshot;
 pub mod sync;
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;
+pub mod wal_classify;
 
 #[cfg(not(feature = "tantivy-engine"))]
 pub mod search_v3 {
@@ -186,9 +193,22 @@ pub use atc_queries::{
     CompactSummary, ExperienceStream, ExpiredExperienceCandidate, OpenExperienceFilter,
     OpenExperienceSummary, RollupEntry, SequenceRange,
 };
-pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
+pub use cache::{
+    CacheDiagnosticsSnapshot, CacheEntryCounts, CacheFootprintEstimate, CacheMetrics,
+    CacheMetricsSnapshot, cache_diagnostics_snapshot, cache_metrics, read_cache,
+};
+pub use circuit_breaker::{
+    CorruptionBreakerSnapshot, CorruptionCircuitBreaker, corruption_circuit_breaker,
+    reset_corruption_circuit_breaker,
+};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
-pub use error::{DbError, DbResult, is_corruption_error, is_lock_error, is_pool_exhausted_error};
+pub use error::{
+    DB_FAILURE_ENVELOPE_SCHEMA_VERSION, DbError, DbErrorClass, DbErrorClassification,
+    DbErrorSeverity, DbFailureEnvelope, DbFailureFdPressure, DbFailureLockOwner,
+    DbFailureRetryReport, DbResult, classify_db_error_message, fd_eviction_freed,
+    is_corruption_error, is_fd_exhaustion_error, is_lock_error, is_mailbox_ownership_contention,
+    is_pool_exhausted_error,
+};
 pub use forensics::{
     ForensicFileLock, ForensicPreSnapshot, ForensicProcessHolder, MailboxForensicCapture,
     capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,
@@ -198,6 +218,11 @@ pub use integrity::{
     MailboxIntegrityVerdict, attempt_vacuum_recovery, full_check, incremental_check,
     inspect_mailbox_integrity, integrity_details_are_suspect, integrity_metrics, is_full_check_due,
     quick_check,
+};
+pub use invariants::{
+    SCHEMA_INVARIANT_REPLAY_COMMAND, SCHEMA_INVARIANT_SCOPES, SchemaInvariantFinding,
+    SchemaInvariantKind, SchemaInvariantReport, check_schema_invariants,
+    check_schema_invariants_conn,
 };
 pub use mailbox_verdict::{
     DURABILITY_TRANSITIONS, DurabilityState, DurabilityTransition, MailboxArchiveDriftState,
@@ -231,6 +256,7 @@ pub use pool::{
     MailboxSidecarState,
     MutatingSurface,
     OverloadPolicy,
+    ReadOnlyIntentGuard,
     RecoveryAction,
     RecoveryAdmissionStatus,
     RecoveryApproval,
@@ -247,10 +273,12 @@ pub use pool::{
     classify_canary_outcome,
     create_pool,
     create_pool_without_startup_init,
+    create_query_only_pool,
     deferred_write_queue,
     ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive,
     evaluate_write_route,
+    get_cached_pool,
     get_or_create_pool,
     inspect_mailbox_db_inventory,
     inspect_mailbox_recovery_lock,
@@ -261,6 +289,7 @@ pub use pool::{
     is_sqlite_recovery_error_message,
     is_sqlite_snapshot_conflict_error_message,
     open_sqlite_file_with_recovery,
+    promote_recovery_candidate,
     reconstruct_sqlite_file_with_archive_salvage,
     record_canary_probe,
     recovery_admission,
@@ -306,19 +335,24 @@ pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// Runtime DB traffic uses `FrankenConnection` to enable pure-Rust `SQLite` with
-/// `BEGIN CONCURRENT` write paths.
+/// Runtime mailbox traffic uses SQLModel's FrankenSQLite driver. Recovery and
+/// verification paths that must inspect canonical SQLite metadata use the
+/// distinct `CanonicalDbConn` alias below.
 pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
 
 /// The connection type used by canonical verification and recovery flows.
 ///
-/// Canonical verification and recovery use native SQLite so corruption verdicts
-/// are not self-referential with the runtime FrankenSQLite path.
+/// Kept as a distinct alias at call sites that are specifically doing
+/// verification/recovery work.
 pub type CanonicalDbConn = sqlmodel_sqlite::SqliteConnection;
 
 pub fn close_db_conn(conn: DbConn, context: &'static str) {
     if let Err(error) = conn.close_sync() {
-        tracing::warn!(context, error = %error, "failed to close database connection");
+        tracing::warn!(
+            context,
+            error = %error,
+            "failed to close FrankenSQLite connection explicitly"
+        );
     }
 }
 
@@ -367,4 +401,30 @@ impl Drop for DbConnGuard {
 #[must_use]
 pub const fn guard_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
     DbConnGuard::new(conn, context)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normal_mailbox_connection_aliases_use_frankensqlite_runtime() {
+        let runtime_type = std::any::type_name::<super::DbConn>();
+        assert!(
+            runtime_type.contains("sqlmodel_frankensqlite"),
+            "DbConn must route normal mailbox traffic through sqlmodel_frankensqlite, got {runtime_type}"
+        );
+        assert!(
+            runtime_type.contains("FrankenConnection"),
+            "DbConn must be the SQLModel FrankenSQLite connection, got {runtime_type}"
+        );
+
+        let canonical_type = std::any::type_name::<super::CanonicalDbConn>();
+        assert!(
+            canonical_type.contains("sqlmodel_sqlite"),
+            "CanonicalDbConn must stay on canonical sqlmodel_sqlite, got {canonical_type}"
+        );
+        assert!(
+            !canonical_type.contains("frankensqlite") && !canonical_type.contains("fsqlite"),
+            "CanonicalDbConn must not route verification/recovery through FrankenSQLite: {canonical_type}"
+        );
+    }
 }

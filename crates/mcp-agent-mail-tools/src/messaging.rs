@@ -12,7 +12,7 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::{
     Config, TailLatencyPhaseLedger, TailLatencyPhaseRecorder,
-    append_tail_latency_evidence_if_configured,
+    append_tail_latency_evidence_if_configured, resolve_project_path,
 };
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,8 @@ use crate::tool_util::{
     resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
+
+const FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
 
 fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
     if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
@@ -422,6 +424,16 @@ async fn resolve_or_register_agent(
         {
             Outcome::Ok(agent) => Ok(agent),
             Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
+                // Proof gate (fail-closed): auto-registering an unknown recipient
+                // here cannot carry a signed `registration_proof` bundle, so when
+                // the gate is enabled we refuse instead of minting an unproven
+                // identity (program/model="unknown"). Without this, `send_message`
+                // to a non-existent recipient was a side door around the gate.
+                // Disabled gate = no-op, so default auto-register behavior is
+                // preserved exactly.
+                crate::proof_gate::reject_auto_registration_if_enabled(
+                    "send_message auto-registration of recipient",
+                )?;
                 match mcp_agent_mail_db::queries::register_agent(
                     ctx.cx(),
                     pool,
@@ -1358,6 +1370,10 @@ pub struct InboxMessage {
     #[serde(default, skip_serializing)]
     pub bcc: Vec<String>,
     pub created_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_ts: Option<String>,
     pub kind: String,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1534,6 +1550,33 @@ effective_free_bytes={free}"
                 }),
             ));
         }
+    }
+
+    // Durability gate (#122): if the WBQ has reported even one retry-exhausted
+    // op since the last operator clear, the in-memory ID allocator has
+    // already handed out IDs that don't have backing rows. Accepting new
+    // writes in that state would issue more such IDs and produce silent
+    // data loss. Refuse loud and direct the operator at the recovery path.
+    if mcp_agent_mail_storage::durability_degraded() {
+        let stats = mcp_agent_mail_storage::wbq_stats();
+        return Err(legacy_tool_error(
+            "DURABILITY_DEGRADED",
+            format!(
+                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
+                 last failure at us={}); refusing to accept new messages until operator clears the \
+                 durability flag via `am doctor repair` (which will also recover any in-memory \
+                 rows that never persisted)",
+                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
+            ),
+            true,
+            json!({
+                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+                "wbq_errors_total": stats.errors,
+                "wbq_enqueued_total": stats.enqueued,
+                "wbq_drained_total": stats.drained,
+            }),
+        ));
     }
 
     let pool = get_db_pool()?;
@@ -2108,7 +2151,7 @@ effective_free_bytes={free}"
         sender_name: sender.name.clone(),
         subject: message.subject.clone(),
         body_md: message.body_md.clone(),
-        thread_id: thread_id.clone(),
+        thread_id: message.thread_id.clone(),
         importance: message.importance.clone(),
         created_ts: message.created_ts,
     });
@@ -2334,6 +2377,33 @@ effective_free_bytes={free}"
         }
     }
 
+    // Durability gate (#122): if the WBQ has reported even one retry-exhausted
+    // op since the last operator clear, the in-memory ID allocator has
+    // already handed out IDs that don't have backing rows. Accepting new
+    // writes in that state would issue more such IDs and produce silent
+    // data loss. Refuse loud and direct the operator at the recovery path.
+    if mcp_agent_mail_storage::durability_degraded() {
+        let stats = mcp_agent_mail_storage::wbq_stats();
+        return Err(legacy_tool_error(
+            "DURABILITY_DEGRADED",
+            format!(
+                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
+                 last failure at us={}); refusing to accept new messages until operator clears the \
+                 durability flag via `am doctor repair` (which will also recover any in-memory \
+                 rows that never persisted)",
+                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
+            ),
+            true,
+            json!({
+                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+                "wbq_errors_total": stats.errors,
+                "wbq_enqueued_total": stats.enqueued,
+                "wbq_drained_total": stats.drained,
+            }),
+        ));
+    }
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -2343,15 +2413,69 @@ effective_free_bytes={free}"
         mcp_agent_mail_db::queries::get_message(ctx.cx(), &pool, message_id).await,
     )?;
     if original.project_id != project_id {
-        return Err(legacy_tool_error(
-            "NOT_FOUND",
-            format!("Message not found: {message_id}"),
-            true,
-            json!({
-                "entity": "Message",
-                "identifier": message_id,
-            }),
-        ));
+        // GH#204: this is the only message surface that gates on raw project
+        // row equality; `fetch_inbox` / `mark_message_read` scope by agent id
+        // instead. A mailbox created before the #194 case-alias collapse can
+        // carry two project rows for one logical project (case-variant keys on
+        // a case-insensitive filesystem), so a message every other tool
+        // resolves would be reported here as a spurious NOT_FOUND. Accept the
+        // reply when the owning row is an alias of the requested project, and
+        // otherwise reject it while making clear that the id exists but is out
+        // of scope — deliberately without identifying the owning project, see
+        // the disclosure note below.
+        let owner = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_project_by_id(ctx.cx(), &pool, original.project_id)
+                .await,
+        )
+        .ok();
+
+        // Compare canonicalized *paths*, not slugs. `compute_project_slug`
+        // routes through `slugify`, which collapses every non-alphanumeric run
+        // to a single dash — so `/srv/app-one`, `/srv/app_one` and
+        // `/srv/app.one` share a slug, and using it here would admit replies
+        // across genuinely distinct projects. `resolve_project_path`
+        // canonicalizes through the filesystem, which collapses exactly the
+        // aliases GH#194 is about (case-variant keys on a case-insensitive
+        // filesystem, symlinks, `..`) and nothing else; when the directory is
+        // absent it falls back to the literal path, so the comparison stays
+        // exact rather than lossy.
+        //
+        // Comparing slugs directly would also be pointless here: we only reach
+        // this branch when the row ids differ, and `slug` is UNIQUE, so two
+        // distinct rows can never share one.
+        let aliases_requested_project = owner.as_ref().is_some_and(|owner| {
+            resolve_project_path(&owner.human_key) == resolve_project_path(&project.human_key)
+        });
+
+        if !aliases_requested_project {
+            // Say *why* the lookup failed without disclosing the owning
+            // project. Message ids are globally sequential, so echoing the
+            // owner's human_key here would let any agent enumerate ids to map
+            // out projects it has no access to. Naming the failure mode is
+            // what saves the debugging time; naming the other project is not.
+            let detail = if owner.is_some() {
+                format!(
+                    "Message not found: {message_id} (the id exists but belongs to a different project; \
+                     it is not reachable from '{}'). If you expected it here, the project's identity \
+                     rows may have forked — check `am doctor` and the project key spelling.",
+                    project.human_key
+                )
+            } else {
+                format!("Message not found: {message_id}")
+            };
+            return Err(legacy_tool_error(
+                "NOT_FOUND",
+                detail,
+                true,
+                json!({
+                    "entity": "Message",
+                    "identifier": message_id,
+                    "requested_project_id": project_id,
+                    "requested_project_key": project.human_key.clone(),
+                    "belongs_to_other_project": owner.is_some(),
+                }),
+            ));
+        }
     }
 
     // Resolve importance: use override if provided, otherwise inherit from original.
@@ -3009,7 +3133,10 @@ effective_free_bytes={free}"
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
-/// Retrieve recent messages for an agent without mutating read/ack state.
+/// Retrieve recent messages for an agent and mark returned rows read.
+///
+/// Fetched messages are automatically marked as read. Acknowledgement state is
+/// not changed; callers must use `acknowledge_message` for `ack_required` mail.
 ///
 /// # Parameters
 /// - `project_key`: Project identifier
@@ -3018,17 +3145,22 @@ effective_free_bytes={free}"
 /// - `since_ts`: Only messages after this timestamp
 /// - `limit`: Max messages to return (default: 20)
 /// - `include_bodies`: Include full message bodies (default: false)
+/// - `unread_only`: Only messages not yet marked read (default: false)
+/// - `ack_overdue_only`: Only unacknowledged ack-required messages older than the SLA (default: false)
 /// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
+/// - `mark_read`: Auto-mark returned messages read (default: true). Pass false
+///   for a non-consuming peek — e.g. `am check-inbox` hooks (GH#207) — which
+///   must never change read state.
 ///
 /// # Conformance
-/// Python-parity.
+/// Python-parity (`mark_read` is a Rust-native additive extension).
 #[allow(
     clippy::items_after_statements,
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Retrieve recent messages for an agent without mutating read/ack state.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
+    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
 )]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -3038,7 +3170,10 @@ pub async fn fetch_inbox(
     since_ts: Option<String>,
     limit: Option<i32>,
     include_bodies: Option<bool>,
+    unread_only: Option<bool>,
+    ack_overdue_only: Option<bool>,
     topic: Option<String>,
+    mark_read: Option<bool>,
 ) -> McpResult<String> {
     let mut phase = TailLatencyPhaseRecorder::new("fetch_inbox");
     phase.mark("queue_wait");
@@ -3069,13 +3204,15 @@ pub async fn fetch_inbox(
     })?;
     let include_body = include_bodies.unwrap_or(false);
     let urgent = urgent_only.unwrap_or(false);
+    let unread = unread_only.unwrap_or(false);
+    let ack_overdue = ack_overdue_only.unwrap_or(false);
     reject_unsupported_topic_argument(topic.as_deref(), "fetch_inbox")?;
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
     // Use archive-aware read pool so that inbox reads fall back to archive
     // snapshots when the live SQLite is suspect (DegradedReadOnly).
-    let read_pool = get_read_db_pool()?;
+    let read_pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -3113,32 +3250,87 @@ pub async fn fetch_inbox(
         None
     };
 
-    let inbox_rows = db_outcome_to_mcp_result(if include_body {
-        mcp_agent_mail_db::queries::fetch_inbox(
-            ctx.cx(),
-            &read_pool,
-            project_id,
-            agent_id,
-            urgent,
-            since_micros,
-            msg_limit,
-        )
-        .await
-    } else {
-        mcp_agent_mail_db::queries::fetch_inbox_metadata(
-            ctx.cx(),
-            &read_pool,
-            project_id,
-            agent_id,
-            urgent,
-            since_micros,
-            msg_limit,
-        )
-        .await
+    let inbox_rows = db_outcome_to_mcp_result(match (include_body, ack_overdue, unread) {
+        (true, true, _) => {
+            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
+            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+                threshold,
+            )
+            .await
+        }
+        (false, true, _) => {
+            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
+            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue_metadata(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+                threshold,
+            )
+            .await
+        }
+        (true, false, true) => {
+            mcp_agent_mail_db::queries::fetch_inbox_unread(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
+        (false, false, true) => {
+            mcp_agent_mail_db::queries::fetch_inbox_unread_metadata(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
+        (true, false, false) => {
+            mcp_agent_mail_db::queries::fetch_inbox(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
+        (false, false, false) => {
+            mcp_agent_mail_db::queries::fetch_inbox_metadata(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
     })?;
     phase.mark("sqlite_query");
 
-    let messages: Vec<InboxMessage> = inbox_rows
+    let mut messages: Vec<InboxMessage> = inbox_rows
         .into_iter()
         .map(|row| {
             let attachments = parse_attachment_metadata_json(&row.message.attachments);
@@ -3165,6 +3357,8 @@ pub async fn fetch_inbox(
                 cc,
                 bcc,
                 created_ts: Some(micros_to_iso(row.message.created_ts)),
+                read_ts: row.read_ts.map(micros_to_iso),
+                ack_ts: row.ack_ts.map(micros_to_iso),
                 kind: row.kind,
                 attachments,
                 body_md: if include_body {
@@ -3183,19 +3377,22 @@ pub async fn fetch_inbox(
     });
 
     tracing::debug!(
-        "Fetched {} messages for {} in project {} (limit: {}, urgent: {}, since: {:?})",
+        "Fetched {} messages for {} in project {} (limit: {}, urgent: {}, unread: {}, ack_overdue: {}, since: {:?})",
         messages.len(),
         agent_name,
         project_key,
         msg_limit,
         urgent,
+        unread,
+        ack_overdue,
         since_ts
     );
 
-    // Auto-mark fetched messages as read (and auto-ack if ack_required=1).
+    // Auto-mark fetched messages as read.
     // Agents consistently fail to call mark_message_read explicitly, so
-    // fetching IS reading.  Best-effort: errors are logged but don't fail
-    // the fetch.
+    // fetching IS reading. Acknowledgement remains explicit through
+    // acknowledge_message. Best-effort: errors are logged but don't fail the
+    // fetch.
     //
     // Uses batch UPDATE (single transaction) instead of N individual
     // mark_message_read calls — ~80% latency reduction for typical 20-message
@@ -3204,26 +3401,37 @@ pub async fn fetch_inbox(
     // The write-back MUST target the live DB, not the archive snapshot,
     // because snapshot pools are read-only reconstructions. If the live DB
     // is degraded the write will fail gracefully (already best-effort).
-    {
+    //
+    // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
+    // must leave read state untouched.
+    if mark_read.unwrap_or(true) && !messages.is_empty() {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let write_path = get_db_pool()
             .ok()
             .map(|live_pool| live_pool.sqlite_path().to_string());
         if let Some(ref live_sqlite_path) = write_path {
-            if let Err(e) = mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
+            match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
                 agent_id,
                 &ids,
             ) {
-                tracing::warn!(
-                    agent_id = agent_id,
-                    count = ids.len(),
-                    error = %e,
-                    "batch auto-mark-read on fetch_inbox failed"
-                );
-            } else {
-                mcp_agent_mail_db::read_cache()
-                    .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                Ok(Some(batch)) => {
+                    apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
+                    mcp_agent_mail_db::read_cache()
+                        .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                }
+                Ok(None) => {
+                    mcp_agent_mail_db::read_cache()
+                        .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = agent_id,
+                        count = ids.len(),
+                        error = %e,
+                        "batch auto-mark-read on fetch_inbox failed"
+                    );
+                }
             }
         } else {
             tracing::warn!(
@@ -3257,6 +3465,20 @@ pub async fn fetch_inbox(
     phase.mark("json_serialization");
     emit_tail_latency_evidence(&phase.finish("ok"));
     Ok(response)
+}
+
+fn apply_auto_read_timestamp(
+    messages: &mut [InboxMessage],
+    updated_message_ids: &[i64],
+    read_ts: i64,
+) {
+    let updated_ids = updated_message_ids.iter().copied().collect::<HashSet<_>>();
+    let read_at = micros_to_iso(read_ts);
+    for message in messages {
+        if updated_ids.contains(&message.id) && message.read_ts.is_none() {
+            message.read_ts = Some(read_at.clone());
+        }
+    }
 }
 
 /// Mark a message as read for the given agent.
@@ -3322,6 +3544,187 @@ pub async fn mark_message_read(
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+// ── Durable ack intents (br-bvq1x.8.3 / H3) ──────────────────────────────────
+//
+// When `acknowledge_message` cannot reach the live mailbox (DB corrupt / busy /
+// pool-exhausted / circuit-open), the ack is recorded as a hash-witnessed
+// durable intent under
+// `<storage_root>/degraded_intents/acknowledge_message.jsonl` and replayed
+// automatically (idempotently) on the next successful call. This mirrors the
+// release-intent pattern in `reservations.rs`; both share the on-disk
+// primitives in `crate::degraded_intents`.
+//
+// The classification predicates below intentionally match the release-intent
+// ones (the A1 corruption/error taxonomy). They are duplicated here rather than
+// shared because the reservation predicates remain private to `reservations.rs`
+// pending the Track-F single-mutation-chokepoint work.
+
+const fn db_error_supports_ack_intent(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Pool(_)
+            | DbError::Sqlite(_)
+            | DbError::Schema(_)
+            | DbError::ResourceBusy(_)
+            | DbError::PoolExhausted { .. }
+            | DbError::CircuitBreakerOpen { .. }
+            | DbError::IntegrityCorruption { .. }
+    )
+}
+
+fn mcp_error_supports_ack_intent(error: &McpError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data["error"]["type"].as_str())
+        .is_some_and(|error_type| {
+            matches!(
+                error_type,
+                "DATABASE_CORRUPTION"
+                    | "DATABASE_ERROR"
+                    | "DATABASE_POOL_EXHAUSTED"
+                    | "RESOURCE_BUSY"
+            )
+        })
+}
+
+/// Build the `queued` response after persisting a durable ack intent.
+fn queued_ack_intent_response(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    message_id: i64,
+    failure_stage: &str,
+    error_detail: &str,
+) -> McpResult<String> {
+    let receipt = crate::degraded_intents::append_ack_intent(
+        config,
+        project_key,
+        agent_name,
+        message_id,
+        failure_stage,
+        error_detail,
+    )
+    .map_err(|error| {
+        legacy_tool_error(
+            "ACK_INTENT_WRITE_FAILED",
+            format!(
+                "Could not acknowledge the message because the database is unavailable, and \
+                 writing the local ack-intent log also failed: {error}"
+            ),
+            false,
+            json!({ "error_detail": error.to_string() }),
+        )
+    })?;
+    serde_json::to_string(&json!({
+        "message_id": message_id,
+        "acknowledged": false,
+        "acknowledged_at": Value::Null,
+        "read_at": Value::Null,
+        "status": "queued",
+        "queued": true,
+        "message": "acknowledgement queued because DB unavailable",
+        "intent": {
+            "id": receipt.intent_id,
+            "path": receipt.intent_path.display().to_string(),
+            "content_sha256": receipt.content_sha256,
+            "replay": "automatic_on_next_successful_acknowledge_message_call",
+        },
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Replay a single queued ack intent against the now-reachable DB.
+///
+/// Returns `Err((detail, retryable))` where `retryable == false` marks the
+/// intent permanently un-replayable (e.g. the message no longer exists) so it
+/// is abandoned rather than retried forever.
+async fn replay_single_ack_intent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    intent: &crate::degraded_intents::QueuedAckIntent,
+) -> Result<(), (String, bool)> {
+    let project = resolve_project(ctx, pool, &intent.project_key)
+        .await
+        .map_err(|error| (error.to_string(), mcp_error_supports_ack_intent(&error)))?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        pool,
+        project_id,
+        &intent.agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await
+    .map_err(|error| (error.to_string(), mcp_error_supports_ack_intent(&error)))?;
+    let agent_id = agent.id.unwrap_or(0);
+    match mcp_agent_mail_db::queries::acknowledge_message(
+        ctx.cx(),
+        pool,
+        agent_id,
+        intent.message_id,
+    )
+    .await
+    {
+        Outcome::Ok(_) => Ok(()),
+        Outcome::Err(error) => {
+            let retryable = db_error_supports_ack_intent(&error);
+            Err((error.to_string(), retryable))
+        }
+        Outcome::Cancelled(_) => Err(("ack replay cancelled".to_string(), true)),
+        Outcome::Panicked(_) => Err(("ack replay panicked".to_string(), true)),
+    }
+}
+
+/// Replay every queued ack intent (best-effort) now that the DB is reachable.
+async fn replay_queued_ack_intents(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+) {
+    let intents = match crate::degraded_intents::read_queued_ack_intents(config) {
+        Ok(intents) => intents,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read queued ack intents");
+            return;
+        }
+    };
+    for intent in intents {
+        match replay_single_ack_intent(ctx, pool, &intent).await {
+            Ok(()) => {
+                crate::degraded_intents::append_ack_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    crate::degraded_intents::REPLAY_STATUS_REPLAYED,
+                    None,
+                );
+            }
+            Err((detail, retryable)) => {
+                let status = if retryable {
+                    crate::degraded_intents::REPLAY_STATUS_FAILED
+                } else {
+                    crate::degraded_intents::REPLAY_STATUS_ABANDONED
+                };
+                crate::degraded_intents::append_ack_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    status,
+                    Some(&detail),
+                );
+                tracing::warn!(
+                    intent_id = intent.intent_id,
+                    retryable,
+                    error = %detail,
+                    "queued ack intent replay failed"
+                );
+            }
+        }
+    }
+}
+
 /// Acknowledge a message (also marks as read).
 ///
 /// # Parameters
@@ -3344,12 +3747,40 @@ pub async fn acknowledge_message(
     message_id: i64,
 ) -> McpResult<String> {
     let agent_name = normalize_agent_name_or_original(agent_name);
+    let config = Config::get();
 
-    let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Each step that can hit a corrupt/busy/unavailable DB queues a durable
+    // ack intent (fail-soft) rather than dropping a closeout acknowledgement.
+    let pool = match get_db_pool() {
+        Ok(pool) => pool,
+        Err(error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "get_db_pool",
+                &error.to_string(),
+            );
+        }
+    };
+    let project = match resolve_project(ctx, &pool, &project_key).await {
+        Ok(project) => project,
+        Err(error) if mcp_error_supports_ack_intent(&error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "resolve_project",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(
+    let agent = match resolve_agent(
         ctx,
         &pool,
         project_id,
@@ -3357,15 +3788,50 @@ pub async fn acknowledge_message(
         &project.slug,
         &project.human_key,
     )
-    .await?;
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) if mcp_error_supports_ack_intent(&error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "resolve_agent",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let agent_id = agent.id.unwrap_or(0);
 
     // Authorization note: agent_id is globally unique (auto-increment), so
     // the DB query implicitly scopes to the correct project. See mark_message_read.
-    let (read_ts, ack_ts) = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::acknowledge_message(ctx.cx(), &pool, agent_id, message_id)
-            .await,
-    )?;
+    let (read_ts, ack_ts) = match mcp_agent_mail_db::queries::acknowledge_message(
+        ctx.cx(),
+        &pool,
+        agent_id,
+        message_id,
+    )
+    .await
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(error) if db_error_supports_ack_intent(&error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "acknowledge_message",
+                &error.to_string(),
+            );
+        }
+        other => db_outcome_to_mcp_result(other)?,
+    };
+
+    // The DB is reachable: opportunistically replay any previously-queued ack
+    // intents so degraded-mode acknowledgements land once the mailbox recovers.
+    replay_queued_ack_intents(ctx, &pool, &config).await;
 
     let response = AckStatusResponse {
         message_id,
@@ -3441,6 +3907,188 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}, None) failed: {other:?}"),
         }
+    }
+
+    // ── Durable ack-intent replay (br-bvq1x.8.3 / H3) ────────────────────────
+
+    #[test]
+    fn queued_ack_intent_response_reports_queued_ack() {
+        // The queue-on-corruption wrapper that `acknowledge_message` returns
+        // when the live mailbox is unavailable: it must persist a durable intent
+        // AND return a `queued` (not acknowledged) envelope with the intent's id.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::get();
+        config.storage_root = tmp.path().to_path_buf();
+
+        let payload = queued_ack_intent_response(
+            &config,
+            "/abs/project",
+            "BlueLake",
+            1234,
+            "acknowledge_message",
+            "database disk image is malformed",
+        )
+        .expect("queued ack response");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("queued ack JSON parses");
+        assert_eq!(parsed["message_id"].as_i64(), Some(1234));
+        assert_eq!(parsed["acknowledged"].as_bool(), Some(false));
+        assert!(parsed["acknowledged_at"].is_null());
+        assert!(parsed["read_at"].is_null());
+        assert_eq!(parsed["status"].as_str(), Some("queued"));
+        assert_eq!(parsed["queued"].as_bool(), Some(true));
+        assert!(
+            parsed["intent"]["id"]
+                .as_str()
+                .is_some_and(|s| s.len() == 16)
+        );
+        assert!(parsed["intent"]["content_sha256"].as_str().is_some());
+        assert!(
+            parsed["intent"]["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("acknowledge_message.jsonl"))
+        );
+
+        let queued = crate::degraded_intents::read_queued_ack_intents(&config).expect("read");
+        assert_eq!(
+            queued.len(),
+            1,
+            "the queued response must persist the intent"
+        );
+        assert_eq!(queued[0].message_id, 1234);
+        assert_eq!(queued[0].agent_name, "BlueLake");
+    }
+
+    #[test]
+    fn db_error_classification_matches_queue_eligibility() {
+        // The ack-intent queue eligibility must mirror the corruption taxonomy:
+        // corruption/availability errors queue; a missing recipient does not.
+        assert!(db_error_supports_ack_intent(
+            &DbError::IntegrityCorruption {
+                message: "malformed".to_string(),
+                details: vec![],
+            }
+        ));
+        assert!(db_error_supports_ack_intent(&DbError::ResourceBusy(
+            "locked".to_string()
+        )));
+        assert!(!db_error_supports_ack_intent(&DbError::not_found(
+            "MessageRecipient",
+            "1:2",
+        )));
+    }
+
+    #[test]
+    fn replay_queued_ack_intent_acks_once_on_success() {
+        run_thread_validation_test("ack-intent-replay.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-ack-intent-replay").await;
+            let project_id = project.id.expect("project id");
+            let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+            let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+            let recipient_id = recipient.id.expect("recipient id");
+
+            let message = match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "ack me",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+            let message_id = message.id.expect("message id");
+
+            // Isolated config: durable-intent files live in a tempdir, never the
+            // real mailbox storage root.
+            let intent_dir = tempfile::tempdir().expect("intent tempdir");
+            let mut config = Config::get();
+            config.storage_root = intent_dir.path().to_path_buf();
+
+            crate::degraded_intents::append_ack_intent(
+                &config,
+                &project.human_key,
+                &recipient.name,
+                message_id,
+                "injected_db_unavailable",
+                "database disk image is malformed",
+            )
+            .expect("append ack intent");
+            assert_eq!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .len(),
+                1
+            );
+
+            let ctx = McpContext::new(cx.clone(), 1);
+            // Idempotent: replaying twice must clear exactly once and never error.
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+
+            assert!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .is_empty(),
+                "successfully replayed ack intent should not remain queued"
+            );
+
+            let (read_ts, ack_ts) =
+                match queries::acknowledge_message(&cx, &pool, recipient_id, message_id).await {
+                    Outcome::Ok(value) => value,
+                    other => panic!("verify ack failed: {other:?}"),
+                };
+            assert!(ack_ts > 0, "message should be acknowledged after replay");
+            assert!(read_ts > 0, "message should be marked read after replay");
+        });
+    }
+
+    #[test]
+    fn replay_abandons_ack_intent_for_missing_message() {
+        run_thread_validation_test("ack-intent-abandon.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-ack-intent-abandon").await;
+            let project_id = project.id.expect("project id");
+            let agent = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+
+            let intent_dir = tempfile::tempdir().expect("intent tempdir");
+            let mut config = Config::get();
+            config.storage_root = intent_dir.path().to_path_buf();
+
+            // Queue an ack for a message that does not exist → not_found on
+            // replay → permanently abandoned (cleared), not retried forever.
+            crate::degraded_intents::append_ack_intent(
+                &config,
+                &project.human_key,
+                &agent.name,
+                999_999,
+                "injected_db_unavailable",
+                "database disk image is malformed",
+            )
+            .expect("append ack intent");
+            assert_eq!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .len(),
+                1
+            );
+
+            let ctx = McpContext::new(cx.clone(), 1);
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+            assert!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .is_empty(),
+                "permanently-unreplayable ack intent should be abandoned, not retried forever"
+            );
+        });
     }
 
     #[test]
@@ -4509,6 +5157,8 @@ mod tests {
             cc: vec![],
             bcc: vec![],
             created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
             kind: "to".into(),
             attachments: vec![],
             body_md: None,
@@ -4532,6 +5182,8 @@ mod tests {
             cc: vec![],
             bcc: vec![],
             created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
             kind: "to".into(),
             attachments: vec![json!({"path": "img.webp", "type": "file"})],
             body_md: Some("Hello world".into()),
@@ -4581,6 +5233,8 @@ mod tests {
             cc: vec!["GoldHawk".into()],
             bcc: vec!["SilverPeak".into()],
             created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
             kind: "to".into(),
             attachments: vec![],
             body_md: None,
@@ -4591,6 +5245,78 @@ mod tests {
         assert!(json.get("to").is_none());
         assert!(json.get("cc").is_none());
         assert!(json.get("bcc").is_none());
+    }
+
+    #[test]
+    fn apply_auto_read_timestamp_fills_only_updated_missing_read_receipts() {
+        let old_read_at = "2026-02-06T00:30:00Z".to_string();
+        let mut messages = vec![
+            InboxMessage {
+                id: 1,
+                project_id: 1,
+                sender_id: 1,
+                thread_id: None,
+                subject: "new".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                from: "BlueLake".into(),
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                created_ts: Some("2026-02-06T00:00:00Z".into()),
+                read_ts: None,
+                ack_ts: None,
+                kind: "to".into(),
+                attachments: vec![],
+                body_md: None,
+            },
+            InboxMessage {
+                id: 2,
+                project_id: 1,
+                sender_id: 1,
+                thread_id: None,
+                subject: "already-read".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                from: "BlueLake".into(),
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                created_ts: Some("2026-02-06T00:00:00Z".into()),
+                read_ts: Some(old_read_at.clone()),
+                ack_ts: None,
+                kind: "to".into(),
+                attachments: vec![],
+                body_md: None,
+            },
+            InboxMessage {
+                id: 3,
+                project_id: 1,
+                sender_id: 1,
+                thread_id: None,
+                subject: "not-updated".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                from: "BlueLake".into(),
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                created_ts: Some("2026-02-06T00:00:00Z".into()),
+                read_ts: None,
+                ack_ts: None,
+                kind: "to".into(),
+                attachments: vec![],
+                body_md: None,
+            },
+        ];
+
+        let batch_read_ts = 1_770_354_000_000_000;
+        apply_auto_read_timestamp(&mut messages, &[1, 2], batch_read_ts);
+        let batch_read_at = micros_to_iso(batch_read_ts);
+
+        assert_eq!(messages[0].read_ts.as_deref(), Some(batch_read_at.as_str()));
+        assert_eq!(messages[1].read_ts.as_deref(), Some(old_read_at.as_str()));
+        assert_eq!(messages[2].read_ts, None);
     }
 
     #[test]

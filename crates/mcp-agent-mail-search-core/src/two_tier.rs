@@ -1319,6 +1319,278 @@ mod tests {
         results.iter().map(|hit| hit.doc_id).collect()
     }
 
+    fn axis_entry(
+        doc_id: i64,
+        fast_value: f32,
+        quality_value: f32,
+        has_quality: bool,
+        config: &TwoTierConfig,
+    ) -> TwoTierEntry {
+        TwoTierEntry {
+            doc_id,
+            doc_kind: crate::document::DocKind::Message,
+            project_id: Some(1),
+            fast_embedding: axis_f16_embedding(fast_value, config.fast_dimension),
+            quality_embedding: axis_f16_embedding(quality_value, config.quality_dimension),
+            has_quality,
+        }
+    }
+
+    fn build_axis_index(config: &TwoTierConfig, entries: Vec<TwoTierEntry>) -> TwoTierIndex {
+        TwoTierIndex::build("fast", "quality", config, entries).unwrap()
+    }
+
+    #[test]
+    fn test_concurrent_init_no_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Barrier, OnceLock};
+        use std::thread;
+
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let slot = Arc::new(OnceLock::<Arc<TwoTierIndex>>::new());
+        let init_count = Arc::new(AtomicUsize::new(0));
+        let thread_count = 8;
+        let barrier = Arc::new(Barrier::new(thread_count));
+
+        #[allow(clippy::needless_collect)] // collect keeps all workers racing the barrier
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let config = config.clone();
+                let init_count = Arc::clone(&init_count);
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let index = Arc::clone(slot.get_or_init(|| {
+                        init_count.fetch_add(1, Ordering::Relaxed);
+                        Arc::new(build_axis_index(
+                            &config,
+                            vec![axis_entry(42, 1.0, 1.0, true, &config)],
+                        ))
+                    }));
+                    let fast_embedder =
+                        Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+                    let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), None, config);
+                    searcher
+                        .search_fast_only("needle", 1)
+                        .expect("post-init search should work")
+                })
+            })
+            .collect();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("init worker should not panic"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            init_count.load(Ordering::Relaxed),
+            1,
+            "initializer path and init log equivalent should run once"
+        );
+        assert!(results.iter().all(|hits| doc_ids(hits) == vec![42]));
+    }
+
+    #[test]
+    fn test_search_mixed_quality_docs() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            quality_weight: 0.8,
+            ..TwoTierConfig::default()
+        };
+        let index = build_axis_index(
+            &config,
+            vec![
+                axis_entry(101, 0.4, 1.0, true, &config),
+                axis_entry(102, 0.95, 50.0, false, &config),
+                axis_entry(103, 0.3, 0.9, true, &config),
+                axis_entry(104, 0.7, 50.0, false, &config),
+                axis_entry(105, 0.2, 0.5, true, &config),
+                axis_entry(106, 0.45, 50.0, false, &config),
+            ],
+        );
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("needle", 6).collect();
+        let SearchPhase::Refined {
+            results: refined, ..
+        } = &phases[1]
+        else {
+            panic!("phase 1 should be Refined");
+        };
+        let refined_ids = doc_ids(refined);
+        assert_eq!(
+            refined_ids,
+            vec![102, 101, 103, 104, 106, 105],
+            "quality docs rerank while fallback-only docs remain ranked by fast score"
+        );
+        assert!(refined.iter().any(|hit| index.has_quality(hit.idx)));
+        assert!(refined.iter().any(|hit| !index.has_quality(hit.idx)));
+    }
+
+    #[test]
+    fn test_progressive_yields_initial_and_refined() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            quality_weight: 1.0,
+            ..TwoTierConfig::default()
+        };
+        let index = build_axis_index(
+            &config,
+            vec![
+                axis_entry(1, 3.0, 0.1, true, &config),
+                axis_entry(2, 2.0, 5.0, true, &config),
+                axis_entry(3, 1.0, 4.0, true, &config),
+            ],
+        );
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 3).collect();
+        assert_eq!(phases.len(), 2, "both phases should be observable");
+        let SearchPhase::Initial {
+            results: initial, ..
+        } = &phases[0]
+        else {
+            panic!("phase 0 should be Initial");
+        };
+        let SearchPhase::Refined {
+            results: refined, ..
+        } = &phases[1]
+        else {
+            panic!("phase 1 should be Refined");
+        };
+        assert_eq!(doc_ids(initial), vec![1, 2, 3]);
+        assert_eq!(doc_ids(refined), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn test_initial_latency_under_5ms() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            fast_only: true,
+            ..TwoTierConfig::default()
+        };
+        let entries = (0..16)
+            .map(|idx| axis_entry(idx, 1.0 + (idx as f32 * 0.01), 1.0, true, &config))
+            .collect();
+        let index = build_axis_index(&config, entries);
+        let fast_embedder = Arc::new(StubEmbedder::new("fast", axis_query(config.fast_dimension)));
+        let searcher = TwoTierSearcher::new(&index, Some(fast_embedder), None, config);
+
+        let mut latencies_ms = (0..100)
+            .map(|query_idx| {
+                match searcher
+                    .search(&format!("latency query {query_idx}"), 3)
+                    .next()
+                    .expect("initial phase should be emitted")
+                {
+                    SearchPhase::Initial {
+                        results,
+                        latency_ms,
+                    } => {
+                        assert_eq!(results.len(), 3);
+                        latency_ms
+                    }
+                    other => panic!("unexpected phase: {other:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        latencies_ms.sort_unstable();
+        let p95_index = (latencies_ms.len() * 95).div_ceil(100).saturating_sub(1);
+        let p95 = latencies_ms[p95_index];
+        assert!(
+            p95 < 5,
+            "initial-tier p95 should stay under 5ms, got {p95}ms"
+        );
+    }
+
+    #[test]
+    fn test_quality_coverage_metric() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let index = build_axis_index(
+            &config,
+            vec![
+                axis_entry(1, 1.0, 1.0, true, &config),
+                axis_entry(2, 1.0, 1.0, true, &config),
+                axis_entry(3, 1.0, 1.0, true, &config),
+                axis_entry(4, 1.0, 1.0, true, &config),
+                axis_entry(5, 1.0, 1.0, true, &config),
+                axis_entry(6, 1.0, 1.0, true, &config),
+                axis_entry(7, 1.0, 1.0, true, &config),
+                axis_entry(8, 1.0, 0.0, false, &config),
+                axis_entry(9, 1.0, 0.0, false, &config),
+                axis_entry(10, 1.0, 0.0, false, &config),
+            ],
+        );
+        let mut metrics = TwoTierMetrics::default();
+        metrics.record_index(index.metrics());
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.index.doc_count, 10);
+        assert_eq!(snapshot.index.quality_doc_count, 7);
+        assert!(
+            (snapshot.index.quality_coverage - 0.7).abs() < f32::EPSILON,
+            "two_tier_quality_coverage_ratio should equal quality_count / total"
+        );
+    }
+
+    #[test]
+    fn test_refinement_excludes_non_quality_docs() {
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let index = build_axis_index(
+            &config,
+            vec![
+                axis_entry(11, 0.1, 0.9, true, &config),
+                axis_entry(12, 1.0, 50.0, false, &config),
+                axis_entry(13, 0.2, 0.8, true, &config),
+                axis_entry(14, 0.9, 50.0, false, &config),
+            ],
+        );
+        let quality_embedder = Arc::new(StubEmbedder::new(
+            "quality",
+            axis_query(config.quality_dimension),
+        ));
+        let searcher = TwoTierSearcher::new(&index, None, Some(quality_embedder), config);
+
+        let phases: Vec<SearchPhase> = searcher.search("query", 10).collect();
+        assert_eq!(phases.len(), 1);
+        let SearchPhase::Refined {
+            results: refined, ..
+        } = &phases[0]
+        else {
+            panic!("phase 0 should be Refined");
+        };
+        assert_eq!(doc_ids(refined), vec![11, 13]);
+        assert!(refined.iter().all(|hit| index.has_quality(hit.idx)));
+    }
+
     #[test]
     fn two_tier_search_records_metrics_when_recorder_attached() {
         let config = TwoTierConfig {

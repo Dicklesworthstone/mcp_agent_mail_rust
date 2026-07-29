@@ -52,6 +52,7 @@ pub fn start(config: &Config) {
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("ack-ttl-scan".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 ack_ttl_loop(&config);
             }) {
@@ -188,7 +189,15 @@ fn run_ack_ttl_cycle_with_state(
     pool: &DbPool,
     previously_overdue: &mut HashSet<OverdueAckKey>,
 ) -> Result<(usize, usize), String> {
-    let cx = Cx::for_testing();
+    // This worker runs on a dedicated OS thread outside the async runtime, so
+    // there is no parent Cx to derive from. Rather than forge a full-capability
+    // Cx with the test-only `Cx::for_testing()` (gated behind `test-internals`),
+    // borrow the runtime-backed ambient Cx<cap::All> (INFINITE budget) that
+    // `Runtime::block_on` installs. It is Arc-backed, so the clone returned here
+    // stays valid across the subsequent block_on calls in this function.
+    let cx = block_on(async {
+        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+    });
     let now = now_micros();
     let ttl_us = i64::try_from(config.ack_ttl_seconds)
         .unwrap_or(1800)
@@ -373,21 +382,23 @@ fn escalate(
                     config: config.clone(),
                     reservations: res_jsons,
                 };
-                match mcp_agent_mail_storage::wbq_enqueue(op.clone()) {
-                    mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-                    | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
-                    mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                // Write the grant artifact directly (GH#178 semantics), never
+                // via the write-behind queue: a QUEUED active-grant op drained
+                // after the holder's later direct-written release would
+                // resurrect a stale-active artifact — a wrong holder that the
+                // released-row reconcile pass (br-74sxo) would only repair on
+                // a later reservation access. On failure the DB row stays
+                // authoritative and reconcile-on-read re-emits the artifact on
+                // the next reservation read in this project.
+                match mcp_agent_mail_storage::write_op_sync_direct(&op) {
+                    mcp_agent_mail_storage::DirectArchiveWrite::Written
+                    | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
+                    mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
                         warn!(
+                            error = %error,
                             project = %project.slug,
-                            "WBQ unavailable during ACK escalation archive write; falling back to synchronous storage write"
+                            "ACK escalation archive write failed; leaving the artifact to reconcile-on-read"
                         );
-                        if let Err(error) = mcp_agent_mail_storage::write_op_sync(&op) {
-                            warn!(
-                                error = %error,
-                                project = %project.slug,
-                                "ACK escalation archive fallback write failed"
-                            );
-                        }
                     }
                 }
             }
@@ -469,6 +480,20 @@ mod tests {
         create_pool(&pool_config).expect("create pool")
     }
 
+    fn ensure_ephemeral_test_project(
+        cx: &Cx,
+        pool: &DbPool,
+        human_key: &str,
+    ) -> mcp_agent_mail_db::ProjectRow {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            || match block_on(async { queries::ensure_project(cx, pool, human_key).await }) {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure_project failed: {other:?}"),
+            },
+        )
+    }
+
     fn seed_unacked_message() -> (tempfile::TempDir, DbPool, Cx, queries::UnackedMessageRow) {
         let tmp = tempfile::tempdir().unwrap();
         let pool = make_test_pool(&tmp);
@@ -478,11 +503,7 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project =
-            match block_on(async { queries::ensure_project(&cx, &pool, &human_key).await }) {
-                Outcome::Ok(p) => p,
-                other => panic!("ensure_project failed: {other:?}"),
-            };
+        let project = ensure_ephemeral_test_project(&cx, &pool, &human_key);
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
@@ -919,11 +940,7 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project =
-            match block_on(async { queries::ensure_project(&cx, &pool, &human_key).await }) {
-                Outcome::Ok(p) => p,
-                other => panic!("ensure_project failed: {other:?}"),
-            };
+        let project = ensure_ephemeral_test_project(&cx, &pool, &human_key);
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {

@@ -1701,10 +1701,12 @@ impl AgentRhythm {
             sum_log_ratio += (sorted[i] / threshold_val).ln();
         }
 
-        let tail_index = if sum_log_ratio > 0.0 {
+        let normal_threshold = self.effective_avg() + k * self.std_dev();
+
+        let tail_index = if sum_log_ratio > f64::EPSILON {
             (tail_count as f64) / sum_log_ratio
         } else {
-            2.0
+            return normal_threshold;
         };
 
         // Ensure alpha > 1.0 for valid CVaR
@@ -1720,10 +1722,10 @@ impl AgentRhythm {
             let var = threshold_val * (1.0 - tail_q).powf(-1.0 / alpha);
             var * alpha / (alpha - 1.0)
         } else {
-            self.effective_avg() + k * self.std_dev()
+            normal_threshold
         };
 
-        cvar.max(self.effective_avg() + k * self.std_dev())
+        cvar.max(normal_threshold)
     }
 
     /// How long since the last activity (microseconds).
@@ -2286,29 +2288,21 @@ mod liveness_tests {
         let threshold = rhythm.suspicion_threshold(3.0);
         let avg = rhythm.effective_avg();
 
-        // The first `recent_intervals < 10` branch of `suspicion_threshold`
-        // returns `avg + k*std`, but with 100 observations we're firmly in
-        // the Hill-estimator / CVaR branch. There, a degenerate all-equal
-        // sample yields `sum_log_ratio = 0`, which drops to the fallback
-        // Pareto index (alpha = 2) and produces
-        // `cvar = threshold_val * (1-tail_q)^(-1/alpha) * alpha/(alpha-1)`.
-        // That's intentionally much larger than `avg` — a tail-risk
-        // estimator should stay conservative even when observed variance
-        // collapsed to the EWMA floor. What we *can* verify is (a) the
-        // threshold is finite and strictly above the mean, and (b) the
-        // CVaR branch still clamps above `avg + k*std`, which is the
-        // lower-bound contract in the final `.max(...)` on line 1721.
+        // With a degenerate all-equal sample there is no observed heavy tail
+        // to estimate. The detector should fall back to the normal rhythm
+        // threshold instead of fabricating a Pareto tail that would mask a
+        // genuinely silent agent.
         assert!(
             threshold.is_finite(),
-            "CVaR threshold must stay finite with degenerate variance (std={std})"
+            "threshold must stay finite with degenerate variance (std={std})"
         );
         assert!(
             threshold > avg,
-            "zero-variance threshold ({threshold}) must still exceed avg ({avg}) under the tail-risk model"
+            "zero-variance threshold ({threshold}) must still exceed avg ({avg})"
         );
         assert!(
             threshold >= avg + 3.0 * std,
-            "CVaR output must remain at least as conservative as avg + k*std (threshold={threshold}, avg={avg}, std={std})"
+            "threshold must remain at least as conservative as avg + k*std (threshold={threshold}, avg={avg}, std={std})"
         );
 
         // Silence just above the threshold should trigger suspicion — the
@@ -4894,7 +4888,18 @@ impl AtcEngine {
                     .saturating_add((self.config.probe_interval_micros / 2).max(250_000)),
             );
         }
-        next_review
+        if next_review <= now_micros {
+            let recheck_delay = if entry.state == LivenessState::Alive
+                && entry.rhythm.is_suspicious(now_micros, threshold_k)
+            {
+                self.config.probe_interval_micros / 4
+            } else {
+                self.config.probe_interval_micros / 2
+            };
+            now_micros.saturating_add(recheck_delay.max(250_000))
+        } else {
+            next_review
+        }
     }
 
     fn reschedule_agent(&mut self, agent: &str, now_micros: i64, incumbent_k: f64) {
@@ -5026,32 +5031,38 @@ impl AtcEngine {
         if name == ATC_AGENT_NAME {
             return; // self-exclusion
         }
-        let project_key = project_key
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        match self.agents.entry(name.to_string()) {
-            std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                let entry = occupied.get_mut();
-                let program_changed = entry.program != program;
-                if project_key.is_some() {
-                    entry.project_key = project_key;
-                }
-                entry.program = program.to_string();
-                if program_changed {
-                    let seeded = Self::seeded_rhythm(program);
-                    if entry.rhythm.observation_count == 0 && entry.rhythm.last_activity_ts == 0 {
-                        entry.rhythm = seeded;
-                    } else {
-                        entry.rhythm.prior_interval = seeded.prior_interval;
-                    }
-                }
-                entry.core.sync_policy_from(&self.liveness_core);
+        let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(entry) = self.agents.get_mut(name) {
+            let program_changed = entry.program != program;
+            let project_changed =
+                project_key.is_some_and(|incoming| entry.project_key.as_deref() != Some(incoming));
+            if !program_changed && !project_changed {
+                // Periodic durable population refreshes commonly replay an
+                // identical snapshot. Treat that as a true no-op: allocating
+                // replacement Strings and pushing another scheduler heap item
+                // every minute created needless long-running daemon churn.
+                return;
             }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(AgentLivenessEntry {
+            if project_changed {
+                entry.project_key = project_key.map(ToOwned::to_owned);
+            }
+            if program_changed {
+                entry.program.clear();
+                entry.program.push_str(program);
+                let seeded = Self::seeded_rhythm(program);
+                if entry.rhythm.observation_count == 0 && entry.rhythm.last_activity_ts == 0 {
+                    entry.rhythm = seeded;
+                } else {
+                    entry.rhythm.prior_interval = seeded.prior_interval;
+                }
+            }
+            entry.core.sync_policy_from(&self.liveness_core);
+        } else {
+            self.agents.insert(
+                name.to_string(),
+                AgentLivenessEntry {
                     name: name.to_string(),
-                    project_key,
+                    project_key: project_key.map(ToOwned::to_owned),
                     program: program.to_string(),
                     state: LivenessState::Alive,
                     rhythm: Self::seeded_rhythm(program),
@@ -5061,9 +5072,9 @@ impl AtcEngine {
                     core: self.liveness_core.clone(),
                     schedule_version: 0,
                     next_review_micros: i64::MAX,
-                });
-                self.mark_agent_order_dirty();
-            }
+                },
+            );
+            self.mark_agent_order_dirty();
         }
         let fallback_active = self.current_release_guard_reason().is_some();
         let incumbent_k = Self::effective_threshold(
@@ -9553,27 +9564,30 @@ pub fn atc_sync_agent_snapshot(
     } else {
         program
     };
-
-    e.register_agent(name, program, project_key);
-    let prior_last_activity = e
-        .agents
-        .get(name)
-        .map_or(0, |entry| entry.rhythm.last_activity_ts);
-    drop(e);
-    if let Some(thresholds) = ATC_THRESHOLDS.get()
-        && let Ok(mut t) = thresholds.lock()
-    {
-        t.entry(name.to_string())
-            .or_insert_with(|| AdaptiveThreshold::new(base_k));
+    let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
+    let prior = e.agents.get(name).map(|entry| {
+        (
+            entry.rhythm.last_activity_ts,
+            entry.program == program,
+            project_key.is_none() || entry.project_key.as_deref() == project_key,
+        )
+    });
+    if prior.is_some_and(|(prior_ts, same_program, same_project)| {
+        same_program && same_project && last_activity_ts <= prior_ts
+    }) {
+        return;
     }
-    let Some(engine) = ATC_ENGINE.get() else {
-        return;
-    };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
+    let prior_last_activity = prior.map_or(0, |(prior_ts, _, _)| prior_ts);
+    e.register_agent(name, program, project_key);
     if last_activity_ts > prior_last_activity {
         e.observe_activity(name, project_key, last_activity_ts);
+    }
+    drop(e);
+    if let Some(thresholds) = ATC_THRESHOLDS.get()
+        && let Ok(mut thresholds) = thresholds.lock()
+        && !thresholds.contains_key(name)
+    {
+        thresholds.insert(name.to_string(), AdaptiveThreshold::new(base_k));
     }
 }
 
@@ -9601,6 +9615,12 @@ pub fn atc_sync_population_from_db(
     /// than this are already effectively Dead; loading them generates a
     /// cold-start effect burst without any coordination value.
     const DEFAULT_RECENCY_MICROS: i64 = 7 * 24 * 3600 * 1_000_000;
+    /// Hard upper bound on one refresh's row materialization. This is far
+    /// above observed active populations while preventing a corrupt or very
+    /// long-lived mailbox from turning a periodic control-plane task into an
+    /// unbounded allocation.
+    const DEFAULT_POPULATION_LIMIT: usize = 4096;
+    const MAX_POPULATION_LIMIT: usize = 65_536;
 
     let recency_micros =
         mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_RECENCY_SECS")
@@ -9611,10 +9631,20 @@ pub fn atc_sync_population_from_db(
 
     let now = mcp_agent_mail_core::timestamps::now_micros();
     let recency_cutoff = now.saturating_sub(recency_micros);
+    let population_limit = mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_LIMIT")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_POPULATION_LIMIT)
+        .min(MAX_POPULATION_LIMIT);
 
     let cx = asupersync::Cx::for_request_with_budget(asupersync::Budget::INFINITE);
-    let projects =
-        match fastmcp_core::block_on(mcp_agent_mail_db::queries::list_projects(&cx, pool)) {
+    let agents =
+        match fastmcp_core::block_on(mcp_agent_mail_db::queries::list_atc_population_snapshot(
+            &cx,
+            pool,
+            recency_cutoff,
+            population_limit,
+        )) {
             asupersync::Outcome::Ok(rows) => rows,
             asupersync::Outcome::Err(error) => return Err(error.to_string()),
             asupersync::Outcome::Cancelled(reason) => {
@@ -9626,44 +9656,22 @@ pub fn atc_sync_population_from_db(
         };
 
     let mut stats = AtcPopulationSyncStats::default();
-    for project in projects {
-        let Some(project_id) = project.id else {
-            continue;
-        };
-        stats.projects = stats.projects.saturating_add(1);
-        let agents = match fastmcp_core::block_on(mcp_agent_mail_db::queries::list_agents(
-            &cx, pool, project_id,
-        )) {
-            asupersync::Outcome::Ok(rows) => rows,
-            asupersync::Outcome::Err(error) => return Err(error.to_string()),
-            asupersync::Outcome::Cancelled(reason) => {
-                return Err(format!("cancelled: {reason:?}"));
-            }
-            asupersync::Outcome::Panicked(payload) => {
-                return Err(format!("panicked: {}", payload.message()));
-            }
-        };
-        let project_key = project.human_key.trim();
-        let project_key = (!project_key.is_empty()).then_some(project_key);
-        for agent in agents {
-            stats.agents = stats.agents.saturating_add(1);
-            if agent.last_active_ts > 0 {
-                stats.active_agents = stats.active_agents.saturating_add(1);
-            }
-            // Skip agents that have been silent beyond the recency window.
-            // They are already Dead from the liveness evaluator's perspective;
-            // hydrating them only floods the effect queue on cold start.
-            if agent.last_active_ts > 0 && agent.last_active_ts < recency_cutoff {
-                continue;
-            }
-            atc_sync_agent_snapshot(
-                &agent.name,
-                &agent.program,
-                project_key,
-                agent.last_active_ts,
-            );
+    let mut projects = HashSet::new();
+    for agent in agents {
+        projects.insert(agent.project_id);
+        stats.agents = stats.agents.saturating_add(1);
+        if agent.last_active_ts > 0 {
+            stats.active_agents = stats.active_agents.saturating_add(1);
         }
+        let project_key = agent.project_key.trim();
+        atc_sync_agent_snapshot(
+            &agent.name,
+            &agent.program,
+            (!project_key.is_empty()).then_some(project_key),
+            agent.last_active_ts,
+        );
     }
+    stats.projects = projects.len();
     Ok(stats)
 }
 
@@ -11157,6 +11165,26 @@ mod alien_enhancement_tests {
     }
 
     #[test]
+    fn identical_registration_does_not_churn_liveness_schedule() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("StableAgent", "claude-code", Some("/tmp/project"));
+        engine.observe_activity("StableAgent", Some("/tmp/project"), 5_000_000);
+        let before = engine.agents.get("StableAgent").expect("agent tracked");
+        let schedule_version = before.schedule_version;
+        let next_review_micros = before.next_review_micros;
+        let heap_len = engine.liveness_schedule.len();
+
+        for _ in 0..128 {
+            engine.register_agent("StableAgent", "claude-code", Some("/tmp/project"));
+        }
+
+        let after = engine.agents.get("StableAgent").expect("agent tracked");
+        assert_eq!(after.schedule_version, schedule_version);
+        assert_eq!(after.next_review_micros, next_review_micros);
+        assert_eq!(engine.liveness_schedule.len(), heap_len);
+    }
+
+    #[test]
     fn sync_population_from_db_seeds_existing_agents() {
         let _guard = GLOBAL_ATC_TEST_LOCK
             .lock()
@@ -11221,14 +11249,55 @@ mod alien_enhancement_tests {
             other => panic!("register agent: {other:?}"),
         };
 
+        let query_tracker = std::sync::Arc::new(mcp_agent_mail_db::QueryTracker::new());
+        query_tracker.enable(None);
+        let _query_guard = mcp_agent_mail_db::tracking::set_active_tracker(query_tracker.clone());
         let stats = atc_sync_population_from_db(&pool).expect("sync population");
         assert_eq!(stats.projects, 1);
         assert_eq!(stats.agents, 1);
         assert_eq!(stats.active_agents, 1);
         assert_eq!(
+            query_tracker.snapshot().total,
+            1,
+            "population hydration must stay a single joined query"
+        );
+        assert_eq!(
             atc_agent_last_activity("BlueLake"),
             Some(agent.last_active_ts)
         );
+
+        let (schedule_version, next_review_micros, schedule_len) = {
+            let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+            let engine = engine_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = engine.agents.get("BlueLake").expect("agent tracked");
+            (
+                entry.schedule_version,
+                entry.next_review_micros,
+                engine.liveness_schedule.len(),
+            )
+        };
+
+        const REPEATED_REFRESHES: u64 = 256;
+        for _ in 0..REPEATED_REFRESHES {
+            let repeated = atc_sync_population_from_db(&pool).expect("repeat population sync");
+            assert_eq!(repeated, stats);
+        }
+        assert_eq!(
+            query_tracker.snapshot().total,
+            1 + REPEATED_REFRESHES,
+            "each population refresh must issue exactly one query"
+        );
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        let engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = engine.agents.get("BlueLake").expect("agent tracked");
+        assert_eq!(entry.schedule_version, schedule_version);
+        assert_eq!(entry.next_review_micros, next_review_micros);
+        assert_eq!(engine.liveness_schedule.len(), schedule_len);
+        drop(engine);
 
         let summary = atc_summary().expect("summary");
         assert!(
@@ -11769,6 +11838,44 @@ mod alien_enhancement_tests {
     }
 
     #[test]
+    fn atc_replay_tick_fixture_records_budget_overrun_debt() {
+        let mut engine = AtcEngine::new_for_testing();
+
+        engine.replay_from_ledger([ReplayEvent::Tick {
+            total_micros: 186_000,
+            tick_budget_micros: 5_000,
+            utilization_ratio: 37.2,
+            budget_exceeded: true,
+            baseline_probe_limit: 3,
+        }]);
+
+        assert_eq!(engine.slow_controller.budget_debt_micros(), 181_000);
+        assert!(
+            engine.slow_controller.probe_budget_fraction <= 0.051,
+            "overrun should clamp probe budget fraction near minimum, got {}",
+            engine.slow_controller.probe_budget_fraction
+        );
+        assert_eq!(engine.slow_controller.probe_limit, 1);
+
+        engine.replay_from_ledger([ReplayEvent::Tick {
+            total_micros: 1_000,
+            tick_budget_micros: 5_000,
+            utilization_ratio: 0.2,
+            budget_exceeded: false,
+            baseline_probe_limit: 3,
+        }]);
+
+        assert!(
+            engine.slow_controller.budget_debt_micros() < 181_000,
+            "subsequent cheap tick should repay some budget debt"
+        );
+        assert!(
+            engine.slow_controller.budget_debt_micros() > 0,
+            "one cheap tick should not erase the 186ms overrun debt"
+        );
+    }
+
+    #[test]
     fn shadow_policy_probe_disagreement_does_not_dilute_regret_average() {
         let mut shadow = AtcShadowPolicyState::default();
         shadow.record_decision_pair(
@@ -11801,6 +11908,40 @@ mod alien_enhancement_tests {
             "compaction should keep only the latest schedule entry per agent"
         );
         assert_eq!(engine.scheduled_agent_count(), 1);
+    }
+
+    #[test]
+    fn stale_flaky_agent_reschedules_into_future() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("LaggingAgent", "claude-code", None);
+
+        let now = 600_000_000;
+        let old_activity = 1_000_000;
+        {
+            let entry = engine
+                .agents
+                .get_mut("LaggingAgent")
+                .expect("registered agent");
+            entry.state = LivenessState::Flaky;
+            entry.rhythm.last_activity_ts = old_activity;
+            entry.probe_sent_at = old_activity;
+        }
+
+        let incumbent_k = engine.incumbent_policy.suspicion_k;
+        engine.reschedule_agent("LaggingAgent", now, incumbent_k);
+
+        let entry = engine.agents.get("LaggingAgent").expect("registered agent");
+        let minimum_future_delay = (engine.config.probe_interval_micros / 2).max(250_000);
+        assert_eq!(
+            entry.next_review_micros,
+            now.saturating_add(minimum_future_delay)
+        );
+        assert!(
+            engine
+                .next_scheduled_review_micros()
+                .is_some_and(|due| due > now),
+            "stale flaky agents must not be requeued at an already-overdue timestamp"
+        );
     }
 
     #[test]

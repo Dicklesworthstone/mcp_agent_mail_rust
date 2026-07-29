@@ -114,32 +114,80 @@ fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
 
     let n_threads = 50;
     let barrier_start = Arc::new(Barrier::new(n_threads));
-    let barrier_hold = Arc::new(Barrier::new(n_threads));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let handles: Vec<_> = (0..n_threads)
         .map(|_| {
             let pool = pool.clone();
             let barrier_start = Arc::clone(&barrier_start);
-            let barrier_hold = Arc::clone(&barrier_hold);
+            let release = Arc::clone(&release);
+            let result_tx = result_tx.clone();
             std::thread::spawn(move || {
                 barrier_start.wait();
                 let conn = match block_on(|cx| async move { pool.acquire(&cx).await }) {
                     Outcome::Ok(c) => c,
                     Outcome::Err(e) => {
-                        panic!("pool warmup acquire should succeed without SQLITE_BUSY: {e:?}")
+                        let _ = result_tx.send(Err(format!(
+                            "pool warmup acquire should succeed without SQLITE_BUSY: {e:?}"
+                        )));
+                        return;
                     }
-                    Outcome::Cancelled(r) => panic!("pool warmup acquire cancelled: {r:?}"),
-                    Outcome::Panicked(p) => panic!("{p}"),
+                    Outcome::Cancelled(r) => {
+                        let _ =
+                            result_tx.send(Err(format!("pool warmup acquire cancelled: {r:?}")));
+                        return;
+                    }
+                    Outcome::Panicked(p) => {
+                        let _ = result_tx.send(Err(p.to_string()));
+                        return;
+                    }
                 };
-                barrier_hold.wait();
+                let _ = result_tx.send(Ok(()));
+                while !release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 drop(conn);
             })
         })
         .collect();
+    drop(result_tx);
 
-    for h in handles {
-        h.join().expect("thread join");
+    let mut errors = Vec::new();
+    for _ in 0..n_threads {
+        match result_rx.recv_timeout(std::time::Duration::from_secs(75)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => {
+                errors.push(format!(
+                    "timed out waiting for pool warmup worker result: {e}"
+                ));
+                break;
+            }
+        }
     }
+    release.store(true, Ordering::Release);
+    for h in handles {
+        if let Err(payload) = h.join() {
+            let panic_msg = payload
+                .downcast_ref::<&str>()
+                .map_or_else(
+                    || {
+                        payload
+                            .downcast_ref::<String>()
+                            .map_or("unknown panic payload", String::as_str)
+                    },
+                    |msg| *msg,
+                )
+                .to_string();
+            errors.push(format!("pool warmup worker panicked: {panic_msg}"));
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "pool warmup workers failed:\n{}",
+        errors.join("\n")
+    );
 
     // Verify we end up at a consistent latest schema (no migration races).
     block_on(|cx| async move {
@@ -150,14 +198,14 @@ fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
             Outcome::Panicked(p) => panic!("{p}"),
         };
 
-        let statuses = match schema::migration_status(&cx, &*conn).await {
+        let statuses = match schema::migration_runner_base().status(&cx, &*conn).await {
             Outcome::Ok(s) => s,
             Outcome::Err(e) => panic!("migration_status should succeed: {e:?}"),
             Outcome::Cancelled(r) => panic!("migration_status cancelled: {r:?}"),
             Outcome::Panicked(p) => panic!("{p}"),
         };
 
-        let expected = schema::schema_migrations().len();
+        let expected = schema::schema_migrations_base().len();
         assert_eq!(statuses.len(), expected, "all migrations should be tracked");
         assert!(
             statuses
@@ -2071,15 +2119,15 @@ fn get_inbox_stats_opt(pool: &DbPool, agent_id: i64) -> Option<InboxStatsRow> {
 }
 
 fn invalidate_cached_inbox_stats(pool: &DbPool, agent_id: i64) {
-    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
+    read_cache().invalidate_inbox_stats_scoped(&pool.sqlite_identity_key(), agent_id);
 }
 
 fn get_cached_inbox_stats(pool: &DbPool, agent_id: i64) -> Option<InboxStatsRow> {
-    read_cache().get_inbox_stats_scoped(pool.sqlite_path(), agent_id)
+    read_cache().get_inbox_stats_scoped(&pool.sqlite_identity_key(), agent_id)
 }
 
 fn put_cached_inbox_stats(pool: &DbPool, stats: &InboxStatsRow) {
-    read_cache().put_inbox_stats_scoped(pool.sqlite_path(), stats);
+    read_cache().put_inbox_stats_scoped(&pool.sqlite_identity_key(), stats);
 }
 
 fn get_inbox_stats(pool: &DbPool, agent_id: i64) -> InboxStatsRow {
@@ -2342,8 +2390,8 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
         "mark_message_read should decrement unread_count to zero"
     );
     assert_eq!(
-        after_mark_read.ack_pending_count, 0,
-        "mark_message_read should auto-ack ack_required messages (read = ack)"
+        after_mark_read.ack_pending_count, 1,
+        "mark_message_read should leave ack_required messages pending explicit acknowledgement"
     );
     assert_ne!(
         after_mark_read.unread_count, stale_before_mark_read.unread_count,
@@ -2359,7 +2407,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
     };
     put_cached_inbox_stats(&pool, &stale_before_ack);
 
-    // acknowledge_message is now idempotent — auto-ack already set ack_ts.
+    // acknowledge_message is the operation that clears explicit ack-required mail.
     let _ack_ts = acknowledge_message(&pool, receiver_id, first_msg);
     let after_ack = get_inbox_stats(&pool, receiver_id);
     assert_eq!(
@@ -2372,7 +2420,7 @@ fn stress_inbox_stats_invalidation_after_read_ack_and_new_message() {
     );
     assert_eq!(
         after_ack.ack_pending_count, 0,
-        "ack_pending should remain zero (already auto-acked on read)"
+        "acknowledge_message should clear ack_pending_count"
     );
     assert_ne!(
         after_ack.ack_pending_count, stale_before_ack.ack_pending_count,
@@ -3256,9 +3304,10 @@ fn set_contact_policy_updates_cache() {
             .unwrap();
 
             let agent_id = agent.id.unwrap();
+            let cache_scope = pool.sqlite_identity_key();
 
             // 2. Verify initial cache has policy="auto"
-            let cached = read_cache().get_agent_by_id(agent_id);
+            let cached = read_cache().get_agent_by_id_scoped(&cache_scope, agent_id);
             assert!(cached.is_some(), "agent should be cached after register");
             assert_eq!(cached.unwrap().contact_policy, "auto");
 
@@ -3269,7 +3318,7 @@ fn set_contact_policy_updates_cache() {
             assert_eq!(updated.contact_policy, "contacts_only");
 
             // 4. Verify cache was updated (this was the bug — cache was stale before the fix)
-            let cached2 = read_cache().get_agent_by_id(agent_id);
+            let cached2 = read_cache().get_agent_by_id_scoped(&cache_scope, agent_id);
             assert!(cached2.is_some(), "agent should still be in cache");
             assert_eq!(
                 cached2.unwrap().contact_policy,
@@ -3283,7 +3332,7 @@ fn set_contact_policy_updates_cache() {
                 .unwrap();
             assert_eq!(updated2.contact_policy, "block_all");
 
-            let cached3 = read_cache().get_agent_by_id(agent_id);
+            let cached3 = read_cache().get_agent_by_id_scoped(&cache_scope, agent_id);
             assert_eq!(
                 cached3.unwrap().contact_policy,
                 "block_all",
@@ -3507,4 +3556,218 @@ fn noun_for(idx: u64) -> &'static str {
         "Prairie",
     ];
     NOUNS[(idx as usize) % NOUNS.len()]
+}
+
+// =============================================================================
+// Test: Concurrent file-reservation create→renew→release lane (#144)
+//
+// Guards the `run_with_mvcc_retry` release path in queries.rs under contention:
+// ~8 worker threads each repeatedly create, renew, and release a reservation on
+// their OWN distinct path against the shared frankensqlite store. After the
+// storm we assert the DB integrity check passes and the final reservation set
+// is consistent — no orphaned (never-released) and no duplicate active rows.
+// =============================================================================
+
+#[test]
+fn concurrent_reservation_create_renew_release_lane_stays_consistent() {
+    const WORKERS: u64 = 8;
+    const ITERATIONS: u64 = 10;
+
+    let (pool, _dir) = make_pool();
+    let suffix = unique_suffix();
+    let human_key = format!("/data/stress/reservation_lane_{suffix}");
+
+    // Set up the project and one agent per worker up front (single-threaded).
+    let (pid, agent_ids) = block_on(|cx| {
+        let pool = pool.clone();
+        let human_key = human_key.clone();
+        async move {
+            // Distinct, valid adjective+noun agent names (e.g. "RedLake",
+            // "OrangePeak", ...) — must pass `is_valid_agent_name`.
+            const ADJECTIVES: &[&str] = &[
+                "Red", "Orange", "Yellow", "Pink", "Black", "Purple", "Blue", "Brown", "White",
+                "Green",
+            ];
+
+            let proj = match queries::ensure_project(&cx, &pool, &human_key).await {
+                Outcome::Ok(r) => r,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let pid = proj.id.unwrap();
+            let mut agent_ids = Vec::with_capacity(WORKERS as usize);
+            for i in 0..WORKERS {
+                let name = format!(
+                    "{}{}",
+                    ADJECTIVES[i as usize % ADJECTIVES.len()],
+                    noun_for(i)
+                );
+                let agent = match queries::register_agent(
+                    &cx, &pool, pid, &name, "test", "test", None, None, None,
+                )
+                .await
+                {
+                    Outcome::Ok(r) => r,
+                    other => panic!("register_agent {name} failed: {other:?}"),
+                };
+                agent_ids.push(agent.id.unwrap());
+            }
+            (pid, agent_ids)
+        }
+    });
+
+    // All workers start their storm at the same instant.
+    let barrier = Arc::new(Barrier::new(WORKERS as usize));
+    let mut handles = Vec::with_capacity(WORKERS as usize);
+
+    for (w, agent_id) in agent_ids.iter().copied().enumerate() {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            // Each worker owns a unique path so the cycle exercises the
+            // create→renew→release MVCC-retry path without artificial exclusive
+            // conflicts (the conflict path has its own test).
+            let path = format!("src/worker_{w}/edit.rs");
+            barrier.wait();
+            for _ in 0..ITERATIONS {
+                // create
+                block_on_with_retry(50, |cx| {
+                    let pool = pool.clone();
+                    let path = path.clone();
+                    async move {
+                        queries::create_file_reservations(
+                            &cx,
+                            &pool,
+                            pid,
+                            agent_id,
+                            &[path.as_str()],
+                            3600,
+                            true,
+                            "lane",
+                        )
+                        .await
+                    }
+                });
+                // renew
+                block_on_with_retry(50, |cx| {
+                    let pool = pool.clone();
+                    let path = path.clone();
+                    async move {
+                        queries::renew_reservations(
+                            &cx,
+                            &pool,
+                            pid,
+                            agent_id,
+                            1800,
+                            Some(&[path.as_str()]),
+                            None,
+                        )
+                        .await
+                    }
+                });
+                // release
+                block_on_with_retry(50, |cx| {
+                    let pool = pool.clone();
+                    let path = path.clone();
+                    async move {
+                        queries::release_reservations(
+                            &cx,
+                            &pool,
+                            pid,
+                            agent_id,
+                            Some(&[path.as_str()]),
+                            None,
+                        )
+                        .await
+                    }
+                });
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().expect("worker thread panicked");
+    }
+
+    // 1. DB integrity check passes after the concurrent storm.
+    let integrity = pool
+        .run_full_integrity_check()
+        .expect("integrity check should run");
+    assert!(
+        integrity.ok,
+        "frankensqlite integrity check failed after concurrent reservation storm: {:?}",
+        integrity.details
+    );
+
+    // 2. Final reservation set is consistent: every worker released its path on
+    //    the last iteration, so NO active reservations should remain (no
+    //    orphaned leases left behind by the release path under contention).
+    let active = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::get_active_reservations(&cx, &pool, pid).await {
+                Outcome::Ok(r) => r,
+                other => panic!("get_active_reservations failed: {other:?}"),
+            }
+        }
+    });
+    assert!(
+        active.is_empty(),
+        "expected no active reservations after every worker released; leftovers: {:?}",
+        active
+            .iter()
+            .map(|r| (r.agent_id, r.path_pattern.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // 3. Re-create one reservation per worker and assert no duplicates: each
+    //    (agent, path) yields exactly one active row (the release path did not
+    //    leave a stale active duplicate that would block re-acquisition).
+    for (w, agent_id) in agent_ids.iter().copied().enumerate() {
+        let path = format!("src/worker_{w}/edit.rs");
+        block_on_with_retry(50, |cx| {
+            let pool = pool.clone();
+            let path = path.clone();
+            async move {
+                queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    pid,
+                    agent_id,
+                    &[path.as_str()],
+                    3600,
+                    true,
+                    "verify",
+                )
+                .await
+            }
+        });
+    }
+    let active_final = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::get_active_reservations(&cx, &pool, pid).await {
+                Outcome::Ok(r) => r,
+                other => panic!("get_active_reservations failed: {other:?}"),
+            }
+        }
+    });
+    assert_eq!(
+        active_final.len(),
+        WORKERS as usize,
+        "expected exactly one active reservation per worker after re-acquire; got: {:?}",
+        active_final
+            .iter()
+            .map(|r| (r.agent_id, r.path_pattern.clone()))
+            .collect::<Vec<_>>()
+    );
+    // No duplicate (agent_id, path) active rows.
+    let mut seen = std::collections::HashSet::new();
+    for r in &active_final {
+        assert!(
+            seen.insert((r.agent_id, r.path_pattern.clone())),
+            "duplicate active reservation for {:?}",
+            (r.agent_id, &r.path_pattern)
+        );
+    }
 }

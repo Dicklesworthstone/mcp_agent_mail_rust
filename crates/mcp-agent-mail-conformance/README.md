@@ -16,10 +16,10 @@ This crate keeps the live Rust router honest against the legacy Python reference
 
 ## Current coverage (as of 2026-04-18)
 
-- The live Rust router exposes 37 tools.
+- The live Rust router exposes 38 tools.
 - 34 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
-- 3 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, and `list_agents`.
-- All 3 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
+- 4 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents`, and `check_file_reservation_conflicts`.
+- All 4 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
 - The former tool fixture gap tracked by `br-a2k3h.3` is closed by the dedicated Rust-native fixture lane.
 - The live Rust router exposes 25 logical resource templates after collapsing `?{query}` variants.
 - 23 resource templates have Python behavior fixtures.
@@ -44,12 +44,12 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `whois` - Inspect an agent profile and optional recent archive commits.
 - `send_message` - Create a message, persist recipients, and write archive copies.
 - `reply_message` - Reply in-thread while preserving the original thread semantics.
-- `fetch_inbox` - Read recent inbox items without mutating archive message contents.
+- `fetch_inbox` - Read recent inbox items and record read state without mutating archive message contents.
 - `mark_message_read` - Mark a delivered message as read for one recipient.
 - `acknowledge_message` - Mark a delivered message as read and acknowledged.
 - `request_contact` - Request permission to open a contact link with another agent.
 - `respond_contact` - Approve or deny a pending contact request.
-- `list_contacts` - List the outgoing contact edges for an agent.
+- `list_contacts` - List contact relationships for an agent.
 - `set_contact_policy` - Set an agent's inbound contact policy.
 - `file_reservation_paths` - Reserve project-relative files or globs for coordinated edits.
 - `release_file_reservations` - Release one or more active file reservations.
@@ -70,11 +70,12 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `renew_build_slot` - Extend an existing build slot lease.
 - `release_build_slot` - Release an existing build slot lease.
 
-### Rust-native extensions (3)
+### Rust-native extensions (4)
 
 - `resolve_pane_identity` - Resolve the canonical agent name for a tmux pane from Rust-side identity files; there is no Python pane-identity analogue.
 - `cleanup_pane_identities` - Remove stale per-pane identity files for dead tmux panes; this is Rust-only operational cleanup tied to the pane identity model.
 - `list_agents` - List all registered agents in a project; this Rust-native identity surface is now covered by the dedicated `rust_native/` golden fixtures.
+- `check_file_reservation_conflicts` - Read-only authoritative conflict check for pre-edit/pre-commit guards (added in `08b05c76`, GH#196); covered by the dedicated `rust_native/` golden fixtures.
 
 Full inventory and the current blocker record live in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANCE_AUDIT_2026-04-18.md).
 

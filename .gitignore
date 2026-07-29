@@ -208,3 +208,20 @@ vendor/*
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
+.claude/settings.local.json
+
+# am doctor per-run artifacts (world-class doctor surface)
+.doctor/
+*.doctor-lock
+
+# Generated session-history mining report
+/COMPREHENSIVE_ISSUES_AND_PROBLEMS_WITH_AM_BASED_ON_COMPLETE_SESSION_HISTORY_ANALYSIS.md
+cursor.mcp.json
+factory.mcp.json
+gemini.mcp.json
+windsurf.mcp.json
+
+# Agent run artifacts / probes
+.space_probe
+claude-upgrade-progress.json
+agy.mcp.json

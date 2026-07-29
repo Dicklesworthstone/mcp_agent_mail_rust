@@ -132,6 +132,8 @@ pub async fn macro_start_session(
     file_reservation_ttl_seconds: Option<i64>,
     inbox_limit: Option<i32>,
     reaper_exempt: Option<bool>,
+    pane_id: Option<String>,
+    registration_proof: Option<String>,
 ) -> McpResult<String> {
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
@@ -160,8 +162,11 @@ pub async fn macro_start_session(
     // the pane identity first and reuse the pre-registered name when one is
     // available, so the macro is idempotent against the boot path.
     let resolved_name = agent_name.or_else(|| {
-        mcp_agent_mail_core::pane_identity::resolve_identity_current_pane(&project.human_key)
-            .and_then(|name| normalize_resolved_pane_agent_name(&name))
+        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+            &project.human_key,
+            pane_id.as_deref(),
+        )
+        .and_then(|name| normalize_resolved_pane_agent_name(&name))
     });
 
     let agent_json = crate::identity::register_agent(
@@ -173,6 +178,8 @@ pub async fn macro_start_session(
         task_description,
         None,
         reaper_exempt,
+        pane_id,
+        registration_proof,
     )
     .await?;
     let agent: AgentResponse = parse_json(agent_json, "agent")?;
@@ -222,6 +229,9 @@ pub async fn macro_start_session(
         None,
         Some(inbox_limit),
         Some(false),
+        None,
+        None,
+        None,
         None,
     )
     .await?;
@@ -280,6 +290,7 @@ pub async fn macro_prepare_thread(
     llm_mode: Option<bool>,
     llm_model: Option<String>,
     inbox_limit: Option<i32>,
+    registration_proof: Option<String>,
 ) -> McpResult<String> {
     let thread_id_trimmed = thread_id.trim();
     if thread_id_trimmed.is_empty() {
@@ -296,6 +307,12 @@ pub async fn macro_prepare_thread(
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
     let inbox_limit = parse_macro_inbox_limit(inbox_limit)?;
 
+    // The write lease is scoped to the two direct DB uses (project resolution
+    // and thread listing) and must be dropped before whois/fetch_inbox below:
+    // those read surfaces acquire the archive-aware read pool, whose snapshot
+    // gate refuses to serve while any writer lease is active, so holding
+    // `pool` across their awaits self-deadlocks until the 120 s snapshot
+    // deadline (br-097bj).
     let pool = get_db_pool()?;
     let project_row = resolve_project(ctx, &pool, &project_key).await?;
     let project = ProjectResponse {
@@ -305,6 +322,18 @@ pub async fn macro_prepare_thread(
         created_at: micros_to_iso(project_row.created_at),
     };
     let project_id = project_row.id.unwrap_or(0);
+
+    let messages = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_thread_messages(
+            ctx.cx(),
+            &pool,
+            project_id,
+            &thread_id,
+            None,
+        )
+        .await,
+    )?;
+    drop(pool);
 
     let should_register = register_if_missing.unwrap_or(true);
     let agent = if should_register {
@@ -317,6 +346,8 @@ pub async fn macro_prepare_thread(
             task_description,
             None,
             None,
+            None,
+            registration_proof,
         )
         .await?;
         parse_json(agent_json, "agent")?
@@ -334,17 +365,6 @@ pub async fn macro_prepare_thread(
         let whois: WhoisResponse = parse_json(whois_json, "agent")?;
         whois.agent
     };
-
-    let messages = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_thread_messages(
-            ctx.cx(),
-            &pool,
-            project_id,
-            &thread_id,
-            None,
-        )
-        .await,
-    )?;
 
     let include_examples = include_examples.unwrap_or(true);
     let use_llm = llm_mode.unwrap_or(true);
@@ -418,6 +438,9 @@ pub async fn macro_prepare_thread(
         None,
         Some(inbox_limit),
         Some(include_inbox_bodies.unwrap_or(false)),
+        None,
+        None,
+        None,
         None,
     )
     .await?;
@@ -1304,6 +1327,8 @@ mod tests {
                 cc: Vec::new(),
                 bcc: Vec::new(),
                 created_ts: None,
+                read_ts: None,
+                ack_ts: None,
                 kind: "direct".into(),
                 attachments: Vec::new(),
                 body_md: Some("Body text".into()),

@@ -17,11 +17,11 @@ use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, FileReservationRow, create_pool, now_micros,
     queries::{
         self, get_agent_last_mail_activity, list_unreleased_file_reservations,
-        project_ids_with_active_reservations, release_expired_reservations,
-        release_reservations_by_ids_returning_ids,
+        project_ids_with_active_reservations, prune_released_file_reservations,
+        release_expired_reservations, release_reservations_by_ids_returning_ids,
     },
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,6 +89,7 @@ pub fn start(config: &Config) {
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("file-res-cleanup".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 cleanup_loop(&config);
             }) {
@@ -218,11 +219,16 @@ fn run_cleanup_cycle_with_cache(
     pool: &DbPool,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<(usize, usize), String> {
-    // This worker runs on a dedicated OS thread outside the async runtime,
-    // so there is no parent Cx to derive from. Cx::for_testing() provides
-    // Budget::INFINITE which is correct for a long-running background worker
-    // that should never be cancelled by budget exhaustion.
-    let cx = Cx::for_testing();
+    // This worker runs on a dedicated OS thread outside the async runtime, so
+    // there is no parent Cx to derive from. Borrow the runtime-backed ambient
+    // Cx<cap::All> that `Runtime::block_on` installs (INFINITE budget, correct
+    // for a long-running worker that must never be cancelled by budget
+    // exhaustion) instead of the test-only `Cx::for_testing()` constructor,
+    // which is gated behind `test-internals`. The Cx is Arc-backed, so the
+    // clone returned here stays valid across the later block_on calls below.
+    let cx = block_on(async {
+        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+    });
 
     // Get all project IDs with active reservations.
     let project_ids =
@@ -300,6 +306,45 @@ fn run_cleanup_cycle_with_cache(
                 error = %err,
                 "cleanup: failed to enqueue archive updates for released reservations"
             );
+        }
+    }
+
+    // Phase 3 (GH#154 item 2): retention prune. Released/expired reservations
+    // are only ever marked released, never deleted, so `file_reservations` grows
+    // unbounded on a long-lived mailbox (one report: ~30k rows / 0 active over
+    // ~55 days), inflating every active-reservation scan. Hard-DELETE released
+    // rows whose settled timestamp is older than the configured retention
+    // horizon. The git archive retains the audit history, so this is
+    // non-destructive. `0` days disables the prune (historical behavior).
+    if config.file_reservations_retention_days > 0 {
+        let retention_us = i64::try_from(config.file_reservations_retention_days)
+            .unwrap_or(30)
+            .saturating_mul(86_400)
+            .saturating_mul(1_000_000);
+        let older_than_us = now_micros().saturating_sub(retention_us);
+        match block_on(async {
+            prune_released_file_reservations(&cx, pool, None, older_than_us).await
+        }) {
+            Outcome::Ok(deleted) => {
+                if deleted > 0 {
+                    info!(
+                        deleted,
+                        retention_days = config.file_reservations_retention_days,
+                        "cleanup: pruned released file reservations past retention horizon"
+                    );
+                }
+            }
+            Outcome::Err(err) => warn!(
+                error = %err,
+                "cleanup: file-reservation retention prune failed; will retry next cycle"
+            ),
+            Outcome::Cancelled(_) => {
+                warn!("cleanup: file-reservation retention prune was cancelled");
+            }
+            Outcome::Panicked(panic) => warn!(
+                panic = %panic.message(),
+                "cleanup: file-reservation retention prune panicked"
+            ),
         }
     }
 
@@ -885,6 +930,15 @@ fn write_cleanup_artifacts(
     else {
         return Err("failed to list reservations for artifact generation".into());
     };
+    let found_ids = target_reservations
+        .iter()
+        .filter_map(|row| row.id)
+        .collect::<HashSet<_>>();
+    if let Some(missing_id) = released_ids.iter().find(|id| !found_ids.contains(id)) {
+        return Err(format!(
+            "cleanup artifact reservation lookup failed for released reservation {missing_id}"
+        ));
+    }
 
     let mut res_jsons = Vec::new();
     for row in target_reservations {
@@ -1123,6 +1177,13 @@ mod tests {
         create_pool(&pool_config).expect("create pool")
     }
 
+    fn allow_ephemeral_project_roots_for_test<R>(f: impl FnOnce() -> R) -> R {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            f,
+        )
+    }
+
     fn seed_active_reservation(
         tmp: &tempfile::TempDir,
     ) -> (DbPool, Cx, i64, i64, i64, String, String) {
@@ -1133,12 +1194,14 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project = match fastmcp_core::block_on(async {
-            queries::ensure_project(&cx, &pool, &human_key).await
-        }) {
-            Outcome::Ok(p) => p,
-            other => panic!("ensure_project failed: {other:?}"),
-        };
+        let project = allow_ephemeral_project_roots_for_test(|| {
+            match fastmcp_core::block_on(async {
+                queries::ensure_project(&cx, &pool, &human_key).await
+            }) {
+                Outcome::Ok(p) => p,
+                other => panic!("ensure_project failed: {other:?}"),
+            }
+        });
         let project_id = project.id.expect("project id");
 
         let agent = match fastmcp_core::block_on(async {
@@ -1200,12 +1263,14 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project = match fastmcp_core::block_on(async {
-            queries::ensure_project(&cx, &pool, &human_key).await
-        }) {
-            Outcome::Ok(p) => p,
-            other => panic!("ensure_project failed: {other:?}"),
-        };
+        let project = allow_ephemeral_project_roots_for_test(|| {
+            match fastmcp_core::block_on(async {
+                queries::ensure_project(&cx, &pool, &human_key).await
+            }) {
+                Outcome::Ok(p) => p,
+                other => panic!("ensure_project failed: {other:?}"),
+            }
+        });
         let project_id = project.id.expect("project id");
 
         let agent = match fastmcp_core::block_on(async {
@@ -1698,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn write_cleanup_artifacts_errors_when_agent_lookup_fails() {
+    fn write_cleanup_artifacts_errors_when_released_reservation_lookup_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cx, project_id, agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
@@ -1727,8 +1792,8 @@ mod tests {
         let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
         assert!(
             result
-                .expect_err("missing agent lookup should fail cleanup artifact generation")
-                .contains("agent lookup failed")
+                .expect_err("missing reservation lookup should fail cleanup artifact generation")
+                .contains("reservation lookup failed")
         );
     }
 

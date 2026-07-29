@@ -196,6 +196,36 @@ fn identify_lock_holder_via_proc(db_path: &std::path::Path) -> Option<LockHolder
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
+    pids_holding_file_filtered(path, |_| true)
+}
+
+/// Internal variant of [`pids_holding_file`] that lets callers prune candidate
+/// PIDs *before* the expensive per-FD scan. Used by
+/// [`agent_mail_pids_holding_file`] so we don't open every FD of every process
+/// on the host just to discard non-Agent-Mail PIDs at the end.
+///
+/// Performance and safety notes:
+/// - `read_link` on a /proc fd magic link returns the kernel's resolved
+///   target path WITHOUT touching the target filesystem — one syscall per
+///   FD. Following the link with `stat(2)`/`metadata` (previous behavior)
+///   walks into the target filesystem, and a stat into a dead FUSE mount
+///   blocks in `request_wait_answer` forever, wedging single-threaded
+///   startup before the listener binds (br-piwvy, ts1 incident).
+/// - Only fds whose resolved path string equals the canonicalized probe
+///   target are stat-confirmed for `(dev, ino)`; that stat lands on the
+///   probe target's own filesystem, which we already statted above.
+///   Non-file FDs (sockets, pipes, anon inodes) and deleted-fd targets
+///   (" (deleted)" suffix) mismatch on the string compare and are skipped
+///   without ever touching a foreign filesystem.
+/// - The `pre_filter` callback runs after parsing the PID but before opening
+///   `/proc/<pid>/fd`, so a callback that rejects ~99% of host PIDs
+///   (e.g. `pid_is_agent_mail`) collapses the cost to O(matched PIDs × FDs).
+#[cfg(target_os = "linux")]
+#[must_use]
+fn pids_holding_file_filtered<F: Fn(u32) -> bool>(
+    path: &std::path::Path,
+    pre_filter: F,
+) -> Vec<u32> {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(target_meta) = std::fs::metadata(path) else {
@@ -203,6 +233,9 @@ pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
     };
     let target_ino = target_meta.ino();
     let target_dev = target_meta.dev();
+    let Ok(canonical_target) = std::fs::canonicalize(path) else {
+        return Vec::new();
+    };
     let my_pid = std::process::id();
 
     let Ok(proc_dir) = std::fs::read_dir("/proc") else {
@@ -221,16 +254,20 @@ pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
         if pid == my_pid {
             continue;
         }
+        if !pre_filter(pid) {
+            continue;
+        }
         let fd_dir = format!("/proc/{pid}/fd");
         let Ok(fds) = std::fs::read_dir(&fd_dir) else {
             continue;
         };
         for fd_entry in fds.flatten() {
-            // readlink on /proc/<pid>/fd/<N> gives the target path.
             let Ok(link_target) = std::fs::read_link(fd_entry.path()) else {
                 continue;
             };
-            // Compare by inode+device to handle symlinks and bind mounts.
+            if link_target != canonical_target {
+                continue;
+            }
             if let Ok(link_meta) = std::fs::metadata(&link_target) {
                 if link_meta.ino() == target_ino && link_meta.dev() == target_dev {
                     holders.push(pid);
@@ -271,8 +308,24 @@ pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
 
 /// Find Agent Mail PIDs that have the given database file open.
 ///
-/// Filters `pids_holding_file` results to only include processes whose
-/// executable or command line matches the Agent Mail signature.
+/// Filters by the Agent Mail binary signature *before* walking each
+/// candidate PID's `/proc/<pid>/fd/` directory — `pid_is_agent_mail` only
+/// has to read `/proc/<pid>/cmdline` and `/proc/<pid>/exe`, while the FD
+/// scan can do ~100 syscalls per process. On a typical host this drops
+/// the call from O(host PIDs × FDs per PID) to O(am PIDs × FDs per PID),
+/// usually a 50–500× reduction.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn agent_mail_pids_holding_file(path: &std::path::Path) -> Vec<u32> {
+    pids_holding_file_filtered(path, pid_is_agent_mail)
+}
+
+/// Find Agent Mail PIDs that have the given database file open (macOS).
+///
+/// macOS has no `/proc`, so this stays on the original two-step path:
+/// shell out to `lsof` (which is already filtered to the target file) and
+/// then drop any returned PIDs that are not Agent Mail processes.
+#[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn agent_mail_pids_holding_file(path: &std::path::Path) -> Vec<u32> {
     pids_holding_file(path)
@@ -2351,6 +2404,29 @@ fn probe_integrity(config: &Config) -> ProbeResult {
                 );
                 return attempt_probe_recovery(config);
             }
+            // mcp_agent_mail#160 belt-and-suspenders: even when archive
+            // drift didn't trip the recovery path, make sure the messages
+            // ID allocator is at or ahead of the archive's max so no
+            // INSERT can re-use an id the archive already considers
+            // canonical. Failures here are logged but non-fatal — the
+            // alternative (refusing to start) would be worse than the
+            // worst case we're guarding against (duplicate-id allocation,
+            // which already produces a yellow doctor signal).
+            match pool.advance_message_id_floor_from_archive() {
+                Ok(Some(new_floor)) => {
+                    tracing::warn!(
+                        new_floor,
+                        "startup: advanced messages id allocator floor to match archive (mcp_agent_mail#160)"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "startup: id-floor advance check failed; continuing without advance (mcp_agent_mail#160)"
+                    );
+                }
+            }
             ProbeResult::Ok { name: "integrity" }
         }
         Err(ref e) => {
@@ -2984,6 +3060,56 @@ mod tests {
 
     fn default_config() -> Config {
         Config::default()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pids_holding_file_finds_child_holder_via_readlink_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("held.db");
+        std::fs::write(&target, b"held").expect("seed file");
+        // A child that opens the file and sleeps; `tail -f` keeps the fd open.
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn tail -f holder");
+        let child_pid = child.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            if pids_holding_file(&target).contains(&child_pid) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Probing through a symlinked spelling of the same path must also
+        // match: the kernel fd path is canonical, so the probe target is
+        // canonicalized before the readlink string compare (br-piwvy).
+        let link = dir.path().join("held-link.db");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let via_link = found && pids_holding_file(&link).contains(&child_pid);
+
+        let other = dir.path().join("unheld.db");
+        std::fs::write(&other, b"unheld").expect("seed other");
+        let other_holders = pids_holding_file(&other);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(found, "child holding the file must be reported");
+        assert!(
+            via_link,
+            "symlinked probe spelling must canonicalize and match"
+        );
+        assert!(
+            !other_holders.contains(&child_pid),
+            "child must not be reported for a file it does not hold"
+        );
     }
 
     #[test]

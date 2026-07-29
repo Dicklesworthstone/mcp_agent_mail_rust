@@ -147,6 +147,7 @@ pub fn extract_links(event: &MailEvent) -> Vec<CorrelationLink> {
 
         MailEvent::HttpRequest { .. }
         | MailEvent::HealthPulse { .. }
+        | MailEvent::GitSegfaultRetry { .. }
         | MailEvent::ServerStarted { .. }
         | MailEvent::ServerShutdown { .. } => {
             // No entity-level correlation for infrastructure events.
@@ -496,6 +497,7 @@ const fn kind_label(kind: MailEventKind) -> &'static str {
         MailEventKind::AgentRegistered => "Agent Registered",
         MailEventKind::HttpRequest => "HTTP Request",
         MailEventKind::HealthPulse => "Health Pulse",
+        MailEventKind::GitSegfaultRetry => "Git Segfault Retry",
         MailEventKind::ServerStarted => "Server Started",
         MailEventKind::ServerShutdown => "Server Shutdown",
     }
@@ -710,6 +712,26 @@ fn detail_body(event: &MailEvent) -> String {
             lines.join("\n")
         }
 
+        MailEvent::GitSegfaultRetry {
+            name,
+            repo_slug,
+            attempt_n,
+            signal,
+            exhausted,
+            ..
+        } => {
+            let mut lines = Vec::new();
+            lines.push(format!("Event: {name}"));
+            lines.push(format!("Repo: {repo_slug}"));
+            lines.push(format!("Attempt: {attempt_n}"));
+            lines.push(format!(
+                "Signal: {}",
+                signal.map_or_else(|| "?".to_string(), |s| s.to_string())
+            ));
+            lines.push(format!("Exhausted: {exhausted}"));
+            lines.join("\n")
+        }
+
         MailEvent::ServerStarted {
             endpoint,
             config_summary,
@@ -867,6 +889,10 @@ mod tests {
         assert_eq!(kind_label(MailEventKind::ToolCallEnd), "Tool Call (end)");
         assert_eq!(kind_label(MailEventKind::MessageSent), "Message Sent");
         assert_eq!(kind_label(MailEventKind::HttpRequest), "HTTP Request");
+        assert_eq!(
+            kind_label(MailEventKind::GitSegfaultRetry),
+            "Git Segfault Retry"
+        );
         assert_eq!(kind_label(MailEventKind::ServerStarted), "Server Started");
         assert_eq!(kind_label(MailEventKind::ServerShutdown), "Server Shutdown");
     }
