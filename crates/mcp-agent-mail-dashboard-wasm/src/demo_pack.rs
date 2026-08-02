@@ -13,6 +13,10 @@ pub const PUBLIC_PRIVACY_POLICY_V1: &str = "agent-mail-dashboard-public-demo-v1"
 const MAX_ACTIONS: usize = 10_000;
 const MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const MAX_SPARKLINE_SAMPLES: usize = 240;
+const STARTUP_HISTORY_EVENTS: u64 = 986;
+const STARTUP_AGENT_ROWS: usize = 500;
+const STARTUP_PROJECT_ROWS: usize = 41;
+const STARTUP_CONTACT_ROWS: usize = 200;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DemoProvenance {
@@ -440,14 +444,16 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
         "scripts/verification/**",
     ];
 
-    (0_u64..128)
+    (0_u64..STARTUP_HISTORY_EVENTS)
         .map(|index| {
             let actor_index = usize::try_from(index).unwrap_or_default() % AGENTS.len();
             let peer_index = (actor_index + 3) % AGENTS.len();
             let project_index = usize::try_from(index / 3).unwrap_or_default() % PROJECTS.len();
             let subject_index = usize::try_from(index).unwrap_or_default() % SUBJECTS.len();
             let timestamp_micros = base_ts
-                - i64::try_from(128_u64.saturating_sub(index)).unwrap_or_default() * 750_000;
+                - i64::try_from(STARTUP_HISTORY_EVENTS.saturating_sub(index))
+                    .unwrap_or_default()
+                    * 750_000;
             let seq = 20_000 + index;
             let id = 30_000 + i64::try_from(index).unwrap_or_default();
             let operation = match index % 8 {
@@ -530,7 +536,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
 #[must_use]
 pub fn curated_public_demo() -> DemoPack {
     const BASE_TS: i64 = 1_772_668_800_000_000;
-    let agents = [
+    let agent_templates = [
         ("AmberDeer", "codex-cli", "gpt-5", "mcp-agent-mail-rust"),
         ("RubyPrairie", "claude-code", "opus", "frankentui"),
         ("GrayElk", "codex-cli", "gpt-5", "mcp-agent-mail-rust"),
@@ -547,20 +553,27 @@ pub fn curated_public_demo() -> DemoPack {
         ("CopperField", "codex-cli", "gpt-5", "frankensqlite"),
         ("TealFalcon", "claude-code", "sonnet", "edge-runtime"),
         ("CrimsonLake", "codex-cli", "gpt-5", "browser-runtime"),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(index, (name, program, model, project))| AgentSummary {
-        project: project.to_string(),
-        name: name.to_string(),
-        program: program.to_string(),
-        model: model.to_string(),
-        last_active_ts: BASE_TS - i64::try_from(index).unwrap_or(0) * 7_000_000,
-        health: None,
-    })
-    .collect::<Vec<_>>();
+    ];
+    let agents = (0..STARTUP_AGENT_ROWS)
+        .map(|index| {
+            let (name, program, model, project) = agent_templates[index % agent_templates.len()];
+            let cycle = index / agent_templates.len();
+            AgentSummary {
+                project: project.to_string(),
+                name: if cycle == 0 {
+                    name.to_string()
+                } else {
+                    format!("{name}{cycle:02}")
+                },
+                program: program.to_string(),
+                model: model.to_string(),
+                last_active_ts: BASE_TS - i64::try_from(index).unwrap_or(0) * 7_000_000,
+                health: None,
+            }
+        })
+        .collect::<Vec<_>>();
 
-    let projects = [
+    let project_templates = [
         (1, "mcp-agent-mail-rust", 1_825, 3),
         (2, "frankentui", 1_971, 2),
         (3, "frankensqlite", 1_123, 1),
@@ -571,20 +584,33 @@ pub fn curated_public_demo() -> DemoPack {
         (8, "browser-runtime", 476, 2),
         (9, "observability", 284, 1),
         (10, "integration-tests", 197, 1),
-    ]
-    .into_iter()
-    .map(
-        |(id, slug, message_count, reservation_count)| ProjectSummary {
-            id,
-            slug: slug.to_string(),
-            human_key: format!("public-demo/{slug}"),
-            agent_count: 16,
-            message_count,
-            reservation_count,
-            created_at: BASE_TS - 86_400_000_000,
-        },
-    )
-    .collect::<Vec<_>>();
+    ];
+    let projects = (0..STARTUP_PROJECT_ROWS)
+        .map(|index| {
+            let (slug, message_count, reservation_count) = project_templates
+                .get(index)
+                .map(|(_, slug, messages, reservations)| {
+                    ((*slug).to_string(), *messages, *reservations)
+                })
+                .unwrap_or_else(|| {
+                    (
+                        format!("public-project-{:02}", index + 1),
+                        180 + u64::try_from((index * 137) % 3_600).unwrap_or_default(),
+                        u64::try_from(index % 4).unwrap_or_default(),
+                    )
+                });
+            ProjectSummary {
+                id: 1 + i64::try_from(index).unwrap_or_default(),
+                human_key: format!("public-demo/{slug}"),
+                slug,
+                agent_count: 8 + u64::try_from(index % 37).unwrap_or_default(),
+                message_count,
+                reservation_count,
+                created_at: BASE_TS
+                    - (1 + i64::try_from(index).unwrap_or_default()) * 86_400_000_000,
+            }
+        })
+        .collect::<Vec<_>>();
 
     let reservation_rows = [
         ("mcp-agent-mail-rust", "AmberDeer", "crates/dashboard/**"),
@@ -619,7 +645,7 @@ pub fn curated_public_demo() -> DemoPack {
         })
         .collect::<Vec<_>>();
 
-    let contact_rows = [
+    let contact_templates = [
         (
             "AmberDeer",
             "RubyPrairie",
@@ -659,11 +685,11 @@ pub fn curated_public_demo() -> DemoPack {
             "browser-runtime",
         ),
     ];
-    let contacts = contact_rows
-        .into_iter()
-        .enumerate()
-        .map(
-            |(index, (from, to, from_project, to_project))| ContactSummary {
+    let contacts = (0..STARTUP_CONTACT_ROWS)
+        .map(|index| {
+            let (from, to, from_project, to_project) =
+                contact_templates[index % contact_templates.len()];
+            ContactSummary {
                 from_agent: from.to_string(),
                 to_agent: to.to_string(),
                 from_project_slug: from_project.to_string(),
@@ -672,8 +698,8 @@ pub fn curated_public_demo() -> DemoPack {
                 reason: "synthetic public demo coordination".to_string(),
                 updated_ts: BASE_TS - i64::try_from(index).unwrap_or_default() * 4_000_000,
                 expires_ts: None,
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
 
     let base_stats = DbStatSnapshot {
@@ -835,13 +861,42 @@ pub fn curated_public_demo() -> DemoPack {
 
 #[cfg(test)]
 mod tests {
-    use super::{DemoPack, DemoPackError, curated_public_demo};
+    use super::{
+        DemoPack, DemoPackError, STARTUP_AGENT_ROWS, STARTUP_CONTACT_ROWS, STARTUP_HISTORY_EVENTS,
+        STARTUP_PROJECT_ROWS, curated_public_demo,
+    };
 
     #[test]
     fn curated_pack_round_trips_and_digest_verifies() {
         let pack = curated_public_demo();
         let json = pack.to_pretty_json().unwrap();
         assert_eq!(DemoPack::from_json(&json).unwrap(), pack);
+    }
+
+    #[test]
+    fn curated_pack_opens_at_terminal_reference_density() {
+        let pack = curated_public_demo();
+        let startup_events = pack
+            .actions
+            .iter()
+            .take_while(|action| action.at_ms == 0)
+            .count();
+        assert_eq!(
+            startup_events,
+            usize::try_from(STARTUP_HISTORY_EVENTS).unwrap()
+        );
+        assert_eq!(
+            pack.bootstrap.db_stats.agents_list.len(),
+            STARTUP_AGENT_ROWS
+        );
+        assert_eq!(
+            pack.bootstrap.db_stats.projects_list.len(),
+            STARTUP_PROJECT_ROWS
+        );
+        assert_eq!(
+            pack.bootstrap.db_stats.contacts_list.len(),
+            STARTUP_CONTACT_ROWS
+        );
     }
 
     #[test]
