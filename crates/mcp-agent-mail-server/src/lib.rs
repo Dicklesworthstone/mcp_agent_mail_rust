@@ -2729,29 +2729,36 @@ pub(crate) struct ObservabilitySyncDb {
     _snapshot_dir: Option<SnapshotDirGuard>,
 }
 
-/// Minimum spacing between archive-backed observability snapshot rebuilds
-/// per storage root (mcp_agent_mail_rust#219). Every rebuild replays the
-/// whole archive; the operator dashboard refresh worker re-enters on any
-/// connection failure every ~1.2 s, and under a permanently slightly-ahead
-/// archive that amounted to a full reconstruction per tick. Observability
-/// reads tolerate this much staleness by definition.
-const OBSERVABILITY_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// Suppression window after a *failed* archive-backed observability snapshot
+/// build (mcp_agent_mail_rust#219). Every build replays the whole archive,
+/// and failure-retry loops (the operator dashboard refresh worker re-enters
+/// on any connection failure every ~1.2 s) amounted to a full reconstruction
+/// attempt per tick. Successful builds are never suppressed — surfaces that
+/// need snapshot-fresh reads keep getting them.
+const OBSERVABILITY_SNAPSHOT_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 
-static LAST_OBSERVABILITY_SNAPSHOT_ATTEMPTS: OnceLock<Mutex<HashMap<PathBuf, Instant>>> =
+static LAST_OBSERVABILITY_SNAPSHOT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, Instant>>> =
     OnceLock::new();
 
-fn observability_snapshot_attempted_recently(storage_root: &Path) -> bool {
-    let map = LAST_OBSERVABILITY_SNAPSHOT_ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()));
+fn observability_snapshot_failed_recently(storage_root: &Path) -> bool {
+    let map = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     let guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .get(storage_root)
-        .is_some_and(|at| at.elapsed() < OBSERVABILITY_SNAPSHOT_MIN_INTERVAL)
+        .is_some_and(|at| at.elapsed() < OBSERVABILITY_SNAPSHOT_FAILURE_BACKOFF)
 }
 
-fn note_observability_snapshot_attempt(storage_root: &Path) {
-    let map = LAST_OBSERVABILITY_SNAPSHOT_ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()));
+fn note_observability_snapshot_failure(storage_root: &Path) {
+    let map = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.insert(storage_root.to_path_buf(), Instant::now());
+}
+
+fn clear_observability_snapshot_failure(storage_root: &Path) {
+    if let Some(map) = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get() {
+        let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(storage_root);
+    }
 }
 
 impl ObservabilitySyncDb {
@@ -2770,7 +2777,6 @@ impl ObservabilitySyncDb {
         salvage_db_path: Option<&Path>,
         context: &str,
     ) -> Result<Self, String> {
-        note_observability_snapshot_attempt(storage_root);
         let snapshot_dir = SnapshotDirGuard::new("server-observability-mailbox-")
             .map_err(|error| format!("failed to allocate observability snapshot dir: {error}"))?;
         let sqlite_path = snapshot_dir.path().join("mailbox.sqlite3");
@@ -2785,6 +2791,7 @@ impl ObservabilitySyncDb {
             },
         );
         if let Err(error) = reconstruct {
+            note_observability_snapshot_failure(storage_root);
             tracing::warn!(
                 operation = context,
                 storage_root = %storage_root.display(),
@@ -2796,6 +2803,7 @@ impl ObservabilitySyncDb {
                 "failed to build archive-backed observability snapshot: {error}"
             ));
         }
+        clear_observability_snapshot_failure(storage_root);
         let sqlite_path_str = sqlite_path.to_string_lossy().into_owned();
         let conn = open_best_effort_sync_db_connection(&sqlite_path_str).map_err(|error| {
             format!(
@@ -2904,16 +2912,16 @@ pub(crate) fn open_observability_sync_db_connection(
     match open_best_effort_sync_db_connection(&sqlite_path) {
         Ok(conn) => match inspect_archive_db_drift(storage_root, &resolved_path, &conn) {
             Ok(Some(drift)) => {
-                // #219: drift against a *healthy* live file only means the
-                // dashboard would read slightly stale rows. Rebuilding an
-                // O(archive) snapshot more often than the coalesce window is
-                // never worth it — serve the live connection instead.
-                if observability_snapshot_attempted_recently(storage_root) {
+                // #219: if a snapshot build just failed, another O(archive)
+                // attempt within the backoff window will fail the same way —
+                // serve the healthy-but-stale live connection instead of
+                // burning a full reconstruction per retry tick.
+                if observability_snapshot_failed_recently(storage_root) {
                     tracing::debug!(
                         operation = context,
                         source = %resolved_path.display(),
                         drift = drift.readiness_error(),
-                        "serving live sqlite for observability despite archive drift; a snapshot rebuild ran within the coalesce window"
+                        "serving live sqlite for observability despite archive drift; a snapshot build failed within the backoff window"
                     );
                     return Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path)));
                 }

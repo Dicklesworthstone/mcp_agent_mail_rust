@@ -5729,6 +5729,8 @@ mod tests {
             salvaged_recipients: 0,
             salvaged_reservations: 0,
             salvaged_reservation_releases: 0,
+            salvaged_rows_skipped_unmapped: 0,
+            salvaged_placeholder_senders: 0,
             parse_errors: 3,
             warnings: vec![],
             suppressed_warnings: 0,
@@ -6485,6 +6487,143 @@ body
             1_i64,
             "salvage database should promote project created_at"
         );
+    }
+
+    /// Regression for mcp_agent_mail_rust#219: writes racing a recovery
+    /// promotion left `agent_links` / `messages` / `message_recipients` rows
+    /// referencing agent ids that never existed in the salvage source. The
+    /// strict merge refused the entire recovery ("unmapped origin agent
+    /// 925") forever, wedging the mailbox until manual DB surgery. Dangling
+    /// coordination rows must degrade to itemized skips, and unmapped
+    /// senders must degrade to placeholder agents so message content
+    /// survives.
+    #[test]
+    fn salvage_merge_survives_dangling_cross_generation_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed.db");
+        let salvage_db_path = tmp.path().join("salvage.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT, created_at INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT, model TEXT, task_description TEXT, inception_ts INTEGER, last_active_ts INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT, body_md TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER, recipients_json TEXT, attachments TEXT)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, ack_ts INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, status TEXT, reason TEXT, created_ts INTEGER, updated_ts INTEGER, expires_ts INTEGER)",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (20, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        // Two live identities. Ids 925, 1240, and 464 are deliberately
+        // absent from `agents` — exactly the incident shape.
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+                 VALUES (5, 20, 'RealAgent', 'codex', 'gpt', '', 10, 10), (6, 20, 'PeerAgent', 'codex', 'gpt', '', 10, 10)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES \
+                 (42, 20, 1240, NULL, 'orphan sender', 'body from the racing write', 'normal', 0, 100, '{}', '[]'), \
+                 (43, 20, 5, NULL, 'healthy', 'body', 'normal', 0, 101, '{}', '[]')",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (43, 464, 'to', NULL, NULL), (43, 6, 'to', 5, NULL)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agent_links (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) VALUES \
+                 (507, 20, 925, 20, 6, 'approved', 'auto-handshake by send_message', 100, 101, NULL), \
+                 (508, 20, 5, 20, 6, 'approved', 'auto-handshake by send_message', 100, 101, NULL)",
+                &[],
+            )
+            .unwrap();
+        drop(salvage_conn);
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("merge must survive dangling cross-generation rows");
+
+        assert_eq!(
+            stats.salvaged_placeholder_senders, 1,
+            "sender 1240 must degrade to a placeholder agent"
+        );
+        assert!(
+            stats.salvaged_rows_skipped_unmapped >= 2,
+            "dangling link (agent 925) and recipient (agent 464) must be skipped, got {}",
+            stats.salvaged_rows_skipped_unmapped
+        );
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("agent_link") && w.contains("dangling")),
+            "the skipped link must be itemized: {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        // The racing write's message content survived, re-homed under the
+        // placeholder sender.
+        let rows = conn
+            .query_sync(
+                "SELECT a.name AS name, a.program AS program FROM messages m JOIN agents a ON a.id = m.sender_id WHERE m.id = 42",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "message 42 must be carried into the candidate");
+        assert_eq!(
+            rows[0].get_named::<String>("name").unwrap(),
+            "unknown-agent-1240"
+        );
+        assert_eq!(rows[0].get_named::<String>("program").unwrap(), "unknown");
+        // The healthy link survived; the dangling one did not.
+        let link_rows = conn
+            .query_sync("SELECT COUNT(*) AS n FROM agent_links", &[])
+            .unwrap();
+        assert_eq!(link_rows[0].get_named::<i64>("n").unwrap(), 1);
+        // Healthy recipient state survived; the dangling recipient did not.
+        let recip = conn
+            .query_sync(
+                "SELECT agent_id FROM message_recipients WHERE message_id = 43",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recip.len(), 1, "only the mappable recipient row survives");
     }
 
     #[cfg(unix)]

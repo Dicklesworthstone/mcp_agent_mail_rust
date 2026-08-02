@@ -4538,26 +4538,34 @@ fn reconcile_archive_state_before_init(
     //    writers parked the archive cannot advance mid-build, so the
     //    promoted database is exactly current and the drift predicate is
     //    false by construction afterwards.
-    let cooldown = crate::write_barrier::archive_reconcile_min_interval();
-    if let Some(age) = crate::write_barrier::time_since_last_promotion(primary_path)
-        && age < cooldown
-    {
-        tracing::info!(
-            path = %primary_path.display(),
-            promotion_age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
-            cooldown_secs = cooldown.as_secs(),
-            "deferred archive-ahead reconcile; a durable promotion completed moments ago"
-        );
-        return Ok(false);
-    }
-    let Some(_promotion_barrier) = crate::write_barrier::try_acquire_promotion_barrier_if_idle()
-    else {
-        tracing::info!(
-            path = %primary_path.display(),
-            foreign_writers = crate::write_barrier::foreign_writer_count(),
-            "deferred archive-ahead reconcile; in-process write activity or another promotion is in flight"
-        );
-        return Ok(false);
+    let _promotion_barrier = if crate::write_barrier::current_thread_holds_promotion_barrier() {
+        // Nested inside an ongoing recovery operation (e.g. a just-restored
+        // backup catching up to the archive). The pacing gates below apply
+        // only to standalone drift reconciles; a recovery that already owns
+        // the barrier must complete its catch-up as one operation.
+        None
+    } else {
+        let cooldown = crate::write_barrier::archive_reconcile_min_interval();
+        if let Some(age) = crate::write_barrier::time_since_last_promotion(primary_path)
+            && age < cooldown
+        {
+            tracing::info!(
+                path = %primary_path.display(),
+                promotion_age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                cooldown_secs = cooldown.as_secs(),
+                "deferred archive-ahead reconcile; a durable promotion completed moments ago"
+            );
+            return Ok(false);
+        }
+        let Some(barrier) = crate::write_barrier::try_acquire_promotion_barrier_if_idle() else {
+            tracing::info!(
+                path = %primary_path.display(),
+                foreign_writers = crate::write_barrier::foreign_writer_count(),
+                "deferred archive-ahead reconcile; in-process write activity or another promotion is in flight"
+            );
+            return Ok(false);
+        };
+        Some(barrier)
     };
 
     // Preserve DB-only coordination state (contacts, acknowledgements,
@@ -9081,6 +9089,21 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<(), SqlError> {
+    // #219: the entire corruption-recovery operation (backup restore,
+    // archive reconstruction, post-restore catch-up reconcile) runs as one
+    // unit under the promotion barrier so no in-process write can straddle
+    // any of its file swaps. Nested acquisitions inside promote/reconstruct
+    // helpers pass through.
+    let (_promotion_barrier, drain_outcome) = crate::write_barrier::acquire_promotion_barrier_draining(
+        crate::write_barrier::writer_drain_timeout(),
+    );
+    if let crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain_outcome {
+        tracing::warn!(
+            path = %primary_path.display(),
+            remaining_writers,
+            "proceeding with sqlite archive recovery despite undrained in-process writers"
+        );
+    }
     validate_sqlite_target_path(primary_path, "sqlite archive recovery target")?;
     if !path_is_occupied(primary_path) && has_quarantined_primary_artifact(primary_path) {
         return Err(SqlError::Custom(format!(
@@ -14754,6 +14777,12 @@ mod tests {
             "---json\n{\"id\":3,\"from\":\"Alice\",\"to\":[\"Dana\"],\"subject\":\"Third\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:10:00Z\",\"attachments\":[]}\n---\n\nthird body\n",
         )
         .unwrap();
+        // #219: back-to-back standalone drift reconciles are now paced by the
+        // post-promotion cooldown (the exact pattern behind the production
+        // reconstruct loop). This test verifies the *coalesce cache* alone
+        // does not swallow a fresh archive change, so clear the promotion
+        // recency record the cooldown keys on.
+        crate::write_barrier::reset_for_test();
         assert!(
             reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
             "a fresh archive change inside the coalesce window must force a second rebuild"

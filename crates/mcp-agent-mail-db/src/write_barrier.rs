@@ -76,13 +76,18 @@ pub fn writer_drain_timeout() -> Duration {
 }
 
 /// Minimum spacing between archive-drift reconciles per path
-/// (`AM_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS`, default 60).
+/// (`AM_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS`, default 60). Unlike the
+/// recovery breaker's thresholds, an explicit `0` here is honored and
+/// disables the cooldown — it is a pacing knob, not a safety floor.
 #[must_use]
 pub fn archive_reconcile_min_interval() -> Duration {
-    Duration::from_secs(parse_positive_u64(
-        std::env::var("AM_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS").ok(),
-        DEFAULT_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS,
-    ))
+    std::env::var("AM_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(
+            Duration::from_secs(DEFAULT_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS),
+            Duration::from_secs,
+        )
 }
 
 struct BarrierState {
@@ -126,6 +131,15 @@ fn current_thread_write_depth() -> usize {
 
 fn current_thread_holds_barrier() -> bool {
     THREAD_BARRIER_DEPTH.with(Cell::get) > 0
+}
+
+/// Whether the calling thread is already inside a promotion barrier — i.e.
+/// executing as part of an ongoing recovery operation. Pacing gates
+/// (cooldowns, idle checks) apply only to standalone drift reconciles, never
+/// to steps nested inside a recovery that already owns the barrier.
+#[must_use]
+pub fn current_thread_holds_promotion_barrier() -> bool {
+    current_thread_holds_barrier()
 }
 
 /// RAII lease marking one in-flight write-path operation.
