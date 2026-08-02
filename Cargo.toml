@@ -33,16 +33,30 @@ fastmcp-server = "0.3.1"
 fastmcp-transport = "0.3.1"
 fastmcp-protocol = "0.3.1"
 
-asupersync = { version = "0.3.9", features = ["tls-webpki-roots"] }
+# br-ba1ui: exact pins keep resolution coherent while the ecosystem is
+# mid-shear. The sibling frankensearch checkout requires asupersync
+# >=0.3.10, but every sqlmodel-* crate published to crates.io (0.3.0 and
+# 0.3.1 alike) exact-pins asupersync =0.3.9 — an unpinned resolve can
+# satisfy neither side and fails with "all possible versions conflict".
+# Resolution: asupersync is pinned =0.3.10 (until the /dp/asupersync
+# checkout is pulled past 0.3.9 the [patch] below is inert — harmless
+# "unused patch" warning — and 0.3.10 comes from the registry; the patch
+# reactivates automatically once the checkout catches up), and sqlmodel-*
+# is pinned =0.3.2, served by the [patch.crates-io] entries pointing at
+# the ../sqlmodel_rust checkout on its v0.3.2 tag ("align SQLModel 0.3.2
+# with Asupersync 0.3.10"), which is tagged upstream but not yet on
+# crates.io. Cleanup once sqlmodel 0.3.2 publishes: delete the sqlmodel
+# patch block below; these version pins then resolve from the registry.
+asupersync = { version = "=0.3.10", features = ["tls-webpki-roots"] }
 
-sqlmodel = "0.3.0"
-sqlmodel-core = "0.3.0"
-sqlmodel-query = "0.3.0"
-sqlmodel-schema = "0.3.0"
-sqlmodel-session = "0.3.0"
-sqlmodel-pool = "0.3.0"
-sqlmodel-frankensqlite = "0.3.0"
-sqlmodel-sqlite = "0.3.0"
+sqlmodel = "=0.3.2"
+sqlmodel-core = "=0.3.2"
+sqlmodel-query = "=0.3.2"
+sqlmodel-schema = "=0.3.2"
+sqlmodel-session = "=0.3.2"
+sqlmodel-pool = "=0.3.2"
+sqlmodel-frankensqlite = "=0.3.2"
+sqlmodel-sqlite = "=0.3.2"
 
 ftui = "0.5.0"
 ftui-runtime = { version = "0.5.0" }
@@ -188,6 +202,24 @@ fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
 fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
 fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
 fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+#
+# sqlmodel is temporarily force-patched to the sibling checkout's v0.3.2
+# tag (branch asupersync-0310-bridge) because every published sqlmodel-*
+# exact-pins asupersync =0.3.9, which is unsatisfiable alongside
+# frankensearch's >=0.3.10 requirement (br-ba1ui). Upstream already fixed
+# this — the v0.3.2 tag is "align SQLModel 0.3.2 with Asupersync 0.3.10"
+# — it just has not been published to crates.io yet. Delete this block
+# (plus nothing else) once sqlmodel 0.3.2 lands on crates.io; the
+# [workspace.dependencies] =0.3.2 pins above then resolve from the
+# registry.
+sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-query = { path = "../sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "../sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-frankensqlite = { path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
 
 beads_rust = { path = "../beads_rust" }
 franken-agent-detection = { path = "../franken_agent_detection" }
