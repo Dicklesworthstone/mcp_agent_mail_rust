@@ -265,6 +265,26 @@ fn run_quick_cycle(
             {
                 tracing::warn!(error = %err, "integrity guard: proactive backup refresh failed");
             }
+            // #219: a drift reconcile deferred at pool-bootstrap time
+            // (cooldown or write activity) is otherwise lost until the next
+            // promotion or restart — the per-path init gate latches. Retry
+            // here on the quick cadence; every standalone pacing gate
+            // (ownership, cooldown, write idleness) still applies inside,
+            // so under sustained write load this stays a cheap no-op and
+            // converges the first time the process goes write-quiet.
+            match mcp_agent_mail_db::pool::retry_archive_drift_reconcile(
+                sqlite_path,
+                storage_root,
+            ) {
+                Ok(true) => tracing::info!(
+                    "integrity guard: reconciled archive-ahead drift during quick cycle"
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::debug!(
+                    error = %err,
+                    "integrity guard: archive drift reconcile attempt failed; will retry next cycle"
+                ),
+            }
         }
         Err(err) => handle_integrity_error(
             "quick_check",
@@ -386,6 +406,11 @@ fn run_db_maintenance_cycle(
     if !config.db_maintenance_enabled {
         return;
     }
+    // #219: checkpoint/ANALYZE/VACUUM rewrite live-file state; hold the
+    // in-process write lease so a recovery promotion cannot rename the file
+    // out from under them (a VACUUM racing a promotion would rebuild the
+    // quarantined generation and recreate sidecars at the live paths).
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     let db = &mcp_agent_mail_core::global_metrics().db;
 
     // Bound WAL growth (cheap, idempotent) so a checkpoint truncates back to the

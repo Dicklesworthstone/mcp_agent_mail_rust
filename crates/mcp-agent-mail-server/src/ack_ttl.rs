@@ -189,6 +189,10 @@ fn run_ack_ttl_cycle_with_state(
     pool: &DbPool,
     previously_overdue: &mut HashSet<OverdueAckKey>,
 ) -> Result<(usize, usize), String> {
+    // #219: escalations insert system agents and file reservations into the
+    // live mailbox; hold the in-process write lease for the whole cycle so a
+    // recovery promotion cannot swap the database mid-escalation.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     // This worker runs on a dedicated OS thread outside the async runtime, so
     // there is no parent Cx to derive from. Rather than forge a full-capability
     // Cx with the test-only `Cx::for_testing()` (gated behind `test-internals`),

@@ -112,6 +112,11 @@ fn metrics_loop(config: &Config) {
     if let Some(db) = conn.as_ref() {
         ensure_metrics_schema(db);
     }
+    // #219: a recovery promotion replaces the live file by rename; a raw
+    // long-lived fd silently follows the old inode into quarantine and every
+    // subsequent write lands in the forensic artifact. Track the promotion
+    // epoch and reopen when it moves.
+    let mut conn_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
     let mut tick_index: u64 = 0;
 
     info!(
@@ -166,13 +171,25 @@ fn metrics_loop(config: &Config) {
                 }
             }
 
-            if conn.is_none() && tick_index.is_multiple_of(12) {
+            let current_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
+            if conn.is_some() && current_epoch != conn_epoch {
+                info!(
+                    target: "tool.metrics",
+                    "reopening metrics connection after a database recovery promotion"
+                );
+                conn = None;
+            }
+            if conn.is_none() && (current_epoch != conn_epoch || tick_index.is_multiple_of(12)) {
                 conn = open_metrics_connection(&config.database_url);
                 if let Some(db) = conn.as_ref() {
                     ensure_metrics_schema(db);
                 }
+                conn_epoch = current_epoch;
             }
             if let Some(db) = conn.as_ref() {
+                // #219: hold the write lease so a promotion cannot rename the
+                // live file out from under this INSERT/DELETE batch.
+                let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
                 if let Err(err) = persist_snapshot_rows(db, collected_ts, &snapshot) {
                     warn!(
                         target: "tool.metrics",

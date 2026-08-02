@@ -219,6 +219,10 @@ fn run_cleanup_cycle_with_cache(
     pool: &DbPool,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<(usize, usize), String> {
+    // #219: reservation release/prune UPDATEs and DELETEs hit the live
+    // mailbox; hold the in-process write lease for the whole cycle so a
+    // recovery promotion cannot swap the database mid-write.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     // This worker runs on a dedicated OS thread outside the async runtime, so
     // there is no parent Cx to derive from. Borrow the runtime-backed ambient
     // Cx<cap::All> that `Runtime::block_on` installs (INFINITE budget, correct

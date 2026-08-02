@@ -5108,6 +5108,9 @@ fn handle_mark_read(
     agent_name: &str,
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
+    // #219: web-UI mutations must hold the in-process write lease so a
+    // recovery promotion can never swap the database mid-write.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     let payload: serde_json::Value =
         serde_json::from_str(body).map_err(|e| (400, format!("Invalid JSON: {e}")))?;
 
@@ -5188,6 +5191,8 @@ fn handle_mark_all_read(
     project_slug: &str,
     agent_name: &str,
 ) -> Result<Option<String>, (u16, String)> {
+    // #219: see handle_mark_read.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
     let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
@@ -5351,6 +5356,10 @@ fn handle_overseer_send(
     project_slug: &str,
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
+    // #219: this handler resolves project/agent ids and inserts afterwards —
+    // exactly the resolve-on-one-generation / land-in-another shape that
+    // minted cross-generation orphans. Hold the write lease throughout.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     let parsed = parse_overseer_body(body)?;
     let full_body = format!(
         "{OVERSEER_PREAMBLE}Human intervention reason: {}\n\n{}",

@@ -2434,11 +2434,25 @@ fn ensure_base_schema_on_sync_connection(conn: &DbConn) -> std::io::Result<()> {
     {
         return Ok(());
     }
+    // #219: only bootstrap schema into a genuinely fresh (zero-object)
+    // database. A non-empty file that lacks the core `messages` table is a
+    // foreign or mid-promotion generation this observability reader does not
+    // own; issuing DDL into it would mutate a half-swapped primary. Leave
+    // the connection usable — read surfaces degrade gracefully when core
+    // tables are absent.
+    let master_objects = conn
+        .query_sync("SELECT COUNT(*) AS n FROM sqlite_master", &[])
+        .ok()
+        .and_then(|rows| rows.first().and_then(|row| row.get_named::<i64>("n").ok()))
+        .unwrap_or(0);
+    if master_objects > 0 {
+        return Ok(());
+    }
     // Execute the base DDL as one multi-statement script, exactly like every
     // other caller of `init_schema_sql_base`. The previous `split(';')` loop
-    // broke as soon as the DDL grew SQL comments and trigger bodies (which
-    // contain interior semicolons), failing every fresh sync connection with
-    // "no SQL statement provided".
+    // broke as soon as the DDL grew SQL comments (which can contain interior
+    // semicolons), failing every fresh sync connection with "no SQL
+    // statement provided".
     let base_ddl = mcp_agent_mail_db::schema::init_schema_sql_base();
     if let Err(e) = conn.execute_raw(&base_ddl) {
         return Err(std::io::Error::other(format!(
@@ -2798,14 +2812,21 @@ impl ObservabilitySyncDb {
                 "failed to build archive-backed observability snapshot: {error}"
             ));
         }
-        clear_observability_snapshot_failure(storage_root);
         let sqlite_path_str = sqlite_path.to_string_lossy().into_owned();
-        let conn = open_best_effort_sync_db_connection(&sqlite_path_str).map_err(|error| {
-            format!(
-                "failed to open archive-backed observability snapshot {}: {error}",
-                sqlite_path.display()
-            )
-        })?;
+        let conn = match open_best_effort_sync_db_connection(&sqlite_path_str) {
+            Ok(conn) => conn,
+            Err(error) => {
+                // A successful build whose open fails must still arm the
+                // backoff — otherwise this class retries the full O(archive)
+                // rebuild at every dashboard tick.
+                note_observability_snapshot_failure(storage_root);
+                return Err(format!(
+                    "failed to open archive-backed observability snapshot {}: {error}",
+                    sqlite_path.display()
+                ));
+            }
+        };
+        clear_observability_snapshot_failure(storage_root);
         Ok(Self {
             conn: Some(conn),
             sqlite_path: sqlite_path_str,
@@ -2940,6 +2961,20 @@ pub(crate) fn open_observability_sync_db_connection(
             }
             Ok(None) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
             Err(error) if archive_has_state => {
+                // #219: same failure backoff as the drift arm — the probe
+                // failing does not make an O(archive) rebuild per dashboard
+                // tick any cheaper. Serving the (openable) live connection
+                // degraded matches the pre-existing !archive_has_state
+                // fallthrough below.
+                if observability_snapshot_failed_recently(storage_root) {
+                    tracing::debug!(
+                        operation = context,
+                        source = %resolved_path.display(),
+                        error = %error,
+                        "serving live sqlite for observability despite a failed inventory probe; a snapshot build failed within the backoff window"
+                    );
+                    return Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path)));
+                }
                 tracing::warn!(
                     operation = context,
                     source = %resolved_path.display(),
@@ -2961,6 +2996,15 @@ pub(crate) fn open_observability_sync_db_connection(
             Err(_) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
         },
         Err(error) if archive_has_state => {
+            // #219: no live connection exists to fall back on here, but a
+            // rebuild that just failed will fail again — surface a fast
+            // error instead of replaying the archive every ~1.2 s tick.
+            if observability_snapshot_failed_recently(storage_root) {
+                return Err(format!(
+                    "live sqlite source could not be opened and an archive snapshot build failed moments ago; suppressed rebuild for up to {}s: {error}",
+                    OBSERVABILITY_SNAPSHOT_FAILURE_BACKOFF.as_secs()
+                ));
+            }
             tracing::warn!(
                 operation = context,
                 source = %resolved_path.display(),
