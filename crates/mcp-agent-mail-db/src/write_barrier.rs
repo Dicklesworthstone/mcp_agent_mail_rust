@@ -147,8 +147,8 @@ pub fn current_thread_holds_promotion_barrier() -> bool {
 
 /// RAII lease marking one in-flight write-path operation.
 ///
-/// Acquisition blocks while a promotion holds the barrier (warning
-/// periodically). The stall is bounded by the promotion itself, and a
+/// Acquisition blocks while a promotion holds the barrier (warning once
+/// after five seconds). The stall is bounded by the promotion itself, and a
 /// stalled tool call is strictly better than a write landing across a file
 /// swap.
 ///
@@ -367,6 +367,16 @@ pub fn time_since_last_promotion(primary_path: &Path) -> Option<Duration> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     guard.get(primary_path).map(Instant::elapsed)
+}
+
+/// Test-only: clear the promotion-recency map WITHOUT touching live barrier
+/// state. Safe to call from tests that run in parallel with other tests
+/// holding write-activity or promotion guards.
+#[cfg(test)]
+pub(crate) fn clear_promotion_recency_for_test() {
+    if let Some(map) = LAST_PROMOTIONS.get() {
+        map.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
 }
 
 #[cfg(test)]

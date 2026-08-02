@@ -14780,9 +14780,10 @@ mod tests {
         // #219: back-to-back standalone drift reconciles are now paced by the
         // post-promotion cooldown (the exact pattern behind the production
         // reconstruct loop). This test verifies the *coalesce cache* alone
-        // does not swallow a fresh archive change, so clear the promotion
-        // recency record the cooldown keys on.
-        crate::write_barrier::reset_for_test();
+        // does not swallow a fresh archive change, so clear only the
+        // promotion-recency record the cooldown keys on — a full barrier
+        // reset would clobber guards held by concurrently running tests.
+        crate::write_barrier::clear_promotion_recency_for_test();
         assert!(
             reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
             "a fresh archive change inside the coalesce window must force a second rebuild"
