@@ -3723,7 +3723,8 @@ mod tests {
         conn.execute_sync(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
-                project_id INTEGER
+                project_id INTEGER,
+                sender_id INTEGER
             )",
             &[],
         )
@@ -3735,6 +3736,7 @@ mod tests {
                 agent_id INTEGER,
                 path_pattern TEXT,
                 \"exclusive\" INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
                 created_ts INTEGER,
                 expires_ts INTEGER,
                 released_ts INTEGER
@@ -3761,6 +3763,9 @@ mod tests {
             "CREATE TABLE message_recipients (
                 id INTEGER PRIMARY KEY,
                 message_id INTEGER,
+                agent_id INTEGER,
+                kind TEXT,
+                read_ts INTEGER,
                 ack_ts INTEGER
             )",
             &[],
@@ -3997,7 +4002,8 @@ first body
         conn.execute_sync(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
-                project_id INTEGER
+                project_id INTEGER,
+                sender_id INTEGER
             )",
             &[],
         )
@@ -5718,6 +5724,7 @@ first body
                 agent_id INTEGER,
                 path_pattern TEXT,
                 \"exclusive\" INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
                 created_ts INTEGER,
                 expires_ts INTEGER,
                 released_ts INTEGER
@@ -5752,6 +5759,7 @@ first body
                 agent_id INTEGER,
                 path_pattern TEXT,
                 \"exclusive\" INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
                 created_ts INTEGER,
                 expires_ts INTEGER,
                 released_ts INTEGER

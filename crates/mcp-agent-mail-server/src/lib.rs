@@ -2434,21 +2434,16 @@ fn ensure_base_schema_on_sync_connection(conn: &DbConn) -> std::io::Result<()> {
     {
         return Ok(());
     }
+    // Execute the base DDL as one multi-statement script, exactly like every
+    // other caller of `init_schema_sql_base`. The previous `split(';')` loop
+    // broke as soon as the DDL grew SQL comments and trigger bodies (which
+    // contain interior semicolons), failing every fresh sync connection with
+    // "no SQL statement provided".
     let base_ddl = mcp_agent_mail_db::schema::init_schema_sql_base();
-    let mut applied = 0usize;
-    for stmt in base_ddl.split(';') {
-        let stmt = stmt.trim();
-        if stmt.is_empty() {
-            continue;
-        }
-        if let Err(e) = conn.execute_raw(&format!("{stmt};")) {
-            // Stop on first failure to avoid a cascade of dependent errors
-            // (e.g. read-only filesystem or locked database).
-            return Err(std::io::Error::other(format!(
-                "failed to ensure base schema after {applied} statement(s): {e}"
-            )));
-        }
-        applied += 1;
+    if let Err(e) = conn.execute_raw(&base_ddl) {
+        return Err(std::io::Error::other(format!(
+            "failed to ensure base schema: {e}"
+        )));
     }
     conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
         .map(|_| ())
@@ -2661,27 +2656,17 @@ fn validate_snapshot_temp_dir(candidate: &Path, source: &str) -> std::io::Result
             ),
         )
     })?;
-    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "{source} resolved to unusable snapshot directory {}: {error}",
-                canonical.display()
-            ),
-        )
-    })?;
     if !metadata.file_type().is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "{source} points to {} which resolves to {} which is not a directory",
-                candidate.display(),
-                canonical.display()
+                "{source} points to {} which is not a directory",
+                candidate.display()
             ),
         ));
     }
 
-    Ok(canonical)
+    Ok(candidate.to_path_buf())
 }
 
 #[cfg(target_os = "macos")]
@@ -2739,6 +2724,38 @@ pub(crate) struct ObservabilitySyncDb {
     _snapshot_dir: Option<SnapshotDirGuard>,
 }
 
+/// Suppression window after a *failed* archive-backed observability snapshot
+/// build (mcp_agent_mail_rust#219). Every build replays the whole archive,
+/// and failure-retry loops (the operator dashboard refresh worker re-enters
+/// on any connection failure every ~1.2 s) amounted to a full reconstruction
+/// attempt per tick. Successful builds are never suppressed — surfaces that
+/// need snapshot-fresh reads keep getting them.
+const OBSERVABILITY_SNAPSHOT_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+static LAST_OBSERVABILITY_SNAPSHOT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, Instant>>> =
+    OnceLock::new();
+
+fn observability_snapshot_failed_recently(storage_root: &Path) -> bool {
+    let map = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .get(storage_root)
+        .is_some_and(|at| at.elapsed() < OBSERVABILITY_SNAPSHOT_FAILURE_BACKOFF)
+}
+
+fn note_observability_snapshot_failure(storage_root: &Path) {
+    let map = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.insert(storage_root.to_path_buf(), Instant::now());
+}
+
+fn clear_observability_snapshot_failure(storage_root: &Path) {
+    if let Some(map) = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get() {
+        let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(storage_root);
+    }
+}
+
 impl ObservabilitySyncDb {
     fn live(conn: DbConn, sqlite_path: String) -> Self {
         Self {
@@ -2769,6 +2786,7 @@ impl ObservabilitySyncDb {
             },
         );
         if let Err(error) = reconstruct {
+            note_observability_snapshot_failure(storage_root);
             tracing::warn!(
                 operation = context,
                 storage_root = %storage_root.display(),
@@ -2780,6 +2798,7 @@ impl ObservabilitySyncDb {
                 "failed to build archive-backed observability snapshot: {error}"
             ));
         }
+        clear_observability_snapshot_failure(storage_root);
         let sqlite_path_str = sqlite_path.to_string_lossy().into_owned();
         let conn = open_best_effort_sync_db_connection(&sqlite_path_str).map_err(|error| {
             format!(
@@ -2888,6 +2907,19 @@ pub(crate) fn open_observability_sync_db_connection(
     match open_best_effort_sync_db_connection(&sqlite_path) {
         Ok(conn) => match inspect_archive_db_drift(storage_root, &resolved_path, &conn) {
             Ok(Some(drift)) => {
+                // #219: if a snapshot build just failed, another O(archive)
+                // attempt within the backoff window will fail the same way —
+                // serve the healthy-but-stale live connection instead of
+                // burning a full reconstruction per retry tick.
+                if observability_snapshot_failed_recently(storage_root) {
+                    tracing::debug!(
+                        operation = context,
+                        source = %resolved_path.display(),
+                        drift = drift.readiness_error(),
+                        "serving live sqlite for observability despite archive drift; a snapshot build failed within the backoff window"
+                    );
+                    return Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path)));
+                }
                 tracing::warn!(
                     operation = context,
                     source = %resolved_path.display(),
@@ -27009,9 +27041,15 @@ first body
         );
     }
 
+    // The four tests below are cf201f67's authoritative set. A later merge
+    // (5efdb8b4) resurrected the stale May-era "canonicalizes symlinked"
+    // variants alongside a mangled function body; the July semantics —
+    // reject symlinked snapshot temp dirs except trusted macOS private/
+    // aliases — are the newer, deliberate design (mcp_agent_mail_rust#219
+    // cleanup).
     #[cfg(unix)]
     #[test]
-    fn validate_snapshot_temp_dir_canonicalizes_symlinked_directory() {
+    fn validate_snapshot_temp_dir_rejects_symlinked_directory() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27020,18 +27058,18 @@ first body
         std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
         symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
 
-        let selected = validate_snapshot_temp_dir(&linked_tmpdir, "system temp dir")
-            .expect("internal snapshot temp dirs should canonicalize symlinked tmpdir paths");
+        let err = validate_snapshot_temp_dir(&linked_tmpdir, "system temp dir")
+            .expect_err("symlinked temp dir should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn validate_snapshot_temp_dir_canonicalizes_symlinked_parent() {
+    fn validate_snapshot_temp_dir_rejects_symlinked_parent() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27041,18 +27079,18 @@ first body
         std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
         symlink(&real_parent, &linked_parent).expect("symlink tmpdir parent");
 
-        let selected = validate_snapshot_temp_dir(&linked_parent.join("child"), "system temp dir")
-            .expect("internal snapshot temp dirs should canonicalize symlinked parent paths");
+        let err = validate_snapshot_temp_dir(&linked_parent.join("child"), "system temp dir")
+            .expect_err("temp dir reached through symlinked parent should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn preferred_snapshot_temp_dir_canonicalizes_symlinked_tmpdir_override() {
+    fn preferred_snapshot_temp_dir_rejects_symlinked_tmpdir_override() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27065,21 +27103,21 @@ first body
             .expect("linked tmpdir utf-8")
             .to_string();
 
-        let selected = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("TMPDIR", linked_tmpdir.as_str())],
             preferred_snapshot_temp_dir,
         )
-        .expect("internal snapshot temp dirs should canonicalize symlinked TMPDIR");
+        .expect_err("symlinked TMPDIR should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn preferred_snapshot_temp_dir_canonicalizes_symlinked_parent_override() {
+    fn preferred_snapshot_temp_dir_rejects_symlinked_parent_override() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27094,15 +27132,15 @@ first body
             .expect("linked child utf-8")
             .to_string();
 
-        let selected = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("TMPDIR", linked_tmpdir.as_str())],
             preferred_snapshot_temp_dir,
         )
-        .expect("internal snapshot temp dirs should canonicalize symlinked TMPDIR parent");
+        .expect_err("TMPDIR reached through a symlinked parent should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 
