@@ -5191,6 +5191,7 @@ impl Model for MailAppModel {
         tui_chrome::render_status_line(
             &self.state,
             active_screen,
+            "LIVE",
             self.macro_engine.recorder_state().is_recording(),
             self.help_visible,
             &self.accessibility,

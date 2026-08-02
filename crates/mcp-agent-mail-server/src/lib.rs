@@ -113,6 +113,7 @@ pub mod tui_panel_helpers;
 pub mod tui_persist;
 pub mod tui_poller;
 pub mod tui_preset;
+pub mod tui_screen_registry;
 pub mod tui_screens;
 pub mod tui_theme;
 pub mod tui_web_dashboard;

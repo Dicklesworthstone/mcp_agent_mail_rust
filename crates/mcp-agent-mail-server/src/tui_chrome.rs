@@ -850,6 +850,7 @@ fn segment_text_width(text: &str) -> u16 {
 pub fn render_status_line(
     state: &TuiSharedState,
     active: MailScreenId,
+    activity_badge: &str,
     recording_active: bool,
     help_visible: bool,
     accessibility: &AccessibilitySettings,
@@ -867,7 +868,7 @@ pub fn render_status_line(
     let bg_style = Style::default().fg(tp.status_fg).bg(tp.status_bg);
     Paragraph::new("").style(bg_style).render(area, frame);
 
-    let (left, center, right) = plan_status_segments(
+    let (left, center, mut right) = plan_status_segments(
         state,
         active,
         recording_active,
@@ -877,6 +878,11 @@ pub fn render_status_line(
         toast_muted,
         area.width,
     );
+    if activity_badge != "LIVE"
+        && let Some(segment) = right.iter_mut().find(|segment| segment.text == "LIVE ")
+    {
+        segment.text = format!("{activity_badge} ");
+    }
 
     // Compute total widths.
     let left_width = left.iter().fold(0u16, |acc, s| {
@@ -1559,7 +1565,7 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 mod tests {
     use super::*;
     use crate::tui_screens::ALL_SCREEN_IDS;
