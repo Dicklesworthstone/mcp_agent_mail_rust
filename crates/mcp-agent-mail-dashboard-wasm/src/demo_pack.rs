@@ -164,6 +164,7 @@ impl DemoPack {
     /// external public pack. It avoids generating the full built-in demo in
     /// `DashboardRunnerCore::new()` and is replaced before initialization.
     #[must_use]
+    #[cfg(feature = "browser-dashboard")]
     pub(crate) fn unloaded_runner_placeholder() -> Self {
         Self {
             schema: DEMO_PACK_SCHEMA_V1.to_string(),

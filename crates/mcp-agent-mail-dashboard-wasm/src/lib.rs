@@ -17,7 +17,9 @@ pub mod console;
 pub mod demo_pack;
 #[cfg(feature = "exporter")]
 pub mod exporter;
+#[cfg(feature = "browser-dashboard")]
 pub mod model;
+#[cfg(feature = "browser-dashboard")]
 pub mod runner_core;
 pub mod state;
 pub mod tui_screens;
@@ -106,7 +108,8 @@ pub mod tui_bridge {
 }
 
 pub use demo_pack::{DemoPack, DemoPackError, curated_public_demo};
+#[cfg(feature = "browser-dashboard")]
 pub use runner_core::{DashboardRunnerCore, RunnerStatus};
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "browser-dashboard"))]
 mod wasm;
