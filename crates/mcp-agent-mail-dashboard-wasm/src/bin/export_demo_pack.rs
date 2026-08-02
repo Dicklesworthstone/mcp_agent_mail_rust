@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for action in &mut pack.actions {
         match &mut action.operation {
-            DemoOperation::SetDbStats { snapshot } => {
+            DemoOperation::SetDbStats { snapshot } | DemoOperation::MergeDbStats { snapshot } => {
                 let message_delta = u64::from(action.at_ms >= 2_000);
                 let ack_delta = if action.at_ms < 2_000 {
                     0

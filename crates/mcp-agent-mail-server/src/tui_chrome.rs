@@ -598,9 +598,10 @@ fn prune_status_segments_to_fit(
 /// (centered between left and right), and right (right-aligned).
 /// Lower-priority segments are dropped until everything fits.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn plan_status_segments(
+fn plan_status_segments_for_activity(
     state: &TuiSharedState,
     active: MailScreenId,
+    activity_badge: &str,
     recording_active: bool,
     help_visible: bool,
     accessibility: &AccessibilitySettings,
@@ -715,7 +716,7 @@ fn plan_status_segments(
     right.push(StatusSegment {
         priority: StatusPriority::Critical,
         role: StatusRole::Normal,
-        text: "LIVE ".to_string(),
+        text: format!("{activity_badge} "),
         fg: tp.status_good,
         bold: true,
         effect: StatusEffect::None,
@@ -840,6 +841,30 @@ fn plan_status_segments(
     (left, center, right)
 }
 
+#[cfg(all(test, not(feature = "browser-dashboard")))]
+fn plan_status_segments(
+    state: &TuiSharedState,
+    active: MailScreenId,
+    recording_active: bool,
+    help_visible: bool,
+    accessibility: &AccessibilitySettings,
+    screen_bindings: &[HelpEntry],
+    toast_muted: bool,
+    available: u16,
+) -> (Vec<StatusSegment>, Vec<StatusSegment>, Vec<StatusSegment>) {
+    plan_status_segments_for_activity(
+        state,
+        active,
+        "LIVE",
+        recording_active,
+        help_visible,
+        accessibility,
+        screen_bindings,
+        toast_muted,
+        available,
+    )
+}
+
 #[inline]
 fn segment_text_width(text: &str) -> u16 {
     u16::try_from(display_width(text)).unwrap_or(u16::MAX)
@@ -868,9 +893,10 @@ pub fn render_status_line(
     let bg_style = Style::default().fg(tp.status_fg).bg(tp.status_bg);
     Paragraph::new("").style(bg_style).render(area, frame);
 
-    let (left, center, mut right) = plan_status_segments(
+    let (left, center, right) = plan_status_segments_for_activity(
         state,
         active,
+        activity_badge,
         recording_active,
         help_visible,
         accessibility,
@@ -878,12 +904,6 @@ pub fn render_status_line(
         toast_muted,
         area.width,
     );
-    if activity_badge != "LIVE"
-        && let Some(segment) = right.iter_mut().find(|segment| segment.text == "LIVE ")
-    {
-        segment.text = format!("{activity_badge} ");
-    }
-
     // Compute total widths.
     let left_width = left.iter().fold(0u16, |acc, s| {
         acc.saturating_add(segment_text_width(&s.text))

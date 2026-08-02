@@ -3,6 +3,8 @@
 //! Displays real-time stats, a live event log, and health alarms in a
 //! responsive layout that adapts from 80×24 to 200×50+.
 
+#[cfg(feature = "browser-dashboard")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -139,6 +141,30 @@ enum DashboardQuickFilter {
     Messages,
     Tools,
     Reservations,
+}
+
+/// User-owned dashboard controls that must survive a browser replay reset.
+///
+/// Data-derived caches and snapshots are deliberately excluded: the replay
+/// rebuilds those from the verified pack, then re-applies only operator state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardInteractionSnapshot {
+    query: String,
+    query_active: bool,
+    quick_filter: DashboardQuickFilter,
+    type_filter: HashSet<MailEventKind>,
+    verbosity: VerbosityTier,
+    scroll_offset: usize,
+    auto_follow: bool,
+    show_trend_panel: bool,
+    show_log_panel: bool,
+}
+
+impl DashboardInteractionSnapshot {
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
 }
 
 impl DashboardQuickFilter {
@@ -565,25 +591,42 @@ impl DashboardScreen {
 
     /// Capture user-owned query/filter state independently of replay data.
     #[must_use]
-    pub fn interaction_snapshot(&self) -> (String, bool, &'static str) {
-        (
-            self.quick_query_input.value().to_string(),
-            self.quick_query_active,
-            self.active_filter_slug(),
-        )
+    pub fn interaction_snapshot(&self) -> DashboardInteractionSnapshot {
+        DashboardInteractionSnapshot {
+            query: self.quick_query_input.value().to_string(),
+            query_active: self.quick_query_active,
+            quick_filter: self.quick_filter,
+            type_filter: self.type_filter.clone(),
+            verbosity: self.verbosity,
+            scroll_offset: self.scroll_offset,
+            auto_follow: self.auto_follow,
+            show_trend_panel: self.show_trend_panel,
+            show_log_panel: self.show_log_panel,
+        }
     }
 
-    /// Restore query/filter state after the deterministic replay loops.
-    pub fn restore_interaction(&mut self, query: &str, query_active: bool, filter: &str) {
+    /// Restore operator state after the deterministic replay loops.
+    pub fn restore_interaction(&mut self, snapshot: &DashboardInteractionSnapshot) {
+        self.quick_query_input.set_value(&snapshot.query);
+        self.quick_query_input.set_focused(snapshot.query_active);
+        self.quick_query_active = snapshot.query_active;
+        self.quick_filter = snapshot.quick_filter;
+        self.type_filter.clone_from(&snapshot.type_filter);
+        self.verbosity = snapshot.verbosity;
+        self.scroll_offset = snapshot.scroll_offset;
+        self.auto_follow = snapshot.auto_follow;
+        self.show_trend_panel = snapshot.show_trend_panel;
+        self.show_log_panel = snapshot.show_log_panel;
+        self.invalidate_visible_cache();
+    }
+
+    /// Set the browser-visible live-query editor state without exposing the
+    /// underlying text widget implementation.
+    pub fn set_query_interaction(&mut self, query: &str, active: bool) {
         self.quick_query_input.set_value(query);
-        self.quick_query_active = query_active;
-        let quick_filter = match filter {
-            "messages" => DashboardQuickFilter::Messages,
-            "tools" => DashboardQuickFilter::Tools,
-            "reservations" => DashboardQuickFilter::Reservations,
-            _ => DashboardQuickFilter::All,
-        };
-        self.apply_quick_filter(quick_filter);
+        self.quick_query_input.set_focused(active);
+        self.quick_query_active = active;
+        self.invalidate_visible_cache();
     }
 
     /// Ingest new events from the ring buffer.
@@ -6245,8 +6288,12 @@ fn render_quick_filter_controls(
 
 /// Pre-computed total char width of quick-filter control labels (avoids 4× format!
 /// allocations per frame). Labels: " [1:All] ", " [2:Msg] ", " [3:Tools] ", " [4:Resv] ".
-const QUICK_FILTER_CONTROLS_TOTAL_CHARS: usize =
-    " [1:All] ".len() + " [2:Msg] ".len() + " [3:Tools] ".len() + " [4:Resv] ".len();
+const QUICK_FILTER_CONTROL_WIDTHS: [u16; 4] = [
+    " [1:All] ".len() as u16,
+    " [2:Msg] ".len() as u16,
+    " [3:Tools] ".len() as u16,
+    " [4:Resv] ".len() as u16,
+];
 
 fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
     if width == 0 || available_height == 0 {
@@ -6256,17 +6303,22 @@ fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
         // Preserve one line for the event viewer on cramped layouts.
         return 0;
     }
-    let total_chars = QUICK_FILTER_CONTROLS_TOTAL_CHARS;
-    let width_usize = usize::from(width.max(1));
-    let estimated_lines = total_chars.saturating_add(width_usize.saturating_sub(1)) / width_usize;
-    let estimated_lines = estimated_lines.max(1);
+    // Mirror `render_quick_filter_controls`: labels are atomic, so unused tail
+    // cells cannot be treated as available to the next label.
+    let mut estimated_lines = 1_u16;
+    let mut used = 0_u16;
+    for label_width in QUICK_FILTER_CONTROL_WIDTHS {
+        if used > 0 && used.saturating_add(label_width) > width {
+            estimated_lines = estimated_lines.saturating_add(1);
+            used = 0;
+        }
+        used = used.saturating_add(label_width);
+    }
     let max_controls = available_height.saturating_sub(1);
     if max_controls == 0 {
         return 0;
     }
-    u16::try_from(estimated_lines)
-        .unwrap_or(u16::MAX)
-        .min(max_controls)
+    estimated_lines.min(max_controls)
 }
 
 /// Returns `true` when `(x, y)` is inside the half-open rectangle.
@@ -6295,10 +6347,27 @@ fn event_log_window_bounds(
 }
 
 #[cfg(feature = "browser-dashboard")]
-const fn unix_epoch_micros_now() -> Option<i64> {
-    // Browser replay owns a deterministic pack clock. Returning `None`
-    // makes callers use the pack snapshot instead of the viewer's wall clock.
-    None
+thread_local! {
+    static BROWSER_REPLAY_NOW_MICROS: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Synchronize the shared production dashboard with the deterministic absolute
+/// clock owned by the browser replay model.
+#[cfg(feature = "browser-dashboard")]
+pub fn set_browser_replay_now_micros(now_micros: i64) {
+    BROWSER_REPLAY_NOW_MICROS.set(now_micros.max(0));
+}
+
+#[cfg(feature = "browser-dashboard")]
+#[must_use]
+pub fn browser_replay_now_micros() -> Option<i64> {
+    let now = BROWSER_REPLAY_NOW_MICROS.get();
+    (now > 0).then_some(now)
+}
+
+#[cfg(feature = "browser-dashboard")]
+fn unix_epoch_micros_now() -> Option<i64> {
+    browser_replay_now_micros()
 }
 
 #[cfg(not(feature = "browser-dashboard"))]
@@ -6313,7 +6382,7 @@ fn unix_epoch_micros_now() -> Option<i64> {
 fn dashboard_timestamp_micros() -> i64 {
     #[cfg(feature = "browser-dashboard")]
     {
-        0
+        unix_epoch_micros_now().unwrap_or_default()
     }
     #[cfg(not(feature = "browser-dashboard"))]
     {
@@ -7506,6 +7575,8 @@ mod tests {
     fn quick_filter_controls_height_scales_with_width() {
         assert_eq!(quick_filter_controls_height(120, 12), 1);
         assert_eq!(quick_filter_controls_height(28, 12), 2);
+        assert_eq!(quick_filter_controls_height(21, 12), 2);
+        assert_eq!(quick_filter_controls_height(20, 12), 3);
         assert_eq!(quick_filter_controls_height(18, 12), 3);
     }
 

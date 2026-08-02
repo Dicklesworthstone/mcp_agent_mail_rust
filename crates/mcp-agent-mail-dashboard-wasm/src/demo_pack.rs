@@ -54,10 +54,24 @@ pub struct DemoAction {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DemoOperation {
-    PublishEvent { event: MailEvent },
-    SetDbStats { snapshot: DbStatSnapshot },
-    RecordRequest { status: u16, duration_ms: u64 },
-    ConsoleLine { text: String },
+    PublishEvent {
+        event: MailEvent,
+    },
+    SetDbStats {
+        snapshot: DbStatSnapshot,
+    },
+    /// Replace scalar/reservation data while inheriting omitted heavyweight
+    /// roster, project, and contact detail vectors from the prior snapshot.
+    MergeDbStats {
+        snapshot: DbStatSnapshot,
+    },
+    RecordRequest {
+        status: u16,
+        duration_ms: u64,
+    },
+    ConsoleLine {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -256,7 +270,8 @@ impl DemoPack {
             }
             match &action.operation {
                 DemoOperation::PublishEvent { event } => validate_event(index, event)?,
-                DemoOperation::SetDbStats { snapshot } => validate_snapshot(snapshot)?,
+                DemoOperation::SetDbStats { snapshot }
+                | DemoOperation::MergeDbStats { snapshot } => validate_snapshot(snapshot)?,
                 DemoOperation::RecordRequest { status, .. } => {
                     if !(100..=599).contains(status) {
                         return Err(DemoPackError::InvalidHttpStatus {
@@ -313,7 +328,8 @@ impl DemoPack {
             DemoOperation::PublishEvent { event } => {
                 let _ = state.push_event(event.clone());
             }
-            DemoOperation::SetDbStats { snapshot } => {
+            DemoOperation::SetDbStats { snapshot } => state.update_db_stats(snapshot.clone()),
+            DemoOperation::MergeDbStats { snapshot } => {
                 let mut merged = snapshot.clone();
                 if let Some(current) = state.db_stats_snapshot() {
                     if merged.agents_list.is_empty() {
@@ -898,13 +914,13 @@ pub fn curated_public_demo() -> DemoPack {
         },
         DemoAction {
             at_ms: 2_000,
-            operation: DemoOperation::SetDbStats {
+            operation: DemoOperation::MergeDbStats {
                 snapshot: stats_after_message,
             },
         },
         DemoAction {
             at_ms: 6_000,
-            operation: DemoOperation::SetDbStats {
+            operation: DemoOperation::MergeDbStats {
                 snapshot: stats_after_ack,
             },
         },
@@ -923,7 +939,7 @@ pub fn curated_public_demo() -> DemoPack {
         },
         DemoAction {
             at_ms: 10_000,
-            operation: DemoOperation::SetDbStats {
+            operation: DemoOperation::MergeDbStats {
                 snapshot: stats_after_release.clone(),
             },
         },
@@ -981,9 +997,10 @@ pub fn curated_public_demo() -> DemoPack {
 #[cfg(test)]
 mod tests {
     use super::{
-        DemoPack, DemoPackError, STARTUP_AGENT_ROWS, STARTUP_CONTACT_ROWS, STARTUP_HISTORY_EVENTS,
-        STARTUP_PROJECT_ROWS, curated_public_demo,
+        DemoOperation, DemoPack, DemoPackError, STARTUP_AGENT_ROWS, STARTUP_CONTACT_ROWS,
+        STARTUP_HISTORY_EVENTS, STARTUP_PROJECT_ROWS, curated_public_demo,
     };
+    use crate::state::TuiSharedState;
 
     #[test]
     fn curated_pack_round_trips_and_digest_verifies() {
@@ -1021,6 +1038,35 @@ mod tests {
             pack.bootstrap.db_stats.contacts_list.len(),
             STARTUP_CONTACT_ROWS
         );
+    }
+
+    #[test]
+    fn compact_stats_merge_is_explicit_and_full_snapshots_can_clear_details() {
+        let mut pack = curated_public_demo();
+        let action_index = pack
+            .actions
+            .iter()
+            .position(|action| matches!(&action.operation, DemoOperation::MergeDbStats { .. }))
+            .expect("curated pack should contain a compact stats merge");
+        let state = TuiSharedState::new();
+        pack.apply_bootstrap(&state);
+        pack.apply_action(action_index, &state);
+        let merged = state.db_stats_snapshot().expect("merged stats snapshot");
+        assert_eq!(merged.agents_list.len(), STARTUP_AGENT_ROWS);
+        assert_eq!(merged.projects_list.len(), STARTUP_PROJECT_ROWS);
+        assert_eq!(merged.contacts_list.len(), STARTUP_CONTACT_ROWS);
+
+        let snapshot = match &pack.actions[action_index].operation {
+            DemoOperation::MergeDbStats { snapshot } => snapshot.clone(),
+            _ => unreachable!("selected operation changed"),
+        };
+        pack.actions[action_index].operation = DemoOperation::SetDbStats { snapshot };
+        pack.apply_bootstrap(&state);
+        pack.apply_action(action_index, &state);
+        let replaced = state.db_stats_snapshot().expect("full stats snapshot");
+        assert!(replaced.agents_list.is_empty());
+        assert!(replaced.projects_list.is_empty());
+        assert!(replaced.contacts_list.is_empty());
     }
 
     #[test]
