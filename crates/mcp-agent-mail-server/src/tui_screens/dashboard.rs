@@ -17,7 +17,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, MouseButton, MouseEventKind, PackedRgba};
 use ftui_extras::canvas::{Canvas, Mode, Painter};
 use ftui_extras::charts::{LineChart, Series};
 use ftui_extras::text_effects::{ColorGradient, StyledText, TextEffect};
@@ -178,8 +178,55 @@ impl DashboardQuickFilter {
         }
     }
 
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Messages => "messages",
+            Self::Tools => "tools",
+            Self::Reservations => "reservations",
+        }
+    }
+
     const fn includes_messages(self) -> bool {
         matches!(self, Self::All | Self::Messages)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DashboardQuickFilterHitRegion {
+    filter: DashboardQuickFilter,
+    area: Rect,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardHitRegions {
+    quick_filters: [Option<DashboardQuickFilterHitRegion>; 4],
+    query_bar: Rect,
+    live_search_panel: Rect,
+    event_viewer: Rect,
+}
+
+impl Default for DashboardHitRegions {
+    fn default() -> Self {
+        Self {
+            quick_filters: [None; 4],
+            query_bar: Rect::new(0, 0, 0, 0),
+            live_search_panel: Rect::new(0, 0, 0, 0),
+            event_viewer: Rect::new(0, 0, 0, 0),
+        }
+    }
+}
+
+impl DashboardHitRegions {
+    fn quick_filter_at(&self, x: u16, y: u16) -> Option<DashboardQuickFilter> {
+        self.quick_filters
+            .iter()
+            .flatten()
+            .find_map(|hit| point_in_rect(hit.area, x, y).then_some(hit.filter))
+    }
+
+    const fn search_area_contains(&self, x: u16, y: u16) -> bool {
+        point_in_rect(self.query_bar, x, y) || point_in_rect(self.live_search_panel, x, y)
     }
 }
 
@@ -288,6 +335,8 @@ pub struct DashboardScreen {
     quick_query_input: TextInput,
     /// True while the query input has keyboard focus.
     quick_query_active: bool,
+    /// Pointer hit regions derived from the most recently rendered layout.
+    hit_regions: RefCell<DashboardHitRegions>,
     /// Console log pane for tool call cards / HTTP requests.
     console_log: RefCell<crate::console::LogPane>,
     /// Last consumed console log sequence number.
@@ -475,6 +524,7 @@ impl DashboardScreen {
                 .with_placeholder("Type to live-filter dashboard; Enter opens Search Cockpit")
                 .with_focused(false),
             quick_query_active: false,
+            hit_regions: RefCell::new(DashboardHitRegions::default()),
             console_log: RefCell::new(crate::console::LogPane::new()),
             console_log_last_seq: 0,
             event_log_viewer: RefCell::new(crate::console::LogPane::new()),
@@ -502,6 +552,38 @@ impl DashboardScreen {
     pub fn set_motion_preferences(&mut self, reduced_motion: bool, chart_animations_enabled: bool) {
         self.reduced_motion = reduced_motion;
         self.chart_animations_enabled = chart_animations_enabled;
+    }
+
+    /// Stable read-only identifier for the visible event quick filter.
+    ///
+    /// Browser hosts expose this in runner status so pointer-driven filter
+    /// changes can be observed without reaching into screen internals.
+    #[must_use]
+    pub const fn active_filter_slug(&self) -> &'static str {
+        self.quick_filter.slug()
+    }
+
+    /// Capture user-owned query/filter state independently of replay data.
+    #[must_use]
+    pub fn interaction_snapshot(&self) -> (String, bool, &'static str) {
+        (
+            self.quick_query_input.value().to_string(),
+            self.quick_query_active,
+            self.active_filter_slug(),
+        )
+    }
+
+    /// Restore query/filter state after the deterministic replay loops.
+    pub fn restore_interaction(&mut self, query: &str, query_active: bool, filter: &str) {
+        self.quick_query_input.set_value(query);
+        self.quick_query_active = query_active;
+        let quick_filter = match filter {
+            "messages" => DashboardQuickFilter::Messages,
+            "tools" => DashboardQuickFilter::Tools,
+            "reservations" => DashboardQuickFilter::Reservations,
+            _ => DashboardQuickFilter::All,
+        };
+        self.apply_quick_filter(quick_filter);
     }
 
     /// Ingest new events from the ring buffer.
@@ -1335,9 +1417,34 @@ impl MailScreen for DashboardScreen {
                     _ => {}
                 }
             }
-            // Mouse: scroll wheel moves event log (parity with j/k)
+            // Mouse: rendered hit regions keep pointer behavior aligned with
+            // the responsive dashboard layout; the wheel retains j/k parity.
             Event::Mouse(mouse) => match mouse.kind {
-                ftui::MouseEventKind::ScrollDown => {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let quick_filter =
+                        { self.hit_regions.borrow().quick_filter_at(mouse.x, mouse.y) };
+                    if let Some(filter) = quick_filter {
+                        self.end_query_edit();
+                        self.apply_quick_filter(filter);
+                        return Cmd::None;
+                    }
+
+                    let (search_hit, event_hit) = {
+                        let hit_regions = self.hit_regions.borrow();
+                        (
+                            hit_regions.search_area_contains(mouse.x, mouse.y),
+                            point_in_rect(hit_regions.event_viewer, mouse.x, mouse.y),
+                        )
+                    };
+                    if search_hit {
+                        self.begin_query_edit();
+                    } else if event_hit {
+                        self.end_query_edit();
+                    }
+                }
+                MouseEventKind::ScrollDown
+                    if point_in_rect(self.hit_regions.borrow().event_viewer, mouse.x, mouse.y) =>
+                {
                     if self.scroll_offset > 0 {
                         self.scroll_offset = self.scroll_offset.saturating_sub(1);
                     }
@@ -1345,7 +1452,9 @@ impl MailScreen for DashboardScreen {
                         self.auto_follow = true;
                     }
                 }
-                ftui::MouseEventKind::ScrollUp => {
+                MouseEventKind::ScrollUp
+                    if point_in_rect(self.hit_regions.borrow().event_viewer, mouse.x, mouse.y) =>
+                {
                     self.scroll_offset += 1;
                     self.auto_follow = false;
                     self.clamp_scroll_offset();
@@ -1476,6 +1585,7 @@ impl MailScreen for DashboardScreen {
 
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        *self.hit_regions.borrow_mut() = DashboardHitRegions::default();
         let tc = TerminalClass::from_rect(area);
         let density = DensityHint::from_terminal_class(tc);
         let effects_enabled = state.tui_effects_enabled();
@@ -1608,6 +1718,7 @@ impl MailScreen for DashboardScreen {
             self.verbosity,
             inline_anomaly_count,
             effects_enabled && !self.reduced_motion,
+            &self.hit_regions,
         );
         // Compute tool latency rows once for the whole frame. This avoids 10+
         // redundant O(N log N) aggregation passes across render_insight_rail,
@@ -1642,6 +1753,7 @@ impl MailScreen for DashboardScreen {
                     preview,
                     latency_rows: &latency_rows,
                     insight_layout,
+                    hit_regions: &self.hit_regions,
                 },
             );
         }
@@ -1706,7 +1818,7 @@ impl MailScreen for DashboardScreen {
             },
             HelpEntry {
                 key: "Mouse",
-                action: "Wheel scroll event log",
+                action: "Focus panels, select filter, or scroll event log",
             },
         ]
     }
@@ -2808,6 +2920,7 @@ fn render_primary_cluster(
     verbosity: VerbosityTier,
     inline_anomaly_count: usize,
     effects_enabled: bool,
+    hit_regions: &RefCell<DashboardHitRegions>,
 ) {
     if area.height < 3 || area.width < 24 {
         return;
@@ -2835,6 +2948,7 @@ fn render_primary_cluster(
             query_text,
             db_snapshot,
             entries,
+            hit_regions,
         );
     }
 
@@ -2850,6 +2964,7 @@ fn render_primary_cluster(
             verbosity,
             inline_anomaly_count,
             effects_enabled,
+            hit_regions,
         );
     }
 }
@@ -2863,10 +2978,12 @@ fn render_dashboard_query_bar(
     query_text: &str,
     db_snapshot: &DbStatSnapshot,
     entries: &[&EventEntry],
+    hit_regions: &RefCell<DashboardHitRegions>,
 ) {
     if area.is_empty() {
         return;
     }
+    hit_regions.borrow_mut().query_bar = area;
     let query_terms = parse_query_terms(query_text);
     let agent_matches = db_snapshot
         .agents_list
@@ -3206,6 +3323,7 @@ struct BottomRailContext<'a, 'entry> {
     preview: Option<&'a RecentMessagePreview>,
     latency_rows: &'a [ToolLatencyRow],
     insight_layout: InsightRailLayout,
+    hit_regions: &'a RefCell<DashboardHitRegions>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3217,6 +3335,7 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
         preview,
         latency_rows,
         insight_layout,
+        hit_regions,
     } = *context;
 
     if area.width < 24 || area.height < 4 {
@@ -3385,10 +3504,10 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
 
         if area.width >= 96 && area.height >= 8 {
             let (left, right) = split_width_ratio_with_gap(area, 0.55, 1);
-            render_query_matches_panel(frame, left, query_text, db_snapshot, entries);
+            render_query_matches_panel(frame, left, query_text, db_snapshot, entries, hit_regions);
             render_recent_activity_panel(frame, right, entries, query_text);
         } else {
-            render_query_matches_panel(frame, area, query_text, db_snapshot, entries);
+            render_query_matches_panel(frame, area, query_text, db_snapshot, entries, hit_regions);
         }
         return;
     }
@@ -3401,7 +3520,14 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
         let (preview_col, query_col) =
             split_width_ratio_with_gap(area, if area.width >= 120 { 0.58 } else { 0.5 }, 1);
         render_recent_message_preview_panel(frame, preview_col, preview);
-        render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
+        render_query_matches_panel(
+            frame,
+            query_col,
+            query_text,
+            db_snapshot,
+            entries,
+            hit_regions,
+        );
         return;
     }
 
@@ -3412,7 +3538,14 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
         let (metrics_col, support_col) = split_width_ratio_with_gap(rest, 0.5, 1);
 
         render_recent_message_preview_panel(frame, preview_col, preview);
-        render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
+        render_query_matches_panel(
+            frame,
+            query_col,
+            query_text,
+            db_snapshot,
+            entries,
+            hit_regions,
+        );
         render_recent_activity_panel(frame, activity_col, entries, query_text);
         if matches!(preview_mode, PreviewFooterMode::SignalsOnly) {
             render_event_mix_panel(frame, metrics_col, entries, query_text);
@@ -3448,7 +3581,14 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
         let (activity_col, metrics_col) = split_width_ratio_with_gap(rest, 0.40, 1);
 
         render_recent_message_preview_panel(frame, preview_col, preview);
-        render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
+        render_query_matches_panel(
+            frame,
+            query_col,
+            query_text,
+            db_snapshot,
+            entries,
+            hit_regions,
+        );
         render_recent_activity_panel(frame, activity_col, entries, query_text);
 
         if matches!(preview_mode, PreviewFooterMode::SignalsOnly) {
@@ -3482,7 +3622,7 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
         let (middle, rest) = split_width_ratio_with_gap(rest, 0.33, 1);
         let (right, aux) = split_width_ratio_with_gap(rest, 0.5, 1);
         render_recent_message_preview_panel(frame, left, preview);
-        render_query_matches_panel(frame, middle, query_text, db_snapshot, entries);
+        render_query_matches_panel(frame, middle, query_text, db_snapshot, entries, hit_regions);
         render_recent_activity_panel(frame, right, entries, query_text);
 
         if matches!(preview_mode, PreviewFooterMode::SignalsOnly) {
@@ -3521,7 +3661,7 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
         let (left, rest) = split_width_ratio_with_gap(area, 0.5, 1);
         let (middle, right) = split_width_ratio_with_gap(rest, 0.5, 1);
         render_recent_message_preview_panel(frame, left, preview);
-        render_query_matches_panel(frame, middle, query_text, db_snapshot, entries);
+        render_query_matches_panel(frame, middle, query_text, db_snapshot, entries, hit_regions);
         render_recent_activity_panel(frame, right, entries, query_text);
         return;
     }
@@ -3530,14 +3670,14 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
         if query_text.is_empty() {
             render_recent_message_preview_panel(frame, area, preview);
         } else {
-            render_query_matches_panel(frame, area, query_text, db_snapshot, entries);
+            render_query_matches_panel(frame, area, query_text, db_snapshot, entries, hit_regions);
         }
         return;
     }
 
     let (left, right) = split_width_ratio_with_gap(area, 0.62, 1);
     render_recent_message_preview_panel(frame, left, preview);
-    render_query_matches_panel(frame, right, query_text, db_snapshot, entries);
+    render_query_matches_panel(frame, right, query_text, db_snapshot, entries, hit_regions);
 }
 
 const fn snapshot_panel_query_terms(_query_text: &str) -> Vec<String> {
@@ -5293,10 +5433,12 @@ fn render_query_matches_panel(
     query_text: &str,
     db_snapshot: &DbStatSnapshot,
     entries: &[&EventEntry],
+    hit_regions: &RefCell<DashboardHitRegions>,
 ) {
     if area.width < 22 || area.height < 3 {
         return;
     }
+    hit_regions.borrow_mut().live_search_panel = area;
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::bordered()
         .title("Live Search")
@@ -5897,6 +6039,7 @@ fn render_event_log(
     verbosity: VerbosityTier,
     inline_anomaly_count: usize,
     effects_enabled: bool,
+    hit_regions: &RefCell<DashboardHitRegions>,
 ) {
     if area.height < 3 || area.width < 20 {
         return;
@@ -5938,35 +6081,11 @@ fn render_event_log(
         inner.height.saturating_sub(controls_height),
     );
 
-    let meta_style = crate::tui_theme::text_meta(&tp);
-    let active_style = Style::default()
-        .fg(tp.selection_fg)
-        .bg(tp.selection_bg)
-        .bold();
-    let mut controls = Vec::new();
-    let mut controls_chars = 0usize;
-    for filter in [
-        DashboardQuickFilter::All,
-        DashboardQuickFilter::Messages,
-        DashboardQuickFilter::Tools,
-        DashboardQuickFilter::Reservations,
-    ] {
-        let label = format!(" [{}:{}] ", filter.key(), filter.control_label());
-        controls_chars = controls_chars.saturating_add(label.len());
-        let span = if quick_filter == filter {
-            Span::styled(label, active_style)
-        } else {
-            Span::styled(label, meta_style)
-        };
-        controls.push(span);
-    }
-    if controls_area.height > 0 {
-        let controls_text = Text::from_line(Line::from_spans(controls));
-        let mut paragraph = Paragraph::new(controls_text);
-        if controls_area.height > 1 || controls_chars > usize::from(inner.width) {
-            paragraph = paragraph.wrap(ftui::text::WrapMode::Word);
-        }
-        paragraph.render(controls_area, frame);
+    let quick_filter_hits = render_quick_filter_controls(frame, controls_area, quick_filter, &tp);
+    {
+        let mut regions = hit_regions.borrow_mut();
+        regions.quick_filters = quick_filter_hits;
+        regions.event_viewer = viewer_area;
     }
 
     if viewer_area.height == 0 {
@@ -6060,6 +6179,70 @@ fn render_event_log(
     pane.render(viewer_area, frame);
 }
 
+/// Render the quick-filter controls and return their exact on-screen cells.
+///
+/// Hit regions are produced by the same row-packing loop that renders each
+/// label, so pointer geometry follows responsive wrapping automatically.
+fn render_quick_filter_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    quick_filter: DashboardQuickFilter,
+    palette: &crate::tui_theme::TuiThemePalette,
+) -> [Option<DashboardQuickFilterHitRegion>; 4] {
+    let mut hit_regions = [None; 4];
+    if area.is_empty() {
+        return hit_regions;
+    }
+
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+    let mut x = area.x;
+    let mut y = area.y;
+    for (index, filter) in [
+        DashboardQuickFilter::All,
+        DashboardQuickFilter::Messages,
+        DashboardQuickFilter::Tools,
+        DashboardQuickFilter::Reservations,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = format!(" [{}:{}] ", filter.key(), filter.control_label());
+        let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX);
+        if x > area.x && x.saturating_add(label_width) > right {
+            x = area.x;
+            y = y.saturating_add(1);
+        }
+        if y >= bottom {
+            break;
+        }
+
+        let visible_width = label_width.min(right.saturating_sub(x));
+        if visible_width == 0 {
+            continue;
+        }
+        let control_area = Rect::new(x, y, visible_width, 1);
+        let style = if quick_filter == filter {
+            Style::default()
+                .fg(palette.selection_fg)
+                .bg(palette.selection_bg)
+                .bold()
+        } else {
+            crate::tui_theme::text_meta(palette)
+        };
+        Paragraph::new(label)
+            .style(style)
+            .render(control_area, frame);
+        hit_regions[index] = Some(DashboardQuickFilterHitRegion {
+            filter,
+            area: control_area,
+        });
+        x = x.saturating_add(label_width);
+    }
+
+    hit_regions
+}
+
 /// Pre-computed total char width of quick-filter control labels (avoids 4× format!
 /// allocations per frame). Labels: " [1:All] ", " [2:Msg] ", " [3:Tools] ", " [4:Resv] ".
 const QUICK_FILTER_CONTROLS_TOTAL_CHARS: usize =
@@ -6084,6 +6267,14 @@ fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
     u16::try_from(estimated_lines)
         .unwrap_or(u16::MAX)
         .min(max_controls)
+}
+
+/// Returns `true` when `(x, y)` is inside the half-open rectangle.
+const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
 }
 
 fn event_log_window_bounds(
@@ -6374,6 +6565,27 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    fn rendered_quick_filter_area(screen: &DashboardScreen, filter: DashboardQuickFilter) -> Rect {
+        let area = screen
+            .hit_regions
+            .borrow()
+            .quick_filters
+            .iter()
+            .flatten()
+            .find(|hit| hit.filter == filter)
+            .map(|hit| hit.area);
+        assert!(area.is_some(), "missing rendered hit region for {filter:?}");
+        area.unwrap_or(Rect::new(0, 0, 0, 0))
+    }
+
+    fn left_click(area: Rect) -> Event {
+        Event::Mouse(ftui::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x.saturating_add(area.width / 2),
+            area.y.saturating_add(area.height / 2),
+        ))
     }
 
     #[test]
@@ -8544,16 +8756,19 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('2'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Messages);
+        assert_eq!(screen.active_filter_slug(), "messages");
         assert!(screen.type_filter.contains(&MailEventKind::MessageSent));
         assert!(screen.type_filter.contains(&MailEventKind::MessageReceived));
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('3'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Tools);
+        assert_eq!(screen.active_filter_slug(), "tools");
         assert!(screen.type_filter.contains(&MailEventKind::ToolCallStart));
         assert!(screen.type_filter.contains(&MailEventKind::ToolCallEnd));
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('4'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Reservations);
+        assert_eq!(screen.active_filter_slug(), "reservations");
         assert!(
             screen
                 .type_filter
@@ -8567,6 +8782,7 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('1'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::All);
+        assert_eq!(screen.active_filter_slug(), "all");
         assert!(screen.type_filter.is_empty());
     }
 
@@ -8943,6 +9159,89 @@ mod tests {
     // ── Mouse parity tests (br-1xt0m.1.12.4) ──────────────────
 
     #[test]
+    fn rendered_quick_filter_click_selects_filter_on_wide_layout() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+
+        let all_area = rendered_quick_filter_area(&screen, DashboardQuickFilter::All);
+        let tools_area = rendered_quick_filter_area(&screen, DashboardQuickFilter::Tools);
+        assert_eq!(all_area.y, tools_area.y, "wide controls should share a row");
+        assert_eq!(screen.active_filter_slug(), "all");
+
+        screen.update(&left_click(tools_area), &state);
+
+        assert_eq!(screen.active_filter_slug(), "tools");
+        assert!(screen.type_filter.contains(&MailEventKind::ToolCallStart));
+        assert!(screen.type_filter.contains(&MailEventKind::ToolCallEnd));
+    }
+
+    #[test]
+    fn rendered_quick_filter_click_selects_filter_on_wrapped_layout() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(24, 18, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 24, 18), &state);
+
+        let all_area = rendered_quick_filter_area(&screen, DashboardQuickFilter::All);
+        let reservations_area =
+            rendered_quick_filter_area(&screen, DashboardQuickFilter::Reservations);
+        assert!(
+            reservations_area.y > all_area.y,
+            "narrow controls should wrap to a later row: all={all_area:?}, reservations={reservations_area:?}"
+        );
+
+        screen.update(&left_click(reservations_area), &state);
+
+        assert_eq!(screen.active_filter_slug(), "reservations");
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationGranted)
+        );
+        assert!(
+            screen
+                .type_filter
+                .contains(&MailEventKind::ReservationReleased)
+        );
+    }
+
+    #[test]
+    fn rendered_live_search_and_event_panel_clicks_transfer_focus() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.quick_query_input.set_value("agent");
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(200, 50, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 200, 50), &state);
+
+        let (live_search_area, event_viewer_area) = {
+            let regions = screen.hit_regions.borrow();
+            (regions.live_search_panel, regions.event_viewer)
+        };
+        assert!(
+            !live_search_area.is_empty(),
+            "Live Search panel must render"
+        );
+        assert!(!event_viewer_area.is_empty(), "event viewer must render");
+        assert!(!screen.quick_query_active);
+
+        screen.update(&left_click(live_search_area), &state);
+        assert!(screen.quick_query_active);
+        assert!(screen.consumes_text_input());
+
+        screen.update(&left_click(event_viewer_area), &state);
+        assert!(!screen.quick_query_active);
+        assert!(!screen.consumes_text_input());
+    }
+
+    #[test]
     fn mouse_scroll_up_increases_offset() {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
@@ -8961,10 +9260,15 @@ mod tests {
         }
         assert_eq!(screen.scroll_offset, 0);
 
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(200, 50, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 200, 50), &state);
+        let event_viewer = screen.hit_regions.borrow().event_viewer;
+
         let scroll_up = Event::Mouse(ftui::MouseEvent::new(
             ftui::MouseEventKind::ScrollUp,
-            10,
-            10,
+            event_viewer.x,
+            event_viewer.y,
         ));
         screen.update(&scroll_up, &state);
         assert_eq!(screen.scroll_offset, 1, "scroll up should increase offset");
@@ -8979,10 +9283,15 @@ mod tests {
         screen.scroll_offset = 5;
         screen.auto_follow = false;
 
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(200, 50, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 200, 50), &state);
+        let event_viewer = screen.hit_regions.borrow().event_viewer;
+
         let scroll_down = Event::Mouse(ftui::MouseEvent::new(
             ftui::MouseEventKind::ScrollDown,
-            10,
-            10,
+            event_viewer.x,
+            event_viewer.y,
         ));
         screen.update(&scroll_down, &state);
         assert_eq!(
@@ -8999,6 +9308,31 @@ mod tests {
             screen.auto_follow,
             "reaching bottom should re-enable auto-follow"
         );
+    }
+
+    #[test]
+    fn mouse_scroll_outside_event_viewer_does_not_move_event_log() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.scroll_offset = 3;
+        screen.auto_follow = false;
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(200, 50, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 200, 50), &state);
+        let search = screen.hit_regions.borrow().query_bar;
+
+        screen.update(
+            &Event::Mouse(ftui::MouseEvent::new(
+                ftui::MouseEventKind::ScrollDown,
+                search.x,
+                search.y,
+            )),
+            &state,
+        );
+
+        assert_eq!(screen.scroll_offset, 3);
+        assert!(!screen.auto_follow);
     }
 
     // ── Screen logic, density heuristics, and failure paths (br-1xt0m.1.13.8) ──
