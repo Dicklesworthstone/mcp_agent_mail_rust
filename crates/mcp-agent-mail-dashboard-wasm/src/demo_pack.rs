@@ -28,6 +28,7 @@ const STARTUP_PROJECT_ROWS: usize = 41;
 const STARTUP_CONTACT_ROWS: usize = 200;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DemoProvenance {
     pub source_label: String,
     pub captured_at: String,
@@ -37,6 +38,7 @@ pub struct DemoProvenance {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DemoBootstrap {
     pub db_stats: DbStatSnapshot,
     pub requests: RequestCounters,
@@ -52,7 +54,7 @@ pub struct DemoAction {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DemoOperation {
     PublishEvent {
         event: MailEvent,
@@ -75,6 +77,7 @@ pub enum DemoOperation {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DemoPack {
     pub schema: String,
     pub title: String,
@@ -121,6 +124,12 @@ pub enum DemoPackError {
         index: usize,
         status: u16,
     },
+    InvalidRequestCounters {
+        total: u64,
+        classified: Option<u64>,
+        latency_total_ms: u64,
+        reason: &'static str,
+    },
     UnredactedEvent(usize),
     UnsafeText {
         field: String,
@@ -130,6 +139,7 @@ pub enum DemoPackError {
         expected: String,
         actual: String,
     },
+    UnknownField(String),
 }
 
 impl std::fmt::Display for DemoPackError {
@@ -178,8 +188,19 @@ impl DemoPack {
                 max: MAX_SERIALIZED_PACK_BYTES,
             });
         }
-        let pack: Self =
+        let raw: serde_json::Value =
             serde_json::from_str(json).map_err(|error| DemoPackError::Json(error.to_string()))?;
+        let pack: Self = serde_json::from_value(raw.clone())
+            .map_err(|error| DemoPackError::Json(error.to_string()))?;
+        // The content digest is computed from the typed, canonical pack. Any
+        // member silently ignored during deserialization would otherwise be
+        // absent from both validation and the digest while remaining present
+        // in the public JSON response. Compare the complete raw shape against
+        // the typed re-serialization as a defense-in-depth backstop for every
+        // nested schema, including flattened actions and external structs.
+        let typed = serde_json::to_value(&pack)
+            .map_err(|error| DemoPackError::Json(error.to_string()))?;
+        reject_unknown_json_members(&raw, &typed, "$" )?;
         pack.validate()?;
         Ok(pack)
     }
@@ -248,6 +269,7 @@ impl DemoPack {
                 return Err(DemoPackError::NonFiniteLatency(index));
             }
         }
+        validate_request_counters(self.bootstrap.requests)?;
         validate_snapshot(&self.bootstrap.db_stats)?;
         for (index, line) in self.bootstrap.console_lines.iter().enumerate() {
             validate_public_text(&format!("bootstrap.console_lines[{index}]"), line)?;
@@ -364,7 +386,10 @@ fn validate_snapshot(snapshot: &DbStatSnapshot) -> Result<(), DemoPackError> {
     }
     for (index, project) in snapshot.projects_list.iter().enumerate() {
         validate_public_text(&format!("projects[{index}].slug"), &project.slug)?;
-        validate_public_text(&format!("projects[{index}].human_key"), &project.human_key)?;
+        validate_public_path(
+            &format!("projects[{index}].human_key"),
+            &project.human_key,
+        )?;
     }
     for (index, contact) in snapshot.contacts_list.iter().enumerate() {
         validate_public_text(
@@ -396,6 +421,69 @@ fn validate_snapshot(snapshot: &DbStatSnapshot) -> Result<(), DemoPackError> {
             &format!("reservations[{index}].path_pattern"),
             &reservation.path_pattern,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_request_counters(counters: RequestCounters) -> Result<(), DemoPackError> {
+    let classified = counters
+        .status_2xx
+        .checked_add(counters.status_4xx)
+        .and_then(|count| count.checked_add(counters.status_5xx));
+    let Some(classified) = classified else {
+        return Err(DemoPackError::InvalidRequestCounters {
+            total: counters.total,
+            classified: None,
+            latency_total_ms: counters.latency_total_ms,
+            reason: "status bucket sum overflowed",
+        });
+    };
+    if classified > counters.total {
+        return Err(DemoPackError::InvalidRequestCounters {
+            total: counters.total,
+            classified: Some(classified),
+            latency_total_ms: counters.latency_total_ms,
+            reason: "classified status buckets exceed total requests",
+        });
+    }
+    if counters.total == 0 && counters.latency_total_ms != 0 {
+        return Err(DemoPackError::InvalidRequestCounters {
+            total: counters.total,
+            classified: Some(classified),
+            latency_total_ms: counters.latency_total_ms,
+            reason: "zero requests cannot carry aggregate latency",
+        });
+    }
+    Ok(())
+}
+
+fn reject_unknown_json_members(
+    raw: &serde_json::Value,
+    typed: &serde_json::Value,
+    path: &str,
+) -> Result<(), DemoPackError> {
+    match (raw, typed) {
+        (serde_json::Value::Object(raw_fields), serde_json::Value::Object(typed_fields)) => {
+            for (key, raw_value) in raw_fields {
+                let field_path = format!("{path}.{key}");
+                let Some(typed_value) = typed_fields.get(key) else {
+                    return Err(DemoPackError::UnknownField(field_path));
+                };
+                reject_unknown_json_members(raw_value, typed_value, &field_path)?;
+            }
+        }
+        (serde_json::Value::Array(raw_items), serde_json::Value::Array(typed_items)) => {
+            for (index, (raw_value, typed_value)) in
+                raw_items.iter().zip(typed_items.iter()).enumerate()
+            {
+                reject_unknown_json_members(
+                    raw_value,
+                    typed_value,
+                    &format!("{path}[{index}]"),
+                )?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -568,6 +656,18 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
         "Release candidate is ready for verification.\n\nPlease compare the 220-column terminal buffer, then check Dashboard filters, screen tabs, wheel scrolling, and fullscreen restoration.",
         "Reservation handoff confirmed.\n\nThe public replay remains read-only: aggregate counts come from the snapshot exporter while all names, paths, messages, and event details are synthetic.",
     ];
+    const TOOL_NAMES: [&str; 4] = [
+        "send_message",
+        "file_reservation",
+        "search_messages",
+        "health_check",
+    ];
+    const HTTP_PATHS: [&str; 4] = [
+        "api/mcp",
+        "api/messages",
+        "api/agents",
+        "health/ready",
+    ];
 
     (0_u64..STARTUP_HISTORY_EVENTS)
         .map(|index| {
@@ -580,7 +680,18 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                     * 750_000;
             let seq = 20_000 + index;
             let id = 30_000 + i64::try_from(index).unwrap_or_default();
-            let operation = match index % 8 {
+            let event_slot = index % 16;
+            let paired_index = if matches!(event_slot, 5 | 11) {
+                index.saturating_sub(1)
+            } else {
+                index
+            };
+            let paired_actor_index =
+                usize::try_from(paired_index).unwrap_or_default() % AGENTS.len();
+            let paired_project_index =
+                usize::try_from(paired_index / 3).unwrap_or_default() % PROJECTS.len();
+            let tool_index = usize::try_from(paired_index / 2).unwrap_or_default() % TOOL_NAMES.len();
+            let operation = match event_slot {
                 0 => DemoOperation::PublishEvent {
                     event: MailEvent::AgentRegistered {
                         seq,
@@ -601,7 +712,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                         project: PROJECTS[project_index].to_string(),
                     },
                 },
-                1 => DemoOperation::PublishEvent {
+                1 | 13 => DemoOperation::PublishEvent {
                     event: MailEvent::ReservationGranted {
                         seq,
                         timestamp_micros,
@@ -614,7 +725,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                         project: PROJECTS[project_index].to_string(),
                     },
                 },
-                2 | 5 => DemoOperation::PublishEvent {
+                2 | 8 | 14 => DemoOperation::PublishEvent {
                     event: MailEvent::MessageReceived {
                         seq,
                         timestamp_micros,
@@ -629,7 +740,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                         body_md: MESSAGE_BODIES[subject_index % MESSAGE_BODIES.len()].to_string(),
                     },
                 },
-                _ => DemoOperation::PublishEvent {
+                3 | 9 | 15 => DemoOperation::PublishEvent {
                     event: MailEvent::MessageSent {
                         seq,
                         timestamp_micros,
@@ -644,6 +755,75 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                         body_md: MESSAGE_BODIES[subject_index % MESSAGE_BODIES.len()].to_string(),
                     },
                 },
+                4 | 10 => DemoOperation::PublishEvent {
+                    event: MailEvent::ToolCallStart {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Tooling,
+                        redacted: true,
+                        tool_name: TOOL_NAMES[tool_index].to_string(),
+                        params_json: serde_json::json!({
+                            "mode": "synthetic_public_replay",
+                            "scope": PROJECTS[paired_project_index],
+                        }),
+                        project: Some(PROJECTS[paired_project_index].to_string()),
+                        agent: Some(AGENTS[paired_actor_index].to_string()),
+                    },
+                },
+                5 | 11 => DemoOperation::PublishEvent {
+                    event: MailEvent::ToolCallEnd {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Tooling,
+                        redacted: true,
+                        tool_name: TOOL_NAMES[tool_index].to_string(),
+                        duration_ms: 24 + (index % 9) * 13,
+                        result_preview: Some("synthetic public result".to_string()),
+                        queries: 1 + index % 4,
+                        query_time_ms: 4.0
+                            + f64::from(u32::try_from(index % 7).unwrap_or_default()) * 2.5,
+                        per_table: vec![
+                            ("messages".to_string(), 1 + index % 12),
+                            ("agents".to_string(), 1),
+                        ],
+                        project: Some(PROJECTS[paired_project_index].to_string()),
+                        agent: Some(AGENTS[paired_actor_index].to_string()),
+                    },
+                },
+                6 | 12 => DemoOperation::PublishEvent {
+                    event: MailEvent::HttpRequest {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Http,
+                        redacted: true,
+                        method: if index.is_multiple_of(4) { "POST" } else { "GET" }.to_string(),
+                        path: HTTP_PATHS[usize::try_from(index).unwrap_or_default()
+                            % HTTP_PATHS.len()]
+                            .to_string(),
+                        status: match index % 5 {
+                            0 => 503,
+                            1 => 409,
+                            2 => 202,
+                            _ => 200,
+                        },
+                        duration_ms: 18 + (index % 11) * 17,
+                        client_ip: "synthetic-public-client".to_string(),
+                    },
+                },
+                7 => DemoOperation::PublishEvent {
+                    event: MailEvent::GitSegfaultRetry {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Tooling,
+                        redacted: true,
+                        name: "git_status".to_string(),
+                        repo_slug: PROJECTS[project_index].to_string(),
+                        attempt_n: 1 + u32::try_from(index % 3).unwrap_or_default(),
+                        signal: Some(11),
+                        exhausted: index % 64 == 55,
+                    },
+                },
+                _ => unreachable!("event slot is modulo 16"),
             };
             DemoAction {
                 at_ms: 0,
@@ -1001,6 +1181,7 @@ mod tests {
         STARTUP_HISTORY_EVENTS, STARTUP_PROJECT_ROWS, curated_public_demo,
     };
     use crate::state::TuiSharedState;
+    use crate::tui_events::MailEventKind;
 
     #[test]
     fn curated_pack_round_trips_and_digest_verifies() {
@@ -1038,6 +1219,23 @@ mod tests {
             pack.bootstrap.db_stats.contacts_list.len(),
             STARTUP_CONTACT_ROWS
         );
+
+        let event_count = |kind| {
+            pack.actions
+                .iter()
+                .filter_map(|action| match &action.operation {
+                    DemoOperation::PublishEvent { event } => Some(event.kind()),
+                    _ => None,
+                })
+                .filter(|event_kind| *event_kind == kind)
+                .count()
+        };
+        let tool_starts = event_count(MailEventKind::ToolCallStart);
+        let tool_ends = event_count(MailEventKind::ToolCallEnd);
+        assert_eq!(tool_starts, tool_ends, "tool lifecycle rows must be balanced");
+        assert!(tool_starts >= 12, "tool filters need a dense opening history");
+        assert!(event_count(MailEventKind::HttpRequest) >= 12);
+        assert!(event_count(MailEventKind::GitSegfaultRetry) >= 6);
     }
 
     #[test]
@@ -1108,6 +1306,106 @@ mod tests {
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
+        ));
+    }
+
+    #[test]
+    fn project_human_keys_must_be_public_relative_paths() {
+        for private_path in [
+            "/Volumes/private/mailbox",
+            "/private/work/agent-mail",
+            "D:/work/private-mailbox",
+            "D:\\work\\private-mailbox",
+        ] {
+            let mut pack = curated_public_demo();
+            pack.bootstrap.db_stats.projects_list[0].human_key = private_path.to_string();
+            pack.finalize_digest();
+            assert!(
+                matches!(pack.validate(), Err(DemoPackError::UnsafeText { .. })),
+                "absolute project human_key was accepted: {private_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_members_fail_before_privacy_or_digest_bypass() {
+        let pack = curated_public_demo();
+        let base = serde_json::to_value(pack).unwrap();
+        let mut cases = Vec::new();
+
+        let mut top_level = base.clone();
+        top_level["private_dump"] = serde_json::json!("/Users/private/mailbox.sqlite3");
+        cases.push(("top-level", top_level));
+
+        let mut provenance = base.clone();
+        provenance["provenance"]["private_dump"] =
+            serde_json::json!("/Users/private/mailbox.sqlite3");
+        cases.push(("provenance", provenance));
+
+        let mut counters = base.clone();
+        counters["bootstrap"]["requests"]["private_dump"] =
+            serde_json::json!("/Users/private/mailbox.sqlite3");
+        cases.push(("request counters", counters));
+
+        let mut snapshot = base.clone();
+        snapshot["bootstrap"]["db_stats"]["projects_list"][0]["private_dump"] =
+            serde_json::json!("/Users/private/mailbox.sqlite3");
+        cases.push(("nested snapshot row", snapshot));
+
+        let mut action = base.clone();
+        action["actions"][0]["private_dump"] =
+            serde_json::json!("/Users/private/mailbox.sqlite3");
+        cases.push(("flattened action", action));
+
+        let mut event = base;
+        event["actions"][0]["event"]["private_dump"] =
+            serde_json::json!("/Users/private/mailbox.sqlite3");
+        cases.push(("nested event", event));
+
+        for (label, value) in cases {
+            let result = DemoPack::from_json(&serde_json::to_string(&value).unwrap());
+            assert!(result.is_err(), "unknown {label} member was accepted");
+            assert!(
+                !matches!(result, Err(DemoPackError::DigestMismatch { .. })),
+                "unknown {label} member reached the typed digest instead of failing at the schema boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn impossible_bootstrap_request_counters_fail_closed() {
+        let mut zero_total_latency = curated_public_demo();
+        zero_total_latency.bootstrap.requests = crate::state::RequestCounters {
+            total: 0,
+            latency_total_ms: 1,
+            ..crate::state::RequestCounters::default()
+        };
+        zero_total_latency.finalize_digest();
+        assert!(matches!(
+            zero_total_latency.validate(),
+            Err(DemoPackError::InvalidRequestCounters { .. })
+        ));
+
+        let mut buckets_exceed_total = curated_public_demo();
+        buckets_exceed_total.bootstrap.requests.total = 1;
+        buckets_exceed_total.bootstrap.requests.status_2xx = 2;
+        buckets_exceed_total.bootstrap.requests.status_4xx = 0;
+        buckets_exceed_total.bootstrap.requests.status_5xx = 0;
+        buckets_exceed_total.finalize_digest();
+        assert!(matches!(
+            buckets_exceed_total.validate(),
+            Err(DemoPackError::InvalidRequestCounters { .. })
+        ));
+
+        let mut overflowing_buckets = curated_public_demo();
+        overflowing_buckets.bootstrap.requests.total = u64::MAX;
+        overflowing_buckets.bootstrap.requests.status_2xx = u64::MAX;
+        overflowing_buckets.bootstrap.requests.status_4xx = 1;
+        overflowing_buckets.bootstrap.requests.status_5xx = 0;
+        overflowing_buckets.finalize_digest();
+        assert!(matches!(
+            overflowing_buckets.validate(),
+            Err(DemoPackError::InvalidRequestCounters { .. })
         ));
     }
 

@@ -1,6 +1,7 @@
 //! Portable screen contract and public-replay screens used by the browser shell.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 use ftui::Event;
 use ftui::layout::Rect;
@@ -121,6 +122,15 @@ pub struct PublicReplayScreen {
     scroll: usize,
     search_query: String,
     search_active: bool,
+    row_cache: RefCell<Option<PublicRowsCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct PublicRowsCache {
+    screen: MailScreenId,
+    generation: DataGeneration,
+    query: String,
+    rows: Vec<String>,
 }
 
 impl Default for PublicReplayScreen {
@@ -138,6 +148,7 @@ impl PublicReplayScreen {
             scroll: 0,
             search_query: String::new(),
             search_active: false,
+            row_cache: RefCell::new(None),
         }
     }
 
@@ -147,6 +158,7 @@ impl PublicReplayScreen {
         self.search_query.clear();
         self.search_active = false;
         self.list_area.set(Rect::new(0, 0, 0, 0));
+        *self.row_cache.get_mut() = None;
     }
 
     pub fn begin_search(&mut self, query: &str) {
@@ -154,6 +166,7 @@ impl PublicReplayScreen {
         self.search_active = true;
         self.selected = 0;
         self.scroll = 0;
+        *self.row_cache.get_mut() = None;
     }
 
     #[must_use]
@@ -171,10 +184,61 @@ impl PublicReplayScreen {
         self.selected
     }
 
+    /// Focus the public timeline row whose event timestamp is closest to the
+    /// production Dashboard deep-link target.
+    pub fn focus_timeline_at(&mut self, timestamp_micros: i64, state: &TuiSharedState) -> bool {
+        let events = state.tick_events_since_limited(0, 2_000);
+        let Some(index) = events
+            .iter()
+            .filter(|event| event_visible_on(MailScreenId::Timeline, event))
+            .enumerate()
+            .min_by_key(|(_, event)| event.timestamp_micros().abs_diff(timestamp_micros))
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        let previous = (self.selected, self.scroll);
+        self.selected = index;
+        let page = usize::from(self.list_area.get().height.max(1));
+        self.scroll = self.selected.saturating_sub(page / 2);
+        previous != (self.selected, self.scroll)
+    }
+
+    fn ensure_rows(&self, screen: MailScreenId, state: &TuiSharedState) {
+        let generation = state.data_generation();
+        let needs_rebuild = self.row_cache.borrow().as_ref().is_none_or(|cache| {
+            cache.screen != screen
+                || cache.generation != generation
+                || cache.query != self.search_query
+        });
+        if !needs_rebuild {
+            return;
+        }
+        let mut rows = public_rows(screen, state);
+        if screen == MailScreenId::Search && !self.search_query.is_empty() {
+            let normalized_query = self.search_query.to_ascii_lowercase();
+            rows.retain(|row| row.to_ascii_lowercase().contains(&normalized_query));
+        }
+        *self.row_cache.borrow_mut() = Some(PublicRowsCache {
+            screen,
+            generation,
+            query: self.search_query.clone(),
+            rows,
+        });
+    }
+
+    fn visible_row_count(&self, screen: MailScreenId, state: &TuiSharedState) -> usize {
+        self.ensure_rows(screen, state);
+        self.row_cache
+            .borrow()
+            .as_ref()
+            .map_or(0, |cache| cache.rows.len())
+    }
+
     /// Reconcile preserved selection/scroll state with freshly reset replay
     /// data so a shorter result set cannot leave the list scrolled past EOF.
     pub fn normalize(&mut self, screen: MailScreenId, state: &TuiSharedState) {
-        let row_count = self.visible_rows(screen, state).len();
+        let row_count = self.visible_row_count(screen, state);
         let page = usize::from(self.list_area.get().height.max(1));
         self.clamp_to_rows(row_count, page);
     }
@@ -264,6 +328,12 @@ impl PublicReplayScreen {
                     ) =>
                 {
                     let relative = usize::from(mouse.y.saturating_sub(self.list_area.get().y));
+                    let remaining_rows = self
+                        .visible_row_count(screen, state)
+                        .saturating_sub(self.scroll);
+                    if relative >= remaining_rows {
+                        return false;
+                    }
                     self.selected = self.scroll.saturating_add(relative);
                 }
                 MouseEventKind::ScrollDown
@@ -288,7 +358,7 @@ impl PublicReplayScreen {
             },
             _ => return false,
         }
-        let row_count = self.visible_rows(screen, state).len();
+        let row_count = self.visible_row_count(screen, state);
         self.clamp_to_rows(row_count, page);
         (
             self.selected,
@@ -296,14 +366,6 @@ impl PublicReplayScreen {
             self.search_query.clone(),
             self.search_active,
         ) != previous
-    }
-
-    fn visible_rows(&self, screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
-        let mut rows = public_rows(screen, state);
-        if screen == MailScreenId::Search && !self.search_query.is_empty() {
-            rows.retain(|row| contains_ci(row, &self.search_query));
-        }
-        rows
     }
 
     pub fn view(
@@ -315,7 +377,12 @@ impl PublicReplayScreen {
     ) {
         let palette = crate::tui_theme::TuiThemePalette::current();
         let meta = screen_meta(screen);
-        let rows = self.visible_rows(screen, state);
+        self.ensure_rows(screen, state);
+        let row_cache = self.row_cache.borrow();
+        let rows = &row_cache
+            .as_ref()
+            .expect("public replay rows must be cached before rendering")
+            .rows;
 
         let header_height = area.height.min(3);
         let header_area = Rect::new(area.x, area.y, area.width, header_height);
@@ -337,7 +404,7 @@ impl PublicReplayScreen {
                 ),
             ]),
             Line::from_spans([Span::styled(
-                meta.description,
+                browser_projection_description(screen),
                 Style::default().fg(palette.text_secondary),
             )]),
             Line::from_spans([Span::styled(
@@ -406,12 +473,95 @@ impl PublicReplayScreen {
     }
 }
 
-fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
-    let stats = state.db_stats_snapshot().unwrap_or_default();
+const fn browser_projection_description(screen: MailScreenId) -> &'static str {
     match screen {
-        MailScreenId::Agents => stats
+        MailScreenId::Dashboard => {
+            "Production DashboardScreen driven by the sanitized replay state."
+        }
+        MailScreenId::Messages => {
+            "Synthetic public message events; mailbox reads and mutations are unavailable."
+        }
+        MailScreenId::Threads => "Synthetic public messages grouped by replay thread identifier.",
+        MailScreenId::Agents => {
+            "Synthetic public agent roster backed by aggregate-safe replay data."
+        }
+        MailScreenId::Search => "Client-side text filter across sanitized public replay events.",
+        MailScreenId::Reservations => {
+            "Synthetic reservation rows; live lock operations are unavailable."
+        }
+        MailScreenId::ToolMetrics => {
+            "Synthetic tool, HTTP, and Git telemetry from the public replay."
+        }
+        MailScreenId::SystemHealth => {
+            "Read-only aggregate health summary from the public replay state."
+        }
+        MailScreenId::Timeline => {
+            "Chronological sanitized replay events with Dashboard deep-link focus."
+        }
+        MailScreenId::Projects => {
+            "Synthetic project labels paired with count-only aggregate metrics."
+        }
+        MailScreenId::Contacts => {
+            "Synthetic public contact graph rows; approval actions are unavailable."
+        }
+        MailScreenId::Explorer => "Read-only event explorer over the sanitized replay stream.",
+        MailScreenId::Analytics => {
+            "Derived summary of synthetic telemetry kinds and request counters."
+        }
+        MailScreenId::Attachments => {
+            "The public replay deliberately contains no attachment payload metadata."
+        }
+        MailScreenId::ArchiveBrowser => {
+            "Released synthetic reservations only; Git/archive payloads are not shipped."
+        }
+        MailScreenId::Atc => {
+            "Synthetic coordination roster only; no readiness or authority decision is asserted."
+        }
+    }
+}
+
+fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
+    match screen {
+        MailScreenId::Messages => public_event_rows(screen, state),
+        MailScreenId::Threads => {
+            let mut threads: BTreeMap<String, (String, String, usize)> = BTreeMap::new();
+            for event in state.tick_events_since_limited(0, 2_000) {
+                let (thread_id, subject, project) = match event {
+                    MailEvent::MessageSent {
+                        thread_id,
+                        subject,
+                        project,
+                        ..
+                    }
+                    | MailEvent::MessageReceived {
+                        thread_id,
+                        subject,
+                        project,
+                        ..
+                    } => (thread_id, subject, project),
+                    _ => continue,
+                };
+                let entry = threads
+                    .entry(thread_id)
+                    .or_insert_with(|| (subject, project, 0));
+                entry.2 = entry.2.saturating_add(1);
+            }
+            threads
+                .into_iter()
+                .map(|(thread, (subject, project, count))| {
+                    format!("◉ {thread:<26} messages:{count:<4} {subject} · {project}")
+                })
+                .collect()
+        }
+        MailScreenId::Attachments => vec![
+            "No attachment metadata or payload bytes are included in this public replay."
+                .to_string(),
+        ],
+        MailScreenId::Agents => state
+            .db_stats_snapshot()
+            .unwrap_or_default()
             .agents_list
-            .iter()
+            .into_iter()
             .map(|agent| {
                 format!(
                     "● {:<20} {:<14} {:<16} {}",
@@ -419,9 +569,11 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
                 )
             })
             .collect(),
-        MailScreenId::Projects => stats
+        MailScreenId::Projects => state
+            .db_stats_snapshot()
+            .unwrap_or_default()
             .projects_list
-            .iter()
+            .into_iter()
             .map(|project| {
                 format!(
                     "▣ {:<26} agents:{:<4} messages:{:<7} locks:{:<4}",
@@ -432,9 +584,11 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
                 )
             })
             .collect(),
-        MailScreenId::Contacts => stats
+        MailScreenId::Contacts => state
+            .db_stats_snapshot()
+            .unwrap_or_default()
             .contacts_list
-            .iter()
+            .into_iter()
             .map(|contact| {
                 format!(
                     "◉ {:<18} → {:<18} {:<10} {}",
@@ -442,9 +596,11 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
                 )
             })
             .collect(),
-        MailScreenId::Reservations | MailScreenId::ArchiveBrowser => stats
+        MailScreenId::Reservations => state
+            .db_stats_snapshot()
+            .unwrap_or_default()
             .reservation_snapshots
-            .iter()
+            .into_iter()
             .map(|reservation| {
                 format!(
                     "{} {:<18} {:<26} {}",
@@ -455,40 +611,93 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
                 )
             })
             .collect(),
-        MailScreenId::SystemHealth => vec![
-            format!(
-                "Database snapshot     projects:{:<5} agents:{:<6} messages:{}",
-                stats.projects, stats.agents, stats.messages
-            ),
-            format!("Reservation ledger    active:{}", stats.file_reservations),
-            format!("Contact graph         links:{}", stats.contact_links),
-            format!("Acknowledgements      pending:{}", stats.ack_pending),
-            format!("Transport             {}", state.transport_mode_label()),
-            format!("Request latency       avg:{}ms", state.avg_latency_ms()),
-        ],
-        MailScreenId::Atc => stats
-            .agents_list
-            .iter()
-            .take(200)
-            .enumerate()
-            .map(|(index, agent)| {
+        MailScreenId::ArchiveBrowser => {
+            let rows = state
+                .db_stats_snapshot()
+                .unwrap_or_default()
+                .reservation_snapshots
+                .into_iter()
+                .filter(|reservation| reservation.released_ts.is_some())
+                .map(|reservation| {
+                    format!(
+                        "released {:<18} {:<26} {}",
+                        reservation.agent_name, reservation.project_slug, reservation.path_pattern
+                    )
+                })
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                vec![
+                    "No released reservation records are present in this replay phase.".to_string(),
+                ]
+            } else {
+                rows
+            }
+        }
+        MailScreenId::SystemHealth => {
+            let stats = state.db_stats_snapshot().unwrap_or_default();
+            vec![
                 format!(
-                    "{} {:<20} {:<20} evidence:{:03} conflicts:{}",
-                    if index % 7 == 0 { "HOLD" } else { "CLEAR" },
-                    agent.name,
-                    agent.project,
-                    90 + index % 10,
-                    usize::from(index % 11 == 0)
+                    "Database snapshot     projects:{:<5} agents:{:<6} messages:{}",
+                    stats.projects, stats.agents, stats.messages
+                ),
+                format!("Reservation ledger    active:{}", stats.file_reservations),
+                format!("Contact graph         links:{}", stats.contact_links),
+                format!("Acknowledgements      pending:{}", stats.ack_pending),
+                format!("Transport             {}", state.transport_mode_label()),
+                format!("Request latency       avg:{}ms", state.avg_latency_ms()),
+            ]
+        }
+        MailScreenId::Atc => state
+            .db_stats_snapshot()
+            .unwrap_or_default()
+            .agents_list
+            .into_iter()
+            .take(200)
+            .map(|agent| {
+                format!(
+                    "● {:<20} {:<22} {:<14} {}",
+                    agent.name, agent.project, agent.program, agent.model
                 )
             })
             .collect(),
-        _ => state
-            .tick_events_since_limited(0, 2_000)
-            .into_iter()
-            .filter(|event| event_visible_on(screen, event))
-            .map(|event| public_event_row(&event))
-            .collect(),
+        MailScreenId::Analytics => {
+            let mut counts = BTreeMap::<&'static str, usize>::new();
+            for event in state.tick_events_since_limited(0, 2_000) {
+                if event_visible_on(screen, &event) {
+                    let label = event.kind().compact_label();
+                    *counts.entry(label).or_default() += 1;
+                }
+            }
+            let requests = state.request_counters();
+            let mut rows = counts
+                .into_iter()
+                .map(|(kind, count)| format!("telemetry {:<18} events:{count}", kind))
+                .collect::<Vec<_>>();
+            rows.push(format!(
+                "requests total:{} 2xx:{} 4xx:{} 5xx:{} avg:{}ms",
+                requests.total,
+                requests.status_2xx,
+                requests.status_4xx,
+                requests.status_5xx,
+                state.avg_latency_ms()
+            ));
+            rows
+        }
+        MailScreenId::ToolMetrics
+        | MailScreenId::Search
+        | MailScreenId::Timeline
+        | MailScreenId::Explorer => public_event_rows(screen, state),
+        MailScreenId::Dashboard => Vec::new(),
     }
+}
+
+fn public_event_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
+    state
+        .tick_events_since_limited(0, 2_000)
+        .into_iter()
+        .filter(|event| event_visible_on(screen, event))
+        .map(|event| public_event_row(&event))
+        .collect()
 }
 
 fn event_visible_on(screen: MailScreenId, event: &MailEvent) -> bool {
@@ -593,3 +802,91 @@ fn public_event_row(event: &MailEvent) -> String {
 
 #[path = "../../mcp-agent-mail-server/src/tui_screens/dashboard.rs"]
 pub mod dashboard;
+
+#[cfg(test)]
+mod tests {
+    use super::{MailScreenId, PublicReplayScreen, public_rows};
+    use crate::demo_pack::{DemoOperation, curated_public_demo};
+    use crate::state::TuiSharedState;
+    use ftui::layout::Rect;
+    use ftui::{Event, MouseButton, MouseEvent, MouseEventKind};
+
+    fn populated_state() -> TuiSharedState {
+        let pack = curated_public_demo();
+        let state = TuiSharedState::new();
+        pack.apply_bootstrap(&state);
+        for (index, action) in pack.actions.iter().enumerate() {
+            if action.at_ms != 0 {
+                break;
+            }
+            if matches!(&action.operation, DemoOperation::PublishEvent { .. }) {
+                pack.apply_action(index, &state);
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn public_projections_are_screen_specific_and_authority_bounded() {
+        let state = populated_state();
+        let messages = public_rows(MailScreenId::Messages, &state);
+        let threads = public_rows(MailScreenId::Threads, &state);
+        let tools = public_rows(MailScreenId::ToolMetrics, &state);
+        let attachments = public_rows(MailScreenId::Attachments, &state);
+        let atc = public_rows(MailScreenId::Atc, &state);
+
+        assert!(!messages.is_empty());
+        assert!(!threads.is_empty());
+        assert_ne!(threads, messages);
+        assert!(threads.iter().all(|row| row.contains("messages:")));
+        assert!(!tools.is_empty(), "the tool screen must not open blank");
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].contains("No attachment metadata"));
+        assert!(atc.iter().all(|row| {
+            let lower = row.to_ascii_lowercase();
+            !["hold", "clear", "evidence", "conflict"]
+                .iter()
+                .any(|claim| lower.contains(claim))
+        }));
+    }
+
+    #[test]
+    fn clicking_below_the_last_visible_row_is_a_noop() {
+        let state = populated_state();
+        let row_count = public_rows(MailScreenId::Messages, &state).len();
+        assert!(row_count >= 2);
+
+        let mut screen = PublicReplayScreen::new();
+        screen.list_area.set(Rect::new(10, 5, 80, 5));
+        screen.scroll = row_count - 2;
+
+        let blank_click = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            9,
+        ));
+        assert!(!screen.update(&blank_click, MailScreenId::Messages, &state));
+        assert_eq!(screen.selected_row(), 0);
+
+        let last_row_click = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            6,
+        ));
+        assert!(screen.update(&last_row_click, MailScreenId::Messages, &state));
+        assert_eq!(screen.selected_row(), row_count - 1);
+    }
+
+    #[test]
+    fn timeline_focus_selects_the_nearest_event_timestamp() {
+        let state = populated_state();
+        let events = state.tick_events_since_limited(0, 2_000);
+        let target_index = 37;
+        let target = events[target_index].timestamp_micros();
+        let mut screen = PublicReplayScreen::new();
+        screen.list_area.set(Rect::new(0, 0, 120, 12));
+
+        assert!(screen.focus_timeline_at(target, &state));
+        assert_eq!(screen.selected_row(), target_index);
+    }
+}

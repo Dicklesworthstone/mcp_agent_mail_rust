@@ -306,6 +306,7 @@ impl VerbosityTier {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSummary {
     pub project: String,
     pub name: String,
@@ -317,6 +318,7 @@ pub struct AgentSummary {
 
 /// Per-project summary for the Projects screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectSummary {
     pub id: i64,
     pub slug: String,
@@ -329,6 +331,7 @@ pub struct ProjectSummary {
 
 /// A contact link entry for the Contacts screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ContactSummary {
     pub from_agent: String,
     pub to_agent: String,
@@ -341,6 +344,7 @@ pub struct ContactSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DbStatSnapshot {
     pub projects: u64,
     pub agents: u64,
@@ -357,6 +361,7 @@ pub struct DbStatSnapshot {
 
 /// Cached reservation metadata derived from the `file_reservations` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReservationSnapshot {
     pub id: i64,
     pub project_slug: String,
@@ -377,7 +382,7 @@ impl ReservationSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MailEvent {
     ToolCallStart {
         seq: u64,

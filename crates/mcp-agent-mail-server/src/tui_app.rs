@@ -5188,7 +5188,7 @@ impl Model for MailAppModel {
 
         // 3. Status line (z=3)
         let status_started = Instant::now();
-        tui_chrome::render_status_line(
+        tui_chrome::render_status_line_with_hits(
             &self.state,
             active_screen,
             "LIVE",
@@ -5197,6 +5197,7 @@ impl Model for MailAppModel {
             &self.accessibility,
             &screen_bindings,
             self.toast_muted,
+            &self.mouse_dispatcher,
             frame,
             chrome.status_line,
         );

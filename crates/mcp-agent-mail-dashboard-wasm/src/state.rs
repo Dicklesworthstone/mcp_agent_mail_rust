@@ -38,6 +38,7 @@ impl Default for ConfigSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestCounters {
     pub total: u64,
     pub status_2xx: u64,

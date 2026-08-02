@@ -62,8 +62,30 @@ pub const STATUS_PALETTE_TOGGLE: u32 = STATUS_HIT_BASE + 1;
 /// Perf HUD toggle in the status bar.
 pub const STATUS_PERF_TOGGLE: u32 = STATUS_HIT_BASE + 2;
 
-const STATUS_HELP_ZONE_WIDTH: u16 = 4;
-const STATUS_PALETTE_ZONE_WIDTH: u16 = 6;
+/// Interactive semantic roles rendered in the status line.
+///
+/// The chrome renderer records the exact rectangle occupied by each role
+/// after responsive pruning and clipping.  Mouse dispatch uses only those
+/// recorded rectangles; blank padding and adjacent informational segments
+/// are deliberately not clickable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusHitRole {
+    /// Command-palette hint (for example `[^P]`).
+    PaletteToggle,
+    /// Help hint (`F1` or `[F1]` while the overlay is visible).
+    HelpToggle,
+}
+
+impl StatusHitRole {
+    /// Canonical frame hit ID for this interactive status role.
+    #[must_use]
+    pub const fn hit_id(self) -> HitId {
+        match self {
+            Self::PaletteToggle => HitId::new(STATUS_PALETTE_TOGGLE),
+            Self::HelpToggle => HitId::new(STATUS_HELP_TOGGLE),
+        }
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // HitLayer — layer classification enum
@@ -234,6 +256,10 @@ pub struct MouseDispatcher {
     tab_bar_area: Cell<Rect>,
     /// Status line row cached from last `view()`.
     status_line_area: Cell<Rect>,
+    /// Exact command-palette segment rectangle from the last status render.
+    status_palette_slot: Cell<Rect>,
+    /// Exact help segment rectangle from the last status render.
+    status_help_slot: Cell<Rect>,
     /// Per-tab hit regions. Up to `ALL_SCREEN_IDS.len()` entries.
     tab_slots: Vec<Cell<TabHitSlot>>,
     /// Last hover target for coalesced hover events (future use).
@@ -252,6 +278,8 @@ impl MouseDispatcher {
         Self {
             tab_bar_area: Cell::new(Rect::new(0, 0, 0, 0)),
             status_line_area: Cell::new(Rect::new(0, 0, 0, 0)),
+            status_palette_slot: Cell::new(Rect::new(0, 0, 0, 0)),
+            status_help_slot: Cell::new(Rect::new(0, 0, 0, 0)),
             tab_slots,
             last_hover_screen: Cell::new(None),
         }
@@ -261,6 +289,7 @@ impl MouseDispatcher {
     pub fn update_chrome_areas(&self, tab_bar: Rect, status_line: Rect) {
         self.tab_bar_area.set(tab_bar);
         self.status_line_area.set(status_line);
+        self.clear_status_slots();
     }
 
     /// Record a tab's hit region during tab-bar rendering.
@@ -295,6 +324,37 @@ impl MouseDispatcher {
         }
     }
 
+    /// Clear status-role rectangles before rendering a new status line.
+    ///
+    /// Responsive pruning can remove a role that existed in the prior frame,
+    /// so retaining old geometry would make invisible controls clickable.
+    pub fn clear_status_slots(&self) {
+        self.status_palette_slot.set(Rect::new(0, 0, 0, 0));
+        self.status_help_slot.set(Rect::new(0, 0, 0, 0));
+    }
+
+    /// Record the exact rendered rectangle for an interactive status role.
+    ///
+    /// Empty rectangles intentionally clear the role.  The renderer supplies
+    /// already-clipped rectangles, so a pruned or fully clipped segment has no
+    /// hit target.
+    pub fn record_status_slot(&self, role: StatusHitRole, rect: Rect) {
+        match role {
+            StatusHitRole::PaletteToggle => self.status_palette_slot.set(rect),
+            StatusHitRole::HelpToggle => self.status_help_slot.set(rect),
+        }
+    }
+
+    /// Return the exact rectangle occupied by a rendered status role.
+    #[must_use]
+    pub fn status_slot(&self, role: StatusHitRole) -> Option<Rect> {
+        let rect = match role {
+            StatusHitRole::PaletteToggle => self.status_palette_slot.get(),
+            StatusHitRole::HelpToggle => self.status_help_slot.get(),
+        };
+        (!rect.is_empty()).then_some(rect)
+    }
+
     /// Return a tab slot's position as `(x_start, x_end, y)`, if registered.
     pub fn tab_slot(&self, index: usize) -> Option<(u16, u16, u16)> {
         self.tab_slots.get(index).and_then(|cell| {
@@ -308,9 +368,9 @@ impl MouseDispatcher {
     /// Priority order (highest first):
     /// 1. Tab bar clicks → `SwitchScreen`
     /// 2. Status line clicks:
-    ///    - Rightmost help zone → `ToggleHelp`
-    ///    - Right-adjacent palette zone → `OpenPalette`
-    ///    - Center region → `Forward`
+    ///    - Exact rendered help segment → `ToggleHelp`
+    ///    - Exact rendered palette segment → `OpenPalette`
+    ///    - Blank/other status cells → `Forward`
     /// 3. Everything else → `Forward` to active screen
     ///
     /// Only `MouseDown(Left)` triggers actions to prevent double-fire.
@@ -340,22 +400,16 @@ impl MouseDispatcher {
         // Check status line.
         let status_area = self.status_line_area.get();
         if point_in_rect(status_area, mx, my) {
-            let rel_x = mx.saturating_sub(status_area.x);
-            let mut help_zone = STATUS_HELP_ZONE_WIDTH.min(status_area.width);
-            let mut palette_zone =
-                STATUS_PALETTE_ZONE_WIDTH.min(status_area.width.saturating_sub(help_zone));
-            if palette_zone == 0 && status_area.width > 1 {
-                // On ultra-narrow status bars, split the line so both actions
-                // remain reachable.
-                help_zone = status_area.width / 2;
-                palette_zone = status_area.width.saturating_sub(help_zone);
-            }
-            let help_start = status_area.width.saturating_sub(help_zone);
-            if rel_x >= help_start {
+            if self
+                .status_slot(StatusHitRole::HelpToggle)
+                .is_some_and(|rect| point_in_rect(rect, mx, my))
+            {
                 return MouseAction::ToggleHelp;
             }
-            let palette_start = help_start.saturating_sub(palette_zone);
-            if rel_x >= palette_start {
+            if self
+                .status_slot(StatusHitRole::PaletteToggle)
+                .is_some_and(|rect| point_in_rect(rect, mx, my))
+            {
                 return MouseAction::OpenPalette;
             }
 
@@ -610,6 +664,7 @@ mod tests {
     fn dispatcher_status_line_click_toggles_help() {
         let d = MouseDispatcher::new();
         d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_status_slot(StatusHitRole::HelpToggle, Rect::new(77, 24, 3, 1));
         let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 79, 24);
         assert_eq!(d.dispatch(&ev), MouseAction::ToggleHelp);
     }
@@ -618,6 +673,7 @@ mod tests {
     fn dispatcher_status_right_side_opens_palette() {
         let d = MouseDispatcher::new();
         d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_status_slot(StatusHitRole::PaletteToggle, Rect::new(72, 24, 5, 1));
         let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 75, 24);
         assert_eq!(d.dispatch(&ev), MouseAction::OpenPalette);
     }
@@ -631,15 +687,40 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_status_narrow_width_keeps_help_and_palette_accessible() {
+    fn dispatcher_status_roles_use_exact_recorded_rectangles() {
         let d = MouseDispatcher::new();
-        d.update_chrome_areas(Rect::new(0, 0, 10, 1), Rect::new(0, 24, 10, 1));
+        d.update_chrome_areas(Rect::new(0, 0, 40, 1), Rect::new(10, 24, 30, 1));
+        d.record_status_slot(StatusHitRole::PaletteToggle, Rect::new(27, 24, 5, 1));
+        d.record_status_slot(StatusHitRole::HelpToggle, Rect::new(35, 24, 5, 1));
 
-        let help = make_mouse(MouseEventKind::Down(MouseButton::Left), 9, 24);
-        assert_eq!(d.dispatch(&help), MouseAction::ToggleHelp);
+        for x in 27..32 {
+            let palette = make_mouse(MouseEventKind::Down(MouseButton::Left), x, 24);
+            assert_eq!(d.dispatch(&palette), MouseAction::OpenPalette, "x={x}");
+        }
+        for x in 35..40 {
+            let help = make_mouse(MouseEventKind::Down(MouseButton::Left), x, 24);
+            assert_eq!(d.dispatch(&help), MouseAction::ToggleHelp, "x={x}");
+        }
 
-        let palette = make_mouse(MouseEventKind::Down(MouseButton::Left), 5, 24);
-        assert_eq!(d.dispatch(&palette), MouseAction::OpenPalette);
+        // Cells immediately adjacent to the roles, blank padding between
+        // them, and unrelated status content must not activate either role.
+        for x in [10, 26, 32, 34] {
+            let other = make_mouse(MouseEventKind::Down(MouseButton::Left), x, 24);
+            assert_eq!(d.dispatch(&other), MouseAction::Forward, "x={x}");
+        }
+    }
+
+    #[test]
+    fn dispatcher_chrome_update_clears_stale_status_rectangles() {
+        let d = MouseDispatcher::new();
+        d.update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 24, 80, 1));
+        d.record_status_slot(StatusHitRole::HelpToggle, Rect::new(77, 24, 3, 1));
+        assert!(d.status_slot(StatusHitRole::HelpToggle).is_some());
+
+        d.update_chrome_areas(Rect::new(0, 0, 20, 1), Rect::new(0, 24, 20, 1));
+        assert!(d.status_slot(StatusHitRole::HelpToggle).is_none());
+        let old_help = make_mouse(MouseEventKind::Down(MouseButton::Left), 79, 24);
+        assert_eq!(d.dispatch(&old_help), MouseAction::Forward);
     }
 
     #[test]

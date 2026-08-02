@@ -12,6 +12,7 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Frame, PackedRgba, Style};
 
 use crate::tui_bridge::TuiSharedState;
+use crate::tui_hit_regions::{MouseDispatcher, StatusHitRole};
 use crate::tui_persist::AccessibilitySettings;
 use crate::tui_screens::{HelpEntry, MAIL_SCREEN_REGISTRY, MailScreenId, screen_meta};
 
@@ -481,6 +482,16 @@ enum StatusRole {
     HelpToggle,
 }
 
+impl StatusRole {
+    const fn hit_role(self) -> Option<StatusHitRole> {
+        match self {
+            Self::Normal => None,
+            Self::PaletteToggle => Some(StatusHitRole::PaletteToggle),
+            Self::HelpToggle => Some(StatusHitRole::HelpToggle),
+        }
+    }
+}
+
 /// A semantic segment of the status bar.
 struct StatusSegment {
     priority: StatusPriority,
@@ -870,6 +881,23 @@ fn segment_text_width(text: &str) -> u16 {
     u16::try_from(display_width(text)).unwrap_or(u16::MAX)
 }
 
+/// Intersect a one-row status segment with the row that is actually rendered.
+///
+/// Responsive pruning can leave a semantic segment in the plan even when the
+/// mandatory left label consumes every visible cell.  Returning `None` for a
+/// fully clipped segment prevents invisible controls from retaining hit areas.
+fn visible_status_segment_rect(area: Rect, x: u16, width: u16) -> Option<Rect> {
+    if area.height == 0 || width == 0 {
+        return None;
+    }
+    let area_right = area.x.saturating_add(area.width);
+    let segment_right = x.saturating_add(width);
+    let visible_start = x.max(area.x);
+    let visible_end = segment_right.min(area_right);
+    (visible_end > visible_start)
+        .then(|| Rect::new(visible_start, area.y, visible_end - visible_start, 1))
+}
+
 /// Render the status line into a 1-row area.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn render_status_line(
@@ -884,8 +912,75 @@ pub fn render_status_line(
     frame: &mut Frame,
     area: Rect,
 ) {
+    render_status_line_impl(
+        state,
+        active,
+        activity_badge,
+        recording_active,
+        help_visible,
+        accessibility,
+        screen_bindings,
+        toast_muted,
+        None,
+        frame,
+        area,
+    );
+}
+
+/// Render the status line and cache the exact interactive role rectangles.
+///
+/// This is the production shell path.  It shares the same segment plan and
+/// cursor used for drawing, so pruning, help-label width changes, non-zero
+/// origins, and terminal clipping cannot drift from mouse dispatch geometry.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub fn render_status_line_with_hits(
+    state: &TuiSharedState,
+    active: MailScreenId,
+    activity_badge: &str,
+    recording_active: bool,
+    help_visible: bool,
+    accessibility: &AccessibilitySettings,
+    screen_bindings: &[HelpEntry],
+    toast_muted: bool,
+    dispatcher: &MouseDispatcher,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    render_status_line_impl(
+        state,
+        active,
+        activity_badge,
+        recording_active,
+        help_visible,
+        accessibility,
+        screen_bindings,
+        toast_muted,
+        Some(dispatcher),
+        frame,
+        area,
+    );
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn render_status_line_impl(
+    state: &TuiSharedState,
+    active: MailScreenId,
+    activity_badge: &str,
+    recording_active: bool,
+    help_visible: bool,
+    accessibility: &AccessibilitySettings,
+    screen_bindings: &[HelpEntry],
+    toast_muted: bool,
+    dispatcher: Option<&MouseDispatcher>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     use ftui::text::{Line, Span, Text};
     use ftui_extras::text_effects::{StyledText, TextEffect};
+
+    if let Some(dispatcher) = dispatcher {
+        dispatcher.clear_status_slots();
+    }
 
     let tp = crate::tui_theme::TuiThemePalette::current();
 
@@ -986,6 +1081,14 @@ pub fn render_status_line(
     for seg in &right {
         let style = status_segment_style(seg, &tp, effects_enabled);
         let seg_width = segment_text_width(&seg.text);
+        if let (Some(dispatcher), Some(role), Some(rect)) = (
+            dispatcher,
+            seg.role.hit_role(),
+            visible_status_segment_rect(area, cursor_x, seg_width),
+        ) {
+            dispatcher.record_status_slot(role, rect);
+            frame.register_hit_region(rect, role.hit_id());
+        }
         if effects_enabled && seg.effect != StatusEffect::None && seg_width > 0 {
             effect_overlays.push((cursor_x, seg_width, seg.effect, seg.fg, seg.text.clone()));
         }
@@ -2206,6 +2309,144 @@ mod tests {
         assert!(
             last_text == "F1" || last_text == "[F1]",
             "expected help hint to be rightmost, got: {last_text}"
+        );
+    }
+
+    fn render_status_hit_geometry(width: u16, help_visible: bool) -> (MouseDispatcher, Rect) {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let a11y = AccessibilitySettings::default();
+        let dispatcher = MouseDispatcher::new();
+        let area = Rect::new(7, 2, width, 1);
+        dispatcher.update_chrome_areas(Rect::new(7, 0, width, 1), area);
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(area.x.saturating_add(width).saturating_add(1), 4, &mut pool);
+        render_status_line_with_hits(
+            &state,
+            MailScreenId::Dashboard,
+            "LIVE",
+            false,
+            help_visible,
+            &a11y,
+            &[],
+            false,
+            &dispatcher,
+            &mut frame,
+            area,
+        );
+
+        (dispatcher, area)
+    }
+
+    fn status_left_click(x: u16, y: u16) -> ftui::MouseEvent {
+        ftui::MouseEvent {
+            kind: ftui::MouseEventKind::Down(ftui::MouseButton::Left),
+            x,
+            y,
+            modifiers: ftui::Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn status_hit_geometry_matches_closed_help_role_cells_exactly() {
+        use crate::tui_hit_regions::MouseAction;
+
+        let (dispatcher, area) = render_status_hit_geometry(120, false);
+        let palette = dispatcher
+            .status_slot(StatusHitRole::PaletteToggle)
+            .expect("palette segment should survive at 120 columns");
+        let help = dispatcher
+            .status_slot(StatusHitRole::HelpToggle)
+            .expect("help segment should survive at 120 columns");
+
+        assert_eq!(palette, Rect::new(area.x + 112, area.y, 5, 1));
+        assert_eq!(help, Rect::new(area.x + 117, area.y, 3, 1));
+
+        for x in palette.x..palette.x + palette.width {
+            assert_eq!(
+                dispatcher.dispatch(&status_left_click(x, area.y)),
+                MouseAction::OpenPalette,
+                "palette cell x={x}"
+            );
+        }
+        for x in help.x..help.x + help.width {
+            assert_eq!(
+                dispatcher.dispatch(&status_left_click(x, area.y)),
+                MouseAction::ToggleHelp,
+                "help cell x={x}"
+            );
+        }
+
+        // The immediately preceding cell belongs to an informational segment,
+        // not the palette role.  The exact boundary between the two roles is
+        // also preserved rather than becoming one broad right-edge zone.
+        assert_eq!(
+            dispatcher.dispatch(&status_left_click(palette.x - 1, area.y)),
+            MouseAction::Forward
+        );
+        assert_eq!(
+            dispatcher.dispatch(&status_left_click(help.x - 1, area.y)),
+            MouseAction::OpenPalette
+        );
+    }
+
+    #[test]
+    fn status_hit_geometry_tracks_expanded_help_label() {
+        let (dispatcher, area) = render_status_hit_geometry(120, true);
+        assert_eq!(
+            dispatcher.status_slot(StatusHitRole::PaletteToggle),
+            Some(Rect::new(area.x + 110, area.y, 5, 1))
+        );
+        assert_eq!(
+            dispatcher.status_slot(StatusHitRole::HelpToggle),
+            Some(Rect::new(area.x + 115, area.y, 5, 1))
+        );
+    }
+
+    #[test]
+    fn status_hit_geometry_omits_pruned_palette_and_keeps_blank_cells_inert() {
+        use crate::tui_hit_regions::MouseAction;
+
+        // At 17 columns the mandatory screen title and help label fit, but
+        // responsive pruning removes LIVE and the palette role.
+        let (dispatcher, area) = render_status_hit_geometry(17, false);
+        assert_eq!(
+            dispatcher.status_slot(StatusHitRole::PaletteToggle),
+            None
+        );
+        let help = dispatcher
+            .status_slot(StatusHitRole::HelpToggle)
+            .expect("help role should survive at 17 columns");
+        assert_eq!(help, Rect::new(area.x + 14, area.y, 3, 1));
+
+        // The cell immediately before help is layout padding, not a synthetic
+        // palette target.  The old fixed right-edge zones misclassified it.
+        assert_eq!(
+            dispatcher.dispatch(&status_left_click(help.x - 1, area.y)),
+            MouseAction::Forward
+        );
+        assert_eq!(
+            dispatcher.dispatch(&status_left_click(help.x, area.y)),
+            MouseAction::ToggleHelp
+        );
+    }
+
+    #[test]
+    fn status_hit_geometry_omits_fully_clipped_roles() {
+        use crate::tui_hit_regions::MouseAction;
+
+        // The critical screen title consumes all ten cells.  Although help is
+        // retained semantically as the final fallback, none of it is rendered.
+        let (dispatcher, area) = render_status_hit_geometry(10, false);
+        assert_eq!(
+            dispatcher.status_slot(StatusHitRole::PaletteToggle),
+            None
+        );
+        assert_eq!(dispatcher.status_slot(StatusHitRole::HelpToggle), None);
+        assert_eq!(
+            dispatcher.dispatch(&status_left_click(area.x + area.width - 1, area.y)),
+            MouseAction::Forward
         );
     }
 
