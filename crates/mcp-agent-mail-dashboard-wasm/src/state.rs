@@ -248,6 +248,26 @@ impl TuiSharedState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Human-readable transport label used by the shared production chrome.
+    #[must_use]
+    pub fn transport_mode_label(&self) -> &'static str {
+        self.config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transport_mode()
+    }
+
+    /// Mean request latency used by the shared production status line.
+    #[must_use]
+    pub fn avg_latency_ms(&self) -> u64 {
+        let counters = self.request_counters();
+        if counters.total == 0 {
+            0
+        } else {
+            counters.latency_total_ms / counters.total
+        }
+    }
+
     #[must_use]
     pub fn uptime(&self) -> Duration {
         Duration::from_micros(self.logical_elapsed_micros.load(Ordering::Relaxed))

@@ -20,7 +20,9 @@ pub const MAX_TEXT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_ACTIONS: usize = 10_000;
 const MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const MAX_SPARKLINE_SAMPLES: usize = 240;
-const STARTUP_HISTORY_EVENTS: u64 = 986;
+// Match the native reference's populated roster/contact rails. Timed snapshots
+// below omit these repeated detail vectors and merge them from bootstrap.
+const STARTUP_HISTORY_EVENTS: u64 = 192;
 const STARTUP_AGENT_ROWS: usize = 500;
 const STARTUP_PROJECT_ROWS: usize = 41;
 const STARTUP_CONTACT_ROWS: usize = 200;
@@ -125,6 +127,34 @@ impl std::fmt::Display for DemoPackError {
 impl std::error::Error for DemoPackError {}
 
 impl DemoPack {
+    /// Minimal inert value used only while the host fetches and verifies the
+    /// external public pack. It avoids generating the full built-in demo in
+    /// `DashboardRunnerCore::new()` and is replaced before initialization.
+    #[must_use]
+    pub(crate) fn unloaded_runner_placeholder() -> Self {
+        Self {
+            schema: DEMO_PACK_SCHEMA_V1.to_string(),
+            title: "Agent Mail browser runner".to_string(),
+            replay_label: "awaiting verified public pack".to_string(),
+            duration_ms: 1,
+            loop_replay: false,
+            provenance: DemoProvenance {
+                source_label: "aggregate counts pending; details synthetic".to_string(),
+                captured_at: "1970-01-01T00:00:00Z".to_string(),
+                source_revision: "unloaded".to_string(),
+                privacy_policy: PUBLIC_PRIVACY_POLICY_V1.to_string(),
+                content_sha256: String::new(),
+            },
+            bootstrap: DemoBootstrap {
+                db_stats: DbStatSnapshot::default(),
+                requests: RequestCounters::default(),
+                latency_samples_ms: Vec::new(),
+                console_lines: Vec::new(),
+            },
+            actions: Vec::new(),
+        }
+    }
+
     pub fn from_json(json: &str) -> Result<Self, DemoPackError> {
         // Size gate BEFORE parsing: nothing about a pack larger than the
         // contract ceiling is worth allocating for.
@@ -283,7 +313,21 @@ impl DemoPack {
             DemoOperation::PublishEvent { event } => {
                 let _ = state.push_event(event.clone());
             }
-            DemoOperation::SetDbStats { snapshot } => state.update_db_stats(snapshot.clone()),
+            DemoOperation::SetDbStats { snapshot } => {
+                let mut merged = snapshot.clone();
+                if let Some(current) = state.db_stats_snapshot() {
+                    if merged.agents_list.is_empty() {
+                        merged.agents_list = current.agents_list;
+                    }
+                    if merged.projects_list.is_empty() {
+                        merged.projects_list = current.projects_list;
+                    }
+                    if merged.contacts_list.is_empty() {
+                        merged.contacts_list = current.contacts_list;
+                    }
+                }
+                state.update_db_stats(merged);
+            }
             DemoOperation::RecordRequest {
                 status,
                 duration_ms,
@@ -502,6 +546,12 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
         "release/**",
         "scripts/verification/**",
     ];
+    const MESSAGE_BODIES: [&str; 4] = [
+        "Parity review complete.\n\nThe browser frame now uses the production tab chrome and DashboardScreen. Mouse hit regions are derived from the rendered layout, so resizing cannot desynchronize clicks.",
+        "Fresh-eyes pass found the input queue waiting on the replay clock.\n\nPointer events now wake the runner on the next animation frame while the deterministic replay remains throttled.",
+        "Release candidate is ready for verification.\n\nPlease compare the 220-column terminal buffer, then check Dashboard filters, screen tabs, wheel scrolling, and fullscreen restoration.",
+        "Reservation handoff confirmed.\n\nThe public replay remains read-only: aggregate counts come from the snapshot exporter while all names, paths, messages, and event details are synthetic.",
+    ];
 
     (0_u64..STARTUP_HISTORY_EVENTS)
         .map(|index| {
@@ -510,8 +560,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
             let project_index = usize::try_from(index / 3).unwrap_or_default() % PROJECTS.len();
             let subject_index = usize::try_from(index).unwrap_or_default() % SUBJECTS.len();
             let timestamp_micros = base_ts
-                - i64::try_from(STARTUP_HISTORY_EVENTS.saturating_sub(index))
-                    .unwrap_or_default()
+                - i64::try_from(STARTUP_HISTORY_EVENTS.saturating_sub(index)).unwrap_or_default()
                     * 750_000;
             let seq = 20_000 + index;
             let id = 30_000 + i64::try_from(index).unwrap_or_default();
@@ -561,8 +610,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                         subject: SUBJECTS[subject_index].to_string(),
                         thread_id: format!("public-coordination-{}", index % 12),
                         project: PROJECTS[project_index].to_string(),
-                        body_md: "Synthetic public coordination detail for the interactive dashboard replay."
-                            .to_string(),
+                        body_md: MESSAGE_BODIES[subject_index % MESSAGE_BODIES.len()].to_string(),
                     },
                 },
                 _ => DemoOperation::PublishEvent {
@@ -577,8 +625,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                         subject: SUBJECTS[subject_index].to_string(),
                         thread_id: format!("public-coordination-{}", index % 12),
                         project: PROJECTS[project_index].to_string(),
-                        body_md: "Synthetic public coordination detail for the interactive dashboard replay."
-                            .to_string(),
+                        body_md: MESSAGE_BODIES[subject_index % MESSAGE_BODIES.len()].to_string(),
                     },
                 },
             };
@@ -791,6 +838,19 @@ pub fn curated_public_demo() -> DemoPack {
     }
     stats_after_release.timestamp_micros = BASE_TS + 10_000_000;
 
+    // Timed updates change scalar counters and reservations only. Leaving the
+    // large roster/project/contact vectors in every snapshot multiplied the
+    // public artifact and startup validation cost without adding information.
+    for snapshot in [
+        &mut stats_after_message,
+        &mut stats_after_ack,
+        &mut stats_after_release,
+    ] {
+        snapshot.agents_list.clear();
+        snapshot.projects_list.clear();
+        snapshot.contacts_list.clear();
+    }
+
     let synthetic_message = MailEvent::MessageSent {
         seq: 10_001,
         timestamp_micros: BASE_TS + 2_000_000,
@@ -929,6 +989,11 @@ mod tests {
     fn curated_pack_round_trips_and_digest_verifies() {
         let pack = curated_public_demo();
         let json = pack.to_pretty_json().unwrap();
+        assert!(
+            json.len() < 500_000,
+            "public replay pack regressed to {} bytes",
+            json.len()
+        );
         assert_eq!(DemoPack::from_json(&json).unwrap(), pack);
     }
 
