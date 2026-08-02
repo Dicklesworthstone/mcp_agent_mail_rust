@@ -4858,9 +4858,16 @@ fn merge_salvaged_database(
                     ))
                 })?;
                     if current_kind != kind {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage: recipient ({target_message_id}, {target_agent_id}) has conflicting kinds {current_kind:?} and {kind:?}; refusing a primary-key collision"
-                        )));
+                        // #219: a to/cc divergence between the archive-built
+                        // candidate and the live database must never refuse
+                        // an entire recovery. The live DB wins: the
+                        // promotion continuity receipt keys recipients on
+                        // (message, agent, kind), so preserving the salvage
+                        // side's kind is what "no DB coordination-state
+                        // loss" means to the system's own invariants.
+                        stats.push_warning(format!(
+                            "salvaged recipient ({target_message_id}, {target_agent_id}) has conflicting kinds {current_kind:?} (candidate) and {kind:?} (salvage); adopted the salvage kind to preserve DB coordination-state continuity"
+                        ));
                     }
                     let current_read_ts = existing_row
                         .get_named::<Option<i64>>("read_ts")
@@ -4868,13 +4875,17 @@ fn merge_salvaged_database(
                     let current_ack_ts = existing_row
                         .get_named::<Option<i64>>("ack_ts")
                         .unwrap_or_default();
-                    if current_read_ts != read_ts || current_ack_ts != ack_ts {
+                    if current_read_ts != read_ts
+                        || current_ack_ts != ack_ts
+                        || current_kind != kind
+                    {
                         target_conn
                         .execute_sync(
                             "UPDATE message_recipients SET \
-                                 read_ts = ?, ack_ts = ? \
+                                 kind = ?, read_ts = ?, ack_ts = ? \
                              WHERE message_id = ? AND agent_id = ?",
                             &[
+                                Value::Text(kind),
                                 read_ts.map_or(Value::Null, Value::BigInt),
                                 ack_ts.map_or(Value::Null, Value::BigInt),
                                 Value::BigInt(target_message_id),
