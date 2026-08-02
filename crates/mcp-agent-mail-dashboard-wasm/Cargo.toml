@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["browser-dashboard"]
 browser-dashboard = []
-exporter = ["dep:sqlmodel-sqlite", "dep:clap"]
+exporter = ["dep:sqlmodel-sqlite", "dep:clap", "dep:same-file"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -39,6 +39,7 @@ chrono = { version = "0.4", features = ["serde"] }
 web-time = "1.1.0"
 sqlmodel-sqlite = { version = "=0.3.0", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+same-file = { version = "1", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"

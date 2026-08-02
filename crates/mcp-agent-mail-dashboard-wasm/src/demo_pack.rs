@@ -198,9 +198,9 @@ impl DemoPack {
         // in the public JSON response. Compare the complete raw shape against
         // the typed re-serialization as a defense-in-depth backstop for every
         // nested schema, including flattened actions and external structs.
-        let typed = serde_json::to_value(&pack)
-            .map_err(|error| DemoPackError::Json(error.to_string()))?;
-        reject_unknown_json_members(&raw, &typed, "$" )?;
+        let typed =
+            serde_json::to_value(&pack).map_err(|error| DemoPackError::Json(error.to_string()))?;
+        reject_unknown_json_members(&raw, &typed, "$")?;
         pack.validate()?;
         Ok(pack)
     }
@@ -386,10 +386,7 @@ fn validate_snapshot(snapshot: &DbStatSnapshot) -> Result<(), DemoPackError> {
     }
     for (index, project) in snapshot.projects_list.iter().enumerate() {
         validate_public_text(&format!("projects[{index}].slug"), &project.slug)?;
-        validate_public_path(
-            &format!("projects[{index}].human_key"),
-            &project.human_key,
-        )?;
+        validate_public_path(&format!("projects[{index}].human_key"), &project.human_key)?;
     }
     for (index, contact) in snapshot.contacts_list.iter().enumerate() {
         validate_public_text(
@@ -476,11 +473,7 @@ fn reject_unknown_json_members(
             for (index, (raw_value, typed_value)) in
                 raw_items.iter().zip(typed_items.iter()).enumerate()
             {
-                reject_unknown_json_members(
-                    raw_value,
-                    typed_value,
-                    &format!("{path}[{index}]"),
-                )?;
+                reject_unknown_json_members(raw_value, typed_value, &format!("{path}[{index}]"))?;
             }
         }
         _ => {}
@@ -662,12 +655,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
         "search_messages",
         "health_check",
     ];
-    const HTTP_PATHS: [&str; 4] = [
-        "api/mcp",
-        "api/messages",
-        "api/agents",
-        "health/ready",
-    ];
+    const HTTP_PATHS: [&str; 4] = ["api/mcp", "api/messages", "api/agents", "health/ready"];
 
     (0_u64..STARTUP_HISTORY_EVENTS)
         .map(|index| {
@@ -690,7 +678,8 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                 usize::try_from(paired_index).unwrap_or_default() % AGENTS.len();
             let paired_project_index =
                 usize::try_from(paired_index / 3).unwrap_or_default() % PROJECTS.len();
-            let tool_index = usize::try_from(paired_index / 2).unwrap_or_default() % TOOL_NAMES.len();
+            let tool_index =
+                usize::try_from(paired_index / 2).unwrap_or_default() % TOOL_NAMES.len();
             let operation = match event_slot {
                 0 => DemoOperation::PublishEvent {
                     event: MailEvent::AgentRegistered {
@@ -796,10 +785,15 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
                         timestamp_micros,
                         source: EventSource::Http,
                         redacted: true,
-                        method: if index.is_multiple_of(4) { "POST" } else { "GET" }.to_string(),
-                        path: HTTP_PATHS[usize::try_from(index).unwrap_or_default()
-                            % HTTP_PATHS.len()]
-                            .to_string(),
+                        method: if index.is_multiple_of(4) {
+                            "POST"
+                        } else {
+                            "GET"
+                        }
+                        .to_string(),
+                        path: HTTP_PATHS
+                            [usize::try_from(index).unwrap_or_default() % HTTP_PATHS.len()]
+                        .to_string(),
                         status: match index % 5 {
                             0 => 503,
                             1 => 409,
@@ -1232,8 +1226,14 @@ mod tests {
         };
         let tool_starts = event_count(MailEventKind::ToolCallStart);
         let tool_ends = event_count(MailEventKind::ToolCallEnd);
-        assert_eq!(tool_starts, tool_ends, "tool lifecycle rows must be balanced");
-        assert!(tool_starts >= 12, "tool filters need a dense opening history");
+        assert_eq!(
+            tool_starts, tool_ends,
+            "tool lifecycle rows must be balanced"
+        );
+        assert!(
+            tool_starts >= 12,
+            "tool filters need a dense opening history"
+        );
         assert!(event_count(MailEventKind::HttpRequest) >= 12);
         assert!(event_count(MailEventKind::GitSegfaultRetry) >= 6);
     }
@@ -1353,8 +1353,7 @@ mod tests {
         cases.push(("nested snapshot row", snapshot));
 
         let mut action = base.clone();
-        action["actions"][0]["private_dump"] =
-            serde_json::json!("/Users/private/mailbox.sqlite3");
+        action["actions"][0]["private_dump"] = serde_json::json!("/Users/private/mailbox.sqlite3");
         cases.push(("flattened action", action));
 
         let mut event = base;

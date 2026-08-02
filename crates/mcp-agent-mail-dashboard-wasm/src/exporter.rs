@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use same_file::Handle;
 use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 
 /// The six public aggregate counts exported into the demo pack.
@@ -40,12 +41,22 @@ pub struct AggregateCounts {
 
 /// Stat fingerprint used to re-verify that a quiescent source stayed
 /// quiescent across an `immutable=1` read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct QuiescentStamp {
+    identity: Handle,
     len: u64,
     modified: SystemTime,
     wal_exists: bool,
     shm_exists: bool,
+}
+
+/// Stable file handles for a live WAL triplet. The files may grow while the
+/// writer commits, but their identities must not change beneath the exporter.
+#[derive(Debug, PartialEq, Eq)]
+struct LiveSourceIdentity {
+    database: Handle,
+    wal: Handle,
+    shm: Handle,
 }
 
 fn wal_sidecar_paths(path: &Path) -> (PathBuf, PathBuf) {
@@ -60,11 +71,43 @@ fn quiescent_stamp(path: &Path) -> Result<QuiescentStamp, Box<dyn std::error::Er
     let metadata = std::fs::metadata(path)?;
     let (wal, shm) = wal_sidecar_paths(path);
     Ok(QuiescentStamp {
+        identity: Handle::from_path(path)?,
         len: metadata.len(),
         modified: metadata.modified()?,
-        wal_exists: wal.exists(),
-        shm_exists: shm.exists(),
+        wal_exists: wal.try_exists()?,
+        shm_exists: shm.try_exists()?,
     })
+}
+
+impl LiveSourceIdentity {
+    fn capture(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let (wal, shm) = wal_sidecar_paths(path);
+        Ok(Self {
+            database: Handle::from_path(path)?,
+            wal: Handle::from_path(wal)?,
+            shm: Handle::from_path(shm)?,
+        })
+    }
+
+    fn verify_paths(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let current = Self::capture(path).map_err(|error| {
+            format!("live WAL source became incomplete during aggregate export: {error}")
+        })?;
+        if current != *self {
+            return Err(
+                "live WAL database or sidecar identity changed during aggregate export; \
+                 refusing counts from an unbound source"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SourceIdentity {
+    Immutable(QuiescentStamp),
+    Live(LiveSourceIdentity),
 }
 
 /// Percent-encode the characters that would change URI interpretation.
@@ -77,9 +120,7 @@ fn uri_escape_path(path: &str) -> String {
 /// A strictly read-only handle on the source mailbox database.
 pub struct SourceConnection {
     connection: SqliteConnection,
-    /// `Some` when the source was quiescent at open time and was therefore
-    /// opened `immutable=1`; the stamp re-verifies quiescence after reads.
-    immutable_stamp: Option<QuiescentStamp>,
+    identity: SourceIdentity,
     path: PathBuf,
 }
 
@@ -101,19 +142,43 @@ pub struct SourceConnection {
 pub fn open_source_read_only(path: &str) -> Result<SourceConnection, Box<dyn std::error::Error>> {
     let source_path = PathBuf::from(path);
     let (wal, shm) = wal_sidecar_paths(&source_path);
-    let live_wal = wal.exists() || shm.exists();
+    let wal_exists = wal.try_exists()?;
+    let shm_exists = shm.try_exists()?;
 
-    let (connection, immutable_stamp) = if live_wal {
-        let mut config = SqliteConfig::file(path);
-        config.flags = OpenFlags::read_only();
-        (SqliteConnection::open(&config)?, None)
-    } else {
-        let stamp = quiescent_stamp(&source_path)?;
-        let uri = format!("file:{}?mode=ro&immutable=1", uri_escape_path(path));
-        let mut config = SqliteConfig::file(uri);
-        config.flags = OpenFlags::read_only();
-        config.flags.uri = true;
-        (SqliteConnection::open(&config)?, Some(stamp))
+    let (connection, identity) = match (wal_exists, shm_exists) {
+        (true, true) => {
+            let identity = LiveSourceIdentity::capture(&source_path)?;
+            let mut config = SqliteConfig::file(path);
+            config.flags = OpenFlags::read_only();
+            let connection = SqliteConnection::open(&config)?;
+            // Bind the SQLite handle to the exact path identities observed
+            // before open. A checkpoint/restart can replace WAL sidecars in
+            // the exists/open window; publishing through that race is unsafe.
+            identity.verify_paths(&source_path)?;
+            (connection, SourceIdentity::Live(identity))
+        }
+        (false, false) => {
+            let stamp = quiescent_stamp(&source_path)?;
+            let uri = format!("file:{}?mode=ro&immutable=1", uri_escape_path(path));
+            let mut config = SqliteConfig::file(uri);
+            config.flags = OpenFlags::read_only();
+            config.flags.uri = true;
+            let connection = SqliteConnection::open(&config)?;
+            let after_open = quiescent_stamp(&source_path)?;
+            if after_open != stamp {
+                return Err(
+                    "source database changed while opening the immutable aggregate reader".into(),
+                );
+            }
+            (connection, SourceIdentity::Immutable(stamp))
+        }
+        _ => {
+            return Err(
+                "source database has an incomplete WAL sidecar pair; refusing a plain read-only \
+                 open that could create or mutate the missing sidecar"
+                    .into(),
+            );
+        }
     };
 
     let user_version = connection
@@ -134,7 +199,7 @@ pub fn open_source_read_only(path: &str) -> Result<SourceConnection, Box<dyn std
 
     Ok(SourceConnection {
         connection,
-        immutable_stamp,
+        identity,
         path: source_path,
     })
 }
@@ -185,15 +250,18 @@ pub fn read_aggregates_snapshot(
         let _ = connection.execute_raw("ROLLBACK");
     }
 
-    if let Some(stamp) = &source.immutable_stamp {
-        let now = quiescent_stamp(&source.path)?;
-        if now != *stamp {
-            return Err(
-                "source database changed during an immutable read; the exported counts \
-                 cannot be trusted — rerun the export against the live database"
-                    .into(),
-            );
+    match &source.identity {
+        SourceIdentity::Immutable(stamp) => {
+            let now = quiescent_stamp(&source.path)?;
+            if now != *stamp {
+                return Err(
+                    "source database changed during an immutable read; the exported counts \
+                     cannot be trusted — rerun the export against the live database"
+                        .into(),
+                );
+            }
         }
+        SourceIdentity::Live(identity) => identity.verify_paths(&source.path)?,
     }
 
     result
@@ -228,6 +296,7 @@ fn read_aggregates_in_transaction(
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -277,6 +346,18 @@ mod tests {
         connection
     }
 
+    fn snapshot_directory(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(path)
+            .expect("read snapshot directory")
+            .map(|entry| {
+                let entry = entry.expect("read snapshot entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = std::fs::read(entry.path()).expect("read snapshot file");
+                (name, bytes)
+            })
+            .collect()
+    }
+
     #[test]
     fn read_only_open_rejects_missing_source() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -290,6 +371,39 @@ mod tests {
             !path.exists(),
             "failed read-only open must not leave a file behind"
         );
+    }
+
+    #[test]
+    fn read_only_open_rejects_partial_wal_pairs_without_mutating_files() {
+        for sidecar_suffix in ["-wal", "-shm"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("mailbox.sqlite3");
+            let path_string = path.to_string_lossy().into_owned();
+            let writer = SqliteConnection::open_file(path_string.clone()).expect("open database");
+            create_schema(&writer);
+            insert_coherent_round(&writer);
+            drop(writer);
+
+            let sidecar_path = PathBuf::from(format!("{path_string}{sidecar_suffix}"));
+            std::fs::write(&sidecar_path, b"incomplete synthetic sidecar")
+                .expect("create partial sidecar fixture");
+            let before = snapshot_directory(dir.path());
+
+            let result = open_source_read_only(&path_string);
+            let error = match result {
+                Ok(_) => panic!("partial WAL pair unexpectedly opened"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("incomplete WAL sidecar pair"),
+                "partial pair failed for an unrelated reason: {error}"
+            );
+            assert_eq!(
+                snapshot_directory(dir.path()),
+                before,
+                "rejected partial WAL pair must remain byte-for-byte untouched"
+            );
+        }
     }
 
     #[test]
@@ -414,23 +528,11 @@ mod tests {
             .expect("checkpoint");
         drop(writer);
 
-        let snapshot_dir = |label: &str| -> std::collections::BTreeMap<String, Vec<u8>> {
-            std::fs::read_dir(dir.path())
-                .expect(label)
-                .map(|entry| {
-                    let entry = entry.expect(label);
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let bytes = std::fs::read(entry.path()).expect(label);
-                    (name, bytes)
-                })
-                .collect()
-        };
-
-        let before = snapshot_dir("snapshot before");
+        let before = snapshot_directory(dir.path());
         let reader = open_source_read_only(&path_string).expect("read-only open");
         let counts = read_aggregates_snapshot(&reader).expect("aggregates");
         drop(reader);
-        let after = snapshot_dir("snapshot after");
+        let after = snapshot_directory(dir.path());
 
         assert_eq!(counts.projects, 1);
         assert_eq!(

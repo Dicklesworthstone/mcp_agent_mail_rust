@@ -2411,10 +2411,7 @@ mod tests {
         // At 17 columns the mandatory screen title and help label fit, but
         // responsive pruning removes LIVE and the palette role.
         let (dispatcher, area) = render_status_hit_geometry(17, false);
-        assert_eq!(
-            dispatcher.status_slot(StatusHitRole::PaletteToggle),
-            None
-        );
+        assert_eq!(dispatcher.status_slot(StatusHitRole::PaletteToggle), None);
         let help = dispatcher
             .status_slot(StatusHitRole::HelpToggle)
             .expect("help role should survive at 17 columns");
@@ -2439,10 +2436,7 @@ mod tests {
         // The critical screen title consumes all ten cells.  Although help is
         // retained semantically as the final fallback, none of it is rendered.
         let (dispatcher, area) = render_status_hit_geometry(10, false);
-        assert_eq!(
-            dispatcher.status_slot(StatusHitRole::PaletteToggle),
-            None
-        );
+        assert_eq!(dispatcher.status_slot(StatusHitRole::PaletteToggle), None);
         assert_eq!(dispatcher.status_slot(StatusHitRole::HelpToggle), None);
         assert_eq!(
             dispatcher.dispatch(&status_left_click(area.x + area.width - 1, area.y)),
