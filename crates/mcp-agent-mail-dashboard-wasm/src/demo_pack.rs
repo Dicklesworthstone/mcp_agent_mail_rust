@@ -18,6 +18,10 @@ pub const MAX_SERIALIZED_PACK_BYTES: usize = 8 * 1024 * 1024;
 /// console lines, event strings). Shared across all loaders.
 pub const MAX_TEXT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_ACTIONS: usize = 10_000;
+/// Bound synchronous work at any single replay instant. The curated opening
+/// frame intentionally applies 192 history events at t=0, so retain generous
+/// headroom without allowing an entire 10,000-action pack to block one frame.
+const MAX_ACTIONS_PER_TIMESTAMP: usize = 512;
 const MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const MAX_SPARKLINE_SAMPLES: usize = 240;
 // Match the native reference's populated roster/contact rails. Timed snapshots
@@ -108,6 +112,11 @@ pub enum DemoPackError {
     EmptyMetadata(&'static str),
     InvalidDuration(u64),
     TooManyActions(usize),
+    TooManyActionsAtTimestamp {
+        at_ms: u64,
+        count: usize,
+        max: usize,
+    },
     TooManySparklineSamples(usize),
     NonFiniteLatency(usize),
     NonMonotonicAction {
@@ -275,6 +284,7 @@ impl DemoPack {
             validate_public_text(&format!("bootstrap.console_lines[{index}]"), line)?;
         }
         let mut previous_ms = 0;
+        let mut actions_at_timestamp = 0_usize;
         for (index, action) in self.actions.iter().enumerate() {
             if index > 0 && action.at_ms < previous_ms {
                 return Err(DemoPackError::NonMonotonicAction {
@@ -288,6 +298,18 @@ impl DemoPack {
                     index,
                     at_ms: action.at_ms,
                     duration_ms: self.duration_ms,
+                });
+            }
+            if index == 0 || action.at_ms != previous_ms {
+                actions_at_timestamp = 1;
+            } else {
+                actions_at_timestamp = actions_at_timestamp.saturating_add(1);
+            }
+            if actions_at_timestamp > MAX_ACTIONS_PER_TIMESTAMP {
+                return Err(DemoPackError::TooManyActionsAtTimestamp {
+                    at_ms: action.at_ms,
+                    count: actions_at_timestamp,
+                    max: MAX_ACTIONS_PER_TIMESTAMP,
                 });
             }
             match &action.operation {
@@ -1503,6 +1525,20 @@ mod tests {
         assert!(matches!(
             invalid_status.validate(),
             Err(DemoPackError::InvalidHttpStatus { status: 99, .. })
+        ));
+
+        let mut action_burst = curated_public_demo();
+        let repeated = action_burst.actions[0].clone();
+        action_burst.actions = vec![repeated; super::MAX_ACTIONS_PER_TIMESTAMP + 1];
+        action_burst.finalize_digest();
+        assert!(matches!(
+            action_burst.validate(),
+            Err(DemoPackError::TooManyActionsAtTimestamp {
+                at_ms: 0,
+                count,
+                max,
+            }) if count == super::MAX_ACTIONS_PER_TIMESTAMP + 1
+                && max == super::MAX_ACTIONS_PER_TIMESTAMP
         ));
     }
 

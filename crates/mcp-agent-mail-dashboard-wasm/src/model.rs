@@ -4,7 +4,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, KeyCode, KeyEventKind, MouseEventKind, Style};
+use ftui::{Event, KeyCode, KeyEventKind, Modifiers, MouseEventKind, Style};
 use ftui_runtime::program::{Cmd, Model};
 
 use crate::demo_pack::{DemoPack, DemoPackError, curated_public_demo};
@@ -24,6 +24,17 @@ impl From<Event> for DashboardMessage {
     fn from(event: Event) -> Self {
         Self(event)
     }
+}
+
+/// Result of advancing the deterministic replay independently of rendering.
+///
+/// The browser runner uses `advanced_ms` to derive production-parity logical
+/// ticks without tying replay time to the host's animation-frame cadence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReplayAdvance {
+    pub(crate) advanced_ms: u64,
+    pub(crate) visible_changed: bool,
+    pub(crate) replay_reset: bool,
 }
 
 /// State owned by the browser runner. The dashboard and replay adapter are
@@ -109,7 +120,7 @@ impl DashboardModel {
         screen
     }
 
-    fn sync_replay_clock(&self) {
+    pub(crate) fn sync_replay_clock(&self) {
         let elapsed_micros = i64::try_from(self.elapsed_ms)
             .unwrap_or(i64::MAX)
             .saturating_mul(1_000);
@@ -183,36 +194,61 @@ impl DashboardModel {
     }
 
     /// Advance the deterministic replay clock. Returns whether visible state
-    /// may have changed and therefore needs a host-driven tick/render.
+    /// may have changed and therefore needs a host-driven render.
     pub fn advance_replay_ms(&mut self, dt_ms: u64) -> bool {
+        self.advance_replay(dt_ms).visible_changed
+    }
+
+    /// Advance replay state and report the exact amount of logical time that
+    /// was consumed. Loop reconstruction is constant in the number of cycles:
+    /// prior cycles cannot affect the final replay snapshot, so only the final
+    /// cycle's bootstrap and due actions need to be applied.
+    pub(crate) fn advance_replay(&mut self, dt_ms: u64) -> ReplayAdvance {
         if self.paused || dt_ms == 0 {
-            return false;
+            return ReplayAdvance::default();
         }
 
         let previous_clock_second = self.elapsed_ms / 1_000;
-        let mut actions_applied = false;
-        let mut replay_reset = false;
-        let mut remaining = dt_ms;
-        loop {
-            let to_end = self.pack.duration_ms.saturating_sub(self.elapsed_ms);
-            let step = remaining.min(to_end);
-            self.elapsed_ms = self.elapsed_ms.saturating_add(step);
-            actions_applied |= self.apply_due_actions();
-            remaining = remaining.saturating_sub(step);
+        let actions_applied;
+        let replay_reset;
+        let duration_ms = self.pack.duration_ms;
+        let total_ms = u128::from(self.elapsed_ms) + u128::from(dt_ms);
+        let advanced_ms;
 
-            if self.elapsed_ms < self.pack.duration_ms {
-                break;
-            }
-            if !self.pack.loop_replay || remaining == 0 {
-                break;
-            }
+        if total_ms <= u128::from(duration_ms) {
+            self.elapsed_ms = u64::try_from(total_ms).unwrap_or(duration_ms);
+            actions_applied = self.apply_due_actions();
+            replay_reset = false;
+            advanced_ms = dt_ms;
+        } else if !self.pack.loop_replay {
+            advanced_ms = duration_ms.saturating_sub(self.elapsed_ms);
+            self.elapsed_ms = duration_ms;
+            actions_applied = self.apply_due_actions();
+            replay_reset = false;
+        } else {
+            let remainder = (total_ms - u128::from(duration_ms)) % u128::from(duration_ms);
+            let final_elapsed_ms = if remainder == 0 {
+                duration_ms
+            } else {
+                u64::try_from(remainder).unwrap_or(duration_ms)
+            };
+
             self.reset_replay(true);
+            self.elapsed_ms = final_elapsed_ms;
+            actions_applied = self.apply_due_actions();
             replay_reset = true;
+            advanced_ms = dt_ms;
         }
 
         self.state.set_elapsed_ms(self.elapsed_ms);
         self.sync_replay_clock();
-        actions_applied || replay_reset || self.elapsed_ms / 1_000 != previous_clock_second
+        ReplayAdvance {
+            advanced_ms,
+            visible_changed: actions_applied
+                || replay_reset
+                || self.elapsed_ms / 1_000 != previous_clock_second,
+            replay_reset,
+        }
     }
 
     fn apply_due_actions(&mut self) -> bool {
@@ -261,6 +297,18 @@ impl DashboardModel {
     }
 
     #[must_use]
+    pub(crate) const fn tick_count(&self) -> u64 {
+        self.tick_count
+    }
+
+    /// Apply one production-cadence logical tick without forcing an
+    /// intermediate browser repaint.
+    pub(crate) fn logical_tick(&mut self) {
+        self.tick_count = self.tick_count.saturating_add(1);
+        self.screen.tick(self.tick_count, &self.state);
+    }
+
+    #[must_use]
     pub const fn pack(&self) -> &DemoPack {
         &self.pack
     }
@@ -306,6 +354,9 @@ impl DashboardModel {
                 let label = match target {
                     DeepLinkTarget::TimelineAtTime(timestamp) => {
                         self.activate_screen(MailScreenId::Timeline);
+                        let _ = self
+                            .public_screen
+                            .focus_timeline_at(timestamp, &self.state);
                         format!("timeline:{timestamp}")
                     }
                     DeepLinkTarget::SearchFocused(query) => {
@@ -386,6 +437,15 @@ impl DashboardModel {
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
         {
+            let is_ctrl_p = key.modifiers.contains(Modifiers::CTRL)
+                && matches!(key.code, KeyCode::Char('p' | 'P'));
+            if is_ctrl_p {
+                self.last_deep_link = Some("search:".to_string());
+                self.activate_screen(MailScreenId::Search);
+                self.public_screen.begin_search("");
+                return true;
+            }
+
             match key.code {
                 KeyCode::Tab => {
                     self.activate_screen(self.active_screen.next());
@@ -405,13 +465,22 @@ impl DashboardModel {
                     self.interaction_revision = self.interaction_revision.saturating_add(1);
                     return true;
                 }
-                KeyCode::Char('/') if !text_mode => {
+                KeyCode::Char('/')
+                    if !text_mode && self.active_screen != MailScreenId::Dashboard =>
+                {
                     self.last_deep_link = Some("search:".to_string());
                     self.activate_screen(MailScreenId::Search);
                     self.public_screen.begin_search("");
                     return true;
                 }
-                KeyCode::Char(character) if !text_mode => {
+                KeyCode::Char(character)
+                    if !text_mode
+                        && !key
+                            .modifiers
+                            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                        && !(self.active_screen == MailScreenId::Dashboard
+                            && matches!(character, '1'..='4')) =>
+                {
                     if let Some(screen) = screen_from_jump_key(character) {
                         self.activate_screen(screen);
                         return true;
@@ -425,11 +494,7 @@ impl DashboardModel {
 
     fn screen_bindings(&self) -> Vec<HelpEntry> {
         if self.active_screen == MailScreenId::Dashboard {
-            self.screen
-                .keybindings()
-                .into_iter()
-                .filter(|entry| !matches!(entry.key, "/" | "1-4"))
-                .collect()
+            self.screen.keybindings()
         } else {
             vec![
                 HelpEntry {
@@ -480,6 +545,10 @@ impl Model for DashboardModel {
     }
 
     fn view(&self, frame: &mut ftui::Frame<'_>) {
+        // Dashboard time helpers use a thread-local compatibility clock. A
+        // browser page can host multiple runners, so install this instance's
+        // clock immediately before every render.
+        self.sync_replay_clock();
         let area = ftui::layout::Rect::new(0, 0, frame.width(), frame.height());
         let chrome = crate::tui_chrome::chrome_layout(area);
         crate::tui_chrome::render_tab_bar(
@@ -504,7 +573,7 @@ impl Model for DashboardModel {
         }
 
         let bindings = self.screen_bindings();
-        crate::tui_chrome::render_status_line(
+        crate::tui_chrome::render_status_line_with_hits(
             &self.state,
             self.active_screen,
             "REPLAY",
@@ -513,6 +582,7 @@ impl Model for DashboardModel {
             &self.accessibility,
             &bindings,
             false,
+            &self.mouse_dispatcher,
             frame,
             chrome.status_line,
         );
@@ -542,7 +612,7 @@ fn render_browser_help(
     let inner = block.inner(overlay);
     block.render(overlay, frame);
     let text = format!(
-        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click Dashboard filters or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  /                    open Search\n  F1 or ?              toggle this help\n\nThis browser build is read-only. Aggregate counts come from a read-only Agent Mail SQLite export; names, paths, messages, and replay events are synthetic public-demo details.",
+        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click Dashboard filters or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  1-4 on Dashboard     apply its quick filters\n  / on Dashboard       edit its live filter\n  / elsewhere          open Search\n  Ctrl+P               open Search\n  F1 or ?              toggle this help\n\nThis browser build is read-only. Aggregate counts come from a read-only Agent Mail SQLite export; names, paths, messages, and replay events are synthetic public-demo details.",
         meta.title, meta.description
     );
     Paragraph::new(text)

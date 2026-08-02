@@ -9,6 +9,10 @@ use ftui_web::{WebFlatPatchBatch, WebPatchStats};
 use crate::demo_pack::DemoPackError;
 use crate::model::DashboardModel;
 
+const MAX_HOST_ADVANCE_MS: f64 = 60_000.0;
+const NANOS_PER_MILLI: u128 = 1_000_000;
+const LOGICAL_TICK_MS: u64 = 100;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunnerStatus {
     pub running: bool,
@@ -38,6 +42,9 @@ pub struct DashboardRunnerCore {
     cached_patch_hash: Option<String>,
     cached_patch_stats: Option<WebPatchStats>,
     cached_logs: Vec<String>,
+    replay_submillis_nanos: u32,
+    logical_tick_remainder_ms: u64,
+    render_request_pending: bool,
 }
 
 impl DashboardRunnerCore {
@@ -48,6 +55,9 @@ impl DashboardRunnerCore {
             cached_patch_hash: None,
             cached_patch_stats: None,
             cached_logs: Vec::new(),
+            replay_submillis_nanos: 0,
+            logical_tick_remainder_ms: 0,
+            render_request_pending: false,
         }
     }
 
@@ -62,9 +72,8 @@ impl DashboardRunnerCore {
 
     pub fn load_demo_pack_json(&mut self, json: &str) -> Result<(), DemoPackError> {
         self.inner.model_mut().load_pack_json(json)?;
-        if self.inner.is_initialized() {
-            self.inner.push_event(ftui::Event::Tick);
-        }
+        self.reset_timing_accumulators();
+        self.request_render();
         Ok(())
     }
 
@@ -72,13 +81,66 @@ impl DashboardRunnerCore {
         if !dt_ms.is_finite() || dt_ms <= 0.0 {
             return;
         }
-        let bounded_ms = dt_ms.min(60_000.0);
+        // Pause freezes both replay state and the runner clock that drives
+        // animations. Discard paused wall time rather than replaying it later.
+        if self.inner.model().paused() {
+            return;
+        }
+        let bounded_ms = dt_ms.min(MAX_HOST_ADVANCE_MS);
         let duration =
             Duration::try_from_secs_f64(bounded_ms / 1_000.0).unwrap_or(Duration::from_secs(60));
         self.inner.advance_time(duration);
-        let elapsed_ms = bounded_ms.round().clamp(1.0, u64::MAX as f64) as u64;
-        if self.inner.model_mut().advance_replay_ms(elapsed_ms) {
-            self.inner.push_event(ftui::Event::Tick);
+
+        let replay_nanos = u128::from(self.replay_submillis_nanos) + duration.as_nanos();
+        let elapsed_ms = u64::try_from(replay_nanos / NANOS_PER_MILLI).unwrap_or(u64::MAX);
+        self.replay_submillis_nanos =
+            u32::try_from(replay_nanos % NANOS_PER_MILLI).unwrap_or_default();
+        if elapsed_ms == 0 {
+            return;
+        }
+
+        // Advance in logical-tick-sized slices. This keeps data ingestion and
+        // stat history identical whether the host supplies many RAF deltas or
+        // one large catch-up delta, while still requesting only one repaint.
+        let mut remaining_ms = elapsed_ms;
+        let mut visible_changed = false;
+        while remaining_ms > 0 {
+            let to_tick_ms = LOGICAL_TICK_MS.saturating_sub(self.logical_tick_remainder_ms);
+            let slice_ms = remaining_ms.min(to_tick_ms);
+            let advance = self.inner.model_mut().advance_replay(slice_ms);
+            if advance.advanced_ms == 0 {
+                break;
+            }
+            remaining_ms = remaining_ms.saturating_sub(advance.advanced_ms);
+            visible_changed |= advance.visible_changed;
+
+            if advance.replay_reset {
+                // The model rebuilt the final replay cycle and reset its tick
+                // history. Reconstruct only ticks in that surviving cycle.
+                let replay_elapsed_ms = self.inner.model().elapsed_ms();
+                let due_ticks = replay_elapsed_ms / LOGICAL_TICK_MS;
+                self.logical_tick_remainder_ms = replay_elapsed_ms % LOGICAL_TICK_MS;
+                for _ in 0..due_ticks {
+                    self.inner.model_mut().logical_tick();
+                }
+                visible_changed |= due_ticks > 0;
+            } else {
+                self.logical_tick_remainder_ms = self
+                    .logical_tick_remainder_ms
+                    .saturating_add(advance.advanced_ms);
+                if self.logical_tick_remainder_ms == LOGICAL_TICK_MS {
+                    self.logical_tick_remainder_ms = 0;
+                    self.inner.model_mut().logical_tick();
+                    visible_changed = true;
+                }
+            }
+
+            if advance.advanced_ms < slice_ms {
+                break;
+            }
+        }
+        if visible_changed {
+            self.request_render();
         }
     }
 
@@ -100,7 +162,8 @@ impl DashboardRunnerCore {
         if !self.inner.is_initialized() {
             self.init();
         }
-        match self.inner.step() {
+        self.inner.model().sync_replay_clock();
+        let result = match self.inner.step() {
             Ok(result) => result,
             Err(error) => {
                 self.cached_logs.push(format!("runner_step_error: {error}"));
@@ -111,7 +174,9 @@ impl DashboardRunnerCore {
                     frame_idx: self.inner.frame_idx(),
                 }
             }
-        }
+        };
+        self.render_request_pending = false;
+        result
     }
 
     #[must_use]
@@ -145,12 +210,13 @@ impl DashboardRunnerCore {
 
     pub fn set_reduced_motion(&mut self, reduced_motion: bool) {
         self.inner.model_mut().set_reduced_motion(reduced_motion);
-        self.inner.push_event(ftui::Event::Tick);
+        self.request_render();
     }
 
     pub fn reset(&mut self) {
         self.inner.model_mut().reset();
-        self.inner.push_event(ftui::Event::Tick);
+        self.reset_timing_accumulators();
+        self.request_render();
     }
 
     #[must_use]
@@ -187,6 +253,21 @@ impl DashboardRunnerCore {
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
         self.inner.size()
+    }
+
+    fn reset_timing_accumulators(&mut self) {
+        self.replay_submillis_nanos = 0;
+        self.logical_tick_remainder_ms = 0;
+    }
+
+    fn request_render(&mut self) {
+        if self.inner.is_initialized() && !self.render_request_pending {
+            // StepProgram intentionally renders only after an event. Replay
+            // ticks were already applied at their exact logical boundaries,
+            // so a focus refresh is a mutation-free invalidation signal.
+            self.inner.push_event(Event::Focus(true));
+            self.render_request_pending = true;
+        }
     }
 }
 
