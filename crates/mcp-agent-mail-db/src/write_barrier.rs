@@ -258,6 +258,12 @@ impl Drop for PromotionBarrierGuard {
         if self.passthrough {
             return;
         }
+        debug_assert_eq!(
+            THREAD_BARRIER_DEPTH.with(Cell::get),
+            0,
+            "outer promotion barrier dropped while a passthrough guard is still alive; \
+             barrier guards must be strictly LIFO-scoped"
+        );
         let b = barrier();
         let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.promotion_active = false;
@@ -348,16 +354,45 @@ pub fn acquire_promotion_barrier_draining(
 
 static LAST_PROMOTIONS: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
 
+/// Cap on retained promotion-recency entries; oldest are evicted first.
+/// Promotions are rare and roots are few — this only bounds pathological
+/// many-mailbox processes.
+const MAX_PROMOTION_RECENCY_ENTRIES: usize = 64;
+
+/// Monotonic count of durable promotions in this process. Long-lived raw
+/// connections (e.g. the tool-metrics worker) compare this against a cached
+/// value to detect that their fd now points at a quarantined generation and
+/// must be reopened (mcp_agent_mail_rust#219).
+static PROMOTION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current process-wide promotion epoch.
+#[must_use]
+pub fn promotion_epoch() -> u64 {
+    PROMOTION_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn last_promotions() -> &'static Mutex<HashMap<PathBuf, Instant>> {
     LAST_PROMOTIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Record that `primary_path` just went through a durable promotion.
 pub fn record_promotion(primary_path: &Path) {
+    PROMOTION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let mut guard = last_promotions()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     guard.insert(primary_path.to_path_buf(), Instant::now());
+    if guard.len() > MAX_PROMOTION_RECENCY_ENTRIES {
+        let mut entries: Vec<(PathBuf, Instant)> =
+            guard.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by_key(|(_, at)| *at);
+        for (stale, _) in entries
+            .iter()
+            .take(guard.len() - MAX_PROMOTION_RECENCY_ENTRIES)
+        {
+            guard.remove(stale);
+        }
+    }
 }
 
 /// Time since the last durable promotion of `primary_path`, if any.

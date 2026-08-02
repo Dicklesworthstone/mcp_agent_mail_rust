@@ -4454,6 +4454,28 @@ pub fn archive_storage_root_is_authoritative_for_sqlite_path(
         || sqlite_path.starts_with(storage_root)
 }
 
+/// Periodic in-process retry for archive-drift catch-up
+/// (mcp_agent_mail_rust#219).
+///
+/// A drift reconcile deferred at pool-bootstrap time (post-promotion
+/// cooldown or in-process write activity) would otherwise be lost until the
+/// next promotion or process restart, because the per-path init gate latches
+/// after a successful bootstrap. Background maintenance calls this on its
+/// own cadence; all standalone pacing gates (mailbox ownership, cooldown,
+/// write idleness) apply inside, so a call under load is a cheap no-op.
+///
+/// # Errors
+///
+/// Propagates reconstruction/promotion failures from the underlying
+/// reconcile; a deferred or not-needed reconcile is `Ok(false)`.
+#[allow(clippy::result_large_err)]
+pub fn retry_archive_drift_reconcile(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<bool, SqlError> {
+    reconcile_archive_state_before_init(primary_path, storage_root)
+}
+
 #[allow(clippy::result_large_err)]
 fn reconcile_archive_state_before_init(
     primary_path: &Path,
@@ -4546,7 +4568,15 @@ fn reconcile_archive_state_before_init(
         None
     } else {
         let cooldown = crate::write_barrier::archive_reconcile_min_interval();
-        if let Some(age) = crate::write_barrier::time_since_last_promotion(primary_path)
+        // Check both the caller's spelling and the normalized identity —
+        // retire records both, but different pools can reach here with
+        // different spellings of the same file (relative, symlinked parent).
+        let identity = normalize_sqlite_identity_path(&primary_path.to_string_lossy());
+        let promotion_age = crate::write_barrier::time_since_last_promotion(primary_path)
+            .into_iter()
+            .chain(crate::write_barrier::time_since_last_promotion(Path::new(&identity)))
+            .min();
+        if let Some(age) = promotion_age
             && age < cooldown
         {
             tracing::info!(

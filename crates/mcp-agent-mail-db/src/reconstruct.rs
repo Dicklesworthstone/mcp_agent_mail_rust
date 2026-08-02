@@ -4546,6 +4546,20 @@ fn merge_salvaged_database(
                         stats.salvaged_rows_skipped_unmapped += 1;
                         continue;
                     };
+                    // Dedup BEFORE sender resolution: when the candidate
+                    // (built from the archive, the primary source) already
+                    // carries this message, no placeholder agent must be
+                    // minted for it — the placeholder INSERT is not rolled
+                    // back by a `continue`, and an unreferenced
+                    // `unknown-agent-N` row would survive into the recovered
+                    // database while the substitution counter overcounted.
+                    if message_project_id(&target_conn, source_message_id)?
+                        == Some(target_project_id)
+                    {
+                        message_id_map.insert(source_message_id, source_message_id);
+                        continue;
+                    }
+
                     let source_sender_id = row.get_named::<i64>("sender_id").map_err(|e| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: decode sender_id for message {source_message_id}: {e}"
@@ -4582,13 +4596,6 @@ fn merge_salvaged_database(
                             placeholder_id
                         }
                     };
-
-                    if message_project_id(&target_conn, source_message_id)?
-                        == Some(target_project_id)
-                    {
-                        message_id_map.insert(source_message_id, source_message_id);
-                        continue;
-                    }
 
                     let thread_id = row
                         .get_named::<String>("thread_id")
