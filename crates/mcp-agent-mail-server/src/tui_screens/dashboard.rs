@@ -5,7 +5,10 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::Instant;
+#[cfg(not(feature = "browser-dashboard"))]
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use ftui::Style;
 use ftui::layout::Rect;
@@ -490,6 +493,17 @@ impl DashboardScreen {
         }
     }
 
+    /// Apply host-provided motion preferences.
+    ///
+    /// Native callers keep the environment-derived defaults from [`Self::new`].
+    /// Browser hosts call this after construction so `prefers-reduced-motion`
+    /// and the public replay policy control every dashboard animation without
+    /// forking the production screen implementation.
+    pub fn set_motion_preferences(&mut self, reduced_motion: bool, chart_animations_enabled: bool) {
+        self.reduced_motion = reduced_motion;
+        self.chart_animations_enabled = chart_animations_enabled;
+    }
+
     /// Ingest new events from the ring buffer.
     fn ingest_events(&mut self, state: &TuiSharedState) {
         let new_events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
@@ -801,7 +815,7 @@ impl DashboardScreen {
             raw_count,
             rendered_count,
             dropped_count,
-            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            timestamp_micros: dashboard_timestamp_micros(),
             db_url: cfg.database_url,
             storage_root: cfg.storage_root,
             transport_mode,
@@ -954,6 +968,7 @@ impl DashboardScreen {
 
     #[cfg(test)]
     #[allow(clippy::cast_precision_loss, clippy::unused_self)]
+    #[cfg(all(test, not(feature = "browser-dashboard")))]
     fn detect_anomalies(&self, state: &TuiSharedState) -> Vec<DetectedAnomaly> {
         let counters = state.request_counters();
         let db = state.db_stats_snapshot().unwrap_or_default();
@@ -1728,7 +1743,7 @@ pub(crate) fn format_event(event: &MailEvent) -> EventEntry {
     event.to_event_log_entry()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 fn format_ctx(project: Option<&str>, agent: Option<&str>) -> String {
     match (project, agent) {
         (Some(p), Some(a)) => format!(" [{a}@{p}]"),
@@ -4535,7 +4550,7 @@ fn compute_tool_latency_rows(
     entries: &[&EventEntry],
     query_terms: &[String],
 ) -> Vec<ToolLatencyRow> {
-    let now_micros = chrono::Utc::now().timestamp_micros();
+    let now_micros = dashboard_timestamp_micros();
     let cutoff = now_micros.saturating_sub(TOOL_LATENCY_WINDOW_MICROS);
     let mut by_tool: HashMap<String, ToolAgg> = HashMap::new();
     for entry in entries.iter().filter(|entry| {
@@ -6088,12 +6103,31 @@ fn event_log_window_bounds(
     (start, end)
 }
 
+#[cfg(feature = "browser-dashboard")]
+const fn unix_epoch_micros_now() -> Option<i64> {
+    // Browser replay owns a deterministic pack clock. Returning `None`
+    // makes callers use the pack snapshot instead of the viewer's wall clock.
+    None
+}
+
+#[cfg(not(feature = "browser-dashboard"))]
 fn unix_epoch_micros_now() -> Option<i64> {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_micros();
     i64::try_from(micros).ok()
+}
+
+fn dashboard_timestamp_micros() -> i64 {
+    #[cfg(feature = "browser-dashboard")]
+    {
+        0
+    }
+    #[cfg(not(feature = "browser-dashboard"))]
+    {
+        chrono::Utc::now().timestamp_micros()
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -6265,28 +6299,28 @@ pub fn render_sparkline(data: &[f64], width: usize) -> String {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Thresholds for agent activity status (in microseconds, used in tests).
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 const ACTIVE_THRESHOLD_US: i64 = 60 * 1_000_000; // 60 seconds
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 const IDLE_THRESHOLD_US: i64 = 5 * 60 * 1_000_000; // 5 minutes
 
 /// Activity dot colors (used in tests), derived from the theme palette.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 fn activity_green() -> PackedRgba {
     crate::tui_theme::TuiThemePalette::current().activity_active
 }
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 fn activity_yellow() -> PackedRgba {
     crate::tui_theme::TuiThemePalette::current().activity_idle
 }
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 fn activity_gray() -> PackedRgba {
     crate::tui_theme::TuiThemePalette::current().activity_stale
 }
 
 /// Returns an activity dot character and color based on how recently an agent
 /// was active. Green = active (<60s), yellow = idle (<5m), gray = stale.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRgba) {
     if last_active_us == 0 {
         return ('○', activity_gray());
@@ -6305,7 +6339,7 @@ fn activity_indicator(now_us: i64, last_active_us: i64) -> (char, PackedRgba) {
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 mod tests {
     use super::*;
     use crate::tui_bridge::TuiSharedState;
@@ -6746,7 +6780,7 @@ mod tests {
 
     #[test]
     fn tool_latency_window_excludes_stale_events() {
-        let now = chrono::Utc::now().timestamp_micros();
+        let now = dashboard_timestamp_micros();
         let recent = EventEntry {
             kind: MailEventKind::ToolCallEnd,
             severity: EventSeverity::Debug,

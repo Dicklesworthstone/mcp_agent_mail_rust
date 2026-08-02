@@ -1,16 +1,75 @@
-# SPEC (Deferred): Browser TUI Parity Contract
+# Browser Dashboard Contracts: Public Replay Shipped, Live Parity Deferred
 
-**Status**: deferred as of 2026-04-18 via `br-il53l.1`
+**Status**: privacy-bounded public replay shipped 2026-08-02; authenticated live
+browser parity remains deferred via `br-il53l.1`
+
+## What Shipped
+
+The marketing-site dashboard is now the production Agent Mail `DashboardScreen`
+compiled to WebAssembly and rendered by FrankenTUI's browser renderer. It is not a
+DOM imitation and it is not a video: the browser host sends normalized keyboard and
+pointer events into the same screen update logic, advances a deterministic replay
+clock, and applies FrankenTUI flat cell patches to a canvas.
+
+The portable boundary lives in `crates/mcp-agent-mail-dashboard-wasm/`, a standalone
+nested workspace intentionally excluded from the native root workspace. Its default
+browser dependency graph contains the shared TUI modules, FrankenTUI runtime/rendering
+crates, serde, and browser bindings; it does not link the Agent Mail server, native DB
+pool, mailbox storage, search index, or mutation tools.
+
+The shipped public surface has a narrower contract than live parity:
+
+- `tui_screens/dashboard.rs` is the exact production screen implementation.
+- `TuiSharedState` is an in-memory browser adapter populated only by a validated pack.
+- replay time and event order are host-driven and deterministic;
+- reduced-motion mode disables chart transitions and holds a static frame;
+- resize events enter the real responsive DashboardScreen layout;
+- no HTTP bearer token, mailbox API, database URL, filesystem root, or write capability
+  is present in the browser bundle.
+
+## Public Data Contract
+
+The checked-in `agent_mail.demo_pack.v1` combines two deliberately different classes
+of data:
+
+1. Six scalar aggregate counts are read from Agent Mail SQLite using count-only SQL:
+   projects, agents, messages, active file reservations, contact links, and pending
+   acknowledgements.
+2. Every identifying detail is curated synthetic material: agent names, project names,
+   paths, messages, subjects, thread IDs, programs, models, and replay events.
+
+The exporter never serializes its source path and opens its output with `create_new`, so
+it refuses accidental overwrite. Before writing, the typed pack validator recursively
+checks text and path fields, bounded collections, finite metrics, monotonic actions,
+duration bounds, the privacy-policy marker, and the pack content digest. The website
+then verifies the versioned artifact manifest's byte counts and SHA-256 digests before
+initializing either WASM module.
+
+Refresh a pack offline with:
+
+```bash
+cargo run \
+  --manifest-path crates/mcp-agent-mail-dashboard-wasm/Cargo.toml \
+  --features exporter \
+  --bin am-export-dashboard-demo -- \
+  --source /absolute/path/to/storage.sqlite3 \
+  --output /new/path/demo_pack.v1.json \
+  --source-revision "$(git rev-parse HEAD)" \
+  --captured-at "2026-08-02T00:00:00Z"
+```
+
+The output path must not already exist. Run the crate tests and the website artifact
+digest tests before replacing a published pack.
 
 ## Intent
 
-The original browser-parity plan was to ship a browser-loadable page at `/web-dashboard`
+The original live browser-parity plan was to ship a browser-loadable page at `/web-dashboard`
 that mirrors the live terminal TUI in real time. The intended transport was HTTP polling
 for state (`GET /mail/ws-state`) plus input ingress (`POST /mail/ws-input`), with a
 browser-side renderer capable of drawing the same screen model the terminal TUI exposes.
 
-This document is the recovery point for that idea after the explicit RETIRE decision on
-2026-04-18. It is not a promise that the feature is returning soon.
+The public replay does not revive that authenticated transport. This document remains
+the recovery point for live parity after the explicit RETIRE decision on 2026-04-18.
 
 ## What Existed At Deferral Time
 
@@ -93,6 +152,9 @@ This spec should be read alongside those retirement tasks, not as a substitute f
 ## Current Guidance
 
 - Treat `/mail/*` as the supported browser-facing surface.
+- Treat the marketing-site WASM dashboard as an interactive, read-only public replay of
+  the production screen—not as a connection to the viewer's Agent Mail instance.
+- Refresh public packs only through the count-only exporter and the typed privacy gate.
 - Treat `/mail/ws-state` as a supported polling endpoint for robot/TUI consumers, not as
   proof that the browser mirror shipped.
 - Treat `/web-dashboard` and `/mail/ws-input` as deferred browser-mirror concepts until a

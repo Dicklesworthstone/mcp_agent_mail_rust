@@ -827,7 +827,15 @@ Use the Beads issue ID (`br-123`) as the Mail `thread_id` and prefix message sub
 
 ## Web UI
 
-The server includes a lightweight, server-rendered web UI for humans at `/mail/`. Agents should continue using MCP tools and resources; the web UI is for human review and oversight. Use `/mail/*` for mailbox and task oversight. The browser TUI mirror at `/web-dashboard` is deferred and not a supported surface; see `docs/SPEC-browser-parity-contract-deferred.md`.
+The server includes a lightweight, server-rendered web UI for humans at `/mail/`. Agents should continue using MCP tools and resources; the web UI is for human review and oversight. Use `/mail/*` for mailbox and task oversight. The authenticated live browser TUI mirror at `/web-dashboard` remains deferred and is not a supported surface.
+
+The project website separately embeds the real production `DashboardScreen` through
+`crates/mcp-agent-mail-dashboard-wasm/` and FrankenTUI's browser renderer. That surface
+is an interactive, read-only public replay: six SQLite aggregate counts are real, while
+all names, paths, messages, and replay events are synthetic. It does not connect to a
+visitor's mailbox or expose the deferred `/mail/ws-input` path. See
+[`docs/SPEC-browser-parity-contract-deferred.md`](docs/SPEC-browser-parity-contract-deferred.md)
+for the shipped replay boundary and the still-deferred live parity contract.
 
 ### Routes
 
@@ -1015,6 +1023,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (16 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
+│   ├── mcp-agent-mail-dashboard-wasm/      # Standalone public DashboardScreen WASM replay + safe exporter
 │   └── mcp-agent-mail-conformance/         # Python parity tests
 ├── experimental/
 │   └── mcp-agent-mail-wasm/                # Parked standalone WASM/browser prototype
@@ -1759,7 +1768,7 @@ Common pitfalls
 | [RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md](docs/RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md) | `am legacy` / `am upgrade` migration operations |
 | [RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) | Pre-release validation |
 | [ROLLOUT_PLAYBOOK.md](docs/ROLLOUT_PLAYBOOK.md) | Staged rollout strategy |
-| [SPEC-browser-parity-contract-deferred.md](docs/SPEC-browser-parity-contract-deferred.md) | Deferred browser TUI mirror contract and future revisit checklist |
+| [SPEC-browser-parity-contract-deferred.md](docs/SPEC-browser-parity-contract-deferred.md) | Shipped public WASM replay boundary and deferred live browser-parity contract |
 | [SPEC-threat-model.md](docs/SPEC-threat-model.md) | Consolidated threat model covering assets, adversaries, attack surfaces, and mitigations |
 | [SPEC-search-v3-query-contract.md](docs/SPEC-search-v3-query-contract.md) | Query grammar, filters, and Search V3 contract |
 | [SPEC-web-ui-parity-contract.md](docs/SPEC-web-ui-parity-contract.md) | Web UI parity and route contract |

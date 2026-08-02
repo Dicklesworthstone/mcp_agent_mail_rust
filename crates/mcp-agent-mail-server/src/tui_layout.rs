@@ -1226,7 +1226,7 @@ fn allocate_axis(
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 mod tests {
     use super::*;
 

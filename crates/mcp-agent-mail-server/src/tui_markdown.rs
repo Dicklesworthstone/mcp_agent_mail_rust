@@ -496,7 +496,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 mod tests {
     use super::*;
     use std::time::Instant;
