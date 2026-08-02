@@ -14,7 +14,7 @@ members = [
   "crates/mcp-agent-mail-search-core",
   "crates/mcp-agent-mail-test-helpers",
 ]
-exclude = ["experimental/*"]
+exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
 version = "0.3.24"
@@ -79,6 +79,7 @@ toml_edit = "0.25"
 json5 = "1.3.1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
+web-time = "1.1.0"
 comrak = { version = "0.54.0", default-features = false }
 include_dir = "0.7.4"
 minijinja = "2.15.1"

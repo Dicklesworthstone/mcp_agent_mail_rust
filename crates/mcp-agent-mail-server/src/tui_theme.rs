@@ -232,7 +232,7 @@ fn theme_id_for_canonical_name(name: &str) -> Option<ThemeId> {
 }
 
 /// Mutex to serialize tests that mutate `ACTIVE_NAMED_THEME_INDEX`.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 pub(crate) static NAMED_THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2322,7 +2322,7 @@ pub fn style_json_punctuation(tp: &TuiThemePalette) -> Style {
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 mod tests {
     use super::*;
     use ftui_extras::theme::ScopedThemeLock;

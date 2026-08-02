@@ -24,6 +24,7 @@ pub mod fancy;
 
 use std::cell::RefCell;
 use std::fmt::Write;
+use web_time::Instant;
 
 use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text, display_width};
@@ -2104,7 +2105,7 @@ impl AmbientEffectRenderer {
         animation_seconds: f64,
         base_bg: PackedRgba,
     ) -> AmbientRenderTelemetry {
-        let render_start = std::time::Instant::now();
+        let render_start = Instant::now();
         let state = determine_ambient_health_state(health);
 
         if area.is_empty() || !mode.is_enabled() {
@@ -3175,7 +3176,7 @@ impl AnimationBudget {
     where
         F: FnOnce() -> R,
     {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let result = f();
         self.spend(start.elapsed());
         result
@@ -3296,7 +3297,7 @@ impl Default for FocusGlow {
 pub struct ChartTransition {
     from: Vec<f64>,
     to: Vec<f64>,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<Instant>,
     duration: std::time::Duration,
 }
 
@@ -3320,7 +3321,7 @@ impl ChartTransition {
     }
 
     /// Set a new target vector, starting a transition from the current sampled state.
-    pub fn set_target(&mut self, next: &[f64], now: std::time::Instant) {
+    pub fn set_target(&mut self, next: &[f64], now: Instant) {
         if Self::values_equal(&self.to, next) {
             return;
         }
@@ -3340,7 +3341,7 @@ impl ChartTransition {
 
     /// Whether the transition is still actively animating at `now`.
     #[must_use]
-    pub fn is_animating(&self, now: std::time::Instant) -> bool {
+    pub fn is_animating(&self, now: Instant) -> bool {
         let Some(started_at) = self.started_at else {
             return false;
         };
@@ -3354,7 +3355,7 @@ impl ChartTransition {
     ///
     /// When `disable_motion` is true, returns the target immediately.
     #[must_use]
-    pub fn sample_values(&self, now: std::time::Instant, disable_motion: bool) -> Vec<f64> {
+    pub fn sample_values(&self, now: Instant, disable_motion: bool) -> Vec<f64> {
         if self.to.is_empty() {
             return Vec::new();
         }
@@ -3373,7 +3374,7 @@ impl ChartTransition {
             .collect()
     }
 
-    fn eased_progress(&self, now: std::time::Instant) -> f64 {
+    fn eased_progress(&self, now: Instant) -> f64 {
         let Some(started_at) = self.started_at else {
             return 1.0;
         };
@@ -5295,10 +5296,11 @@ pub fn generate_system_overview_mermaid(
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use web_time::Instant;
 
     use ftui::GraphemePool;
     use ftui::layout::Rect;
@@ -6324,7 +6326,7 @@ mod tests {
 
     /// Render a widget N times and assert total time is under budget.
     fn render_perf(widget: &impl Widget, w: u16, h: u16, iters: u32, budget_us: u128) {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for _ in 0..iters {
             let mut pool = GraphemePool::new();
             let mut frame = Frame::new(w, h, &mut pool);
@@ -6692,7 +6694,7 @@ mod tests {
 
     #[test]
     fn chart_transition_uses_ease_out_interpolation() {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
         transition.set_target(&[10.0, 20.0], start);
         transition.set_target(&[30.0, 40.0], start);
@@ -6709,7 +6711,7 @@ mod tests {
 
     #[test]
     fn chart_transition_clamps_to_target_and_respects_disable_motion() {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
         transition.set_target(&[5.0], start);
         transition.set_target(&[25.0], start);
@@ -6723,7 +6725,7 @@ mod tests {
 
     #[test]
     fn chart_transition_is_animating_only_until_duration_elapses() {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
         transition.set_target(&[5.0], start);
         transition.set_target(&[25.0], start);
@@ -6734,7 +6736,7 @@ mod tests {
 
     #[test]
     fn chart_transition_clear_resets_state() {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut transition = ChartTransition::new(std::time::Duration::from_millis(200));
         transition.set_target(&[1.0, 2.0, 3.0], start);
         transition.clear();
@@ -8509,7 +8511,7 @@ mod tests {
 
         // Cached: render 100 frames.
         let widget_cached = HeatmapGrid::new(&data).data_generation(0);
-        let cached_start = std::time::Instant::now();
+        let cached_start = Instant::now();
         for _ in 0..100 {
             let mut frame = Frame::new(80, 24, &mut pool);
             widget_cached.render(area, &mut frame);
@@ -8519,7 +8521,7 @@ mod tests {
 
         // Uncached: render 100 frames with invalidation.
         let widget_uncached = HeatmapGrid::new(&data).data_generation(0);
-        let uncached_start = std::time::Instant::now();
+        let uncached_start = Instant::now();
         for _ in 0..100 {
             widget_uncached.invalidate_cache();
             let mut frame = Frame::new(80, 24, &mut pool);
@@ -8552,7 +8554,7 @@ mod tests {
         let mut pool = GraphemePool::new();
 
         // "Cached" path with changing generation.
-        let changing_start = std::time::Instant::now();
+        let changing_start = Instant::now();
         for generation in 0..100u64 {
             let widget = HeatmapGrid::new(&data).data_generation(generation);
             let mut frame = Frame::new(40, 12, &mut pool);
@@ -8561,7 +8563,7 @@ mod tests {
         let changing_elapsed = changing_start.elapsed();
 
         // "Uncached" path with explicit invalidation (equivalent).
-        let uncached_start = std::time::Instant::now();
+        let uncached_start = Instant::now();
         for _ in 0..100u64 {
             let widget = HeatmapGrid::new(&data).data_generation(0);
             widget.invalidate_cache();

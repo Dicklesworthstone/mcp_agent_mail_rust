@@ -1567,6 +1567,12 @@ fn reconstruct_from_archive_impl(
             if stmt.is_empty() {
                 continue;
             }
+            // NOTE: this split survives comment-only fragments only because
+            // `DbConn` here is `CanonicalDbConn` (see the alias at the top of
+            // this module), whose prepare tolerates comment-only SQL. Do not
+            // copy this loop to a FrankenConnection context — it fails there
+            // with "no SQL statement provided" (see
+            // `ensure_base_schema_on_sync_connection` in the server crate).
             conn.execute_raw(&format!("{stmt};"))
                 .map_err(|e| DbError::Sqlite(format!("reconstruct: DDL: {e}")))?;
         }
@@ -3597,13 +3603,17 @@ fn merge_salvaged_database(
                 .map_err(|e| {
                     DbError::Sqlite(format!("reconstruct salvage: query file_reservations: {e}"))
                 })?;
+            // #219: without identity maps every reservation is unmappable by
+            // definition; the per-row skip logic below handles each one
+            // (leases expire on their own and must never refuse a recovery).
             if !reservation_rows.is_empty()
                 && (project_id_map.is_empty() || agent_id_map.is_empty())
             {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct salvage: {} has file_reservations rows but stable project/agent identity maps are unavailable",
-                    salvage_db_path.display()
-                )));
+                stats.push_warning(format!(
+                    "salvage source {} has {} file_reservations row(s) but no stable project/agent identity maps; all will be skipped",
+                    salvage_db_path.display(),
+                    reservation_rows.len()
+                ));
             }
 
             for row in &reservation_rows {
@@ -4279,13 +4289,16 @@ fn merge_salvaged_database(
                         "reconstruct salvage: query product_project_links: {e}"
                     ))
                 })?;
+            // #219: without identity maps every product link is unmappable by
+            // definition; the per-row skip logic below handles each one.
             if !product_link_rows.is_empty()
                 && (product_id_map.is_empty() || project_id_map.is_empty())
             {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct salvage: {} has product_project_links rows but stable product/project identity maps are unavailable",
-                    salvage_db_path.display()
-                )));
+                stats.push_warning(format!(
+                    "salvage source {} has {} product_project_links row(s) but no stable product/project identity maps; all will be skipped",
+                    salvage_db_path.display(),
+                    product_link_rows.len()
+                ));
             }
 
             for row in &product_link_rows {
