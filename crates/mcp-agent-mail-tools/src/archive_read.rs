@@ -271,10 +271,15 @@ fn slot_for(scope: Scope) -> Result<Arc<Slot>, AcquireError> {
 pub struct WriteGuard {
     slot: Option<Arc<Slot>>,
     active: bool,
+    /// #219: registers this write with the db-crate promotion barrier so a
+    /// live-file recovery promotion can never rename the database out from
+    /// under this call. Acquisition blocks while a promotion is in flight.
+    _write_activity: mcp_agent_mail_db::write_barrier::WriteActivityGuard,
 }
 
 impl WriteGuard {
     pub(crate) fn begin(storage_root: &Path, sqlite_path: Option<&Path>) -> Self {
+        let write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         WRITERS_ACTIVE.fetch_add(1, Ordering::AcqRel);
         WRITER_EPOCH.fetch_add(1, Ordering::AcqRel);
         let slot = sqlite_path
@@ -290,7 +295,11 @@ impl WriteGuard {
             drop(state);
             slot.wake.notify_all();
         }
-        Self { slot, active: true }
+        Self {
+            slot,
+            active: true,
+            _write_activity: write_activity,
+        }
     }
 }
 
