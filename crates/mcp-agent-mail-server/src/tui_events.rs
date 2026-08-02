@@ -20,6 +20,18 @@ pub const DEFAULT_EVENT_RING_CAPACITY: usize = 10_000;
 /// biasing eviction toward low-severity entries near the oldest frontier.
 const LOW_SEVERITY_EVICT_SCAN_LIMIT: usize = 64;
 
+fn event_timestamp_micros() -> i64 {
+    #[cfg(feature = "browser-dashboard")]
+    {
+        // Public replay events carry their own deterministic timestamps.
+        0
+    }
+    #[cfg(not(feature = "browser-dashboard"))]
+    {
+        chrono::Utc::now().timestamp_micros()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSource {
@@ -1253,7 +1265,7 @@ impl EventRingBuffer {
         let seq = inner.next_seq;
         inner.next_seq = inner.next_seq.saturating_add(1);
         event.set_seq(seq);
-        event.set_timestamp_if_unset(chrono::Utc::now().timestamp_micros());
+        event.set_timestamp_if_unset(event_timestamp_micros());
         if inner.events.len() >= inner.capacity {
             let scan_limit = inner.events.len().min(LOW_SEVERITY_EVICT_SCAN_LIMIT);
             let drop_idx = inner
@@ -1553,6 +1565,7 @@ impl FenwickViewportIndex {
     }
 
     #[cfg(test)]
+    #[cfg(all(test, not(feature = "browser-dashboard")))]
     fn rebuild_from_heights(&mut self, heights: &[u16]) {
         self.heights.clear();
         self.heights.reserve(heights.len());
@@ -2116,7 +2129,7 @@ impl RenderItem for ExplorerRow {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "browser-dashboard")))]
 mod tests {
     use super::*;
 

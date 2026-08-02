@@ -34,6 +34,7 @@ fastmcp-protocol.workspace = true
 fastmcp-server.workspace = true
 fastmcp-transport.workspace = true
 chrono.workspace = true
+web-time.workspace = true
 dirs.workspace = true
 glob.workspace = true
 walkdir.workspace = true
@@ -69,6 +70,9 @@ portable = [
     "mcp-agent-mail-storage/portable",
     "mcp-agent-mail-tools/portable",
 ]
+# The browser dashboard crate path-includes the production TUI modules but
+# supplies focused replay tests instead of the server's native DB fixtures.
+browser-dashboard = []
 
 [dev-dependencies]
 # Enable asupersync `test-internals` for TEST/BENCH builds only so tests can
