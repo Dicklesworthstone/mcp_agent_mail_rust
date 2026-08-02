@@ -122,6 +122,7 @@ pub struct SourceConnection {
     connection: SqliteConnection,
     identity: SourceIdentity,
     path: PathBuf,
+    expected_user_version: i64,
 }
 
 /// Open the source mailbox database strictly read-only, failing closed.
@@ -181,11 +182,7 @@ pub fn open_source_read_only(path: &str) -> Result<SourceConnection, Box<dyn std
         }
     };
 
-    let user_version = connection
-        .query_sync("PRAGMA user_version", &[])?
-        .first()
-        .ok_or("PRAGMA user_version returned no row")?
-        .get_named::<i64>("user_version")?;
+    let user_version = read_user_version(&connection)?;
     if connection
         .execute_raw(&format!("PRAGMA user_version = {user_version}"))
         .is_ok()
@@ -201,7 +198,16 @@ pub fn open_source_read_only(path: &str) -> Result<SourceConnection, Box<dyn std
         connection,
         identity,
         path: source_path,
+        expected_user_version: user_version,
     })
+}
+
+fn read_user_version(connection: &SqliteConnection) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(connection
+        .query_sync("PRAGMA user_version", &[])?
+        .first()
+        .ok_or("PRAGMA user_version returned no row")?
+        .get_named::<i64>("user_version")?)
 }
 
 fn count(connection: &SqliteConnection, sql: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -241,7 +247,8 @@ pub fn read_aggregates_snapshot(
     let now_micros = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
 
     connection.execute_raw("BEGIN")?;
-    let result = read_aggregates_in_transaction(connection, now_micros);
+    let result =
+        read_aggregates_in_transaction(connection, now_micros, source.expected_user_version);
     if result.is_ok() {
         connection.execute_raw("COMMIT")?;
     } else {
@@ -270,7 +277,19 @@ pub fn read_aggregates_snapshot(
 fn read_aggregates_in_transaction(
     connection: &SqliteConnection,
     now_micros: i64,
+    expected_user_version: i64,
 ) -> Result<AggregateCounts, Box<dyn std::error::Error>> {
+    // This is deliberately the first read after BEGIN: it both establishes
+    // the SQLite snapshot and binds all following counts to the schema version
+    // whose read-only contract was probed at open time.
+    let actual_user_version = read_user_version(connection)?;
+    if actual_user_version != expected_user_version {
+        return Err(format!(
+            "source schema changed after exporter open: expected user_version \
+             {expected_user_version}, observed {actual_user_version}"
+        )
+        .into());
+    }
     Ok(AggregateCounts {
         projects: count(connection, "SELECT COUNT(*) AS c FROM projects")?,
         agents: count(connection, "SELECT COUNT(*) AS c FROM agents")?,
@@ -426,6 +445,29 @@ mod tests {
         let counts = read_aggregates_snapshot(&reader).expect("aggregates");
         assert_eq!(counts.projects, 1);
         assert_eq!(counts.ack_pending, 1);
+    }
+
+    #[test]
+    fn aggregate_read_rejects_schema_change_after_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mailbox.sqlite3");
+        let path_string = path.to_string_lossy().into_owned();
+        let writer = writer_db(&path_string);
+        create_schema(&writer);
+        insert_coherent_round(&writer);
+
+        let reader = open_source_read_only(&path_string).expect("read-only open");
+        writer
+            .execute_raw("PRAGMA user_version = 42")
+            .expect("simulate post-open schema migration");
+
+        let error = read_aggregates_snapshot(&reader).expect_err("schema drift must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("expected user_version 0, observed 42"),
+            "schema drift failed for an unrelated reason: {error}"
+        );
     }
 
     #[test]
