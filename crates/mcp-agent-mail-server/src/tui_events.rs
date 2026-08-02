@@ -375,6 +375,22 @@ impl ReservationSnapshot {
     }
 }
 
+/// Deserialize an `f64` field inside an internally-tagged enum under
+/// serde_json's `arbitrary_precision` feature (unified into this build by the
+/// fastmcp workspace pin). Internally-tagged enums buffer their content, and
+/// buffered numbers surface as serde_json's private number map — a plain
+/// `f64` field then fails with "invalid type: map, expected f64". Routing
+/// through `serde_json::Number` accepts both the plain and buffered forms.
+fn deserialize_buffered_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let number = serde_json::Number::deserialize(deserializer)?;
+    number
+        .as_f64()
+        .ok_or_else(|| serde::de::Error::custom("number is not representable as f64"))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -398,6 +414,7 @@ pub enum MailEvent {
         duration_ms: u64,
         result_preview: Option<String>,
         queries: u64,
+        #[serde(deserialize_with = "deserialize_buffered_f64")]
         query_time_ms: f64,
         per_table: Vec<(String, u64)>,
         project: Option<String>,
