@@ -2,6 +2,7 @@
 
 use core::time::Duration;
 
+use ftui::{Event, KeyEventKind, MouseButton, MouseEventKind};
 use ftui_web::step_program::{StepProgram, StepResult};
 use ftui_web::{WebFlatPatchBatch, WebPatchStats};
 
@@ -83,7 +84,7 @@ impl DashboardRunnerCore {
 
     pub fn push_encoded_input(&mut self, json: &str) -> bool {
         match ftui_web::input_parser::parse_encoded_input_to_event(json) {
-            Ok(Some(event)) => {
+            Ok(Some(event)) if browser_event_can_change_model(&event) => {
                 self.inner.push_event(event);
                 true
             }
@@ -186,6 +187,20 @@ impl DashboardRunnerCore {
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
         self.inner.size()
+    }
+}
+
+fn browser_event_can_change_model(event: &Event) -> bool {
+    match event {
+        Event::Key(key) => key.kind == KeyEventKind::Press,
+        Event::Paste(_) => true,
+        Event::Mouse(mouse) => matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollUp
+        ),
+        _ => false,
     }
 }
 
@@ -334,6 +349,25 @@ mod tests {
             after.pending_acknowledgements,
             before.pending_acknowledgements
         );
+    }
+
+    #[test]
+    fn no_op_browser_input_phases_do_not_schedule_duplicate_frames() {
+        let mut runner = loaded_runner(120, 36);
+        runner.init();
+        let _ = runner.take_flat_patches();
+
+        assert!(!runner.push_encoded_input(
+            r#"{"kind":"key","phase":"up","key":"v","code":"KeyV","mods":0,"repeat":false}"#,
+        ));
+        assert!(!runner.push_encoded_input(
+            r#"{"kind":"mouse","phase":"up","button":0,"x":5,"y":5,"mods":0}"#,
+        ));
+        assert!(!runner.push_encoded_input(r#"{"kind":"focus","focused":true}"#,));
+
+        let step = runner.step();
+        assert!(!step.rendered);
+        assert_eq!(step.events_processed, 0);
     }
 
     #[test]

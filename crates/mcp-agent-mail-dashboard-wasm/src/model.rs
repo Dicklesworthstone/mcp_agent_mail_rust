@@ -109,6 +109,19 @@ impl DashboardModel {
         screen
     }
 
+    fn sync_replay_clock(&self) {
+        let elapsed_micros = i64::try_from(self.elapsed_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000);
+        let now_micros = self
+            .pack
+            .bootstrap
+            .db_stats
+            .timestamp_micros
+            .saturating_add(elapsed_micros);
+        crate::tui_screens::dashboard::set_browser_replay_now_micros(now_micros);
+    }
+
     pub fn load_pack(&mut self, pack: DemoPack) -> Result<(), DemoPackError> {
         pack.validate()?;
         self.pack = pack;
@@ -135,11 +148,7 @@ impl DashboardModel {
         let dashboard_interaction = self.screen.interaction_snapshot();
         self.screen = self.fresh_screen();
         if preserve_interaction {
-            self.screen.restore_interaction(
-                &dashboard_interaction.0,
-                dashboard_interaction.1,
-                dashboard_interaction.2,
-            );
+            self.screen.restore_interaction(&dashboard_interaction);
         } else {
             self.public_screen.reset();
         }
@@ -163,8 +172,13 @@ impl DashboardModel {
         // logical ticks in both native and browser builds.
         self.tick_count = 10;
         self.state.set_elapsed_ms(0);
+        self.sync_replay_clock();
         self.screen.tick(0, &self.state);
         self.screen.tick(self.tick_count, &self.state);
+        if preserve_interaction {
+            self.public_screen
+                .normalize(self.active_screen, &self.state);
+        }
         self.prepared = true;
     }
 
@@ -197,6 +211,7 @@ impl DashboardModel {
         }
 
         self.state.set_elapsed_ms(self.elapsed_ms);
+        self.sync_replay_clock();
         actions_applied || replay_reset || self.elapsed_ms / 1_000 != previous_clock_second
     }
 
@@ -449,7 +464,11 @@ impl Model for DashboardModel {
         } else if self.handle_shell_input(&message.0) {
             return Cmd::none();
         } else if self.active_screen == MailScreenId::Dashboard {
+            let interaction_before = self.screen.interaction_snapshot();
             let command = self.screen.update(&message.0, &self.state);
+            if self.screen.interaction_snapshot() != interaction_before {
+                self.interaction_revision = self.interaction_revision.saturating_add(1);
+            }
             self.capture_screen_command(command);
         } else if self
             .public_screen
@@ -596,16 +615,60 @@ mod tests {
     }
 
     #[test]
+    fn automatic_replay_wrap_preserves_complete_dashboard_interaction() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        for key in ['v', 'p', 'l', 'k'] {
+            let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+                key,
+            )))));
+        }
+        model.screen.set_query_interaction("reservation", true);
+        let expected = model.screen.interaction_snapshot();
+
+        assert!(model.advance_replay_ms(model.pack().duration_ms + 100));
+
+        assert_eq!(model.screen.interaction_snapshot(), expected);
+    }
+
+    #[test]
+    fn dashboard_interactions_advance_the_semantic_revision() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        let before = model.interaction_revision();
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            'v',
+        )))));
+
+        assert!(model.interaction_revision() > before);
+    }
+
+    #[test]
+    fn replay_clock_uses_absolute_pack_time_instead_of_unix_epoch_zero() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        let base = model.pack().bootstrap.db_stats.timestamp_micros;
+        assert_eq!(
+            crate::tui_screens::dashboard::browser_replay_now_micros(),
+            Some(base)
+        );
+
+        assert!(model.advance_replay_ms(2_500));
+        assert_eq!(
+            crate::tui_screens::dashboard::browser_replay_now_micros(),
+            Some(base + 2_500_000)
+        );
+    }
+
+    #[test]
     fn dashboard_text_mode_receives_digits_instead_of_switching_tabs() {
         let mut model = DashboardModel::new(curated_public_demo());
-        model.screen.restore_interaction("", true, "all");
+        model.screen.set_query_interaction("", true);
 
         let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
             '2',
         )))));
 
         assert_eq!(model.active_screen(), MailScreenId::Dashboard);
-        assert_eq!(model.screen.interaction_snapshot().0, "2");
+        assert_eq!(model.screen.interaction_snapshot().query(), "2");
     }
 
     #[test]

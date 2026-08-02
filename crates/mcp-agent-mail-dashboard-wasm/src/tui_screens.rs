@@ -171,6 +171,29 @@ impl PublicReplayScreen {
         self.selected
     }
 
+    /// Reconcile preserved selection/scroll state with freshly reset replay
+    /// data so a shorter result set cannot leave the list scrolled past EOF.
+    pub fn normalize(&mut self, screen: MailScreenId, state: &TuiSharedState) {
+        let row_count = self.visible_rows(screen, state).len();
+        let page = usize::from(self.list_area.get().height.max(1));
+        self.clamp_to_rows(row_count, page);
+    }
+
+    fn clamp_to_rows(&mut self, row_count: usize, page: usize) {
+        if row_count == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected = self.selected.min(row_count - 1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll.saturating_add(page) {
+            self.scroll = self.selected + 1 - page;
+        }
+        self.scroll = self.scroll.min(row_count.saturating_sub(1));
+    }
+
     /// Process list navigation. Returns true when visible selection or scroll
     /// state changed, allowing the host status contract to expose interaction.
     pub fn update(&mut self, event: &Event, screen: MailScreenId, state: &TuiSharedState) -> bool {
@@ -266,17 +289,7 @@ impl PublicReplayScreen {
             _ => return false,
         }
         let row_count = self.visible_rows(screen, state).len();
-        if row_count == 0 {
-            self.selected = 0;
-            self.scroll = 0;
-        } else {
-            self.selected = self.selected.min(row_count - 1);
-        }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + page {
-            self.scroll = self.selected + 1 - page;
-        }
+        self.clamp_to_rows(row_count, page);
         (
             self.selected,
             self.scroll,
