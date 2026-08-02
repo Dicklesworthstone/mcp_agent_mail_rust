@@ -416,7 +416,7 @@ http_call_json() {
 
 BIN="$(resolve_binary)"
 e2e_log "using mcp-agent-mail binary: ${BIN}"
-WASM_MANIFEST="experimental/mcp-agent-mail-wasm/Cargo.toml"
+WASM_MANIFEST="crates/mcp-agent-mail-dashboard-wasm/Cargo.toml"
 
 # ═══════════════════════════════════════════════════════════════════════
 # Case 1: WASM crate native unit tests (via rch)
@@ -426,7 +426,7 @@ scenario_diag_begin "wasm_native_unit_tests"
 CASE1_LOG="${E2E_ARTIFACT_DIR}/case_01_wasm_native_unit_tests.log"
 
 set +e
-run_cargo_with_rch_only "${CASE1_LOG}" test --manifest-path "${WASM_MANIFEST}" --lib -- --nocapture
+run_cargo_with_rch_only "${CASE1_LOG}" test --manifest-path "${WASM_MANIFEST}" --locked --all-targets -- --nocapture
 CASE1_RC=$?
 set -e
 CASE1_OUT="$(cat "${CASE1_LOG}" 2>/dev/null || true)"
@@ -446,6 +446,34 @@ else
 fi
 scenario_diag_finish "${CASE1_LOG}"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Case 1b: exporter-only native target matrix (via rch)
+# ══════════════════════════════════════════════════════════════════════════
+e2e_case_banner "wasm_exporter_native_tests"
+scenario_diag_begin "wasm_exporter_native_tests"
+CASE1B_LOG="${E2E_ARTIFACT_DIR}/case_01b_wasm_exporter_native_tests.log"
+
+set +e
+run_cargo_with_rch_only "${CASE1B_LOG}" test --manifest-path "${WASM_MANIFEST}" --locked --no-default-features --features exporter --all-targets -- --nocapture
+CASE1B_RC=$?
+set -e
+CASE1B_OUT="$(cat "${CASE1B_LOG}" 2>/dev/null || true)"
+
+if [ "${CASE1B_RC}" -eq 0 ]; then
+    e2e_pass "WASM exporter native tests exit 0 via rch"
+    e2e_assert_file_exists "WASM exporter test log exists" "${CASE1B_LOG}"
+elif [ "${CASE1B_RC}" -eq 127 ]; then
+    scenario_diag_mark_reason "RCH_UNAVAILABLE" "rch not available in PATH"
+    e2e_skip "WASM exporter native tests skipped: rch unavailable"
+elif printf '%s' "${CASE1B_OUT}" | grep -Fq "failed to select a version for the requirement \`ftui = \"^0.2.0\"\`"; then
+    scenario_diag_mark_reason "RCH_REMOTE_DEP_MISMATCH" "remote worker dependency mismatch (ftui 0.2.0)"
+    e2e_skip "WASM exporter native tests skipped: remote rch dependency mismatch (ftui 0.2.0)"
+else
+    scenario_diag_mark_reason "WASM_EXPORTER_TEST_FAILED" "cargo test failed"
+    e2e_fail "WASM exporter native tests failed (rc=${CASE1B_RC})"
+fi
+scenario_diag_finish "${CASE1B_LOG}"
+
 # ═══════════════════════════════════════════════════════════════════════
 # Case 2: wasm32 target build (via rch)
 # ═══════════════════════════════════════════════════════════════════════
@@ -454,7 +482,7 @@ scenario_diag_begin "wasm_target_build"
 CASE2_LOG="${E2E_ARTIFACT_DIR}/case_02_wasm_target_build.log"
 
 set +e
-run_cargo_with_rch_only "${CASE2_LOG}" build --manifest-path "${WASM_MANIFEST}" --target wasm32-unknown-unknown --release
+run_cargo_with_rch_only "${CASE2_LOG}" build --manifest-path "${WASM_MANIFEST}" --locked --target wasm32-unknown-unknown --release --lib
 CASE2_RC=$?
 set -e
 

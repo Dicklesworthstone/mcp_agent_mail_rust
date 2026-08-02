@@ -15,7 +15,7 @@ extern crate self as mcp_agent_mail_core;
 mod browser_contracts;
 pub mod console;
 pub mod demo_pack;
-#[cfg(feature = "exporter")]
+#[cfg(all(feature = "exporter", not(target_arch = "wasm32")))]
 pub mod exporter;
 #[cfg(feature = "browser-dashboard")]
 pub mod model;

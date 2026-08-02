@@ -1,16 +1,29 @@
 //! Export aggregate-only mailbox counts into a sanitized public replay pack.
 
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    compile_error!("am-export-dashboard-demo is a native-only offline exporter");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
+#[cfg(not(target_arch = "wasm32"))]
 use mcp_agent_mail_dashboard_wasm::demo_pack::{DemoOperation, curated_public_demo};
+#[cfg(not(target_arch = "wasm32"))]
 use mcp_agent_mail_dashboard_wasm::exporter::{
     AggregateCounts, open_source_read_only, read_aggregates_snapshot,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use mcp_agent_mail_dashboard_wasm::tui_events::{DbStatSnapshot, MailEvent};
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Parser)]
 #[command(
     name = "am-export-dashboard-demo",
@@ -31,6 +44,7 @@ struct Args {
     captured_at: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn apply_aggregates(
     snapshot: &mut DbStatSnapshot,
     counts: AggregateCounts,
@@ -48,6 +62,7 @@ fn apply_aggregates(
     snapshot.ack_pending = counts.ack_pending.saturating_add_signed(ack_delta);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let source = args.source.canonicalize()?;

@@ -50,6 +50,8 @@ Refresh a pack offline with:
 ```bash
 cargo run \
   --manifest-path crates/mcp-agent-mail-dashboard-wasm/Cargo.toml \
+  --locked \
+  --no-default-features \
   --features exporter \
   --bin am-export-dashboard-demo -- \
   --source /absolute/path/to/storage.sqlite3 \
@@ -58,8 +60,23 @@ cargo run \
   --captured-at "2026-08-02T00:00:00Z"
 ```
 
-The output path must not already exist. Run the crate tests and the website artifact
-digest tests before replacing a published pack.
+The exporter feature is native-only and explicitly enables the shared browser contracts
+whose DTOs the pack serializes; its SQLite, CLI, and filesystem dependencies are excluded
+from the default WASM target graph. The output path must not already exist, and
+`captured_at` must be RFC 3339 / ISO-8601. Before replacing a published pack, run the
+locked default and exporter matrices plus the website artifact digest tests:
+
+```bash
+cargo test \
+  --manifest-path crates/mcp-agent-mail-dashboard-wasm/Cargo.toml \
+  --locked
+cargo test \
+  --manifest-path crates/mcp-agent-mail-dashboard-wasm/Cargo.toml \
+  --locked \
+  --no-default-features \
+  --features exporter \
+  --all-targets
+```
 
 ## Intent
 

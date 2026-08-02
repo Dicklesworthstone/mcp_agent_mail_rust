@@ -429,6 +429,27 @@ pub fn record_tab_hit_slots(
     let plan = compute_tab_window_plan(active, available);
     let mut x = area.x + u16::from(plan.show_left_indicator);
 
+    // Overflow indicators are real controls, not decorative promises. A
+    // click advances to the adjacent hidden screen, which recenters the tab
+    // window and exposes the next page to mouse-only users.
+    if plan.show_left_indicator {
+        let index = plan.start.saturating_sub(1);
+        let meta = &MAIL_SCREEN_REGISTRY[index];
+        dispatcher.record_tab_slot(index, meta.id, area.x, area.x.saturating_add(1), area.y);
+    }
+    if plan.show_right_indicator && plan.end < MAIL_SCREEN_REGISTRY.len() {
+        let index = plan.end;
+        let meta = &MAIL_SCREEN_REGISTRY[index];
+        let indicator_x = area.x.saturating_add(available.saturating_sub(1));
+        dispatcher.record_tab_slot(
+            index,
+            meta.id,
+            indicator_x,
+            indicator_x.saturating_add(1),
+            area.y,
+        );
+    }
+
     for (i, meta) in MAIL_SCREEN_REGISTRY
         .iter()
         .enumerate()
@@ -2200,6 +2221,40 @@ mod tests {
         assert!(
             dispatcher.tab_slot(active_index).is_some(),
             "active tab should always have a hit slot in narrow mode"
+        );
+    }
+
+    #[test]
+    fn tab_overflow_indicators_page_to_adjacent_hidden_screens() {
+        use crate::tui_hit_regions::MouseAction;
+        use ftui::{MouseButton, MouseEvent, MouseEventKind};
+
+        let area = Rect::new(0, 0, 169, 1);
+        let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
+        dispatcher.update_chrome_areas(area, Rect::new(0, 41, 169, 1));
+        let first_plan = compute_tab_window_plan(MailScreenId::Dashboard, area.width);
+        assert!(first_plan.show_right_indicator);
+        record_tab_hit_slots(area, MailScreenId::Dashboard, &dispatcher);
+
+        let next_screen = MAIL_SCREEN_REGISTRY[first_plan.end].id;
+        let right_click = MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            area.width - 1,
+            area.y,
+        );
+        assert_eq!(
+            dispatcher.dispatch(&right_click),
+            MouseAction::SwitchScreen(next_screen)
+        );
+
+        let second_plan = compute_tab_window_plan(next_screen, area.width);
+        assert!(second_plan.show_left_indicator);
+        record_tab_hit_slots(area, next_screen, &dispatcher);
+        let previous_screen = MAIL_SCREEN_REGISTRY[second_plan.start - 1].id;
+        let left_click = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), area.x, area.y);
+        assert_eq!(
+            dispatcher.dispatch(&left_click),
+            MouseAction::SwitchScreen(previous_screen)
         );
     }
 

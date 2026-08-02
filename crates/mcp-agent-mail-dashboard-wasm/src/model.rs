@@ -642,7 +642,7 @@ fn render_browser_help(
     let inner = block.inner(overlay);
     block.render(overlay, frame);
     let text = format!(
-        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click Dashboard filters or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  1-4 on Dashboard     apply its quick filters\n  / on Dashboard       edit its live filter\n  / elsewhere          open Search\n  Ctrl+P               open Search\n  F1 or ?              toggle this help\n\nThis browser build is read-only. Aggregate counts come from a read-only Agent Mail SQLite export; names, paths, messages, and replay events are synthetic public-demo details.",
+        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click < or > to reveal hidden top tabs\n  Click Dashboard filters or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  1-4 on Dashboard     apply its quick filters\n  / on Dashboard       edit its live filter\n  / elsewhere          open Search\n  Ctrl+P               open Search\n  F1 or ?              toggle this help\n\nThis browser build is read-only. Replay counters start from a read-only Agent Mail SQLite aggregate export and may change as synthetic events run; names, paths, messages, and replay events are synthetic public-demo details.",
         meta.title, meta.description
     );
     Paragraph::new(text)

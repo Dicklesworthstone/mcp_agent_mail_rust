@@ -110,6 +110,10 @@ pub enum DemoPackError {
     },
     UnsupportedSchema(String),
     EmptyMetadata(&'static str),
+    InvalidTimestamp {
+        field: &'static str,
+        value: String,
+    },
     InvalidDuration(u64),
     TooManyActions(usize),
     TooManyActionsAtTimestamp {
@@ -247,6 +251,12 @@ impl DemoPack {
                 return Err(DemoPackError::EmptyMetadata(name));
             }
             validate_public_text(name, value)?;
+        }
+        if chrono::DateTime::parse_from_rfc3339(&self.provenance.captured_at).is_err() {
+            return Err(DemoPackError::InvalidTimestamp {
+                field: "captured_at",
+                value: self.provenance.captured_at.clone(),
+            });
         }
         if self.provenance.privacy_policy != PUBLIC_PRIVACY_POLICY_V1 {
             return Err(DemoPackError::UnsafeText {
@@ -670,7 +680,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
         "Parity review complete.\n\nThe browser frame now uses the production tab chrome and DashboardScreen. Mouse hit regions are derived from the rendered layout, so resizing cannot desynchronize clicks.",
         "Fresh-eyes pass found the input queue waiting on the replay clock.\n\nPointer events now wake the runner on the next animation frame while the deterministic replay remains throttled.",
         "Release candidate is ready for verification.\n\nPlease compare the 220-column terminal buffer, then check Dashboard filters, screen tabs, wheel scrolling, and fullscreen restoration.",
-        "Reservation handoff confirmed.\n\nThe public replay remains read-only: aggregate counts come from the snapshot exporter while all names, paths, messages, and event details are synthetic.",
+        "Reservation handoff confirmed.\n\nThe public replay remains read-only: the aggregate counter baseline comes from the snapshot exporter and synthetic events may evolve it, while all names, paths, messages, and event details are synthetic.",
     ];
     const TOOL_NAMES: [&str; 4] = [
         "send_message",
@@ -1439,6 +1449,20 @@ mod tests {
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_capture_timestamp_fails_closed() {
+        let mut pack = curated_public_demo();
+        pack.provenance.captured_at = "not-a-timestamp".to_string();
+        pack.finalize_digest();
+        assert!(matches!(
+            pack.validate(),
+            Err(DemoPackError::InvalidTimestamp {
+                field: "captured_at",
+                ..
+            })
         ));
     }
 
