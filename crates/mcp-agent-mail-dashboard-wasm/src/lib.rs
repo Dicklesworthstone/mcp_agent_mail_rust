@@ -15,6 +15,8 @@ extern crate self as mcp_agent_mail_core;
 mod browser_contracts;
 pub mod console;
 pub mod demo_pack;
+#[cfg(feature = "exporter")]
+pub mod exporter;
 pub mod model;
 pub mod runner_core;
 pub mod state;

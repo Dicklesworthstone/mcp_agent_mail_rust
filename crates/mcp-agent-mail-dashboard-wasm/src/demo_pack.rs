@@ -10,9 +10,20 @@ use crate::tui_events::{
 
 pub const DEMO_PACK_SCHEMA_V1: &str = "agent_mail.demo_pack.v1";
 pub const PUBLIC_PRIVACY_POLICY_V1: &str = "agent-mail-dashboard-public-demo-v1";
+/// Hard ceiling on the serialized pack, enforced BEFORE deserialization so a
+/// hostile pack cannot drive allocation. Public so the exporter, native
+/// runner, and website loader all share one number.
+pub const MAX_SERIALIZED_PACK_BYTES: usize = 8 * 1024 * 1024;
+/// Hard ceiling on any single text field inside a pack (titles, labels,
+/// console lines, event strings). Shared across all loaders.
+pub const MAX_TEXT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_ACTIONS: usize = 10_000;
 const MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const MAX_SPARKLINE_SAMPLES: usize = 240;
+const STARTUP_HISTORY_EVENTS: u64 = 986;
+const STARTUP_AGENT_ROWS: usize = 500;
+const STARTUP_PROJECT_ROWS: usize = 41;
+const STARTUP_CONTACT_ROWS: usize = 200;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DemoProvenance {
@@ -62,6 +73,18 @@ pub struct DemoPack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DemoPackError {
     Json(String),
+    OversizedPack {
+        len: usize,
+        max: usize,
+    },
+    OversizedField {
+        field: String,
+        len: usize,
+        max: usize,
+    },
+    InvalidDigest {
+        digest: String,
+    },
     UnsupportedSchema(String),
     EmptyMetadata(&'static str),
     InvalidDuration(u64),
@@ -103,6 +126,14 @@ impl std::error::Error for DemoPackError {}
 
 impl DemoPack {
     pub fn from_json(json: &str) -> Result<Self, DemoPackError> {
+        // Size gate BEFORE parsing: nothing about a pack larger than the
+        // contract ceiling is worth allocating for.
+        if json.len() > MAX_SERIALIZED_PACK_BYTES {
+            return Err(DemoPackError::OversizedPack {
+                len: json.len(),
+                max: MAX_SERIALIZED_PACK_BYTES,
+            });
+        }
         let pack: Self =
             serde_json::from_str(json).map_err(|error| DemoPackError::Json(error.to_string()))?;
         pack.validate()?;
@@ -210,14 +241,25 @@ impl DemoPack {
             }
             previous_ms = action.at_ms;
         }
-        if !self.provenance.content_sha256.is_empty() {
-            let actual = self.computed_content_sha256();
-            if self.provenance.content_sha256 != actual {
-                return Err(DemoPackError::DigestMismatch {
-                    expected: self.provenance.content_sha256.clone(),
-                    actual,
-                });
-            }
+        // The public website contract requires the provenance digest, so an
+        // absent or malformed digest is a validation failure, not a skip: an
+        // empty digest previously bypassed integrity verification entirely.
+        let digest = &self.provenance.content_sha256;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(DemoPackError::InvalidDigest {
+                digest: digest.clone(),
+            });
+        }
+        let actual = self.computed_content_sha256();
+        if *digest != actual {
+            return Err(DemoPackError::DigestMismatch {
+                expected: digest.clone(),
+                actual,
+            });
         }
         Ok(())
     }
@@ -346,7 +388,21 @@ fn validate_json_strings(field: &str, value: &serde_json::Value) -> Result<(), D
 }
 
 fn validate_public_path(field: &str, value: &str) -> Result<(), DemoPackError> {
-    if value.starts_with('/') || value.contains("../") || value.contains("\\") {
+    // Reject every representation a traversal can hide in, not just the
+    // embedded `../` form: absolute paths, backslash separators, Windows
+    // drive prefixes (`C:/...` has no leading slash), percent escapes (which
+    // could decode into `.`/`/` at a consumer that URL-decodes), and any
+    // `..`/`.`/empty path segment — which covers terminal `..`, `x/..`,
+    // `a//b`, and trailing-slash forms in one rule.
+    let has_drive_prefix = value.len() >= 2 && value.as_bytes()[1] == b':';
+    if value.starts_with('/')
+        || value.contains('\\')
+        || value.contains('%')
+        || has_drive_prefix
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return Err(DemoPackError::UnsafeText {
             field: field.to_string(),
             reason: "path must be project-relative and traversal-free".to_string(),
@@ -356,6 +412,13 @@ fn validate_public_path(field: &str, value: &str) -> Result<(), DemoPackError> {
 }
 
 fn validate_public_text(field: &str, value: &str) -> Result<(), DemoPackError> {
+    if value.len() > MAX_TEXT_FIELD_BYTES {
+        return Err(DemoPackError::OversizedField {
+            field: field.to_string(),
+            len: value.len(),
+            max: MAX_TEXT_FIELD_BYTES,
+        });
+    }
     let lower = value.to_ascii_lowercase();
     let forbidden = [
         ("/users/", "absolute macOS home path"),
@@ -440,14 +503,16 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
         "scripts/verification/**",
     ];
 
-    (0_u64..128)
+    (0_u64..STARTUP_HISTORY_EVENTS)
         .map(|index| {
             let actor_index = usize::try_from(index).unwrap_or_default() % AGENTS.len();
             let peer_index = (actor_index + 3) % AGENTS.len();
             let project_index = usize::try_from(index / 3).unwrap_or_default() % PROJECTS.len();
             let subject_index = usize::try_from(index).unwrap_or_default() % SUBJECTS.len();
             let timestamp_micros = base_ts
-                - i64::try_from(128_u64.saturating_sub(index)).unwrap_or_default() * 750_000;
+                - i64::try_from(STARTUP_HISTORY_EVENTS.saturating_sub(index))
+                    .unwrap_or_default()
+                    * 750_000;
             let seq = 20_000 + index;
             let id = 30_000 + i64::try_from(index).unwrap_or_default();
             let operation = match index % 8 {
@@ -530,7 +595,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
 #[must_use]
 pub fn curated_public_demo() -> DemoPack {
     const BASE_TS: i64 = 1_772_668_800_000_000;
-    let agents = [
+    let agent_templates = [
         ("AmberDeer", "codex-cli", "gpt-5", "mcp-agent-mail-rust"),
         ("RubyPrairie", "claude-code", "opus", "frankentui"),
         ("GrayElk", "codex-cli", "gpt-5", "mcp-agent-mail-rust"),
@@ -547,20 +612,27 @@ pub fn curated_public_demo() -> DemoPack {
         ("CopperField", "codex-cli", "gpt-5", "frankensqlite"),
         ("TealFalcon", "claude-code", "sonnet", "edge-runtime"),
         ("CrimsonLake", "codex-cli", "gpt-5", "browser-runtime"),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(index, (name, program, model, project))| AgentSummary {
-        project: project.to_string(),
-        name: name.to_string(),
-        program: program.to_string(),
-        model: model.to_string(),
-        last_active_ts: BASE_TS - i64::try_from(index).unwrap_or(0) * 7_000_000,
-        health: None,
-    })
-    .collect::<Vec<_>>();
+    ];
+    let agents = (0..STARTUP_AGENT_ROWS)
+        .map(|index| {
+            let (name, program, model, project) = agent_templates[index % agent_templates.len()];
+            let cycle = index / agent_templates.len();
+            AgentSummary {
+                project: project.to_string(),
+                name: if cycle == 0 {
+                    name.to_string()
+                } else {
+                    format!("{name}{cycle:02}")
+                },
+                program: program.to_string(),
+                model: model.to_string(),
+                last_active_ts: BASE_TS - i64::try_from(index).unwrap_or(0) * 7_000_000,
+                health: None,
+            }
+        })
+        .collect::<Vec<_>>();
 
-    let projects = [
+    let project_templates = [
         (1, "mcp-agent-mail-rust", 1_825, 3),
         (2, "frankentui", 1_971, 2),
         (3, "frankensqlite", 1_123, 1),
@@ -571,20 +643,33 @@ pub fn curated_public_demo() -> DemoPack {
         (8, "browser-runtime", 476, 2),
         (9, "observability", 284, 1),
         (10, "integration-tests", 197, 1),
-    ]
-    .into_iter()
-    .map(
-        |(id, slug, message_count, reservation_count)| ProjectSummary {
-            id,
-            slug: slug.to_string(),
-            human_key: format!("public-demo/{slug}"),
-            agent_count: 16,
-            message_count,
-            reservation_count,
-            created_at: BASE_TS - 86_400_000_000,
-        },
-    )
-    .collect::<Vec<_>>();
+    ];
+    let projects = (0..STARTUP_PROJECT_ROWS)
+        .map(|index| {
+            let (slug, message_count, reservation_count) = project_templates
+                .get(index)
+                .map(|(_, slug, messages, reservations)| {
+                    ((*slug).to_string(), *messages, *reservations)
+                })
+                .unwrap_or_else(|| {
+                    (
+                        format!("public-project-{:02}", index + 1),
+                        180 + u64::try_from((index * 137) % 3_600).unwrap_or_default(),
+                        u64::try_from(index % 4).unwrap_or_default(),
+                    )
+                });
+            ProjectSummary {
+                id: 1 + i64::try_from(index).unwrap_or_default(),
+                human_key: format!("public-demo/{slug}"),
+                slug,
+                agent_count: 8 + u64::try_from(index % 37).unwrap_or_default(),
+                message_count,
+                reservation_count,
+                created_at: BASE_TS
+                    - (1 + i64::try_from(index).unwrap_or_default()) * 86_400_000_000,
+            }
+        })
+        .collect::<Vec<_>>();
 
     let reservation_rows = [
         ("mcp-agent-mail-rust", "AmberDeer", "crates/dashboard/**"),
@@ -619,7 +704,7 @@ pub fn curated_public_demo() -> DemoPack {
         })
         .collect::<Vec<_>>();
 
-    let contact_rows = [
+    let contact_templates = [
         (
             "AmberDeer",
             "RubyPrairie",
@@ -659,11 +744,11 @@ pub fn curated_public_demo() -> DemoPack {
             "browser-runtime",
         ),
     ];
-    let contacts = contact_rows
-        .into_iter()
-        .enumerate()
-        .map(
-            |(index, (from, to, from_project, to_project))| ContactSummary {
+    let contacts = (0..STARTUP_CONTACT_ROWS)
+        .map(|index| {
+            let (from, to, from_project, to_project) =
+                contact_templates[index % contact_templates.len()];
+            ContactSummary {
                 from_agent: from.to_string(),
                 to_agent: to.to_string(),
                 from_project_slug: from_project.to_string(),
@@ -672,8 +757,8 @@ pub fn curated_public_demo() -> DemoPack {
                 reason: "synthetic public demo coordination".to_string(),
                 updated_ts: BASE_TS - i64::try_from(index).unwrap_or_default() * 4_000_000,
                 expires_ts: None,
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
 
     let base_stats = DbStatSnapshot {
@@ -835,13 +920,42 @@ pub fn curated_public_demo() -> DemoPack {
 
 #[cfg(test)]
 mod tests {
-    use super::{DemoPack, DemoPackError, curated_public_demo};
+    use super::{
+        DemoPack, DemoPackError, STARTUP_AGENT_ROWS, STARTUP_CONTACT_ROWS, STARTUP_HISTORY_EVENTS,
+        STARTUP_PROJECT_ROWS, curated_public_demo,
+    };
 
     #[test]
     fn curated_pack_round_trips_and_digest_verifies() {
         let pack = curated_public_demo();
         let json = pack.to_pretty_json().unwrap();
         assert_eq!(DemoPack::from_json(&json).unwrap(), pack);
+    }
+
+    #[test]
+    fn curated_pack_opens_at_terminal_reference_density() {
+        let pack = curated_public_demo();
+        let startup_events = pack
+            .actions
+            .iter()
+            .take_while(|action| action.at_ms == 0)
+            .count();
+        assert_eq!(
+            startup_events,
+            usize::try_from(STARTUP_HISTORY_EVENTS).unwrap()
+        );
+        assert_eq!(
+            pack.bootstrap.db_stats.agents_list.len(),
+            STARTUP_AGENT_ROWS
+        );
+        assert_eq!(
+            pack.bootstrap.db_stats.projects_list.len(),
+            STARTUP_PROJECT_ROWS
+        );
+        assert_eq!(
+            pack.bootstrap.db_stats.contacts_list.len(),
+            STARTUP_CONTACT_ROWS
+        );
     }
 
     #[test]
@@ -858,7 +972,7 @@ mod tests {
     fn absolute_home_paths_fail_privacy_gate() {
         let mut pack = curated_public_demo();
         pack.provenance.source_label = "/Users/private/mailbox.sqlite3".to_string();
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
@@ -879,7 +993,7 @@ mod tests {
             })
             .unwrap();
         release[0] = "/tmp/private".to_string();
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
@@ -890,7 +1004,7 @@ mod tests {
     fn unapproved_privacy_policy_fails_closed() {
         let mut pack = curated_public_demo();
         pack.provenance.privacy_policy = "public-demo-unreviewed".to_string();
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
@@ -912,7 +1026,7 @@ mod tests {
         ] {
             let mut pack = curated_public_demo();
             pack.provenance.source_label = prohibited.to_string();
-            pack.provenance.content_sha256.clear();
+            pack.finalize_digest();
             assert!(
                 matches!(pack.validate(), Err(DemoPackError::UnsafeText { .. })),
                 "privacy corpus entry was accepted: {prohibited}"
@@ -934,7 +1048,7 @@ mod tests {
             })
             .unwrap();
         *event = false;
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnredactedEvent(_))
@@ -945,7 +1059,7 @@ mod tests {
     fn malformed_replay_contracts_fail_closed() {
         let mut non_finite = curated_public_demo();
         non_finite.bootstrap.latency_samples_ms[0] = f64::NAN;
-        non_finite.provenance.content_sha256.clear();
+        non_finite.finalize_digest();
         assert!(matches!(
             non_finite.validate(),
             Err(DemoPackError::NonFiniteLatency(0))
@@ -953,7 +1067,7 @@ mod tests {
 
         let mut non_monotonic = curated_public_demo();
         non_monotonic.actions[1].at_ms = 9_000;
-        non_monotonic.provenance.content_sha256.clear();
+        non_monotonic.finalize_digest();
         assert!(matches!(
             non_monotonic.validate(),
             Err(DemoPackError::NonMonotonicAction { .. })
@@ -961,7 +1075,7 @@ mod tests {
 
         let mut past_duration = curated_public_demo();
         past_duration.actions[0].at_ms = past_duration.duration_ms + 1;
-        past_duration.provenance.content_sha256.clear();
+        past_duration.finalize_digest();
         assert!(matches!(
             past_duration.validate(),
             Err(DemoPackError::ActionPastDuration { .. })
@@ -977,10 +1091,113 @@ mod tests {
             })
             .unwrap();
         *status = 99;
-        invalid_status.provenance.content_sha256.clear();
+        invalid_status.finalize_digest();
         assert!(matches!(
             invalid_status.validate(),
             Err(DemoPackError::InvalidHttpStatus { status: 99, .. })
         ));
+    }
+
+    #[test]
+    fn missing_or_malformed_digest_fails_closed() {
+        let mut pack = curated_public_demo();
+        pack.provenance.content_sha256.clear();
+        assert!(
+            matches!(pack.validate(), Err(DemoPackError::InvalidDigest { .. })),
+            "empty digest must no longer bypass integrity verification"
+        );
+
+        for malformed in [
+            "deadbeef",                      // too short
+            &"a".repeat(63),                 // 63 chars
+            &"a".repeat(65),                 // 65 chars
+            &format!("{}G", "a".repeat(63)), // non-hex
+            &curated_public_demo()
+                .provenance
+                .content_sha256
+                .to_uppercase(), // uppercase
+        ] {
+            pack.provenance.content_sha256 = malformed.to_string();
+            assert!(
+                matches!(pack.validate(), Err(DemoPackError::InvalidDigest { .. })),
+                "malformed digest {malformed:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_pack_is_rejected_before_parsing() {
+        let oversized = "x".repeat(super::MAX_SERIALIZED_PACK_BYTES + 1);
+        let result = DemoPack::from_json(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(DemoPackError::OversizedPack { len, max })
+                    if len == super::MAX_SERIALIZED_PACK_BYTES + 1
+                        && max == super::MAX_SERIALIZED_PACK_BYTES
+            ),
+            "an oversized pack must be rejected by the size gate, not the JSON parser"
+        );
+    }
+
+    #[test]
+    fn oversized_text_field_fails_closed() {
+        let mut pack = curated_public_demo();
+        pack.bootstrap
+            .console_lines
+            .push("y".repeat(super::MAX_TEXT_FIELD_BYTES + 1));
+        pack.finalize_digest();
+        assert!(matches!(
+            pack.validate(),
+            Err(DemoPackError::OversizedField { .. })
+        ));
+    }
+
+    #[test]
+    fn curated_pack_fits_comfortably_inside_size_budget() {
+        let json = curated_public_demo().to_pretty_json().unwrap();
+        assert!(
+            json.len() <= super::MAX_SERIALIZED_PACK_BYTES / 2,
+            "curated pack ({} bytes) must keep at least 2x headroom under the \
+             {}-byte contract ceiling",
+            json.len(),
+            super::MAX_SERIALIZED_PACK_BYTES
+        );
+    }
+
+    #[test]
+    fn traversal_paths_fail_in_every_representation() {
+        for hostile in [
+            "..",
+            "../x",
+            "x/..",
+            "a/../b",
+            "a/./b",
+            ".",
+            "a//b",
+            "src/",
+            "/absolute",
+            "a\\..\\b",
+            "..%2f",
+            "%2e%2e/",
+            "a/%2e%2e",
+            "C:/windows",
+            "c:relative",
+        ] {
+            assert!(
+                super::validate_public_path("test.path", hostile).is_err(),
+                "hostile path {hostile:?} must be rejected"
+            );
+        }
+        for benign in [
+            "src/**",
+            "crates/foo/src/lib.rs",
+            "docs/browser-dashboard.md",
+        ] {
+            assert!(
+                super::validate_public_path("test.path", benign).is_ok(),
+                "benign path {benign:?} must stay valid"
+            );
+        }
     }
 }
