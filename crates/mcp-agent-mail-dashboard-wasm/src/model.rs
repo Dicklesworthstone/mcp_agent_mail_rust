@@ -212,6 +212,9 @@ impl DashboardModel {
         let actions_applied;
         let replay_reset;
         let duration_ms = self.pack.duration_ms;
+        if duration_ms == 0 {
+            return ReplayAdvance::default();
+        }
         let total_ms = u128::from(self.elapsed_ms) + u128::from(dt_ms);
         let advanced_ms;
 
@@ -297,6 +300,7 @@ impl DashboardModel {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn tick_count(&self) -> u64 {
         self.tick_count
     }
@@ -348,21 +352,49 @@ impl DashboardModel {
         &self.state
     }
 
+    /// Open the browser Search screen and account for the entire shell
+    /// transition as one semantic interaction, including same-screen query,
+    /// editor, or selection resets.
+    fn open_search(&mut self, query: &str) {
+        let before = (
+            self.active_screen,
+            self.public_screen.search_query().to_string(),
+            self.public_screen.consumes_text_input(MailScreenId::Search),
+            self.public_screen.selected_row(),
+            self.last_deep_link.clone(),
+        );
+
+        if self.active_screen != MailScreenId::Search {
+            self.active_screen = MailScreenId::Search;
+            self.public_screen.reset();
+        }
+        self.public_screen.begin_search(query);
+        self.last_deep_link = Some(format!("search:{query}"));
+
+        let after = (
+            self.active_screen,
+            self.public_screen.search_query().to_string(),
+            self.public_screen.consumes_text_input(MailScreenId::Search),
+            self.public_screen.selected_row(),
+            self.last_deep_link.clone(),
+        );
+        if after != before {
+            self.interaction_revision = self.interaction_revision.saturating_add(1);
+        }
+    }
+
     fn capture_screen_command(&mut self, command: Cmd<MailScreenMsg>) {
         match command {
             Cmd::Msg(MailScreenMsg::DeepLink(target)) => {
                 let label = match target {
                     DeepLinkTarget::TimelineAtTime(timestamp) => {
                         self.activate_screen(MailScreenId::Timeline);
-                        let _ = self
-                            .public_screen
-                            .focus_timeline_at(timestamp, &self.state);
+                        let _ = self.public_screen.focus_timeline_at(timestamp, &self.state);
                         format!("timeline:{timestamp}")
                     }
                     DeepLinkTarget::SearchFocused(query) => {
-                        self.activate_screen(MailScreenId::Search);
-                        self.public_screen.begin_search(&query);
-                        format!("search:{query}")
+                        self.open_search(&query);
+                        return;
                     }
                 };
                 self.last_deep_link = Some(label);
@@ -425,9 +457,7 @@ impl DashboardModel {
                     return true;
                 }
                 MouseAction::OpenPalette => {
-                    self.activate_screen(MailScreenId::Search);
-                    self.public_screen.begin_search("");
-                    self.last_deep_link = Some("search:".to_string());
+                    self.open_search("");
                     return true;
                 }
                 MouseAction::Forward => {}
@@ -440,9 +470,12 @@ impl DashboardModel {
             let is_ctrl_p = key.modifiers.contains(Modifiers::CTRL)
                 && matches!(key.code, KeyCode::Char('p' | 'P'));
             if is_ctrl_p {
-                self.last_deep_link = Some("search:".to_string());
-                self.activate_screen(MailScreenId::Search);
-                self.public_screen.begin_search("");
+                if self.active_screen == MailScreenId::Search
+                    && self.public_screen.consumes_text_input(MailScreenId::Search)
+                {
+                    return true;
+                }
+                self.open_search("");
                 return true;
             }
 
@@ -468,9 +501,7 @@ impl DashboardModel {
                 KeyCode::Char('/')
                     if !text_mode && self.active_screen != MailScreenId::Dashboard =>
                 {
-                    self.last_deep_link = Some("search:".to_string());
-                    self.activate_screen(MailScreenId::Search);
-                    self.public_screen.begin_search("");
+                    self.open_search("");
                     return true;
                 }
                 KeyCode::Char(character)
@@ -524,8 +555,7 @@ impl Model for DashboardModel {
 
     fn update(&mut self, message: Self::Message) -> Cmd<Self::Message> {
         if matches!(message.0, Event::Tick) {
-            self.tick_count = self.tick_count.saturating_add(1);
-            self.screen.tick(self.tick_count, &self.state);
+            self.logical_tick();
         } else if self.handle_shell_input(&message.0) {
             return Cmd::none();
         } else if self.active_screen == MailScreenId::Dashboard {
@@ -622,12 +652,12 @@ fn render_browser_help(
 
 #[cfg(test)]
 mod tests {
-    use ftui::{Event, KeyCode, KeyEvent};
+    use ftui::{Event, KeyCode, KeyEvent, Modifiers};
     use ftui_runtime::program::Model;
 
     use super::{DashboardMessage, DashboardModel};
     use crate::demo_pack::curated_public_demo;
-    use crate::tui_screens::MailScreenId;
+    use crate::tui_screens::{MailScreen, MailScreenId};
 
     #[test]
     fn replay_reset_is_deterministic() {
@@ -673,9 +703,7 @@ mod tests {
     #[test]
     fn automatic_replay_wrap_preserves_active_screen() {
         let mut model = DashboardModel::new(curated_public_demo());
-        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
-            '2',
-        )))));
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Tab))));
         assert_eq!(model.active_screen(), MailScreenId::Messages);
 
         assert!(model.advance_replay_ms(model.pack().duration_ms + 100));
@@ -729,6 +757,52 @@ mod tests {
     }
 
     #[test]
+    fn huge_looping_advance_reconstructs_only_the_final_cycle() {
+        let pack = curated_public_demo();
+        let duration_ms = pack.duration_ms;
+        let mut expected = DashboardModel::new(pack.clone());
+        let mut actual = DashboardModel::new(pack);
+
+        assert!(expected.advance_replay_ms(6_100));
+        assert!(
+            actual.advance_replay_ms(duration_ms.saturating_mul(1_000_000).saturating_add(6_100),)
+        );
+
+        assert_eq!(actual.elapsed_ms(), expected.elapsed_ms());
+        assert_eq!(actual.next_action(), expected.next_action());
+        assert_eq!(
+            actual.state().db_stats_snapshot(),
+            expected.state().db_stats_snapshot()
+        );
+        assert_eq!(
+            actual.state().request_counters(),
+            expected.state().request_counters()
+        );
+        assert_eq!(
+            actual.state().event_ring_stats(),
+            expected.state().event_ring_stats()
+        );
+    }
+
+    #[test]
+    fn huge_exact_looping_advance_preserves_endpoint_semantics() {
+        let pack = curated_public_demo();
+        let duration_ms = pack.duration_ms;
+        let mut expected = DashboardModel::new(pack.clone());
+        let mut actual = DashboardModel::new(pack);
+
+        assert!(expected.advance_replay_ms(duration_ms));
+        assert!(actual.advance_replay_ms(duration_ms.saturating_mul(1_000_000)));
+
+        assert_eq!(actual.elapsed_ms(), duration_ms);
+        assert_eq!(actual.next_action(), expected.next_action());
+        assert_eq!(
+            actual.state().db_stats_snapshot(),
+            expected.state().db_stats_snapshot()
+        );
+    }
+
+    #[test]
     fn dashboard_text_mode_receives_digits_instead_of_switching_tabs() {
         let mut model = DashboardModel::new(curated_public_demo());
         model.screen.set_query_interaction("", true);
@@ -742,8 +816,36 @@ mod tests {
     }
 
     #[test]
-    fn slash_opens_an_editable_public_search() {
+    fn dashboard_numeric_shortcuts_reach_native_quick_filters() {
         let mut model = DashboardModel::new(curated_public_demo());
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            '2',
+        )))));
+
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert_eq!(model.dashboard_filter_slug(), "messages");
+    }
+
+    #[test]
+    fn dashboard_slash_reaches_its_live_filter() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            '/',
+        )))));
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            'r',
+        )))));
+
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert_eq!(model.screen.interaction_snapshot().query(), "r");
+        assert!(model.screen.consumes_text_input());
+    }
+
+    #[test]
+    fn slash_on_a_public_screen_opens_an_editable_public_search() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Tab))));
         let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
             '/',
         )))));
@@ -758,5 +860,117 @@ mod tests {
                 .public_screen
                 .consumes_text_input(MailScreenId::Search)
         );
+    }
+
+    #[test]
+    fn direct_screen_jumps_remain_available_outside_dashboard() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Tab))));
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            '4',
+        )))));
+
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+    }
+
+    #[test]
+    fn ctrl_p_globally_opens_search_without_toggling_dashboard_state() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        model.screen.set_query_interaction("active query", true);
+        let interaction_before = model.screen.interaction_snapshot();
+
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL);
+        let _ = model.update(DashboardMessage(Event::Key(ctrl_p)));
+
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        assert_eq!(model.last_deep_link(), Some("search:"));
+        assert!(
+            model
+                .public_screen
+                .consumes_text_input(MailScreenId::Search)
+        );
+        assert_eq!(model.screen.interaction_snapshot(), interaction_before);
+    }
+
+    #[test]
+    fn ctrl_p_preserves_an_active_search_editor() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        model.open_search("reservation");
+        let revision_before = model.interaction_revision();
+
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL);
+        let _ = model.update(DashboardMessage(Event::Key(ctrl_p)));
+
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        assert_eq!(model.public_screen.search_query(), "reservation");
+        assert!(
+            model
+                .public_screen
+                .consumes_text_input(MailScreenId::Search)
+        );
+        assert_eq!(model.interaction_revision(), revision_before);
+    }
+
+    #[test]
+    fn same_screen_search_activation_increments_revision_exactly_once() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        model.open_search("first");
+        let revision_before = model.interaction_revision();
+
+        model.open_search("second");
+        assert_eq!(model.public_screen.search_query(), "second");
+        assert_eq!(
+            model.interaction_revision(),
+            revision_before.saturating_add(1)
+        );
+
+        let unchanged_revision = model.interaction_revision();
+        model.open_search("second");
+        assert_eq!(model.interaction_revision(), unchanged_revision);
+    }
+
+    #[test]
+    fn slash_reactivates_same_screen_search_with_one_revision() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        model.open_search("reservation");
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Escape))));
+        assert!(
+            !model
+                .public_screen
+                .consumes_text_input(MailScreenId::Search)
+        );
+        let revision_before = model.interaction_revision();
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            '/',
+        )))));
+
+        assert_eq!(model.public_screen.search_query(), "");
+        assert!(
+            model
+                .public_screen
+                .consumes_text_input(MailScreenId::Search)
+        );
+        assert_eq!(
+            model.interaction_revision(),
+            revision_before.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn dashboard_timeline_deep_link_focuses_the_matching_public_row() {
+        let mut model = DashboardModel::new(curated_public_demo());
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Enter))));
+
+        assert_eq!(model.active_screen(), MailScreenId::Timeline);
+        assert!(
+            model
+                .last_deep_link()
+                .is_some_and(|link| link.starts_with("timeline:"))
+        );
+        assert!(model.public_selected_row() > 0);
     }
 }

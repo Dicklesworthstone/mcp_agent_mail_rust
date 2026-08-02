@@ -834,7 +834,7 @@ The project website separately embeds the real production `DashboardScreen` thro
 is an interactive, read-only public replay: six SQLite aggregate counts are real, while
 all names, paths, messages, and replay events are synthetic. It does not connect to a
 visitor's mailbox or expose the deferred `/mail/ws-input` path. The deterministic opening
-frame carries 986 synthetic history events, 500 agent rows, 41 project rows, and 200
+frame carries 192 synthetic history events, 500 agent rows, 41 project rows, and 200
 contact rows so the production dashboard opens at the same busy visual density as a real
 operator session without publishing mailbox content. See
 [`docs/SPEC-browser-parity-contract-deferred.md`](docs/SPEC-browser-parity-contract-deferred.md)

@@ -106,7 +106,17 @@ impl DashboardRunnerCore {
         let mut visible_changed = false;
         while remaining_ms > 0 {
             let to_tick_ms = LOGICAL_TICK_MS.saturating_sub(self.logical_tick_remainder_ms);
-            let slice_ms = remaining_ms.min(to_tick_ms);
+            let to_replay_endpoint_ms = {
+                let model = self.inner.model();
+                model.pack().duration_ms.saturating_sub(model.elapsed_ms())
+            };
+            let mut slice_ms = remaining_ms.min(to_tick_ms);
+            if to_replay_endpoint_ms > 0 {
+                // Land on a partial replay endpoint before wrapping. This
+                // gives its final actions one ingestion tick before the model
+                // reconstructs the surviving cycle.
+                slice_ms = slice_ms.min(to_replay_endpoint_ms);
+            }
             let advance = self.inner.model_mut().advance_replay(slice_ms);
             if advance.advanced_ms == 0 {
                 break;
@@ -133,6 +143,19 @@ impl DashboardRunnerCore {
                     self.inner.model_mut().logical_tick();
                     visible_changed = true;
                 }
+            }
+
+            let at_replay_endpoint = {
+                let model = self.inner.model();
+                model.elapsed_ms() == model.pack().duration_ms
+            };
+            if at_replay_endpoint && self.logical_tick_remainder_ms > 0 {
+                // A replay whose duration is not a multiple of the native
+                // cadence still needs one terminal ingestion tick. Otherwise
+                // endpoint actions remain absent from Dashboard caches forever.
+                self.logical_tick_remainder_ms = 0;
+                self.inner.model_mut().logical_tick();
+                visible_changed = true;
             }
 
             if advance.advanced_ms < slice_ms {
@@ -288,17 +311,70 @@ fn browser_event_can_change_model(event: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::DashboardRunnerCore;
-    use crate::demo_pack::curated_public_demo;
+    use crate::demo_pack::{DemoOperation, DemoPack, curated_public_demo};
 
-    fn loaded_runner(cols: u16, rows: u16) -> DashboardRunnerCore {
+    fn runner_with_pack(pack: &DemoPack, cols: u16, rows: u16) -> DashboardRunnerCore {
         let mut runner = DashboardRunnerCore::new(cols, rows);
-        let json = curated_public_demo()
+        let json = pack
             .to_pretty_json()
-            .expect("curated public demo should serialize");
+            .expect("public demo pack should serialize");
         runner
             .load_demo_pack_json(&json)
-            .expect("curated public demo should load");
+            .expect("public demo pack should load");
         runner
+    }
+
+    fn loaded_runner(cols: u16, rows: u16) -> DashboardRunnerCore {
+        runner_with_pack(&curated_public_demo(), cols, rows)
+    }
+
+    fn terminal_action_pack(loop_replay: bool) -> DemoPack {
+        let mut pack = curated_public_demo();
+        let mut terminal_action = pack
+            .actions
+            .iter()
+            .find(|action| {
+                action.at_ms > 0 && matches!(&action.operation, DemoOperation::PublishEvent { .. })
+            })
+            .cloned()
+            .expect("curated demo should include a timed public event");
+        terminal_action.at_ms = 150;
+        pack.actions.retain(|action| action.at_ms == 0);
+        pack.actions.push(terminal_action);
+        pack.duration_ms = 150;
+        pack.loop_replay = loop_replay;
+        pack.finalize_digest();
+        pack
+    }
+
+    fn latest_dashboard_raw_count(runner: &DashboardRunnerCore) -> u64 {
+        runner
+            .inner
+            .model()
+            .state()
+            .screen_diagnostics_since(0)
+            .into_iter()
+            .filter(|(_, diagnostic)| diagnostic.screen == "dashboard")
+            .map(|(_, diagnostic)| diagnostic.raw_count)
+            .next_back()
+            .expect("Dashboard render should emit a diagnostic")
+    }
+
+    fn assert_terminal_partial_tick(loop_replay: bool) {
+        let pack = terminal_action_pack(loop_replay);
+        let mut runner = runner_with_pack(&pack, 120, 36);
+        runner.set_reduced_motion(true);
+        runner.init();
+        let baseline_raw_count = latest_dashboard_raw_count(&runner);
+
+        runner.advance_time_ms(150.0);
+        let step = runner.step();
+
+        assert!(step.rendered);
+        assert_eq!(runner.status().elapsed_ms, 150);
+        assert_eq!(runner.inner.model().tick_count(), 12);
+        assert_eq!(runner.logical_tick_remainder_ms, 0);
+        assert_eq!(latest_dashboard_raw_count(&runner), baseline_raw_count + 1);
     }
 
     fn initial_patch_contract(cols: u16, rows: u16) -> (String, usize, usize) {
@@ -375,10 +451,12 @@ mod tests {
         let mut runner = loaded_runner(120, 36);
         runner.init();
         let baseline = runner.status();
+        assert_eq!(runner.inner.model().tick_count(), 10);
 
         runner.advance_time_ms(2_000.0);
         let _ = runner.step();
         let after_message = runner.status();
+        assert_eq!(runner.inner.model().tick_count(), 30);
         assert_eq!(after_message.messages, baseline.messages + 1);
         assert_eq!(
             after_message.pending_acknowledgements,
@@ -387,6 +465,7 @@ mod tests {
 
         runner.advance_time_ms(4_000.0);
         let _ = runner.step();
+        assert_eq!(runner.inner.model().tick_count(), 70);
         assert_eq!(
             runner.status().pending_acknowledgements,
             baseline.pending_acknowledgements
@@ -417,7 +496,8 @@ mod tests {
         let _ = runner.step();
         runner.advance_time_ms(15_000.0);
         let after = runner.status();
-        assert_eq!(after.active_screen, "messages");
+        assert_eq!(after.active_screen, "dashboard");
+        assert_eq!(after.dashboard_filter, "messages");
         assert!(after.interaction_revision > before.interaction_revision);
         assert!(after.reduced_motion);
         assert!(after.paused);
@@ -490,5 +570,168 @@ mod tests {
         assert!(step.rendered);
         assert!(!patches.cells.is_empty());
         assert_eq!(runner.status().active_screen, "dashboard");
+    }
+
+    #[test]
+    fn fractional_animation_frames_accumulate_without_replay_drift() {
+        let mut runner = loaded_runner(120, 36);
+        runner.set_reduced_motion(true);
+        runner.init();
+        let _ = runner.take_flat_patches();
+        let mut rendered_frames = 0;
+
+        for _ in 0..60 {
+            runner.advance_time_ms(16.666_7);
+            rendered_frames += usize::from(runner.step().rendered);
+        }
+
+        assert_eq!(runner.status().elapsed_ms, 1_000);
+        assert_eq!(runner.inner.model().tick_count(), 20);
+        assert_eq!(rendered_frames, 10);
+    }
+
+    #[test]
+    fn large_and_small_advances_apply_the_same_logical_ticks() {
+        fn run(deltas: impl IntoIterator<Item = f64>) -> (u64, u64, u64, u64) {
+            let mut runner = loaded_runner(120, 36);
+            runner.set_reduced_motion(true);
+            runner.init();
+            for delta in deltas {
+                runner.advance_time_ms(delta);
+                let _ = runner.step();
+            }
+            let status = runner.status();
+            (
+                status.elapsed_ms,
+                runner.inner.model().tick_count(),
+                status.messages,
+                status.pending_acknowledgements,
+            )
+        }
+
+        assert_eq!(run([2_000.0]), run(std::iter::repeat_n(100.0, 20)));
+    }
+
+    #[test]
+    fn huge_looping_advance_keeps_only_final_cycle_ticks_and_one_repaint() {
+        let mut runner = loaded_runner(120, 36);
+        runner.set_reduced_motion(true);
+        runner.init();
+        let _ = runner.take_flat_patches();
+
+        runner.advance_time_ms(60_000.0);
+        let step = runner.step();
+
+        assert_eq!(runner.status().elapsed_ms, 6_000);
+        assert_eq!(runner.inner.model().tick_count(), 70);
+        assert!(step.rendered);
+        assert_eq!(step.events_processed, 1);
+    }
+
+    #[test]
+    fn non_looping_partial_endpoint_gets_a_terminal_ingestion_tick() {
+        assert_terminal_partial_tick(false);
+    }
+
+    #[test]
+    fn looping_partial_endpoint_gets_a_terminal_ingestion_tick() {
+        assert_terminal_partial_tick(true);
+    }
+
+    #[test]
+    fn looping_cross_endpoint_flushes_then_reconstructs_the_surviving_cycle() {
+        let pack = terminal_action_pack(true);
+        let mut runner = runner_with_pack(&pack, 120, 36);
+        runner.set_reduced_motion(true);
+        runner.init();
+        let baseline_raw_count = latest_dashboard_raw_count(&runner);
+
+        // This single host delta crosses the 150 ms endpoint. The runner must
+        // land at 150 ms for its terminal tick, then reconstruct the new cycle
+        // at 50 ms rather than carrying the prior cycle's caches or cadence.
+        runner.advance_time_ms(200.0);
+        let crossed = runner.step();
+
+        assert!(crossed.rendered);
+        assert_eq!(crossed.events_processed, 1);
+        assert_eq!(runner.status().elapsed_ms, 50);
+        assert_eq!(runner.inner.model().tick_count(), 10);
+        assert_eq!(runner.logical_tick_remainder_ms, 50);
+        assert_eq!(latest_dashboard_raw_count(&runner), baseline_raw_count);
+
+        // Finishing the surviving cycle proves its partial endpoint still
+        // receives both the 100 ms cadence tick and the terminal flush.
+        runner.advance_time_ms(100.0);
+        let endpoint = runner.step();
+
+        assert!(endpoint.rendered);
+        assert_eq!(endpoint.events_processed, 1);
+        assert_eq!(runner.status().elapsed_ms, 150);
+        assert_eq!(runner.inner.model().tick_count(), 12);
+        assert_eq!(runner.logical_tick_remainder_ms, 0);
+        assert_eq!(latest_dashboard_raw_count(&runner), baseline_raw_count + 1);
+    }
+
+    #[test]
+    fn interleaved_runners_install_their_own_replay_clock_before_step() {
+        let mut advanced = loaded_runner(120, 36);
+        let mut initial = loaded_runner(120, 36);
+        advanced.init();
+        initial.init();
+        let base = advanced
+            .inner
+            .model()
+            .pack()
+            .bootstrap
+            .db_stats
+            .timestamp_micros;
+
+        advanced.advance_time_ms(2_500.0);
+        let _ = advanced.step();
+        assert_eq!(
+            crate::tui_screens::dashboard::browser_replay_now_micros(),
+            Some(base + 2_500_000)
+        );
+
+        let idle_step = initial.step();
+        assert!(!idle_step.rendered);
+        assert_eq!(
+            crate::tui_screens::dashboard::browser_replay_now_micros(),
+            Some(base)
+        );
+    }
+
+    #[test]
+    fn pause_freezes_replay_and_the_underlying_runner_clock() {
+        let mut runner = loaded_runner(120, 36);
+        runner.init();
+        runner.set_paused(true);
+        let backend_before = format!("{:?}", runner.inner.backend());
+
+        runner.advance_time_ms(15_000.75);
+
+        assert_eq!(runner.status().elapsed_ms, 0);
+        assert_eq!(runner.inner.model().tick_count(), 10);
+        assert_eq!(format!("{:?}", runner.inner.backend()), backend_before);
+        assert!(!runner.step().rendered);
+    }
+
+    #[test]
+    fn ctrl_p_opens_browser_search_even_from_dashboard_text_mode() {
+        let mut runner = loaded_runner(120, 36);
+        runner.init();
+        assert!(runner.push_encoded_input(
+            r#"{"kind":"key","phase":"down","key":"/","code":"Slash","mods":0,"repeat":false}"#,
+        ));
+        let _ = runner.step();
+        assert_eq!(runner.status().active_screen, "dashboard");
+
+        assert!(runner.push_encoded_input(
+            r#"{"kind":"key","phase":"down","key":"p","code":"KeyP","mods":4,"repeat":false}"#,
+        ));
+        let _ = runner.step();
+
+        assert_eq!(runner.status().active_screen, "search");
+        assert_eq!(runner.status().last_deep_link.as_deref(), Some("search:"));
     }
 }

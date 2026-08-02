@@ -431,7 +431,11 @@ impl PublicReplayScreen {
             self.list_area.set(Rect::new(0, 0, 0, 0));
             return;
         }
-        let title = format!(" {} records · sanitized public demo details ", rows.len());
+        let record_noun = if rows.len() == 1 { "record" } else { "records" };
+        let title = format!(
+            " {} {record_noun} · sanitized public demo details ",
+            rows.len()
+        );
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .title(&title)
