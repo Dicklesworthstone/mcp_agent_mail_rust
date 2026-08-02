@@ -25,6 +25,11 @@ pub struct RunnerStatus {
     pub active_reservations: u64,
     pub pending_acknowledgements: u64,
     pub last_deep_link: Option<String>,
+    pub active_screen: String,
+    pub dashboard_filter: String,
+    pub help_visible: bool,
+    pub interaction_revision: u64,
+    pub selected_row: usize,
 }
 
 pub struct DashboardRunnerCore {
@@ -38,7 +43,7 @@ impl DashboardRunnerCore {
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
-            inner: StepProgram::new(DashboardModel::default(), cols.max(1), rows.max(1)),
+            inner: StepProgram::new(DashboardModel::unloaded(), cols.max(1), rows.max(1)),
             cached_patch_hash: None,
             cached_patch_stats: None,
             cached_logs: Vec::new(),
@@ -55,7 +60,11 @@ impl DashboardRunnerCore {
     }
 
     pub fn load_demo_pack_json(&mut self, json: &str) -> Result<(), DemoPackError> {
-        self.inner.model_mut().load_pack_json(json)
+        self.inner.model_mut().load_pack_json(json)?;
+        if self.inner.is_initialized() {
+            self.inner.push_event(ftui::Event::Tick);
+        }
+        Ok(())
     }
 
     pub fn advance_time_ms(&mut self, dt_ms: f64) {
@@ -166,6 +175,11 @@ impl DashboardRunnerCore {
             active_reservations: stats.file_reservations,
             pending_acknowledgements: stats.ack_pending,
             last_deep_link: model.last_deep_link().map(str::to_owned),
+            active_screen: model.active_screen().as_slug().to_string(),
+            dashboard_filter: model.dashboard_filter_slug().to_string(),
+            help_visible: model.help_visible(),
+            interaction_revision: model.interaction_revision(),
+            selected_row: model.public_selected_row(),
         }
     }
 
@@ -178,9 +192,21 @@ impl DashboardRunnerCore {
 #[cfg(test)]
 mod tests {
     use super::DashboardRunnerCore;
+    use crate::demo_pack::curated_public_demo;
+
+    fn loaded_runner(cols: u16, rows: u16) -> DashboardRunnerCore {
+        let mut runner = DashboardRunnerCore::new(cols, rows);
+        let json = curated_public_demo()
+            .to_pretty_json()
+            .expect("curated public demo should serialize");
+        runner
+            .load_demo_pack_json(&json)
+            .expect("curated public demo should load");
+        runner
+    }
 
     fn initial_patch_contract(cols: u16, rows: u16) -> (String, usize, usize) {
-        let mut runner = DashboardRunnerCore::new(cols, rows);
+        let mut runner = loaded_runner(cols, rows);
         runner.set_reduced_motion(true);
         runner.init();
         let patches = runner.take_flat_patches();
@@ -193,7 +219,7 @@ mod tests {
 
     #[test]
     fn runner_produces_initial_flat_patch_batch() {
-        let mut runner = DashboardRunnerCore::new(120, 36);
+        let mut runner = loaded_runner(120, 36);
         runner.init();
         let patches = runner.take_flat_patches();
         assert!(!patches.cells.is_empty());
@@ -204,7 +230,7 @@ mod tests {
     #[test]
     fn same_input_sequence_is_deterministic() {
         fn run() -> (String, u64) {
-            let mut runner = DashboardRunnerCore::new(120, 36);
+            let mut runner = loaded_runner(120, 36);
             runner.set_reduced_motion(true);
             runner.init();
             let _ = runner.take_flat_patches();
@@ -250,7 +276,7 @@ mod tests {
 
     #[test]
     fn replay_counts_remain_coherent_across_message_ack_and_release_actions() {
-        let mut runner = DashboardRunnerCore::new(120, 36);
+        let mut runner = loaded_runner(120, 36);
         runner.init();
         let baseline = runner.status();
 
@@ -284,7 +310,7 @@ mod tests {
 
     #[test]
     fn browser_input_and_reduced_motion_cannot_mutate_mailbox_counts() {
-        let mut runner = DashboardRunnerCore::new(120, 36);
+        let mut runner = loaded_runner(120, 36);
         runner.set_reduced_motion(true);
         runner.set_paused(true);
         runner.init();
@@ -295,6 +321,8 @@ mod tests {
         let _ = runner.step();
         runner.advance_time_ms(15_000.0);
         let after = runner.status();
+        assert_eq!(after.active_screen, "messages");
+        assert!(after.interaction_revision > before.interaction_revision);
         assert!(after.reduced_motion);
         assert!(after.paused);
         assert_eq!(after.elapsed_ms, 0);
@@ -306,5 +334,46 @@ mod tests {
             after.pending_acknowledgements,
             before.pending_acknowledgements
         );
+    }
+
+    #[test]
+    fn rendered_native_tab_hit_region_switches_screens_from_mouse_input() {
+        let mut runner = loaded_runner(220, 48);
+        runner.set_paused(true);
+        runner.init();
+        let _ = runner.take_flat_patches();
+        let before = runner.status();
+
+        // At normal tab density Dashboard occupies cells 0..=13, followed by
+        // a separator; x=18 is safely inside the rendered Messages tab.
+        assert!(runner.push_encoded_input(
+            r#"{"kind":"mouse","phase":"down","button":0,"x":18,"y":0,"mods":0}"#,
+        ));
+        let step = runner.step();
+        let after = runner.status();
+
+        assert!(step.rendered);
+        assert_eq!(after.active_screen, "messages");
+        assert!(after.interaction_revision > before.interaction_revision);
+    }
+
+    #[test]
+    fn loading_verified_pack_after_init_schedules_a_real_frame() {
+        let mut runner = DashboardRunnerCore::new(120, 36);
+        runner.init();
+        let _ = runner.take_flat_patches();
+        let json = curated_public_demo()
+            .to_pretty_json()
+            .expect("curated public demo should serialize");
+
+        runner
+            .load_demo_pack_json(&json)
+            .expect("verified pack should load after init");
+        let step = runner.step();
+        let patches = runner.take_flat_patches();
+
+        assert!(step.rendered);
+        assert!(!patches.cells.is_empty());
+        assert_eq!(runner.status().active_screen, "dashboard");
     }
 }
