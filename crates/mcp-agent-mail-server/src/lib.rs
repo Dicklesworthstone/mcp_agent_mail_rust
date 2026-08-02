@@ -2434,21 +2434,16 @@ fn ensure_base_schema_on_sync_connection(conn: &DbConn) -> std::io::Result<()> {
     {
         return Ok(());
     }
+    // Execute the base DDL as one multi-statement script, exactly like every
+    // other caller of `init_schema_sql_base`. The previous `split(';')` loop
+    // broke as soon as the DDL grew SQL comments and trigger bodies (which
+    // contain interior semicolons), failing every fresh sync connection with
+    // "no SQL statement provided".
     let base_ddl = mcp_agent_mail_db::schema::init_schema_sql_base();
-    let mut applied = 0usize;
-    for stmt in base_ddl.split(';') {
-        let stmt = stmt.trim();
-        if stmt.is_empty() {
-            continue;
-        }
-        if let Err(e) = conn.execute_raw(&format!("{stmt};")) {
-            // Stop on first failure to avoid a cascade of dependent errors
-            // (e.g. read-only filesystem or locked database).
-            return Err(std::io::Error::other(format!(
-                "failed to ensure base schema after {applied} statement(s): {e}"
-            )));
-        }
-        applied += 1;
+    if let Err(e) = conn.execute_raw(&base_ddl) {
+        return Err(std::io::Error::other(format!(
+            "failed to ensure base schema: {e}"
+        )));
     }
     conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
         .map(|_| ())
@@ -27046,9 +27041,15 @@ first body
         );
     }
 
+    // The four tests below are cf201f67's authoritative set. A later merge
+    // (5efdb8b4) resurrected the stale May-era "canonicalizes symlinked"
+    // variants alongside a mangled function body; the July semantics —
+    // reject symlinked snapshot temp dirs except trusted macOS private/
+    // aliases — are the newer, deliberate design (mcp_agent_mail_rust#219
+    // cleanup).
     #[cfg(unix)]
     #[test]
-    fn validate_snapshot_temp_dir_canonicalizes_symlinked_directory() {
+    fn validate_snapshot_temp_dir_rejects_symlinked_directory() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27057,18 +27058,18 @@ first body
         std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
         symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
 
-        let selected = validate_snapshot_temp_dir(&linked_tmpdir, "system temp dir")
-            .expect("internal snapshot temp dirs should canonicalize symlinked tmpdir paths");
+        let err = validate_snapshot_temp_dir(&linked_tmpdir, "system temp dir")
+            .expect_err("symlinked temp dir should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn validate_snapshot_temp_dir_canonicalizes_symlinked_parent() {
+    fn validate_snapshot_temp_dir_rejects_symlinked_parent() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27078,18 +27079,18 @@ first body
         std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
         symlink(&real_parent, &linked_parent).expect("symlink tmpdir parent");
 
-        let selected = validate_snapshot_temp_dir(&linked_parent.join("child"), "system temp dir")
-            .expect("internal snapshot temp dirs should canonicalize symlinked parent paths");
+        let err = validate_snapshot_temp_dir(&linked_parent.join("child"), "system temp dir")
+            .expect_err("temp dir reached through symlinked parent should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn preferred_snapshot_temp_dir_canonicalizes_symlinked_tmpdir_override() {
+    fn preferred_snapshot_temp_dir_rejects_symlinked_tmpdir_override() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27102,21 +27103,21 @@ first body
             .expect("linked tmpdir utf-8")
             .to_string();
 
-        let selected = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("TMPDIR", linked_tmpdir.as_str())],
             preferred_snapshot_temp_dir,
         )
-        .expect("internal snapshot temp dirs should canonicalize symlinked TMPDIR");
+        .expect_err("symlinked TMPDIR should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn preferred_snapshot_temp_dir_canonicalizes_symlinked_parent_override() {
+    fn preferred_snapshot_temp_dir_rejects_symlinked_parent_override() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27131,15 +27132,15 @@ first body
             .expect("linked child utf-8")
             .to_string();
 
-        let selected = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("TMPDIR", linked_tmpdir.as_str())],
             preferred_snapshot_temp_dir,
         )
-        .expect("internal snapshot temp dirs should canonicalize symlinked TMPDIR parent");
+        .expect_err("TMPDIR reached through a symlinked parent should be rejected");
 
-        assert_eq!(
-            selected,
-            real_tmpdir.canonicalize().expect("canonical real tmpdir")
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
         );
     }
 

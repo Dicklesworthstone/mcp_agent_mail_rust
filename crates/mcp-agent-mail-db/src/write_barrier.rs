@@ -64,9 +64,10 @@ fn parse_positive_u64(raw: Option<String>, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Bounded writer-drain wait for corruption recovery
-/// (`AM_PROMOTION_WRITER_DRAIN_TIMEOUT_SECS`, default 10, zero/garbage fall
-/// back to the default so an override can never disable draining entirely).
+/// Bounded writer-drain wait for corruption recovery.
+///
+/// `AM_PROMOTION_WRITER_DRAIN_TIMEOUT_SECS`, default 10; zero/garbage fall
+/// back to the default so an override can never disable draining entirely.
 #[must_use]
 pub fn writer_drain_timeout() -> Duration {
     Duration::from_secs(parse_positive_u64(
@@ -75,8 +76,9 @@ pub fn writer_drain_timeout() -> Duration {
     ))
 }
 
-/// Minimum spacing between archive-drift reconciles per path
-/// (`AM_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS`, default 60). Unlike the
+/// Minimum spacing between archive-drift reconciles per path.
+///
+/// `AM_ARCHIVE_RECONCILE_MIN_INTERVAL_SECS`, default 60. Unlike the
 /// recovery breaker's thresholds, an explicit `0` here is honored and
 /// disables the cooldown — it is a pacing knob, not a safety floor.
 #[must_use]
@@ -133,10 +135,11 @@ fn current_thread_holds_barrier() -> bool {
     THREAD_BARRIER_DEPTH.with(Cell::get) > 0
 }
 
-/// Whether the calling thread is already inside a promotion barrier — i.e.
-/// executing as part of an ongoing recovery operation. Pacing gates
-/// (cooldowns, idle checks) apply only to standalone drift reconciles, never
-/// to steps nested inside a recovery that already owns the barrier.
+/// Whether the calling thread is already inside a promotion barrier.
+///
+/// True while executing as part of an ongoing recovery operation. Pacing
+/// gates (cooldowns, idle checks) apply only to standalone drift reconciles,
+/// never to steps nested inside a recovery that already owns the barrier.
 #[must_use]
 pub fn current_thread_holds_promotion_barrier() -> bool {
     current_thread_holds_barrier()
@@ -145,8 +148,9 @@ pub fn current_thread_holds_promotion_barrier() -> bool {
 /// RAII lease marking one in-flight write-path operation.
 ///
 /// Acquisition blocks while a promotion holds the barrier (warning
-/// periodically); the stall is bounded by the promotion itself, and a stalled
-/// tool call is strictly better than a write landing across a file swap.
+/// periodically). The stall is bounded by the promotion itself, and a
+/// stalled tool call is strictly better than a write landing across a file
+/// swap.
 ///
 /// Same-thread contract: like the existing `ReadOnlyIntentGuard` /
 /// `RecoveryAdmissionDepthGuard` / `RecoveryBreakerBypassGuard` patterns,
@@ -226,9 +230,11 @@ pub enum DrainOutcome {
     TimedOut { remaining_writers: usize },
 }
 
-/// RAII promotion barrier. While held, new write activity blocks in
-/// [`begin_write_activity`]. Reentrant per thread: nested acquisitions are
-/// passthrough and only the outermost release re-opens the write path.
+/// RAII promotion barrier.
+///
+/// While held, new write activity blocks in [`begin_write_activity`].
+/// Reentrant per thread: nested acquisitions are passthrough and only the
+/// outermost release re-opens the write path.
 #[must_use = "the promotion barrier releases when this guard drops"]
 pub struct PromotionBarrierGuard {
     passthrough: bool,
