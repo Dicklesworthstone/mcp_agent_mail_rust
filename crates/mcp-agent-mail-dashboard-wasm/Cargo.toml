@@ -47,6 +47,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+tempfile = "3"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-Oz"]

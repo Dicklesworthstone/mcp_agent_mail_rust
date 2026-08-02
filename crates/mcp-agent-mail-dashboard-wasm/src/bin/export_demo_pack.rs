@@ -6,8 +6,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use mcp_agent_mail_dashboard_wasm::demo_pack::{DemoOperation, curated_public_demo};
+use mcp_agent_mail_dashboard_wasm::exporter::{
+    AggregateCounts, open_source_read_only, read_aggregates_snapshot,
+};
 use mcp_agent_mail_dashboard_wasm::tui_events::{DbStatSnapshot, MailEvent};
-use sqlmodel_sqlite::SqliteConnection;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,48 +29,6 @@ struct Args {
     /// Public ISO-8601 capture timestamp supplied by the release process.
     #[arg(long)]
     captured_at: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AggregateCounts {
-    projects: u64,
-    agents: u64,
-    messages: u64,
-    file_reservations: u64,
-    contact_links: u64,
-    ack_pending: u64,
-}
-
-fn count(connection: &SqliteConnection, sql: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    let rows = connection.query_sync(sql, &[])?;
-    let value = rows
-        .first()
-        .ok_or("aggregate count query returned no row")?
-        .get_named::<i64>("c")?;
-    Ok(u64::try_from(value)?)
-}
-
-fn read_aggregates(
-    connection: &SqliteConnection,
-) -> Result<AggregateCounts, Box<dyn std::error::Error>> {
-    Ok(AggregateCounts {
-        projects: count(connection, "SELECT COUNT(*) AS c FROM projects")?,
-        agents: count(connection, "SELECT COUNT(*) AS c FROM agents")?,
-        messages: count(connection, "SELECT COUNT(*) AS c FROM messages")?,
-        file_reservations: count(
-            connection,
-            "SELECT COUNT(*) AS c FROM file_reservations \
-             WHERE released_ts IS NULL \
-               AND expires_ts > CAST(strftime('%s', 'now') AS INTEGER) * 1000000",
-        )?,
-        contact_links: count(connection, "SELECT COUNT(*) AS c FROM agent_links")?,
-        ack_pending: count(
-            connection,
-            "SELECT COUNT(*) AS c FROM message_recipients mr \
-             JOIN messages m ON m.id = mr.message_id \
-             WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
-        )?,
-    })
 }
 
 fn apply_aggregates(
@@ -94,8 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !source.is_file() {
         return Err("source must be a regular SQLite file".into());
     }
-    let connection = SqliteConnection::open_file(source.to_string_lossy().into_owned())?;
-    let counts = read_aggregates(&connection)?;
+    // Read-only, fail-closed open plus a single-snapshot aggregate read: the
+    // exporter never holds write capability on the private source, and all
+    // six published counts describe one database state (br-h44pp).
+    let connection = open_source_read_only(&source.to_string_lossy())?;
+    let counts = read_aggregates_snapshot(&connection)?;
 
     let mut pack = curated_public_demo();
     pack.provenance.source_label =
