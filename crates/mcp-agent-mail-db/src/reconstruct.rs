@@ -408,6 +408,16 @@ pub struct ReconstructStats {
     pub salvaged_reservations: usize,
     /// Number of terminal reservation-release ledger rows restored from a salvaged database.
     pub salvaged_reservation_releases: usize,
+    /// Number of salvaged rows skipped because they referenced project or
+    /// agent identities absent from the salvage source itself (dangling
+    /// cross-generation references, mcp_agent_mail_rust#219). One dangling
+    /// coordination row must never block whole-mailbox recovery; each skip
+    /// is itemized through the warning channel.
+    pub salvaged_rows_skipped_unmapped: usize,
+    /// Number of salvaged messages whose sender identity was missing from
+    /// the salvage source and was replaced with a placeholder agent so the
+    /// message content survives (the #113 "unknown-agent" doctrine).
+    pub salvaged_placeholder_senders: usize,
     /// Number of archive files that failed to parse (skipped).
     pub parse_errors: usize,
     /// Human-readable warnings collected during reconstruction. Itemization
@@ -636,6 +646,13 @@ impl std::fmt::Display for ReconstructStats {
                 self.salvaged_recipients,
                 self.salvaged_reservations,
                 self.salvaged_reservation_releases
+            )?;
+        }
+        if self.salvaged_rows_skipped_unmapped > 0 || self.salvaged_placeholder_senders > 0 {
+            write!(
+                f,
+                "; dropped {} unmappable salvaged row(s), substituted {} placeholder sender(s)",
+                self.salvaged_rows_skipped_unmapped, self.salvaged_placeholder_senders
             )?;
         }
         Ok(())
@@ -1550,6 +1567,12 @@ fn reconstruct_from_archive_impl(
             if stmt.is_empty() {
                 continue;
             }
+            // NOTE: this split survives comment-only fragments only because
+            // `DbConn` here is `CanonicalDbConn` (see the alias at the top of
+            // this module), whose prepare tolerates comment-only SQL. Do not
+            // copy this loop to a FrankenConnection context — it fails there
+            // with "no SQL statement provided" (see
+            // `ensure_base_schema_on_sync_connection` in the server crate).
             conn.execute_raw(&format!("{stmt};"))
                 .map_err(|e| DbError::Sqlite(format!("reconstruct: DDL: {e}")))?;
         }
@@ -3392,11 +3415,18 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode project_id for agent {source_agent_id}: {e}"
                     ))
                 })?;
-                let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: agent {source_agent_id} referenced unmapped project id {source_project_id}"
-                    ))
-                })?;
+                // #219: an agent row whose project is absent from the salvage
+                // source is a dangling cross-generation identity — it has no
+                // representable home in the candidate. Skip it; anything that
+                // references it downstream degrades per its own tier.
+                let Some(target_project_id) = project_id_map.get(&source_project_id).copied()
+                else {
+                    stats.push_warning(format!(
+                        "skipped salvaged agent {source_agent_id}: project id {source_project_id} is absent from the salvage source"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
+                };
 
                 let name = row.get_named::<String>("name").map_err(|e| {
                     DbError::Sqlite(format!(
@@ -3573,13 +3603,17 @@ fn merge_salvaged_database(
                 .map_err(|e| {
                     DbError::Sqlite(format!("reconstruct salvage: query file_reservations: {e}"))
                 })?;
+            // #219: without identity maps every reservation is unmappable by
+            // definition; the per-row skip logic below handles each one
+            // (leases expire on their own and must never refuse a recovery).
             if !reservation_rows.is_empty()
                 && (project_id_map.is_empty() || agent_id_map.is_empty())
             {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct salvage: {} has file_reservations rows but stable project/agent identity maps are unavailable",
-                    salvage_db_path.display()
-                )));
+                stats.push_warning(format!(
+                    "salvage source {} has {} file_reservations row(s) but no stable project/agent identity maps; all will be skipped",
+                    salvage_db_path.display(),
+                    reservation_rows.len()
+                ));
             }
 
             for row in &reservation_rows {
@@ -3603,20 +3637,26 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode agent_id for reservation {source_reservation_id}: {e}"
                     ))
                 })?;
-                let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: reservation {source_reservation_id} referenced unmapped project id {source_project_id}"
-                    ))
-                })?;
-                let target_agent_id = *agent_id_map.get(&source_agent_id).ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: reservation {source_reservation_id} referenced unmapped agent id {source_agent_id}"
-                    ))
-                })?;
+                // #219: a reservation whose project or owning agent cannot
+                // be mapped is a dangling cross-generation lease. It cannot
+                // be honored (its owner does not exist) and reservations
+                // expire on their own; skip rather than wedge the recovery.
+                let (Some(target_project_id), Some(target_agent_id)) = (
+                    project_id_map.get(&source_project_id).copied(),
+                    agent_id_map.get(&source_agent_id).copied(),
+                ) else {
+                    stats.push_warning(format!(
+                        "skipped salvaged reservation {source_reservation_id}: project {source_project_id} or agent {source_agent_id} is absent from the salvage source"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
+                };
                 if agent_project_id(&target_conn, target_agent_id)? != Some(target_project_id) {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: reservation {source_reservation_id} maps agent {source_agent_id} outside project {source_project_id}; refusing cross-project ownership"
-                    )));
+                    stats.push_warning(format!(
+                        "skipped salvaged reservation {source_reservation_id}: agent {source_agent_id} maps outside project {source_project_id} (cross-generation artifact)"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
                 }
 
                 let path_pattern = row
@@ -3817,12 +3857,18 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode release timestamp for reservation {source_reservation_id}: {e}"
                     ))
                 })?;
-                let target_reservation_id =
-                    *reservation_id_map.get(&source_reservation_id).ok_or_else(|| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: release references unmapped reservation id {source_reservation_id}"
-                        ))
-                    })?;
+                // #219: a release ledger row for a reservation that was not
+                // carried into the candidate (e.g. its owner was a dangling
+                // cross-generation identity) has nothing to release — skip.
+                let Some(target_reservation_id) =
+                    reservation_id_map.get(&source_reservation_id).copied()
+                else {
+                    stats.push_warning(format!(
+                        "skipped salvaged reservation release for reservation {source_reservation_id}: reservation was not carried into the candidate"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
+                };
                 let existing_release_rows = target_conn
                     .query_sync(
                         "SELECT released_ts FROM file_reservation_releases WHERE reservation_id = ?",
@@ -3903,12 +3949,17 @@ fn merge_salvaged_database(
                 .map_err(|e| {
                     DbError::Sqlite(format!("reconstruct salvage: query agent_links: {e}"))
                 })?;
+            // #219: without identity maps every link is unmappable by
+            // definition. The per-row skip logic below handles each one
+            // (regenerable handshake state must never refuse a recovery);
+            // this blanket note just makes the cause obvious in the log.
             if !agent_link_rows.is_empty() && (project_id_map.is_empty() || agent_id_map.is_empty())
             {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct salvage: {} has agent_links rows but stable project/agent identity maps are unavailable",
-                    salvage_db_path.display()
-                )));
+                stats.push_warning(format!(
+                    "salvage source {} has {} agent_link row(s) but no stable project/agent identity maps; all will be skipped",
+                    salvage_db_path.display(),
+                    agent_link_rows.len()
+                ));
             }
 
             for row in &agent_link_rows {
@@ -3933,42 +3984,45 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode agent_link peer agent: {e}"
                     ))
                 })?;
-                let target_origin_project_id = *project_id_map
-                    .get(&source_origin_project_id)
-                    .ok_or_else(|| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: agent_link references unmapped origin project {source_origin_project_id}"
-                        ))
-                    })?;
-                let target_origin_agent_id = *agent_id_map
-                    .get(&source_origin_agent_id)
-                    .ok_or_else(|| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: agent_link references unmapped origin agent {source_origin_agent_id}"
-                        ))
-                    })?;
-                let target_peer_project_id = *project_id_map
-                    .get(&source_peer_project_id)
-                    .ok_or_else(|| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: agent_link references unmapped peer project {source_peer_project_id}"
-                        ))
-                    })?;
-                let target_peer_agent_id =
-                    *agent_id_map.get(&source_peer_agent_id).ok_or_else(|| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: agent_link references unmapped peer agent {source_peer_agent_id}"
-                        ))
-                    })?;
+                // #219: an agent_link whose endpoints cannot be mapped is a
+                // dangling cross-generation artifact (a write that raced a
+                // recovery promotion referenced identities the salvage
+                // source never held). Auto-handshake links regenerate on the
+                // next send; skipping one row is strictly better than
+                // refusing the entire recovery with "unmapped origin agent"
+                // forever. Skips are itemized and counted.
+                let link_label = format!(
+                    "{source_origin_project_id}/{source_origin_agent_id}->{source_peer_project_id}/{source_peer_agent_id}"
+                );
+                let mapped_endpoints = (
+                    project_id_map.get(&source_origin_project_id).copied(),
+                    agent_id_map.get(&source_origin_agent_id).copied(),
+                    project_id_map.get(&source_peer_project_id).copied(),
+                    agent_id_map.get(&source_peer_agent_id).copied(),
+                );
+                let (
+                    Some(target_origin_project_id),
+                    Some(target_origin_agent_id),
+                    Some(target_peer_project_id),
+                    Some(target_peer_agent_id),
+                ) = mapped_endpoints
+                else {
+                    stats.push_warning(format!(
+                        "skipped salvaged agent_link {link_label}: one or more endpoints reference identities absent from the salvage source (dangling cross-generation row)"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
+                };
                 if agent_project_id(&target_conn, target_origin_agent_id)?
                     != Some(target_origin_project_id)
                     || agent_project_id(&target_conn, target_peer_agent_id)?
                         != Some(target_peer_project_id)
                 {
-                    return Err(DbError::Sqlite(
-                        "reconstruct salvage: agent_link ownership crosses a stable project boundary"
-                            .to_string(),
+                    stats.push_warning(format!(
+                        "skipped salvaged agent_link {link_label}: ownership crosses a stable project boundary (cross-generation artifact)"
                     ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
                 }
 
                 let link_status = row
@@ -3981,9 +4035,11 @@ fn merge_salvaged_database(
                 let updated_ts = row.get_named::<i64>("updated_ts").unwrap_or(created_ts);
                 let expires_ts = row.get_named::<i64>("expires_ts").ok();
                 if created_ts <= 0 || updated_ts < created_ts {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: agent_link {source_origin_project_id}/{source_origin_agent_id}->{source_peer_project_id}/{source_peer_agent_id} has invalid timestamp ordering ({created_ts}, {updated_ts})"
-                    )));
+                    stats.push_warning(format!(
+                        "skipped salvaged agent_link {link_label}: invalid timestamp ordering ({created_ts}, {updated_ts})"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
                 }
 
                 let existing_links = target_conn
@@ -4233,13 +4289,16 @@ fn merge_salvaged_database(
                         "reconstruct salvage: query product_project_links: {e}"
                     ))
                 })?;
+            // #219: without identity maps every product link is unmappable by
+            // definition; the per-row skip logic below handles each one.
             if !product_link_rows.is_empty()
                 && (product_id_map.is_empty() || project_id_map.is_empty())
             {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct salvage: {} has product_project_links rows but stable product/project identity maps are unavailable",
-                    salvage_db_path.display()
-                )));
+                stats.push_warning(format!(
+                    "salvage source {} has {} product_project_links row(s) but no stable product/project identity maps; all will be skipped",
+                    salvage_db_path.display(),
+                    product_link_rows.len()
+                ));
             }
 
             for row in &product_link_rows {
@@ -4253,20 +4312,18 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode product_project_link project id: {e}"
                     ))
                 })?;
-                let target_product_id = *product_id_map
-                            .get(&source_product_id)
-                            .ok_or_else(|| {
-                                DbError::Sqlite(format!(
-                                    "reconstruct salvage: product_project_link references unmapped product {source_product_id}"
-                                ))
-                            })?;
-                let target_project_id = *project_id_map
-                            .get(&source_project_id)
-                            .ok_or_else(|| {
-                                DbError::Sqlite(format!(
-                                    "reconstruct salvage: product_project_link references unmapped project {source_project_id}"
-                                ))
-                            })?;
+                // #219: dangling product/project references are
+                // cross-generation artifacts; skip the link row.
+                let (Some(target_product_id), Some(target_project_id)) = (
+                    product_id_map.get(&source_product_id).copied(),
+                    project_id_map.get(&source_project_id).copied(),
+                ) else {
+                    stats.push_warning(format!(
+                        "skipped salvaged product_project_link {source_product_id}->{source_project_id}: product or project is absent from the salvage source"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
+                };
 
                 target_conn
                         .execute_sync(
@@ -4436,6 +4493,8 @@ fn merge_salvaged_database(
             // The first batch has no id floor so non-positive ids (which the
             // strict salvage contract refuses) still sort first, surface, and
             // fail closed exactly as the previous full-table read did.
+            // #219: memo for placeholder senders substituted for unmapped ids.
+            let mut placeholder_sender_memo: HashMap<(i64, String), i64> = HashMap::new();
             let mut message_keyset_floor: Option<i64> = None;
             loop {
                 let (message_where, message_params): (&str, Vec<Value>) = match message_keyset_floor
@@ -4473,27 +4532,56 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode project_id for message {source_message_id}: {e}"
                     ))
                 })?;
-                    let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: message {source_message_id} referenced unmapped project id {source_project_id}"
-                    ))
-                })?;
+                    // #219: a message whose project identity is absent from
+                    // the salvage source has no valid destination — skip it
+                    // (the canonical archive copy, when one exists, is
+                    // already in the candidate; the salvage source itself is
+                    // preserved via quarantine/forensics).
+                    let Some(target_project_id) =
+                        project_id_map.get(&source_project_id).copied()
+                    else {
+                        stats.push_warning(format!(
+                            "skipped salvaged message {source_message_id}: project id {source_project_id} is absent from the salvage source"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
+                    };
                     let source_sender_id = row.get_named::<i64>("sender_id").map_err(|e| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: decode sender_id for message {source_message_id}: {e}"
                     ))
                 })?;
-                    let target_sender_id = *agent_id_map.get(&source_sender_id).ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: message {source_message_id} referenced unmapped sender id {source_sender_id}"
-                    ))
-                })?;
-                    if agent_project_id(&target_conn, target_sender_id)? != Some(target_project_id)
-                    {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage: message {source_message_id} maps sender {source_sender_id} outside project {source_project_id}; refusing cross-project ownership"
-                        )));
-                    }
+                    // #219: a sender identity missing from the salvage source
+                    // must not drop the message (that is real content) and
+                    // must not wedge the recovery. Substitute a placeholder
+                    // agent in the target project, mirroring the #113
+                    // "unknown-agent" doctrine for orphaned recipients.
+                    let target_sender_id = match agent_id_map.get(&source_sender_id).copied() {
+                        Some(mapped) => {
+                            if agent_project_id(&target_conn, mapped)? != Some(target_project_id) {
+                                stats.push_warning(format!(
+                                    "skipped salvaged message {source_message_id}: sender {source_sender_id} maps outside project {source_project_id} (cross-generation artifact); the canonical archive copy is authoritative"
+                                ));
+                                stats.salvaged_rows_skipped_unmapped += 1;
+                                continue;
+                            }
+                            mapped
+                        }
+                        None => {
+                            let placeholder_name = format!("unknown-agent-{source_sender_id}");
+                            let placeholder_id = ensure_agent_exists(
+                                &target_conn,
+                                target_project_id,
+                                &placeholder_name,
+                                &mut placeholder_sender_memo,
+                            )?;
+                            stats.push_warning(format!(
+                                "salvaged message {source_message_id} sender id {source_sender_id} is absent from the salvage source; substituted placeholder agent '{placeholder_name}'"
+                            ));
+                            stats.salvaged_placeholder_senders += 1;
+                            placeholder_id
+                        }
+                    };
 
                     if message_project_id(&target_conn, source_message_id)?
                         == Some(target_project_id)
@@ -4660,22 +4748,33 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode agent_id for message {source_message_id}: {e}"
                     ))
                 })?;
-                    let target_agent_id = *agent_id_map.get(&source_agent_id).ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: recipient for message {source_message_id} references unmapped agent id {source_agent_id}"
-                    ))
-                })?;
+                    // #219: recipient rows carry per-recipient read/ack
+                    // state. A dangling agent or message reference is a
+                    // cross-generation artifact; losing one recipient's read
+                    // state is trivial next to refusing the whole recovery.
+                    let Some(target_agent_id) = agent_id_map.get(&source_agent_id).copied()
+                    else {
+                        stats.push_warning(format!(
+                            "skipped salvaged recipient state for message {source_message_id}: agent id {source_agent_id} is absent from the salvage source"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
+                    };
                     let target_agent_project_id = agent_project_id(&target_conn, target_agent_id)?
                     .ok_or_else(|| {
                         DbError::Sqlite(format!(
                             "reconstruct salvage: mapped target agent {target_agent_id} is missing"
                         ))
                     })?;
-                    let target_message_id = *message_id_map.get(&source_message_id).ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: recipient references unmapped source-local message id {source_message_id}; refusing to attach state without a decoded salvage message identity"
-                    ))
-                })?;
+                    let Some(target_message_id) =
+                        message_id_map.get(&source_message_id).copied()
+                    else {
+                        stats.push_warning(format!(
+                            "skipped salvaged recipient state: message id {source_message_id} was not carried into the candidate"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
+                    };
                     let target_message_project_id = message_project_id(
                     &target_conn,
                     target_message_id,
@@ -4686,9 +4785,11 @@ fn merge_salvaged_database(
                     ))
                 })?;
                     if target_agent_project_id != target_message_project_id {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage: recipient agent {source_agent_id} for message {source_message_id} maps outside the message project; refusing cross-project recipient state"
-                        )));
+                        stats.push_warning(format!(
+                            "skipped salvaged recipient state for message {source_message_id}: agent {source_agent_id} maps outside the message project (cross-generation artifact)"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
                     }
                     let raw_kind = row.get_named::<String>("kind").ok();
                     let kind = normalize_salvaged_recipient_kind(
@@ -5641,6 +5742,8 @@ mod tests {
             salvaged_recipients: 0,
             salvaged_reservations: 0,
             salvaged_reservation_releases: 0,
+            salvaged_rows_skipped_unmapped: 0,
+            salvaged_placeholder_senders: 0,
             parse_errors: 3,
             warnings: vec![],
             suppressed_warnings: 0,
@@ -6397,6 +6500,143 @@ body
             1_i64,
             "salvage database should promote project created_at"
         );
+    }
+
+    /// Regression for mcp_agent_mail_rust#219: writes racing a recovery
+    /// promotion left `agent_links` / `messages` / `message_recipients` rows
+    /// referencing agent ids that never existed in the salvage source. The
+    /// strict merge refused the entire recovery ("unmapped origin agent
+    /// 925") forever, wedging the mailbox until manual DB surgery. Dangling
+    /// coordination rows must degrade to itemized skips, and unmapped
+    /// senders must degrade to placeholder agents so message content
+    /// survives.
+    #[test]
+    fn salvage_merge_survives_dangling_cross_generation_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed.db");
+        let salvage_db_path = tmp.path().join("salvage.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT, created_at INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT, model TEXT, task_description TEXT, inception_ts INTEGER, last_active_ts INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT, body_md TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER, recipients_json TEXT, attachments TEXT)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, ack_ts INTEGER)",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, status TEXT, reason TEXT, created_ts INTEGER, updated_ts INTEGER, expires_ts INTEGER)",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (20, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        // Two live identities. Ids 925, 1240, and 464 are deliberately
+        // absent from `agents` — exactly the incident shape.
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+                 VALUES (5, 20, 'RealAgent', 'codex', 'gpt', '', 10, 10), (6, 20, 'PeerAgent', 'codex', 'gpt', '', 10, 10)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES \
+                 (42, 20, 1240, NULL, 'orphan sender', 'body from the racing write', 'normal', 0, 100, '{}', '[]'), \
+                 (43, 20, 5, NULL, 'healthy', 'body', 'normal', 0, 101, '{}', '[]')",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (43, 464, 'to', NULL, NULL), (43, 6, 'to', 5, NULL)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agent_links (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) VALUES \
+                 (507, 20, 925, 20, 6, 'approved', 'auto-handshake by send_message', 100, 101, NULL), \
+                 (508, 20, 5, 20, 6, 'approved', 'auto-handshake by send_message', 100, 101, NULL)",
+                &[],
+            )
+            .unwrap();
+        drop(salvage_conn);
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("merge must survive dangling cross-generation rows");
+
+        assert_eq!(
+            stats.salvaged_placeholder_senders, 1,
+            "sender 1240 must degrade to a placeholder agent"
+        );
+        assert!(
+            stats.salvaged_rows_skipped_unmapped >= 2,
+            "dangling link (agent 925) and recipient (agent 464) must be skipped, got {}",
+            stats.salvaged_rows_skipped_unmapped
+        );
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("agent_link") && w.contains("dangling")),
+            "the skipped link must be itemized: {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        // The racing write's message content survived, re-homed under the
+        // placeholder sender.
+        let rows = conn
+            .query_sync(
+                "SELECT a.name AS name, a.program AS program FROM messages m JOIN agents a ON a.id = m.sender_id WHERE m.id = 42",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "message 42 must be carried into the candidate");
+        assert_eq!(
+            rows[0].get_named::<String>("name").unwrap(),
+            "unknown-agent-1240"
+        );
+        assert_eq!(rows[0].get_named::<String>("program").unwrap(), "unknown");
+        // The healthy link survived; the dangling one did not.
+        let link_rows = conn
+            .query_sync("SELECT COUNT(*) AS n FROM agent_links", &[])
+            .unwrap();
+        assert_eq!(link_rows[0].get_named::<i64>("n").unwrap(), 1);
+        // Healthy recipient state survived; the dangling recipient did not.
+        let recip = conn
+            .query_sync(
+                "SELECT agent_id FROM message_recipients WHERE message_id = 43",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recip.len(), 1, "only the mappable recipient row survives");
     }
 
     #[cfg(unix)]

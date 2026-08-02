@@ -1339,13 +1339,21 @@ pub mod tool_util {
             }
         }
 
-        // Check read cache first (slug lookups only; ensure_project always hits DB)
+        // Delegate to the queries layer, which is cache-first against the
+        // *pool-scoped* cache. The previous code path consulted the unscoped
+        // (`scope = ""`) cache here as a pre-check and wrote every resolved
+        // project back to it. Unscoped entries are invisible to
+        // `invalidate_scope` (which only ever runs with
+        // "{identity}@{generation}" scopes), so a numeric `project.id` cached
+        // here survived every pool retirement and recovery promotion for the
+        // full cache TTL — and could even originate from an archive-snapshot
+        // read pool whose reconstructed rowids never matched the live file.
+        // Write tools then minted placeholder agents and agent_links against
+        // the stale id (mcp_agent_mail_rust#219). Same split-brain class as
+        // the agent-side fix for mcp_agent_mail_rust#106: always go through
+        // the scoped path so the cache key matches the pool the SQL will
+        // actually run against.
         let is_absolute = std::path::Path::new(raw_identifier).is_absolute();
-        if !is_absolute
-            && let Some(cached) = mcp_agent_mail_db::read_cache().get_project(raw_identifier)
-        {
-            return Ok(cached);
-        }
         let out = if is_absolute {
             mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, raw_identifier).await
         } else {
@@ -1353,11 +1361,7 @@ pub mod tool_util {
         };
 
         match db_outcome_to_mcp_result(out) {
-            Ok(project) => {
-                // Populate cache on miss
-                mcp_agent_mail_db::read_cache().put_project(&project);
-                Ok(project)
-            }
+            Ok(project) => Ok(project),
             Err(e) => {
                 // Only enhance NOT_FOUND errors with fuzzy suggestions
                 let is_not_found = e

@@ -82,6 +82,7 @@ pub mod sync;
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;
 pub mod wal_classify;
+pub mod write_barrier;
 
 #[cfg(not(feature = "tantivy-engine"))]
 pub mod search_v3 {
