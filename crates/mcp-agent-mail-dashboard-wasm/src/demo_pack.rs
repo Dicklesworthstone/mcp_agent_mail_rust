@@ -10,6 +10,13 @@ use crate::tui_events::{
 
 pub const DEMO_PACK_SCHEMA_V1: &str = "agent_mail.demo_pack.v1";
 pub const PUBLIC_PRIVACY_POLICY_V1: &str = "agent-mail-dashboard-public-demo-v1";
+/// Hard ceiling on the serialized pack, enforced BEFORE deserialization so a
+/// hostile pack cannot drive allocation. Public so the exporter, native
+/// runner, and website loader all share one number.
+pub const MAX_SERIALIZED_PACK_BYTES: usize = 8 * 1024 * 1024;
+/// Hard ceiling on any single text field inside a pack (titles, labels,
+/// console lines, event strings). Shared across all loaders.
+pub const MAX_TEXT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_ACTIONS: usize = 10_000;
 const MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const MAX_SPARKLINE_SAMPLES: usize = 240;
@@ -82,6 +89,18 @@ pub struct DemoPack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DemoPackError {
     Json(String),
+    OversizedPack {
+        len: usize,
+        max: usize,
+    },
+    OversizedField {
+        field: String,
+        len: usize,
+        max: usize,
+    },
+    InvalidDigest {
+        digest: String,
+    },
     UnsupportedSchema(String),
     EmptyMetadata(&'static str),
     InvalidDuration(u64),
@@ -151,6 +170,14 @@ impl DemoPack {
     }
 
     pub fn from_json(json: &str) -> Result<Self, DemoPackError> {
+        // Size gate BEFORE parsing: nothing about a pack larger than the
+        // contract ceiling is worth allocating for.
+        if json.len() > MAX_SERIALIZED_PACK_BYTES {
+            return Err(DemoPackError::OversizedPack {
+                len: json.len(),
+                max: MAX_SERIALIZED_PACK_BYTES,
+            });
+        }
         let pack: Self =
             serde_json::from_str(json).map_err(|error| DemoPackError::Json(error.to_string()))?;
         pack.validate()?;
@@ -259,14 +286,25 @@ impl DemoPack {
             }
             previous_ms = action.at_ms;
         }
-        if !self.provenance.content_sha256.is_empty() {
-            let actual = self.computed_content_sha256();
-            if self.provenance.content_sha256 != actual {
-                return Err(DemoPackError::DigestMismatch {
-                    expected: self.provenance.content_sha256.clone(),
-                    actual,
-                });
-            }
+        // The public website contract requires the provenance digest, so an
+        // absent or malformed digest is a validation failure, not a skip: an
+        // empty digest previously bypassed integrity verification entirely.
+        let digest = &self.provenance.content_sha256;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(DemoPackError::InvalidDigest {
+                digest: digest.clone(),
+            });
+        }
+        let actual = self.computed_content_sha256();
+        if *digest != actual {
+            return Err(DemoPackError::DigestMismatch {
+                expected: digest.clone(),
+                actual,
+            });
         }
         Ok(())
     }
@@ -410,7 +448,21 @@ fn validate_json_strings(field: &str, value: &serde_json::Value) -> Result<(), D
 }
 
 fn validate_public_path(field: &str, value: &str) -> Result<(), DemoPackError> {
-    if value.starts_with('/') || value.contains("../") || value.contains("\\") {
+    // Reject every representation a traversal can hide in, not just the
+    // embedded `../` form: absolute paths, backslash separators, Windows
+    // drive prefixes (`C:/...` has no leading slash), percent escapes (which
+    // could decode into `.`/`/` at a consumer that URL-decodes), and any
+    // `..`/`.`/empty path segment — which covers terminal `..`, `x/..`,
+    // `a//b`, and trailing-slash forms in one rule.
+    let has_drive_prefix = value.len() >= 2 && value.as_bytes()[1] == b':';
+    if value.starts_with('/')
+        || value.contains('\\')
+        || value.contains('%')
+        || has_drive_prefix
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return Err(DemoPackError::UnsafeText {
             field: field.to_string(),
             reason: "path must be project-relative and traversal-free".to_string(),
@@ -420,6 +472,13 @@ fn validate_public_path(field: &str, value: &str) -> Result<(), DemoPackError> {
 }
 
 fn validate_public_text(field: &str, value: &str) -> Result<(), DemoPackError> {
+    if value.len() > MAX_TEXT_FIELD_BYTES {
+        return Err(DemoPackError::OversizedField {
+            field: field.to_string(),
+            len: value.len(),
+            max: MAX_TEXT_FIELD_BYTES,
+        });
+    }
     let lower = value.to_ascii_lowercase();
     let forbidden = [
         ("/users/", "absolute macOS home path"),
@@ -1024,7 +1083,7 @@ mod tests {
     fn absolute_home_paths_fail_privacy_gate() {
         let mut pack = curated_public_demo();
         pack.provenance.source_label = "/Users/private/mailbox.sqlite3".to_string();
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
@@ -1045,7 +1104,7 @@ mod tests {
             })
             .unwrap();
         release[0] = "/tmp/private".to_string();
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
@@ -1056,7 +1115,7 @@ mod tests {
     fn unapproved_privacy_policy_fails_closed() {
         let mut pack = curated_public_demo();
         pack.provenance.privacy_policy = "public-demo-unreviewed".to_string();
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnsafeText { .. })
@@ -1078,7 +1137,7 @@ mod tests {
         ] {
             let mut pack = curated_public_demo();
             pack.provenance.source_label = prohibited.to_string();
-            pack.provenance.content_sha256.clear();
+            pack.finalize_digest();
             assert!(
                 matches!(pack.validate(), Err(DemoPackError::UnsafeText { .. })),
                 "privacy corpus entry was accepted: {prohibited}"
@@ -1100,7 +1159,7 @@ mod tests {
             })
             .unwrap();
         *event = false;
-        pack.provenance.content_sha256.clear();
+        pack.finalize_digest();
         assert!(matches!(
             pack.validate(),
             Err(DemoPackError::UnredactedEvent(_))
@@ -1111,7 +1170,7 @@ mod tests {
     fn malformed_replay_contracts_fail_closed() {
         let mut non_finite = curated_public_demo();
         non_finite.bootstrap.latency_samples_ms[0] = f64::NAN;
-        non_finite.provenance.content_sha256.clear();
+        non_finite.finalize_digest();
         assert!(matches!(
             non_finite.validate(),
             Err(DemoPackError::NonFiniteLatency(0))
@@ -1119,7 +1178,7 @@ mod tests {
 
         let mut non_monotonic = curated_public_demo();
         non_monotonic.actions[1].at_ms = 9_000;
-        non_monotonic.provenance.content_sha256.clear();
+        non_monotonic.finalize_digest();
         assert!(matches!(
             non_monotonic.validate(),
             Err(DemoPackError::NonMonotonicAction { .. })
@@ -1127,7 +1186,7 @@ mod tests {
 
         let mut past_duration = curated_public_demo();
         past_duration.actions[0].at_ms = past_duration.duration_ms + 1;
-        past_duration.provenance.content_sha256.clear();
+        past_duration.finalize_digest();
         assert!(matches!(
             past_duration.validate(),
             Err(DemoPackError::ActionPastDuration { .. })
@@ -1143,10 +1202,113 @@ mod tests {
             })
             .unwrap();
         *status = 99;
-        invalid_status.provenance.content_sha256.clear();
+        invalid_status.finalize_digest();
         assert!(matches!(
             invalid_status.validate(),
             Err(DemoPackError::InvalidHttpStatus { status: 99, .. })
         ));
+    }
+
+    #[test]
+    fn missing_or_malformed_digest_fails_closed() {
+        let mut pack = curated_public_demo();
+        pack.provenance.content_sha256.clear();
+        assert!(
+            matches!(pack.validate(), Err(DemoPackError::InvalidDigest { .. })),
+            "empty digest must no longer bypass integrity verification"
+        );
+
+        for malformed in [
+            "deadbeef",                      // too short
+            &"a".repeat(63),                 // 63 chars
+            &"a".repeat(65),                 // 65 chars
+            &format!("{}G", "a".repeat(63)), // non-hex
+            &curated_public_demo()
+                .provenance
+                .content_sha256
+                .to_uppercase(), // uppercase
+        ] {
+            pack.provenance.content_sha256 = malformed.to_string();
+            assert!(
+                matches!(pack.validate(), Err(DemoPackError::InvalidDigest { .. })),
+                "malformed digest {malformed:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_pack_is_rejected_before_parsing() {
+        let oversized = "x".repeat(super::MAX_SERIALIZED_PACK_BYTES + 1);
+        let result = DemoPack::from_json(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(DemoPackError::OversizedPack { len, max })
+                    if len == super::MAX_SERIALIZED_PACK_BYTES + 1
+                        && max == super::MAX_SERIALIZED_PACK_BYTES
+            ),
+            "an oversized pack must be rejected by the size gate, not the JSON parser"
+        );
+    }
+
+    #[test]
+    fn oversized_text_field_fails_closed() {
+        let mut pack = curated_public_demo();
+        pack.bootstrap
+            .console_lines
+            .push("y".repeat(super::MAX_TEXT_FIELD_BYTES + 1));
+        pack.finalize_digest();
+        assert!(matches!(
+            pack.validate(),
+            Err(DemoPackError::OversizedField { .. })
+        ));
+    }
+
+    #[test]
+    fn curated_pack_fits_comfortably_inside_size_budget() {
+        let json = curated_public_demo().to_pretty_json().unwrap();
+        assert!(
+            json.len() <= super::MAX_SERIALIZED_PACK_BYTES / 2,
+            "curated pack ({} bytes) must keep at least 2x headroom under the \
+             {}-byte contract ceiling",
+            json.len(),
+            super::MAX_SERIALIZED_PACK_BYTES
+        );
+    }
+
+    #[test]
+    fn traversal_paths_fail_in_every_representation() {
+        for hostile in [
+            "..",
+            "../x",
+            "x/..",
+            "a/../b",
+            "a/./b",
+            ".",
+            "a//b",
+            "src/",
+            "/absolute",
+            "a\\..\\b",
+            "..%2f",
+            "%2e%2e/",
+            "a/%2e%2e",
+            "C:/windows",
+            "c:relative",
+        ] {
+            assert!(
+                super::validate_public_path("test.path", hostile).is_err(),
+                "hostile path {hostile:?} must be rejected"
+            );
+        }
+        for benign in [
+            "src/**",
+            "crates/foo/src/lib.rs",
+            "docs/browser-dashboard.md",
+        ] {
+            assert!(
+                super::validate_public_path("test.path", benign).is_ok(),
+                "benign path {benign:?} must stay valid"
+            );
+        }
     }
 }
