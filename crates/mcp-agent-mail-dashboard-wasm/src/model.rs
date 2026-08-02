@@ -77,10 +77,16 @@ impl DashboardModel {
         self.pack.apply_bootstrap(&self.state);
         self.next_action = 0;
         self.elapsed_ms = 0;
-        self.tick_count = 0;
+        self.apply_due_actions();
+        // Prime two production stat-refresh boundaries so the first browser
+        // frame has real percentile and throughput history instead of empty
+        // chart shells. DashboardScreen refreshes those histories every ten
+        // logical ticks in both native and browser builds.
+        self.tick_count = 10;
         self.last_deep_link = None;
         self.state.set_elapsed_ms(0);
         self.screen.tick(0, &self.state);
+        self.screen.tick(self.tick_count, &self.state);
     }
 
     /// Advance the deterministic replay clock. Returns whether visible state
@@ -221,11 +227,20 @@ mod tests {
     #[test]
     fn replay_reset_is_deterministic() {
         let mut model = DashboardModel::new(curated_public_demo());
+        let initial_action = model.next_action();
+        let startup_actions = model
+            .pack()
+            .actions
+            .iter()
+            .take_while(|action| action.at_ms == 0)
+            .count();
+        assert_eq!(initial_action, startup_actions);
+        assert_eq!(model.state().event_ring_stats().len, startup_actions);
         assert!(model.advance_replay_ms(10_000));
-        assert_eq!(model.next_action(), 7);
+        assert_eq!(model.next_action(), initial_action + 7);
         model.reset();
         assert_eq!(model.elapsed_ms(), 0);
-        assert_eq!(model.next_action(), 0);
+        assert_eq!(model.next_action(), initial_action);
         assert_eq!(
             model.state().db_stats_snapshot(),
             Some(model.pack().bootstrap.db_stats.clone())

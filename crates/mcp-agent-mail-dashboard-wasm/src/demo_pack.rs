@@ -386,29 +386,176 @@ fn validate_public_text(field: &str, value: &str) -> Result<(), DemoPackError> {
     Ok(())
 }
 
+fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
+    const AGENTS: [&str; 16] = [
+        "AmberDeer",
+        "RubyPrairie",
+        "GrayElk",
+        "RedHarbor",
+        "CoralDog",
+        "BrownGlacier",
+        "WindyLynx",
+        "JadePine",
+        "SilverCove",
+        "BlueMeadow",
+        "IvoryPeak",
+        "GoldenReef",
+        "VioletBrook",
+        "CopperField",
+        "TealFalcon",
+        "CrimsonLake",
+    ];
+    const PROJECTS: [&str; 8] = [
+        "mcp-agent-mail-rust",
+        "frankentui",
+        "frankensqlite",
+        "agent-tooling",
+        "edge-runtime",
+        "skills-library",
+        "release-automation",
+        "browser-runtime",
+    ];
+    const SUBJECTS: [&str; 12] = [
+        "Dashboard parity review is ready",
+        "Reservation handoff completed",
+        "Browser frame hash verified",
+        "Release validation passed",
+        "Shared renderer integration update",
+        "Replay fixture privacy review",
+        "Responsive layout test results",
+        "Mailbox migration checkpoint",
+        "Coordination thread follow-up",
+        "Performance trace summary",
+        "Cross-project dependency resolved",
+        "Fresh-eyes review findings",
+    ];
+    const PATHS: [&str; 8] = [
+        "crates/dashboard/**",
+        "crates/ftui-web/**",
+        "crates/storage/**",
+        "docs/browser-dashboard.md",
+        "components/terminal/**",
+        "tests/replay/**",
+        "release/**",
+        "scripts/verification/**",
+    ];
+
+    (0_u64..128)
+        .map(|index| {
+            let actor_index = usize::try_from(index).unwrap_or_default() % AGENTS.len();
+            let peer_index = (actor_index + 3) % AGENTS.len();
+            let project_index = usize::try_from(index / 3).unwrap_or_default() % PROJECTS.len();
+            let subject_index = usize::try_from(index).unwrap_or_default() % SUBJECTS.len();
+            let timestamp_micros = base_ts
+                - i64::try_from(128_u64.saturating_sub(index)).unwrap_or_default() * 750_000;
+            let seq = 20_000 + index;
+            let id = 30_000 + i64::try_from(index).unwrap_or_default();
+            let operation = match index % 8 {
+                0 => DemoOperation::PublishEvent {
+                    event: MailEvent::AgentRegistered {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Lifecycle,
+                        redacted: true,
+                        name: AGENTS[actor_index].to_string(),
+                        program: if index.is_multiple_of(3) {
+                            "claude-code".to_string()
+                        } else {
+                            "codex-cli".to_string()
+                        },
+                        model_name: if index.is_multiple_of(3) {
+                            "opus".to_string()
+                        } else {
+                            "gpt-5".to_string()
+                        },
+                        project: PROJECTS[project_index].to_string(),
+                    },
+                },
+                1 => DemoOperation::PublishEvent {
+                    event: MailEvent::ReservationGranted {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Reservations,
+                        redacted: true,
+                        agent: AGENTS[actor_index].to_string(),
+                        paths: vec![PATHS[project_index].to_string()],
+                        exclusive: !index.is_multiple_of(3),
+                        ttl_s: 7_200,
+                        project: PROJECTS[project_index].to_string(),
+                    },
+                },
+                2 | 5 => DemoOperation::PublishEvent {
+                    event: MailEvent::MessageReceived {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Mail,
+                        redacted: true,
+                        id,
+                        from: AGENTS[actor_index].to_string(),
+                        to: vec![AGENTS[peer_index].to_string()],
+                        subject: SUBJECTS[subject_index].to_string(),
+                        thread_id: format!("public-coordination-{}", index % 12),
+                        project: PROJECTS[project_index].to_string(),
+                        body_md: "Synthetic public coordination detail for the interactive dashboard replay."
+                            .to_string(),
+                    },
+                },
+                _ => DemoOperation::PublishEvent {
+                    event: MailEvent::MessageSent {
+                        seq,
+                        timestamp_micros,
+                        source: EventSource::Mail,
+                        redacted: true,
+                        id,
+                        from: AGENTS[actor_index].to_string(),
+                        to: vec![AGENTS[peer_index].to_string()],
+                        subject: SUBJECTS[subject_index].to_string(),
+                        thread_id: format!("public-coordination-{}", index % 12),
+                        project: PROJECTS[project_index].to_string(),
+                        body_md: "Synthetic public coordination detail for the interactive dashboard replay."
+                            .to_string(),
+                    },
+                },
+            };
+            DemoAction {
+                at_ms: 0,
+                operation,
+            }
+        })
+        .collect()
+}
+
 /// Curated public replay using production-scale aggregate shapes and fully
 /// synthetic message/path details. No mailbox database is embedded.
 #[must_use]
 pub fn curated_public_demo() -> DemoPack {
     const BASE_TS: i64 = 1_772_668_800_000_000;
     let agents = [
-        ("AmberDeer", "codex-cli", "gpt-5"),
-        ("RubyPrairie", "claude-code", "opus"),
-        ("GrayElk", "codex-cli", "gpt-5"),
-        ("RedHarbor", "cursor", "composer"),
-        ("CoralDog", "codex-cli", "gpt-5"),
-        ("BrownGlacier", "claude-code", "sonnet"),
-        ("WindyLynx", "codex-cli", "gpt-5"),
-        ("JadePine", "claude-code", "opus"),
+        ("AmberDeer", "codex-cli", "gpt-5", "mcp-agent-mail-rust"),
+        ("RubyPrairie", "claude-code", "opus", "frankentui"),
+        ("GrayElk", "codex-cli", "gpt-5", "mcp-agent-mail-rust"),
+        ("RedHarbor", "cursor", "composer", "frankensqlite"),
+        ("CoralDog", "codex-cli", "gpt-5", "agent-tooling"),
+        ("BrownGlacier", "claude-code", "sonnet", "frankentui"),
+        ("WindyLynx", "codex-cli", "gpt-5", "edge-runtime"),
+        ("JadePine", "claude-code", "opus", "skills-library"),
+        ("SilverCove", "codex-cli", "gpt-5", "release-automation"),
+        ("BlueMeadow", "claude-code", "sonnet", "browser-runtime"),
+        ("IvoryPeak", "codex-cli", "gpt-5", "mcp-agent-mail-rust"),
+        ("GoldenReef", "claude-code", "opus", "frankentui"),
+        ("VioletBrook", "cursor", "composer", "agent-tooling"),
+        ("CopperField", "codex-cli", "gpt-5", "frankensqlite"),
+        ("TealFalcon", "claude-code", "sonnet", "edge-runtime"),
+        ("CrimsonLake", "codex-cli", "gpt-5", "browser-runtime"),
     ]
     .into_iter()
     .enumerate()
-    .map(|(index, (name, program, model))| AgentSummary {
-        project: "mcp-agent-mail-rust".to_string(),
+    .map(|(index, (name, program, model, project))| AgentSummary {
+        project: project.to_string(),
         name: name.to_string(),
         program: program.to_string(),
         model: model.to_string(),
-        last_active_ts: BASE_TS - i64::try_from(index).unwrap_or(0) * 18_000_000,
+        last_active_ts: BASE_TS - i64::try_from(index).unwrap_or(0) * 7_000_000,
         health: None,
     })
     .collect::<Vec<_>>();
@@ -420,6 +567,10 @@ pub fn curated_public_demo() -> DemoPack {
         (4, "agent-tooling", 523, 0),
         (5, "edge-runtime", 243, 0),
         (6, "skills-library", 139, 0),
+        (7, "release-automation", 318, 2),
+        (8, "browser-runtime", 476, 2),
+        (9, "observability", 284, 1),
+        (10, "integration-tests", 197, 1),
     ]
     .into_iter()
     .map(
@@ -427,7 +578,7 @@ pub fn curated_public_demo() -> DemoPack {
             id,
             slug: slug.to_string(),
             human_key: format!("public-demo/{slug}"),
-            agent_count: 8,
+            agent_count: 16,
             message_count,
             reservation_count,
             created_at: BASE_TS - 86_400_000_000,
@@ -435,56 +586,102 @@ pub fn curated_public_demo() -> DemoPack {
     )
     .collect::<Vec<_>>();
 
-    let reservations = vec![
-        ReservationSnapshot {
-            id: 101,
-            project_slug: "mcp-agent-mail-rust".to_string(),
-            agent_name: "AmberDeer".to_string(),
-            path_pattern: "crates/dashboard/**".to_string(),
-            exclusive: true,
-            granted_ts: BASE_TS - 40_000_000,
-            expires_ts: BASE_TS + 6_000_000_000,
-            released_ts: None,
-        },
-        ReservationSnapshot {
-            id: 102,
-            project_slug: "frankentui".to_string(),
-            agent_name: "RubyPrairie".to_string(),
-            path_pattern: "crates/ftui-web/**".to_string(),
-            exclusive: true,
-            granted_ts: BASE_TS - 70_000_000,
-            expires_ts: BASE_TS + 4_200_000_000,
-            released_ts: None,
-        },
-        ReservationSnapshot {
-            id: 103,
-            project_slug: "mcp-agent-mail-rust".to_string(),
-            agent_name: "GrayElk".to_string(),
-            path_pattern: "docs/browser-dashboard.md".to_string(),
-            exclusive: false,
-            granted_ts: BASE_TS - 25_000_000,
-            expires_ts: BASE_TS + 7_200_000_000,
-            released_ts: None,
-        },
+    let reservation_rows = [
+        ("mcp-agent-mail-rust", "AmberDeer", "crates/dashboard/**"),
+        ("frankentui", "RubyPrairie", "crates/ftui-web/**"),
+        (
+            "mcp-agent-mail-rust",
+            "GrayElk",
+            "docs/browser-dashboard.md",
+        ),
+        ("frankensqlite", "RedHarbor", "crates/storage/**"),
+        ("agent-tooling", "CoralDog", "crates/coordination/**"),
+        ("frankentui", "BrownGlacier", "crates/renderer/**"),
+        ("edge-runtime", "WindyLynx", "crates/browser/**"),
+        ("skills-library", "JadePine", "skills/agent-mail/**"),
+        ("release-automation", "SilverCove", "release/**"),
+        ("browser-runtime", "BlueMeadow", "tests/replay/**"),
     ];
+    let reservations = reservation_rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, (project, agent, path))| ReservationSnapshot {
+            id: 101 + i64::try_from(index).unwrap_or_default(),
+            project_slug: project.to_string(),
+            agent_name: agent.to_string(),
+            path_pattern: path.to_string(),
+            exclusive: !index.is_multiple_of(3),
+            granted_ts: BASE_TS
+                - (40_000_000 + i64::try_from(index).unwrap_or_default() * 3_000_000),
+            expires_ts: BASE_TS
+                + (3_600_000_000 + i64::try_from(index).unwrap_or_default() * 240_000_000),
+            released_ts: None,
+        })
+        .collect::<Vec<_>>();
 
-    let contacts = vec![ContactSummary {
-        from_agent: "AmberDeer".to_string(),
-        to_agent: "RubyPrairie".to_string(),
-        from_project_slug: "mcp-agent-mail-rust".to_string(),
-        to_project_slug: "frankentui".to_string(),
-        status: "approved".to_string(),
-        reason: "public demo coordination".to_string(),
-        updated_ts: BASE_TS - 20_000_000,
-        expires_ts: None,
-    }];
+    let contact_rows = [
+        (
+            "AmberDeer",
+            "RubyPrairie",
+            "mcp-agent-mail-rust",
+            "frankentui",
+        ),
+        (
+            "GrayElk",
+            "RedHarbor",
+            "mcp-agent-mail-rust",
+            "frankensqlite",
+        ),
+        ("CoralDog", "BrownGlacier", "agent-tooling", "frankentui"),
+        ("WindyLynx", "JadePine", "edge-runtime", "skills-library"),
+        (
+            "SilverCove",
+            "BlueMeadow",
+            "release-automation",
+            "browser-runtime",
+        ),
+        (
+            "IvoryPeak",
+            "GoldenReef",
+            "mcp-agent-mail-rust",
+            "frankentui",
+        ),
+        (
+            "VioletBrook",
+            "CopperField",
+            "agent-tooling",
+            "frankensqlite",
+        ),
+        (
+            "TealFalcon",
+            "CrimsonLake",
+            "edge-runtime",
+            "browser-runtime",
+        ),
+    ];
+    let contacts = contact_rows
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (from, to, from_project, to_project))| ContactSummary {
+                from_agent: from.to_string(),
+                to_agent: to.to_string(),
+                from_project_slug: from_project.to_string(),
+                to_project_slug: to_project.to_string(),
+                status: "approved".to_string(),
+                reason: "synthetic public demo coordination".to_string(),
+                updated_ts: BASE_TS - i64::try_from(index).unwrap_or_default() * 4_000_000,
+                expires_ts: None,
+            },
+        )
+        .collect::<Vec<_>>();
 
     let base_stats = DbStatSnapshot {
-        projects: 6,
-        agents: 391,
+        projects: 10,
+        agents: 1_550,
         messages: 1_825,
-        file_reservations: 3,
-        contact_links: 14,
+        file_reservations: 10,
+        contact_links: 64,
         ack_pending: 28,
         agents_list: agents,
         projects_list: projects,
@@ -503,7 +700,7 @@ pub fn curated_public_demo() -> DemoPack {
     stats_after_ack.timestamp_micros = BASE_TS + 6_000_000;
 
     let mut stats_after_release = stats_after_ack.clone();
-    stats_after_release.file_reservations = 2;
+    stats_after_release.file_reservations = stats_after_ack.file_reservations.saturating_sub(1);
     if let Some(reservation) = stats_after_release.reservation_snapshots.get_mut(1) {
         reservation.released_ts = Some(BASE_TS + 10_000_000);
     }
@@ -539,6 +736,64 @@ pub fn curated_public_demo() -> DemoPack {
         db_stats: stats_after_release.clone(),
     };
 
+    let mut actions = synthetic_startup_history(BASE_TS);
+    actions.extend([
+        DemoAction {
+            at_ms: 1_000,
+            operation: DemoOperation::RecordRequest {
+                status: 200,
+                duration_ms: 48,
+            },
+        },
+        DemoAction {
+            at_ms: 2_000,
+            operation: DemoOperation::PublishEvent {
+                event: synthetic_message,
+            },
+        },
+        DemoAction {
+            at_ms: 2_000,
+            operation: DemoOperation::SetDbStats {
+                snapshot: stats_after_message,
+            },
+        },
+        DemoAction {
+            at_ms: 6_000,
+            operation: DemoOperation::SetDbStats {
+                snapshot: stats_after_ack,
+            },
+        },
+        DemoAction {
+            at_ms: 7_000,
+            operation: DemoOperation::RecordRequest {
+                status: 409,
+                duration_ms: 112,
+            },
+        },
+        DemoAction {
+            at_ms: 10_000,
+            operation: DemoOperation::PublishEvent {
+                event: reservation_release,
+            },
+        },
+        DemoAction {
+            at_ms: 10_000,
+            operation: DemoOperation::SetDbStats {
+                snapshot: stats_after_release.clone(),
+            },
+        },
+        DemoAction {
+            at_ms: 14_000,
+            operation: DemoOperation::PublishEvent { event: health },
+        },
+        DemoAction {
+            at_ms: 16_000,
+            operation: DemoOperation::ConsoleLine {
+                text: "replay loop complete; resetting to verified bootstrap".to_string(),
+            },
+        },
+    ]);
+
     let mut pack = DemoPack {
         schema: DEMO_PACK_SCHEMA_V1.to_string(),
         title: "Agent Mail coordination dashboard".to_string(),
@@ -561,68 +816,17 @@ pub fn curated_public_demo() -> DemoPack {
                 status_5xx: 20,
                 latency_total_ms: 3_402_000,
             },
-            latency_samples_ms: vec![42.0, 58.0, 47.0, 86.0, 64.0, 51.0, 73.0, 49.0],
+            latency_samples_ms: vec![
+                42.0, 58.0, 47.0, 86.0, 64.0, 51.0, 73.0, 49.0, 56.0, 67.0, 45.0, 91.0, 62.0, 54.0,
+                78.0, 44.0, 52.0, 69.0, 48.0, 83.0, 61.0, 57.0, 75.0, 46.0, 59.0, 71.0, 43.0, 88.0,
+                66.0, 53.0, 80.0, 50.0,
+            ],
             console_lines: vec![
                 "demo pack verified; public replay is read-only".to_string(),
                 "FrankenTUI browser renderer connected".to_string(),
             ],
         },
-        actions: vec![
-            DemoAction {
-                at_ms: 1_000,
-                operation: DemoOperation::RecordRequest {
-                    status: 200,
-                    duration_ms: 48,
-                },
-            },
-            DemoAction {
-                at_ms: 2_000,
-                operation: DemoOperation::PublishEvent {
-                    event: synthetic_message,
-                },
-            },
-            DemoAction {
-                at_ms: 2_000,
-                operation: DemoOperation::SetDbStats {
-                    snapshot: stats_after_message,
-                },
-            },
-            DemoAction {
-                at_ms: 6_000,
-                operation: DemoOperation::SetDbStats {
-                    snapshot: stats_after_ack,
-                },
-            },
-            DemoAction {
-                at_ms: 7_000,
-                operation: DemoOperation::RecordRequest {
-                    status: 409,
-                    duration_ms: 112,
-                },
-            },
-            DemoAction {
-                at_ms: 10_000,
-                operation: DemoOperation::PublishEvent {
-                    event: reservation_release,
-                },
-            },
-            DemoAction {
-                at_ms: 10_000,
-                operation: DemoOperation::SetDbStats {
-                    snapshot: stats_after_release.clone(),
-                },
-            },
-            DemoAction {
-                at_ms: 14_000,
-                operation: DemoOperation::PublishEvent { event: health },
-            },
-            DemoAction {
-                at_ms: 16_000,
-                operation: DemoOperation::ConsoleLine {
-                    text: "replay loop complete; resetting to verified bootstrap".to_string(),
-                },
-            },
-        ],
+        actions,
     };
     pack.finalize_digest();
     debug_assert!(pack.validate().is_ok());
@@ -723,13 +927,13 @@ mod tests {
             .actions
             .iter_mut()
             .find_map(|action| match &mut action.operation {
-                super::DemoOperation::PublishEvent { event } => Some(event),
+                super::DemoOperation::PublishEvent {
+                    event: crate::tui_events::MailEvent::MessageSent { redacted, .. },
+                } => Some(redacted),
                 _ => None,
             })
             .unwrap();
-        if let crate::tui_events::MailEvent::MessageSent { redacted, .. } = event {
-            *redacted = false;
-        }
+        *event = false;
         pack.provenance.content_sha256.clear();
         assert!(matches!(
             pack.validate(),
