@@ -10248,7 +10248,6 @@ impl HttpState {
             base_path: config.http_path.clone(),
             allow_cors: config.http_cors_enabled,
             cors_origins: config.http_cors_origins.clone(),
-            timeout: Duration::from_secs(30),
             max_body_size: 10 * 1024 * 1024,
         }));
         let web_root = static_files::resolve_web_root();
@@ -10534,16 +10533,24 @@ impl HttpState {
             return None;
         }
 
-        let (path, _query) = split_path_query(&req.uri);
-        let http_req = to_mcp_http_request(req, &path);
-        let resp = self.handler.handle_options(&http_req);
-        Some(to_http1_response(
-            resp,
+        // fastmcp's `HttpRequestHandler::handle_options` became strict for
+        // bare MCP servers (exact base-path match, explicit origins only,
+        // POST-only preflight). This server fronts several HTTP surfaces
+        // (MCP endpoint, REST bridge, mail UI, health routes) behind one
+        // listener and has its own CORS model (`cors_origin` +
+        // `apply_cors_headers`, wildcard-aware with credential rules), so
+        // preflight is answered locally instead of delegating.
+        let mut resp = Http1Response::new(204, default_reason(204), Vec::new());
+        resp.headers
+            .push(("access-control-max-age".to_string(), "86400".to_string()));
+        apply_cors_headers(
+            &mut resp,
             self.cors_origin(req),
             self.config.http_cors_allow_credentials,
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
-        ))
+        );
+        Some(resp)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11598,13 +11605,18 @@ to skip auth for local requests.</p>
         dispatch_checkpoint(cx, cancel)?;
         let budget = cx.budget();
         let mut session = Session::new(self.server_info.clone(), self.server_capabilities.clone());
+        // fastmcp's router handlers now take a request-scoped `McpContext`
+        // instead of a bare `Cx`; the budget travels inside the context
+        // (handlers enforce it via `budget_error`) rather than as an
+        // explicit argument.
+        let request_ctx = McpContext::new(cx.clone(), request_id).with_budget_ceiling(budget);
 
         match request.method.as_str() {
             "initialize" => {
                 let params: fastmcp_protocol::InitializeParams = parse_params(request.params)?;
                 let out = self
                     .router
-                    .handle_initialize(cx, &mut session, params, None)?;
+                    .handle_initialize(&request_ctx, &mut session, params, None)?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "initialized" | "notifications/cancelled" | "logging/setLevel" => {
@@ -11615,7 +11627,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out = self
                     .router
-                    .handle_tools_list(cx, params, Some(session.state()))?;
+                    .handle_tools_list(&request_ctx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -11711,18 +11723,15 @@ to skip auth for local requests.</p>
                     };
 
                 dispatch_checkpoint(cx, cancel)?;
+                // Request id and budget now travel inside `request_ctx`; the
+                // trailing options are the notification sender and the
+                // BidirectionalSenders handle, neither of which this custom
+                // dispatch layer drives.
                 let result = self.router.handle_tools_call(
-                    cx,
-                    request_id,
+                    &request_ctx,
                     params,
-                    &budget,
                     SessionState::new(),
                     None,
-                    None,
-                    // fastmcp 0.3 added an 8th argument — an optional
-                    // BidirectionalSenders handle for server-initiated
-                    // request flow. We don't drive any bidirectional
-                    // requests from the MCP dispatch layer, so `None`.
                     None,
                 );
                 dispatch_checkpoint(cx, cancel)?;
@@ -11864,14 +11873,14 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out = self
                     .router
-                    .handle_resources_list(cx, params, Some(session.state()))?;
+                    .handle_resources_list(&request_ctx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "resources/templates/list" => {
                 let params: fastmcp_protocol::ListResourceTemplatesParams =
                     parse_params_or_default(request.params)?;
                 let out = self.router.handle_resource_templates_list(
-                    cx,
+                    &request_ctx,
                     params,
                     Some(session.state()),
                 )?;
@@ -11883,14 +11892,10 @@ to skip auth for local requests.</p>
                 let format_value = extract_format_from_uri(&params.uri);
                 dispatch_checkpoint(cx, cancel)?;
                 let out = self.router.handle_resources_read(
-                    cx,
-                    request_id,
+                    &request_ctx,
                     &params,
-                    &budget,
                     SessionState::new(),
                     None,
-                    None,
-                    // fastmcp 0.3 added the 8th BidirectionalSenders arg.
                     None,
                 )?;
                 dispatch_checkpoint(cx, cancel)?;
@@ -11906,44 +11911,27 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out = self
                     .router
-                    .handle_prompts_list(cx, params, Some(session.state()))?;
+                    .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
                 let params: fastmcp_protocol::GetPromptParams = parse_params(request.params)?;
                 let out = self.router.handle_prompts_get(
-                    cx,
-                    request_id,
+                    &request_ctx,
                     params,
-                    &budget,
                     SessionState::new(),
                     None,
-                    None,
-                    // fastmcp 0.3 added the 8th BidirectionalSenders arg.
                     None,
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
-            "tasks/list" => {
-                let params: fastmcp_protocol::ListTasksParams =
-                    parse_params_or_default(request.params)?;
-                let out = self.router.handle_tasks_list(cx, params, None)?;
-                serde_json::to_value(out).map_err(McpError::from)
-            }
-            "tasks/get" => {
-                let params: fastmcp_protocol::GetTaskParams = parse_params(request.params)?;
-                let out = self.router.handle_tasks_get(cx, params, None)?;
-                serde_json::to_value(out).map_err(McpError::from)
-            }
-            "tasks/cancel" => {
-                let params: fastmcp_protocol::CancelTaskParams = parse_params(request.params)?;
-                let out = self.router.handle_tasks_cancel(cx, params, None)?;
-                serde_json::to_value(out).map_err(McpError::from)
-            }
-            "tasks/submit" => {
-                let params: fastmcp_protocol::SubmitTaskParams = parse_params(request.params)?;
-                let out = self.router.handle_tasks_submit(cx, params, None)?;
-                serde_json::to_value(out).map_err(McpError::from)
+            "tasks/list" | "tasks/get" | "tasks/cancel" | "tasks/submit" => {
+                // fastmcp quarantined the experimental tasks surface pending
+                // the MCP 2026-07-28 design: the router handlers are
+                // `#[cfg(test)]`-only and fastmcp's own production dispatch
+                // rejects these methods before middleware. Mirror that
+                // verdict exactly.
+                Err(McpError::method_not_found(&request.method))
             }
             _ => Err(McpError::new(
                 McpErrorCode::MethodNotFound,
@@ -16365,11 +16353,15 @@ const fn http_error_status(
     match err {
         HttpError::InvalidMethod(_) => HttpStatus::METHOD_NOT_ALLOWED,
         HttpError::InvalidContentType(_)
+        | HttpError::InvalidRequestLine(_)
+        | HttpError::InvalidHeader(_)
+        | HttpError::InvalidPath(_)
         | HttpError::JsonError(_)
         | HttpError::CodecError(_)
         | HttpError::HeadersTooLarge { .. }
         | HttpError::BodyTooLarge { .. }
         | HttpError::UnsupportedTransferEncoding(_) => HttpStatus::BAD_REQUEST,
+        HttpError::OriginNotAllowed(_) => HttpStatus::FORBIDDEN,
         HttpError::Timeout | HttpError::Closed => HttpStatus::SERVICE_UNAVAILABLE,
         HttpError::Transport(_) => HttpStatus::INTERNAL_SERVER_ERROR,
     }
@@ -21140,7 +21132,11 @@ first body
     }
 
     #[test]
-    fn http_post_jsonrpc_extra_fields_are_ignored() {
+    fn http_post_jsonrpc_extra_fields_are_rejected() {
+        // fastmcp-protocol hardened `JsonRpcRequest` with
+        // `#[serde(deny_unknown_fields)]` (FND-01): unknown top-level
+        // members are now a protocol violation rather than being silently
+        // ignored. This test pins the strict behavior end-to-end.
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
 
@@ -21156,21 +21152,9 @@ first body
         req.body = serde_json::to_vec(&payload).expect("serialize payload");
 
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
-        assert_eq!(body["jsonrpc"], "2.0");
-        assert_eq!(body["id"], 91);
-        assert!(
-            body.get("error").is_none(),
-            "extra fields should not force protocol error: {body}"
-        );
-        assert!(
-            body.get("result")
-                .and_then(|v| v.get("tools"))
-                .and_then(serde_json::Value::as_array)
-                .is_some(),
-            "expected tools/list result despite extra fields"
+        assert_eq!(
+            resp.status, 400,
+            "unknown top-level JSON-RPC members must be rejected"
         );
     }
 

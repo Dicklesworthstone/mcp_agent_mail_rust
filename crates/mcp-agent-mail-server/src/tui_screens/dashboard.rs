@@ -9638,7 +9638,11 @@ mod tests {
     fn quick_filter_controls_total_chars_matches_label_sum() {
         let expected =
             " [1:All] ".len() + " [2:Msg] ".len() + " [3:Tools] ".len() + " [4:Resv] ".len();
-        assert_eq!(QUICK_FILTER_CONTROLS_TOTAL_CHARS, expected);
+        let total: usize = QUICK_FILTER_CONTROL_WIDTHS
+            .iter()
+            .map(|width| usize::from(*width))
+            .sum();
+        assert_eq!(total, expected);
     }
 
     #[test]
