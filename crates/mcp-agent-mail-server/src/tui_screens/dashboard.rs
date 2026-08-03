@@ -548,6 +548,7 @@ impl DashboardScreen {
             show_log_panel: false,
             quick_query_input: TextInput::new()
                 .with_placeholder("Type to live-filter dashboard; Enter opens Search Cockpit")
+                .with_max_length(96)
                 .with_focused(false),
             quick_query_active: false,
             hit_regions: RefCell::new(DashboardHitRegions::default()),
@@ -1460,6 +1461,13 @@ impl MailScreen for DashboardScreen {
                         self.apply_quick_filter(DashboardQuickFilter::Reservations);
                     }
                     _ => {}
+                }
+            }
+            Event::Paste(_) if self.quick_query_active => {
+                let before = self.quick_query_input.value().to_string();
+                self.quick_query_input.handle_event(event);
+                if self.quick_query_input.value() != before {
+                    self.clamp_scroll_offset();
                 }
             }
             // Mouse: rendered hit regions keep pointer behavior aligned with
@@ -8353,6 +8361,21 @@ mod tests {
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('/'))), &state);
         assert!(screen.quick_query_active);
         assert!(screen.consumes_text_input());
+    }
+
+    #[test]
+    fn live_query_paste_is_single_line_and_bounded() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut screen = DashboardScreen::new();
+        screen.begin_query_edit();
+
+        let pasted = format!("alpha\nbeta\tgamma\u{7}{}", "x".repeat(120));
+        screen.update(&Event::Paste(ftui::PasteEvent::bracketed(pasted)), &state);
+
+        assert!(screen.quick_query().starts_with("alpha beta gamma"));
+        assert!(!screen.quick_query().chars().any(char::is_control));
+        assert_eq!(screen.quick_query().chars().count(), 96);
     }
 
     #[test]

@@ -127,10 +127,29 @@ pub struct PublicReplayScreen {
     // reconcile selection/scroll with the geometry used for mouse hit testing.
     selected: Cell<usize>,
     scroll: Cell<usize>,
+    active_viewport: Cell<MailScreenId>,
+    saved_viewports: RefCell<[PublicViewport; MailScreenId::COUNT]>,
     search_query: String,
     search_active: bool,
     row_cache: RefCell<Option<PublicRowsCache>>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct PublicViewport {
+    list_area: Rect,
+    selected: usize,
+    scroll: usize,
+}
+
+impl PublicViewport {
+    const EMPTY: Self = Self {
+        list_area: Rect::new(0, 0, 0, 0),
+        selected: 0,
+        scroll: 0,
+    };
+}
+
+const MAX_SEARCH_QUERY_CHARS: usize = 96;
 
 #[derive(Debug, Clone)]
 struct PublicRowsCache {
@@ -181,6 +200,8 @@ impl PublicReplayScreen {
             search_input_area: Cell::new(Rect::new(0, 0, 0, 0)),
             selected: Cell::new(0),
             scroll: Cell::new(0),
+            active_viewport: Cell::new(MailScreenId::Dashboard),
+            saved_viewports: RefCell::new([PublicViewport::EMPTY; MailScreenId::COUNT]),
             search_query: String::new(),
             search_active: false,
             row_cache: RefCell::new(None),
@@ -190,6 +211,8 @@ impl PublicReplayScreen {
     pub fn reset(&mut self) {
         self.selected.set(0);
         self.scroll.set(0);
+        self.active_viewport.set(MailScreenId::Dashboard);
+        *self.saved_viewports.get_mut() = [PublicViewport::EMPTY; MailScreenId::COUNT];
         self.search_query.clear();
         self.search_active = false;
         self.list_area.set(Rect::new(0, 0, 0, 0));
@@ -198,11 +221,47 @@ impl PublicReplayScreen {
     }
 
     pub fn begin_search(&mut self, query: &str) {
-        self.search_query = query.chars().take(96).collect();
+        self.activate_viewport(MailScreenId::Search);
+        self.search_query = sanitize_search_text(query, MAX_SEARCH_QUERY_CHARS);
         self.search_active = true;
         self.selected.set(0);
         self.scroll.set(0);
         *self.row_cache.get_mut() = None;
+    }
+
+    /// Preserve the current public list viewport and restore the destination
+    /// screen's last selection, scroll offset, and rendered hit-test geometry.
+    /// Row materialization remains a single keyed cache: changing screens does
+    /// not invalidate data eagerly, and `ensure_rows` rebuilds it when the
+    /// destination screen/query/generation differs.
+    pub fn switch_screen(&self, from: MailScreenId, to: MailScreenId) {
+        debug_assert_eq!(
+            self.active_viewport.get(),
+            from,
+            "public replay viewport must follow the shell's active screen"
+        );
+        self.activate_viewport(to);
+    }
+
+    fn activate_viewport(&self, screen: MailScreenId) {
+        let current_screen = self.active_viewport.get();
+        if current_screen == screen {
+            return;
+        }
+
+        let mut saved = self.saved_viewports.borrow_mut();
+        saved[current_screen.index()] = PublicViewport {
+            list_area: self.list_area.get(),
+            selected: self.selected.get(),
+            scroll: self.scroll.get(),
+        };
+        let destination = saved[screen.index()];
+        drop(saved);
+
+        self.list_area.set(destination.list_area);
+        self.selected.set(destination.selected);
+        self.scroll.set(destination.scroll);
+        self.active_viewport.set(screen);
     }
 
     /// Reactivate the existing Search editor without changing its query or
@@ -234,6 +293,7 @@ impl PublicReplayScreen {
     /// Focus the public timeline row whose event timestamp is closest to the
     /// production Dashboard deep-link target.
     pub fn focus_timeline_at(&mut self, timestamp_micros: i64, state: &TuiSharedState) -> bool {
+        self.activate_viewport(MailScreenId::Timeline);
         let events = state.replay_events();
         let Some(index) = events
             .iter()
@@ -348,6 +408,7 @@ impl PublicReplayScreen {
     /// Reconcile preserved selection/scroll state with freshly reset replay
     /// data so a shorter result set cannot leave the list scrolled past EOF.
     pub fn normalize(&mut self, screen: MailScreenId, state: &TuiSharedState) {
+        self.activate_viewport(screen);
         let row_count = self.visible_row_count(screen, state);
         let page = usize::from(self.list_area.get().height.max(1));
         self.clamp_to_rows(row_count, page);
@@ -377,6 +438,7 @@ impl PublicReplayScreen {
     /// Process list navigation. Returns true when visible selection or scroll
     /// state changed, allowing the host status contract to expose interaction.
     pub fn update(&mut self, event: &Event, screen: MailScreenId, state: &TuiSharedState) -> bool {
+        self.activate_viewport(screen);
         let previous = (
             self.selected.get(),
             self.scroll.get(),
@@ -402,7 +464,7 @@ impl PublicReplayScreen {
                             && !key.modifiers.intersects(
                                 Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
                             )
-                            && self.search_query.chars().count() < 96 =>
+                            && self.search_query.chars().count() < MAX_SEARCH_QUERY_CHARS =>
                     {
                         self.search_query.push(character);
                         self.selected.set(0);
@@ -412,10 +474,14 @@ impl PublicReplayScreen {
                 }
             }
             Event::Paste(paste) if screen == MailScreenId::Search && self.search_active => {
-                let remaining = 96_usize.saturating_sub(self.search_query.chars().count());
-                self.search_query.extend(paste.text.chars().take(remaining));
-                self.selected.set(0);
-                self.scroll.set(0);
+                let remaining =
+                    MAX_SEARCH_QUERY_CHARS.saturating_sub(self.search_query.chars().count());
+                let pasted = sanitize_search_text(&paste.text, remaining);
+                if !pasted.is_empty() {
+                    self.search_query.push_str(&pasted);
+                    self.selected.set(0);
+                    self.scroll.set(0);
+                }
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -501,6 +567,7 @@ impl PublicReplayScreen {
         area: Rect,
         state: &TuiSharedState,
     ) {
+        self.activate_viewport(screen);
         let palette = crate::tui_theme::TuiThemePalette::current();
         let meta = screen_meta(screen);
         self.ensure_rows(screen, state);
@@ -628,6 +695,21 @@ const fn search_input_hit_area(screen: MailScreenId, header_area: Rect) -> Rect 
     }
 }
 
+fn sanitize_search_text(text: &str, max_chars: usize) -> String {
+    // Keep the one-line browser Search editor aligned with FrankenTUI's
+    // TextInput contract: line separators and tabs become spaces, while other
+    // control characters are discarded. Apply the scalar cap after filtering
+    // so rejected controls cannot consume the caller's remaining budget.
+    text.chars()
+        .map(|character| match character {
+            '\n' | '\r' | '\t' => ' ',
+            _ => character,
+        })
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect()
+}
+
 const fn public_rows_generation(
     screen: MailScreenId,
     generation: DataGeneration,
@@ -681,7 +763,7 @@ const fn public_rows_generation(
     }
 }
 
-const fn browser_projection_description(screen: MailScreenId) -> &'static str {
+pub(crate) const fn browser_projection_description(screen: MailScreenId) -> &'static str {
     match screen {
         MailScreenId::Dashboard => {
             "Production DashboardScreen driven by the sanitized replay state."
@@ -1204,7 +1286,7 @@ mod tests {
     use crate::state::TuiSharedState;
     use crate::tui_events::{EventSource, MailEvent};
     use ftui::layout::Rect;
-    use ftui::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use ftui::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind, PasteEvent};
 
     fn populated_state() -> TuiSharedState {
         let pack = curated_public_demo();
@@ -1292,6 +1374,7 @@ mod tests {
         assert!(row_count >= 2);
 
         let mut screen = PublicReplayScreen::new();
+        screen.switch_screen(MailScreenId::Dashboard, MailScreenId::Messages);
         screen.list_area.set(Rect::new(10, 5, 80, 5));
         screen.scroll.set(row_count - 2);
 
@@ -1333,6 +1416,171 @@ mod tests {
     }
 
     #[test]
+    fn screen_switches_restore_independent_viewports_and_rebuild_keyed_rows() {
+        let state = populated_state();
+        let message_count = public_rows(MailScreenId::Messages, &state).len();
+        let thread_count = public_rows(MailScreenId::Threads, &state).len();
+        assert!(message_count > 2);
+        assert!(thread_count > 1);
+
+        let mut screen = PublicReplayScreen::new();
+        screen.switch_screen(MailScreenId::Dashboard, MailScreenId::Messages);
+        let message_area = Rect::new(3, 5, 90, 2);
+        screen.list_area.set(message_area);
+        assert!(screen.update(
+            &Event::Key(KeyEvent::new(KeyCode::End)),
+            MailScreenId::Messages,
+            &state,
+        ));
+        let message_viewport = (
+            screen.selected.get(),
+            screen.scroll.get(),
+            screen.list_area.get(),
+        );
+        assert_eq!(message_viewport.0, message_count - 1);
+        assert_eq!(
+            screen.row_cache.borrow().as_ref().map(|cache| cache.screen),
+            Some(MailScreenId::Messages)
+        );
+
+        screen.switch_screen(MailScreenId::Messages, MailScreenId::Threads);
+        assert_eq!((screen.selected.get(), screen.scroll.get()), (0, 0));
+        assert_eq!(screen.list_area.get(), Rect::new(0, 0, 0, 0));
+
+        let thread_area = Rect::new(7, 9, 72, 4);
+        screen.list_area.set(thread_area);
+        assert!(screen.update(
+            &Event::Key(KeyEvent::new(KeyCode::Down)),
+            MailScreenId::Threads,
+            &state,
+        ));
+        let thread_viewport = (
+            screen.selected.get(),
+            screen.scroll.get(),
+            screen.list_area.get(),
+        );
+        assert_eq!(thread_viewport, (1, 0, thread_area));
+        assert_eq!(
+            screen.row_cache.borrow().as_ref().map(|cache| cache.screen),
+            Some(MailScreenId::Threads)
+        );
+
+        screen.switch_screen(MailScreenId::Threads, MailScreenId::Messages);
+        assert_eq!(
+            (
+                screen.selected.get(),
+                screen.scroll.get(),
+                screen.list_area.get()
+            ),
+            message_viewport
+        );
+        screen.normalize(MailScreenId::Messages, &state);
+        assert_eq!(
+            screen.row_cache.borrow().as_ref().map(|cache| cache.screen),
+            Some(MailScreenId::Messages),
+            "the single row cache must rematerialize for the restored screen"
+        );
+
+        screen.switch_screen(MailScreenId::Messages, MailScreenId::Threads);
+        assert_eq!(
+            (
+                screen.selected.get(),
+                screen.scroll.get(),
+                screen.list_area.get()
+            ),
+            thread_viewport
+        );
+    }
+
+    #[test]
+    fn search_editor_and_viewport_survive_a_screen_round_trip() {
+        let mut screen = PublicReplayScreen::new();
+        screen.begin_search("release");
+        screen.selected.set(7);
+        screen.scroll.set(5);
+        let search_area = Rect::new(4, 8, 84, 6);
+        screen.list_area.set(search_area);
+
+        screen.switch_screen(MailScreenId::Search, MailScreenId::Agents);
+        assert_eq!((screen.selected.get(), screen.scroll.get()), (0, 0));
+        screen.selected.set(2);
+        screen.scroll.set(1);
+
+        screen.switch_screen(MailScreenId::Agents, MailScreenId::Search);
+        assert_eq!(screen.search_query(), "release");
+        assert!(screen.consumes_text_input(MailScreenId::Search));
+        assert_eq!((screen.selected.get(), screen.scroll.get()), (7, 5));
+        assert_eq!(screen.list_area.get(), search_area);
+    }
+
+    #[test]
+    fn explicit_reset_clears_every_saved_viewport_and_search_state() {
+        let state = populated_state();
+        let mut screen = PublicReplayScreen::new();
+        screen.begin_search("reservation");
+        screen.selected.set(4);
+        screen.scroll.set(3);
+        screen.list_area.set(Rect::new(1, 2, 70, 5));
+        screen.search_input_area.set(Rect::new(1, 1, 70, 1));
+        screen.ensure_rows(MailScreenId::Search, &state);
+        screen.switch_screen(MailScreenId::Search, MailScreenId::Messages);
+        screen.selected.set(6);
+        screen.scroll.set(4);
+        screen.list_area.set(Rect::new(3, 4, 80, 7));
+
+        screen.reset();
+
+        assert_eq!(screen.active_viewport.get(), MailScreenId::Dashboard);
+        assert_eq!(screen.selected_row(), 0);
+        assert_eq!(screen.scroll.get(), 0);
+        assert_eq!(screen.list_area.get(), Rect::new(0, 0, 0, 0));
+        assert_eq!(screen.search_input_area.get(), Rect::new(0, 0, 0, 0));
+        assert_eq!(screen.search_query(), "");
+        assert!(!screen.consumes_text_input(MailScreenId::Search));
+        assert!(screen.row_cache.borrow().is_none());
+
+        screen.switch_screen(MailScreenId::Dashboard, MailScreenId::Search);
+        assert_eq!((screen.selected.get(), screen.scroll.get()), (0, 0));
+        assert_eq!(screen.list_area.get(), Rect::new(0, 0, 0, 0));
+        screen.switch_screen(MailScreenId::Search, MailScreenId::Messages);
+        assert_eq!((screen.selected.get(), screen.scroll.get()), (0, 0));
+        assert_eq!(screen.list_area.get(), Rect::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn search_paste_is_single_line_sanitized_and_scalar_capped() {
+        let state = populated_state();
+        let mut screen = PublicReplayScreen::new();
+        screen.begin_search("");
+
+        let sanitized = Event::Paste(PasteEvent::bracketed(
+            "alpha\nbeta\rgamma\tdelta\0\u{1b}\u{7f}🙂",
+        ));
+        assert!(screen.update(&sanitized, MailScreenId::Search, &state));
+        assert_eq!(screen.search_query(), "alpha beta gamma delta🙂");
+        assert!(
+            screen
+                .search_query()
+                .chars()
+                .all(|character| !character.is_control())
+        );
+
+        screen.begin_search(&"x".repeat(MAX_SEARCH_QUERY_CHARS - 1));
+        let capped = Event::Paste(PasteEvent::bracketed("\0🙂界overflow"));
+        assert!(screen.update(&capped, MailScreenId::Search, &state));
+        assert_eq!(
+            screen.search_query().chars().count(),
+            MAX_SEARCH_QUERY_CHARS
+        );
+        assert!(screen.search_query().ends_with('🙂'));
+
+        let full_query = screen.search_query().to_string();
+        let rejected = Event::Paste(PasteEvent::bracketed("more"));
+        assert!(!screen.update(&rejected, MailScreenId::Search, &state));
+        assert_eq!(screen.search_query(), full_query);
+    }
+
+    #[test]
     fn public_projection_generations_ignore_unrelated_replay_channels() {
         let state = populated_state();
         let before = state.data_generation();
@@ -1358,10 +1606,37 @@ mod tests {
         let target_index = 37;
         let target = events[target_index].timestamp_micros();
         let mut screen = PublicReplayScreen::new();
+        screen.switch_screen(MailScreenId::Dashboard, MailScreenId::Timeline);
         screen.list_area.set(Rect::new(0, 0, 120, 12));
 
         assert!(screen.focus_timeline_at(target, &state));
         assert_eq!(screen.selected_row(), target_index);
+    }
+
+    #[test]
+    fn timeline_focus_never_reuses_another_screens_page_geometry() {
+        let state = populated_state();
+        let events = state.tick_events_since_limited(0, 2_000);
+        let target_index = 37;
+        let target = events[target_index].timestamp_micros();
+        let mut screen = PublicReplayScreen::new();
+        screen.switch_screen(MailScreenId::Dashboard, MailScreenId::Messages);
+        screen.list_area.set(Rect::new(0, 0, 120, 20));
+        screen.selected.set(8);
+        screen.scroll.set(3);
+
+        assert!(screen.focus_timeline_at(target, &state));
+        assert_eq!(screen.active_viewport.get(), MailScreenId::Timeline);
+        assert_eq!(screen.selected_row(), target_index);
+        assert_eq!(
+            screen.scroll.get(),
+            target_index,
+            "a never-rendered Timeline uses its own one-row fallback, not Messages geometry"
+        );
+
+        screen.switch_screen(MailScreenId::Timeline, MailScreenId::Messages);
+        assert_eq!((screen.selected.get(), screen.scroll.get()), (8, 3));
+        assert_eq!(screen.list_area.get(), Rect::new(0, 0, 120, 20));
     }
 
     #[test]

@@ -1,20 +1,17 @@
 //! FrankenTUI model that renders the production Agent Mail dashboard.
 
-use ftui::widgets::Widget;
-use ftui::widgets::block::Block;
-use ftui::widgets::borders::BorderType;
-use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, Style};
+use ftui::{Event, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind};
 use ftui_runtime::program::{Cmd, Model};
 
 use crate::demo_pack::{DemoPack, DemoPackError, curated_public_demo};
 use crate::state::TuiSharedState;
 use crate::tui_hit_regions::{MouseAction, MouseDispatcher};
+use crate::tui_keymap::HelpSection;
 use crate::tui_persist::AccessibilitySettings;
 use crate::tui_screens::dashboard::DashboardScreen;
 use crate::tui_screens::{
     DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, PublicReplayScreen,
-    screen_from_jump_key, screen_meta,
+    browser_projection_description, screen_from_jump_key, screen_meta,
 };
 
 #[derive(Debug, Clone)]
@@ -398,8 +395,9 @@ impl DashboardModel {
         );
 
         if self.active_screen != MailScreenId::Search {
+            self.public_screen
+                .switch_screen(self.active_screen, MailScreenId::Search);
             self.active_screen = MailScreenId::Search;
-            self.public_screen.reset();
         }
         self.public_screen.begin_search(query);
         self.last_deep_link = Some(format!("search:{query}"));
@@ -443,8 +441,18 @@ impl DashboardModel {
 
     fn activate_screen(&mut self, screen: MailScreenId) {
         if self.active_screen != screen {
+            self.public_screen
+                .switch_screen(self.active_screen, screen);
             self.active_screen = screen;
-            self.public_screen.reset();
+            self.interaction_revision = self.interaction_revision.saturating_add(1);
+        }
+    }
+
+    fn scroll_help_down(&mut self) {
+        let previous = self.help_scroll;
+        let max_scroll = browser_help_max_scroll(self.active_screen, self.last_terminal_area.get());
+        self.help_scroll = self.help_scroll.saturating_add(1).min(max_scroll);
+        if self.help_scroll != previous {
             self.interaction_revision = self.interaction_revision.saturating_add(1);
         }
     }
@@ -459,8 +467,7 @@ impl DashboardModel {
                         self.interaction_revision = self.interaction_revision.saturating_add(1);
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
-                        self.help_scroll = self.help_scroll.saturating_add(1);
-                        self.interaction_revision = self.interaction_revision.saturating_add(1);
+                        self.scroll_help_down();
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         let previous = self.help_scroll;
@@ -487,9 +494,7 @@ impl DashboardModel {
                                 self.interaction_revision.saturating_add(1);
                         }
                         MouseEventKind::ScrollDown if inside => {
-                            self.help_scroll = self.help_scroll.saturating_add(1);
-                            self.interaction_revision =
-                                self.interaction_revision.saturating_add(1);
+                            self.scroll_help_down();
                         }
                         MouseEventKind::ScrollUp if inside => {
                             let previous = self.help_scroll;
@@ -692,38 +697,132 @@ impl Model for DashboardModel {
         );
 
         if self.help_visible {
-            render_browser_help(self.active_screen, self.help_scroll, frame, area);
+            render_browser_help(
+                self.active_screen,
+                self.help_scroll,
+                !self.reduced_motion,
+                frame,
+                area,
+            );
         }
     }
+}
+
+fn browser_help_sections(screen: MailScreenId) -> Vec<HelpSection> {
+    let current_screen_entries = if screen == MailScreenId::Dashboard {
+        vec![
+            (
+                "A / M / O / R".to_string(),
+                "Dashboard All / Messages / Tools / Reservations filters".to_string(),
+            ),
+            (
+                "j/k or Up/Down".to_string(),
+                "Scroll Dashboard events".to_string(),
+            ),
+            (
+                "Enter".to_string(),
+                "Open the focused Timeline or Search context".to_string(),
+            ),
+        ]
+    } else {
+        vec![
+            (
+                "j/k or Up/Down".to_string(),
+                "Select a public replay row".to_string(),
+            ),
+            (
+                "PageUp/PageDown".to_string(),
+                "Move by one visible page".to_string(),
+            ),
+            (
+                "Click".to_string(),
+                "Select a public replay row".to_string(),
+            ),
+        ]
+    };
+
+    vec![
+        HelpSection {
+            title: format!("{} · browser replay", screen_meta(screen).title),
+            description: Some(browser_projection_description(screen).to_string()),
+            body_markdown: Some(
+                "Production DashboardScreen + shared chrome.\nRead-only browser replay; no mailbox mutations.\nNative command palette/actions are not included.\nCount-only SQLite totals seed synthetic details."
+                    .to_string(),
+            ),
+            entries: current_screen_entries,
+        },
+        HelpSection {
+            title: "Mouse".to_string(),
+            description: None,
+            body_markdown: None,
+            entries: vec![
+                ("Top tabs".to_string(), "Switch screens".to_string()),
+                ("< or >".to_string(), "Reveal hidden top tabs".to_string()),
+                (
+                    "Dashboard controls".to_string(),
+                    "Choose filters or edit Live Filter".to_string(),
+                ),
+                (
+                    "Wheel".to_string(),
+                    "Scroll the panel under the pointer".to_string(),
+                ),
+            ],
+        },
+        HelpSection {
+            title: "Global keyboard".to_string(),
+            description: None,
+            body_markdown: None,
+            entries: vec![
+                (
+                    "Tab / Shift+Tab".to_string(),
+                    "Next / previous screen".to_string(),
+                ),
+                (
+                    "1-9, 0, ! through ^".to_string(),
+                    "Direct screen jump".to_string(),
+                ),
+                ("/".to_string(), "Open Search".to_string()),
+                (
+                    "Ctrl+P or :".to_string(),
+                    "Open the browser Search adapter".to_string(),
+                ),
+                ("F1 or ?".to_string(), "Toggle this help".to_string()),
+                (
+                    "j/k while help is open".to_string(),
+                    "Scroll this overlay".to_string(),
+                ),
+            ],
+        },
+    ]
+}
+
+fn browser_help_max_scroll(screen: MailScreenId, area: ftui::layout::Rect) -> u16 {
+    let total_lines = browser_help_sections(screen)
+        .iter()
+        .map(|section| section.line_count().saturating_add(1))
+        .sum::<usize>()
+        .saturating_sub(1);
+    let inner_height = crate::tui_chrome::help_overlay_rect(area)
+        .height
+        .saturating_sub(2);
+    u16::try_from(total_lines.saturating_sub(usize::from(inner_height))).unwrap_or(u16::MAX)
 }
 
 fn render_browser_help(
     screen: MailScreenId,
     scroll: u16,
+    effects_enabled: bool,
     frame: &mut ftui::Frame<'_>,
     area: ftui::layout::Rect,
 ) {
-    let palette = crate::tui_theme::TuiThemePalette::current();
-    let meta = screen_meta(screen);
-    let overlay = crate::tui_chrome::help_overlay_rect(area);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(" Agent Mail Browser Controls · F1/Esc close ")
-        .style(
-            Style::default()
-                .fg(palette.help_border_fg)
-                .bg(palette.help_bg),
-        );
-    let inner = block.inner(overlay);
-    block.render(overlay, frame);
-    let text = format!(
-        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click < or > to reveal hidden top tabs\n  Click Dashboard filters, the Search input, or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  /                    open Search\n  Ctrl+P or :          open the browser Search adapter\n  F1 or ?              toggle this help\n\nThis browser build uses the production DashboardScreen and shared chrome inside a read-only, browser-safe replay shell. The native command palette and mutating operator actions are deliberately absent. Replay counters start from a read-only Agent Mail SQLite aggregate export and may change as synthetic events run; names, paths, messages, and replay events are synthetic public-demo details.",
-        meta.title, meta.description
+    let sections = browser_help_sections(screen);
+    crate::tui_chrome::render_help_overlay_sections(
+        &sections,
+        scroll,
+        effects_enabled,
+        frame,
+        area,
     );
-    Paragraph::new(text)
-        .scroll((scroll, 0))
-        .style(Style::default().fg(palette.help_fg).bg(palette.help_bg))
-        .render(inner, frame);
 }
 
 #[cfg(test)]
@@ -907,6 +1006,20 @@ mod tests {
         assert_eq!(model.help_scroll, 1);
         let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Up))));
         assert_eq!(model.help_scroll, 0);
+
+        for _ in 0..100 {
+            let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Down))));
+        }
+        assert_eq!(
+            model.help_scroll,
+            super::browser_help_max_scroll(MailScreenId::Dashboard, area)
+        );
+        let saturated_revision = model.interaction_revision();
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Down))));
+        assert_eq!(model.interaction_revision(), saturated_revision);
+        while model.help_scroll > 0 {
+            let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Up))));
+        }
 
         let overlay = crate::tui_chrome::help_overlay_rect(area);
         let inside_x = overlay.x.saturating_add(1);
