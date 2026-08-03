@@ -20,6 +20,7 @@ exporter = [
   "dep:sqlmodel-sqlite",
   "dep:clap",
   "dep:same-file",
+  "dep:tempfile",
 ]
 
 [dependencies]
@@ -44,9 +45,10 @@ chrono = { version = "0.4", features = ["serde"] }
 web-time = "1.1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-sqlmodel-sqlite = { version = "=0.3.2", optional = true }
+sqlmodel-sqlite = { version = "=0.3.3", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 same-file = { version = "1", optional = true }
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
@@ -55,7 +57,6 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"
-tempfile = "3"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-Oz"]

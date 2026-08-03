@@ -56,7 +56,7 @@ sqlmodel-schema = "=0.3.2"
 sqlmodel-session = "=0.3.2"
 sqlmodel-pool = "=0.3.2"
 sqlmodel-frankensqlite = "=0.3.2"
-sqlmodel-sqlite = "=0.3.2"
+sqlmodel-sqlite = "=0.3.3"
 
 ftui = "0.5.0"
 ftui-runtime = { version = "0.5.0" }

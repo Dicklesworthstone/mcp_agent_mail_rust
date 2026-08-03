@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  DASHBOARD_FRANKENTUI_REVISION: 8aeb72216c3a5e8b03029c9634e607adcc297402
 
 jobs:
   # The browser dashboard crate is an independent nested workspace, so the
@@ -21,7 +22,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Clone FrankenTUI sibling dependency
-        run: git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+        run: |
+          git init ../frankentui
+          git -C ../frankentui remote add origin https://github.com/Dicklesworthstone/frankentui
+          git -C ../frankentui fetch --depth 1 origin "$DASHBOARD_FRANKENTUI_REVISION"
+          git -C ../frankentui checkout --detach FETCH_HEAD
+          test "$(git -C ../frankentui rev-parse HEAD)" = "$DASHBOARD_FRANKENTUI_REVISION"
 
       - uses: dtolnay/rust-toolchain@stable
         with:

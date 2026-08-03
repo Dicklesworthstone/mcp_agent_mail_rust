@@ -99,11 +99,40 @@ impl DashboardRunnerCore {
             return;
         }
 
-        // Advance in logical-tick-sized slices. This keeps data ingestion and
-        // stat history identical whether the host supplies many RAF deltas or
-        // one large catch-up delta, while still requesting only one repaint.
+        // If the delta crosses a loop boundary, every state mutation before
+        // the final cycle is discarded by replay reset. Collapse those dead
+        // cycles in O(1), then advance only the surviving cycle at native
+        // logical-tick boundaries. Without this collapse, a valid 1 ms loop
+        // could force hundreds of resets and bootstrap replays in one frame.
         let mut remaining_ms = elapsed_ms;
         let mut visible_changed = false;
+        let (loop_replay, replay_duration_ms, replay_elapsed_ms) = {
+            let model = self.inner.model();
+            (
+                model.pack().loop_replay,
+                model.pack().duration_ms,
+                model.elapsed_ms(),
+            )
+        };
+        let to_replay_endpoint_ms = replay_duration_ms.saturating_sub(replay_elapsed_ms);
+        if loop_replay && replay_duration_ms > 0 && remaining_ms > to_replay_endpoint_ms {
+            let total_ms = u128::from(replay_elapsed_ms) + u128::from(remaining_ms);
+            let remainder =
+                (total_ms - u128::from(replay_duration_ms)) % u128::from(replay_duration_ms);
+            remaining_ms = if remainder == 0 {
+                replay_duration_ms
+            } else {
+                u64::try_from(remainder).unwrap_or(replay_duration_ms)
+            };
+            self.inner.model_mut().restart_looping_replay_cycle();
+            self.logical_tick_remainder_ms = 0;
+            visible_changed = true;
+        }
+
+        // Advance the surviving cycle in logical-tick-sized slices. This
+        // keeps action ingestion and stat history identical whether the host
+        // supplies many RAF deltas or one large catch-up delta, while still
+        // requesting only one repaint.
         while remaining_ms > 0 {
             let to_tick_ms = LOGICAL_TICK_MS.saturating_sub(self.logical_tick_remainder_ms);
             let to_replay_endpoint_ms = {
@@ -646,9 +675,10 @@ mod tests {
         runner.init();
         let baseline_raw_count = latest_dashboard_raw_count(&runner);
 
-        // This single host delta crosses the 150 ms endpoint. The runner must
-        // land at 150 ms for its terminal tick, then reconstruct the new cycle
-        // at 50 ms rather than carrying the prior cycle's caches or cadence.
+        // This single host delta crosses the 150 ms endpoint. The runner can
+        // discard that completed cycle because reset removes all of its state,
+        // then reconstruct the surviving cycle at 50 ms without carrying the
+        // prior cycle's caches or cadence.
         runner.advance_time_ms(200.0);
         let crossed = runner.step();
 
@@ -670,6 +700,39 @@ mod tests {
         assert_eq!(runner.inner.model().tick_count(), 12);
         assert_eq!(runner.logical_tick_remainder_ms, 0);
         assert_eq!(latest_dashboard_raw_count(&runner), baseline_raw_count + 1);
+    }
+
+    #[test]
+    fn dense_one_millisecond_loop_collapses_catch_up_to_one_reset() {
+        let mut pack = curated_public_demo();
+        let startup_action = pack
+            .actions
+            .iter()
+            .find(|action| action.at_ms == 0)
+            .cloned()
+            .expect("curated demo should include a startup action");
+        pack.actions = vec![startup_action; 512];
+        pack.duration_ms = 1;
+        pack.loop_replay = true;
+        pack.finalize_digest();
+        pack.validate().expect("dense short loop should be valid");
+
+        let mut runner = runner_with_pack(&pack, 120, 36);
+        runner.set_reduced_motion(true);
+        runner.init();
+        let resets_before = runner.inner.model().replay_reset_count();
+
+        runner.advance_time_ms(60_000.0);
+        let step = runner.step();
+
+        assert!(step.rendered);
+        assert_eq!(runner.status().elapsed_ms, 1);
+        assert_eq!(runner.inner.model().tick_count(), 11);
+        assert_eq!(
+            runner.inner.model().replay_reset_count(),
+            resets_before + 1,
+            "discarded loop cycles must not each clone and reapply the bootstrap"
+        );
     }
 
     #[test]

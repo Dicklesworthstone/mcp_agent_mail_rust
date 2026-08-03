@@ -14,7 +14,9 @@ use ftui::{Frame, PackedRgba, Style};
 use crate::tui_bridge::TuiSharedState;
 use crate::tui_hit_regions::{MouseDispatcher, StatusHitRole};
 use crate::tui_persist::AccessibilitySettings;
-use crate::tui_screens::{HelpEntry, MAIL_SCREEN_REGISTRY, MailScreenId, screen_meta};
+use crate::tui_screens::{
+    HelpEntry, MAIL_SCREEN_REGISTRY, MailScreenId, jump_key_label_for_display_index, screen_meta,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Chrome layout
@@ -116,8 +118,14 @@ const fn tab_label_for_mode(
 }
 
 #[inline]
+fn tab_key_label(index: usize) -> String {
+    jump_key_label_for_display_index(index.saturating_add(1))
+        .map_or_else(|| index.saturating_add(1).to_string(), str::to_owned)
+}
+
+#[inline]
 fn tab_slot_width(index: usize, label: &str, show_icon: bool) -> u16 {
-    let key_str = format!("{}", index + 1);
+    let key_str = tab_key_label(index);
     let key_w = u16::try_from(display_width(key_str.as_str())).unwrap_or(u16::MAX);
     let label_w = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
     if label.is_empty() {
@@ -210,6 +218,30 @@ fn compute_tab_window_plan(active: MailScreenId, available: u16) -> TabWindowPla
         }
     }
 
+    // Hidden tabs must always retain a visible mouse affordance. The greedy
+    // expansion above can consume the final cell exactly, leaving hidden
+    // screens with no `<`/`>` indicator. Trim only non-active edge tabs until
+    // the core plus the required indicators fits.
+    let mut trim_right = true;
+    loop {
+        let core_width = tab_core_width(&widths, start, end);
+        let indicator_cells = u16::from(start > 0) + u16::from(end < widths.len());
+        if core_width.saturating_add(indicator_cells) <= available {
+            break;
+        }
+        let can_trim_left = start < active_index;
+        let can_trim_right = end > active_index + 1;
+        if !can_trim_left && !can_trim_right {
+            break;
+        }
+        if (trim_right && can_trim_right) || !can_trim_left {
+            end -= 1;
+        } else {
+            start += 1;
+        }
+        trim_right = !trim_right;
+    }
+
     let core_width = tab_core_width(&widths, start, end);
     let spare = available.saturating_sub(core_width);
     let hidden_left = start > 0;
@@ -287,14 +319,13 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
 
     for i in plan.start..plan.end {
         let meta = &MAIL_SCREEN_REGISTRY[i];
-        let number = i + 1;
         let label = tab_label_for_mode(meta, ultra_compact, compact);
         let is_active = meta.id == active;
         let category_changed =
             i > plan.start && MAIL_SCREEN_REGISTRY[i - 1].category != meta.category;
 
         // " 1:Label " — each tab has fixed structure
-        let key_str = format!("{number}");
+        let key_str = tab_key_label(i);
         let has_label = !label.is_empty();
         let show_icon = has_label && !compact;
         let tab_width = tab_slot_width(i, label, show_icon);
@@ -351,7 +382,10 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
 
         let label_span = if use_gradient && has_label {
             // Reserve label width in the base tab row; overlay gradient text below.
-            Span::styled(" ".repeat(label.len()), Style::default().fg(fg).bg(bg))
+            Span::styled(
+                " ".repeat(display_width(label)),
+                Style::default().fg(fg).bg(bg),
+            )
         } else if has_label {
             Span::styled(label, label_style)
         } else {
@@ -400,17 +434,24 @@ pub fn render_tab_bar(active: MailScreenId, effects_enabled: bool, frame: &mut F
         if use_gradient && has_label {
             let gradient =
                 ColorGradient::new(vec![(0.0, tp.status_accent), (1.0, tp.text_secondary)]);
-            let label_width = u16::try_from(label.len()).unwrap_or(u16::MAX);
-            let key_width = u16::try_from(key_str.len()).unwrap_or(u16::MAX);
-            let label_x = x + 1 + key_width + 2;
             StyledText::new(label)
                 .effect(TextEffect::HorizontalGradient { gradient })
                 .base_color(tp.status_accent)
                 .bold()
-                .render(Rect::new(label_x, area.y, label_width, 1), frame);
+                .render(tab_gradient_label_rect(x, area.y, &key_str, label), frame);
         }
         x += tab_width;
     }
+}
+
+fn tab_gradient_label_rect(x: u16, y: u16, key: &str, label: &str) -> Rect {
+    let key_width = u16::try_from(display_width(key)).unwrap_or(u16::MAX);
+    let label_width = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
+    let label_x = x
+        .saturating_add(1)
+        .saturating_add(key_width)
+        .saturating_add(2);
+    Rect::new(label_x, y, label_width, 1)
 }
 
 /// Compute and record per-tab hit slots into the mouse dispatcher.
@@ -552,7 +593,7 @@ fn status_segment_style(
 fn status_group_width(segments: &[StatusSegment], separated: bool) -> u16 {
     segments.iter().enumerate().fold(0u16, |acc, (idx, seg)| {
         let sep = if separated && idx > 0 { 3 } else { 0 };
-        let width = u16::try_from(display_width(&seg.text)).unwrap_or(u16::MAX);
+        let width = status_segment_width(seg);
         acc.saturating_add(sep).saturating_add(width)
     })
 }
@@ -902,6 +943,39 @@ fn segment_text_width(text: &str) -> u16 {
     u16::try_from(display_width(text)).unwrap_or(u16::MAX)
 }
 
+/// Return the width occupied by a status segment after span expansion.
+///
+/// Key-hint strings store keycaps as `\x01key\x02`, while the renderer expands
+/// each keycap to ` key `.  Measuring the marker string directly therefore
+/// undercounts two cells per keycap and can shift or clip every segment to its
+/// right, including interactive status roles.
+fn status_segment_width(seg: &StatusSegment) -> u16 {
+    if seg.priority != StatusPriority::Low || !seg.text.contains('\x01') {
+        return segment_text_width(&seg.text);
+    }
+
+    let mut width = 0u16;
+    let mut rest = seg.text.as_str();
+    while !rest.is_empty() {
+        let Some(start) = rest.find('\x01') else {
+            return width.saturating_add(segment_text_width(rest));
+        };
+        width = width.saturating_add(segment_text_width(&rest[..start]));
+        rest = &rest[start + 1..];
+
+        let Some(end) = rest.find('\x02') else {
+            // Matches `push_keycap_chip_spans`: a malformed opener is removed
+            // and the remaining text is rendered without keycap padding.
+            return width.saturating_add(segment_text_width(rest));
+        };
+        width = width
+            .saturating_add(segment_text_width(&rest[..end]))
+            .saturating_add(2);
+        rest = &rest[end + 1..];
+    }
+    width
+}
+
 /// Intersect a one-row status segment with the row that is actually rendered.
 ///
 /// Responsive pruning can leave a semantic segment in the plan even when the
@@ -1021,20 +1095,20 @@ fn render_status_line_impl(
         area.width,
     );
     // Compute total widths.
-    let left_width = left.iter().fold(0u16, |acc, s| {
-        acc.saturating_add(segment_text_width(&s.text))
-    });
+    let left_width = left
+        .iter()
+        .fold(0u16, |acc, s| acc.saturating_add(status_segment_width(s)));
     let center_width: u16 = center
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let sep = if i > 0 { 3u16 } else { 0 }; // " | "
-            segment_text_width(&s.text).saturating_add(sep)
+            status_segment_width(s).saturating_add(sep)
         })
         .sum();
-    let right_width = right.iter().fold(0u16, |acc, s| {
-        acc.saturating_add(segment_text_width(&s.text))
-    });
+    let right_width = right
+        .iter()
+        .fold(0u16, |acc, s| acc.saturating_add(status_segment_width(s)));
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(16);
     let mut effect_overlays: Vec<(u16, u16, StatusEffect, PackedRgba, String)> = Vec::new();
@@ -1046,7 +1120,7 @@ fn render_status_line_impl(
     for seg in &left {
         let style = status_segment_style(seg, &tp, effects_enabled);
         spans.push(Span::styled(seg.text.clone(), style));
-        cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
+        cursor_x = cursor_x.saturating_add(status_segment_width(seg));
     }
 
     // Center padding + center segments
@@ -1085,7 +1159,7 @@ fn render_status_line_impl(
             let style = status_segment_style(seg, &tp, effects_enabled);
             spans.push(Span::styled(seg.text.clone(), style));
         }
-        cursor_x = cursor_x.saturating_add(segment_text_width(&seg.text));
+        cursor_x = cursor_x.saturating_add(status_segment_width(seg));
     }
 
     // Right padding
@@ -1101,7 +1175,7 @@ fn render_status_line_impl(
     // Right segments
     for seg in &right {
         let style = status_segment_style(seg, &tp, effects_enabled);
-        let seg_width = segment_text_width(&seg.text);
+        let seg_width = status_segment_width(seg);
         if let (Some(dispatcher), Some(role), Some(rect)) = (
             dispatcher,
             seg.role.hit_role(),
@@ -1485,7 +1559,7 @@ fn render_keybinding_line_themed(
 
     let keycap = format!(" {key} ");
     // Total width of leading space + keycap
-    let keycap_total = 2 + keycap.len(); // "  " prefix + keycap
+    let keycap_total = 2 + display_width(&keycap); // "  " prefix + keycap
     let key_len = u16::try_from(keycap_total).unwrap_or(key_col);
     let pad_len = key_col.saturating_sub(key_len) as usize;
     let padding = " ".repeat(pad_len);
@@ -1576,10 +1650,10 @@ impl ChromePalette {
 /// Width of a single keycap/action chip: ` key ` + ` action` + separator.
 ///
 /// Returns the display width (key padded + action + trailing separator).
-const fn chip_width(key: &str, action: &str, is_last: bool) -> usize {
+fn chip_width(key: &str, action: &str, is_last: bool) -> usize {
     // ` key ` (reverse-video keycap) + ` action` + ` · ` separator (3 if not last)
-    let keycap = key.len() + 2; // space + key + space
-    let act = 1 + action.len(); // space + action
+    let keycap = display_width(key) + 2; // space + key + space
+    let act = 1 + display_width(action); // space + action
     let sep = if is_last { 0 } else { 3 }; // " · "
     keycap + act + sep
 }
@@ -1705,6 +1779,48 @@ pub fn render_key_hint_bar(screen_bindings: &[HelpEntry], frame: &mut Frame, are
     Paragraph::new(Text::from_lines([line])).render(area, frame);
 }
 
+// The shared chrome is compiled both by the native server and by the browser
+// dashboard crate. The larger native test module below depends on server-only
+// state constructors, so keep these portable Unicode layout regressions in a
+// small browser-feature module as well.
+#[cfg(all(test, feature = "browser-dashboard"))]
+mod browser_layout_tests {
+    use super::*;
+
+    #[test]
+    fn browser_help_action_column_uses_unicode_display_width() {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(30, 1, &mut pool);
+
+        render_keybinding_line_themed(
+            "↑/↓",
+            "Move",
+            Rect::new(0, 0, 30, 1),
+            12,
+            0,
+            &tp,
+            &mut frame,
+        );
+
+        assert_eq!(
+            frame
+                .buffer
+                .get(12, 0)
+                .and_then(|cell| cell.content.as_char()),
+            Some('M')
+        );
+    }
+
+    #[test]
+    fn browser_active_tab_gradient_rect_uses_unicode_display_width() {
+        assert_eq!(
+            tab_gradient_label_rect(3, 2, "↑", "工具"),
+            Rect::new(7, 2, 4, 1)
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
@@ -1796,6 +1912,53 @@ mod tests {
         let hints = build_key_hints(&bindings, 6, 20);
         assert!(hints.contains("\x01j\x02 Navigate down"));
         assert!(!hints.contains("\x01k\x02"));
+    }
+
+    #[test]
+    fn build_key_hints_measures_unicode_keys_in_terminal_cells() {
+        let bindings = [HelpEntry {
+            key: "↑/↓",
+            action: "Move",
+        }];
+        // Rendered width is ` ↑/↓ ` (5 cells) + ` Move` (5 cells).
+        // UTF-8 byte length is larger and used to incorrectly reject this
+        // exactly-fitting hint.
+        let hints = build_key_hints(&bindings, 1, 10);
+        assert_eq!(hints, "\x01↑/↓\x02 Move");
+    }
+
+    #[test]
+    fn help_keybinding_action_aligns_after_unicode_keycap() {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(30, 1, &mut pool);
+
+        render_keybinding_line_themed(
+            "↑/↓",
+            "Move",
+            Rect::new(0, 0, 30, 1),
+            12,
+            0,
+            &tp,
+            &mut frame,
+        );
+
+        assert_eq!(
+            frame
+                .buffer
+                .get(12, 0)
+                .and_then(|cell| cell.content.as_char()),
+            Some('M'),
+            "the action column must be measured in terminal cells, not UTF-8 bytes"
+        );
+    }
+
+    #[test]
+    fn active_tab_gradient_rect_uses_unicode_display_width() {
+        assert_eq!(
+            tab_gradient_label_rect(3, 2, "↑", "工具"),
+            Rect::new(7, 2, 4, 1)
+        );
     }
 
     #[test]
@@ -2184,6 +2347,47 @@ mod tests {
     }
 
     #[test]
+    fn compact_tabs_ten_and_beyond_use_canonical_shortcuts_and_hit_geometry() {
+        use crate::tui_hit_regions::MouseAction;
+        use ftui::{MouseButton, MouseEvent, MouseEventKind};
+
+        let area = Rect::new(3, 0, 50, 1);
+        for (display_index, expected_key) in [(10, "0"), (11, "!")] {
+            let active = ALL_SCREEN_IDS[display_index - 1];
+            let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
+            dispatcher.update_chrome_areas(area, Rect::new(3, 24, area.width, 1));
+            record_tab_hit_slots(area, active, &dispatcher);
+
+            assert_eq!(tab_key_label(display_index - 1), expected_key);
+            let (x_start, x_end, y) = dispatcher
+                .tab_slot(display_index - 1)
+                .expect("active compact tab must remain visible");
+            let label = screen_meta(active).short_label;
+            let expected_width = 1_u16
+                .saturating_add(
+                    u16::try_from(display_width(expected_key)).expect("shortcut width fits u16"),
+                )
+                .saturating_add(1)
+                .saturating_add(1)
+                .saturating_add(
+                    u16::try_from(display_width(label)).expect("compact label width fits u16"),
+                )
+                .saturating_add(1);
+            assert_eq!(x_end - x_start, expected_width);
+
+            let key_click = MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                x_start.saturating_add(1),
+                y,
+            );
+            assert_eq!(
+                dispatcher.dispatch(&key_click),
+                MouseAction::SwitchScreen(active)
+            );
+        }
+    }
+
+    #[test]
     fn tab_hit_slots_no_overlap() {
         let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
         record_tab_hit_slots(
@@ -2256,6 +2460,33 @@ mod tests {
             dispatcher.dispatch(&left_click),
             MouseAction::SwitchScreen(previous_screen)
         );
+    }
+
+    #[test]
+    fn exact_fit_widths_keep_hidden_tabs_mouse_accessible() {
+        // These widths exactly fit a greedy prefix of the Dashboard tab bar.
+        // Without reserving the overflow cell, the next hidden screen exists
+        // but has no visible or clickable way to reach it.
+        for width in [43, 53, 65, 83, 101, 120, 134, 149, 164, 179, 195, 213, 235] {
+            let plan = compute_tab_window_plan(MailScreenId::Dashboard, width);
+            assert!(
+                plan.end < MAIL_SCREEN_REGISTRY.len(),
+                "width {width} should leave at least one screen hidden"
+            );
+            assert!(
+                plan.show_right_indicator,
+                "width {width} hid screens without a right overflow indicator"
+            );
+
+            let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
+            let area = Rect::new(0, 0, width, 1);
+            record_tab_hit_slots(area, MailScreenId::Dashboard, &dispatcher);
+            assert_eq!(
+                dispatcher.tab_slot(plan.end),
+                Some((width - 1, width, area.y)),
+                "width {width} did not map the overflow cell to the adjacent hidden screen"
+            );
+        }
     }
 
     // ── Status segment discoverability tests (br-1xt0m.1.12.1) ──
@@ -2367,7 +2598,11 @@ mod tests {
         );
     }
 
-    fn render_status_hit_geometry(width: u16, help_visible: bool) -> (MouseDispatcher, Rect) {
+    fn render_status_hit_geometry_with_bindings(
+        width: u16,
+        help_visible: bool,
+        screen_bindings: &[HelpEntry],
+    ) -> (MouseDispatcher, Rect, Vec<char>) {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
         let a11y = AccessibilitySettings::default();
@@ -2384,13 +2619,29 @@ mod tests {
             false,
             help_visible,
             &a11y,
-            &[],
+            screen_bindings,
             false,
             &dispatcher,
             &mut frame,
             area,
         );
 
+        let rendered_cells = (area.x..area.x.saturating_add(area.width))
+            .map(|x| {
+                frame
+                    .buffer
+                    .get(x, area.y)
+                    .and_then(|cell| cell.content.as_char())
+                    .unwrap_or(' ')
+            })
+            .collect();
+
+        (dispatcher, area, rendered_cells)
+    }
+
+    fn render_status_hit_geometry(width: u16, help_visible: bool) -> (MouseDispatcher, Rect) {
+        let (dispatcher, area, _) =
+            render_status_hit_geometry_with_bindings(width, help_visible, &[]);
         (dispatcher, area)
     }
 
@@ -2457,6 +2708,53 @@ mod tests {
             dispatcher.status_slot(StatusHitRole::HelpToggle),
             Some(Rect::new(area.x + 115, area.y, 5, 1))
         );
+    }
+
+    #[test]
+    fn status_keycaps_preserve_right_role_rendering_and_hit_geometry() {
+        use crate::tui_hit_regions::MouseAction;
+
+        let bindings = [
+            HelpEntry {
+                key: "j",
+                action: "Down",
+            },
+            HelpEntry {
+                key: "k",
+                action: "Up",
+            },
+        ];
+        let (dispatcher, area, rendered_cells) =
+            render_status_hit_geometry_with_bindings(160, false, &bindings);
+        let palette = dispatcher
+            .status_slot(StatusHitRole::PaletteToggle)
+            .expect("palette segment should survive with key hints");
+        let help = dispatcher
+            .status_slot(StatusHitRole::HelpToggle)
+            .expect("help segment should survive with key hints");
+
+        assert_eq!(palette, Rect::new(area.x + 152, area.y, 5, 1));
+        assert_eq!(help, Rect::new(area.x + 157, area.y, 3, 1));
+        assert_eq!(
+            &rendered_cells[152..160],
+            &['[', '^', 'P', ']', ' ', 'F', '1', ' '],
+            "right-side roles must occupy the same cells that dispatch clicks"
+        );
+
+        for x in palette.x..palette.x + palette.width {
+            assert_eq!(
+                dispatcher.dispatch(&status_left_click(x, area.y)),
+                MouseAction::OpenPalette,
+                "palette cell x={x}"
+            );
+        }
+        for x in help.x..help.x + help.width {
+            assert_eq!(
+                dispatcher.dispatch(&status_left_click(x, area.y)),
+                MouseAction::ToggleHelp,
+                "help cell x={x}"
+            );
+        }
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub struct DashboardModel {
     reduced_motion: bool,
     last_deep_link: Option<String>,
     prepared: bool,
+    #[cfg(test)]
+    replay_reset_count: u64,
 }
 
 impl Default for DashboardModel {
@@ -84,6 +86,8 @@ impl DashboardModel {
             reduced_motion: false,
             last_deep_link: None,
             prepared: false,
+            #[cfg(test)]
+            replay_reset_count: 0,
         };
         model.reset();
         model
@@ -111,6 +115,8 @@ impl DashboardModel {
             reduced_motion: false,
             last_deep_link: None,
             prepared: false,
+            #[cfg(test)]
+            replay_reset_count: 0,
         }
     }
 
@@ -153,6 +159,10 @@ impl DashboardModel {
     }
 
     fn reset_replay(&mut self, preserve_interaction: bool) {
+        #[cfg(test)]
+        {
+            self.replay_reset_count = self.replay_reset_count.saturating_add(1);
+        }
         let preserved_screen = self.active_screen;
         let preserved_help = self.help_visible;
         let preserved_deep_link = self.last_deep_link.clone();
@@ -186,11 +196,19 @@ impl DashboardModel {
         self.sync_replay_clock();
         self.screen.tick(0, &self.state);
         self.screen.tick(self.tick_count, &self.state);
-        if preserve_interaction {
-            self.public_screen
-                .normalize(self.active_screen, &self.state);
-        }
+        // Public replay rows are materialized lazily by view/input. Deferring
+        // their normalization avoids rebuilding a 10,000-row projection while
+        // catch-up replay is still applying actions that will be discarded or
+        // superseded before the next browser frame.
         self.prepared = true;
+    }
+
+    /// Discard prior loop cycles and restore the deterministic beginning of
+    /// the surviving cycle. The runner then advances that one cycle at native
+    /// logical-tick boundaries so history samples retain their exact timing.
+    pub(crate) fn restart_looping_replay_cycle(&mut self) {
+        debug_assert!(self.pack.loop_replay);
+        self.reset_replay(true);
     }
 
     /// Advance the deterministic replay clock. Returns whether visible state
@@ -303,6 +321,12 @@ impl DashboardModel {
     #[cfg(test)]
     pub(crate) const fn tick_count(&self) -> u64 {
         self.tick_count
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn replay_reset_count(&self) -> u64 {
+        self.replay_reset_count
     }
 
     /// Apply one production-cadence logical tick without forcing an
@@ -501,7 +525,13 @@ impl DashboardModel {
                 KeyCode::Char('/')
                     if !text_mode && self.active_screen != MailScreenId::Dashboard =>
                 {
-                    self.open_search("");
+                    if self.active_screen == MailScreenId::Search {
+                        if self.public_screen.reactivate_search() {
+                            self.interaction_revision = self.interaction_revision.saturating_add(1);
+                        }
+                    } else {
+                        self.open_search("");
+                    }
                     return true;
                 }
                 KeyCode::Char(character)
@@ -642,7 +672,7 @@ fn render_browser_help(
     let inner = block.inner(overlay);
     block.render(overlay, frame);
     let text = format!(
-        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click < or > to reveal hidden top tabs\n  Click Dashboard filters or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  1-4 on Dashboard     apply its quick filters\n  / on Dashboard       edit its live filter\n  / elsewhere          open Search\n  Ctrl+P               open Search\n  F1 or ?              toggle this help\n\nThis browser build is read-only. Replay counters start from a read-only Agent Mail SQLite aggregate export and may change as synthetic events run; names, paths, messages, and replay events are synthetic public-demo details.",
+        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click < or > to reveal hidden top tabs\n  Click Dashboard filters, the Search input, or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  1-4 on Dashboard     apply its quick filters\n  / on Dashboard       edit its live filter\n  / elsewhere          open Search\n  Ctrl+P               open Search\n  F1 or ?              toggle this help\n\nThis browser build is read-only. Replay counters start from a read-only Agent Mail SQLite aggregate export and may change as synthetic events run; names, paths, messages, and replay events are synthetic public-demo details.",
         meta.title, meta.description
     );
     Paragraph::new(text)
@@ -656,7 +686,7 @@ mod tests {
     use ftui_runtime::program::Model;
 
     use super::{DashboardMessage, DashboardModel};
-    use crate::demo_pack::curated_public_demo;
+    use crate::demo_pack::{DemoAction, DemoOperation, curated_public_demo};
     use crate::tui_screens::{MailScreen, MailScreenId};
 
     #[test]
@@ -863,6 +893,40 @@ mod tests {
     }
 
     #[test]
+    fn slash_reactivates_inactive_search_without_clearing_query_or_selection() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        model.open_search("release");
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Enter))));
+        assert!(
+            !model
+                .public_screen
+                .consumes_text_input(MailScreenId::Search)
+        );
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::End))));
+        let selection_before = model.public_selected_row();
+        let revision_before = model.interaction_revision();
+        assert!(
+            selection_before > 0,
+            "release query should have multiple rows"
+        );
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            '/',
+        )))));
+
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        assert_eq!(model.public_screen.search_query(), "release");
+        assert_eq!(model.public_selected_row(), selection_before);
+        assert!(
+            model
+                .public_screen
+                .consumes_text_input(MailScreenId::Search)
+        );
+        assert!(model.interaction_revision() > revision_before);
+    }
+
+    #[test]
     fn direct_screen_jumps_remain_available_outside_dashboard() {
         let mut model = DashboardModel::new(curated_public_demo());
         let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Tab))));
@@ -873,6 +937,47 @@ mod tests {
         )))));
 
         assert_eq!(model.active_screen(), MailScreenId::Agents);
+    }
+
+    #[test]
+    fn timed_roster_shrink_clamps_public_selection_on_next_observation() {
+        let mut pack = curated_public_demo();
+        let mut smaller_snapshot = pack.bootstrap.db_stats.clone();
+        smaller_snapshot.agents = 1;
+        smaller_snapshot.agents_list.truncate(1);
+        pack.actions.retain(|action| action.at_ms == 0);
+        pack.actions.push(DemoAction {
+            at_ms: 1,
+            operation: DemoOperation::SetDbStats {
+                snapshot: smaller_snapshot,
+            },
+        });
+        pack.duration_ms = 100;
+        pack.loop_replay = false;
+        pack.finalize_digest();
+
+        let mut model = DashboardModel::new(pack);
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Tab))));
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            '4',
+        )))));
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::End))));
+        assert!(model.public_selected_row() > 0);
+
+        assert!(model.advance_replay_ms(1));
+        assert!(
+            model.public_selected_row() > 0,
+            "replay ingestion must defer expensive row projection until observation"
+        );
+        // Replay ingestion deliberately defers row materialization. The next
+        // view or input observation rebuilds once and clamps before use.
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Down))));
+        assert_eq!(model.public_selected_row(), 0);
+        assert_eq!(
+            model.state().db_stats_snapshot().unwrap().agents_list.len(),
+            1
+        );
     }
 
     #[test]

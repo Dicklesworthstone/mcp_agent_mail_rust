@@ -1,5 +1,8 @@
 //! Versioned, privacy-bounded data pack and deterministic replay actions.
 
+use std::cell::Cell;
+
+use serde::de::DeserializeSeed as _;
 use sha2::{Digest, Sha256};
 
 use crate::state::{ConfigSnapshot, RequestCounters, TuiSharedState};
@@ -18,6 +21,20 @@ pub const MAX_SERIALIZED_PACK_BYTES: usize = 8 * 1024 * 1024;
 /// console lines, event strings). Shared across all loaders.
 pub const MAX_TEXT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_ACTIONS: usize = 10_000;
+/// Bound the full parsed JSON tree, including numbers and empty strings. The
+/// byte ceiling alone is not enough: compact arrays can otherwise expand into
+/// millions of `serde_json::Value` nodes before typed validation begins.
+const MAX_JSON_NODES: usize = 100_000;
+const MAX_BOOTSTRAP_CONSOLE_LINES: usize = 2_000;
+const MAX_SNAPSHOT_AGENTS: usize = 2_000;
+const MAX_SNAPSHOT_PROJECTS: usize = 1_000;
+const MAX_SNAPSHOT_CONTACTS: usize = 5_000;
+const MAX_SNAPSHOT_RESERVATIONS: usize = 5_000;
+const MAX_HEALTH_METRICS_PER_AGENT: usize = 32;
+const MAX_EVENT_RECIPIENTS: usize = 256;
+const MAX_EVENT_PATHS: usize = 256;
+const MAX_EVENT_TABLE_ROWS: usize = 256;
+const MAX_EVENT_PARAMS_JSON_NODES: usize = 4_096;
 /// Bound synchronous work at any single replay instant. The curated opening
 /// frame intentionally applies 192 history events at t=0, so retain generous
 /// headroom without allowing an entire 10,000-action pack to block one frame.
@@ -122,6 +139,11 @@ pub enum DemoPackError {
         max: usize,
     },
     TooManySparklineSamples(usize),
+    TooManyItems {
+        field: String,
+        len: usize,
+        max: usize,
+    },
     NonFiniteLatency(usize),
     NonMonotonicAction {
         index: usize,
@@ -136,6 +158,10 @@ pub enum DemoPackError {
     InvalidHttpStatus {
         index: usize,
         status: u16,
+    },
+    InvalidEventFloat {
+        index: usize,
+        field: &'static str,
     },
     InvalidRequestCounters {
         total: u64,
@@ -202,8 +228,16 @@ impl DemoPack {
                 max: MAX_SERIALIZED_PACK_BYTES,
             });
         }
-        let raw: serde_json::Value =
-            serde_json::from_str(json).map_err(|error| DemoPackError::Json(error.to_string()))?;
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let parsed_nodes = Cell::new(0);
+        let UniqueJsonValue(raw) = UniqueJsonSeed {
+            parsed_nodes: &parsed_nodes,
+        }
+        .deserialize(&mut deserializer)
+        .map_err(|error| DemoPackError::Json(error.to_string()))?;
+        deserializer
+            .end()
+            .map_err(|error| DemoPackError::Json(error.to_string()))?;
         let pack: Self = serde_json::from_value(raw.clone())
             .map_err(|error| DemoPackError::Json(error.to_string()))?;
         // The content digest is computed from the typed, canonical pack. Any
@@ -284,6 +318,11 @@ impl DemoPack {
                 self.bootstrap.latency_samples_ms.len(),
             ));
         }
+        validate_item_count(
+            "bootstrap.console_lines",
+            self.bootstrap.console_lines.len(),
+            MAX_BOOTSTRAP_CONSOLE_LINES,
+        )?;
         for (index, latency) in self.bootstrap.latency_samples_ms.iter().enumerate() {
             if !latency.is_finite() || *latency < 0.0 {
                 return Err(DemoPackError::NonFiniteLatency(index));
@@ -410,12 +449,169 @@ impl DemoPack {
     }
 }
 
+struct UniqueJsonValue(serde_json::Value);
+
+#[derive(Clone, Copy)]
+struct UniqueJsonSeed<'a> {
+    parsed_nodes: &'a Cell<usize>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for UniqueJsonSeed<'_> {
+    type Value = UniqueJsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let next_count = self.parsed_nodes.get().saturating_add(1);
+        if next_count > MAX_JSON_NODES {
+            return Err(serde::de::Error::custom(format_args!(
+                "JSON semantic node budget exceeded (max {MAX_JSON_NODES})"
+            )));
+        }
+        self.parsed_nodes.set(next_count);
+        deserializer.deserialize_any(UniqueJsonVisitor {
+            parsed_nodes: self.parsed_nodes,
+        })
+    }
+}
+
+struct UniqueJsonVisitor<'a> {
+    parsed_nodes: &'a Cell<usize>,
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueJsonVisitor<'_> {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_unit()
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("non-finite JSON number"))?;
+        Ok(UniqueJsonValue(serde_json::Value::Number(number)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_string(value.to_string())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_JSON_NODES));
+        while let Some(UniqueJsonValue(value)) = sequence.next_element_seed(UniqueJsonSeed {
+            parsed_nodes: self.parsed_nodes,
+        })? {
+            values.push(value);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut values =
+            serde_json::Map::with_capacity(entries.size_hint().unwrap_or(0).min(MAX_JSON_NODES));
+        while let Some(key) = entries.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom("duplicate JSON object key"));
+            }
+            let UniqueJsonValue(value) = entries.next_value_seed(UniqueJsonSeed {
+                parsed_nodes: self.parsed_nodes,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(values)))
+    }
+}
+
+fn validate_item_count(field: &str, len: usize, max: usize) -> Result<(), DemoPackError> {
+    if len > max {
+        return Err(DemoPackError::TooManyItems {
+            field: field.to_string(),
+            len,
+            max,
+        });
+    }
+    Ok(())
+}
+
 fn validate_snapshot(snapshot: &DbStatSnapshot) -> Result<(), DemoPackError> {
+    validate_item_count(
+        "snapshot.agents_list",
+        snapshot.agents_list.len(),
+        MAX_SNAPSHOT_AGENTS,
+    )?;
+    validate_item_count(
+        "snapshot.projects_list",
+        snapshot.projects_list.len(),
+        MAX_SNAPSHOT_PROJECTS,
+    )?;
+    validate_item_count(
+        "snapshot.contacts_list",
+        snapshot.contacts_list.len(),
+        MAX_SNAPSHOT_CONTACTS,
+    )?;
+    validate_item_count(
+        "snapshot.reservation_snapshots",
+        snapshot.reservation_snapshots.len(),
+        MAX_SNAPSHOT_RESERVATIONS,
+    )?;
     for (index, agent) in snapshot.agents_list.iter().enumerate() {
         validate_public_text(&format!("agents[{index}].project"), &agent.project)?;
         validate_public_text(&format!("agents[{index}].name"), &agent.name)?;
         validate_public_text(&format!("agents[{index}].program"), &agent.program)?;
         validate_public_text(&format!("agents[{index}].model"), &agent.model)?;
+        if let Some(health) = &agent.health {
+            validate_item_count(
+                &format!("agents[{index}].health.metrics"),
+                health.metrics.len(),
+                MAX_HEALTH_METRICS_PER_AGENT,
+            )?;
+            for (metric_index, metric) in health.metrics.iter().enumerate() {
+                validate_public_text(
+                    &format!("agents[{index}].health.metrics[{metric_index}].evidence"),
+                    &metric.evidence,
+                )?;
+            }
+        }
     }
     for (index, project) in snapshot.projects_list.iter().enumerate() {
         validate_public_text(&format!("projects[{index}].slug"), &project.slug)?;
@@ -518,9 +714,136 @@ fn validate_event(index: usize, event: &MailEvent) -> Result<(), DemoPackError> 
     if !event.redacted() {
         return Err(DemoPackError::UnredactedEvent(index));
     }
-    let encoded =
+    match event {
+        MailEvent::ToolCallStart { params_json, .. } => {
+            validate_json_node_count(
+                &format!("actions[{index}].event.params_json"),
+                params_json,
+                MAX_EVENT_PARAMS_JSON_NODES,
+            )?;
+        }
+        MailEvent::ToolCallEnd {
+            query_time_ms,
+            per_table,
+            ..
+        } => {
+            if !query_time_ms.is_finite() || *query_time_ms < 0.0 {
+                return Err(DemoPackError::InvalidEventFloat {
+                    index,
+                    field: "query_time_ms",
+                });
+            }
+            validate_item_count(
+                &format!("actions[{index}].event.per_table"),
+                per_table.len(),
+                MAX_EVENT_TABLE_ROWS,
+            )?;
+        }
+        MailEvent::MessageSent { to, .. } | MailEvent::MessageReceived { to, .. } => {
+            validate_item_count(
+                &format!("actions[{index}].event.to"),
+                to.len(),
+                MAX_EVENT_RECIPIENTS,
+            )?;
+        }
+        MailEvent::ReservationGranted { paths, .. }
+        | MailEvent::ReservationReleased { paths, .. } => {
+            validate_item_count(
+                &format!("actions[{index}].event.paths"),
+                paths.len(),
+                MAX_EVENT_PATHS,
+            )?;
+        }
+        MailEvent::HttpRequest { status, .. } => {
+            if !(100..=599).contains(status) {
+                return Err(DemoPackError::InvalidHttpStatus {
+                    index,
+                    status: *status,
+                });
+            }
+        }
+        MailEvent::HealthPulse { db_stats, .. } => validate_snapshot(db_stats)?,
+        _ => {}
+    }
+    let mut encoded =
         serde_json::to_value(event).map_err(|error| DemoPackError::Json(error.to_string()))?;
+    if let MailEvent::HttpRequest { path, .. } = event {
+        validate_public_http_route(&format!("actions[{index}].event.path"), path)?;
+        // An HTTP route and a filesystem path have different grammars. The
+        // generic arbitrary-JSON walker deliberately treats keys named `path`
+        // as project-relative filesystem paths, so remove this known typed
+        // route only after validating it with the route-specific contract.
+        if let serde_json::Value::Object(fields) = &mut encoded {
+            fields.remove("path");
+        }
+    }
     validate_json_strings(&format!("actions[{index}].event"), &encoded)
+}
+
+fn validate_json_node_count(
+    field: &str,
+    value: &serde_json::Value,
+    max: usize,
+) -> Result<(), DemoPackError> {
+    let mut count = 0_usize;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        count = count.saturating_add(1);
+        if count > max {
+            return Err(DemoPackError::TooManyItems {
+                field: field.to_string(),
+                len: count,
+                max,
+            });
+        }
+        let child_count = match value {
+            serde_json::Value::Array(values) => values.len(),
+            serde_json::Value::Object(values) => values.len(),
+            _ => 0,
+        };
+        let projected = count
+            .saturating_add(pending.len())
+            .saturating_add(child_count);
+        if projected > max {
+            return Err(DemoPackError::TooManyItems {
+                field: field.to_string(),
+                len: projected,
+                max,
+            });
+        }
+        match value {
+            serde_json::Value::Array(values) => pending.extend(values),
+            serde_json::Value::Object(values) => pending.extend(values.values()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_http_route(field: &str, value: &str) -> Result<(), DemoPackError> {
+    let Some(relative) = value.strip_prefix('/') else {
+        return Err(DemoPackError::UnsafeText {
+            field: field.to_string(),
+            reason: "HTTP route must begin with one forward slash".to_string(),
+        });
+    };
+    let first_segment = relative.split('/').next().unwrap_or_default();
+    let approved_public_namespace = matches!(first_segment, "api" | "health");
+    if value.starts_with("//")
+        || value
+            .chars()
+            .any(|character| matches!(character, '\\' | '%' | '?' | '#'))
+        || !approved_public_namespace
+        || relative
+            .split('/')
+            .any(|segment| segment == "." || segment == ".." || segment.is_empty())
+    {
+        return Err(DemoPackError::UnsafeText {
+            field: field.to_string(),
+            reason: "HTTP route must be origin-relative and traversal-free".to_string(),
+        });
+    }
+    validate_public_text(field, relative)
 }
 
 fn validate_json_strings(field: &str, value: &serde_json::Value) -> Result<(), DemoPackError> {
@@ -534,22 +857,31 @@ fn validate_json_strings(field: &str, value: &serde_json::Value) -> Result<(), D
         }
         serde_json::Value::Object(values) => {
             for (key, value) in values {
-                let nested_field = format!("{field}.{key}");
-                if matches!(key.as_str(), "path" | "path_pattern")
-                    && let serde_json::Value::String(path) = value
-                {
-                    validate_public_path(&nested_field, path)?;
-                    continue;
-                }
-                if key == "paths"
-                    && let serde_json::Value::Array(paths) = value
-                {
-                    for (index, path) in paths.iter().enumerate() {
-                        if let serde_json::Value::String(path) = path {
-                            validate_public_path(&format!("{nested_field}[{index}]"), path)?;
-                        } else {
-                            validate_json_strings(&format!("{nested_field}[{index}]"), path)?;
+                // Keys are public bytes too. Validate them without echoing a
+                // potentially sensitive key into the diagnostic field path.
+                validate_public_text(&format!("{field}.<key>"), key)?;
+                let nested_field = format!("{field}.<value>");
+                if is_path_like_json_key(key) {
+                    match value {
+                        serde_json::Value::String(path) => {
+                            validate_public_path(&nested_field, path)?;
                         }
+                        serde_json::Value::Array(paths) => {
+                            for (index, path) in paths.iter().enumerate() {
+                                if let serde_json::Value::String(path) = path {
+                                    validate_public_path(
+                                        &format!("{nested_field}[{index}]"),
+                                        path,
+                                    )?;
+                                } else {
+                                    validate_json_strings(
+                                        &format!("{nested_field}[{index}]"),
+                                        path,
+                                    )?;
+                                }
+                            }
+                        }
+                        _ => validate_json_strings(&nested_field, value)?,
                     }
                     continue;
                 }
@@ -561,6 +893,16 @@ fn validate_json_strings(field: &str, value: &serde_json::Value) -> Result<(), D
     }
 }
 
+fn is_path_like_json_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "cwd" | "human_key" | "path" | "paths" | "path_pattern" | "root"
+    ) || key.ends_with("_path")
+        || key.ends_with("_paths")
+        || key.ends_with("_root")
+}
+
 fn validate_public_path(field: &str, value: &str) -> Result<(), DemoPackError> {
     // Reject every representation a traversal can hide in, not just the
     // embedded `../` form: absolute paths, backslash separators, Windows
@@ -570,6 +912,7 @@ fn validate_public_path(field: &str, value: &str) -> Result<(), DemoPackError> {
     // `a//b`, and trailing-slash forms in one rule.
     let has_drive_prefix = value.len() >= 2 && value.as_bytes()[1] == b':';
     if value.starts_with('/')
+        || value.starts_with('~')
         || value.contains('\\')
         || value.contains('%')
         || has_drive_prefix
@@ -598,6 +941,8 @@ fn validate_public_text(field: &str, value: &str) -> Result<(), DemoPackError> {
         ("/users/", "absolute macOS home path"),
         ("/home/", "absolute Unix home path"),
         ("c:\\users\\", "absolute Windows home path"),
+        ("file://", "local file URL"),
+        ("sqlite://", "SQLite URL"),
         ("authorization:", "authorization header"),
         ("bearer ", "bearer credential"),
         ("ghp_", "GitHub token"),
@@ -614,6 +959,26 @@ fn validate_public_text(field: &str, value: &str) -> Result<(), DemoPackError> {
             reason: (*reason).to_string(),
         });
     }
+    if contains_absolute_path_token(value) {
+        return Err(DemoPackError::UnsafeText {
+            field: field.to_string(),
+            reason: "absolute filesystem path".to_string(),
+        });
+    }
+    if value.as_bytes().windows(3).any(|window| {
+        window[0] == b'%' && window[1].is_ascii_hexdigit() && window[2].is_ascii_hexdigit()
+    }) {
+        return Err(DemoPackError::UnsafeText {
+            field: field.to_string(),
+            reason: "percent-encoded bytes are not allowed in public replay text".to_string(),
+        });
+    }
+    if value.contains("://") {
+        return Err(DemoPackError::UnsafeText {
+            field: field.to_string(),
+            reason: "URL-like values are not allowed in public replay text".to_string(),
+        });
+    }
     if value.contains('\0') || value.len() > 32_768 {
         return Err(DemoPackError::UnsafeText {
             field: field.to_string(),
@@ -621,6 +986,47 @@ fn validate_public_text(field: &str, value: &str) -> Result<(), DemoPackError> {
         });
     }
     Ok(())
+}
+
+fn contains_absolute_path_token(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (0..bytes.len()).any(|index| {
+        let at_boundary = index == 0 || {
+            let previous = bytes[index - 1];
+            !previous.is_ascii_alphanumeric()
+                && !matches!(previous, b'.' | b'_' | b'-' | b'/' | b'\\')
+        };
+        if !at_boundary {
+            return false;
+        }
+
+        let remaining = &bytes[index..];
+        (remaining.len() >= 2 && matches!(remaining[0], b'/' | b'\\'))
+            || starts_with_tilde_home(remaining)
+            || (remaining.len() >= 3
+                && remaining[0].is_ascii_alphabetic()
+                && remaining[1] == b':'
+                && matches!(remaining[2], b'/' | b'\\'))
+    })
+}
+
+fn starts_with_tilde_home(value: &[u8]) -> bool {
+    if value.len() < 2 || value[0] != b'~' {
+        return false;
+    }
+    if matches!(value[1], b'/' | b'\\') {
+        return true;
+    }
+    let Some(separator) = value[1..]
+        .iter()
+        .position(|byte| matches!(byte, b'/' | b'\\'))
+    else {
+        return false;
+    };
+    separator > 0
+        && value[1..1 + separator]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
@@ -688,7 +1094,7 @@ fn synthetic_startup_history(base_ts: i64) -> Vec<DemoAction> {
         "search_messages",
         "health_check",
     ];
-    const HTTP_PATHS: [&str; 4] = ["api/mcp", "api/messages", "api/agents", "health/ready"];
+    const HTTP_PATHS: [&str; 4] = ["/api/mcp", "/api/messages", "/api/agents", "/health/ready"];
 
     (0_u64..STARTUP_HISTORY_EVENTS)
         .map(|index| {
@@ -1207,8 +1613,11 @@ mod tests {
         DemoOperation, DemoPack, DemoPackError, STARTUP_AGENT_ROWS, STARTUP_CONTACT_ROWS,
         STARTUP_HISTORY_EVENTS, STARTUP_PROJECT_ROWS, curated_public_demo,
     };
+    use crate::browser_contracts::{
+        AgentHealthGrade, AgentHealthMetric, AgentHealthMetricKind, AgentHealthScorecard,
+    };
     use crate::state::TuiSharedState;
-    use crate::tui_events::MailEventKind;
+    use crate::tui_events::{MailEvent, MailEventKind};
 
     #[test]
     fn curated_pack_round_trips_and_digest_verifies() {
@@ -1343,10 +1752,169 @@ mod tests {
     }
 
     #[test]
+    fn absolute_paths_under_arbitrary_event_json_keys_fail_privacy_gate() {
+        for private_path in [
+            "/Volumes/private/mailbox",
+            "/private/work/agent-mail",
+            "/tmp/agent-mail.sqlite3",
+            "../private/mailbox",
+            "workspace/../private",
+            "D:/work/private-mailbox",
+            "\\\\private-host\\mailbox",
+        ] {
+            let mut pack = curated_public_demo();
+            let params = pack
+                .actions
+                .iter_mut()
+                .find_map(|action| match &mut action.operation {
+                    DemoOperation::PublishEvent {
+                        event: MailEvent::ToolCallStart { params_json, .. },
+                    } => Some(params_json),
+                    _ => None,
+                })
+                .expect("curated pack should contain a tool-call start");
+            params["cwd"] = serde_json::json!(private_path);
+            pack.finalize_digest();
+            assert!(
+                matches!(pack.validate(), Err(DemoPackError::UnsafeText { .. })),
+                "private path under an arbitrary JSON key was accepted: {private_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_arbitrary_event_json_keys_fail_privacy_gate() {
+        let mut pack = curated_public_demo();
+        let params = pack
+            .actions
+            .iter_mut()
+            .find_map(|action| match &mut action.operation {
+                DemoOperation::PublishEvent {
+                    event: MailEvent::ToolCallStart { params_json, .. },
+                } => Some(params_json),
+                _ => None,
+            })
+            .expect("curated pack should contain a tool-call start");
+        params["Authorization: Bearer ghp_private"] = serde_json::json!("synthetic");
+        pack.finalize_digest();
+        assert!(matches!(
+            pack.validate(),
+            Err(DemoPackError::UnsafeText { .. })
+        ));
+    }
+
+    #[test]
+    fn encoded_and_scheme_wrapped_paths_in_arbitrary_json_fail_privacy_gate() {
+        for private_location in [
+            "%2FUsers%2Fprivate%2Fmailbox.sqlite3",
+            "%252Fhome%252Fprivate%252Fmailbox.sqlite3",
+            "ssh://private-host/Volumes/mailbox",
+        ] {
+            let mut pack = curated_public_demo();
+            let params = pack
+                .actions
+                .iter_mut()
+                .find_map(|action| match &mut action.operation {
+                    DemoOperation::PublishEvent {
+                        event: MailEvent::ToolCallStart { params_json, .. },
+                    } => Some(params_json),
+                    _ => None,
+                })
+                .expect("curated pack should contain a tool-call start");
+            params["note"] = serde_json::json!(private_location);
+            pack.finalize_digest();
+            assert!(
+                matches!(pack.validate(), Err(DemoPackError::UnsafeText { .. })),
+                "encoded private location was accepted: {private_location}"
+            );
+        }
+    }
+
+    #[test]
+    fn delimiter_wrapped_absolute_paths_in_arbitrary_json_fail_privacy_gate() {
+        for private_location in [
+            "note|/Volumes/private/mailbox",
+            "note?/private/work/agent-mail",
+            "note:/tmp/agent-mail.sqlite3",
+            "note→/Volumes/private/mailbox",
+            "note|~/private/mailbox",
+            "note|D:/private/mailbox",
+            "note|\\\\private-host\\mailbox",
+        ] {
+            let mut pack = curated_public_demo();
+            let params = pack
+                .actions
+                .iter_mut()
+                .find_map(|action| match &mut action.operation {
+                    DemoOperation::PublishEvent {
+                        event: MailEvent::ToolCallStart { params_json, .. },
+                    } => Some(params_json),
+                    _ => None,
+                })
+                .expect("curated pack should contain a tool-call start");
+            params["note"] = serde_json::json!(private_location);
+            pack.finalize_digest();
+            assert!(
+                matches!(pack.validate(), Err(DemoPackError::UnsafeText { .. })),
+                "delimiter-wrapped private path was accepted: {private_location}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_routes_use_origin_relative_not_filesystem_path_semantics() {
+        let mut valid = curated_public_demo();
+        let route = valid
+            .actions
+            .iter_mut()
+            .find_map(|action| match &mut action.operation {
+                DemoOperation::PublishEvent {
+                    event: MailEvent::HttpRequest { path, .. },
+                } => Some(path),
+                _ => None,
+            })
+            .expect("curated pack should contain an HTTP request");
+        *route = "/api/mcp".to_string();
+        valid.finalize_digest();
+        valid
+            .validate()
+            .expect("a normal origin-relative HTTP route should be public-safe");
+
+        for unsafe_route in [
+            "api/mcp",
+            "//private-host/share",
+            "/api/../private",
+            "/Users/private/mailbox.sqlite3",
+            "/root/.ssh/id_rsa",
+            "/usr/local/private",
+            "/api/messages?token=private",
+        ] {
+            let mut pack = valid.clone();
+            let route = pack
+                .actions
+                .iter_mut()
+                .find_map(|action| match &mut action.operation {
+                    DemoOperation::PublishEvent {
+                        event: MailEvent::HttpRequest { path, .. },
+                    } => Some(path),
+                    _ => None,
+                })
+                .expect("curated pack should contain an HTTP request");
+            *route = unsafe_route.to_string();
+            pack.finalize_digest();
+            assert!(
+                matches!(pack.validate(), Err(DemoPackError::UnsafeText { .. })),
+                "unsafe HTTP route was accepted: {unsafe_route}"
+            );
+        }
+    }
+
+    #[test]
     fn project_human_keys_must_be_public_relative_paths() {
         for private_path in [
             "/Volumes/private/mailbox",
             "/private/work/agent-mail",
+            "~private/projects/agent-mail",
             "D:/work/private-mailbox",
             "D:\\work\\private-mailbox",
         ] {
@@ -1358,6 +1926,48 @@ mod tests {
                 "absolute project human_key was accepted: {private_path}"
             );
         }
+    }
+
+    #[test]
+    fn agent_health_evidence_is_inside_the_privacy_boundary() {
+        let private_health = AgentHealthScorecard {
+            score: 90,
+            grade: AgentHealthGrade::A,
+            observed_weight_bp: 10_000,
+            decision_count: 1,
+            metrics: vec![AgentHealthMetric {
+                kind: AgentHealthMetricKind::ActivityRecency,
+                available: true,
+                raw_score: 90,
+                weight_bp: 10_000,
+                evidence: "/Users/private/.mcp_agent_mail/storage.sqlite3".to_string(),
+            }],
+        };
+
+        let mut bootstrap_pack = curated_public_demo();
+        bootstrap_pack.bootstrap.db_stats.agents_list[0].health = Some(private_health.clone());
+        bootstrap_pack.finalize_digest();
+        assert!(matches!(
+            bootstrap_pack.validate(),
+            Err(DemoPackError::UnsafeText { .. })
+        ));
+
+        let mut action_pack = curated_public_demo();
+        let mut private_agent = action_pack.bootstrap.db_stats.agents_list[0].clone();
+        private_agent.health = Some(private_health);
+        let action = action_pack
+            .actions
+            .iter_mut()
+            .find(|action| matches!(&action.operation, DemoOperation::MergeDbStats { .. }))
+            .expect("curated replay should contain a timed DB snapshot");
+        if let DemoOperation::MergeDbStats { snapshot } = &mut action.operation {
+            snapshot.agents_list.push(private_agent);
+        }
+        action_pack.finalize_digest();
+        assert!(matches!(
+            action_pack.validate(),
+            Err(DemoPackError::UnsafeText { .. })
+        ));
     }
 
     #[test]
@@ -1400,6 +2010,33 @@ mod tests {
             assert!(
                 !matches!(result, Err(DemoPackError::DigestMismatch { .. })),
                 "unknown {label} member reached the typed digest instead of failing at the schema boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_json_keys_fail_before_typed_validation_and_digest_checks() {
+        let pack = curated_public_demo();
+        let json = pack.to_pretty_json().unwrap();
+        let markers = [
+            (
+                "top-level",
+                "\"title\": \"Agent Mail coordination dashboard\"",
+            ),
+            (
+                "nested provenance",
+                "\"source_label\": \"approved aggregate counts projection; all details synthetic\"",
+            ),
+            ("arbitrary params", "\"mode\": \"synthetic_public_replay\""),
+        ];
+
+        for (label, marker) in markers {
+            assert!(json.contains(marker), "missing {label} duplicate marker");
+            let duplicated = json.replacen(marker, &format!("{marker},\n    {marker}"), 1);
+            let result = DemoPack::from_json(&duplicated);
+            assert!(
+                matches!(result, Err(DemoPackError::Json(ref error)) if error.contains("duplicate JSON object key")),
+                "duplicate {label} key was accepted or reached a later validation stage: {result:?}"
             );
         }
     }
@@ -1552,6 +2189,49 @@ mod tests {
             Err(DemoPackError::InvalidHttpStatus { status: 99, .. })
         ));
 
+        for invalid_query_time in [f64::NAN, f64::NEG_INFINITY, -0.01] {
+            let mut invalid_event_float = curated_public_demo();
+            let query_time_ms = invalid_event_float
+                .actions
+                .iter_mut()
+                .find_map(|action| match &mut action.operation {
+                    DemoOperation::PublishEvent {
+                        event: MailEvent::ToolCallEnd { query_time_ms, .. },
+                    } => Some(query_time_ms),
+                    _ => None,
+                })
+                .expect("curated pack should contain a tool-call end");
+            *query_time_ms = invalid_query_time;
+            invalid_event_float.finalize_digest();
+            assert!(matches!(
+                invalid_event_float.validate(),
+                Err(DemoPackError::InvalidEventFloat {
+                    field: "query_time_ms",
+                    ..
+                })
+            ));
+        }
+
+        for invalid_status in [99, 600] {
+            let mut invalid_http_event = curated_public_demo();
+            let status = invalid_http_event
+                .actions
+                .iter_mut()
+                .find_map(|action| match &mut action.operation {
+                    DemoOperation::PublishEvent {
+                        event: MailEvent::HttpRequest { status, .. },
+                    } => Some(status),
+                    _ => None,
+                })
+                .expect("curated pack should contain an HTTP event");
+            *status = invalid_status;
+            invalid_http_event.finalize_digest();
+            assert!(matches!(
+                invalid_http_event.validate(),
+                Err(DemoPackError::InvalidHttpStatus { status, .. }) if status == invalid_status
+            ));
+        }
+
         let mut action_burst = curated_public_demo();
         let repeated = action_burst.actions[0].clone();
         action_burst.actions = vec![repeated; super::MAX_ACTIONS_PER_TIMESTAMP + 1];
@@ -1623,6 +2303,86 @@ mod tests {
     }
 
     #[test]
+    fn semantic_cardinality_limits_fail_closed() {
+        let mut console_pack = curated_public_demo();
+        console_pack.bootstrap.console_lines =
+            vec![String::new(); super::MAX_BOOTSTRAP_CONSOLE_LINES + 1];
+        console_pack.finalize_digest();
+        assert!(matches!(
+            console_pack.validate(),
+            Err(DemoPackError::TooManyItems { ref field, len, max })
+                if field == "bootstrap.console_lines"
+                    && len == super::MAX_BOOTSTRAP_CONSOLE_LINES + 1
+                    && max == super::MAX_BOOTSTRAP_CONSOLE_LINES
+        ));
+
+        let mut recipient_pack = curated_public_demo();
+        let recipients = recipient_pack
+            .actions
+            .iter_mut()
+            .find_map(|action| match &mut action.operation {
+                DemoOperation::PublishEvent {
+                    event: MailEvent::MessageSent { to, .. },
+                } => Some(to),
+                _ => None,
+            })
+            .expect("curated pack should contain a sent message");
+        *recipients = vec!["SyntheticAgent".to_string(); super::MAX_EVENT_RECIPIENTS + 1];
+        recipient_pack.finalize_digest();
+        assert!(matches!(
+            recipient_pack.validate(),
+            Err(DemoPackError::TooManyItems { ref field, len, max })
+                if field.ends_with(".event.to")
+                    && len == super::MAX_EVENT_RECIPIENTS + 1
+                    && max == super::MAX_EVENT_RECIPIENTS
+        ));
+
+        let mut params_pack = curated_public_demo();
+        let params = params_pack
+            .actions
+            .iter_mut()
+            .find_map(|action| match &mut action.operation {
+                DemoOperation::PublishEvent {
+                    event: MailEvent::ToolCallStart { params_json, .. },
+                } => Some(params_json),
+                _ => None,
+            })
+            .expect("curated pack should contain a tool-call start");
+        *params = serde_json::json!(vec![0; super::MAX_EVENT_PARAMS_JSON_NODES]);
+        params_pack.finalize_digest();
+        assert!(matches!(
+            params_pack.validate(),
+            Err(DemoPackError::TooManyItems { ref field, max, .. })
+                if field.ends_with(".event.params_json")
+                    && max == super::MAX_EVENT_PARAMS_JSON_NODES
+        ));
+    }
+
+    #[test]
+    fn json_node_budget_stops_compact_arrays_during_deserialization() {
+        let mut pack = curated_public_demo();
+        let params = pack
+            .actions
+            .iter_mut()
+            .find_map(|action| match &mut action.operation {
+                DemoOperation::PublishEvent {
+                    event: MailEvent::ToolCallStart { params_json, .. },
+                } => Some(params_json),
+                _ => None,
+            })
+            .expect("curated pack should contain a tool-call start");
+        *params = serde_json::json!(vec![0; super::MAX_JSON_NODES]);
+        let json = serde_json::to_string(&pack).expect("oversized semantic fixture serializes");
+        assert!(json.len() < super::MAX_SERIALIZED_PACK_BYTES);
+
+        assert!(
+            matches!(DemoPack::from_json(&json), Err(DemoPackError::Json(ref error))
+                if error.contains("JSON semantic node budget exceeded")),
+            "the semantic budget must reject compact arrays before typed cloning"
+        );
+    }
+
+    #[test]
     fn curated_pack_fits_comfortably_inside_size_budget() {
         let json = curated_public_demo().to_pretty_json().unwrap();
         assert!(
@@ -1646,6 +2406,7 @@ mod tests {
             "a//b",
             "src/",
             "/absolute",
+            "~private/absolute",
             "a\\..\\b",
             "..%2f",
             "%2e%2e/",
