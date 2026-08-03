@@ -225,3 +225,8 @@ windsurf.mcp.json
 .space_probe
 claude-upgrade-progress.json
 agy.mcp.json
+
+# === multi-repo ephemeral cleanup 2026-08-03 ===
+# Agent recovery "misplaced duplicate" backups left beside real sources.
+# Never the source of truth; real fixers live without this suffix.
+*.misplaced-dup-backup-*
