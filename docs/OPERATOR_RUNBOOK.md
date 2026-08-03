@@ -123,7 +123,7 @@ Use the palette (`Ctrl+P` or `:`) for fast, low-friction control:
 
 1. Open palette and type fuzzy text (screen/tool/agent/project/thread/reservation).
 2. Use arrow keys + `Enter` to execute actions.
-3. Prefer palette when direct jump keys are ambiguous (especially screens 11-15).
+3. Prefer palette when direct jump keys are ambiguous (especially screens 11-16).
 4. Use palette for transport/layout/macro actions to keep workflows deterministic.
 
 ### 3.2 Toast Focus Mode
@@ -146,6 +146,7 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 - Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets.
 - Contacts: `n` toggles Table/Graph; `g` toggles Mermaid panel.
 - Reservations: `n` opens create-reservation form.
+- ATC: `d` opens decision detail; `r` opens the retention report.
 
 ## 4. Screens Reference
 
@@ -166,6 +167,7 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 | 13 | Analytics   | Anomaly feed with confidence and remediation links |
 | 14 | Attachments | Attachment inventory, preview, and provenance |
 | 15 | Archive Browser | Two-pane Git archive tree + file content preview |
+| 16 | ATC | Snapshot-driven control surface, decision detail, and retention report |
 
 ### 4.1 Representative Operator Workflows
 

@@ -1052,7 +1052,7 @@ mod tests {
             '/',
         )))));
 
-        assert_eq!(model.public_screen.search_query(), "");
+        assert_eq!(model.public_screen.search_query(), "reservation");
         assert!(
             model
                 .public_screen

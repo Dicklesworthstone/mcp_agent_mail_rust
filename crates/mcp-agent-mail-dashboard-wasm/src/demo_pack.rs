@@ -254,15 +254,31 @@ impl DemoPack {
     }
 
     pub fn to_pretty_json(&self) -> Result<String, DemoPackError> {
-        serde_json::to_string_pretty(self).map_err(|error| DemoPackError::Json(error.to_string()))
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|error| DemoPackError::Json(error.to_string()))?;
+        if json.len() > MAX_SERIALIZED_PACK_BYTES {
+            return Err(DemoPackError::OversizedPack {
+                len: json.len(),
+                max: MAX_SERIALIZED_PACK_BYTES,
+            });
+        }
+        Ok(json)
     }
 
     #[must_use]
     pub fn computed_content_sha256(&self) -> String {
+        self.try_computed_content_sha256()
+            .map(|(digest, _)| digest)
+            .expect("DemoPack's derived Serialize implementations must be infallible")
+    }
+
+    fn try_computed_content_sha256(&self) -> Result<(String, usize), DemoPackError> {
         let mut canonical = self.clone();
         canonical.provenance.content_sha256.clear();
-        let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-        hex::encode(Sha256::digest(bytes))
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|error| DemoPackError::Json(error.to_string()))?;
+        let len = bytes.len();
+        Ok((hex::encode(Sha256::digest(bytes)), len))
     }
 
     pub fn finalize_digest(&mut self) {
@@ -393,7 +409,18 @@ impl DemoPack {
                 digest: digest.clone(),
             });
         }
-        let actual = self.computed_content_sha256();
+        let (actual, canonical_len) = self.try_computed_content_sha256()?;
+        // The canonical digest payload differs from the transmitted compact
+        // JSON only by replacing the empty digest string with the validated
+        // 64-byte lowercase hex digest. Enforce the same byte contract for
+        // in-memory callers as `from_json` does before parsing.
+        let serialized_len = canonical_len.saturating_add(digest.len());
+        if serialized_len > MAX_SERIALIZED_PACK_BYTES {
+            return Err(DemoPackError::OversizedPack {
+                len: serialized_len,
+                max: MAX_SERIALIZED_PACK_BYTES,
+            });
+        }
         if *digest != actual {
             return Err(DemoPackError::DigestMismatch {
                 expected: digest.clone(),
@@ -2287,6 +2314,34 @@ mod tests {
             ),
             "an oversized pack must be rejected by the size gate, not the JSON parser"
         );
+    }
+
+    #[test]
+    fn in_memory_validation_and_pretty_serialization_enforce_pack_byte_ceiling() {
+        let mut pack = curated_public_demo();
+        let text = "z".repeat(super::MAX_TEXT_FIELD_BYTES);
+        pack.actions = (0_u64..2_050)
+            .map(|at_ms| super::DemoAction {
+                at_ms,
+                operation: DemoOperation::ConsoleLine { text: text.clone() },
+            })
+            .collect();
+        pack.duration_ms = 2_050;
+        pack.loop_replay = false;
+        pack.finalize_digest();
+
+        assert!(matches!(
+            pack.validate(),
+            Err(DemoPackError::OversizedPack { len, max })
+                if len > super::MAX_SERIALIZED_PACK_BYTES
+                    && max == super::MAX_SERIALIZED_PACK_BYTES
+        ));
+        assert!(matches!(
+            pack.to_pretty_json(),
+            Err(DemoPackError::OversizedPack { len, max })
+                if len > super::MAX_SERIALIZED_PACK_BYTES
+                    && max == super::MAX_SERIALIZED_PACK_BYTES
+        ));
     }
 
     #[test]

@@ -376,6 +376,15 @@ impl TuiSharedState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Request-counter generation for the current replay epoch, used by
+    /// incremental public projections. Reading the atomic directly avoids
+    /// taking the replay-ring lock a second time after an exact event batch has
+    /// already been cloned; a replay reset also changes the event epoch.
+    #[must_use]
+    pub(crate) fn request_generation(&self) -> u64 {
+        self.request_gen.load(Ordering::Relaxed)
+    }
+
     /// Human-readable transport label used by the shared production chrome.
     #[must_use]
     pub fn transport_mode_label(&self) -> &'static str {
@@ -389,11 +398,10 @@ impl TuiSharedState {
     #[must_use]
     pub fn avg_latency_ms(&self) -> u64 {
         let counters = self.request_counters();
-        if counters.total == 0 {
-            0
-        } else {
-            counters.latency_total_ms / counters.total
-        }
+        counters
+            .latency_total_ms
+            .checked_div(counters.total)
+            .unwrap_or(0)
     }
 
     #[must_use]

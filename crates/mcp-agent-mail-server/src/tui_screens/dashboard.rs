@@ -3012,7 +3012,7 @@ fn render_primary_cluster(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn render_dashboard_query_bar(
     frame: &mut Frame<'_>,
     area: Rect,

@@ -21,6 +21,7 @@ exporter = [
   "dep:clap",
   "dep:same-file",
   "dep:tempfile",
+  "dep:libc",
 ]
 
 [dependencies]
@@ -49,6 +50,9 @@ sqlmodel-sqlite = { version = "=0.3.3", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 same-file = { version = "1", optional = true }
 tempfile = { version = "3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"

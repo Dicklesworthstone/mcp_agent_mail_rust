@@ -38,12 +38,24 @@ of data:
 2. Every identifying detail is curated synthetic material: agent names, project names,
    paths, messages, subjects, thread IDs, programs, models, and replay events.
 
-The exporter never serializes its source path and opens its output with `create_new`, so
-it refuses accidental overwrite. Before writing, the typed pack validator recursively
-checks text and path fields, bounded collections, finite metrics, monotonic actions,
-duration bounds, the privacy-policy marker, and the pack content digest. The website
-then verifies the versioned artifact manifest's byte counts and SHA-256 digests before
-initializing either WASM module.
+The exporter never serializes its source path. It resolves the source and output parent
+directories once, requires distinct physical directories, and keeps using those resolved
+paths so a later working-directory or parent-symlink change cannot redirect either read or
+publication. It copies source database and WAL bytes into a verified owner-only private
+snapshot without opening the source through SQLite; this preserves source contents and its
+directory namespace, although ordinary raw reads may still update access-time metadata or
+trigger filesystem audit events. Output is staged completely in the resolved destination
+directory and published without clobbering an existing leaf. The destination directory must
+be owned by the exporting user and not be group- or world-writable; protecting either
+resolved parent directory from coordinated replacement by the same user or by any actor
+with rename authority over an ancestor remains an operator trust boundary. A failed
+post-publication file or directory sync is reported explicitly: the final path exists, but
+its durability could not be confirmed.
+
+Before publication, the typed pack validator recursively checks text and path fields,
+bounded collections, finite metrics, monotonic actions, duration bounds, the privacy-policy
+marker, and the pack content digest. The website then verifies the versioned artifact
+manifest's byte counts and SHA-256 digests before initializing either WASM module.
 
 Refresh a pack offline with:
 
@@ -60,11 +72,15 @@ cargo run \
   --captured-at "2026-08-02T00:00:00Z"
 ```
 
-The exporter feature is native-only and explicitly enables the shared browser contracts
-whose DTOs the pack serializes; its SQLite, CLI, and filesystem dependencies are excluded
-from the default WASM target graph. The output path must not already exist, and
-`captured_at` must be RFC 3339 / ISO-8601. Before replacing a published pack, run the
-locked default and exporter matrices plus the website artifact digest tests:
+The exporter feature is native Unix-only and explicitly enables the shared browser
+contracts whose DTOs the pack serializes; its SQLite, CLI, and filesystem dependencies are
+excluded from the default WASM target graph. The output path must not already exist,
+`source_revision` must be exactly 40 lowercase hexadecimal characters, and `captured_at`
+must be RFC 3339 / ISO-8601. Its 30-second source I/O check is an elapsed budget between
+filesystem operations, not a killable deadline for a blocked kernel or network-filesystem
+call; use process-level supervision when reading an untrusted mount. Before replacing a
+published pack, run the locked default and exporter matrices plus the website artifact
+digest tests:
 
 ```bash
 cargo test \

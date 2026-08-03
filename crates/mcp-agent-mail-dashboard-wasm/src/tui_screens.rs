@@ -139,6 +139,32 @@ struct PublicRowsCache {
     query: String,
     rows: Vec<String>,
     event_cursor: Option<ReplayEventCursor>,
+    event_projection: EventProjectionCache,
+}
+
+#[derive(Debug, Clone, Default)]
+enum EventProjectionCache {
+    #[default]
+    None,
+    Direct,
+    Threads {
+        positions: BTreeMap<String, usize>,
+        // First-seen replay order is intentional. It keeps incremental inserts
+        // append-only, preserves the user's selection when a lexically earlier
+        // thread arrives, and avoids reformatting/shifting every existing row.
+        summaries: Vec<ThreadProjectionSummary>,
+    },
+    Analytics {
+        counts: BTreeMap<&'static str, usize>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ThreadProjectionSummary {
+    thread: String,
+    subject: String,
+    project: String,
+    count: usize,
 }
 
 impl Default for PublicReplayScreen {
@@ -226,7 +252,7 @@ impl PublicReplayScreen {
     }
 
     fn ensure_rows(&self, screen: MailScreenId, state: &TuiSharedState) {
-        if uses_direct_event_rows(screen) {
+        if uses_incremental_event_projection(screen) {
             let previous_cursor = self
                 .row_cache
                 .borrow()
@@ -242,35 +268,38 @@ impl PublicReplayScreen {
                 DataGeneration {
                     event_epoch: batch.cursor.epoch,
                     event_total_pushed: batch.cursor.total_pushed,
+                    request_gen: if screen == MailScreenId::Analytics {
+                        state.request_generation()
+                    } else {
+                        0
+                    },
                     ..DataGeneration::default()
                 },
             );
 
             if batch.incremental {
-                let normalized_query = (screen == MailScreenId::Search
-                    && !self.search_query.is_empty())
-                .then(|| self.search_query.to_ascii_lowercase());
                 let mut cache = self.row_cache.borrow_mut();
                 let cache = cache
                     .as_mut()
                     .expect("an incremental cursor must belong to a materialized row cache");
-                for event in batch.events {
-                    if event_visible_on(screen, &event) {
-                        let row = public_event_row(&event);
-                        if normalized_query
-                            .as_ref()
-                            .is_none_or(|query| row.to_ascii_lowercase().contains(query))
-                        {
-                            cache.rows.push(row);
-                        }
-                    }
+                let request_projection_changed = screen == MailScreenId::Analytics
+                    && cache.generation.request_gen != generation.request_gen;
+                if batch.events.is_empty() && !request_projection_changed {
+                    // A render/input observation with an unchanged cursor must
+                    // reuse the materialized rows. In particular, Analytics
+                    // formatting allocates a new row vector even for an empty
+                    // event delta unless this no-op is recognized here.
+                    cache.generation = generation;
+                    cache.event_cursor = Some(batch.cursor);
+                    return;
                 }
+                append_event_projection(screen, &self.search_query, batch.events, state, cache);
                 cache.generation = generation;
                 cache.event_cursor = Some(batch.cursor);
                 return;
             }
 
-            let mut rows = public_event_rows_from_events(screen, batch.events);
+            let (mut rows, event_projection) = build_event_projection(screen, batch.events, state);
             filter_search_rows(screen, &self.search_query, &mut rows);
             *self.row_cache.borrow_mut() = Some(PublicRowsCache {
                 screen,
@@ -278,6 +307,7 @@ impl PublicReplayScreen {
                 query: self.search_query.clone(),
                 rows,
                 event_cursor: Some(batch.cursor),
+                event_projection,
             });
             return;
         }
@@ -303,6 +333,7 @@ impl PublicReplayScreen {
             query: self.search_query.clone(),
             rows,
             event_cursor: None,
+            event_projection: EventProjectionCache::None,
         });
     }
 
@@ -370,13 +401,12 @@ impl PublicReplayScreen {
                         if !character.is_control()
                             && !key.modifiers.intersects(
                                 Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
-                            ) =>
+                            )
+                            && self.search_query.chars().count() < 96 =>
                     {
-                        if self.search_query.chars().count() < 96 {
-                            self.search_query.push(character);
-                            self.selected.set(0);
-                            self.scroll.set(0);
-                        }
+                        self.search_query.push(character);
+                        self.selected.set(0);
+                        self.scroll.set(0);
                     }
                     _ => {}
                 }
@@ -701,36 +731,7 @@ const fn browser_projection_description(screen: MailScreenId) -> &'static str {
 fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
     match screen {
         MailScreenId::Messages => public_event_rows(screen, state),
-        MailScreenId::Threads => {
-            let mut threads: BTreeMap<String, (String, String, usize)> = BTreeMap::new();
-            for event in state.replay_events() {
-                let (thread_id, subject, project) = match event {
-                    MailEvent::MessageSent {
-                        thread_id,
-                        subject,
-                        project,
-                        ..
-                    }
-                    | MailEvent::MessageReceived {
-                        thread_id,
-                        subject,
-                        project,
-                        ..
-                    } => (thread_id, subject, project),
-                    _ => continue,
-                };
-                let entry = threads
-                    .entry(thread_id)
-                    .or_insert_with(|| (subject, project, 0));
-                entry.2 = entry.2.saturating_add(1);
-            }
-            threads
-                .into_iter()
-                .map(|(thread, (subject, project, count))| {
-                    format!("◉ {thread:<26} messages:{count:<4} {subject} · {project}")
-                })
-                .collect()
-        }
+        MailScreenId::Threads => build_event_projection(screen, state.replay_events(), state).0,
         MailScreenId::Attachments => vec![
             "No attachment metadata or payload bytes are included in this public replay."
                 .to_string(),
@@ -838,29 +839,7 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
                 )
             })
             .collect(),
-        MailScreenId::Analytics => {
-            let mut counts = BTreeMap::<&'static str, usize>::new();
-            for event in state.replay_events() {
-                if event_visible_on(screen, &event) {
-                    let label = event.kind().compact_label();
-                    *counts.entry(label).or_default() += 1;
-                }
-            }
-            let requests = state.request_counters();
-            let mut rows = counts
-                .into_iter()
-                .map(|(kind, count)| format!("telemetry {:<18} events:{count}", kind))
-                .collect::<Vec<_>>();
-            rows.push(format!(
-                "requests total:{} 2xx:{} 4xx:{} 5xx:{} avg:{}ms",
-                requests.total,
-                requests.status_2xx,
-                requests.status_4xx,
-                requests.status_5xx,
-                state.avg_latency_ms()
-            ));
-            rows
-        }
+        MailScreenId::Analytics => build_event_projection(screen, state.replay_events(), state).0,
         MailScreenId::ToolMetrics
         | MailScreenId::Search
         | MailScreenId::Timeline
@@ -869,15 +848,189 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
     }
 }
 
-const fn uses_direct_event_rows(screen: MailScreenId) -> bool {
+const fn uses_incremental_event_projection(screen: MailScreenId) -> bool {
     matches!(
         screen,
         MailScreenId::Messages
+            | MailScreenId::Threads
             | MailScreenId::ToolMetrics
             | MailScreenId::Search
             | MailScreenId::Timeline
             | MailScreenId::Explorer
+            | MailScreenId::Analytics
     )
+}
+
+fn build_event_projection(
+    screen: MailScreenId,
+    events: Vec<MailEvent>,
+    state: &TuiSharedState,
+) -> (Vec<String>, EventProjectionCache) {
+    match screen {
+        MailScreenId::Threads => {
+            let mut positions = BTreeMap::new();
+            let mut summaries = Vec::new();
+            for event in events {
+                append_thread_projection_event(&event, &mut positions, &mut summaries);
+            }
+            let rows = summaries.iter().map(format_thread_projection).collect();
+            (
+                rows,
+                EventProjectionCache::Threads {
+                    positions,
+                    summaries,
+                },
+            )
+        }
+        MailScreenId::Analytics => {
+            let mut counts = BTreeMap::new();
+            for event in events {
+                append_analytics_projection_event(&event, &mut counts);
+            }
+            let rows = analytics_projection_rows(&counts, state);
+            (rows, EventProjectionCache::Analytics { counts })
+        }
+        _ => (
+            public_event_rows_from_events(screen, events),
+            EventProjectionCache::Direct,
+        ),
+    }
+}
+
+fn append_event_projection(
+    screen: MailScreenId,
+    query: &str,
+    events: Vec<MailEvent>,
+    state: &TuiSharedState,
+    cache: &mut PublicRowsCache,
+) {
+    match &mut cache.event_projection {
+        EventProjectionCache::Direct => {
+            let normalized_query = (screen == MailScreenId::Search && !query.is_empty())
+                .then(|| query.to_ascii_lowercase());
+            for event in events {
+                if event_visible_on(screen, &event) {
+                    let row = public_event_row(&event);
+                    if normalized_query
+                        .as_ref()
+                        .is_none_or(|query| row.to_ascii_lowercase().contains(query))
+                    {
+                        cache.rows.push(row);
+                    }
+                }
+            }
+        }
+        EventProjectionCache::Threads {
+            positions,
+            summaries,
+        } => {
+            for event in events {
+                if let Some(changed_index) =
+                    append_thread_projection_event(&event, positions, summaries)
+                {
+                    let row = format_thread_projection(&summaries[changed_index]);
+                    if changed_index == cache.rows.len() {
+                        cache.rows.push(row);
+                    } else if let Some(existing) = cache.rows.get_mut(changed_index) {
+                        *existing = row;
+                    }
+                }
+            }
+        }
+        EventProjectionCache::Analytics { counts } => {
+            for event in events {
+                append_analytics_projection_event(&event, counts);
+            }
+            cache.rows = analytics_projection_rows(counts, state);
+        }
+        EventProjectionCache::None => {
+            unreachable!("incremental event cache is missing its projection state");
+        }
+    }
+}
+
+fn append_thread_projection_event(
+    event: &MailEvent,
+    positions: &mut BTreeMap<String, usize>,
+    summaries: &mut Vec<ThreadProjectionSummary>,
+) -> Option<usize> {
+    #[cfg(test)]
+    record_public_derived_event_visit();
+
+    let (thread, subject, project) = match event {
+        MailEvent::MessageSent {
+            thread_id,
+            subject,
+            project,
+            ..
+        }
+        | MailEvent::MessageReceived {
+            thread_id,
+            subject,
+            project,
+            ..
+        } => (thread_id, subject, project),
+        _ => return None,
+    };
+    if let Some(index) = positions.get(thread).copied() {
+        summaries[index].count = summaries[index].count.saturating_add(1);
+        return Some(index);
+    }
+
+    let index = summaries.len();
+    positions.insert(thread.clone(), index);
+    summaries.push(ThreadProjectionSummary {
+        thread: thread.clone(),
+        subject: subject.clone(),
+        project: project.clone(),
+        count: 1,
+    });
+    Some(index)
+}
+
+fn format_thread_projection(summary: &ThreadProjectionSummary) -> String {
+    format!(
+        "◉ {:<26} messages:{:<4} {} · {}",
+        summary.thread, summary.count, summary.subject, summary.project
+    )
+}
+
+fn append_analytics_projection_event(
+    event: &MailEvent,
+    counts: &mut BTreeMap<&'static str, usize>,
+) {
+    #[cfg(test)]
+    record_public_derived_event_visit();
+
+    if event_visible_on(MailScreenId::Analytics, event) {
+        let label = event.kind().compact_label();
+        let count = counts.entry(label).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+fn analytics_projection_rows(
+    counts: &BTreeMap<&'static str, usize>,
+    state: &TuiSharedState,
+) -> Vec<String> {
+    let requests = state.request_counters();
+    let avg_latency_ms = requests
+        .latency_total_ms
+        .checked_div(requests.total)
+        .unwrap_or(0);
+    let mut rows = counts
+        .iter()
+        .map(|(kind, count)| format!("telemetry {kind:<18} events:{count}"))
+        .collect::<Vec<_>>();
+    rows.push(format!(
+        "requests total:{} 2xx:{} 4xx:{} 5xx:{} avg:{}ms",
+        requests.total,
+        requests.status_2xx,
+        requests.status_4xx,
+        requests.status_5xx,
+        avg_latency_ms
+    ));
+    rows
 }
 
 fn filter_search_rows(screen: MailScreenId, query: &str, rows: &mut Vec<String>) {
@@ -1008,6 +1161,7 @@ fn public_event_row(event: &MailEvent) -> String {
 #[cfg(test)]
 thread_local! {
     static PUBLIC_EVENT_FORMAT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static PUBLIC_DERIVED_EVENT_VISIT_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1020,14 +1174,31 @@ fn public_event_format_count() -> usize {
     PUBLIC_EVENT_FORMAT_COUNT.with(Cell::get)
 }
 
+#[cfg(test)]
+fn record_public_derived_event_visit() {
+    PUBLIC_DERIVED_EVENT_VISIT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn reset_public_derived_event_visit_count() {
+    PUBLIC_DERIVED_EVENT_VISIT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn public_derived_event_visit_count() -> usize {
+    PUBLIC_DERIVED_EVENT_VISIT_COUNT.with(Cell::get)
+}
+
 #[path = "../../mcp-agent-mail-server/src/tui_screens/dashboard.rs"]
 pub mod dashboard;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MailScreenId, PublicReplayScreen, public_event_format_count, public_rows,
-        public_rows_generation, reset_public_event_format_count, search_input_hit_area,
+        MailScreenId, PublicReplayScreen, public_derived_event_visit_count,
+        public_event_format_count, public_rows, public_rows_generation,
+        reset_public_derived_event_visit_count, reset_public_event_format_count,
+        search_input_hit_area,
     };
     use crate::demo_pack::{DemoOperation, curated_public_demo};
     use crate::state::TuiSharedState;
@@ -1061,6 +1232,22 @@ mod tests {
             status: 200,
             duration_ms: 1,
             client_ip: "synthetic-client".to_string(),
+        }
+    }
+
+    fn public_message(thread: impl Into<String>, subject: impl Into<String>) -> MailEvent {
+        MailEvent::MessageSent {
+            seq: 0,
+            timestamp_micros: 1,
+            source: EventSource::Mail,
+            redacted: true,
+            id: 1,
+            from: "SyntheticSender".to_string(),
+            to: vec!["SyntheticRecipient".to_string()],
+            subject: subject.into(),
+            thread_id: thread.into(),
+            project: "synthetic-project".to_string(),
+            body_md: "synthetic public message".to_string(),
         }
     }
 
@@ -1223,6 +1410,186 @@ mod tests {
             public_event_format_count(),
             90,
             "repeated refreshes must format each retained event once, not rebuild the cumulative history"
+        );
+    }
+
+    #[test]
+    fn derived_event_projections_process_only_new_tail_events() {
+        let state = TuiSharedState::new_with_replay_event_capacity(256);
+        for index in 0..40 {
+            assert!(state.push_event(public_message(
+                format!("thread-{}", index % 4),
+                format!("subject-{index}")
+            )));
+        }
+        let threads = PublicReplayScreen::new();
+
+        reset_public_derived_event_visit_count();
+        threads.ensure_rows(MailScreenId::Threads, &state);
+        assert_eq!(public_derived_event_visit_count(), 40);
+        assert_eq!(cached_rows(&threads).len(), 4);
+
+        for index in 0..50 {
+            assert!(state.push_event(public_message(
+                format!("thread-{}", index % 4),
+                format!("tail-subject-{index}")
+            )));
+            threads.ensure_rows(MailScreenId::Threads, &state);
+        }
+        assert_eq!(
+            public_derived_event_visit_count(),
+            90,
+            "thread aggregation must visit each retained event once, not rescan cumulative history"
+        );
+        assert!(
+            cached_rows(&threads)
+                .iter()
+                .any(|row| row.contains("messages:23"))
+        );
+
+        let analytics = PublicReplayScreen::new();
+        reset_public_derived_event_visit_count();
+        analytics.ensure_rows(MailScreenId::Analytics, &state);
+        assert_eq!(public_derived_event_visit_count(), 90);
+
+        for index in 0..50 {
+            assert!(state.push_event(public_http(format!("/tail/{index}"))));
+            analytics.ensure_rows(MailScreenId::Analytics, &state);
+        }
+        assert_eq!(
+            public_derived_event_visit_count(),
+            140,
+            "analytics aggregation must update from deltas instead of rescanning the ring"
+        );
+        assert!(
+            cached_rows(&analytics)
+                .iter()
+                .any(|row| row.contains("events:50"))
+        );
+    }
+
+    #[test]
+    fn analytics_projection_refreshes_request_row_without_event_rescan() {
+        let state = TuiSharedState::new_with_replay_event_capacity(16);
+        assert!(state.push_event(public_http("/initial")));
+        let analytics = PublicReplayScreen::new();
+        reset_public_derived_event_visit_count();
+        analytics.ensure_rows(MailScreenId::Analytics, &state);
+        assert_eq!(public_derived_event_visit_count(), 1);
+
+        state.record_request(503, 75);
+        analytics.ensure_rows(MailScreenId::Analytics, &state);
+
+        assert_eq!(
+            public_derived_event_visit_count(),
+            1,
+            "request-only updates must not revisit unchanged replay events"
+        );
+        assert!(
+            cached_rows(&analytics)
+                .last()
+                .is_some_and(|row| row.contains("total:1") && row.contains("5xx:1"))
+        );
+    }
+
+    #[test]
+    fn unchanged_analytics_projection_reuses_materialized_rows() {
+        let state = TuiSharedState::new_with_replay_event_capacity(16);
+        assert!(state.push_event(public_http("/initial")));
+        let analytics = PublicReplayScreen::new();
+        analytics.ensure_rows(MailScreenId::Analytics, &state);
+        let initial_rows = analytics
+            .row_cache
+            .borrow()
+            .as_ref()
+            .expect("analytics rows should be cached")
+            .rows
+            .as_ptr();
+
+        analytics.ensure_rows(MailScreenId::Analytics, &state);
+        let observed_rows = analytics
+            .row_cache
+            .borrow()
+            .as_ref()
+            .expect("analytics rows should remain cached")
+            .rows
+            .as_ptr();
+
+        assert_eq!(
+            observed_rows, initial_rows,
+            "an unchanged render must reuse the existing Analytics row allocation"
+        );
+    }
+
+    #[test]
+    fn derived_thread_projection_rebuilds_after_ring_eviction() {
+        let state = TuiSharedState::new_with_replay_event_capacity(4);
+        for index in 0..4 {
+            assert!(state.push_event(public_message(
+                format!("old-{index}"),
+                format!("old-subject-{index}")
+            )));
+        }
+        let threads = PublicReplayScreen::new();
+        threads.ensure_rows(MailScreenId::Threads, &state);
+
+        reset_public_derived_event_visit_count();
+        assert!(state.push_event(public_message("newest", "newest-subject")));
+        threads.ensure_rows(MailScreenId::Threads, &state);
+
+        let rows = cached_rows(&threads);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| !row.contains("old-0")));
+        assert!(rows.iter().any(|row| row.contains("newest")));
+        assert_eq!(
+            public_derived_event_visit_count(),
+            4,
+            "overflow must rebuild from exactly the retained ring"
+        );
+    }
+
+    #[test]
+    fn thread_projection_uses_stable_first_seen_replay_order() {
+        let state = TuiSharedState::new_with_replay_event_capacity(8);
+        assert!(state.push_event(public_message("thread-z", "subject-z")));
+        assert!(state.push_event(public_message("thread-a", "subject-a")));
+        let threads = PublicReplayScreen::new();
+        threads.ensure_rows(MailScreenId::Threads, &state);
+
+        let initial = cached_rows(&threads);
+        assert!(initial[0].contains("thread-z"));
+        assert!(initial[1].contains("thread-a"));
+
+        assert!(state.push_event(public_message("thread-m", "subject-m")));
+        threads.ensure_rows(MailScreenId::Threads, &state);
+        let appended = cached_rows(&threads);
+        assert!(appended[0].contains("thread-z"));
+        assert!(appended[1].contains("thread-a"));
+        assert!(appended[2].contains("thread-m"));
+    }
+
+    #[test]
+    fn derived_thread_projection_rebuilds_after_reset_with_equal_counts() {
+        let state = TuiSharedState::new_with_replay_event_capacity(8);
+        assert!(state.push_event(public_message("old-one", "old-subject-one")));
+        assert!(state.push_event(public_message("old-two", "old-subject-two")));
+        let threads = PublicReplayScreen::new();
+        threads.ensure_rows(MailScreenId::Threads, &state);
+
+        state.reset();
+        assert!(state.push_event(public_message("new-one", "new-subject-one")));
+        assert!(state.push_event(public_message("new-two", "new-subject-two")));
+        reset_public_derived_event_visit_count();
+        threads.ensure_rows(MailScreenId::Threads, &state);
+
+        let rows = cached_rows(&threads);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.contains("new-")));
+        assert!(rows.iter().all(|row| !row.contains("old-")));
+        assert_eq!(
+            public_derived_event_visit_count(),
+            2,
+            "a reset epoch must replace the derived cache even when the event count matches"
         );
     }
 

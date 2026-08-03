@@ -1164,6 +1164,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "js-sys",
+ "libc",
  "pretty_assertions",
  "same-file",
  "serde",
@@ -1870,9 +1871,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-sqlite"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a30deaa6193d2b134df219ef94d26e3566bfd1d61fafe010e833295fe31fb08"
+checksum = "f2b0314bd501b666c79e7f9b9e3a6f94be692593440d139fbd07367ec183d647"
 dependencies = [
  "asupersync",
  "libsqlite3-sys",
