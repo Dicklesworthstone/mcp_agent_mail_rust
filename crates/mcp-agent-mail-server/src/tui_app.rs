@@ -4753,9 +4753,7 @@ impl Model for MailAppModel {
                 // (tab clicks, status line). Checked before global keybindings
                 // so that shell regions consume the event and prevent
                 // accidental forwarding to screens.
-                if let Event::Mouse(ref mouse) = *event
-                    && !text_mode
-                {
+                if let Event::Mouse(ref mouse) = *event {
                     use crate::tui_hit_regions::MouseAction;
                     match self.mouse_dispatcher.dispatch(mouse) {
                         MouseAction::SwitchScreen(id) => {
@@ -9496,6 +9494,53 @@ mod tests {
         });
         model.update(MailMsg::Terminal(click));
         assert!(model.help_visible());
+    }
+
+    #[test]
+    fn shell_tab_click_remains_available_while_search_edits_text() {
+        let mut model = test_model();
+        model.apply_deep_link_with_transition(&DeepLinkTarget::SearchFocused(String::new()));
+        assert!(model.consumes_text_input());
+        model
+            .mouse_dispatcher
+            .update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 39, 80, 1));
+        model
+            .mouse_dispatcher
+            .record_tab_slot(1, MailScreenId::Messages, 10, 20, 0);
+
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: 12,
+            y: 0,
+            modifiers: Modifiers::empty(),
+        });
+        model.update(MailMsg::Terminal(click));
+
+        assert_eq!(model.active_screen(), MailScreenId::Messages);
+    }
+
+    #[test]
+    fn shell_palette_click_remains_available_while_search_edits_text() {
+        let mut model = test_model();
+        model.apply_deep_link_with_transition(&DeepLinkTarget::SearchFocused(String::new()));
+        assert!(model.consumes_text_input());
+        model
+            .mouse_dispatcher
+            .update_chrome_areas(Rect::new(0, 0, 80, 1), Rect::new(0, 39, 80, 1));
+        model.mouse_dispatcher.record_status_slot(
+            crate::tui_hit_regions::StatusHitRole::PaletteToggle,
+            Rect::new(60, 39, 4, 1),
+        );
+
+        let click = Event::Mouse(ftui::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: 61,
+            y: 39,
+            modifiers: Modifiers::empty(),
+        });
+        model.update(MailMsg::Terminal(click));
+
+        assert!(model.command_palette.is_visible());
     }
 
     #[test]

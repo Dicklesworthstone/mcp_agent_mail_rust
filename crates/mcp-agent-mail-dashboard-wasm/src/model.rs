@@ -4,7 +4,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, KeyCode, KeyEventKind, Modifiers, MouseEventKind, Style};
+use ftui::{Event, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, Style};
 use ftui_runtime::program::{Cmd, Model};
 
 use crate::demo_pack::{DemoPack, DemoPackError, curated_public_demo};
@@ -48,6 +48,8 @@ pub struct DashboardModel {
     mouse_dispatcher: MouseDispatcher,
     accessibility: AccessibilitySettings,
     help_visible: bool,
+    help_scroll: u16,
+    last_terminal_area: std::cell::Cell<ftui::layout::Rect>,
     interaction_revision: u64,
     next_action: usize,
     elapsed_ms: u64,
@@ -78,6 +80,8 @@ impl DashboardModel {
             mouse_dispatcher: MouseDispatcher::new(),
             accessibility: AccessibilitySettings::default(),
             help_visible: false,
+            help_scroll: 0,
+            last_terminal_area: std::cell::Cell::new(ftui::layout::Rect::new(0, 0, 0, 0)),
             interaction_revision: 0,
             next_action: 0,
             elapsed_ms: 0,
@@ -107,6 +111,8 @@ impl DashboardModel {
             mouse_dispatcher: MouseDispatcher::new(),
             accessibility: AccessibilitySettings::default(),
             help_visible: false,
+            help_scroll: 0,
+            last_terminal_area: std::cell::Cell::new(ftui::layout::Rect::new(0, 0, 0, 0)),
             interaction_revision: 0,
             next_action: 0,
             elapsed_ms: 0,
@@ -165,6 +171,7 @@ impl DashboardModel {
         }
         let preserved_screen = self.active_screen;
         let preserved_help = self.help_visible;
+        let preserved_help_scroll = self.help_scroll;
         let preserved_deep_link = self.last_deep_link.clone();
         let dashboard_interaction = self.screen.interaction_snapshot();
         self.screen = self.fresh_screen();
@@ -177,10 +184,12 @@ impl DashboardModel {
         if preserve_interaction {
             self.active_screen = preserved_screen;
             self.help_visible = preserved_help;
+            self.help_scroll = preserved_help_scroll;
             self.last_deep_link = preserved_deep_link;
         } else {
             self.active_screen = MailScreenId::Dashboard;
             self.help_visible = false;
+            self.help_scroll = 0;
             self.last_deep_link = None;
             self.interaction_revision = self.interaction_revision.saturating_add(1);
         }
@@ -443,24 +452,59 @@ impl DashboardModel {
     fn handle_shell_input(&mut self, event: &Event) -> bool {
         if self.help_visible {
             match event {
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press
-                        && matches!(
-                            key.code,
-                            KeyCode::Escape | KeyCode::F(1) | KeyCode::Char('?')
-                        ) =>
-                {
-                    self.help_visible = false;
-                    self.interaction_revision = self.interaction_revision.saturating_add(1);
-                    return true;
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Escape | KeyCode::F(1) | KeyCode::Char('?') => {
+                        self.help_visible = false;
+                        self.help_scroll = 0;
+                        self.interaction_revision = self.interaction_revision.saturating_add(1);
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                        self.interaction_revision = self.interaction_revision.saturating_add(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        let previous = self.help_scroll;
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                        if self.help_scroll != previous {
+                            self.interaction_revision =
+                                self.interaction_revision.saturating_add(1);
+                        }
+                    }
+                    _ => {
+                        self.help_visible = false;
+                        self.help_scroll = 0;
+                        self.interaction_revision = self.interaction_revision.saturating_add(1);
+                    }
+                },
+                Event::Mouse(mouse) => {
+                    let overlay = crate::tui_chrome::help_overlay_rect(self.last_terminal_area.get());
+                    let inside = crate::tui_hit_regions::point_in_rect(overlay, mouse.x, mouse.y);
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) if !inside => {
+                            self.help_visible = false;
+                            self.help_scroll = 0;
+                            self.interaction_revision =
+                                self.interaction_revision.saturating_add(1);
+                        }
+                        MouseEventKind::ScrollDown if inside => {
+                            self.help_scroll = self.help_scroll.saturating_add(1);
+                            self.interaction_revision =
+                                self.interaction_revision.saturating_add(1);
+                        }
+                        MouseEventKind::ScrollUp if inside => {
+                            let previous = self.help_scroll;
+                            self.help_scroll = self.help_scroll.saturating_sub(1);
+                            if self.help_scroll != previous {
+                                self.interaction_revision =
+                                    self.interaction_revision.saturating_add(1);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)) => {
-                    self.help_visible = false;
-                    self.interaction_revision = self.interaction_revision.saturating_add(1);
-                    return true;
-                }
-                _ => return true,
+                _ => {}
             }
+            return true;
         }
 
         let text_mode = if self.active_screen == MailScreenId::Dashboard {
@@ -477,6 +521,7 @@ impl DashboardModel {
                 }
                 MouseAction::ToggleHelp => {
                     self.help_visible = true;
+                    self.help_scroll = 0;
                     self.interaction_revision = self.interaction_revision.saturating_add(1);
                     return true;
                 }
@@ -493,7 +538,7 @@ impl DashboardModel {
         {
             let is_ctrl_p = key.modifiers.contains(Modifiers::CTRL)
                 && matches!(key.code, KeyCode::Char('p' | 'P'));
-            if is_ctrl_p {
+            if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
                 if self.active_screen == MailScreenId::Search
                     && self.public_screen.consumes_text_input(MailScreenId::Search)
                 {
@@ -514,17 +559,17 @@ impl DashboardModel {
                 }
                 KeyCode::F(1) => {
                     self.help_visible = true;
+                    self.help_scroll = 0;
                     self.interaction_revision = self.interaction_revision.saturating_add(1);
                     return true;
                 }
                 KeyCode::Char('?') if !text_mode => {
                     self.help_visible = true;
+                    self.help_scroll = 0;
                     self.interaction_revision = self.interaction_revision.saturating_add(1);
                     return true;
                 }
-                KeyCode::Char('/')
-                    if !text_mode && self.active_screen != MailScreenId::Dashboard =>
-                {
+                KeyCode::Char('/') if !text_mode => {
                     if self.active_screen == MailScreenId::Search {
                         if self.public_screen.reactivate_search() {
                             self.interaction_revision = self.interaction_revision.saturating_add(1);
@@ -538,9 +583,7 @@ impl DashboardModel {
                     if !text_mode
                         && !key
                             .modifiers
-                            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-                        && !(self.active_screen == MailScreenId::Dashboard
-                            && matches!(character, '1'..='4')) =>
+                            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER) =>
                 {
                     if let Some(screen) = screen_from_jump_key(character) {
                         self.activate_screen(screen);
@@ -610,6 +653,7 @@ impl Model for DashboardModel {
         // clock immediately before every render.
         self.sync_replay_clock();
         let area = ftui::layout::Rect::new(0, 0, frame.width(), frame.height());
+        self.last_terminal_area.set(area);
         let chrome = crate::tui_chrome::chrome_layout(area);
         crate::tui_chrome::render_tab_bar(
             self.active_screen,
@@ -648,13 +692,14 @@ impl Model for DashboardModel {
         );
 
         if self.help_visible {
-            render_browser_help(self.active_screen, frame, area);
+            render_browser_help(self.active_screen, self.help_scroll, frame, area);
         }
     }
 }
 
 fn render_browser_help(
     screen: MailScreenId,
+    scroll: u16,
     frame: &mut ftui::Frame<'_>,
     area: ftui::layout::Rect,
 ) {
@@ -672,17 +717,21 @@ fn render_browser_help(
     let inner = block.inner(overlay);
     block.render(overlay, frame);
     let text = format!(
-        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click < or > to reveal hidden top tabs\n  Click Dashboard filters, the Search input, or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  1-4 on Dashboard     apply its quick filters\n  / on Dashboard       edit its live filter\n  / elsewhere          open Search\n  Ctrl+P               open Search\n  F1 or ?              toggle this help\n\nThis browser build is read-only. Replay counters start from a read-only Agent Mail SQLite aggregate export and may change as synthetic events run; names, paths, messages, and replay events are synthetic public-demo details.",
+        "{}\n{}\n\nMouse\n  Click a top tab to switch screens\n  Click < or > to reveal hidden top tabs\n  Click Dashboard filters, the Search input, or public replay rows\n  Scroll inside the active panel\n\nKeyboard\n  Tab / Shift+Tab     next / previous screen\n  1-9, 0, ! through ^ direct screen jump\n  /                    open Search\n  Ctrl+P or :          open the browser Search adapter\n  F1 or ?              toggle this help\n\nThis browser build uses the production DashboardScreen and shared chrome inside a read-only, browser-safe replay shell. The native command palette and mutating operator actions are deliberately absent. Replay counters start from a read-only Agent Mail SQLite aggregate export and may change as synthetic events run; names, paths, messages, and replay events are synthetic public-demo details.",
         meta.title, meta.description
     );
     Paragraph::new(text)
+        .scroll((scroll, 0))
         .style(Style::default().fg(palette.help_fg).bg(palette.help_bg))
         .render(inner, frame);
 }
 
 #[cfg(test)]
 mod tests {
-    use ftui::{Event, KeyCode, KeyEvent, Modifiers};
+    use ftui::{
+        Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
+        layout::Rect,
+    };
     use ftui_runtime::program::Model;
 
     use super::{DashboardMessage, DashboardModel};
@@ -846,19 +895,75 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_numeric_shortcuts_reach_native_quick_filters() {
+    fn browser_help_scrolls_and_only_outside_clicks_dismiss_it() {
         let mut model = DashboardModel::new(curated_public_demo());
+        let area = Rect::new(0, 0, 70, 18);
+        model.last_terminal_area.set(area);
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::F(1)))));
+        assert!(model.help_visible());
+        assert_eq!(model.help_scroll, 0);
 
-        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
-            '2',
-        )))));
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Down))));
+        assert_eq!(model.help_scroll, 1);
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Up))));
+        assert_eq!(model.help_scroll, 0);
 
-        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
-        assert_eq!(model.dashboard_filter_slug(), "messages");
+        let overlay = crate::tui_chrome::help_overlay_rect(area);
+        let inside_x = overlay.x.saturating_add(1);
+        let inside_y = overlay.y.saturating_add(1);
+        let _ = model.update(DashboardMessage(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            x: inside_x,
+            y: inside_y,
+            modifiers: Modifiers::empty(),
+        })));
+        assert_eq!(model.help_scroll, 1);
+
+        let _ = model.update(DashboardMessage(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: inside_x,
+            y: inside_y,
+            modifiers: Modifiers::empty(),
+        })));
+        assert!(model.help_visible());
+        assert_eq!(model.help_scroll, 1);
+
+        let _ = model.update(DashboardMessage(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            x: 0,
+            y: 0,
+            modifiers: Modifiers::empty(),
+        })));
+        assert!(!model.help_visible());
+        assert_eq!(model.help_scroll, 0);
     }
 
     #[test]
-    fn dashboard_slash_reaches_its_live_filter() {
+    fn dashboard_numeric_shortcuts_match_native_global_screen_jumps() {
+        for (key, expected_screen) in [
+            ('1', MailScreenId::Dashboard),
+            ('2', MailScreenId::Messages),
+            ('3', MailScreenId::Threads),
+            ('4', MailScreenId::Agents),
+        ] {
+            let mut model = DashboardModel::new(curated_public_demo());
+            let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+                key,
+            )))));
+
+            assert_eq!(model.active_screen(), expected_screen, "jump key {key}");
+            if key == '1' {
+                assert_eq!(
+                    model.dashboard_filter_slug(),
+                    "all",
+                    "the native global jump must not activate a Dashboard quick filter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_slash_matches_native_global_search() {
         let mut model = DashboardModel::new(curated_public_demo());
         let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
             '/',
@@ -867,9 +972,13 @@ mod tests {
             'r',
         )))));
 
-        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
-        assert_eq!(model.screen.interaction_snapshot().query(), "r");
-        assert!(model.screen.consumes_text_input());
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        assert_eq!(model.public_screen.search_query(), "r");
+        assert!(
+            model
+                .public_screen
+                .consumes_text_input(MailScreenId::Search)
+        );
     }
 
     #[test]
@@ -981,9 +1090,8 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_globally_opens_search_without_toggling_dashboard_state() {
+    fn ctrl_p_opens_browser_search_outside_text_entry() {
         let mut model = DashboardModel::new(curated_public_demo());
-        model.screen.set_query_interaction("active query", true);
         let interaction_before = model.screen.interaction_snapshot();
 
         let ctrl_p = KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL);
@@ -997,6 +1105,43 @@ mod tests {
                 .consumes_text_input(MailScreenId::Search)
         );
         assert_eq!(model.screen.interaction_snapshot(), interaction_before);
+    }
+
+    #[test]
+    fn ctrl_p_does_not_escape_dashboard_text_entry() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        model.screen.set_query_interaction("active query", true);
+        let interaction_before = model.screen.interaction_snapshot();
+
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p')).with_modifiers(Modifiers::CTRL);
+        let _ = model.update(DashboardMessage(Event::Key(ctrl_p)));
+
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert_eq!(model.screen.interaction_snapshot(), interaction_before);
+    }
+
+    #[test]
+    fn colon_remains_literal_inside_dashboard_text_entry() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        model.screen.set_query_interaction("active query", true);
+
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            ':',
+        )))));
+
+        assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        assert_eq!(model.screen.interaction_snapshot().query(), "active query:");
+    }
+
+    #[test]
+    fn colon_opens_the_browser_search_adapter() {
+        let mut model = DashboardModel::new(curated_public_demo());
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
+            ':',
+        )))));
+
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        assert_eq!(model.last_deep_link(), Some("search:"));
     }
 
     #[test]

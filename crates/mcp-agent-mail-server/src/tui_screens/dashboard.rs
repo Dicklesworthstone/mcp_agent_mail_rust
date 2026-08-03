@@ -197,10 +197,10 @@ impl DashboardQuickFilter {
 
     const fn key(self) -> &'static str {
         match self {
-            Self::All => "1",
-            Self::Messages => "2",
-            Self::Tools => "3",
-            Self::Reservations => "4",
+            Self::All => "A",
+            Self::Messages => "M",
+            Self::Tools => "O",
+            Self::Reservations => "R",
         }
     }
 
@@ -1451,10 +1451,12 @@ impl MailScreen for DashboardScreen {
                     KeyCode::Char('t') => {
                         self.cycle_quick_filter();
                     }
-                    KeyCode::Char('1') => self.apply_quick_filter(DashboardQuickFilter::All),
-                    KeyCode::Char('2') => self.apply_quick_filter(DashboardQuickFilter::Messages),
-                    KeyCode::Char('3') => self.apply_quick_filter(DashboardQuickFilter::Tools),
-                    KeyCode::Char('4') => {
+                    KeyCode::Char('A') => self.apply_quick_filter(DashboardQuickFilter::All),
+                    KeyCode::Char('M') => {
+                        self.apply_quick_filter(DashboardQuickFilter::Messages);
+                    }
+                    KeyCode::Char('O') => self.apply_quick_filter(DashboardQuickFilter::Tools),
+                    KeyCode::Char('R') => {
                         self.apply_quick_filter(DashboardQuickFilter::Reservations);
                     }
                     _ => {}
@@ -1820,8 +1822,8 @@ impl MailScreen for DashboardScreen {
                 action: "Search (if query) or timeline event",
             },
             HelpEntry {
-                key: "/",
-                action: "Focus live dashboard search",
+                key: "Click",
+                action: "Edit live filter / choose quick filter",
             },
             HelpEntry {
                 key: "Esc",
@@ -1840,7 +1842,7 @@ impl MailScreen for DashboardScreen {
                 action: "Cycle quick filter",
             },
             HelpEntry {
-                key: "1-4",
+                key: "A/M/O/R",
                 action: "Set filter (All/Msg/Tools/Resv)",
             },
             HelpEntry {
@@ -3072,7 +3074,7 @@ fn render_dashboard_query_bar(
     let title = if query_active {
         "Live Filter [EDITING]"
     } else {
-        "Live Filter [/ to edit]"
+        "Live Filter [click to edit]"
     };
     let border = if query_active {
         Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
@@ -5501,7 +5503,7 @@ fn render_query_matches_panel(
         lines.push(Line::from_spans([
             Span::styled("Hint: ", crate::tui_theme::text_meta(&tp)),
             Span::styled(
-                "press / then type",
+                "click Live Filter, then type",
                 Style::default().fg(tp.text_primary).bold(),
             ),
         ]));
@@ -6144,7 +6146,7 @@ fn render_event_log(
         let guidance = if quick_filter == DashboardQuickFilter::All {
             "Waiting for HTTP/tool/message traffic and health pulses."
         } else {
-            "Press 1 for All, or use / to broaden the live filter."
+            "Press A for All, or click Live Filter to broaden results."
         };
         let controls = "Enter opens Timeline/Search context when results are available.";
         let lines = vec![
@@ -6287,12 +6289,12 @@ fn render_quick_filter_controls(
 }
 
 /// Pre-computed total char width of quick-filter control labels (avoids 4× format!
-/// allocations per frame). Labels: " [1:All] ", " [2:Msg] ", " [3:Tools] ", " [4:Resv] ".
+/// allocations per frame). Labels: " [A:All] ", " [M:Msg] ", " [O:Tools] ", " [R:Resv] ".
 const QUICK_FILTER_CONTROL_WIDTHS: [u16; 4] = [
-    " [1:All] ".len() as u16,
-    " [2:Msg] ".len() as u16,
-    " [3:Tools] ".len() as u16,
-    " [4:Resv] ".len() as u16,
+    " [A:All] ".len() as u16,
+    " [M:Msg] ".len() as u16,
+    " [O:Tools] ".len() as u16,
+    " [R:Resv] ".len() as u16,
 ];
 
 fn quick_filter_controls_height(width: u16, available_height: u16) -> u16 {
@@ -7811,7 +7813,7 @@ mod tests {
         screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
         let text = frame_text(&frame);
         assert!(text.contains("No events match current filter."));
-        assert!(text.contains("Press 1 for All"));
+        assert!(text.contains("Press A for All"));
     }
 
     #[test]
@@ -8825,19 +8827,19 @@ mod tests {
         let state = TuiSharedState::new(&config);
         let mut screen = DashboardScreen::new();
 
-        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('2'))), &state);
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('M'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Messages);
         assert_eq!(screen.active_filter_slug(), "messages");
         assert!(screen.type_filter.contains(&MailEventKind::MessageSent));
         assert!(screen.type_filter.contains(&MailEventKind::MessageReceived));
 
-        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('3'))), &state);
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('O'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Tools);
         assert_eq!(screen.active_filter_slug(), "tools");
         assert!(screen.type_filter.contains(&MailEventKind::ToolCallStart));
         assert!(screen.type_filter.contains(&MailEventKind::ToolCallEnd));
 
-        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('4'))), &state);
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('R'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::Reservations);
         assert_eq!(screen.active_filter_slug(), "reservations");
         assert!(
@@ -8851,7 +8853,7 @@ mod tests {
                 .contains(&MailEventKind::ReservationReleased)
         );
 
-        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('1'))), &state);
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('A'))), &state);
         assert_eq!(screen.quick_filter, DashboardQuickFilter::All);
         assert_eq!(screen.active_filter_slug(), "all");
         assert!(screen.type_filter.is_empty());
@@ -9637,7 +9639,7 @@ mod tests {
     #[test]
     fn quick_filter_controls_total_chars_matches_label_sum() {
         let expected =
-            " [1:All] ".len() + " [2:Msg] ".len() + " [3:Tools] ".len() + " [4:Resv] ".len();
+            " [A:All] ".len() + " [M:Msg] ".len() + " [O:Tools] ".len() + " [R:Resv] ".len();
         let total: usize = QUICK_FILTER_CONTROL_WIDTHS
             .iter()
             .map(|width| usize::from(*width))

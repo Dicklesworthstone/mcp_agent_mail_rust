@@ -525,8 +525,8 @@ mod tests {
         let _ = runner.step();
         runner.advance_time_ms(15_000.0);
         let after = runner.status();
-        assert_eq!(after.active_screen, "dashboard");
-        assert_eq!(after.dashboard_filter, "messages");
+        assert_eq!(after.active_screen, "messages");
+        assert_eq!(after.dashboard_filter, "all");
         assert!(after.interaction_revision > before.interaction_revision);
         assert!(after.reduced_motion);
         assert!(after.paused);
