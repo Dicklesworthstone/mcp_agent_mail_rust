@@ -830,6 +830,14 @@ pub fn dispatch_root_message(
     match dispatch_result {
         Ok(msg_id) => {
             commit_sync_write_tx(conn)?;
+            // GH#227: every delivery path must invalidate the process-wide
+            // search cache once the message row is committed. This sync path
+            // is the TUI compose dispatch, which runs inside the server
+            // process — without this, cached pre-delivery result sets keep
+            // serving false-negatives for the full cache TTL.
+            crate::search_service::invalidate_search_cache(
+                crate::search_cache::InvalidationTrigger::IndexUpdate,
+            );
             Ok(msg_id)
         }
         Err(err) => {
@@ -1111,6 +1119,33 @@ mod tests {
             .unwrap();
         let row = rows.into_iter().next().expect("agent should exist");
         assert_eq!(row.get_named::<String>("program").unwrap(), "tui-overseer");
+    }
+
+    /// GH#227: the TUI compose dispatch runs inside the server process and
+    /// must invalidate the process-wide search cache after committing, like
+    /// every other delivery path — otherwise cached pre-delivery result sets
+    /// keep answering identical queries with false-negatives for the TTL.
+    #[test]
+    fn gh227_dispatch_root_message_invalidates_search_cache() {
+        let conn = test_conn();
+        let _pid = insert_project(&conn);
+
+        let epoch_before = crate::search_service::global_search_cache_epoch_for_tests();
+        let msg_id = dispatch_root_message(
+            &conn,
+            "ComposeAgent",
+            "Cache invalidation test",
+            "Body",
+            "normal",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(msg_id > 0);
+        assert!(
+            crate::search_service::global_search_cache_epoch_for_tests() > epoch_before,
+            "TUI-composed message must bump the search cache epoch (GH#227)"
+        );
     }
 
     #[test]

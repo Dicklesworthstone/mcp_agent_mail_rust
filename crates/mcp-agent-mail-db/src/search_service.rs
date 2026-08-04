@@ -165,6 +165,13 @@ pub fn invalidate_search_cache(trigger: InvalidationTrigger) {
     }
 }
 
+/// Test-only: current epoch of the (force-initialized) global search cache,
+/// so sibling modules can assert that a delivery path bumped it (GH#227).
+#[cfg(test)]
+pub(crate) fn global_search_cache_epoch_for_tests() -> u64 {
+    global_search_cache().current_epoch()
+}
+
 /// Get search cache metrics snapshot (for diagnostics).
 #[must_use]
 pub fn search_cache_metrics() -> crate::search_cache::CacheMetrics {
