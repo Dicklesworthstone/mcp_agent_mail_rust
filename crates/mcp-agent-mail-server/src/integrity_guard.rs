@@ -272,10 +272,8 @@ fn run_quick_cycle(
             // (ownership, cooldown, write idleness) still applies inside,
             // so under sustained write load this stays a cheap no-op and
             // converges the first time the process goes write-quiet.
-            match mcp_agent_mail_db::pool::retry_archive_drift_reconcile(
-                sqlite_path,
-                storage_root,
-            ) {
+            match mcp_agent_mail_db::pool::retry_archive_drift_reconcile(sqlite_path, storage_root)
+            {
                 Ok(true) => tracing::info!(
                     "integrity guard: reconciled archive-ahead drift during quick cycle"
                 ),

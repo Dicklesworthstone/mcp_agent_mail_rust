@@ -4601,7 +4601,9 @@ fn reconcile_archive_state_before_init(
         let identity = normalize_sqlite_identity_path(&primary_path.to_string_lossy());
         let promotion_age = crate::write_barrier::time_since_last_promotion(primary_path)
             .into_iter()
-            .chain(crate::write_barrier::time_since_last_promotion(Path::new(&identity)))
+            .chain(crate::write_barrier::time_since_last_promotion(Path::new(
+                &identity,
+            )))
             .min();
         if let Some(age) = promotion_age
             && age < cooldown
@@ -8059,9 +8061,10 @@ where
     // out from under an in-process write. Reconstruction paths already hold
     // the barrier (this acquisition passes through); backup/snapshot restore
     // callers get their own bounded drain here.
-    let (_promotion_barrier, drain_outcome) = crate::write_barrier::acquire_promotion_barrier_draining(
-        crate::write_barrier::writer_drain_timeout(),
-    );
+    let (_promotion_barrier, drain_outcome) =
+        crate::write_barrier::acquire_promotion_barrier_draining(
+            crate::write_barrier::writer_drain_timeout(),
+        );
     if let crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain_outcome {
         tracing::warn!(
             primary = %primary_path.display(),
@@ -8615,9 +8618,10 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     // acquisition passes through. On timeout we proceed anyway — a write
     // racing an unhealthy database is already doomed, and refusing recovery
     // indefinitely is worse than a bounded stall.
-    let (_promotion_barrier, drain_outcome) = crate::write_barrier::acquire_promotion_barrier_draining(
-        crate::write_barrier::writer_drain_timeout(),
-    );
+    let (_promotion_barrier, drain_outcome) =
+        crate::write_barrier::acquire_promotion_barrier_draining(
+            crate::write_barrier::writer_drain_timeout(),
+        );
     if let crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain_outcome {
         tracing::warn!(
             path = %primary_path.display(),
@@ -9151,9 +9155,10 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     // unit under the promotion barrier so no in-process write can straddle
     // any of its file swaps. Nested acquisitions inside promote/reconstruct
     // helpers pass through.
-    let (_promotion_barrier, drain_outcome) = crate::write_barrier::acquire_promotion_barrier_draining(
-        crate::write_barrier::writer_drain_timeout(),
-    );
+    let (_promotion_barrier, drain_outcome) =
+        crate::write_barrier::acquire_promotion_barrier_draining(
+            crate::write_barrier::writer_drain_timeout(),
+        );
     if let crate::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain_outcome {
         tracing::warn!(
             path = %primary_path.display(),

@@ -52118,7 +52118,9 @@ startup_timeout_sec = 42
         let wal_path = db_path.with_extension("sqlite3-wal");
 
         let db_before = std::fs::read(&db_path).expect("read db bytes");
-        let wal_before = wal_path.exists().then(|| std::fs::read(&wal_path).expect("read wal"));
+        let wal_before = wal_path
+            .exists()
+            .then(|| std::fs::read(&wal_path).expect("read wal"));
 
         let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
         let result =
@@ -56184,8 +56186,9 @@ startup_timeout_sec = 42
             other => panic!("unexpected command: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["am", "agents", "show", "/home/me/projects/foo", "BlueLake"])
-            .expect("project+agent positional pair must parse for agents show");
+        let cli =
+            Cli::try_parse_from(["am", "agents", "show", "/home/me/projects/foo", "BlueLake"])
+                .expect("project+agent positional pair must parse for agents show");
         match cli.command.expect("expected command") {
             Commands::Agents {
                 action:
@@ -69451,12 +69454,11 @@ fn handle_doctor_repair_with_options(
         let probe_dir = tempfile::Builder::new()
             .prefix("am-doctor-repair-dryrun-")
             .tempdir()
-            .map_err(|e| {
-                CliError::Other(format!("cannot create dry-run probe directory: {e}"))
-            })?;
-        let file_name = reconstruct_db_path
-            .file_name()
-            .map_or_else(|| std::ffi::OsString::from("storage.sqlite3"), std::ffi::OsStr::to_os_string);
+            .map_err(|e| CliError::Other(format!("cannot create dry-run probe directory: {e}")))?;
+        let file_name = reconstruct_db_path.file_name().map_or_else(
+            || std::ffi::OsString::from("storage.sqlite3"),
+            std::ffi::OsStr::to_os_string,
+        );
         let probe_db_path = probe_dir.path().join(&file_name);
         std::fs::copy(&reconstruct_db_path, &probe_db_path).map_err(|e| {
             CliError::Other(format!(
@@ -73168,9 +73170,8 @@ mod blocking_http_chunk_tests {
     #[test]
     fn fatal_write_error_is_fatal() {
         let mut w = ScriptedWriter::new(vec![Err(ErrorKind::BrokenPipe)]);
-        let err =
-            super::write_blocking_http_all(&mut w, b"data", "http://x/mcp/", far_deadline())
-                .expect_err("broken pipe must be fatal");
+        let err = super::write_blocking_http_all(&mut w, b"data", "http://x/mcp/", far_deadline())
+            .expect_err("broken pipe must be fatal");
         assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
     }
 

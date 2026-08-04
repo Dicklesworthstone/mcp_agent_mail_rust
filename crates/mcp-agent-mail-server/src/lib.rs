@@ -2752,7 +2752,9 @@ static LAST_OBSERVABILITY_SNAPSHOT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, Ins
 
 fn observability_snapshot_failed_recently(storage_root: &Path) -> bool {
     let map = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .get(storage_root)
         .is_some_and(|at| at.elapsed() < OBSERVABILITY_SNAPSHOT_FAILURE_BACKOFF)
@@ -2760,13 +2762,17 @@ fn observability_snapshot_failed_recently(storage_root: &Path) -> bool {
 
 fn note_observability_snapshot_failure(storage_root: &Path) {
     let map = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.insert(storage_root.to_path_buf(), Instant::now());
 }
 
 fn clear_observability_snapshot_failure(storage_root: &Path) {
     if let Some(map) = LAST_OBSERVABILITY_SNAPSHOT_FAILURES.get() {
-        let mut guard = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(storage_root);
     }
 }
@@ -6980,8 +6986,8 @@ fn ensure_atc_executor_identity(
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime.block_on(async {
-        let pool = mcp_agent_mail_tools::tool_util::get_db_pool()
-            .map_err(|error| error.to_string())?;
+        let pool =
+            mcp_agent_mail_tools::tool_util::get_db_pool().map_err(|error| error.to_string())?;
         let project = mcp_agent_mail_tools::tool_util::resolve_project(&ctx, &pool, project_key)
             .await
             .map_err(|error| error.to_string())?;
@@ -11656,9 +11662,9 @@ to skip auth for local requests.</p>
         match request.method.as_str() {
             "initialize" => {
                 let params: fastmcp_protocol::InitializeParams = parse_params(request.params)?;
-                let out = self
-                    .router
-                    .handle_initialize(&request_ctx, &mut session, params, None)?;
+                let out =
+                    self.router
+                        .handle_initialize(&request_ctx, &mut session, params, None)?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "initialized" | "notifications/cancelled" | "logging/setLevel" => {
@@ -11667,9 +11673,9 @@ to skip auth for local requests.</p>
             "tools/list" => {
                 let params: fastmcp_protocol::ListToolsParams =
                     parse_params_or_default(request.params)?;
-                let out = self
-                    .router
-                    .handle_tools_list(&request_ctx, params, Some(session.state()))?;
+                let out =
+                    self.router
+                        .handle_tools_list(&request_ctx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -11913,9 +11919,11 @@ to skip auth for local requests.</p>
             "resources/list" => {
                 let params: fastmcp_protocol::ListResourcesParams =
                     parse_params_or_default(request.params)?;
-                let out = self
-                    .router
-                    .handle_resources_list(&request_ctx, params, Some(session.state()))?;
+                let out = self.router.handle_resources_list(
+                    &request_ctx,
+                    params,
+                    Some(session.state()),
+                )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "resources/templates/list" => {
@@ -11951,9 +11959,9 @@ to skip auth for local requests.</p>
             "prompts/list" => {
                 let params: fastmcp_protocol::ListPromptsParams =
                     parse_params_or_default(request.params)?;
-                let out = self
-                    .router
-                    .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
+                let out =
+                    self.router
+                        .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
@@ -33018,9 +33026,11 @@ mod atc_identity_tests {
             "AirTrafficControl must not validate as adjective+noun; if it ever does, \
              revisit the reserved-name exemption"
         );
-        assert!(mcp_agent_mail_core::models::is_reserved_operator_agent_name(
-            crate::atc::ATC_AGENT_NAME
-        ));
+        assert!(
+            mcp_agent_mail_core::models::is_reserved_operator_agent_name(
+                crate::atc::ATC_AGENT_NAME
+            )
+        );
     }
 
     #[test]
@@ -33064,7 +33074,15 @@ mod atc_identity_tests {
         // permanently failing.
         let target = match block_on(async {
             queries::register_agent(
-                &cx, &pool, project_id, "CloudyElk", "test", "test", None, None, None,
+                &cx,
+                &pool,
+                project_id,
+                "CloudyElk",
+                "test",
+                "test",
+                None,
+                None,
+                None,
             )
             .await
         }) {

@@ -176,11 +176,14 @@ pub fn begin_write_activity() -> WriteActivityGuard {
                 .wait_timeout(state, WRITER_WAIT_WARN_INTERVAL)
                 .unwrap_or_else(PoisonError::into_inner);
             state = next;
-            if state.promotion_active && !warned && wait_started.elapsed() >= WRITER_WAIT_WARN_INTERVAL
+            if state.promotion_active
+                && !warned
+                && wait_started.elapsed() >= WRITER_WAIT_WARN_INTERVAL
             {
                 warned = true;
                 tracing::warn!(
-                    waited_ms = u64::try_from(wait_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    waited_ms =
+                        u64::try_from(wait_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "write path is waiting on an in-progress database recovery promotion"
                 );
             }
@@ -429,8 +432,8 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // The barrier is process-global, so these tests serialize on a local
     // mutex to avoid cross-test interference within this module.
@@ -504,10 +507,14 @@ mod tests {
         while !writer_started.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        let (barrier, outcome) =
-            acquire_promotion_barrier_draining(Duration::from_millis(50));
+        let (barrier, outcome) = acquire_promotion_barrier_draining(Duration::from_millis(50));
         assert!(
-            matches!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 }),
+            matches!(
+                outcome,
+                DrainOutcome::TimedOut {
+                    remaining_writers: 1
+                }
+            ),
             "expected timeout with one straggler, got {outcome:?}"
         );
         drop(barrier);

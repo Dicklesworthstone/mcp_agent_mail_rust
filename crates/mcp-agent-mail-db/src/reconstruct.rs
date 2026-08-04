@@ -4537,8 +4537,7 @@ fn merge_salvaged_database(
                     // (the canonical archive copy, when one exists, is
                     // already in the candidate; the salvage source itself is
                     // preserved via quarantine/forensics).
-                    let Some(target_project_id) =
-                        project_id_map.get(&source_project_id).copied()
+                    let Some(target_project_id) = project_id_map.get(&source_project_id).copied()
                     else {
                         stats.push_warning(format!(
                             "skipped salvaged message {source_message_id}: project id {source_project_id} is absent from the salvage source"
@@ -4759,8 +4758,7 @@ fn merge_salvaged_database(
                     // state. A dangling agent or message reference is a
                     // cross-generation artifact; losing one recipient's read
                     // state is trivial next to refusing the whole recovery.
-                    let Some(target_agent_id) = agent_id_map.get(&source_agent_id).copied()
-                    else {
+                    let Some(target_agent_id) = agent_id_map.get(&source_agent_id).copied() else {
                         stats.push_warning(format!(
                             "skipped salvaged recipient state for message {source_message_id}: agent id {source_agent_id} is absent from the salvage source"
                         ));
@@ -4773,8 +4771,7 @@ fn merge_salvaged_database(
                             "reconstruct salvage: mapped target agent {target_agent_id} is missing"
                         ))
                     })?;
-                    let Some(target_message_id) =
-                        message_id_map.get(&source_message_id).copied()
+                    let Some(target_message_id) = message_id_map.get(&source_message_id).copied()
                     else {
                         stats.push_warning(format!(
                             "skipped salvaged recipient state: message id {source_message_id} was not carried into the candidate"
@@ -6636,7 +6633,11 @@ body
                 &[],
             )
             .unwrap();
-        assert_eq!(rows.len(), 1, "message 42 must be carried into the candidate");
+        assert_eq!(
+            rows.len(),
+            1,
+            "message 42 must be carried into the candidate"
+        );
         assert_eq!(
             rows[0].get_named::<String>("name").unwrap(),
             "unknown-agent-1240"

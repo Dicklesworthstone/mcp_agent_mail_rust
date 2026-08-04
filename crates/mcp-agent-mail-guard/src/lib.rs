@@ -4580,7 +4580,10 @@ mod tests {
         let repo_dir = td.path().join("repo");
         std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
         run_git(&repo_dir, &["init", "-q"]);
-        run_git(&repo_dir, &["config", "--local", "core.hooksPath", ".husky"]);
+        run_git(
+            &repo_dir,
+            &["config", "--local", "core.hooksPath", ".husky"],
+        );
 
         let hooks = resolve_install_hooks_dir(&repo_dir).expect("resolve install hooks dir");
         assert_eq!(hooks, repo_dir.join(".husky"));
@@ -4611,7 +4614,10 @@ mod tests {
         assert!(!hookspath_level_refuses_install(ConfigLevel::Global, true));
         // Repo-scoped levels are always honored.
         assert!(!hookspath_level_refuses_install(ConfigLevel::Local, false));
-        assert!(!hookspath_level_refuses_install(ConfigLevel::Worktree, false));
+        assert!(!hookspath_level_refuses_install(
+            ConfigLevel::Worktree,
+            false
+        ));
         assert!(!hookspath_level_refuses_install(ConfigLevel::App, false));
     }
 }
