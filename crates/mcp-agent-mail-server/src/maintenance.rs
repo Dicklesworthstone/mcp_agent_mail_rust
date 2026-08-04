@@ -443,47 +443,6 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn maintenance_command(git_dir: &Path, work_tree: &Path) -> Command {
-    let mut command = Command::new("nice");
-    command.args([
-        "-n",
-        "19",
-        "ionice",
-        "-c",
-        "3",
-        "git",
-        "--git-dir",
-        &git_dir.display().to_string(),
-        "--work-tree",
-        &work_tree.display().to_string(),
-        "maintenance",
-        "run",
-        "--task=loose-objects",
-        "--task=incremental-repack",
-    ]);
-    command
-}
-
-#[cfg(not(target_os = "linux"))]
-fn maintenance_command(git_dir: &Path, work_tree: &Path) -> Command {
-    let mut command = Command::new("nice");
-    command.args([
-        "-n",
-        "19",
-        "git",
-        "--git-dir",
-        &git_dir.display().to_string(),
-        "--work-tree",
-        &work_tree.display().to_string(),
-        "maintenance",
-        "run",
-        "--task=loose-objects",
-        "--task=incremental-repack",
-    ]);
-    command
-}
-
 fn log_report(report: &MaintenanceReport, git_dir: &Path) {
     if report.success {
         let removed = report

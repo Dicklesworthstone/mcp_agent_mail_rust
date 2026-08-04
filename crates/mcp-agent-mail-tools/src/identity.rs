@@ -1348,8 +1348,7 @@ Check that all parameters have valid values."
     }
 
     let base_config = Config::get();
-    let config = maybe_reroute_ephemeral_storage(&base_config, &human_key)
-        .map_or(base_config, |rerouted| rerouted);
+    let config = maybe_reroute_ephemeral_storage(&base_config, &human_key).unwrap_or(base_config);
     let config = &config;
     let pool = get_db_pool()?;
 

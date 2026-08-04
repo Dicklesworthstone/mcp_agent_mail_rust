@@ -329,10 +329,10 @@ impl Connection for TrackedConnection<'_> {
         self.inner.ping(cx)
     }
 
-    async fn close(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
+    fn close(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
         // TrackedConnection borrows the underlying connection; closing is a
         // no-op because we don't own the connection.
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -1452,8 +1452,7 @@ fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
 /// for all deployments.
 static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     let enabled = std::env::var("FSQLITE_CONCURRENT_MODE")
-        .ok()
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
     if enabled {
         tracing::warn!(
             "FSQLITE_CONCURRENT_MODE=true: BEGIN CONCURRENT is enabled. \

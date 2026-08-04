@@ -23190,18 +23190,6 @@ fn beads_issue_awareness_counts_from(
     Ok((ready, open, in_progress))
 }
 
-fn beads_issue_awareness_count(
-    conn: &mcp_agent_mail_db::CanonicalDbConn,
-    sql: &str,
-) -> Result<usize, String> {
-    let rows = conn.query_sync(sql, &[]).map_err(|e| e.to_string())?;
-    let count: i64 = rows
-        .first()
-        .and_then(|row| row.get_named("cnt").ok())
-        .unwrap_or(0);
-    usize::try_from(count).map_err(|_| format!("negative beads count returned: {count}"))
-}
-
 fn beads_issue_awareness_counts() -> Result<(usize, usize, usize), String> {
     beads_issue_awareness_counts_from(None)
 }

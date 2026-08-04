@@ -174,7 +174,7 @@ fn compat_server_advertises_resources_capability() {
 fn compat_minimum_tool_count() {
     let server = mcp_agent_mail_server::build_server(&Config::default());
     let router = server.into_router();
-    let cx = asupersync::Cx::for_testing();
+    let cx = fastmcp_core::McpContext::new(asupersync::Cx::for_testing(), 1);
     let params = fastmcp_protocol::ListToolsParams::default();
     let result = router
         .handle_tools_list(&cx, params, None)
@@ -192,7 +192,7 @@ fn compat_minimum_tool_count() {
 fn compat_core_tools_present() {
     let server = mcp_agent_mail_server::build_server(&Config::default());
     let router = server.into_router();
-    let cx = asupersync::Cx::for_testing();
+    let cx = fastmcp_core::McpContext::new(asupersync::Cx::for_testing(), 1);
     let params = fastmcp_protocol::ListToolsParams::default();
     let result = router
         .handle_tools_list(&cx, params, None)
@@ -420,7 +420,7 @@ fn compat_rbac_writer_roles_vocabulary() {
 fn compat_initialize_returns_server_info() {
     let server = mcp_agent_mail_server::build_server(&Config::default());
     let router = std::sync::Arc::new(server.into_router());
-    let cx = asupersync::Cx::for_testing();
+    let cx = fastmcp_core::McpContext::new(asupersync::Cx::for_testing(), 1);
     let info = fastmcp_protocol::ServerInfo {
         name: "mcp-agent-mail".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -459,7 +459,7 @@ fn compat_initialize_returns_server_info() {
 fn compat_initialize_protocol_version() {
     let server = mcp_agent_mail_server::build_server(&Config::default());
     let router = std::sync::Arc::new(server.into_router());
-    let cx = asupersync::Cx::for_testing();
+    let cx = fastmcp_core::McpContext::new(asupersync::Cx::for_testing(), 1);
     let info = fastmcp_protocol::ServerInfo {
         name: "mcp-agent-mail".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

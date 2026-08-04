@@ -331,11 +331,8 @@ pub(crate) fn query_params_explain_empty_state(query_params: &str) -> bool {
             | "agent" | "agent_name" | "sender" | "recipient" | "importance" | "ack" | "status" => {
                 !matches!(value_lc.as_str(), "all" | "any" | "none" | "*" | "false")
             }
-            "page" => value_lc.parse::<u64>().ok().is_some_and(|page| page > 1),
-            "offset" => value_lc
-                .parse::<u64>()
-                .ok()
-                .is_some_and(|offset| offset > 0),
+            "page" => value_lc.parse::<u64>().is_ok_and(|page| page > 1),
+            "offset" => value_lc.parse::<u64>().is_ok_and(|offset| offset > 0),
             _ => false,
         }
     })

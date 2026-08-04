@@ -322,8 +322,7 @@ use crate::sqlmodel::Value;
 /// limitation (GH#65).
 static SYNC_CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     let enabled = std::env::var("FSQLITE_CONCURRENT_MODE")
-        .ok()
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
     if enabled {
         tracing::warn!(
             "FSQLITE_CONCURRENT_MODE=true (search_recipes): BEGIN CONCURRENT enabled \

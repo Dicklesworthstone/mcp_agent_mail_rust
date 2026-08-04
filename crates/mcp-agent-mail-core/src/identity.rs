@@ -337,7 +337,7 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
     None
 }
 
-fn looks_like_windows_drive_path(value: &str) -> bool {
+const fn looks_like_windows_drive_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()

@@ -3549,7 +3549,7 @@ fn edge_case_release_reservations_idempotency() {
 }
 
 /// Helper: pick a valid noun based on index to avoid name collisions in tests.
-fn noun_for(idx: u64) -> &'static str {
+const fn noun_for(idx: u64) -> &'static str {
     const NOUNS: &[&str] = &[
         "Lake", "Peak", "Stone", "Creek", "Pond", "Grove", "Ridge", "Brook", "Cliff", "Glen",
         "Hill", "Cove", "Marsh", "Castle", "River", "Forest", "Valley", "Canyon", "Meadow",

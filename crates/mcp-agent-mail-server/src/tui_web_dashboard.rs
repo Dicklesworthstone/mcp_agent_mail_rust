@@ -575,8 +575,7 @@ fn cell_attrs_raw(attrs: &ftui::render::cell::CellAttrs) -> u32 {
 /// Encode bytes into base64, appending directly to the output string.
 /// No padding, no allocation beyond the string growth.
 fn base64_encode_into(input: &[u8], out: &mut String) {
-    let chunks = input.chunks_exact(3);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = input.as_chunks::<3>();
     for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(B64[((n >> 18) & 0x3F) as usize] as char);

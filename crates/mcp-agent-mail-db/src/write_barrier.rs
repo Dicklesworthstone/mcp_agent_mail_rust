@@ -555,15 +555,23 @@ mod tests {
         );
         let b = barrier();
         {
-            let state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let promotion_active = b
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .promotion_active;
             assert!(
-                state.promotion_active,
+                promotion_active,
                 "inner passthrough drop must not release the outer barrier"
             );
         }
         drop(outer);
-        let state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
-        assert!(!state.promotion_active, "outer drop must release");
+        let promotion_active = b
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .promotion_active;
+        assert!(!promotion_active, "outer drop must release");
     }
 
     #[test]

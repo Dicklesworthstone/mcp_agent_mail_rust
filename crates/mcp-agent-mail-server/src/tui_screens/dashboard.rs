@@ -148,6 +148,7 @@ enum DashboardQuickFilter {
 /// Data-derived caches and snapshots are deliberately excluded: the replay
 /// rebuilds those from the verified pack, then re-applies only operator state.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent operator toggles, not a state machine
 pub struct DashboardInteractionSnapshot {
     query: String,
     query_active: bool,

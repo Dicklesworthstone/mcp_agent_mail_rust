@@ -4569,31 +4569,30 @@ fn merge_salvaged_database(
                     // must not wedge the recovery. Substitute a placeholder
                     // agent in the target project, mirroring the #113
                     // "unknown-agent" doctrine for orphaned recipients.
-                    let target_sender_id = match agent_id_map.get(&source_sender_id).copied() {
-                        Some(mapped) => {
-                            if agent_project_id(&target_conn, mapped)? != Some(target_project_id) {
-                                stats.push_warning(format!(
-                                    "skipped salvaged message {source_message_id}: sender {source_sender_id} maps outside project {source_project_id} (cross-generation artifact); the canonical archive copy is authoritative"
-                                ));
-                                stats.salvaged_rows_skipped_unmapped += 1;
-                                continue;
-                            }
-                            mapped
-                        }
-                        None => {
-                            let placeholder_name = format!("unknown-agent-{source_sender_id}");
-                            let placeholder_id = ensure_agent_exists(
-                                &target_conn,
-                                target_project_id,
-                                &placeholder_name,
-                                &mut placeholder_sender_memo,
-                            )?;
+                    let target_sender_id = if let Some(mapped) =
+                        agent_id_map.get(&source_sender_id).copied()
+                    {
+                        if agent_project_id(&target_conn, mapped)? != Some(target_project_id) {
                             stats.push_warning(format!(
+                                "skipped salvaged message {source_message_id}: sender {source_sender_id} maps outside project {source_project_id} (cross-generation artifact); the canonical archive copy is authoritative"
+                            ));
+                            stats.salvaged_rows_skipped_unmapped += 1;
+                            continue;
+                        }
+                        mapped
+                    } else {
+                        let placeholder_name = format!("unknown-agent-{source_sender_id}");
+                        let placeholder_id = ensure_agent_exists(
+                            &target_conn,
+                            target_project_id,
+                            &placeholder_name,
+                            &mut placeholder_sender_memo,
+                        )?;
+                        stats.push_warning(format!(
                                 "salvaged message {source_message_id} sender id {source_sender_id} is absent from the salvage source; substituted placeholder agent '{placeholder_name}'"
                             ));
-                            stats.salvaged_placeholder_senders += 1;
-                            placeholder_id
-                        }
+                        stats.salvaged_placeholder_senders += 1;
+                        placeholder_id
                     };
 
                     let thread_id = row

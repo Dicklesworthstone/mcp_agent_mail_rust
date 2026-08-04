@@ -3036,8 +3036,7 @@ fn diagnostics_worker_loop(
 fn diagnostics_screen_recently_visible(last_visible_at: &Mutex<Instant>, now: Instant) -> bool {
     last_visible_at
         .lock()
-        .ok()
-        .is_some_and(|last| now.duration_since(*last) <= DIAG_ACTIVE_GRACE)
+        .is_ok_and(|last| now.duration_since(*last) <= DIAG_ACTIVE_GRACE)
 }
 
 fn emit_screen_diagnostic(state: &TuiSharedState, snap: &DiagnosticsSnapshot) {

@@ -402,8 +402,7 @@ fn decode_metric_row(row: &mcp_agent_mail_db::sqlmodel_core::Row) -> Option<Pers
     let p99_ms = row.get_named::<f64>("latency_p99_ms").ok().unwrap_or(0.0);
     let is_slow = row
         .get_named::<i64>("latency_is_slow")
-        .ok()
-        .is_some_and(|v| v != 0);
+        .is_ok_and(|v| v != 0);
 
     Some(PersistedToolMetric {
         tool_name,

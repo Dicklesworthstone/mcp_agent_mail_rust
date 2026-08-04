@@ -2491,8 +2491,7 @@ fn debug_row_shape(context: &str, row: &Row) {
 
 fn has_file_reservations_released_ts_column(conn: &DbConn) -> bool {
     conn.query_sync("PRAGMA table_info(file_reservations)", &[])
-        .ok()
-        .is_some_and(|rows| {
+        .is_ok_and(|rows| {
             rows.iter()
                 .any(|row| row.get_named::<String>("name").ok().as_deref() == Some("released_ts"))
         })
@@ -2506,8 +2505,7 @@ fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
          LIMIT 1",
         &[],
     )
-    .ok()
-    .is_some_and(|rows| !rows.is_empty())
+    .is_ok_and(|rows| !rows.is_empty())
 }
 
 fn active_reservation_release_join_sql(

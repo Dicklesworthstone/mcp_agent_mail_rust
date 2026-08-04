@@ -1,5 +1,5 @@
 use arbitrary::{Arbitrary, Unstructured};
-use fastmcp::{Budget, CallToolParams, Content, Cx};
+use fastmcp::{CallToolParams, Content, Cx, McpContext};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{FileReservationPaths, SearchMessages, SendMessage};
@@ -285,16 +285,8 @@ fn assert_tool_input_decode_no_panic(
                 meta: None,
             };
             let result = catch_unwind(AssertUnwindSafe(|| {
-                router.handle_tools_call(
-                    &Cx::for_testing(),
-                    1,
-                    params,
-                    &Budget::INFINITE,
-                    SessionState::new(),
-                    None,
-                    None,
-                    None,
-                )
+                let request_ctx = McpContext::new(Cx::for_testing(), 1);
+                router.handle_tools_call(&request_ctx, params, SessionState::new(), None, None)
             }));
 
             let result = result.map_err(|payload| {

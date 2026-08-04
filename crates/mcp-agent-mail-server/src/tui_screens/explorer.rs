@@ -905,10 +905,7 @@ impl MailExplorerScreen {
                             project_slug: read_project_slug(&row, "project_slug", "raw_project_id"),
                             path_pattern: row.get_named("path_pattern").unwrap_or_default(),
                             ttl_remaining_minutes: remaining_micros / 60_000_000,
-                            exclusive: row
-                                .get_named::<i64>("exclusive")
-                                .ok()
-                                .is_some_and(|v| v != 0),
+                            exclusive: row.get_named::<i64>("exclusive").is_ok_and(|v| v != 0),
                         })
                     })
                     .collect()

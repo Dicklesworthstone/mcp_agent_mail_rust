@@ -172,7 +172,7 @@ fn is_unc_verbatim_question_mark(bytes: &[u8], idx: usize) -> bool {
 
 /// Return `true` if `path` is shaped like `/<drive>:[/\\]...` (Windows drive
 /// letter with a stray leading `/` from URL syntax).
-fn is_url_drive_letter_prefix(path: &str) -> bool {
+const fn is_url_drive_letter_prefix(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 4
         && bytes[0] == b'/'
@@ -302,16 +302,17 @@ pub fn sqlite_url_from_path(path: &Path) -> String {
 pub fn simplify_verbatim_path(path: &Path) -> PathBuf {
     const CLASSIC_MAX_PATH: usize = 260;
     let raw = path.to_string_lossy();
-    let simplified: Option<String> = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
-        Some(format!(r"\\{rest}"))
-    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
-        // Only the disk form (`C:\...`) is safe to simplify.
-        let bytes = rest.as_bytes();
-        (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-            .then(|| rest.to_string())
-    } else {
-        None
-    };
+    let simplified: Option<String> = raw.strip_prefix(r"\\?\UNC\").map_or_else(
+        || {
+            raw.strip_prefix(r"\\?\").and_then(|rest| {
+                // Only the disk form (`C:\...`) is safe to simplify.
+                let bytes = rest.as_bytes();
+                (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+                    .then(|| rest.to_string())
+            })
+        },
+        |rest| Some(format!(r"\\{rest}")),
+    );
     match simplified {
         Some(s)
             if s.len() < CLASSIC_MAX_PATH

@@ -1262,7 +1262,9 @@ fn run_mcp_session(project_key: &str) -> Result<Vec<Value>, String> {
         rt.block_on(async {
             let cx =
                 Cx::current().ok_or_else(|| "runtime did not install an ambient Cx".to_string())?;
-            server.run_transport_returning_with_cx(&cx, transport);
+            server
+                .run_transport_returning_with_cx(&cx, transport)
+                .map_err(|e| format!("mcp session transport failed: {e}"))?;
             Ok(())
         })
     });
