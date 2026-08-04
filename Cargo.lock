@@ -2007,6 +2007,7 @@ dependencies = [
  "frankensearch-fusion",
  "frankensearch-index",
  "frankensearch-lexical",
+ "frankensearch-quill",
  "frankensearch-rerank",
  "tracing",
 ]
@@ -2051,6 +2052,7 @@ dependencies = [
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-index",
+ "frankensearch-quill",
  "frankensearch-rerank",
  "rayon",
  "serde",
@@ -2092,6 +2094,28 @@ dependencies = [
  "serde_json",
  "tantivy",
  "tracing",
+]
+
+[[package]]
+name = "frankensearch-quill"
+version = "0.2.1"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "asupersync",
+ "bytemuck",
+ "compact_str",
+ "crc32fast",
+ "frankensearch-core",
+ "frankensearch-index",
+ "rayon",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "wide 1.6.0",
+ "xxhash-rust",
 ]
 
 [[package]]
