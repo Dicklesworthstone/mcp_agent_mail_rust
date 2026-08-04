@@ -2037,9 +2037,36 @@ impl DbPoolConfig {
 
     #[must_use]
     pub fn resolved_storage_root(&self) -> PathBuf {
-        self.storage_root
-            .clone()
-            .unwrap_or_else(|| mcp_agent_mail_core::Config::from_env().storage_root)
+        if let Some(root) = self.storage_root.clone() {
+            return root;
+        }
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        // GH#222 split-brain guard: a pool whose SQLite file lives in an
+        // ephemeral location (tempdir/CI/test harness) must never default its
+        // storage root to the operator's production mail archive. Tests that
+        // isolate only `database_url` used to leak archive artifacts
+        // (project dirs, agent profiles, messages) into
+        // `~/.mcp_agent_mail_git_mailbox_repo/projects/`, which later tripped
+        // the startup drift check and forced full reconstructs. Derive an
+        // isolated ephemeral root from the DB file's directory instead —
+        // the same classification/policy used for ephemeral project roots
+        // (explicit STORAGE_ROOT still wins inside
+        // `compute_ephemeral_storage_root` via the default-root check).
+        if let Ok(sqlite_path) = self.sqlite_path()
+            && sqlite_path != ":memory:"
+            && let Some(db_dir) = Path::new(&sqlite_path).parent()
+            && !db_dir.as_os_str().is_empty()
+            && let Some(isolated) =
+                mcp_agent_mail_core::compute_ephemeral_storage_root(db_dir, &core_config)
+        {
+            tracing::info!(
+                sqlite_path = %sqlite_path,
+                isolated_root = %isolated.display(),
+                "DbPoolConfig: ephemeral database path — rerouting default storage root to isolated ephemeral root (GH#222)",
+            );
+            return isolated;
+        }
+        core_config.storage_root
     }
 
     fn core_config_for_ephemeral_reroute(&self) -> mcp_agent_mail_core::Config {
@@ -17862,6 +17889,42 @@ mod tests {
         // Both should agree: custom storage root prevents reroute.
         assert!(would.is_none());
         assert_eq!(cloned.storage_root, Some(custom));
+    }
+
+    /// GH#222: a config that isolates only `database_url` to a tempdir (the
+    /// classic test-fixture shape) must NOT resolve its storage root to the
+    /// operator's production archive — archive writes would pollute
+    /// `~/.mcp_agent_mail_git_mailbox_repo/projects/` and later force a full
+    /// reconstruct at server startup.
+    #[test]
+    fn resolved_storage_root_reroutes_ephemeral_database_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("db.sqlite3");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..DbPoolConfig::default()
+        };
+        let resolved = config.resolved_storage_root();
+        assert_ne!(
+            resolved,
+            mcp_agent_mail_core::config::default_storage_root_path(),
+            "tempdir DB must never default to the production storage root"
+        );
+        assert!(!resolved.as_os_str().is_empty());
+    }
+
+    /// Complement: an explicit storage root always wins, even for a tempdir DB.
+    #[test]
+    fn resolved_storage_root_explicit_root_wins_over_ephemeral_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("db.sqlite3");
+        let custom = PathBuf::from("/opt/custom-mail-storage");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(custom.clone()),
+            ..DbPoolConfig::default()
+        };
+        assert_eq!(config.resolved_storage_root(), custom);
     }
 
     // ── Canary namespace tests (br-97gc6.5.2.6.5.4) ───────────────────

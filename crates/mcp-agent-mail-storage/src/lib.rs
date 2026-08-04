@@ -5706,7 +5706,11 @@ fn canonicalize_path_cached(path: &Path) -> std::io::Result<PathBuf> {
         }
     }
 
-    let canonical = path.canonicalize()?;
+    // GH#216: simplify Windows extended-length (`\\?\`) canonical results —
+    // libgit2 mishandles the verbatim form, and mixing verbatim/legacy forms
+    // breaks prefix comparisons against Config's simplified storage root.
+    let canonical =
+        mcp_agent_mail_core::disk::simplify_verbatim_path(&path.canonicalize()?);
     if canonical != path {
         return Ok(canonical);
     }

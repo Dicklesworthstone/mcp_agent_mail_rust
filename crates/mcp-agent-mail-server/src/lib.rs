@@ -11175,6 +11175,24 @@ to skip auth for local requests.</p>
 
         // Always release the refresh lock.
         self.jwks_refreshing.store(false, Ordering::Release);
+
+        // GH#221 stale-on-error: a failed refresh must serve the stale cached
+        // key set (when one exists) rather than surfacing `Err`. Returning
+        // `Err` here both failed the caller AND — because the refresh lock was
+        // just released — let the next stale reader win the CAS and mount its
+        // own fetch, cascading refresh attempts against a slow/limited JWKS
+        // endpoint (the stampede the stale-while-revalidate path exists to
+        // prevent). A `force` refresh still reports failure honestly.
+        if result.is_err() && !force {
+            let cached = self
+                .jwks_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(entry) = cached {
+                return Ok(entry.jwks);
+            }
+        }
         result
     }
 

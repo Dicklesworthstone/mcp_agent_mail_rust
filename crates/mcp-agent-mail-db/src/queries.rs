@@ -22163,6 +22163,103 @@ mod tests {
     }
 
     #[test]
+    fn gh213_register_agent_index_table_parity_on_fresh_db() {
+        // GH#213 repro attempt: on a fresh database, 7 acknowledged
+        // `register_agent` writes must leave the agents table and every agents
+        // index in exact agreement, and `PRAGMA integrity_check` must be ok.
+        // (The report observed index/table desync within seconds on Linux.)
+        use asupersync::runtime::RuntimeBuilder;
+
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("gh213_parity.db");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 2,
+            max_connections: 4,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        let project = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            || {
+                rt.block_on(async {
+                    ensure_project(&cx, &pool, dir.path().to_string_lossy().as_ref()).await
+                })
+            },
+        )
+        .into_result()
+        .expect("ensure project");
+        let project_id = project.id.expect("project id");
+
+        let names = [
+            "BlueLake",
+            "RedFox",
+            "GreenCastle",
+            "PurpleBear",
+            "AmberHawk",
+            "SilverOtter",
+            "CopperWolf",
+        ];
+        for name in names {
+            let agent = rt
+                .block_on(register_agent(
+                    &cx, &pool, project_id, name, "test", "test", None, None, None,
+                ))
+                .into_result()
+                .unwrap_or_else(|e| panic!("register_agent({name}) failed: {e}"));
+            assert!(agent.id.is_some(), "acknowledged write must have an id");
+        }
+
+        // External-style parity probes on a fresh connection.
+        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open probe");
+        let empty: [crate::sqlmodel_core::Value; 0] = [];
+        let table_count: i64 = conn
+            .query_sync("SELECT count(*) AS c FROM agents", &empty)
+            .expect("table count")[0]
+            .get_named("c")
+            .expect("decode");
+        assert_eq!(table_count, 7, "acknowledged rows must all be present");
+
+        for index in [
+            "idx_agents_project_name",
+            "idx_agents_last_active_id_desc",
+            "idx_agents_project_name_nocase",
+        ] {
+            let sql = format!("SELECT count(*) AS c FROM agents INDEXED BY {index}");
+            match conn.query_sync(&sql, &empty) {
+                Ok(rows) => {
+                    let index_count: i64 = rows[0].get_named("c").expect("decode");
+                    assert_eq!(
+                        index_count, table_count,
+                        "index {index} disagrees with the agents table (GH#213 desync)"
+                    );
+                }
+                Err(error) => panic!("forced-index count via {index} failed: {error}"),
+            }
+        }
+
+        let integrity = conn
+            .query_sync("PRAGMA integrity_check", &empty)
+            .expect("integrity_check");
+        let verdicts: Vec<String> = integrity
+            .iter()
+            .filter_map(|row| row.get_as::<String>(0).ok())
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec!["ok".to_string()],
+            "fresh DB must pass integrity_check after 7 registrations"
+        );
+    }
+
+    #[test]
     fn insert_system_agent_reselects_existing_name_case_insensitively() {
         use asupersync::runtime::RuntimeBuilder;
 

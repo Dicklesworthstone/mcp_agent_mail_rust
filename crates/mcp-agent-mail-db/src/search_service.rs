@@ -4719,6 +4719,33 @@ mod tests {
 
     static SEARCH_BOOTSTRAP_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    /// GH#227: message ingestion must invalidate the process-wide search
+    /// cache even when the lexical bridge is uninitialized or bound to a
+    /// different database — otherwise cached pre-delivery result sets keep
+    /// serving confident false-negatives until the TTL expires.
+    #[test]
+    fn gh227_index_message_invalidates_search_cache_without_bridge() {
+        let cache = global_search_cache();
+        let epoch_before = cache.current_epoch();
+        let msg = crate::search_v3::IndexableMessage {
+            id: 733,
+            project_id: 1,
+            project_slug: "fleet".to_string(),
+            sender_name: "BlueLake".to_string(),
+            subject: "decision relay".to_string(),
+            body_md: "asyncEligible flag flipped".to_string(),
+            thread_id: None,
+            importance: "normal".to_string(),
+            created_ts: 1,
+        };
+        let result = crate::search_v3::index_message(&msg);
+        assert!(result.is_ok(), "index_message must not fail the send path");
+        assert!(
+            cache.current_epoch() > epoch_before,
+            "ingestion must bump the search cache epoch regardless of bridge state"
+        );
+    }
+
     fn reset_lexical_bootstrap_tracking() {
         lexical_bootstrap_state()
             .lock()

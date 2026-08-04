@@ -1049,25 +1049,35 @@ fn with_tantivy_writer<T>(
 /// This is intentionally fire-and-forget safe: callers should not fail the
 /// message send operation if indexing fails.
 pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
+    // GH#227: a newly ingested message must ALWAYS invalidate the process-wide
+    // search cache — even when the lexical bridge is uninitialized, bound to a
+    // different database, or the Tantivy write fails. Invalidating only on
+    // successful indexing let cached pre-delivery result sets keep answering
+    // identical queries (for up to the cache TTL) with confident
+    // false-negatives that omitted delivered messages.
+    let invalidate = || {
+        crate::search_service::invalidate_search_cache(
+            crate::search_cache::InvalidationTrigger::IndexUpdate,
+        );
+    };
+
     let Some(bridge) = get_bridge() else {
-        return Ok(false); // bridge not initialized, skip silently
+        invalidate();
+        return Ok(false); // bridge not initialized, skip lexical indexing
     };
 
     let handles = bridge.handles();
-    with_tantivy_writer(bridge.index(), |writer| {
+    let write_result = with_tantivy_writer(bridge.index(), |writer| {
         upsert_indexable_message(writer, handles, msg)?;
         writer
             .commit()
             .map_err(|e| format!("Tantivy commit error: {e}"))?;
         Ok(())
-    })?;
+    });
+    invalidate();
+    write_result?;
 
     refresh_index_health_metrics(&bridge);
-
-    // Invalidate search cache so new messages appear immediately.
-    crate::search_service::invalidate_search_cache(
-        crate::search_cache::InvalidationTrigger::IndexUpdate,
-    );
 
     Ok(true)
 }
@@ -1081,12 +1091,20 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
         return Ok(0);
     }
 
+    // GH#227: always invalidate on ingestion (see `index_message`).
+    let invalidate = || {
+        crate::search_service::invalidate_search_cache(
+            crate::search_cache::InvalidationTrigger::IndexUpdate,
+        );
+    };
+
     let Some(bridge) = get_bridge() else {
+        invalidate();
         return Ok(0);
     };
 
     let handles = bridge.handles();
-    with_tantivy_writer(bridge.index(), |writer| {
+    let write_result = with_tantivy_writer(bridge.index(), |writer| {
         for msg in messages {
             upsert_indexable_message(writer, handles, msg)?;
         }
@@ -1094,13 +1112,11 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
             .commit()
             .map_err(|e| format!("Tantivy commit error: {e}"))?;
         Ok(())
-    })?;
+    });
+    invalidate();
+    write_result?;
 
     refresh_index_health_metrics(&bridge);
-
-    crate::search_service::invalidate_search_cache(
-        crate::search_cache::InvalidationTrigger::IndexUpdate,
-    );
 
     Ok(messages.len())
 }

@@ -7396,24 +7396,48 @@ fn summarize_archive_db_parity_probe(
     match crate::collect_doctor_db_inventory(conn) {
         Ok(db) => {
             if let Some(detail) = crate::doctor_archive_db_drift_detail(archive, &db) {
-                return HealthProbeAssessment {
-                    probe: HealthProbe {
-                        name: "archive_db_parity".into(),
-                        status: "fail".into(),
-                        latency_ms: 0.0,
-                        detail: format!(
-                            "{detail}; archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={}){}",
-                            archive.projects,
-                            archive.agents,
-                            archive.messages,
-                            db.counts.projects,
-                            db.counts.agents,
-                            db.counts.messages,
-                            crate::doctor_archive_inventory_suffix(archive)
-                        ),
-                    },
-                    unhealthy: true,
-                    degraded: false,
+                // GH#217: only the data-loss drift class (archive messages or
+                // message ids ahead of the DB) is a real incident. Metadata-only
+                // surplus (extra archive project/agent directories) is the same
+                // hygiene-debt class `am doctor archive-verify` reports as
+                // warning with zero immediate actions — escalating it to
+                // unhealthy/error permanently contradicts the tools this
+                // surface tells operators to run next.
+                let data_loss = crate::doctor_archive_db_drift_is_data_loss_class(archive, &db);
+                let full_detail = format!(
+                    "{detail}; archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={}){}",
+                    archive.projects,
+                    archive.agents,
+                    archive.messages,
+                    db.counts.projects,
+                    db.counts.agents,
+                    db.counts.messages,
+                    crate::doctor_archive_inventory_suffix(archive)
+                );
+                return if data_loss {
+                    HealthProbeAssessment {
+                        probe: HealthProbe {
+                            name: "archive_db_parity".into(),
+                            status: "fail".into(),
+                            latency_ms: 0.0,
+                            detail: full_detail,
+                        },
+                        unhealthy: true,
+                        degraded: false,
+                    }
+                } else {
+                    HealthProbeAssessment {
+                        probe: HealthProbe {
+                            name: "archive_db_parity".into(),
+                            status: "warn".into(),
+                            latency_ms: 0.0,
+                            detail: format!(
+                                "{full_detail}; hygiene debt (no message data at risk) — run `am doctor archive-verify --json` for details"
+                            ),
+                        },
+                        unhealthy: false,
+                        degraded: true,
+                    }
                 };
             }
 
@@ -23845,6 +23869,63 @@ mod tests {
 
         let assessment = summarize_archive_db_parity_probe(Some(&conn), &storage_root);
         assert_ne!(assessment.probe.status, "fail");
+    }
+
+    /// GH#217: metadata-only archive surplus (extra project directories with
+    /// no message drift) is hygiene debt and must classify as degraded/warn,
+    /// never unhealthy/fail.
+    #[test]
+    fn robot_health_archive_parity_hygiene_debt_is_degraded_not_unhealthy() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_hygiene_debt.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        crate::handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open local sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at)
+             VALUES ('demo-project', '/data/projects/demo-project', 0)",
+            &empty,
+        )
+        .expect("insert project");
+
+        // Archive: the registered project PLUS a junk/stale project directory
+        // that has no DB counterpart (the GH#222 test-pollution shape). No
+        // messages exist anywhere, so no message data is at risk.
+        let storage_root = temp_dir.path().join("storage");
+        for (slug, human_key) in [
+            ("demo-project", "/data/projects/demo-project"),
+            ("stale-junk-project", "/tmp/stale-junk-project"),
+        ] {
+            let project_dir = storage_root.join("projects").join(slug);
+            let agents_dir = project_dir.join("agents");
+            std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+            std::fs::write(
+                project_dir.join("project.json"),
+                format!(r#"{{"slug":"{slug}","human_key":"{human_key}"}}"#),
+            )
+            .expect("write project metadata");
+        }
+
+        let assessment = summarize_archive_db_parity_probe(Some(&conn), &storage_root);
+        assert_eq!(
+            assessment.probe.status, "warn",
+            "hygiene-debt drift must be warn, got: {}",
+            assessment.probe.detail
+        );
+        assert!(
+            !assessment.unhealthy,
+            "hygiene-debt drift must not be unhealthy: {}",
+            assessment.probe.detail
+        );
+        assert!(assessment.degraded);
+        assert!(
+            assessment.probe.detail.contains("hygiene debt"),
+            "detail should name the hygiene class: {}",
+            assessment.probe.detail
+        );
     }
 
     #[test]

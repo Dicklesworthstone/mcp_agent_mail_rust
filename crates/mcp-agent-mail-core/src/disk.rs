@@ -285,6 +285,46 @@ pub fn sqlite_url_from_path(path: &Path) -> String {
     format!("sqlite:///{cleaned}")
 }
 
+/// Simplify a Windows extended-length ("verbatim") path back to its legacy
+/// form when it is safe to do so (GH#216).
+///
+/// `fs::canonicalize` on Windows returns `\\?\C:\...` (or `\\?\UNC\srv\share`)
+/// paths. Many downstream consumers — libgit2 most prominently — mishandle the
+/// verbatim form (`I/O error: Incorrect function. (os error 1)`), which broke
+/// every git-archive write-back on Windows storage roots. Stripping is skipped
+/// when the simplified form would not round-trip safely: overall length at or
+/// beyond the classic `MAX_PATH` limit, or components with trailing
+/// dots/spaces (which only the verbatim form preserves).
+///
+/// On non-Windows paths (no verbatim prefix) this is a no-op, so the logic is
+/// exercised by cross-platform tests without `cfg!(windows)` gating.
+#[must_use]
+pub fn simplify_verbatim_path(path: &Path) -> PathBuf {
+    const CLASSIC_MAX_PATH: usize = 260;
+    let raw = path.to_string_lossy();
+    let simplified: Option<String> = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        // Only the disk form (`C:\...`) is safe to simplify.
+        let bytes = rest.as_bytes();
+        (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+            .then(|| rest.to_string())
+    } else {
+        None
+    };
+    match simplified {
+        Some(s)
+            if s.len() < CLASSIC_MAX_PATH
+                && !s
+                    .split('\\')
+                    .any(|component| component.ends_with('.') || component.ends_with(' ')) =>
+        {
+            PathBuf::from(s)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Return the sibling `SQLite` sidecar path for a `database` file.
 #[must_use]
 pub fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -727,6 +767,42 @@ mod tests {
         assert_eq!(
             sqlite_path_component(r"sqlite:///\\?\C:\Users\me\db.sqlite3?mode=ro"),
             Some(r"/\\?\C:\Users\me\db.sqlite3")
+        );
+    }
+
+    /// GH#216: verbatim (`\\?\`) storage roots must simplify to the legacy
+    /// form libgit2 can handle — unless simplification would be lossy.
+    #[test]
+    fn simplify_verbatim_path_disk_and_unc_forms() {
+        assert_eq!(
+            simplify_verbatim_path(Path::new(r"\\?\C:\dev\mailbox")),
+            PathBuf::from(r"C:\dev\mailbox")
+        );
+        assert_eq!(
+            simplify_verbatim_path(Path::new(r"\\?\UNC\server\share\mail")),
+            PathBuf::from(r"\\server\share\mail")
+        );
+        // Non-verbatim paths (all Unix paths) are untouched.
+        assert_eq!(
+            simplify_verbatim_path(Path::new("/data/projects/mail")),
+            PathBuf::from("/data/projects/mail")
+        );
+        // Trailing-dot/space components only survive in verbatim form: keep it.
+        assert_eq!(
+            simplify_verbatim_path(Path::new(r"\\?\C:\dev\weird.\x")),
+            PathBuf::from(r"\\?\C:\dev\weird.\x")
+        );
+        // Paths at/over the classic MAX_PATH limit must stay verbatim.
+        let long_tail = "x".repeat(300);
+        let long = format!(r"\\?\C:\{long_tail}");
+        assert_eq!(
+            simplify_verbatim_path(Path::new(&long)),
+            PathBuf::from(&long)
+        );
+        // Device namespace (`\\.\`) and non-disk verbatim forms are untouched.
+        assert_eq!(
+            simplify_verbatim_path(Path::new(r"\\?\Volume{guid}\x")),
+            PathBuf::from(r"\\?\Volume{guid}\x")
         );
     }
 

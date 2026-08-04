@@ -149,12 +149,23 @@ pub mod search_v3 {
     pub(crate) fn reset_bridge_for_tests() {}
 
     /// Tantivy is disabled, so lexical indexing is skipped deterministically.
+    /// The search cache must still be invalidated on ingestion (GH#227): the
+    /// SQL search paths cache result sets in the same process-wide cache.
     pub fn index_message(_msg: &IndexableMessage) -> Result<bool, String> {
+        crate::search_service::invalidate_search_cache(
+            crate::search_cache::InvalidationTrigger::IndexUpdate,
+        );
         Ok(false)
     }
 
     /// Tantivy is disabled, so batch lexical indexing is skipped deterministically.
-    pub fn index_messages_batch(_messages: &[IndexableMessage]) -> Result<usize, String> {
+    /// See `index_message` for why the cache is still invalidated (GH#227).
+    pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
+        if !messages.is_empty() {
+            crate::search_service::invalidate_search_cache(
+                crate::search_cache::InvalidationTrigger::IndexUpdate,
+            );
+        }
         Ok(0)
     }
 

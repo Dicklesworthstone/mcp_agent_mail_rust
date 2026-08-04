@@ -2842,9 +2842,14 @@ pub enum AgentsCommand {
     },
     /// List agents registered in a project.
     List {
+        /// Project key (slug or human_key / absolute path). Positional
+        /// alternative to -p/--project; defaults to the current directory
+        /// when both are omitted (GH#209).
+        #[arg(value_name = "PROJECT_KEY")]
+        positional_project: Option<String>,
         /// Project key (slug or human_key / absolute path).
         #[arg(long = "project", short = 'p')]
-        project_key: String,
+        project_key: Option<String>,
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -2854,11 +2859,17 @@ pub enum AgentsCommand {
     },
     /// Show details for a specific agent.
     Show {
-        /// Project key (slug or human_key / absolute path).
-        #[arg(long = "project", short = 'p')]
-        project_key: String,
-        /// Agent name.
+        /// Agent name — or, when two positionals are given
+        /// (`am agents show <PROJECT_KEY> <AGENT>`), the project key (GH#209).
+        #[arg(value_name = "AGENT")]
         agent: String,
+        /// Agent name when the first positional is the project key.
+        #[arg(value_name = "AGENT_WHEN_PROJECT_GIVEN")]
+        second_positional: Option<String>,
+        /// Project key (slug or human_key / absolute path). Defaults to the
+        /// current directory when omitted.
+        #[arg(long = "project", short = 'p')]
+        project_key: Option<String>,
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -26521,6 +26532,20 @@ fn doctor_archive_db_drift_detail(
     }
 }
 
+/// GH#217: whether detected archive→DB drift is of the *data-loss* class
+/// (message content or message ids present in the archive but absent from the
+/// DB) as opposed to metadata-only surplus (extra archive project/agent
+/// directories — e.g. stale or junk archives) that `am doctor archive-verify`
+/// classifies as hygiene debt with no immediate action. Health rollups must
+/// not escalate the hygiene class to unhealthy/error.
+fn doctor_archive_db_drift_is_data_loss_class(
+    archive: &DoctorArchiveInventory,
+    db: &DoctorDbInventory,
+) -> bool {
+    archive.messages > db.counts.messages
+        || archive.latest_message_id.unwrap_or(0) > db.max_message_id
+}
+
 fn doctor_archive_inventory_suffix(archive: &DoctorArchiveInventory) -> String {
     let mut extras = Vec::new();
     if archive.canonical_message_files > archive.messages {
@@ -32926,6 +32951,45 @@ fn build_server_create_agent_identity_arguments(
     serde_json::Value::Object(arguments)
 }
 
+/// GH#209: resolve the project key for `am agents list/show` from, in order,
+/// `-p/--project`, the positional argument, then the current directory.
+/// Conflicting explicit values are rejected instead of silently preferring one.
+fn resolve_agents_project_key(
+    flag: Option<String>,
+    positional: Option<String>,
+) -> CliResult<String> {
+    match (flag, positional) {
+        (Some(flag), Some(positional)) => {
+            if flag == positional {
+                Ok(flag)
+            } else {
+                Err(CliError::InvalidArgument(format!(
+                    "conflicting project keys: -p/--project '{flag}' vs positional '{positional}'. \
+                     Pass only one."
+                )))
+            }
+        }
+        (Some(flag), None) => Ok(flag),
+        (None, Some(positional)) => Ok(positional),
+        (None, None) => std::env::current_dir()
+            .map(|cwd| cwd.display().to_string())
+            .map_err(|e| {
+                CliError::InvalidArgument(format!(
+                    "no project key given and the current directory could not be resolved: {e}. \
+                     Pass a project key positionally or with -p/--project."
+                ))
+            }),
+    }
+}
+
+/// GH#209: heuristic for `am agents show <ARG>` — an argument containing a
+/// path separator, starting with `~`/`.`, or matching no plausible agent-name
+/// shape is almost certainly a project key the user expected to be accepted
+/// positionally.
+fn agent_arg_looks_like_project_key(arg: &str) -> bool {
+    arg.contains('/') || arg.contains('\\') || arg.starts_with('~') || arg.starts_with('.')
+}
+
 fn build_server_list_agents_arguments(project_key: &str) -> serde_json::Value {
     serde_json::json!({ "project_key": project_key })
 }
@@ -33440,10 +33504,12 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
         }
 
         AgentsCommand::List {
+            positional_project,
             project_key,
             format,
             json,
         } => {
+            let project_key = resolve_agents_project_key(project_key, positional_project)?;
             let fmt = output::CliOutputFormat::resolve(format, json);
             match try_call_server_tool(
                 &server_url,
@@ -33500,11 +33566,28 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
         }
 
         AgentsCommand::Show {
-            project_key,
             agent,
+            second_positional,
+            project_key,
             format,
             json,
         } => {
+            // GH#209: `am agents show <PROJECT_KEY> <AGENT>` — when two
+            // positionals are given the first is the project key.
+            let (positional_project, agent) = match second_positional {
+                Some(real_agent) => (Some(agent), real_agent),
+                None => {
+                    if project_key.is_none() && agent_arg_looks_like_project_key(&agent) {
+                        return Err(CliError::InvalidArgument(format!(
+                            "'{agent}' looks like a project key, not an agent name. \
+                             Pass the agent too: `am agents show {agent} <AGENT>` \
+                             (or `am agents show -p {agent} <AGENT>`)."
+                        )));
+                    }
+                    (None, agent)
+                }
+            };
+            let project_key = resolve_agents_project_key(project_key, positional_project)?;
             let fmt = output::CliOutputFormat::resolve(format, json);
             match try_call_server_tool(
                 &server_url,
@@ -46591,6 +46674,96 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn scan_markdown_for_blurbs_marker_insertion_writes_real_blurb_text() {
+        // GH#212: filling a marker must write actual documentation prose, not
+        // just an empty end marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, "# Agents\n<!-- am:blurb -->\nSome content").unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(insertions, 1);
+        let content = std::fs::read_to_string(&file).unwrap();
+        let start = content.find("<!-- am:blurb -->").unwrap();
+        let end = content.find("<!-- am:blurb:end -->").unwrap();
+        let between = &content[start..end];
+        assert!(
+            between.contains("MCP Agent Mail: coordination for multi-agent workflows"),
+            "blurb prose must be written between the markers, got: {between:.200}"
+        );
+        assert!(
+            between.contains("Integrating with Beads"),
+            "beads blurb must be written between the markers"
+        );
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_appends_to_markerless_agents_md() {
+        // GH#212: the file a user actually points this at — an AGENTS.md with
+        // no marker — must receive the blurb (append semantics, Python parity).
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, "# Agents\n\nProject instructions.\n").unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(insertions, 1, "marker-less AGENTS.md must get the blurb");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.starts_with("# Agents\n\nProject instructions.\n"));
+        assert!(content.contains("<!-- am:blurb -->"));
+        assert!(content.contains("<!-- am:blurb:end -->"));
+        assert!(content.contains("MCP Agent Mail: coordination for multi-agent workflows"));
+
+        // Idempotent: a second pass must not touch it again.
+        let mut files2 = 0u64;
+        let mut insertions2 = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files2, &mut insertions2).unwrap();
+        assert_eq!(insertions2, 0, "append must be idempotent");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_markerless_agents_md_dry_run_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        let original = "# Claude\n\nInstructions.\n";
+        std::fs::write(&file, original).unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, true, &mut files, &mut insertions).unwrap();
+        assert_eq!(insertions, 1, "dry run should still count the would-append");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_plain_md_without_marker_untouched() {
+        // Non-agent docs must never be modified without an explicit marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("README.md");
+        let original = "# Readme\n";
+        std::fs::write(&file, original).unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(insertions, 0);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_skips_vendor_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendored = tmp.path().join("node_modules").join("pkg");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(vendored.join("AGENTS.md"), "# Vendored\n").unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 5, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 0, "vendored trees must be skipped");
+        assert_eq!(insertions, 0);
+    }
+
+    #[test]
     fn scan_markdown_for_blurbs_skips_already_complete() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("README.md");
@@ -51318,6 +51491,67 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_archive_db_drift_data_loss_classification_gh217() {
+        // Metadata-only surplus (extra archive projects/agents, no message
+        // drift) is hygiene debt, NOT a data-loss incident.
+        let hygiene_archive = DoctorArchiveInventory {
+            projects: 73,
+            agents: 10,
+            messages: 5,
+            latest_message_id: Some(9),
+            ..DoctorArchiveInventory::default()
+        };
+        let hygiene_db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 32,
+                agents: 8,
+                messages: 5,
+            },
+            max_message_id: 9,
+            project_identities: std::collections::BTreeSet::new(),
+        };
+        assert!(!doctor_archive_db_drift_is_data_loss_class(
+            &hygiene_archive,
+            &hygiene_db
+        ));
+
+        // Archive messages ahead of DB → data-loss class.
+        let loss_archive = DoctorArchiveInventory {
+            projects: 1,
+            agents: 1,
+            messages: 10,
+            latest_message_id: Some(10),
+            ..DoctorArchiveInventory::default()
+        };
+        let loss_db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 1,
+                agents: 1,
+                messages: 7,
+            },
+            max_message_id: 7,
+            project_identities: std::collections::BTreeSet::new(),
+        };
+        assert!(doctor_archive_db_drift_is_data_loss_class(
+            &loss_archive,
+            &loss_db
+        ));
+
+        // Latest message id ahead (counts equal) → data-loss class.
+        let id_ahead_archive = DoctorArchiveInventory {
+            projects: 1,
+            agents: 1,
+            messages: 7,
+            latest_message_id: Some(12),
+            ..DoctorArchiveInventory::default()
+        };
+        assert!(doctor_archive_db_drift_is_data_loss_class(
+            &id_ahead_archive,
+            &loss_db
+        ));
+    }
+
+    #[test]
     fn doctor_archive_db_drift_detail_flags_missing_archive_project_even_if_other_db_counts_are_higher()
      {
         let archive = DoctorArchiveInventory {
@@ -51850,6 +52084,67 @@ startup_timeout_sec = 42
         );
         assert!(wal_path.exists(), "dry-run must not move the WAL sidecar");
         assert!(shm_path.exists(), "dry-run must not move the SHM sidecar");
+    }
+
+    /// GH#215: `am doctor repair --dry-run` must be forensically
+    /// non-mutating — it must not checkpoint the WAL it inspects or change a
+    /// single byte of the database file or its sidecars.
+    #[test]
+    fn doctor_repair_dry_run_preserves_db_and_wal_bytes_exactly() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("forensic.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = tmp.path().join("storage");
+        let backup_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        handle_migrate_with_database_url(&db_url).expect("migrate fixture");
+
+        // Leave real frames in the WAL (no checkpoint): this is the evidence
+        // a dry run must not fold into the main file.
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("open fixture");
+            let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+            conn.query_sync(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('wal-evidence', '/tmp/wal-evidence', 0)",
+                &empty,
+            )
+            .expect("write row into WAL");
+        }
+        let wal_path = db_path.with_extension("sqlite3-wal");
+
+        let db_before = std::fs::read(&db_path).expect("read db bytes");
+        let wal_before = wal_path.exists().then(|| std::fs::read(&wal_path).expect("read wal"));
+
+        let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
+        let result =
+            handle_doctor_repair_with(&db_url, &storage_root, &backup_dir, None, true, true);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "dry-run repair should succeed: {output}");
+        assert!(
+            output.contains("dry_run_probe_copy"),
+            "dry-run should announce it probes a copy: {output}"
+        );
+
+        let db_after = std::fs::read(&db_path).expect("re-read db bytes");
+        assert_eq!(
+            db_before, db_after,
+            "dry-run must not change a byte of the main database file"
+        );
+        match wal_before {
+            Some(before) => {
+                let after = std::fs::read(&wal_path).expect("re-read wal");
+                assert_eq!(before, after, "dry-run must not touch the WAL sidecar");
+            }
+            None => assert!(
+                !wal_path.exists(),
+                "dry-run must not materialize a WAL sidecar"
+            ),
+        }
     }
 
     #[test]
@@ -55854,17 +56149,92 @@ startup_timeout_sec = 42
             Commands::Agents {
                 action:
                     AgentsCommand::List {
+                        positional_project,
                         project_key,
                         format,
                         json,
                     },
             } => {
-                assert_eq!(project_key, "my-proj");
+                assert_eq!(project_key.as_deref(), Some("my-proj"));
+                assert_eq!(positional_project, None);
                 assert_eq!(format, Some(output::CliOutputFormat::Toon));
                 assert!(!json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    /// GH#209: the project key is accepted positionally for list/show.
+    #[test]
+    fn agents_list_and_show_accept_positional_project_key() {
+        let cli = Cli::try_parse_from(["am", "agents", "list", "/home/me/projects/foo"])
+            .expect("positional project key must parse for agents list");
+        match cli.command.expect("expected command") {
+            Commands::Agents {
+                action:
+                    AgentsCommand::List {
+                        positional_project,
+                        project_key,
+                        ..
+                    },
+            } => {
+                assert_eq!(positional_project.as_deref(), Some("/home/me/projects/foo"));
+                assert_eq!(project_key, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["am", "agents", "show", "/home/me/projects/foo", "BlueLake"])
+            .expect("project+agent positional pair must parse for agents show");
+        match cli.command.expect("expected command") {
+            Commands::Agents {
+                action:
+                    AgentsCommand::Show {
+                        agent,
+                        second_positional,
+                        project_key,
+                        ..
+                    },
+            } => {
+                assert_eq!(agent, "/home/me/projects/foo");
+                assert_eq!(second_positional.as_deref(), Some("BlueLake"));
+                assert_eq!(project_key, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_agents_project_key_precedence_and_conflicts() {
+        // Flag alone.
+        assert_eq!(
+            resolve_agents_project_key(Some("a".into()), None).expect("flag"),
+            "a"
+        );
+        // Positional alone.
+        assert_eq!(
+            resolve_agents_project_key(None, Some("b".into())).expect("positional"),
+            "b"
+        );
+        // Matching duplicates are fine.
+        assert_eq!(
+            resolve_agents_project_key(Some("a".into()), Some("a".into())).expect("dup"),
+            "a"
+        );
+        // Conflicting values are rejected.
+        assert!(resolve_agents_project_key(Some("a".into()), Some("b".into())).is_err());
+        // Neither → current directory.
+        let cwd = std::env::current_dir().expect("cwd").display().to_string();
+        assert_eq!(resolve_agents_project_key(None, None).expect("cwd"), cwd);
+    }
+
+    #[test]
+    fn agent_arg_project_key_heuristic() {
+        assert!(agent_arg_looks_like_project_key("/home/me/projects/foo"));
+        assert!(agent_arg_looks_like_project_key("./foo"));
+        assert!(agent_arg_looks_like_project_key("~/projects/foo"));
+        assert!(!agent_arg_looks_like_project_key("BlueLake"));
+        assert!(!agent_arg_looks_like_project_key("my-project-slug"));
     }
 
     #[test]
@@ -69059,10 +69429,64 @@ fn handle_doctor_repair_with_options(
         database_url: database_url.to_string(),
         ..Default::default()
     };
-    let reconstruct_db_path = repair_cfg
+    let mut reconstruct_db_path = repair_cfg
         .sqlite_path()
         .map(|path| PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&path)))
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+
+    // GH#215: `--dry-run` must be forensically non-mutating. Opening a WAL
+    // database (even for probes) can checkpoint the WAL into the main file,
+    // destroying byte-exact evidence. Probe a temporary copy of the database
+    // and its sidecars instead; the originals are never opened.
+    //
+    // Authority/plan decisions (e.g. "is the archive authoritative for this
+    // DB?") must still be made against the ORIGINAL path so the dry run
+    // reports the same plan a real run would take.
+    let original_db_path = reconstruct_db_path.clone();
+    let mut database_url = database_url.to_string();
+    let _dry_run_probe_dir: Option<tempfile::TempDir> = if dry_run
+        && reconstruct_db_path.as_os_str() != ":memory:"
+        && reconstruct_db_path.exists()
+    {
+        let probe_dir = tempfile::Builder::new()
+            .prefix("am-doctor-repair-dryrun-")
+            .tempdir()
+            .map_err(|e| {
+                CliError::Other(format!("cannot create dry-run probe directory: {e}"))
+            })?;
+        let file_name = reconstruct_db_path
+            .file_name()
+            .map_or_else(|| std::ffi::OsString::from("storage.sqlite3"), std::ffi::OsStr::to_os_string);
+        let probe_db_path = probe_dir.path().join(&file_name);
+        std::fs::copy(&reconstruct_db_path, &probe_db_path).map_err(|e| {
+            CliError::Other(format!(
+                "cannot copy database for dry-run probe ({} -> {}): {e}",
+                reconstruct_db_path.display(),
+                probe_db_path.display()
+            ))
+        })?;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(&reconstruct_db_path, suffix);
+            if sidecar.exists() {
+                let probe_sidecar = sqlite_sidecar_path(&probe_db_path, suffix);
+                std::fs::copy(&sidecar, &probe_sidecar).map_err(|e| {
+                    CliError::Other(format!(
+                        "cannot copy {suffix} sidecar for dry-run probe: {e}"
+                    ))
+                })?;
+            }
+        }
+        ftui_runtime::ftui_println!(
+            "  dry_run_probe_copy: {} (originals are not opened; WAL state preserved byte-exact)",
+            probe_db_path.display()
+        );
+        database_url = format!("sqlite:///{}", probe_db_path.display());
+        reconstruct_db_path = probe_db_path;
+        Some(probe_dir)
+    } else {
+        None
+    };
+    let database_url = database_url.as_str();
 
     ftui_runtime::ftui_println!("Running database repair...");
     if !confirm_mutating_doctor_action(
@@ -69118,15 +69542,20 @@ fn handle_doctor_repair_with_options(
     let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
     let archive_reconstruct_available = archive_has_state
         && doctor_archive_is_authoritative_for_sqlite_path(
-            &reconstruct_db_path,
+            &original_db_path,
             storage_root,
             storage_root_is_explicit,
         );
 
     // 1. File sanity check via the runtime probe plus canonical fallback so doctor
-    // repair does not misclassify healthy databases as corrupt.
+    // repair does not misclassify healthy databases as corrupt. In dry-run the
+    // probe runs read-only against the temporary copy (GH#215).
     let (integrity_ok, integrity_detail, _used_absolute_fallback, _missing_configured_path) =
-        sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?;
+        if dry_run {
+            sqlite_doctor_file_sanity_read_only(&reconstruct_db_path.display().to_string())?
+        } else {
+            sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?
+        };
 
     ftui_runtime::ftui_println!(
         "  quick_check_ok: {} ({})",
@@ -69228,7 +69657,7 @@ fn handle_doctor_repair_with_options(
             if doctor_archive_is_authoritative_for_db(
                 archive,
                 &db_inventory,
-                &reconstruct_db_path,
+                &original_db_path,
                 storage_root,
                 storage_root_is_explicit,
             ) {
@@ -72160,6 +72589,69 @@ fn read_blocking_http_chunk<R: std::io::Read>(
     }
 }
 
+/// Write `data` fully, retrying transient `EAGAIN`/`EWOULDBLOCK`/`EINTR`
+/// failures until `deadline` (GH#220).
+///
+/// macOS surfaces `Resource temporarily unavailable (os error 35)` from
+/// blocking-socket writes far more readily than Linux (notably right after a
+/// `connect_timeout` handshake and under `SO_SNDTIMEO`). The GH#170 fix gave
+/// the read path this retry loop but left every `write_all`/`flush` mapping
+/// the first transient error straight to a fatal "transport failure" — which
+/// made every daemon-proxied CLI verb fail on macOS while native MCP clients
+/// (with retrying I/O stacks) kept working against the same healthy daemon.
+fn write_blocking_http_all<W: std::io::Write>(
+    stream: &mut W,
+    mut data: &[u8],
+    server_url: &str,
+    deadline: std::time::Instant,
+) -> CliResult<()> {
+    while !data.is_empty() {
+        match stream.write(data) {
+            Ok(0) => {
+                return Err(CliError::Other(format!(
+                    "transport failure calling {server_url}: connection closed mid-request"
+                )));
+            }
+            Ok(written) => data = &data[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "transport failure calling {server_url}: {error}"
+                )));
+            }
+        }
+    }
+    loop {
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "transport failure calling {server_url}: {error}"
+                )));
+            }
+        }
+    }
+}
+
 fn parse_blocking_http_port(port_text: &str, authority: &str) -> CliResult<u16> {
     port_text.parse::<u16>().map_err(|error| {
         CliError::Other(format!(
@@ -72491,17 +72983,11 @@ fn post_jsonrpc_request_blocking_http(
         authorization,
         x_tmux_pane
     );
-    std::io::Write::write_all(&mut stream, head.as_bytes()).map_err(|error| {
-        CliError::Other(format!("transport failure calling {server_url}: {error}"))
-    })?;
-    std::io::Write::write_all(&mut stream, &body).map_err(|error| {
-        CliError::Other(format!("transport failure calling {server_url}: {error}"))
-    })?;
-    std::io::Write::flush(&mut stream).map_err(|error| {
-        CliError::Other(format!("transport failure calling {server_url}: {error}"))
-    })?;
-
+    // GH#220: writes must retry transient EAGAIN/EINTR just like reads.
     let deadline = std::time::Instant::now() + timeout;
+    write_blocking_http_all(&mut stream, head.as_bytes(), server_url, deadline)?;
+    write_blocking_http_all(&mut stream, &body, server_url, deadline)?;
+
     Ok(Some(read_blocking_http_response(
         &mut stream,
         server_url,
@@ -72526,14 +73012,10 @@ fn get_blocking_http_request(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
         target.request_target, target.host_header
     );
-    std::io::Write::write_all(&mut stream, head.as_bytes()).map_err(|error| {
-        CliError::Other(format!("transport failure calling {server_url}: {error}"))
-    })?;
-    std::io::Write::flush(&mut stream).map_err(|error| {
-        CliError::Other(format!("transport failure calling {server_url}: {error}"))
-    })?;
-
+    // GH#220: writes must retry transient EAGAIN/EINTR just like reads.
     let deadline = std::time::Instant::now() + timeout;
+    write_blocking_http_all(&mut stream, head.as_bytes(), server_url, deadline)?;
+
     Ok(Some(read_blocking_http_response(
         &mut stream,
         server_url,
@@ -72628,6 +73110,76 @@ mod blocking_http_chunk_tests {
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let err = read_blocking_http_chunk(&mut reader, &mut chunk, "http://x/mcp/", past)
             .expect_err("past-deadline interrupt must be fatal");
+        assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
+    }
+
+    /// A `Write` that replays a scripted sequence of results, one per call.
+    struct ScriptedWriter {
+        steps: std::collections::VecDeque<Result<usize, ErrorKind>>,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedWriter {
+        fn new(steps: Vec<Result<usize, ErrorKind>>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Write for ScriptedWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(Ok(n)) => {
+                    let n = n.min(data.len());
+                    self.written.extend_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Some(Err(kind)) => Err(Error::from(kind)),
+                None => Ok(data.len()),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self.steps.pop_front() {
+                Some(Err(kind)) => Err(Error::from(kind)),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// GH#220 (macOS EAGAIN, os error 35): transient `WouldBlock`/`TimedOut`/
+    /// `Interrupted` write failures must be retried until the deadline, not
+    /// mapped straight to a fatal "transport failure".
+    #[test]
+    fn transient_write_errors_are_retried() {
+        let mut w = ScriptedWriter::new(vec![
+            Err(ErrorKind::WouldBlock),
+            Ok(4),
+            Err(ErrorKind::Interrupted),
+            Err(ErrorKind::TimedOut),
+            Ok(usize::MAX), // rest
+        ]);
+        super::write_blocking_http_all(&mut w, b"POST /mcp/", "http://x/mcp/", far_deadline())
+            .expect("transient write errors must be retried");
+        assert_eq!(w.written, b"POST /mcp/");
+    }
+
+    #[test]
+    fn fatal_write_error_is_fatal() {
+        let mut w = ScriptedWriter::new(vec![Err(ErrorKind::BrokenPipe)]);
+        let err =
+            super::write_blocking_http_all(&mut w, b"data", "http://x/mcp/", far_deadline())
+                .expect_err("broken pipe must be fatal");
+        assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
+    }
+
+    #[test]
+    fn transient_write_error_past_deadline_is_fatal() {
+        let mut w = ScriptedWriter::new(vec![Err(ErrorKind::WouldBlock); 8]);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let err = super::write_blocking_http_all(&mut w, b"data", "http://x/mcp/", past)
+            .expect_err("past-deadline EAGAIN must be fatal");
         assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
     }
 }
@@ -75861,6 +76413,102 @@ fn handle_docs(action: DocsCommand) -> CliResult<()> {
     }
 }
 
+/// The Agent Mail + Beads documentation blurb inserted by
+/// `am docs insert-blurbs` (GH#212: this prose was never ported from the
+/// Python CLI, which sources the same text from its README snippet markers —
+/// the Rust CLI embeds it so an installed binary needs no README on disk).
+const AM_DOCS_BLURB: &str = r#"## MCP Agent Mail: coordination for multi-agent workflows
+
+What it is
+- A mail-like layer that lets coding agents coordinate asynchronously via MCP tools and resources.
+- Provides identities, inbox/outbox, searchable threads, and advisory file reservations, with human-auditable artifacts in Git.
+
+Why it's useful
+- Prevents agents from stepping on each other with explicit file reservations (leases) for files/globs.
+- Keeps communication out of your token budget by storing messages in a per-project archive.
+- Offers quick reads (`resource://inbox/...`, `resource://thread/...`) and macros that bundle common flows.
+
+How to use effectively
+1) Same repository
+   - Register an identity: call `ensure_project`, then `register_agent` using this repo's absolute path as `project_key`.
+   - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
+   - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
+   - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20&agent_token=<registration_token>` or `resource://thread/{id}?project=<abs-path>&agent=<Agent>&agent_token=<registration_token>&include_bodies=true` unless the current MCP session already authenticated as that agent.
+   - Tip: set `AGENT_NAME` in your environment so the pre-commit guard can block commits that conflict with others' active exclusive file reservations.
+
+2) Across different repos in one project (e.g., Next.js frontend + FastAPI backend)
+   - Option A (single project bus): register both sides under the same `project_key` (shared key/path). Keep reservation patterns specific (e.g., `frontend/**` vs `backend/**`).
+   - Option B (separate projects): each repo has its own `project_key`; use `macro_contact_handshake` or `request_contact`/`respond_contact` to link agents, then message directly. Keep a shared `thread_id` (e.g., ticket key) across repos for clean summaries/audits.
+
+Macros vs granular tools
+- Prefer macros when you want speed or are on a smaller model: `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`.
+- Use granular tools when you need control: `register_agent`, `file_reservation_paths`, `send_message`, `fetch_inbox`, `acknowledge_message`.
+
+Common pitfalls
+- "from_agent not registered": always `register_agent` in the correct `project_key` first.
+- "FILE_RESERVATION_CONFLICT": adjust patterns, wait for expiry, or use a non-exclusive reservation when appropriate.
+- Auth errors: if JWT+JWKS is enabled, include a bearer token with a `kid` that matches server JWKS; static bearer is used only when JWT is disabled.
+
+## Integrating with Beads (dependency-aware task planning)
+
+Beads provides a lightweight, dependency-aware issue database and a CLI (`bd`) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging, audit trail, and file-reservation signals. Project: [steveyegge/beads](https://github.com/steveyegge/beads)
+
+Recommended conventions
+- **Single source of truth**: Use **Beads** for task status/priority/dependencies; use **Agent Mail** for conversation, decisions, and attachments (audit).
+- **Shared identifiers**: Use the Beads issue id (e.g., `bd-123`) as the Mail `thread_id` and prefix message subjects with `[bd-123]`.
+- **Reservations**: When starting a `bd-###` task, call `file_reservation_paths(...)` for the affected paths; include the issue id in the `reason` and release on completion.
+
+Typical flow (agents)
+1) **Pick ready work** (Beads)
+   - `bd ready --json` -> choose one item (highest priority, no blockers)
+2) **Reserve edit surface** (Mail)
+   - `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="bd-123")`
+3) **Announce start** (Mail)
+   - `send_message(..., thread_id="bd-123", subject="[bd-123] Start: <short title>", ack_required=true)`
+4) **Work and update**
+   - Reply in-thread with progress and attach artifacts/images; keep the discussion in one thread per issue id
+5) **Complete and release**
+   - `bd close bd-123 --reason "Completed"` (Beads is status authority)
+   - `release_file_reservations(project_key, agent_name, paths=["src/**"])`
+   - Final Mail reply: `[bd-123] Completed` with summary and links
+
+Mapping cheat-sheet
+- **Mail `thread_id`** <-> `bd-###`
+- **Mail subject**: `[bd-###] ...`
+- **File reservation `reason`**: `bd-###`
+- **Commit messages (optional)**: include `bd-###` for traceability
+
+Pitfalls to avoid
+- Don't create or manage tasks in Mail; treat Beads as the single task queue.
+- Always include `bd-###` in message `thread_id` to avoid ID drift across tools.
+"#;
+
+/// Directory names never worth scanning for agent docs.
+const BLURB_SKIP_SCAN_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".mcp-agent-mail",
+    "node_modules",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "dist",
+    "build",
+    "out",
+    "logs",
+    "target",
+];
+
+/// Whether `file_name` is an agent-instruction doc that should receive the
+/// blurb even without a pre-placed `<!-- am:blurb -->` marker (GH#212: the
+/// marker-less AGENTS.md is the file users actually point this command at).
+fn is_agent_doc_filename(file_name: &str) -> bool {
+    file_name.eq_ignore_ascii_case("AGENTS.md") || file_name.eq_ignore_ascii_case("CLAUDE.md")
+}
+
 fn scan_markdown_for_blurbs(
     dir: &Path,
     depth: usize,
@@ -75875,6 +76523,13 @@ fn scan_markdown_for_blurbs(
     for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| BLURB_SKIP_SCAN_DIRS.contains(&n));
+            if skip {
+                continue;
+            }
             scan_markdown_for_blurbs(
                 &path,
                 depth + 1,
@@ -75883,21 +76538,31 @@ fn scan_markdown_for_blurbs(
                 total_files,
                 total_insertions,
             )?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
+        } else if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
             *total_files += 1;
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            // Look for <!-- am:blurb --> markers
-            if content.contains("<!-- am:blurb -->") && !content.contains("<!-- am:blurb:end -->") {
+            let has_start = content.contains("<!-- am:blurb -->");
+            let has_end = content.contains("<!-- am:blurb:end -->");
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+
+            if has_start && !has_end {
+                // Pre-placed marker: fill it with the actual blurb text
+                // (GH#212: previously only an empty end marker was written).
                 *total_insertions += 1;
                 if !dry_run {
-                    // Insert a placeholder end marker after each blurb marker
-                    let updated = content.replace(
-                        "<!-- am:blurb -->",
-                        "<!-- am:blurb -->\n<!-- am:blurb:end -->",
-                    );
+                    let replacement =
+                        format!("<!-- am:blurb -->\n{AM_DOCS_BLURB}<!-- am:blurb:end -->");
+                    let updated = content.replace("<!-- am:blurb -->", &replacement);
                     std::fs::write(&path, updated)?;
                 }
                 ftui_runtime::ftui_println!(
@@ -75907,6 +76572,29 @@ fn scan_markdown_for_blurbs(
                         " (would insert)"
                     } else {
                         " (inserted)"
+                    }
+                );
+            } else if !has_start && is_agent_doc_filename(file_name) {
+                // Marker-less AGENTS.md / CLAUDE.md: append the full block,
+                // matching the Python CLI's append semantics.
+                *total_insertions += 1;
+                if !dry_run {
+                    let mut updated = content.clone();
+                    if !updated.is_empty() && !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
+                    updated.push_str(&format!(
+                        "\n<!-- am:blurb -->\n{AM_DOCS_BLURB}<!-- am:blurb:end -->\n"
+                    ));
+                    std::fs::write(&path, updated)?;
+                }
+                ftui_runtime::ftui_println!(
+                    "  {} agent doc{}",
+                    path.display(),
+                    if dry_run {
+                        " (would append blurb)"
+                    } else {
+                        " (blurb appended)"
                     }
                 );
             }

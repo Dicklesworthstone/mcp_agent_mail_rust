@@ -1201,8 +1201,13 @@ fn ephemeral_path_hash(path: &str) -> String {
 /// crate continue to reject symlinks *within* the resolved tree.
 fn canonicalize_storage_root(path: &Path) -> io::Result<PathBuf> {
     // Fast path: the entire path already exists.
+    //
+    // GH#216: on Windows `fs::canonicalize` returns extended-length (`\\?\`)
+    // paths, which libgit2 mishandles (`Incorrect function. (os error 1)`),
+    // breaking every archive write-back. Simplify back to the legacy form
+    // whenever it round-trips safely.
     match fs::canonicalize(path) {
-        Ok(c) => return Ok(c),
+        Ok(c) => return Ok(crate::disk::simplify_verbatim_path(&c)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => { /* fall through */ }
         Err(e) => return Err(e),
     }
@@ -1214,7 +1219,7 @@ fn canonicalize_storage_root(path: &Path) -> io::Result<PathBuf> {
     loop {
         match fs::canonicalize(cursor) {
             Ok(canonical_prefix) => {
-                let mut resolved = canonical_prefix;
+                let mut resolved = crate::disk::simplify_verbatim_path(&canonical_prefix);
                 for component in missing_tail.iter().rev() {
                     resolved.push(component);
                 }
