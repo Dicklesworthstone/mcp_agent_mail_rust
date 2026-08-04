@@ -828,7 +828,7 @@ def resolve_archive_root():
     for name in explicit_names:
         candidate = os.path.join(projects_dir, name)
         if is_real_directory(os.path.join(candidate, "file_reservations")):
-            return candidate
+            return candidate, None
 
     canonical_project = canonical_text(project_value)
     canonical_repo = canonical_text(repo_root)
@@ -4619,5 +4619,104 @@ mod tests {
             false
         ));
         assert!(!hookspath_level_refuses_install(ConfigLevel::App, false));
+    }
+
+    /// Regression: `resolve_archive_root`'s explicit-name fast path (a
+    /// slug-style PROJECT whose `projects/<slug>/file_reservations` archive
+    /// exists) must return the `(archive_root, suspicious)` tuple like every
+    /// other return site. It previously returned the bare path, so the
+    /// caller's tuple unpack raised `ValueError` — an unhandled traceback
+    /// (exit 1) that blocked every commit on the *healthy* happy path, and
+    /// that `AGENT_MAIL_GUARD_MODE=warn` could not soften.
+    #[test]
+    fn guard_plugin_explicit_slug_archive_match_does_not_crash() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("a.rs"), "fn a() {}\n").expect("write file");
+        run_git(&repo_dir, &["add", "a.rs"]);
+
+        // Slug-registered project: archive dir named exactly after the
+        // slug-style PROJECT baked into the plugin (the explicit-name fast
+        // path — no project.json needed to match).
+        let reservations_dir = storage_root
+            .join("projects")
+            .join("myproj")
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script("myproj", "pre-commit"),
+        )
+        .expect("write guard script");
+
+        // No active reservations: the archive matches and the commit must be
+        // allowed (exit 0). Before the fix this crashed with a ValueError
+        // traceback and exit 1.
+        let output = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env("STORAGE_ROOT", &storage_root)
+            .arg(&script_path)
+            .output()
+            .expect("run guard script");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Traceback"),
+            "guard plugin must not crash on the explicit-slug archive match: stderr={stderr}",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "matching archive with no active reservations must allow: stdout={}, stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+
+        // With an active exclusive reservation held by another agent, the
+        // same fast path must produce the real conflict block (exit 1 with
+        // the conflict message), not a crash.
+        std::fs::write(
+            reservations_dir.join("res.json"),
+            serde_json::json!({
+                "path_pattern": "a.rs",
+                "agent_name": "OtherAgent",
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let blocked = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env("STORAGE_ROOT", &storage_root)
+            .arg(&script_path)
+            .output()
+            .expect("run guard script (conflict)");
+        let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+        assert!(
+            !blocked_stderr.contains("Traceback"),
+            "conflict path must not crash: stderr={blocked_stderr}",
+        );
+        assert_eq!(
+            blocked.status.code(),
+            Some(1),
+            "conflicting reservation via the explicit-slug fast path must block: stdout={}, stderr={blocked_stderr}",
+            String::from_utf8_lossy(&blocked.stdout),
+        );
+        assert!(
+            blocked_stderr.contains("file reservation conflict"),
+            "expected the real conflict message, got stderr={blocked_stderr}",
+        );
     }
 }
