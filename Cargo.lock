@@ -2112,6 +2112,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "tracing",
  "wide 1.6.0",
