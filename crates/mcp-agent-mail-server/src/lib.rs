@@ -30714,9 +30714,14 @@ first body
 
             let rt = RuntimeBuilder::current_thread().build().expect("runtime");
 
-            // This fetch should fail (bad JSON) but release the lock.
+            // GH#221 stale-on-error: with a stale cached key set present, a
+            // failed refresh (bad JSON) serves the stale entry instead of
+            // erroring — and must still release the lock (asserted below).
             let r = rt.block_on(state.fetch_jwks(&url, false));
-            assert!(r.is_err(), "bad JSON should cause fetch_jwks to fail");
+            assert!(
+                r.is_ok(),
+                "failed refresh must serve the stale cached JWKS (GH#221)"
+            );
 
             // The refreshing flag must be cleared.
             assert!(
