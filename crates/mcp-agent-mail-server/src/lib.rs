@@ -6979,26 +6979,50 @@ fn ensure_atc_executor_identity(
     }
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
-    runtime
-        .block_on(async {
-            mcp_agent_mail_tools::identity::register_agent(
-                &ctx,
-                project_key.to_string(),
-                "mcp-agent-mail".to_string(),
-                "atc-executor".to_string(),
-                Some(atc::ATC_AGENT_NAME.to_string()),
-                Some("ATC automated control plane".to_string()),
-                None,
-                None,
-                None,
-                None,
-            )
+    runtime.block_on(async {
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool()
+            .map_err(|error| error.to_string())?;
+        let project = mcp_agent_mail_tools::tool_util::resolve_project(&ctx, &pool, project_key)
             .await
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?;
+        register_atc_executor_identity(ctx.cx(), &pool, project.id.unwrap_or(0)).await
+    })?;
     ensured_projects.insert(project_key.to_string());
     Ok(())
+}
+
+/// Register the ATC control plane's own `AirTrafficControl` sender identity.
+///
+/// GH#226: `AirTrafficControl` is a reserved system identity, not an
+/// adjective+noun agent name, so it can never pass the validated
+/// `register_agent` tool (the previous implementation failed on every attempt,
+/// which meant no ATC probe/advisory effect could ever be delivered). Register
+/// it through the same unvalidated system-agent path used for `HumanOverseer`.
+async fn register_atc_executor_identity(
+    cx: &Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+) -> Result<(), String> {
+    match mcp_agent_mail_db::queries::insert_system_agent(
+        cx,
+        pool,
+        project_id,
+        atc::ATC_AGENT_NAME,
+        "mcp-agent-mail",
+        "atc-executor",
+        "ATC automated control plane",
+    )
+    .await
+    {
+        asupersync::Outcome::Ok(_) => Ok(()),
+        asupersync::Outcome::Err(error) => Err(error.to_string()),
+        asupersync::Outcome::Cancelled(_) => {
+            Err("cancelled while registering ATC executor identity".to_string())
+        }
+        asupersync::Outcome::Panicked(payload) => Err(format!(
+            "panicked while registering ATC executor identity: {payload:?}"
+        )),
+    }
 }
 
 fn execute_atc_advisory_effect(
@@ -32933,5 +32957,118 @@ first body
 
         let wait = atc_operator_wait_duration(&snapshot, 1_000_000, Duration::from_secs(5));
         assert_eq!(wait, ATC_OPERATOR_MIN_TICK_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod atc_identity_tests {
+    //! GH#226: the ATC control plane must be able to register its own
+    //! `AirTrafficControl` sender identity even though that name can never
+    //! pass the adjective+noun `register_agent` validator.
+
+    use super::register_atc_executor_identity;
+    use asupersync::{Cx, Outcome};
+    use fastmcp_core::block_on;
+    use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, queries};
+
+    fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
+        let db_path = tmp.path().join("db.sqlite3");
+        let db_url = format!(
+            "sqlite:////{}",
+            db_path.to_string_lossy().trim_start_matches('/')
+        );
+        let pool_config = DbPoolConfig {
+            database_url: db_url,
+            min_connections: 1,
+            max_connections: 1,
+            ..Default::default()
+        };
+        create_pool(&pool_config).expect("create pool")
+    }
+
+    #[test]
+    fn atc_agent_name_is_reserved_and_never_adjective_noun() {
+        // The root cause of GH#226: the validated register path can never
+        // accept this name, so the executor must not route through it.
+        assert!(
+            mcp_agent_mail_core::models::normalize_agent_name(crate::atc::ATC_AGENT_NAME).is_none(),
+            "AirTrafficControl must not validate as adjective+noun; if it ever does, \
+             revisit the reserved-name exemption"
+        );
+        assert!(mcp_agent_mail_core::models::is_reserved_operator_agent_name(
+            crate::atc::ATC_AGENT_NAME
+        ));
+    }
+
+    #[test]
+    fn register_atc_executor_identity_creates_system_agent_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = make_test_pool(&tmp);
+        let cx = Cx::for_testing();
+
+        let project_root = tmp.path().join("project_root");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let human_key = project_root.to_string_lossy().to_string();
+        let project = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            || match block_on(async { queries::ensure_project(&cx, &pool, &human_key).await }) {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure_project failed: {other:?}"),
+            },
+        );
+        let project_id = project.id.expect("project id");
+
+        // First registration succeeds (this failed unconditionally before the
+        // GH#226 fix because it went through the validated register tool).
+        block_on(async { register_atc_executor_identity(&cx, &pool, project_id).await })
+            .expect("ATC executor identity registration must succeed");
+
+        // Idempotent re-registration must also succeed.
+        block_on(async { register_atc_executor_identity(&cx, &pool, project_id).await })
+            .expect("re-registration must be idempotent");
+
+        let agent = match block_on(async {
+            queries::get_agent(&cx, &pool, project_id, crate::atc::ATC_AGENT_NAME).await
+        }) {
+            Outcome::Ok(agent) => agent,
+            other => panic!("AirTrafficControl agent row must exist: {other:?}"),
+        };
+        assert_eq!(agent.name, crate::atc::ATC_AGENT_NAME);
+        assert_eq!(agent.program, "mcp-agent-mail");
+
+        // End-to-end: the registered identity can actually send an ATC-style
+        // message to a normal agent, which is the effect GH#226 reported as
+        // permanently failing.
+        let target = match block_on(async {
+            queries::register_agent(
+                &cx, &pool, project_id, "CloudyElk", "test", "test", None, None, None,
+            )
+            .await
+        }) {
+            Outcome::Ok(a) => a,
+            other => panic!("register target agent failed: {other:?}"),
+        };
+        let sender_id = agent.id.expect("atc agent id");
+        let target_id = target.id.expect("target agent id");
+        let msg = match block_on(async {
+            queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "[atc] liveness probe",
+                "probe body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(target_id, "to")],
+            )
+            .await
+        }) {
+            Outcome::Ok(m) => m,
+            other => panic!("ATC probe send failed: {other:?}"),
+        };
+        assert!(msg.id.is_some());
     }
 }

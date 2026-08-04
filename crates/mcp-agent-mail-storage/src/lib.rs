@@ -672,7 +672,11 @@ fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
     metrics.storage.wbq_enqueued_total.inc();
 
     let depth = op_depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-    metrics.storage.wbq_depth.set(depth);
+    // GH#225: the gauge must be updated with a commuting delta, not
+    // `set(depth)`. A racing enqueue/drain pair can otherwise apply their
+    // `set`s out of order, permanently stranding the gauge one above the
+    // authoritative `op_depth` and pinning health red on an idle server.
+    metrics.storage.wbq_depth.add(1);
     metrics.storage.wbq_peak_depth.fetch_max(depth);
 
     let cap = u64::try_from(Config::get().wbq_channel_capacity).unwrap_or(u64::MAX);
@@ -1581,14 +1585,15 @@ fn wbq_drain_loop(
         let drained_u64 = u64::try_from(drained).unwrap_or(u64::MAX);
 
         let depth_after = op_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(drained_u64))
             })
             .unwrap_or(0)
             .saturating_sub(drained_u64);
 
         let metrics = mcp_agent_mail_core::global_metrics();
-        metrics.storage.wbq_depth.set(depth_after);
+        // GH#225: commuting delta, never `set(computed)` (see enqueue path).
+        metrics.storage.wbq_depth.sub_saturating(drained_u64);
         let cap = u64::try_from(channel_capacity).unwrap_or(u64::MAX);
         let threshold = cap.saturating_mul(80).saturating_div(100);
         if threshold > 0 && depth_after >= threshold {
@@ -1691,13 +1696,14 @@ fn wbq_drain_loop(
         match msg {
             WbqMsg::Op(envelope) => {
                 let depth_after = op_depth
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                         Some(cur.saturating_sub(1))
                     })
                     .unwrap_or(0)
                     .saturating_sub(1);
                 let metrics = mcp_agent_mail_core::global_metrics();
-                metrics.storage.wbq_depth.set(depth_after);
+                // GH#225: commuting delta, never `set(computed)`.
+                metrics.storage.wbq_depth.sub_saturating(1);
                 let cap = u64::try_from(channel_capacity).unwrap_or(u64::MAX);
                 let threshold = cap.saturating_mul(80).saturating_div(100);
                 if threshold > 0 && depth_after >= threshold {
@@ -4045,7 +4051,7 @@ fn self_process_repo(
 fn coalescer_update_pending(pending_requests: &Arc<AtomicU64>, drained: u64) {
     let metrics = mcp_agent_mail_core::global_metrics();
     let pending_after = pending_requests
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             Some(cur.saturating_sub(drained))
         })
         .unwrap_or(0)
@@ -4107,7 +4113,7 @@ fn coalescer_restore_drained_work_on_panic(
 
 fn coalescer_depth_decrement(depth: &AtomicU64, drained: u64) -> u64 {
     depth
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             Some(cur.saturating_sub(drained))
         })
         .unwrap_or(0)
@@ -18226,7 +18232,7 @@ mod tests {
     /// Helper: applies the same depth-decrement logic as wbq_drain_loop.
     fn depth_decrement(counter: &AtomicU64, drained: u64) -> u64 {
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(drained))
             })
             .unwrap_or(0)
@@ -18345,7 +18351,7 @@ mod tests {
                     c.fetch_add(1, Ordering::Relaxed);
                 }
                 for _ in 0..ops_per_thread {
-                    c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    c.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                         Some(cur.saturating_sub(1))
                     })
                     .ok();
@@ -18377,7 +18383,7 @@ mod tests {
         for _ in 0..num_threads {
             let c = Arc::clone(&counter);
             handles.push(std::thread::spawn(move || {
-                c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                c.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     Some(cur.saturating_sub(50))
                 })
                 .ok();
@@ -18784,7 +18790,7 @@ mod tests {
                         if i % 2 == 0 {
                             c.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                            c.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                                 Some(cur.saturating_sub(1))
                             })
                             .ok();
@@ -18819,7 +18825,7 @@ mod tests {
                 s.spawn(move || {
                     for batch in 0..drain_per_thread {
                         let prev = c
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                                 Some(cur.saturating_sub(1))
                             })
                             .unwrap_or(0);
@@ -18880,7 +18886,7 @@ mod tests {
                 let c = Arc::clone(&counter);
                 s.spawn(move || {
                     let amount_u64 = amount as u64;
-                    c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    c.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                         Some(cur.saturating_sub(amount_u64))
                     })
                     .ok();
@@ -18925,7 +18931,7 @@ mod tests {
                 s.spawn(move || {
                     loop {
                         let prev = c
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                                 Some(cur.saturating_sub(drain_batch))
                             })
                             .unwrap_or(0);

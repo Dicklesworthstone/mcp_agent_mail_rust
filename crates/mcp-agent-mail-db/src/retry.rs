@@ -557,7 +557,7 @@ fn jitter_factor() -> f64 {
     // LCG: x' = (a*x + c) mod 2^64
     let a: u64 = 6_364_136_223_846_793_005;
     let c: u64 = 1_442_695_040_888_963_407;
-    let old = SEED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+    let old = SEED.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
         Some(x.wrapping_mul(a).wrapping_add(c))
     });
     let val = old.unwrap_or(42);

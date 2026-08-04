@@ -1104,7 +1104,7 @@ mod tests {
         fn embed_batch(&self, texts: &[&str]) -> SearchResult<Vec<EmbeddingResult>> {
             let should_fail = self
                 .fail_batches_remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok();

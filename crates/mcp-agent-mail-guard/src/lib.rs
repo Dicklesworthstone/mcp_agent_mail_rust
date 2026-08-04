@@ -14,6 +14,14 @@ pub enum GuardError {
     InvalidReservationPattern { pattern: String, error: String },
     #[error("missing AGENT_NAME env var")]
     MissingAgentName,
+    #[error(
+        "refusing to install a per-project guard into the machine-wide hooks directory \
+         '{hooks_path}' configured by {origin} core.hooksPath: every repository on this \
+         machine would run this project's reservation guard. Either set a repo-local hooks \
+         path first (`git config --local core.hooksPath <dir>`), or explicitly allow the \
+         shared directory with AGENT_MAIL_GUARD_ALLOW_GLOBAL_HOOKSPATH=1."
+    )]
+    GlobalHooksPath { hooks_path: String, origin: String },
     #[error("git error: {0}")]
     Git(#[from] git2::Error),
     #[error("io error: {0}")]
@@ -167,6 +175,93 @@ pub fn resolve_hooks_dir(repo_path: &Path) -> GuardResult<PathBuf> {
                 return Ok(expanded);
             }
 
+            let root = repo.workdir().unwrap_or(repo_path).to_path_buf();
+            return Ok(root.join(expanded));
+        }
+    }
+
+    let common_git_dir = resolve_common_git_dir(&repo)?;
+    Ok(common_git_dir.join("hooks"))
+}
+
+fn env_allows_global_hookspath() -> bool {
+    std::env::var("AGENT_MAIL_GUARD_ALLOW_GLOBAL_HOOKSPATH")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "t" | "yes" | "y"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Whether an install into a `core.hooksPath` configured at `level` must be
+/// refused. Repo-scoped levels (local/worktree/app) are always honored;
+/// machine-wide levels (global/system/XDG) are refused unless explicitly
+/// allowed (GH#223).
+fn hookspath_level_refuses_install(level: git2::ConfigLevel, allow_global: bool) -> bool {
+    let repo_scoped = matches!(
+        level,
+        git2::ConfigLevel::Local | git2::ConfigLevel::Worktree | git2::ConfigLevel::App
+    );
+    !repo_scoped && !allow_global
+}
+
+fn config_level_label(level: git2::ConfigLevel) -> &'static str {
+    match level {
+        git2::ConfigLevel::System => "system",
+        git2::ConfigLevel::XDG => "XDG",
+        git2::ConfigLevel::Global => "global",
+        git2::ConfigLevel::Local => "local",
+        git2::ConfigLevel::Worktree => "worktree",
+        git2::ConfigLevel::App => "app",
+        _ => "inherited",
+    }
+}
+
+/// Resolve the hooks directory to *install into*.
+///
+/// GH#223: unlike [`resolve_hooks_dir`] (which mirrors git's runtime lookup
+/// and is the right resolver for `uninstall`/`status`, so existing installs
+/// can always be found), installation must not silently honor a
+/// `core.hooksPath` inherited from global/system git config. Such a directory
+/// is used by *every repository on the machine*, so installing the per-project
+/// guard chain-runner there displaces the user's global hooks and turns a
+/// project-scoped reservation guard into a machine-wide gate.
+///
+/// A repo-scoped `core.hooksPath` (local/worktree config, e.g. husky-style
+/// setups) is honored as before. A global/system value is refused with an
+/// actionable error unless `AGENT_MAIL_GUARD_ALLOW_GLOBAL_HOOKSPATH=1` is set.
+pub fn resolve_install_hooks_dir(repo_path: &Path) -> GuardResult<PathBuf> {
+    if !repo_path.exists() {
+        return Err(GuardError::InvalidRepo {
+            path: repo_path.display().to_string(),
+        });
+    }
+
+    let repo = git2::Repository::discover(repo_path)?;
+    if repo.is_bare() || repo.workdir().is_none() {
+        return Err(GuardError::InvalidRepo {
+            path: repo_path.display().to_string(),
+        });
+    }
+
+    let config = repo.config()?;
+    if let Ok(entry) = config.get_entry("core.hookspath") {
+        let raw = entry.value().unwrap_or("").trim().to_string();
+        if !raw.is_empty() {
+            let level = entry.level();
+            if hookspath_level_refuses_install(level, env_allows_global_hookspath()) {
+                return Err(GuardError::GlobalHooksPath {
+                    hooks_path: raw,
+                    origin: config_level_label(level).to_string(),
+                });
+            }
+            drop(entry);
+            let expanded = expand_user(&raw);
+            if expanded.is_absolute() {
+                return Ok(expanded);
+            }
             let root = repo.workdir().unwrap_or(repo_path).to_path_buf();
             return Ok(root.join(expanded));
         }
@@ -350,6 +445,28 @@ HOOK_NAME = __HOOK_NAME_JSON__
 AGENT_NAME = os.environ.get("AGENT_NAME", "").strip()
 GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
 
+def fail_closed(message):
+    """Fail-closed exit for guard infrastructure failures (GH#224).
+
+    Every fail-closed path must (a) honor AGENT_MAIL_GUARD_MODE=warn, which
+    the guard's own block message advertises, and (b) name the
+    AGENT_MAIL_BYPASS escape hatch, so an operator is never stuck behind an
+    exit 2 with no advertised way out.
+    """
+    if GUARD_MODE == "warn":
+        print(
+            "WARNING: " + message + " (AGENT_MAIL_GUARD_MODE=warn: allowing)",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+    print("ERROR: " + message, file=sys.stderr)
+    print(
+        "Set AGENT_MAIL_GUARD_MODE=warn to continue with a warning, or "
+        "AGENT_MAIL_BYPASS=1 to skip this guard entirely.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 # br-8ujfs.5.5 (E5) — Python-side SIGSEGV retry for git 2.51.0 index race.
 # Matches the Rust retry policy (3 retries, 100/400/1600ms jittered).
 # Only retries on segfault-shaped exits (139 = 128+11, 135 = 128+7,
@@ -468,17 +585,9 @@ def get_staged_files():
                 out.append(f)
         return out
     except subprocess.CalledProcessError as exc:
-        print(
-            "mcp-agent-mail: guard failed to inspect staged files: " + str(exc),
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        fail_closed("mcp-agent-mail: guard failed to inspect staged files: " + str(exc))
     except Exception as exc:
-        print(
-            "mcp-agent-mail: guard failed to inspect staged files: " + str(exc),
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        fail_closed("mcp-agent-mail: guard failed to inspect staged files: " + str(exc))
 
 def get_push_files():
     """Get list of files modified in the push (for pre-push)."""
@@ -518,11 +627,9 @@ def get_push_files():
                 detail = (res.stderr or "").strip()
                 if not detail:
                     detail = f"git rev-list exited with status {res.returncode}"
-                print(
-                    "mcp-agent-mail: guard failed to enumerate pushed commits: " + detail,
-                    file=sys.stderr,
+                fail_closed(
+                    "mcp-agent-mail: guard failed to enumerate pushed commits: " + detail
                 )
-                sys.exit(2)
 
             commits = [c.strip() for c in res.stdout.splitlines() if c.strip()]
 
@@ -544,11 +651,9 @@ def get_push_files():
                     detail = diff_res.stderr.decode("utf-8", "ignore").strip()
                     if not detail:
                         detail = f"git diff-tree exited with status {diff_res.returncode}"
-                    print(
-                        "mcp-agent-mail: guard failed to inspect pushed commit paths: " + detail,
-                        file=sys.stderr,
+                    fail_closed(
+                        "mcp-agent-mail: guard failed to inspect pushed commit paths: " + detail
                     )
-                    sys.exit(2)
                 data = diff_res.stdout
                 parts = data.split(b'\0')
                 i = 0
@@ -570,12 +675,10 @@ def get_push_files():
                             p = parts[i].decode('utf-8', 'ignore')
                             if p: files.add(p)
                             i += 1
+    except SystemExit:
+        raise
     except Exception as exc:
-        print(
-            "mcp-agent-mail: guard failed to inspect push files: " + str(exc),
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        fail_closed("mcp-agent-mail: guard failed to inspect push files: " + str(exc))
     return sorted(list(files))
 
 def is_real_directory(path):
@@ -682,14 +785,24 @@ def project_metadata_matches(
     return bool(canonical_human_key and canonical_human_key in {canonical_project, canonical_repo})
 
 def resolve_archive_root():
+    """Locate this project's archive root.
+
+    Returns (archive_root, suspicious_entry):
+    - (path, None) when a matching archive is found;
+    - (None, name) when an archive whose directory name collides with this
+      project's slug exists but provably belongs to a different project
+      (slug collision -- the guard must stay fail-closed, GH#224 note);
+    - (None, None) when nothing in the storage root relates to this repo at
+      all (nothing to guard -- callers may fail open).
+    """
     repo_root = get_repo_root()
     if repo_root and is_real_directory(os.path.join(repo_root, "file_reservations")):
-        return repo_root
+        return repo_root, None
 
     storage_root = default_storage_root()
     projects_dir = os.path.join(storage_root, "projects")
     if not is_real_directory(projects_dir):
-        return None
+        return None, None
 
     project_value = PROJECT.strip()
     project_slug = slugify(project_value) if project_value else ""
@@ -722,8 +835,15 @@ def resolve_archive_root():
     try:
         entries = sorted(os.scandir(projects_dir), key=lambda entry: entry.name)
     except OSError:
-        return None
+        return None, None
 
+    slug_candidates = set(explicit_names)
+    if project_slug:
+        slug_candidates.add(project_slug)
+    if repo_slug:
+        slug_candidates.add(repo_slug)
+
+    suspicious = None
     for entry in entries:
         try:
             if not entry.is_dir(follow_symlinks=False):
@@ -735,15 +855,19 @@ def resolve_archive_root():
         if not is_real_directory(os.path.join(candidate, "file_reservations")):
             continue
         if entry.name in explicit_names:
-            return candidate
+            return candidate, None
 
         metadata_path = os.path.join(candidate, "project.json")
         if not is_real_file(metadata_path):
+            if suspicious is None and entry.name in slug_candidates:
+                suspicious = entry.name
             continue
         try:
             with open(metadata_path, "r", encoding="utf-8") as handle:
                 metadata = json.load(handle)
         except Exception:
+            if suspicious is None and entry.name in slug_candidates:
+                suspicious = entry.name
             continue
         if project_metadata_matches(
             metadata,
@@ -754,9 +878,11 @@ def resolve_archive_root():
             canonical_project,
             canonical_repo,
         ):
-            return candidate
+            return candidate, None
+        if suspicious is None and entry.name in slug_candidates:
+            suspicious = entry.name
 
-    return None
+    return None, suspicious
 
 def released_ts_marks_released(value):
     if value is None:
@@ -801,13 +927,29 @@ def is_expired(value, now):
 
 def get_active_reservations():
     """Read active file reservations directly from the archive."""
-    archive_root = resolve_archive_root()
+    archive_root, suspicious = resolve_archive_root()
     if not archive_root:
+        if suspicious:
+            # An archive directory named like this project's slug exists but
+            # provably belongs to a different project (slug collision).
+            # Reservations for THIS repo may exist yet be unlocatable, so
+            # stay fail-closed (through the GH#224 path that honors warn
+            # mode and names the bypass).
+            fail_closed(
+                f"mcp-agent-mail: guard could not locate archive for project "
+                f"{PROJECT!r} (archive {suspicious!r} exists but belongs to a "
+                "different project -- slug collision)"
+            )
+        # GH#224: this repo matches no agent-mail project archive, so there
+        # are no reservations that could apply and nothing to guard. Fail
+        # OPEN with a visible note -- a guard reachable from a machine-wide
+        # core.hooksPath (GH#223) must not become an every-repo commit gate.
         print(
-            f"mcp-agent-mail: guard could not locate archive for project {PROJECT!r}",
+            f"mcp-agent-mail: no agent-mail archive matches project {PROJECT!r}; "
+            "nothing to guard, allowing",
             file=sys.stderr,
         )
-        sys.exit(2)
+        return []
 
     reservations_dir = os.path.join(archive_root, "file_reservations")
     if not is_real_directory(reservations_dir):
@@ -818,8 +960,9 @@ def get_active_reservations():
     try:
         entries = sorted(os.scandir(reservations_dir), key=lambda entry: entry.name)
     except OSError as exc:
-        print("mcp-agent-mail: guard failed to read reservations: " + str(exc), file=sys.stderr)
-        sys.exit(2)
+        # Real reservation data exists but cannot be read: stay fail-closed,
+        # but through the GH#224 path that honors warn mode + names bypass.
+        fail_closed("mcp-agent-mail: guard failed to read reservations: " + str(exc))
 
     for entry in entries:
         try:
@@ -1056,10 +1199,9 @@ def is_truthy(val):
     return str(val).strip().lower() in ("1", "true", "t", "yes", "y")
 
 def main():
-    if not AGENT_NAME:
-        print("mcp-agent-mail: AGENT_NAME environment variable is required.", file=sys.stderr)
-        sys.exit(2)
-
+    # GH#224: the bypass/enforcement toggles must be honored before any
+    # fail-closed requirement (previously a missing AGENT_NAME exited 2 even
+    # with AGENT_MAIL_BYPASS=1 set).
     if is_truthy(os.environ.get("AGENT_MAIL_BYPASS")):
         sys.exit(0)
 
@@ -1079,6 +1221,16 @@ def main():
     if not reservations:
         sys.exit(0)
 
+    # AGENT_NAME is only needed once active reservations exist (it exempts
+    # the agent's own reservations from conflict checks). Requiring it
+    # earlier turned every commit in unrelated repos into a hard failure
+    # when the guard ran from a shared hooks directory (GH#223/GH#224).
+    if not AGENT_NAME:
+        fail_closed(
+            "mcp-agent-mail: AGENT_NAME environment variable is required "
+            "to evaluate active file reservations against your own holdings"
+        )
+
     conflicts = check_conflicts(files_to_check, reservations)
     if not conflicts:
         sys.exit(0)
@@ -1092,7 +1244,11 @@ def main():
         sys.exit(0)
     else:
         print(f"ERROR: {msg}", file=sys.stderr)
-        print("Set AGENT_MAIL_GUARD_MODE=warn to allow commit anyway.", file=sys.stderr)
+        print(
+            "Set AGENT_MAIL_GUARD_MODE=warn to allow commit anyway, or "
+            "AGENT_MAIL_BYPASS=1 to skip this guard.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 if __name__ == "__main__":
@@ -1113,7 +1269,9 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
         });
     }
 
-    let hooks_dir = resolve_hooks_dir(repo)?;
+    // GH#223: install-time resolution refuses machine-wide (global/system)
+    // core.hooksPath targets unless explicitly allowed.
+    let hooks_dir = resolve_install_hooks_dir(repo)?;
     std::fs::create_dir_all(&hooks_dir)?;
 
     // Helper to install a single hook type
@@ -4214,5 +4372,246 @@ mod tests {
                 String::from_utf8_lossy(&allowed.stderr),
             );
         }
+    }
+
+    /// GH#224: a repo that matches no agent-mail project has nothing to
+    /// guard — the plugin must allow the commit (exit 0) instead of failing
+    /// closed with exit 2.
+    #[test]
+    fn guard_plugin_allows_commit_in_repo_matching_no_project() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("unrelated-repo");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("notes.md"), "hello\n").expect("write file");
+        run_git(&repo_dir, &["add", "notes.md"]);
+
+        // A populated storage root that contains only an UNRELATED project.
+        let other_archive = storage_root.join("projects").join("some-other-project");
+        std::fs::create_dir_all(other_archive.join("file_reservations")).expect("mkdir archive");
+        std::fs::write(
+            other_archive.join("project.json"),
+            serde_json::json!({
+                "slug": "some-other-project",
+                "human_key": "/somewhere/else/entirely",
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script("/an/uninstalled/project", "pre-commit"),
+        )
+        .expect("write guard script");
+
+        let output = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env("STORAGE_ROOT", &storage_root)
+            .arg(&script_path)
+            .output()
+            .expect("run guard script");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "guard must fail open when no project matches this repo: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("nothing to guard"),
+            "expected a visible nothing-to-guard note, got stderr={}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// GH#224: AGENT_MAIL_BYPASS must work even when AGENT_NAME is unset
+    /// (previously the AGENT_NAME requirement exited 2 before the bypass was
+    /// consulted).
+    #[test]
+    fn guard_plugin_bypass_works_without_agent_name() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("a.rs"), "fn a() {}\n").expect("write file");
+        run_git(&repo_dir, &["add", "a.rs"]);
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+
+        let output = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env_remove("AGENT_NAME")
+            .env("AGENT_MAIL_BYPASS", "1")
+            .arg(&script_path)
+            .output()
+            .expect("run guard script");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "AGENT_MAIL_BYPASS=1 must short-circuit before the AGENT_NAME requirement: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// GH#224: when active reservations exist and AGENT_NAME is missing, the
+    /// guard stays fail-closed in block mode (exit 2, naming the bypass) but
+    /// honors AGENT_MAIL_GUARD_MODE=warn (exit 0).
+    #[test]
+    fn guard_plugin_missing_agent_name_with_reservations_honors_warn_mode() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("a.rs"), "fn a() {}\n").expect("write file");
+        run_git(&repo_dir, &["add", "a.rs"]);
+
+        let identity = mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy());
+        let archive_root = storage_root.join("projects").join(&identity.slug);
+        let reservations_dir = archive_root.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        std::fs::write(
+            archive_root.join("project.json"),
+            serde_json::json!({
+                "slug": identity.slug,
+                "human_key": repo_dir.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+        std::fs::write(
+            reservations_dir.join("res.json"),
+            serde_json::json!({
+                "path_pattern": "a.rs",
+                "agent_name": "OtherAgent",
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+
+        // Block mode (default): fail closed, and the failure must advertise
+        // the bypass escape hatch.
+        let blocked = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env_remove("AGENT_NAME")
+            .env("STORAGE_ROOT", &storage_root)
+            .arg(&script_path)
+            .output()
+            .expect("run guard script (block)");
+        assert_eq!(
+            blocked.status.code(),
+            Some(2),
+            "missing AGENT_NAME with active reservations must fail closed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&blocked.stdout),
+            String::from_utf8_lossy(&blocked.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&blocked.stderr);
+        assert!(
+            stderr.contains("AGENT_NAME environment variable is required"),
+            "expected AGENT_NAME requirement, got stderr={stderr}",
+        );
+        assert!(
+            stderr.contains("AGENT_MAIL_BYPASS=1"),
+            "fail-closed output must advertise the bypass, got stderr={stderr}",
+        );
+
+        // Warn mode: same situation must allow with a warning.
+        let warned = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env_remove("AGENT_NAME")
+            .env("STORAGE_ROOT", &storage_root)
+            .env("AGENT_MAIL_GUARD_MODE", "warn")
+            .arg(&script_path)
+            .output()
+            .expect("run guard script (warn)");
+        assert_eq!(
+            warned.status.code(),
+            Some(0),
+            "AGENT_MAIL_GUARD_MODE=warn must soften infrastructure fail-closed paths: stdout={}, stderr={}",
+            String::from_utf8_lossy(&warned.stdout),
+            String::from_utf8_lossy(&warned.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&warned.stderr).contains("WARNING"),
+            "warn mode must still warn, got stderr={}",
+            String::from_utf8_lossy(&warned.stderr),
+        );
+    }
+
+    /// GH#223: installation must honor a repo-local core.hooksPath but refuse
+    /// machine-wide (global/system/XDG) values by default.
+    #[test]
+    fn install_hooks_dir_honors_repo_local_hookspath() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "--local", "core.hooksPath", ".husky"]);
+
+        let hooks = resolve_install_hooks_dir(&repo_dir).expect("resolve install hooks dir");
+        assert_eq!(hooks, repo_dir.join(".husky"));
+    }
+
+    #[test]
+    fn install_hooks_dir_defaults_to_git_hooks() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        let hooks = resolve_install_hooks_dir(&repo_dir).expect("resolve install hooks dir");
+        let canon_hooks = hooks.canonicalize().unwrap_or(hooks);
+        let expected = repo_dir.join(".git").join("hooks");
+        let canon_expected = expected.canonicalize().unwrap_or(expected);
+        assert_eq!(canon_hooks, canon_expected);
+    }
+
+    #[test]
+    fn hookspath_level_refusal_matrix() {
+        use git2::ConfigLevel;
+        // Machine-wide levels refuse by default…
+        assert!(hookspath_level_refuses_install(ConfigLevel::Global, false));
+        assert!(hookspath_level_refuses_install(ConfigLevel::System, false));
+        assert!(hookspath_level_refuses_install(ConfigLevel::XDG, false));
+        // …but are honored under the explicit opt-in.
+        assert!(!hookspath_level_refuses_install(ConfigLevel::Global, true));
+        // Repo-scoped levels are always honored.
+        assert!(!hookspath_level_refuses_install(ConfigLevel::Local, false));
+        assert!(!hookspath_level_refuses_install(ConfigLevel::Worktree, false));
+        assert!(!hookspath_level_refuses_install(ConfigLevel::App, false));
     }
 }

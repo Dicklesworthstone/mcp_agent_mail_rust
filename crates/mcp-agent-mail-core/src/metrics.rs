@@ -104,6 +104,18 @@ impl GaugeU64 {
         self.v.store(value, Ordering::Relaxed);
     }
 
+    /// Saturating decrement. Unlike `set`, deltas commute across threads, so
+    /// concurrent add/sub pairs can never strand the gauge at a stale value
+    /// the way racing `set(computed)` mirrors can (GH#225).
+    #[inline]
+    pub fn sub_saturating(&self, delta: u64) {
+        let _ = self
+            .v
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(delta))
+            });
+    }
+
     #[inline]
     pub fn load(&self) -> u64 {
         self.v.load(Ordering::Relaxed)

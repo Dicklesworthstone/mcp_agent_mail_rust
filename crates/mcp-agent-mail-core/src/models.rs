@@ -641,7 +641,12 @@ pub fn is_valid_agent_name(name: &str) -> bool {
 /// validation. Health / diagnostic checks must exempt these from the
 /// `malformed_agent_name` warning so the operator identity does not generate a
 /// permanent, un-actionable warning (see #243 Bug 3).
-pub const RESERVED_OPERATOR_AGENT_NAMES: &[&str] = &["HumanOverseer"];
+///
+/// `AirTrafficControl` is the ATC control plane's executor identity, likewise
+/// registered via `insert_system_agent` (see #226): it must exist as a real
+/// agent row so ATC probe/advisory `send_message` effects can name it as the
+/// sender, but it is deliberately not an adjective+noun name.
+pub const RESERVED_OPERATOR_AGENT_NAMES: &[&str] = &["HumanOverseer", "AirTrafficControl"];
 
 /// Returns `true` if `name` is a reserved operator / system identity that is
 /// exempt from adjective+noun validation (case-insensitive, trimmed).

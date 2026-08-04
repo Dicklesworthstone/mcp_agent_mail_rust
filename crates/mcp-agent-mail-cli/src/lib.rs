@@ -6152,8 +6152,9 @@ fn emit_pre_tui_startup_banner(config: &Config) {
 }
 
 /// How long a non-takeover `am serve-http` will wait for the restart-coordination
-/// lock before proceeding unlocked (best-effort). While waiting it re-probes
-/// `/healthz`, so a peer that binds during the wait short-circuits this.
+/// lock before refusing to start (the holder is provably alive but not serving
+/// yet — see [`RestartDecision::ContendedAliveHolder`]). While waiting it
+/// re-probes `/healthz`, so a peer that binds during the wait short-circuits this.
 const RESTART_COORD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Single-owner restart-coordination lock for one storage root.
@@ -6175,10 +6176,20 @@ enum RestartDecision {
     /// A peer already won the restart and is answering `/healthz`; this
     /// invocation is redundant and should exit without fighting.
     PeerAlreadyServing,
-    /// Couldn't coordinate (lock contended past the wait / lock infra error) and
-    /// no live peer was seen — proceed best-effort without the lock. Never worse
-    /// than the pre-coordination behavior.
+    /// Couldn't coordinate because the lock INFRASTRUCTURE failed (lock file
+    /// could not be created/opened), or `--takeover` was requested against a
+    /// held lock — proceed best-effort without the lock. Never worse than the
+    /// pre-coordination behavior.
     ProceedUnlocked,
+    /// The restart lock is flock-held by another live process that never
+    /// answered `/healthz` within the wait. A held flock is kernel-released on
+    /// process death, so the holder is provably ALIVE — most likely a peer
+    /// mid-boot (reconstruct/salvage/migration can run for minutes before the
+    /// HTTP listener binds). Killing or racing it is exactly the
+    /// committed-row-loss generator from the 2026-08-01 fleet outage
+    /// (mcp_agent_mail#253), so startup REFUSES (non-zero exit; systemd
+    /// retries) instead of proceeding unlocked.
+    ContendedAliveHolder,
     /// Lock is contended but no peer is serving yet — keep waiting (loop-internal;
     /// never returned to the caller).
     KeepWaiting,
@@ -6212,9 +6223,12 @@ fn restart_lock_path(storage_root: &Path) -> PathBuf {
 /// Coordinate a server (re)start for `config.storage_root`.
 ///
 /// Returns the terminal [`RestartDecision`] and, when it is [`RestartDecision::Proceed`],
-/// the held lock guard (keep it alive for the server's lifetime). On any lock
-/// infrastructure failure this fails open to [`RestartDecision::ProceedUnlocked`]
-/// so coordination can never wedge a legitimate startup.
+/// the held lock guard (keep it alive for the server's lifetime). On lock
+/// INFRASTRUCTURE failure (lock file cannot be opened) this fails open to
+/// [`RestartDecision::ProceedUnlocked`] so broken lock plumbing can never wedge
+/// a legitimate startup. Contention with a live-but-not-yet-serving holder is
+/// NOT infrastructure failure and fails closed
+/// ([`RestartDecision::ContendedAliveHolder`]).
 fn coordinate_server_restart(
     config: &Config,
     takeover: bool,
@@ -6253,11 +6267,22 @@ fn coordinate_server_restart(
             RestartDecision::ProceedUnlocked => return (RestartDecision::ProceedUnlocked, None),
             RestartDecision::KeepWaiting => {
                 if Instant::now() >= deadline {
-                    return (RestartDecision::ProceedUnlocked, None);
+                    // The flock is still held by a live process that is not
+                    // answering /healthz — a peer mid-boot (reconstruct or
+                    // salvage can run far longer than this wait). Proceeding
+                    // unlocked here used to funnel straight into the
+                    // auto-clear kill path, which killed the booting holder
+                    // mid-write and lost committed rows (mcp_agent_mail#253,
+                    // 2026-08-01 fleet outage). Fail closed instead: refuse
+                    // to start and let the supervisor retry.
+                    return (RestartDecision::ContendedAliveHolder, None);
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }
             RestartDecision::Proceed => unreachable!("acquired is handled above the probe"),
+            RestartDecision::ContendedAliveHolder => {
+                unreachable!("ContendedAliveHolder is produced only by the deadline check above")
+            }
         }
     }
 }
@@ -6342,16 +6367,32 @@ mod restart_coordination_tests {
     }
 
     #[test]
-    fn coordinate_proceeds_unlocked_after_timeout_when_held_with_no_peer() {
+    fn coordinate_refuses_after_timeout_when_held_by_alive_holder_with_no_peer() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_with_unused_port(dir.path());
         let (first, _held) = coordinate_server_restart(&config, false, Duration::from_millis(100));
         assert_eq!(first, RestartDecision::Proceed);
-        // No peer is serving (unused port), so a non-takeover contender waits the
-        // short deadline and then proceeds unlocked rather than wedging.
+        // The lock is flock-held by a live process (us) that is NOT answering
+        // /healthz — exactly what a peer mid-reconstruct looks like. A
+        // non-takeover contender must FAIL CLOSED (refuse to start) rather
+        // than proceed unlocked into the kill path: proceeding here is what
+        // lost committed rows in the 2026-08-01 outage (mcp_agent_mail#253).
         let (second, lock2) = coordinate_server_restart(&config, false, Duration::from_millis(250));
-        assert_eq!(second, RestartDecision::ProceedUnlocked);
+        assert_eq!(second, RestartDecision::ContendedAliveHolder);
         assert!(lock2.is_none());
+    }
+
+    #[test]
+    fn coordinate_reacquires_after_holder_releases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_with_unused_port(dir.path());
+        let (first, held) = coordinate_server_restart(&config, false, Duration::from_millis(100));
+        assert_eq!(first, RestartDecision::Proceed);
+        drop(held); // holder exits (flock released by the kernel)
+        // A retry (e.g. the supervisor's next attempt) must now win the lock.
+        let (second, lock2) = coordinate_server_restart(&config, false, Duration::from_millis(250));
+        assert_eq!(second, RestartDecision::Proceed);
+        assert!(lock2.is_some());
     }
 }
 
@@ -6403,6 +6444,21 @@ fn handle_serve_http(
             "another Agent Mail server is already serving this storage root ({}) and is \
              answering /healthz on {}:{}; not restarting (avoiding restart-fighting). Connect \
              to it, or pass `am serve-http --takeover` to forcibly seize the port.",
+            config.storage_root.display(),
+            config.http_host,
+            config.http_port,
+        )));
+    }
+    if restart_decision == RestartDecision::ContendedAliveHolder {
+        return Err(CliError::Other(format!(
+            "another Agent Mail process is holding the restart-coordination lock for this \
+             storage root ({}) but is not answering /healthz on {}:{} yet — it is most \
+             likely still booting (startup reconstruction/salvage can take minutes). \
+             Refusing to start rather than kill a live peer mid-write (see \
+             mcp_agent_mail#253: that race loses committed rows and wedges the mailbox). \
+             The supervisor may simply retry; to inspect the holder run \
+             `am doctor locks`, or pass `am serve-http --takeover` to forcibly seize the \
+             storage root.",
             config.storage_root.display(),
             config.http_host,
             config.http_port,

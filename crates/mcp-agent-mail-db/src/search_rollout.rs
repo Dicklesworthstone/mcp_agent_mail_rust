@@ -204,7 +204,7 @@ impl ShadowMetrics {
         // Sum latency with saturation to avoid wraparound under extreme values.
         let _ =
             self.latency_delta_sum
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_add(comparison.latency_delta_ms))
                 });
     }

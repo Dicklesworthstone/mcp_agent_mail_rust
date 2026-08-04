@@ -185,7 +185,22 @@ impl HealthSignals {
         );
         // Queue latency histograms are cumulative; ignore historical spikes
         // once the queue has drained so old pressure does not pin health.
-        let wbq_queue_p95_us = if snap.storage.wbq_depth == 0 {
+        //
+        // GH#225 defense-in-depth: the depth gauge is maintained by commuting
+        // delta updates, but if it ever strands above the true depth
+        // (historical `set()` races, process bugs), a provably drained queue
+        // (enqueued == drained) must still disarm this guard — otherwise the
+        // cumulative p95 pins health red forever on an idle server.
+        let wbq_backlog = snap
+            .storage
+            .wbq_enqueued_total
+            .saturating_sub(snap.storage.wbq_drained_total);
+        let wbq_effective_depth = if snap.storage.wbq_depth < wbq_backlog {
+            snap.storage.wbq_depth
+        } else {
+            wbq_backlog
+        };
+        let wbq_queue_p95_us = if wbq_effective_depth == 0 {
             0
         } else {
             snap.storage.wbq_queue_latency_us.p95
@@ -422,7 +437,7 @@ pub fn refresh_health_level() -> (HealthLevel, bool) {
     let changed = prev != new as u8;
     if changed {
         // Saturating increment for observability (clamped at 255).
-        let _ = LEVEL_TRANSITIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = LEVEL_TRANSITIONS.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_add(1))
         });
     }
@@ -1077,6 +1092,10 @@ mod tests {
         snap.db.pool_over_80_since_us = now_us - 42_000_000;
         snap.storage.wbq_depth = 75;
         snap.storage.wbq_capacity = 100;
+        // Keep the enqueued-drained backlog consistent with the depth gauge
+        // so the GH#225 stranded-gauge clamp stays disarmed.
+        snap.storage.wbq_enqueued_total = 100;
+        snap.storage.wbq_drained_total = 25;
         snap.storage.wbq_queue_latency_us = HistogramSnapshot {
             count: 1,
             sum: 44_000,
@@ -1172,6 +1191,57 @@ mod tests {
         assert_eq!(signals.wbq_queue_p95_us, 0);
         assert_eq!(signals.commit_queue_p95_us, 0);
         assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn health_signals_stranded_depth_gauge_cannot_pin_red() {
+        // GH#225: a stale non-atomic depth mirror stuck at 1 while the queue
+        // is provably drained (enqueued == drained) must not re-arm the
+        // cumulative queue-wait p95 against the red threshold forever.
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.storage.wbq_depth = 1; // stranded mirror
+        snap.storage.wbq_capacity = 1024;
+        snap.storage.wbq_enqueued_total = 35;
+        snap.storage.wbq_drained_total = 35;
+        snap.storage.wbq_queue_latency_us = HistogramSnapshot {
+            count: 35,
+            sum: 10_604_000,
+            min: 1_000,
+            max: 10_604_000,
+            p50: 5_000,
+            p95: 10_604_000, // ~10.6s, dominated by historical git commits
+            p99: 10_604_000,
+        };
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.wbq_queue_p95_us, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn health_signals_real_backlog_still_reports_queue_latency() {
+        // Complement to the stranded-gauge guard: a genuine backlog
+        // (enqueued > drained) must keep the latency signal armed.
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.storage.wbq_depth = 3;
+        snap.storage.wbq_capacity = 1024;
+        snap.storage.wbq_enqueued_total = 38;
+        snap.storage.wbq_drained_total = 35;
+        snap.storage.wbq_queue_latency_us = HistogramSnapshot {
+            count: 38,
+            sum: 10_604_000,
+            min: 1_000,
+            max: 10_604_000,
+            p50: 5_000,
+            p95: 10_604_000,
+            p99: 10_604_000,
+        };
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.wbq_queue_p95_us, 10_604_000);
+        assert_eq!(signals.classify(), HealthLevel::Red);
     }
 
     #[test]
