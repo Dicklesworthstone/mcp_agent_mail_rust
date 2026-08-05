@@ -551,7 +551,20 @@ fn compute_health_verdicts(
     let archive_db_parity = if kind == SemanticVerdictKind::ArchiveParity {
         HealthVerdict::new(Red, true, semantic.detail.clone())
     } else {
-        HealthVerdict::new(Green, true, "git archive and sqlite index are aligned")
+        // Never assert bare alignment: the git archive legitimately trails the
+        // live SQLite index under write-behind flush, so a green parity verdict
+        // must DISCLOSE the actual inventory (carried in the semantic readiness
+        // detail) instead of claiming "aligned" over counts an operator can see
+        // disagree (bead hfdt-p311n). Green stays correct for within-tolerance
+        // write-behind drift; it just no longer hides it behind a false claim.
+        HealthVerdict::new(
+            Green,
+            true,
+            format!(
+                "git archive/sqlite index within write-behind tolerance ({})",
+                semantic.detail
+            ),
+        )
     };
 
     let transport_health = match probe_transport_decode() {
@@ -2496,6 +2509,30 @@ mod tests {
         assert!(
             verdicts.failing_names().is_empty()
                 || !verdicts.failing_names().contains(&"db_health".to_string())
+        );
+    }
+
+    #[test]
+    fn green_archive_parity_discloses_inventory_not_bare_aligned() {
+        // bead hfdt-p311n: a green archive_db_parity verdict must never hide
+        // visibly unequal archive/db counts behind a bare "aligned" claim. The
+        // old code returned Green + "git archive and sqlite index are aligned"
+        // regardless of the drift the semantic detail already reported.
+        let config = Config::from_env();
+        let drift_detail = "archive projects=13, agents=332, messages=1496, \
+             db projects=13, agents=338, messages=1498";
+        let verdicts = compute_health_verdicts(&config, true, &semantic("ok", drift_detail));
+        assert_eq!(verdicts.archive_db_parity.status, "green");
+        assert!(
+            verdicts.archive_db_parity.detail.contains("agents=338")
+                && verdicts.archive_db_parity.detail.contains("messages=1498"),
+            "a green parity verdict must disclose the actual db/archive counts, \
+             not claim bare alignment: {}",
+            verdicts.archive_db_parity.detail
+        );
+        assert_ne!(
+            verdicts.archive_db_parity.detail, "git archive and sqlite index are aligned",
+            "must not assert bare alignment over visibly unequal counts"
         );
     }
 
