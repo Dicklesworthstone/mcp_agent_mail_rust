@@ -344,7 +344,9 @@ fn is_legacy_single_file_guard(contents: &str) -> bool {
 }
 
 fn render_chain_runner_script(hook_name: &str) -> String {
-    // Mirrors legacy behavior: run hooks.d/<hook>/* in lexical order; forward stdin for pre-push.
+    // Run hooks.d/<hook>/* in lexical order and preserve the first failure
+    // without skipping later guards. Pre-push children all receive the exact
+    // same ref-update bytes.
     let mut lines: Vec<String> = vec![
         "#!/usr/bin/env python3".to_string(),
         format!("# mcp-agent-mail chain-runner ({hook_name})"),
@@ -382,11 +384,23 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         "".to_string(),
         "def _run_child(path: Path, * , stdin_bytes=None):".to_string(),
         "    # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.".to_string(),
-        "    if os.name != 'posix' and path.suffix.lower() == '.py':".to_string(),
-        "        return subprocess.run([sys.executable, str(path)], input=stdin_bytes, check=False).returncode"
+        "    try:".to_string(),
+        "        if os.name != 'posix' and path.suffix.lower() == '.py':".to_string(),
+        "            return subprocess.run([sys.executable, str(path)], input=stdin_bytes, check=False).returncode"
             .to_string(),
-        "    return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode"
+        "        return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode"
             .to_string(),
+        "    except OSError as exc:".to_string(),
+        "        print(f'mcp-agent-mail chain-runner: could not execute {path.name}: {exc}', file=sys.stderr)"
+            .to_string(),
+        "        return 126".to_string(),
+        "".to_string(),
+        "def _remember_failure(path: Path, rc: int, first_failure: int) -> int:".to_string(),
+        "    if rc == 0:".to_string(),
+        "        return first_failure".to_string(),
+        "    print(f'mcp-agent-mail chain-runner: {path.name} exited with status {rc}', file=sys.stderr)"
+            .to_string(),
+        "    return first_failure or rc".to_string(),
         "".to_string(),
     ];
 
@@ -394,29 +408,27 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         lines.extend([
             "# Read STDIN once (Git passes ref tuples); forward to children".to_string(),
             "stdin_bytes = sys.stdin.buffer.read()".to_string(),
+            "first_failure = 0".to_string(),
             "for exe in _list_execs():".to_string(),
             "    rc = _run_child(exe, stdin_bytes=stdin_bytes)".to_string(),
-            "    if rc != 0:".to_string(),
-            "        sys.exit(rc)".to_string(),
+            "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
             "".to_string(),
             "if ORIG.exists():".to_string(),
             "    rc = _run_child(ORIG, stdin_bytes=stdin_bytes)".to_string(),
-            "    if rc != 0:".to_string(),
-            "        sys.exit(rc)".to_string(),
-            "sys.exit(0)".to_string(),
+            "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
+            "sys.exit(first_failure)".to_string(),
         ]);
     } else {
         lines.extend([
+            "first_failure = 0".to_string(),
             "for exe in _list_execs():".to_string(),
             "    rc = _run_child(exe)".to_string(),
-            "    if rc != 0:".to_string(),
-            "        sys.exit(rc)".to_string(),
+            "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
             "".to_string(),
             "if ORIG.exists():".to_string(),
             "    rc = _run_child(ORIG)".to_string(),
-            "    if rc != 0:".to_string(),
-            "        sys.exit(rc)".to_string(),
-            "sys.exit(0)".to_string(),
+            "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
+            "sys.exit(first_failure)".to_string(),
         ]);
     }
 
@@ -4717,6 +4729,153 @@ mod tests {
         assert!(
             blocked_stderr.contains("file reservation conflict"),
             "expected the real conflict message, got stderr={blocked_stderr}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chain_runner_runs_later_pre_commit_hooks_after_guard_failure() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let marker = td.path().join("marker.txt");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        install_guard(&repo_dir.to_string_lossy(), &repo_dir, false).expect("install guard");
+
+        let hooks_dir = resolve_hooks_dir(&repo_dir).expect("hooks dir");
+        write_guard_file_atomic(
+            &hooks_dir
+                .join("hooks.d")
+                .join("pre-commit")
+                .join("60-later"),
+            "#!/bin/sh\nprintf 'later\\n' >> \"$CHAIN_MARKER\"\n",
+            true,
+        )
+        .expect("write later hook");
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-commit.orig"),
+            "#!/bin/sh\nprintf 'orig\\n' >> \"$CHAIN_MARKER\"\n",
+            true,
+        )
+        .expect("write original hook");
+
+        let output = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env_remove("TMUX_PANE")
+            .env_remove("AGENT_NAME")
+            .env("CHAIN_MARKER", &marker)
+            .arg(hooks_dir.join("pre-commit"))
+            .output()
+            .expect("run pre-commit chain");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "chain must preserve the Agent Mail identity failure: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            "later\norig\n",
+            "later and original hooks must run in order after a guard failure"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(PLUGIN_FILE_NAME),
+            "chain should identify the failed plugin: stderr={}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_push_chain_forwards_identical_stdin_after_guard_failure() {
+        use std::io::Write;
+
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let later_stdin = td.path().join("later.stdin");
+        let original_stdin = td.path().join("original.stdin");
+        let marker = td.path().join("marker.txt");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        install_guard(&repo_dir.to_string_lossy(), &repo_dir, true).expect("install guard");
+
+        let hooks_dir = resolve_hooks_dir(&repo_dir).expect("hooks dir");
+        write_guard_file_atomic(
+            &hooks_dir
+                .join("hooks.d")
+                .join("pre-push")
+                .join("60-later"),
+            "#!/bin/sh\ncat > \"$CHAIN_LATER_STDIN\"\nprintf 'later\\n' >> \"$CHAIN_MARKER\"\nexit 9\n",
+            true,
+        )
+        .expect("write later hook");
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-push.orig"),
+            "#!/bin/sh\ncat > \"$CHAIN_ORIGINAL_STDIN\"\nprintf 'orig\\n' >> \"$CHAIN_MARKER\"\n",
+            true,
+        )
+        .expect("write original hook");
+
+        let ref_updates = b"refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+refs/heads/main bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+refs/heads/topic cccccccccccccccccccccccccccccccccccccccc \
+refs/heads/topic dddddddddddddddddddddddddddddddddddddddd\n";
+        let mut child = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env_remove("TMUX_PANE")
+            .env_remove("AGENT_NAME")
+            .env("CHAIN_LATER_STDIN", &later_stdin)
+            .env("CHAIN_ORIGINAL_STDIN", &original_stdin)
+            .env("CHAIN_MARKER", &marker)
+            .arg(hooks_dir.join("pre-push"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn pre-push chain");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(ref_updates)
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("wait output");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "chain must preserve the Agent Mail identity failure: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            std::fs::read(&later_stdin).expect("read later stdin"),
+            ref_updates
+        );
+        assert_eq!(
+            std::fs::read(&original_stdin).expect("read original stdin"),
+            ref_updates
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            "later\norig\n",
+            "later and original hooks must run in order after a guard failure"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("{PLUGIN_FILE_NAME} exited with status 2"))
+                && stderr.contains("60-later exited with status 9"),
+            "chain should report every failed plugin while returning the first status: stderr={stderr}"
         );
     }
 }
