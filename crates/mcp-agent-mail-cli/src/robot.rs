@@ -2535,6 +2535,11 @@ pub enum RobotSubcommand {
     TuiDump,
 
     /// Actionable inbox with priority ordering, urgency/ack synthesis.
+    ///
+    /// Defaults to UNREAD messages only (as if --unread were passed) unless
+    /// --urgent, --ack-overdue, or --all is given. Listing never marks
+    /// messages read: read state changes only via explicit `am mail read`
+    /// or acknowledgement (GH#229).
     Inbox {
         /// Show only urgent messages.
         #[arg(long)]
@@ -5394,6 +5399,14 @@ fn robot_inbox_server_arguments(request: &RobotInboxServerRequest) -> serde_json
         "include_bodies": request.include_bodies,
         "unread_only": unread_only,
         "ack_overdue_only": ack_overdue_only,
+        // `am inbox` is a listing, not a consumption: without this the
+        // fetch_inbox tool auto-marks every returned row read, and the
+        // client-side bucket filter then hides those same rows from the very
+        // response that consumed them — messages nobody ever saw become
+        // permanently invisible to the default unread-only view (GH#229).
+        // Read-state changes are left to explicit `am mail read` / ack, the
+        // same non-consuming-peek contract check-inbox adopted in GH#207.
+        "mark_read": false,
     })
 }
 
@@ -17249,6 +17262,8 @@ mod tests {
         let default_args = robot_inbox_server_arguments(&default_request);
         assert_eq!(default_args["unread_only"], true);
         assert_eq!(default_args["ack_overdue_only"], false);
+        // Listing must never consume unread state (GH#229).
+        assert_eq!(default_args["mark_read"], false);
 
         let urgent_request = RobotInboxServerRequest {
             urgent: true,
@@ -17279,6 +17294,7 @@ mod tests {
         let all_args = robot_inbox_server_arguments(&all_request);
         assert_eq!(all_args["unread_only"], false);
         assert_eq!(all_args["ack_overdue_only"], false);
+        assert_eq!(all_args["mark_read"], false);
     }
 
     #[test]

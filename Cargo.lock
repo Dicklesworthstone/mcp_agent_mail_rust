@@ -1744,6 +1744,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastdivide"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6076,7 +6087,7 @@ dependencies = [
  "backtrace",
  "bitflags 2.13.1",
  "crossterm",
- "fancy-regex",
+ "fancy-regex 0.18.0",
  "log",
  "lru 0.16.4",
  "num-rational",
@@ -7217,7 +7228,7 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
- "fancy-regex",
+ "fancy-regex 0.17.0",
  "getrandom 0.3.4",
  "indicatif",
  "itertools 0.14.0",

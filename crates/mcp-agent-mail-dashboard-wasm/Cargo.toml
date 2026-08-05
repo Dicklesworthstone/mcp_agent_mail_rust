@@ -1,6 +1,6 @@
 [package]
 name = "mcp-agent-mail-dashboard-wasm"
-version = "0.3.24"
+version = "0.3.25"
 edition = "2024"
 license-file = "../../LICENSE"
 rust-version = "1.95"
