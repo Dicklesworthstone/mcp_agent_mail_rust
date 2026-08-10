@@ -208,21 +208,65 @@ ftui-layout = { path = "../frankentui/crates/ftui-layout" }
 ftui-style = { path = "../frankentui/crates/ftui-style" }
 ftui-text = { path = "../frankentui/crates/ftui-text" }
 ftui-backend = { path = "../frankentui/crates/ftui-backend" }
+# FrankenSQLite git-rev pin — see the rationale block above the
+# dependency notes. Every fsqlite crate in the graph is patched to ONE
+# rev so beads_rust and sqlmodel-frankensqlite share a single engine.
+#
+# PARKED (commented out) 2026-08-10: enabling any [patch] change forces a
+# full re-resolution, and re-resolution of this workspace is IMPOSSIBLE
+# today — mcp-agent-mail pins asupersync =0.3.10, the path-patched
+# fastmcp sibling pins =0.3.9, and the mandatory /dp/asupersync path
+# patch provides 0.4.3; the committed Cargo.lock (asupersync 0.3.10) is
+# the only reason builds work at all. See the dependency-deadlock bead.
+# To activate: reconcile asupersync across mail+fastmcp to the /dp
+# checkout's line, then uncomment these 20 lines and rebuild.
+# fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 tru = { path = "../toon_rust" }
 rich_rust = { path = "../rich_rust" }
 
-# FrankenSQLite is intentionally NOT path-patched.
+# FrankenSQLite: git-rev pinned via [patch.crates-io] (decision 2026-08-10,
+# bead br-hpv61 / fleet stall investigation; supersedes the earlier
+# "intentionally NOT path-patched" ruling whose re-evaluation trigger fired).
 #
-# We resolve fsqlite 0.1.18 from crates.io. 0.1.19 was published 2026-07-26
-# but was cut from the v0.1.18 release lineage WITHOUT the 2026-07-21
-# durability wave (no NamespaceOpenIntent::ReadOnlyExisting, no ns-lifecycle
-# changes — verified by content-grep of the upstream v0.1.19 tag), so it does
-# not help br-29u5s/br-mmnyj and a bump has not been evaluated. The sibling
-# checkout is past v0.1.19 and under active development; keep resolving from
-# crates.io. Re-evaluate the pin when a release contains the ns-lifecycle
-# work (unblock probe: git grep ReadOnlyExisting <tag> -- crates/fsqlite-vfs
-# in the sibling repo).
+# Why: the crates.io 0.1.x line lacks the 2026-07-21 durability wave
+# (NamespaceOpenIntent::ReadOnlyExisting + ns-lifecycle) that br-29u5s and
+# br-mmnyj need, and that wave is implicated in the fleet-wide tool-call
+# stalls (write p99 17-24s on this very mailbox; see br-hpv61). fsqlite
+# 0.2.0 IS on crates.io (2026-08-03) and contains the wave, but
+# sqlmodel-frankensqlite <= 0.3.2 requires ^0.1.18, so the registry route
+# is closed until a sqlmodel release accepts 0.2.x — and 0.2.0 also lacks
+# the GH#294 open-must-not-mutate fixes (2026-08-09/10, unreleased).
+#
+# The pin below is rev 2351c6c5 — the SAME rev cass
+# (coding_agent_session_search) pins and builds against: the tip of the
+# 0.1.19-semver fts5 line, verified to contain the ReadOnlyExisting wave
+# (ancestor 6a86c071) plus the deferred-FTS5-validation open. Being
+# 0.1.19-semver, it satisfies sqlmodel and beads_rust requirements.
+#
+# Rollback: delete the fsqlite* entries from [patch.crates-io] below.
+# Cleanup trigger: a sqlmodel-frankensqlite release accepting fsqlite
+# 0.2.x AND an fsqlite release containing GH#294 — then drop the patches
+# and resolve from the registry again.
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the
