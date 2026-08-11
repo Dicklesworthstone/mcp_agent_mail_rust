@@ -915,9 +915,11 @@ mod tests {
     #[test]
     fn identity_source_category_classifies_canonical_path() {
         let isolated = IsolatedConfigBaseDir::new();
-        let project_key = isolated.project_key("proj");
-        let path = canonical_identity_path(&project_key, "main:0:2");
+        let path = canonical_identity_path(&isolated.project_key("proj"), "main:0:2");
+        // The guard must stay alive through the classification: both calls
+        // above and below read the isolated config base dir it installs.
         assert_eq!(identity_source_category(&path), "canonical");
+        drop(isolated);
     }
 
     #[test]
