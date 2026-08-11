@@ -276,6 +276,15 @@ rich_rust = { path = "../rich_rust" }
 # Cleanup trigger: a sqlmodel-frankensqlite release accepting fsqlite
 # 0.2.x AND an fsqlite release containing GH#294 — then drop the patches
 # and resolve from the registry again.
+#
+# 2026-08-11 trigger progress: the fsqlite half is SATISFIED — fsqlite
+# 0.2.1 is on crates.io (ns-lifecycle wave + full FTS5 line + GH#294
+# mutation-free opens). Still waiting on (1) the sqlmodel-* lockstep
+# release accepting fsqlite ^0.2 (migration merged on sqlmodel main at
+# d9a3355 / bd-mk6o; crates.io max is still 0.3.2 requiring ^0.1.19,
+# publish staged upstream awaiting go) and (2) beads_rust lifting its
+# fsqlite ^0.1.18 requirement so the workspace keeps ONE engine.
+# Tracking bead: see the fsqlite-0.2.1 registry adoption bead.
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the

@@ -1436,12 +1436,12 @@ fn run_fixtures_against_rust_server_router() {
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 router.handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            params,
-            SessionState::new(),
-            None,
-            None,
-        )
+                    &McpContext::new(cx.clone(), req_id),
+                    params,
+                    SessionState::new(),
+                    None,
+                    None,
+                )
             }))
             .unwrap_or_else(|payload| {
                 panic!(
@@ -1518,12 +1518,12 @@ fn run_fixtures_against_rust_server_router() {
                 meta: None,
             };
             let result = router.handle_resources_read(
-            &McpContext::new(cx.clone(), req_id),
-            &params,
-            SessionState::new(),
-            None,
-            None,
-        );
+                &McpContext::new(cx.clone(), req_id),
+                &params,
+                SessionState::new(),
+                None,
+                None,
+            );
             req_id += 1;
 
             match (&case.expect.ok, &case.expect.err) {
@@ -1550,9 +1550,9 @@ fn run_fixtures_against_rust_server_router() {
                             .contents
                             .first()
                             .and_then(|c| match c {
-                        LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
+                                LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
                             .unwrap_or("<non-text error>");
                         assert_expected_error(got, expected_err);
                     }
@@ -2100,12 +2100,12 @@ fn run_fixtures_against_rust_server_router() {
         };
         let register_result = router
             .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            register_params,
-            SessionState::new(),
-            None,
-            None,
-        )
+                &McpContext::new(cx.clone(), req_id),
+                register_params,
+                SessionState::new(),
+                None,
+                None,
+            )
             .unwrap_or_else(|e| panic!("register_agent failed for {name}: {e}"));
         req_id += 1;
         assert!(
@@ -2223,10 +2223,10 @@ fn tool_filter_profiles_match_fixtures() {
         // tools/list
         let tools_result = router
             .handle_tools_list(
-            &McpContext::new(cx.clone(), 1),
-            ListToolsParams::default(),
-            None,
-        )
+                &McpContext::new(cx.clone(), 1),
+                ListToolsParams::default(),
+                None,
+            )
             .expect("tools/list failed");
         let mut actual_tools: Vec<String> =
             tools_result.tools.into_iter().map(|t| t.name).collect();
@@ -2248,12 +2248,12 @@ fn tool_filter_profiles_match_fixtures() {
         };
         let result = router
             .handle_resources_read(
-            &McpContext::new(cx.clone(), 1),
-            &params,
-            SessionState::new(),
-            None,
-            None,
-        )
+                &McpContext::new(cx.clone(), 1),
+                &params,
+                SessionState::new(),
+                None,
+                None,
+            )
             .expect("tooling directory read failed");
         let dir_json = decode_json_from_resource_contents(&params.uri, &result.contents)
             .expect("tooling directory JSON decode failed");
@@ -2554,12 +2554,12 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
         meta: None,
     };
     let shedable_result = router.handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            shedable_params,
-            SessionState::new(),
-            None,
-            None,
-        );
+        &McpContext::new(cx.clone(), req_id),
+        shedable_params,
+        SessionState::new(),
+        None,
+        None,
+    );
     req_id += 1;
     match shedable_result {
         Ok(call_result) => {
@@ -2651,12 +2651,12 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
         };
         let result = router
             .handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            params,
-            SessionState::new(),
-            None,
-            None,
-        )
+                &McpContext::new(cx.clone(), req_id),
+                params,
+                SessionState::new(),
+                None,
+                None,
+            )
             .unwrap_or_else(|e| panic!("{name} failed: {e}"));
         req_id += 1;
         assert!(
@@ -3300,12 +3300,12 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
         meta: None,
     };
     let result = router.handle_resources_read(
-            &McpContext::new(cx.clone(), req_id),
-            &params,
-            SessionState::new(),
-            None,
-            None,
-        );
+        &McpContext::new(cx.clone(), req_id),
+        &params,
+        SessionState::new(),
+        None,
+        None,
+    );
     let read_result = result.expect("projects query read should succeed");
     let json = decode_json_from_resource_contents(&params.uri, &read_result.contents)
         .expect("projects query response should decode");
@@ -3560,12 +3560,12 @@ fn toon_format_resolution_json_fallback() {
         meta: None,
     };
     let result = router.handle_tools_call(
-            &McpContext::new(cx.clone(), 1),
-            params,
-            SessionState::new(),
-            None,
-            None,
-        );
+        &McpContext::new(cx.clone(), 1),
+        params,
+        SessionState::new(),
+        None,
+        None,
+    );
     let call_result = result.expect("health_check should not fail");
     assert!(!call_result.is_error, "health_check should succeed");
 
@@ -3625,12 +3625,12 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            params,
-            SessionState::new(),
-            None,
-            None,
-        );
+        &McpContext::new(cx.clone(), req_id),
+        params,
+        SessionState::new(),
+        None,
+        None,
+    );
     req_id += 1;
     let call_result = result.unwrap_or_else(|e| panic!("ensure_project setup failed: {e}"));
     assert!(!call_result.is_error, "ensure_project setup returned error");
@@ -3677,12 +3677,12 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            params,
-            SessionState::new(),
-            None,
-            None,
-        );
+        &McpContext::new(cx.clone(), req_id),
+        params,
+        SessionState::new(),
+        None,
+        None,
+    );
     req_id += 1;
     let call_result = result.expect("summarize_thread should not fail with llm_mode=false");
     assert!(
@@ -3712,12 +3712,12 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-            &McpContext::new(cx.clone(), req_id),
-            params,
-            SessionState::new(),
-            None,
-            None,
-        );
+        &McpContext::new(cx.clone(), req_id),
+        params,
+        SessionState::new(),
+        None,
+        None,
+    );
     let call_result = result.expect("macro_prepare_thread should not fail with llm_mode=false");
     assert!(
         !call_result.is_error,

@@ -570,9 +570,10 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     // curated prelude no longer re-exports a bare `Server` (it now offers
     // `modern::Server`/`legacy_2024::Server` era wrappers instead), and this
     // builder deliberately stays on the underlying dual-era server.
-    let server = fastmcp_server::Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION")).on_shutdown(move || {
-        shutdown_runtime_services(&shutdown_config);
-    });
+    let server = fastmcp_server::Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"))
+        .on_shutdown(move || {
+            shutdown_runtime_services(&shutdown_config);
+        });
 
     let server = add_tool(
         server,
