@@ -222,34 +222,33 @@ ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 # dependency notes. Every fsqlite crate in the graph is patched to ONE
 # rev so beads_rust and sqlmodel-frankensqlite share a single engine.
 #
-# PARKED (commented out) 2026-08-10: enabling any [patch] change forces a
-# full re-resolution, and re-resolution of this workspace is IMPOSSIBLE
-# today — mcp-agent-mail pins asupersync =0.3.10, the path-patched
-# fastmcp sibling pins =0.3.9, and the mandatory /dp/asupersync path
-# patch provides 0.4.3; the committed Cargo.lock (asupersync 0.3.10) is
-# the only reason builds work at all. See the dependency-deadlock bead.
-# To activate: reconcile asupersync across mail+fastmcp to the /dp
-# checkout's line, then uncomment these 20 lines and rebuild.
-# fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
-# fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+# UNPARKED 2026-08-11 (bead br-noizk): the asupersync deadlock that made
+# re-resolution impossible is fixed — the whole graph now resolves ONE
+# registry asupersync 0.3.10 (fastmcp sibling bumped =0.3.9 -> =0.3.10;
+# the /dp/asupersync 0.4.3 path patch is inert under [[patch.unused]]).
+# The fsqlite rev below requires asupersync ^0.3.9, so the pin is only
+# resolvable on the 0.3.x line — do NOT move the workspace to
+# asupersync 0.4.x while this pin is active.
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
+fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 tru = { path = "../toon_rust" }
 rich_rust = { path = "../rich_rust" }
