@@ -30,6 +30,16 @@ use crate::search_planner::{
 /// Bridge between the Tantivy search engine and the planner query/result types.
 pub struct TantivyBridge {
     index: Index,
+    /// Lazily-created, retained index writer (GH#239).
+    ///
+    /// Every Tantivy writer owns its own indexing worker + segment-merge
+    /// threads. Opening and dropping a fresh writer for each indexed message
+    /// re-spawns those workers per write, which turns a busy mailbox into a
+    /// merge-worker storm. The writer is created on first write, bounded to a
+    /// single worker thread, reused for the bridge's lifetime, and dropped on
+    /// any write failure so uncommitted operations cannot ride along with a
+    /// later caller's commit. Read-only bridge uses never create it.
+    writer: Mutex<Option<tantivy::IndexWriter>>,
     handles: FieldHandles,
     index_dir: PathBuf,
 }
@@ -62,6 +72,7 @@ impl TantivyBridge {
 
         Ok(Self {
             index,
+            writer: Mutex::new(None),
             handles,
             index_dir: index_dir.to_owned(),
         })
@@ -76,6 +87,7 @@ impl TantivyBridge {
         register_tokenizer(&index);
         Self {
             index,
+            writer: Mutex::new(None),
             handles,
             index_dir: PathBuf::new(),
         }
@@ -370,14 +382,9 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
 // ── Global bridge (lazy singleton) ──────────────────────────────────────
 
 static BRIDGE: OnceLock<RwLock<Option<Arc<TantivyBridge>>>> = OnceLock::new();
-static TANTIVY_WRITER_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn bridge_slot() -> &'static RwLock<Option<Arc<TantivyBridge>>> {
     BRIDGE.get_or_init(|| RwLock::new(None))
-}
-
-fn tantivy_writer_guard() -> &'static Mutex<()> {
-    TANTIVY_WRITER_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 fn same_index_dir(lhs: &Path, rhs: &Path) -> bool {
@@ -1009,6 +1016,11 @@ fn choose_backfill_plan(
     Ok(BackfillPlan::FullRebuild)
 }
 
+/// One indexing worker keeps merge threads bounded on the retained writer;
+/// mailbox write rates never need parallel segment building.
+const TANTIVY_WRITER_THREADS: usize = 1;
+const TANTIVY_WRITER_MEMORY_BUDGET_BYTES: usize = 15_000_000;
+
 /// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
 /// for writers. In concurrent environments, this can fail. We retry a few times
 /// with exponential backoff to handle writers from older binaries or external tools.
@@ -1016,7 +1028,9 @@ fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWri
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
     loop {
-        match index.writer(15_000_000) {
+        match index
+            .writer_with_num_threads(TANTIVY_WRITER_THREADS, TANTIVY_WRITER_MEMORY_BUDGET_BYTES)
+        {
             Ok(writer) => return Ok(writer),
             Err(e) => {
                 if retries == 0 {
@@ -1031,14 +1045,33 @@ fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWri
 }
 
 fn with_tantivy_writer<T>(
-    index: &tantivy::Index,
+    bridge: &TantivyBridge,
     operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = tantivy_writer_guard()
-        .lock()
-        .map_err(|e| format!("Tantivy writer guard poisoned: {e}"))?;
-    let mut writer = acquire_writer_with_retry(index)?;
-    operation(&mut writer)
+    let mut slot = match bridge.writer.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // A panic mid-write leaves the retained writer in an unknown
+            // state; drop it so the next call re-acquires a clean one.
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            guard
+        }
+    };
+    if slot.is_none() {
+        *slot = Some(acquire_writer_with_retry(bridge.index())?);
+    }
+    let writer = slot
+        .as_mut()
+        .expect("retained Tantivy writer initialized above");
+    let result = operation(writer);
+    if result.is_err() {
+        // The retained writer may hold uncommitted operations from the failed
+        // closure; dropping it rolls them back so they cannot ride along with
+        // a later caller's commit.
+        *slot = None;
+    }
+    result
 }
 
 /// Index a single message into the global Tantivy bridge.
@@ -1067,7 +1100,7 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     };
 
     let handles = bridge.handles();
-    let write_result = with_tantivy_writer(bridge.index(), |writer| {
+    let write_result = with_tantivy_writer(&bridge, |writer| {
         upsert_indexable_message(writer, handles, msg)?;
         writer
             .commit()
@@ -1104,7 +1137,7 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
     };
 
     let handles = bridge.handles();
-    let write_result = with_tantivy_writer(bridge.index(), |writer| {
+    let write_result = with_tantivy_writer(&bridge, |writer| {
         for msg in messages {
             upsert_indexable_message(writer, handles, msg)?;
         }
@@ -1186,7 +1219,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
         if index_stats.count > 0 {
-            with_tantivy_writer(bridge.index(), |writer| {
+            with_tantivy_writer(&bridge, |writer| {
                 writer
                     .delete_all_documents()
                     .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
@@ -1281,7 +1314,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         BackfillPlan::Incremental { start_after_id } => start_after_id,
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
-    let total_indexed = with_tantivy_writer(bridge.index(), |writer| {
+    let total_indexed = with_tantivy_writer(&bridge, |writer| {
         if matches!(plan, BackfillPlan::FullRebuild) {
             writer
                 .delete_all_documents()
@@ -2166,6 +2199,87 @@ mod tests {
     fn index_messages_batch_empty_returns_zero() {
         let result = index_messages_batch(&[]);
         assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn with_tantivy_writer_retains_writer_across_calls() {
+        // GH#239: sequential writes must reuse one retained writer instead of
+        // opening (and spawning merge workers for) a fresh writer per call.
+        let bridge = TantivyBridge::in_memory();
+        assert!(bridge.writer.lock().unwrap().is_none());
+
+        let handles = bridge.handles();
+        for id in [301_i64, 302_i64] {
+            let msg = make_indexable(id, "Retained writer", "Body");
+            with_tantivy_writer(&bridge, |writer| {
+                upsert_indexable_message(writer, handles, &msg)?;
+                writer
+                    .commit()
+                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
+                Ok(())
+            })
+            .expect("indexed via retained writer");
+            assert!(
+                bridge.writer.lock().unwrap().is_some(),
+                "writer must stay retained after a successful write"
+            );
+        }
+
+        let results = bridge.search(&PlannerQuery {
+            text: "Retained".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn with_tantivy_writer_drops_writer_on_operation_error() {
+        // A failed closure may leave uncommitted operations on the retained
+        // writer; the writer must be dropped so they cannot leak into a later
+        // caller's commit.
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+
+        let stale = make_indexable(401, "Uncommitted casualty", "Body");
+        let err = with_tantivy_writer(&bridge, |writer| {
+            upsert_indexable_message(writer, handles, &stale)?;
+            Err::<(), String>("simulated failure after staging a doc".to_string())
+        });
+        assert!(err.is_err());
+        assert!(
+            bridge.writer.lock().unwrap().is_none(),
+            "failed write must drop the retained writer"
+        );
+
+        let msg = make_indexable(402, "Fresh start", "Body");
+        with_tantivy_writer(&bridge, |writer| {
+            upsert_indexable_message(writer, handles, &msg)?;
+            writer
+                .commit()
+                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+            Ok(())
+        })
+        .expect("write after recovery");
+
+        let stale_results = bridge.search(&PlannerQuery {
+            text: "casualty".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        });
+        assert!(
+            stale_results.is_empty(),
+            "uncommitted doc from the failed write must not survive"
+        );
+        let fresh_results = bridge.search(&PlannerQuery {
+            text: "Fresh".to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(fresh_results.len(), 1);
     }
 
     #[test]
