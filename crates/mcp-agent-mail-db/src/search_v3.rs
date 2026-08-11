@@ -19,7 +19,7 @@ use tantivy::Order;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{AllQuery, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::{Index, IndexReader, ReloadPolicy, Term};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
 use crate::DbConn;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
@@ -30,6 +30,11 @@ use crate::search_planner::{
 /// Bridge between the Tantivy search engine and the planner query/result types.
 pub struct TantivyBridge {
     index: Index,
+    /// Retain one bounded writer once indexing begins. Opening and dropping a
+    /// fresh writer for every message starts fresh indexing and merge workers,
+    /// which turns a busy mailbox into a merge-worker storm. Keeping this lazy
+    /// preserves the bridge's read-only/open use cases until a write is needed.
+    writer: Mutex<Option<tantivy::IndexWriter<TantivyDocument>>>,
     handles: FieldHandles,
     index_dir: PathBuf,
 }
@@ -59,9 +64,9 @@ impl TantivyBridge {
         global_metrics()
             .search
             .update_index_health(index_size_bytes, doc_count);
-
         Ok(Self {
             index,
+            writer: Mutex::new(None),
             handles,
             index_dir: index_dir.to_owned(),
         })
@@ -76,6 +81,7 @@ impl TantivyBridge {
         register_tokenizer(&index);
         Self {
             index,
+            writer: Mutex::new(None),
             handles,
             index_dir: PathBuf::new(),
         }
@@ -370,14 +376,9 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
 // ── Global bridge (lazy singleton) ──────────────────────────────────────
 
 static BRIDGE: OnceLock<RwLock<Option<Arc<TantivyBridge>>>> = OnceLock::new();
-static TANTIVY_WRITER_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn bridge_slot() -> &'static RwLock<Option<Arc<TantivyBridge>>> {
     BRIDGE.get_or_init(|| RwLock::new(None))
-}
-
-fn tantivy_writer_guard() -> &'static Mutex<()> {
-    TANTIVY_WRITER_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 fn same_index_dir(lhs: &Path, rhs: &Path) -> bool {
@@ -1009,14 +1010,21 @@ fn choose_backfill_plan(
     Ok(BackfillPlan::FullRebuild)
 }
 
-/// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
-/// for writers. In concurrent environments, this can fail. We retry a few times
-/// with exponential backoff to handle writers from older binaries or external tools.
-fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWriter, String> {
+const TANTIVY_WRITER_THREADS: usize = 1;
+const TANTIVY_WRITER_MEMORY_BUDGET_BYTES: usize = 15_000_000;
+
+/// Acquire the bridge's bounded writer with retries. Tantivy acquires an
+/// exclusive directory lock for writers, so startup must tolerate an older
+/// binary or external maintenance tool releasing that lock shortly afterward.
+fn acquire_writer_with_retry(
+    index: &tantivy::Index,
+) -> Result<tantivy::IndexWriter<TantivyDocument>, String> {
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
     loop {
-        match index.writer(15_000_000) {
+        match index
+            .writer_with_num_threads(TANTIVY_WRITER_THREADS, TANTIVY_WRITER_MEMORY_BUDGET_BYTES)
+        {
             Ok(writer) => return Ok(writer),
             Err(e) => {
                 if retries == 0 {
@@ -1031,14 +1039,20 @@ fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWri
 }
 
 fn with_tantivy_writer<T>(
-    index: &tantivy::Index,
+    bridge: &TantivyBridge,
     operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = tantivy_writer_guard()
+    let mut writer_slot = bridge
+        .writer
         .lock()
-        .map_err(|e| format!("Tantivy writer guard poisoned: {e}"))?;
-    let mut writer = acquire_writer_with_retry(index)?;
-    operation(&mut writer)
+        .map_err(|e| format!("Tantivy writer poisoned: {e}"))?;
+    if writer_slot.is_none() {
+        *writer_slot = Some(acquire_writer_with_retry(bridge.index())?);
+    }
+    let writer = writer_slot
+        .as_mut()
+        .expect("Tantivy writer must be initialized before use");
+    operation(writer)
 }
 
 /// Index a single message into the global Tantivy bridge.
@@ -1067,7 +1081,7 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     };
 
     let handles = bridge.handles();
-    let write_result = with_tantivy_writer(bridge.index(), |writer| {
+    let write_result = with_tantivy_writer(&bridge, |writer| {
         upsert_indexable_message(writer, handles, msg)?;
         writer
             .commit()
@@ -1104,7 +1118,7 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
     };
 
     let handles = bridge.handles();
-    let write_result = with_tantivy_writer(bridge.index(), |writer| {
+    let write_result = with_tantivy_writer(&bridge, |writer| {
         for msg in messages {
             upsert_indexable_message(writer, handles, msg)?;
         }
@@ -1186,7 +1200,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
         if index_stats.count > 0 {
-            with_tantivy_writer(bridge.index(), |writer| {
+            with_tantivy_writer(&bridge, |writer| {
                 writer
                     .delete_all_documents()
                     .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
@@ -1281,7 +1295,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         BackfillPlan::Incremental { start_after_id } => start_after_id,
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
-    let total_indexed = with_tantivy_writer(bridge.index(), |writer| {
+    let total_indexed = with_tantivy_writer(&bridge, |writer| {
         if matches!(plan, BackfillPlan::FullRebuild) {
             writer
                 .delete_all_documents()
@@ -1489,17 +1503,19 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_writer_behavior() {
+    fn bridge_holds_tantivy_writer_lock() {
         let dir = tempfile::TempDir::new().unwrap();
         let bridge = TantivyBridge::open(dir.path()).unwrap();
-        let _writer1 = bridge
+        let direct_writer = bridge
             .index()
             .writer::<TantivyDocument>(15_000_000)
-            .unwrap();
+            .expect("bridge must not claim a writer before its first write");
+        drop(direct_writer);
+        with_tantivy_writer(&bridge, |_writer| Ok(())).unwrap();
         let writer2_res = bridge.index().writer::<TantivyDocument>(15_000_000);
         assert!(
             writer2_res.is_err(),
-            "second writer should fail with lock error"
+            "the bridge must retain its writer instead of recreating one per message"
         );
     }
 
