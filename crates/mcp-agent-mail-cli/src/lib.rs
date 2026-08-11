@@ -2877,6 +2877,26 @@ pub enum AgentsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Resolve an already-registered pane identity (read-only; GH#240).
+    ///
+    /// Performs no registration and no inbox read. Fails closed (exit 2) when
+    /// no identity file matches the pane.
+    #[command(name = "resolve-pane")]
+    ResolvePane {
+        /// Project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Tmux pane identifier (composite `session:window:pane` or bare
+        /// `%N`). Resolved from the current tmux pane when omitted.
+        #[arg(long)]
+        pane: Option<String>,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Detect installed coding agents on this system.
     Detect {
         /// Restrict detection to specific connector slugs (comma-separated).
@@ -3388,7 +3408,10 @@ fn command_is_read_only(command: &Commands) -> bool {
 fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
     matches!(
         action,
-        AgentsCommand::List { .. } | AgentsCommand::Show { .. } | AgentsCommand::Detect { .. }
+        AgentsCommand::List { .. }
+            | AgentsCommand::Show { .. }
+            | AgentsCommand::Detect { .. }
+            | AgentsCommand::ResolvePane { .. }
     )
 }
 
@@ -33650,6 +33673,72 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             Ok(())
         }
 
+        AgentsCommand::ResolvePane {
+            project_key,
+            pane,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let effective_pane = match pane.as_deref().map(str::trim) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => mcp_agent_mail_core::get_composite_tmux_pane_id().unwrap_or_default(),
+            };
+            if effective_pane.is_empty() {
+                return Err(CliError::InvalidArgument(
+                    "no pane id provided and $TMUX_PANE is not set; pass --pane explicitly \
+                     or run inside a tmux session"
+                        .into(),
+                ));
+            }
+
+            // Identity files hash the project's human_key (absolute path).
+            // A slug argument is mapped through the local DB so the lookup
+            // matches what registration used; an absolute path needs no DB.
+            let mut candidate_keys = vec![project_key.clone()];
+            if !std::path::Path::new(&project_key).is_absolute()
+                && let Ok(ctx) = context::AsyncCliContext::open()
+            {
+                let cx = asupersync::Cx::for_request();
+                if let Ok(proj) = resolve_project_async(&cx, &ctx.pool, &project_key).await
+                    && proj.human_key != project_key
+                {
+                    candidate_keys.push(proj.human_key);
+                }
+            }
+
+            let resolved = candidate_keys.iter().find_map(|key| {
+                mcp_agent_mail_core::resolve_identity_with_path(key, &effective_pane)
+            });
+
+            let Some((agent_name, resolved_path)) = resolved else {
+                return Err(CliError::InvalidArgument(format!(
+                    "no identity registered for pane '{effective_pane}' in project \
+                     '{project_key}'; register one with `am agents register -p {project_key} \
+                     --program <PROGRAM> --model <MODEL>` or the register_agent MCP tool"
+                )));
+            };
+
+            // GH#240 contract: report the source category, never the identity
+            // file path or contents.
+            let source = mcp_agent_mail_core::identity_source_category(&resolved_path);
+            let data = serde_json::json!({
+                "schema_version": "am.agents.resolve-pane.v1",
+                "agent_name": agent_name,
+                "pane_id": effective_pane,
+                "project_key": project_key,
+                "source": source,
+            });
+            output::emit_output(&data, fmt, || {
+                output::section("Pane Identity");
+                output::kv("Agent", &agent_name);
+                output::kv("Pane", &effective_pane);
+                output::kv("Project", &project_key);
+                output::kv("Source", source);
+            });
+            Ok(())
+        }
+
         AgentsCommand::Detect {
             only,
             include_undetected,
@@ -56191,6 +56280,53 @@ startup_timeout_sec = 42
                 assert_eq!(second_positional.as_deref(), Some("BlueLake"));
                 assert_eq!(project_key, None);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agents_resolve_pane_parses_and_is_read_only() {
+        // GH#240: `am agents resolve-pane` must parse with an explicit pane…
+        let cli = Cli::try_parse_from([
+            "am",
+            "agents",
+            "resolve-pane",
+            "-p",
+            "/home/me/projects/foo",
+            "--pane",
+            "main:0:2",
+            "--json",
+        ])
+        .expect("resolve-pane with explicit pane must parse");
+        match cli.command.expect("expected command") {
+            Commands::Agents { action } => {
+                // …and classify as read-only so it never hits the
+                // mailbox-mutation refusal path.
+                assert!(agents_command_is_read_only(&action));
+                match action {
+                    AgentsCommand::ResolvePane {
+                        project_key,
+                        pane,
+                        json,
+                        ..
+                    } => {
+                        assert_eq!(project_key, "/home/me/projects/foo");
+                        assert_eq!(pane.as_deref(), Some("main:0:2"));
+                        assert!(json);
+                    }
+                    other => panic!("unexpected agents action: {other:?}"),
+                }
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Pane is optional (falls back to the current tmux pane at runtime).
+        let cli = Cli::try_parse_from(["am", "agents", "resolve-pane", "-p", "backend-slug"])
+            .expect("resolve-pane without pane must parse");
+        match cli.command.expect("expected command") {
+            Commands::Agents {
+                action: AgentsCommand::ResolvePane { pane, .. },
+            } => assert_eq!(pane, None),
             other => panic!("unexpected command: {other:?}"),
         }
     }

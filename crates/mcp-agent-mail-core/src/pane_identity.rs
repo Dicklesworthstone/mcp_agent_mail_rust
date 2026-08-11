@@ -205,6 +205,38 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
     None
 }
 
+/// Classify which identity-file convention produced a resolved path.
+///
+/// Callers that surface resolution results to automation (GH#240) should
+/// report this category instead of the concrete filesystem path, so the
+/// contract does not disclose identity-file locations or contents.
+///
+/// Categories:
+/// - `canonical`: `~/.config/agent-mail/identity/<project_hash>/<pane_key>`
+/// - `legacy-claude`: `~/.claude/agent-mail/identity.<pane_id>`
+/// - `legacy-ntm`: `/tmp/agent-mail-name.<project_hash>.<pane_id>`
+/// - `compatible`: any other path a fallback rule matched
+#[must_use]
+pub fn identity_source_category(path: &Path) -> &'static str {
+    let canonical_root = config_base_dir().join(IDENTITY_DIR_NAME);
+    if path.starts_with(&canonical_root) {
+        return "canonical";
+    }
+    if let Some(home) = home_dir()
+        && path.starts_with(home.join(".claude").join("agent-mail"))
+    {
+        return "legacy-claude";
+    }
+    let is_ntm_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with("agent-mail-name."));
+    if is_ntm_name && path.starts_with("/tmp") {
+        return "legacy-ntm";
+    }
+    "compatible"
+}
+
 /// Resolve the agent name for the current tmux pane.
 ///
 /// Uses [`get_composite_tmux_pane_id`] to obtain a session-unique composite
@@ -876,6 +908,29 @@ mod tests {
         fn drop(&mut self) {
             set_test_live_tmux_panes(None);
         }
+    }
+
+    // -- identity_source_category -------------------------------------------
+
+    #[test]
+    fn identity_source_category_classifies_canonical_path() {
+        let isolated = IsolatedConfigBaseDir::new();
+        let project_key = isolated.project_key("proj");
+        let path = canonical_identity_path(&project_key, "main:0:2");
+        assert_eq!(identity_source_category(&path), "canonical");
+    }
+
+    #[test]
+    fn identity_source_category_classifies_legacy_paths() {
+        let _isolated = IsolatedConfigBaseDir::new();
+        if let Some(home) = home_dir() {
+            let claude = home.join(".claude").join("agent-mail").join("identity.%3");
+            assert_eq!(identity_source_category(&claude), "legacy-claude");
+        }
+        let ntm = PathBuf::from("/tmp/agent-mail-name.abc123def456.%3");
+        assert_eq!(identity_source_category(&ntm), "legacy-ntm");
+        let other = PathBuf::from("/var/lib/agent-mail/identity/xyz");
+        assert_eq!(identity_source_category(&other), "compatible");
     }
 
     // -- project_hash --------------------------------------------------------
