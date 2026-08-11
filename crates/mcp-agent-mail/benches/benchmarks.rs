@@ -7,7 +7,7 @@
 )]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use fastmcp::{Budget, CallToolParams, Cx};
+use fastmcp::{CallToolParams, Cx, McpContext};
 use fastmcp_core::{Outcome, SessionState, block_on};
 use mcp_agent_mail_conformance::Fixtures;
 use mcp_agent_mail_db::search_planner::SearchQuery;
@@ -63,7 +63,6 @@ fn seed_fixtures(fixtures: &Fixtures) {
         let config = mcp_agent_mail_core::Config::from_env();
         let router = mcp_agent_mail_server::build_server(&config).into_router();
         let cx = Cx::for_testing();
-        let budget = Budget::INFINITE;
         let mut req_id: u64 = 1;
 
         for (tool_name, tool_fixture) in &fixtures.tools {
@@ -79,14 +78,13 @@ fn seed_fixtures(fixtures: &Fixtures) {
                     meta: None,
                 };
 
+                // New fastmcp API: the request budget rides the ambient Cx
+                // inside McpContext (Budget::INFINITE here).
                 let _ = router
                     .handle_tools_call(
-                        &cx,
-                        req_id,
+                        &McpContext::new(cx.clone(), req_id),
                         params,
-                        &budget,
                         SessionState::new(),
-                        None,
                         None,
                         None,
                     )
@@ -118,7 +116,6 @@ fn bench_tools(c: &mut Criterion) {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
 
     let mut group = c.benchmark_group("mcp_agent_mail_tools");
 
@@ -172,12 +169,9 @@ fn bench_tools(c: &mut Criterion) {
                 b.iter(|| {
                     let out = router
                         .handle_tools_call(
-                            &cx,
-                            req_id,
+                            &McpContext::new(cx.clone(), req_id),
                             params.clone(),
-                            &budget,
                             SessionState::new(),
-                            None,
                             None,
                             None,
                         )

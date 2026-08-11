@@ -2,7 +2,7 @@
 //! fixture character-for-character. The fixture was generated from the Python
 //! MCP server and lives at `tests/conformance/fixtures/tool_descriptions.json`.
 
-use fastmcp::{Cx, ListToolsParams, Tool};
+use fastmcp::{Cx, ListToolsParams, McpContext, Tool};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,7 +73,11 @@ fn get_rust_tools() -> Vec<Tool> {
     let cx = Cx::for_testing();
 
     let tools_result = router
-        .handle_tools_list(&cx, ListToolsParams::default(), None)
+        .handle_tools_list(
+            &McpContext::new(cx.clone(), 1),
+            ListToolsParams::default(),
+            None,
+        )
         .expect("tools/list failed");
 
     tools_result.tools

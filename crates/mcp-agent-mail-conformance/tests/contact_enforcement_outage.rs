@@ -13,7 +13,8 @@
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
-use fastmcp::{Budget, CallToolParams, Cx};
+use fastmcp::legacy_2024::LegacyContent;
+use fastmcp::{Budget, CallToolParams, Cx, McpContext};
 use fastmcp_core::SessionState;
 use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
@@ -93,6 +94,8 @@ fn call_tool(
     args: Value,
     req_id: &mut u64,
 ) -> Result<Value, String> {
+    // request budget now rides the ambient Cx (Budget::INFINITE here)
+    let _ = budget;
     let params = CallToolParams {
         name: name.to_string(),
         arguments: if args.is_null() { None } else { Some(args) },
@@ -100,15 +103,12 @@ fn call_tool(
     };
     *req_id += 1;
     let result = router.handle_tools_call(
-        cx,
-        *req_id,
-        params,
-        budget,
-        SessionState::new(),
-        None,
-        None,
-        None,
-    );
+            &McpContext::new(cx.clone(), *req_id),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        );
     match result {
         Ok(resp) => {
             if resp.is_error {
@@ -116,7 +116,7 @@ fn call_tool(
                     .content
                     .first()
                     .and_then(|c| match c {
-                        fastmcp::Content::Text { text } => Some(text.clone()),
+                        LegacyContent::Text { text, .. } => Some(text.clone()),
                         _ => None,
                     })
                     .unwrap_or_default();
@@ -126,7 +126,7 @@ fn call_tool(
                 .content
                 .first()
                 .and_then(|c| match c {
-                    fastmcp::Content::Text { text } => Some(text.clone()),
+                    LegacyContent::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();

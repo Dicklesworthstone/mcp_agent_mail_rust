@@ -174,6 +174,16 @@ inherits = "release"     # Benchmarks use same optimizations as release
 # `/dp/asupersync` as two distinct packages and refuses the lock
 # ("package collision in the lockfile"). Single path string => single
 # Cx/Outcome universe.
+#
+# br-noizk NOTE (2026-08-10): the /dp checkout is now 0.4.3, which no longer
+# matches this workspace's =0.3.10 universe (sqlmodel 0.3.2/0.3.3 on
+# crates.io pin asupersync =0.3.10 exactly; frankensearch caps <0.4). The
+# patch is therefore INERT — cargo records it under [[patch.unused]] and the
+# whole graph resolves one asupersync 0.3.10 from the registry, so the
+# single-universe invariant still holds. Keep the line (same path string)
+# so the patch re-engages automatically when the fleet unifies on 0.4.x
+# (needs: sqlmodel release accepting 0.4, frankensearch ceiling lift,
+# fastmcp bump — inventory on bead br-noizk).
 asupersync = { path = "/dp/asupersync" }
 #
 # fastmcp-rust is temporarily force-patched to the sibling checkout

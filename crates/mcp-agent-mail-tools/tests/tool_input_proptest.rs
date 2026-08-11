@@ -1,5 +1,6 @@
 use arbitrary::{Arbitrary, Unstructured};
-use fastmcp::{CallToolParams, Content, Cx, McpContext};
+use fastmcp::legacy_2024::LegacyContent;
+use fastmcp::{CallToolParams, Cx, McpContext};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{FileReservationPaths, SearchMessages, SendMessage};
@@ -243,10 +244,13 @@ fn assert_bounded_error(err: &fastmcp::McpError) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-fn assert_bounded_content(content: &[Content]) -> Result<(), TestCaseError> {
+// The tools router's CallToolResult now carries the exact-2024 wire model
+// (`LegacyContent`, with annotations/_meta members) instead of the modern
+// `Content` union; the bound being asserted is unchanged.
+fn assert_bounded_content(content: &[LegacyContent]) -> Result<(), TestCaseError> {
     let mut total_text_bytes = 0usize;
     for item in content {
-        if let Content::Text { text } = item {
+        if let LegacyContent::Text { text, .. } = item {
             total_text_bytes = total_text_bytes.saturating_add(text.len());
             assert_no_internal_panic_marker(text)?;
         }

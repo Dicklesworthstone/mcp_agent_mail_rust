@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
-use fastmcp::{Cx, JsonRpcMessage, JsonRpcRequest, Server, StdioTransport, Transport};
+use fastmcp::{Cx, JsonRpcMessage, JsonRpcRequest, StdioTransport, Transport};
 use fastmcp_transport::http::{
     HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpTransport,
 };
@@ -64,10 +64,6 @@ struct TransportExecution {
     http_headers: Vec<HashMap<String, String>>,
 }
 
-fn protocol_server() -> Server {
-    mcp_agent_mail_server::build_server(&Config::default())
-}
-
 fn initialize_request<T: Into<Value>>(id: T) -> JsonRpcRequest {
     let params = Some(json!({
         "protocolVersion": "2024-11-05",
@@ -88,7 +84,9 @@ fn initialize_request<T: Into<Value>>(id: T) -> JsonRpcRequest {
 }
 
 fn execute_transport(transport: TransportKind, payloads: Vec<Payload>) -> TransportExecution {
-    let server = protocol_server();
+    // Inlined former `protocol_server()` helper: the raw `fastmcp_server::Server`
+    // type returned by build_server is no longer nameable via the `fastmcp` facade.
+    let server = mcp_agent_mail_server::build_server(&Config::default());
     let writer = SharedBufferWriter::default();
     let output = writer.clone();
 

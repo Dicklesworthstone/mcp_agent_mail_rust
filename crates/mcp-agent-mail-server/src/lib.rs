@@ -561,12 +561,16 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
 
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
+pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Server {
     // Wire the config flag into the global atomic gate.
     mcp_agent_mail_core::set_shedding_enabled(config.backpressure_shedding_enabled);
 
     let shutdown_config = config.clone();
-    let server = Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION")).on_shutdown(move || {
+    // `fastmcp_server::Server` is spelled explicitly: the fastmcp facade's
+    // curated prelude no longer re-exports a bare `Server` (it now offers
+    // `modern::Server`/`legacy_2024::Server` era wrappers instead), and this
+    // builder deliberately stays on the underlying dual-era server.
+    let server = fastmcp_server::Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION")).on_shutdown(move || {
         shutdown_runtime_services(&shutdown_config);
     });
 
@@ -16410,6 +16414,16 @@ const fn http_error_status(
         | HttpError::BodyTooLarge { .. }
         | HttpError::UnsupportedTransferEncoding(_) => HttpStatus::BAD_REQUEST,
         HttpError::OriginNotAllowed(_) => HttpStatus::FORBIDDEN,
+        // The request accepts neither modern JSON nor request-scoped SSE;
+        // mirror fastmcp-server's own ModernPostRejection::NotAcceptable
+        // mapping.
+        HttpError::NotAcceptable => HttpStatus::NOT_ACCEPTABLE,
+        // Admission errors carry their canonical HTTP status (405/400/…)
+        // computed by fastmcp-protocol; preserve it instead of flattening.
+        HttpError::ProtocolAdmission(admission) => HttpStatus(admission.http_status()),
+        // Unsupported request Content-Encoding is a client framing error,
+        // same bucket as UnsupportedTransferEncoding above.
+        HttpError::UnsupportedContentEncoding(_) => HttpStatus::BAD_REQUEST,
         HttpError::Timeout | HttpError::Closed => HttpStatus::SERVICE_UNAVAILABLE,
         HttpError::Transport(_) => HttpStatus::INTERNAL_SERVER_ERROR,
     }

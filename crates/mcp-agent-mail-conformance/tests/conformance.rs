@@ -1,7 +1,8 @@
 // Note: unsafe required for env::set_var in Rust 2024
 #![allow(unsafe_code)]
 
-use fastmcp::{Budget, CallToolParams, Content, Cx, ListToolsParams, ReadResourceParams};
+use fastmcp::legacy_2024::{LegacyContent, LegacyResourceContent};
+use fastmcp::{Budget, CallToolParams, Cx, ListToolsParams, McpContext, ReadResourceParams};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_conformance::{Case, ExpectedError, Fixtures, Normalize};
 use proptest::prelude::*;
@@ -247,7 +248,7 @@ fn normalize_pair(mut actual: Value, mut expected: Value, norm: &Normalize) -> (
     (actual, expected)
 }
 
-fn decode_json_from_tool_content(content: &[Content]) -> Result<Value, String> {
+fn decode_json_from_tool_content(content: &[LegacyContent]) -> Result<Value, String> {
     if content.len() != 1 {
         return Err(format!(
             "expected exactly 1 content item, got {}",
@@ -256,32 +257,30 @@ fn decode_json_from_tool_content(content: &[Content]) -> Result<Value, String> {
     }
 
     match &content[0] {
-        Content::Text { text } => match serde_json::from_str(text) {
+        LegacyContent::Text { text, .. } => match serde_json::from_str(text) {
             Ok(v) => Ok(v),
             Err(_) => Ok(Value::String(text.clone())),
         },
-        Content::Resource { resource } => {
-            let text = resource
-                .text
-                .as_deref()
-                .ok_or_else(|| "tool returned Resource content without text".to_string())?;
+        LegacyContent::Resource { resource, .. } => {
+            let text = match resource {
+                LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            }
+            .ok_or_else(|| "tool returned Resource content without text".to_string())?;
             match serde_json::from_str(text) {
                 Ok(v) => Ok(v),
                 Err(_) => Ok(Value::String(text.to_string())),
             }
         }
-        Content::Image { mime_type, .. } => Err(format!(
+        LegacyContent::Image { mime_type, .. } => Err(format!(
             "tool returned Image content (mime_type={mime_type}); JSON decode not supported yet"
-        )),
-        Content::Audio { mime_type, .. } => Err(format!(
-            "tool returned Audio content (mime_type={mime_type}); JSON decode not supported yet"
         )),
     }
 }
 
 fn decode_json_from_resource_contents(
     uri: &str,
-    contents: &[fastmcp::ResourceContent],
+    contents: &[LegacyResourceContent],
 ) -> Result<Value, String> {
     if contents.len() != 1 {
         return Err(format!(
@@ -290,10 +289,11 @@ fn decode_json_from_resource_contents(
         ));
     }
     let item = &contents[0];
-    let text = item
-        .text
-        .as_deref()
-        .ok_or_else(|| format!("resource {uri} returned no text"))?;
+    let text = match item {
+        LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    }
+    .ok_or_else(|| format!("resource {uri} returned no text"))?;
     match serde_json::from_str(text) {
         Ok(v) => Ok(v),
         Err(_) => Ok(Value::String(text.to_string())),
@@ -1017,6 +1017,8 @@ fn execute_tool(
     tool_name: &str,
     arguments: Option<Value>,
 ) -> Result<Result<Value, String>, String> {
+    // request budget now rides the ambient Cx (Budget::INFINITE here)
+    let _ = budget;
     let params = CallToolParams {
         name: tool_name.to_string(),
         arguments,
@@ -1024,12 +1026,9 @@ fn execute_tool(
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         router.handle_tools_call(
-            cx,
-            *req_id,
+            &McpContext::new(cx.clone(), *req_id),
             params,
-            budget,
             SessionState::new(),
-            None,
             None,
             None,
         )
@@ -1048,7 +1047,7 @@ fn execute_tool(
             .content
             .first()
             .and_then(|content| match content {
-                Content::Text { text } => Some(text.clone()),
+                LegacyContent::Text { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| "<non-text error>".to_string());
@@ -1437,15 +1436,12 @@ fn run_fixtures_against_rust_server_router() {
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 router.handle_tools_call(
-                    &cx,
-                    req_id,
-                    params,
-                    &budget,
-                    SessionState::new(),
-                    None,
-                    None,
-                    None,
-                )
+            &McpContext::new(cx.clone(), req_id),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        )
             }))
             .unwrap_or_else(|payload| {
                 panic!(
@@ -1470,7 +1466,7 @@ fn run_fixtures_against_rust_server_router() {
                             .content
                             .first()
                             .and_then(|c| match c {
-                                Content::Text { text } => Some(text.clone()),
+                                LegacyContent::Text { text, .. } => Some(text.clone()),
                                 _ => None,
                             })
                             .unwrap_or_default();
@@ -1498,7 +1494,7 @@ fn run_fixtures_against_rust_server_router() {
                             case.name
                         );
                         let got = match &call_result.content.first() {
-                            Some(Content::Text { text }) => text.as_str(),
+                            Some(LegacyContent::Text { text, .. }) => text.as_str(),
                             _ => "<non-text error>",
                         };
                         assert_expected_error(got, expected_err);
@@ -1522,15 +1518,12 @@ fn run_fixtures_against_rust_server_router() {
                 meta: None,
             };
             let result = router.handle_resources_read(
-                &cx,
-                req_id,
-                &params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            );
+            &McpContext::new(cx.clone(), req_id),
+            &params,
+            SessionState::new(),
+            None,
+            None,
+        );
             req_id += 1;
 
             match (&case.expect.ok, &case.expect.err) {
@@ -1556,7 +1549,10 @@ fn run_fixtures_against_rust_server_router() {
                         let got = read_result
                             .contents
                             .first()
-                            .and_then(|c| c.text.as_deref())
+                            .and_then(|c| match c {
+                        LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
                             .unwrap_or("<non-text error>");
                         assert_expected_error(got, expected_err);
                     }
@@ -2081,12 +2077,9 @@ fn run_fixtures_against_rust_server_router() {
     };
     let ensure_result = router
         .handle_tools_call(
-            &cx,
-            req_id,
+            &McpContext::new(cx.clone(), req_id),
             ensure_params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         )
@@ -2107,15 +2100,12 @@ fn run_fixtures_against_rust_server_router() {
         };
         let register_result = router
             .handle_tools_call(
-                &cx,
-                req_id,
-                register_params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            &McpContext::new(cx.clone(), req_id),
+            register_params,
+            SessionState::new(),
+            None,
+            None,
+        )
             .unwrap_or_else(|e| panic!("register_agent failed for {name}: {e}"));
         req_id += 1;
         assert!(
@@ -2141,12 +2131,9 @@ fn run_fixtures_against_rust_server_router() {
     };
     let send_result = router
         .handle_tools_call(
-            &cx,
-            req_id,
+            &McpContext::new(cx.clone(), req_id),
             send_params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         )
@@ -2204,12 +2191,9 @@ fn run_fixtures_against_rust_server_router() {
     };
     let fetch_result = router
         .handle_tools_call(
-            &cx,
-            req_id,
+            &McpContext::new(cx.clone(), req_id),
             fetch_params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         )
@@ -2238,7 +2222,11 @@ fn tool_filter_profiles_match_fixtures() {
 
         // tools/list
         let tools_result = router
-            .handle_tools_list(&cx, ListToolsParams::default(), None)
+            .handle_tools_list(
+            &McpContext::new(cx.clone(), 1),
+            ListToolsParams::default(),
+            None,
+        )
             .expect("tools/list failed");
         let mut actual_tools: Vec<String> =
             tools_result.tools.into_iter().map(|t| t.name).collect();
@@ -2260,15 +2248,12 @@ fn tool_filter_profiles_match_fixtures() {
         };
         let result = router
             .handle_resources_read(
-                &cx,
-                1,
-                &params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            &McpContext::new(cx.clone(), 1),
+            &params,
+            SessionState::new(),
+            None,
+            None,
+        )
             .expect("tooling directory read failed");
         let dir_json = decode_json_from_resource_contents(&params.uri, &result.contents)
             .expect("tooling directory JSON decode failed");
@@ -2569,15 +2554,12 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
         meta: None,
     };
     let shedable_result = router.handle_tools_call(
-        &cx,
-        req_id,
-        shedable_params,
-        &budget,
-        SessionState::new(),
-        None,
-        None,
-        None,
-    );
+            &McpContext::new(cx.clone(), req_id),
+            shedable_params,
+            SessionState::new(),
+            None,
+            None,
+        );
     req_id += 1;
     match shedable_result {
         Ok(call_result) => {
@@ -2586,7 +2568,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
                 .content
                 .first()
                 .and_then(|c| match c {
-                    Content::Text { text } => Some(text.as_str()),
+                    LegacyContent::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .unwrap_or("<non-text error>");
@@ -2612,12 +2594,9 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
     };
     let critical_result = router
         .handle_tools_call(
-            &cx,
-            req_id,
+            &McpContext::new(cx.clone(), req_id),
             critical_params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         )
@@ -2672,15 +2651,12 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
         };
         let result = router
             .handle_tools_call(
-                &cx,
-                req_id,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-                None,
-            )
+            &McpContext::new(cx.clone(), req_id),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        )
             .unwrap_or_else(|e| panic!("{name} failed: {e}"));
         req_id += 1;
         assert!(
@@ -3307,12 +3283,9 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
             meta: None,
         };
         let result = router.handle_tools_call(
-            &cx,
-            req_id,
+            &McpContext::new(cx.clone(), req_id),
             params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         );
@@ -3327,15 +3300,12 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
         meta: None,
     };
     let result = router.handle_resources_read(
-        &cx,
-        req_id,
-        &params,
-        &budget,
-        SessionState::new(),
-        None,
-        None,
-        None,
-    );
+            &McpContext::new(cx.clone(), req_id),
+            &params,
+            SessionState::new(),
+            None,
+            None,
+        );
     let read_result = result.expect("projects query read should succeed");
     let json = decode_json_from_resource_contents(&params.uri, &read_result.contents)
         .expect("projects query response should decode");
@@ -3368,12 +3338,9 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
     };
     let zero_result = router
         .handle_resources_read(
-            &cx,
-            1,
+            &McpContext::new(cx.clone(), 1),
             &zero_params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         )
@@ -3423,12 +3390,9 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
             meta: None,
         };
         let result = router.handle_resources_read(
-            &cx,
-            u64::try_from(idx + 1).expect("request id"),
+            &McpContext::new(cx.clone(), u64::try_from(idx + 1).expect("request id")),
             &params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         );
@@ -3447,7 +3411,10 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
                 let text = read_result
                     .contents
                     .first()
-                    .and_then(|c| c.text.as_deref())
+                    .and_then(|c| match c {
+                        LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
                     .unwrap_or("<non-text>");
                 assert!(
                     text.contains(expected_substr),
@@ -3506,12 +3473,9 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
             meta: None,
         };
         let result = router.handle_resources_read(
-            &cx,
-            u64::try_from(idx + 1).expect("request id"),
+            &McpContext::new(cx.clone(), u64::try_from(idx + 1).expect("request id")),
             &params,
-            &budget,
             SessionState::new(),
-            None,
             None,
             None,
         );
@@ -3537,7 +3501,10 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
                 let text = read_result
                     .contents
                     .first()
-                    .and_then(|c| c.text.as_deref())
+                    .and_then(|c| match c {
+                        LegacyResourceContent::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
                     .unwrap_or("<non-text>");
                 assert!(
                     contains_any(text),
@@ -3593,15 +3560,12 @@ fn toon_format_resolution_json_fallback() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &cx,
-        1,
-        params,
-        &budget,
-        SessionState::new(),
-        None,
-        None,
-        None,
-    );
+            &McpContext::new(cx.clone(), 1),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        );
     let call_result = result.expect("health_check should not fail");
     assert!(!call_result.is_error, "health_check should succeed");
 
@@ -3661,15 +3625,12 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &cx,
-        req_id,
-        params,
-        &budget,
-        SessionState::new(),
-        None,
-        None,
-        None,
-    );
+            &McpContext::new(cx.clone(), req_id),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        );
     req_id += 1;
     let call_result = result.unwrap_or_else(|e| panic!("ensure_project setup failed: {e}"));
     assert!(!call_result.is_error, "ensure_project setup returned error");
@@ -3716,15 +3677,12 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &cx,
-        req_id,
-        params,
-        &budget,
-        SessionState::new(),
-        None,
-        None,
-        None,
-    );
+            &McpContext::new(cx.clone(), req_id),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        );
     req_id += 1;
     let call_result = result.expect("summarize_thread should not fail with llm_mode=false");
     assert!(
@@ -3754,15 +3712,12 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = router.handle_tools_call(
-        &cx,
-        req_id,
-        params,
-        &budget,
-        SessionState::new(),
-        None,
-        None,
-        None,
-    );
+            &McpContext::new(cx.clone(), req_id),
+            params,
+            SessionState::new(),
+            None,
+            None,
+        );
     let call_result = result.expect("macro_prepare_thread should not fail with llm_mode=false");
     assert!(
         !call_result.is_error,
