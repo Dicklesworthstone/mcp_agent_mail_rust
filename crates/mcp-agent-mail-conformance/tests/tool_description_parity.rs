@@ -609,6 +609,12 @@ fn check_cluster_descriptions(tool_names: &[&str]) {
     let mut failures: Vec<String> = Vec::new();
 
     for &name in tool_names {
+        // Rust-native tools intentionally have no Python description baseline.
+        // Registration is asserted by the inventory test above instead.
+        if RUST_NATIVE_TOOLS.contains(&name) {
+            continue;
+        }
+
         let Some(py_tool) = python_by_name.get(name) else {
             failures.push(format!("[{name}] not found in Python fixture"));
             continue;
