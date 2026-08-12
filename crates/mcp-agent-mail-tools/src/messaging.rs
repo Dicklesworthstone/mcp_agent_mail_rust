@@ -439,7 +439,10 @@ async fn resolve_or_register_agent(
             .await
         {
             Outcome::Ok(agent) => Ok(agent),
-            Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
+            Outcome::Err(DbError::NotFound { .. })
+                if config.messaging_auto_register_recipients
+                    && !config.messaging_fail_closed_send_profile =>
+            {
                 // Proof gate (fail-closed): auto-registering an unknown recipient
                 // here cannot carry a signed `registration_proof` bundle, so when
                 // the gate is enabled we refuse instead of minting an unproven
@@ -1368,6 +1371,117 @@ pub struct MessagePayload {
     pub bcc: Vec<String>,
 }
 
+/// One delivery outcome in a redacted send receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactedSendTargetOutcome {
+    /// Canonical recipient agent name.
+    pub recipient: String,
+    /// Recipient role from the send request: `to`, `cc`, or `bcc`.
+    pub kind: String,
+    /// The terminal outcome for this recipient.
+    pub outcome: String,
+}
+
+/// Payload-free response returned by the fail-closed send profile.
+///
+/// This deliberately has no subject, body, attachment, or full recipient-list
+/// payload. The individual target outcomes are retained so a caller can audit
+/// delivery without copying message contents into logs or orchestration state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactedSendMessageReceipt {
+    pub receipt_mode: String,
+    pub project: String,
+    pub message_id: i64,
+    pub project_id: i64,
+    pub sender_id: i64,
+    pub thread_id: Option<String>,
+    pub created_ts: String,
+    pub verified_sender: bool,
+    pub target_outcomes: Vec<RedactedSendTargetOutcome>,
+}
+
+fn redacted_send_target_outcomes(
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+) -> Vec<RedactedSendTargetOutcome> {
+    let mut outcomes = Vec::with_capacity(to.len() + cc.len() + bcc.len());
+    for (kind, recipients) in [("to", to), ("cc", cc), ("bcc", bcc)] {
+        outcomes.extend(
+            recipients
+                .iter()
+                .cloned()
+                .map(|recipient| RedactedSendTargetOutcome {
+                    recipient,
+                    kind: kind.to_string(),
+                    outcome: "delivered".to_string(),
+                }),
+        );
+    }
+    outcomes
+}
+
+fn verify_sender_identity(
+    sender_name: &str,
+    sender_token: Option<&str>,
+    registration_token: Option<&str>,
+    require_verified_sender: bool,
+) -> McpResult<bool> {
+    let Some(sender_token) = sender_token.filter(|token| !token.is_empty()) else {
+        if require_verified_sender {
+            return Err(legacy_tool_error(
+                "SENDER_TOKEN_REQUIRED",
+                format!(
+                    "A sender_token is required to send as agent '{sender_name}' while the fail-closed send profile is enabled."
+                ),
+                true,
+                json!({
+                    "sender_name": sender_name,
+                    "profile": "fail_closed",
+                    "hint": "Use the registration_token returned by register_agent as sender_token",
+                }),
+            ));
+        }
+        return Ok(false);
+    };
+
+    let Some(registration_token) = registration_token else {
+        if require_verified_sender {
+            return Err(legacy_tool_error(
+                "SENDER_TOKEN_UNAVAILABLE",
+                format!(
+                    "Agent '{sender_name}' has no stored registration token, so sender proof cannot be verified while the fail-closed send profile is enabled. Re-register the agent before sending."
+                ),
+                false,
+                json!({
+                    "sender_name": sender_name,
+                    "profile": "fail_closed",
+                    "hint": "Re-register the agent to obtain a registration_token before sending",
+                }),
+            ));
+        }
+        return Ok(false);
+    };
+
+    if mcp_agent_mail_core::setup::constant_time_str_eq(sender_token, registration_token) {
+        Ok(true)
+    } else {
+        Err(legacy_tool_error(
+            "SENDER_TOKEN_MISMATCH",
+            format!(
+                "sender_token does not match the registered token for agent '{sender_name}'. \
+                 Only the agent's owner (the session that called register_agent) can send \
+                 messages as this agent. Use the registration_token returned by register_agent."
+            ),
+            false,
+            json!({
+                "sender_name": sender_name,
+                "hint": "Use the registration_token returned by register_agent as sender_token",
+            }),
+        ))
+    }
+}
+
 /// Inbox message summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxMessage {
@@ -1457,7 +1571,7 @@ pub struct ReplyMessageResponse {
 /// - `thread_id`: Associate with existing thread (optional; bare numerics must already exist)
 /// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
-/// - `sender_token`: Registration token for sender identity verification (optional)
+/// - `sender_token`: Registration token for sender identity verification (optional by default; mandatory in the fail-closed profile)
 ///
 /// # Conformance
 /// Python-parity.
@@ -1625,41 +1739,15 @@ effective_free_bytes={free}"
     .await?;
     let sender_id = sender.id.unwrap_or(0);
 
-    // ── Sender identity verification (issue #42) ──────────────────────
-    //
-    // If `sender_token` is provided, validate it against the agent's stored
-    // `registration_token` using constant-time comparison.
-    // - Match: proceed, set `verified_sender = true` in response.
-    // - Mismatch: reject immediately with an error (impersonation attempt).
-    // - Not provided: proceed but set `verified_sender = false`.
-    let verified_sender = match sender_token.as_deref() {
-        Some(token) => {
-            if let Some(ref stored_token) = sender.registration_token {
-                if mcp_agent_mail_core::setup::constant_time_str_eq(token, stored_token) {
-                    true
-                } else {
-                    return Err(legacy_tool_error(
-                        "SENDER_TOKEN_MISMATCH",
-                        format!(
-                            "sender_token does not match the registered token for agent '{sender_name}'. \
-                             Only the agent's owner (the session that called register_agent) can send \
-                             messages as this agent. Use the registration_token returned by register_agent."
-                        ),
-                        false,
-                        json!({
-                            "sender_name": sender_name,
-                            "hint": "Use the registration_token returned by register_agent as sender_token",
-                        }),
-                    ));
-                }
-            } else {
-                // Agent has no stored token — token was provided but agent never had one.
-                // Treat as unverified rather than rejecting (graceful upgrade path).
-                false
-            }
-        }
-        None => false,
-    };
+    // The opt-in fail-closed profile rejects missing/unavailable proof before
+    // recipient resolution, auto-registration, contact handshakes, DB writes,
+    // notifications, or archive dispatch can occur.
+    let verified_sender = verify_sender_identity(
+        &sender_name,
+        sender_token.as_deref(),
+        sender.registration_token.as_deref(),
+        config.messaging_fail_closed_send_profile,
+    )?;
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
     {
@@ -2244,37 +2332,52 @@ effective_free_bytes={free}"
         );
     }
 
-    // Extract path strings from processed metadata for response format
-    let attachment_paths_out: Vec<String> = all_attachment_meta
-        .iter()
-        .filter_map(|m| m.get("path").and_then(|p| p.as_str()).map(str::to_string))
-        .collect();
-
-    let payload = MessagePayload {
-        id: message_id,
-        project_id,
-        sender_id,
-        thread_id: message.thread_id,
-        subject: message.subject,
-        body_md: message.body_md,
-        importance: message.importance,
-        ack_required: message.ack_required != 0,
-        created_ts: Some(micros_to_iso(message.created_ts)),
-        attachments: all_attachment_meta,
-        from: sender.name.clone(),
-        to: resolved_to.into_vec(),
-        cc: resolved_cc_recipients.into_vec(),
-        bcc: resolved_bcc_recipients.into_vec(),
-    };
-
-    let response = SendMessageResponse {
-        deliveries: vec![DeliveryResult {
+    let response = if config.messaging_fail_closed_send_profile {
+        serde_json::to_string(&RedactedSendMessageReceipt {
+            receipt_mode: "redacted".to_string(),
             project: project.human_key.clone(),
-            payload,
-        }],
-        count: 1,
-        attachments: attachment_paths_out,
-        verified_sender,
+            message_id,
+            project_id,
+            sender_id,
+            thread_id: message.thread_id,
+            created_ts: micros_to_iso(message.created_ts),
+            verified_sender,
+            target_outcomes: redacted_send_target_outcomes(
+                &resolved_to,
+                &resolved_cc_recipients,
+                &resolved_bcc_recipients,
+            ),
+        })
+    } else {
+        let attachment_paths_out: Vec<String> = all_attachment_meta
+            .iter()
+            .filter_map(|m| m.get("path").and_then(|p| p.as_str()).map(str::to_string))
+            .collect();
+        let payload = MessagePayload {
+            id: message_id,
+            project_id,
+            sender_id,
+            thread_id: message.thread_id,
+            subject: message.subject,
+            body_md: message.body_md,
+            importance: message.importance,
+            ack_required: message.ack_required != 0,
+            created_ts: Some(micros_to_iso(message.created_ts)),
+            attachments: all_attachment_meta,
+            from: sender.name.clone(),
+            to: resolved_to.into_vec(),
+            cc: resolved_cc_recipients.into_vec(),
+            bcc: resolved_bcc_recipients.into_vec(),
+        };
+        serde_json::to_string(&SendMessageResponse {
+            deliveries: vec![DeliveryResult {
+                project: project.human_key.clone(),
+                payload,
+            }],
+            count: 1,
+            attachments: attachment_paths_out,
+            verified_sender,
+        })
     };
 
     tracing::debug!(
@@ -2285,8 +2388,7 @@ effective_free_bytes={free}"
         project_key
     );
 
-    serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+    response.map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
 /// Reply to an existing message, preserving or establishing a thread.
@@ -5316,6 +5418,62 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["count"], 0);
         assert!(json["deliveries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fail_closed_sender_verification_rejects_missing_and_unavailable_proof() {
+        assert!(!verify_sender_identity("BlueLake", None, Some("token"), false).unwrap());
+        assert!(verify_sender_identity("BlueLake", Some("token"), Some("token"), true).unwrap());
+
+        let missing = verify_sender_identity("BlueLake", None, Some("token"), true)
+            .expect_err("fail-closed sends require a supplied token");
+        assert_eq!(missing.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            missing.data.as_ref().expect("structured error")["error"]["type"],
+            "SENDER_TOKEN_REQUIRED"
+        );
+
+        let unavailable = verify_sender_identity("BlueLake", Some("token"), None, true)
+            .expect_err("fail-closed sends require a stored token");
+        assert_eq!(
+            unavailable.data.as_ref().expect("structured error")["error"]["type"],
+            "SENDER_TOKEN_UNAVAILABLE"
+        );
+
+        let mismatch = verify_sender_identity("BlueLake", Some("wrong"), Some("token"), true)
+            .expect_err("mismatched token must be rejected");
+        assert_eq!(
+            mismatch.data.as_ref().expect("structured error")["error"]["type"],
+            "SENDER_TOKEN_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn redacted_send_receipt_omits_message_payload_and_keeps_target_outcomes() {
+        let receipt = RedactedSendMessageReceipt {
+            receipt_mode: "redacted".to_string(),
+            project: "/workspace/example".to_string(),
+            message_id: 41,
+            project_id: 7,
+            sender_id: 11,
+            thread_id: Some("bd-237".to_string()),
+            created_ts: "2026-08-12T19:00:00Z".to_string(),
+            verified_sender: true,
+            target_outcomes: redacted_send_target_outcomes(
+                &["BlueLake".to_string()],
+                &["GreenHill".to_string()],
+                &[],
+            ),
+        };
+        let json = serde_json::to_value(&receipt).expect("receipt serializes");
+
+        assert_eq!(json["receipt_mode"], "redacted");
+        assert_eq!(json["message_id"], 41);
+        assert_eq!(json["target_outcomes"][0]["recipient"], "BlueLake");
+        assert_eq!(json["target_outcomes"][1]["kind"], "cc");
+        for forbidden in ["subject", "body_md", "attachments", "deliveries"] {
+            assert!(json.get(forbidden).is_none(), "receipt leaked {forbidden}");
+        }
     }
 
     #[test]
