@@ -245,6 +245,8 @@ fn error_code_catalog_is_stable() {
         "CONFLICT",
         "CONTACT_BLOCKED",
         "CONTACT_REQUIRED",
+        "CURSOR_AHEAD",
+        "CURSOR_EXPIRED",
         "DATABASE_CORRUPTION",
         "DATABASE_ERROR",
         "DATABASE_POOL_EXHAUSTED",
