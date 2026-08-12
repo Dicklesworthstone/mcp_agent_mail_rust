@@ -6364,7 +6364,7 @@ fn coordinate_server_restart(
     wait: std::time::Duration,
 ) -> (RestartDecision, Option<RestartCoordinationLock>) {
     use fs2::FileExt;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let path = restart_lock_path(&config.storage_root);
     if let Some(parent) = path.parent() {
