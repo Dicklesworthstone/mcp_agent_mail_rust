@@ -5036,6 +5036,9 @@ impl DispatchPermit {
             DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
             None
         } else {
+            mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
+                .inflight
+                .add(1);
             Some(DispatchPermit {
                 zombified: Arc::new(AtomicBool::new(false)),
             })
@@ -5050,8 +5053,14 @@ impl Drop for DispatchPermit {
             // was being accounted as a zombie. Release the zombie slot now that
             // the uncancellable work has finally exited.
             DISPATCH_ZOMBIES.fetch_sub(1, Ordering::Relaxed);
+            mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
+                .zombies
+                .sub_saturating(1);
         } else {
             DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
+                .inflight
+                .sub_saturating(1);
         }
     }
 }
@@ -5093,13 +5102,43 @@ fn dispatch_checkpoint(cx: &Cx, cancel: &DispatchCancel) -> Result<(), McpError>
     cx.checkpoint().map_err(|_| dispatch_cancelled_error())
 }
 
+const fn micros_to_millis_ceil(micros: u64) -> u64 {
+    micros.saturating_add(999).saturating_div(1_000)
+}
+
+fn dispatch_timeout_error_text(
+    method: &str,
+    dispatch_timeout_secs: u64,
+    diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
+) -> String {
+    let dispatch = &diagnostics.blocking_dispatch;
+    format!(
+        "Request timed out after {dispatch_timeout_secs}s (method={method}). \
+         Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
+         client_deadline_ms={}; pool_acquire_p99_ms={}; database_write_p99_ms={}; \
+         archive_wbq_p99_ms={}; archive_commit_p99_ms={}; \
+         blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
+         blocking_dispatch_timeouts_total={}.",
+        diagnostics.stage.as_str(),
+        diagnostics.stage_exceeded_budget,
+        micros_to_millis_ceil(diagnostics.client_deadline_us),
+        micros_to_millis_ceil(diagnostics.pool_acquire_p99_us),
+        micros_to_millis_ceil(diagnostics.database_write_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_commit_p99_us),
+        dispatch.inflight,
+        dispatch.zombies,
+        dispatch.timeouts_total,
+    )
+}
+
 fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError {
+    let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
+    let diagnostics =
+        mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
     McpError::new(
         McpErrorCode::InternalError,
-        format!(
-            "Request timed out after {dispatch_timeout_secs}s \
-             (method={method}). The database may be under heavy contention."
-        ),
+        dispatch_timeout_error_text(method, dispatch_timeout_secs, &diagnostics),
     )
 }
 
@@ -5279,6 +5318,9 @@ where
                         if !permit.zombified.swap(true, Ordering::AcqRel) {
                             DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
                             let zombies = DISPATCH_ZOMBIES.fetch_add(1, Ordering::Relaxed) + 1;
+                            let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
+                            metrics.inflight.sub_saturating(1);
+                            metrics.zombies.add(1);
                             tracing::error!(
                                 method = %grace_method,
                                 grace_secs,
@@ -5300,6 +5342,9 @@ where
                 "blocking dispatch timed out; cancellation requested, \
                  permit will be force-released after {grace_secs}s grace"
             );
+            mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
+                .timeouts_total
+                .inc();
             Err(dispatch_timeout_error(&method, dispatch_timeout_secs))
         }
     }
@@ -10467,7 +10512,7 @@ impl HttpState {
             config,
             rate_limiter: Arc::new(RateLimiter::new()),
             rate_limit_redis: Mutex::new(rate_limit_redis),
-            request_timeout_secs: 30,
+            request_timeout_secs: mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS / 1_000,
             handler,
             jwks_http_client: HttpClient::new(),
             jwks_cache: Mutex::new(None),
@@ -16957,6 +17002,31 @@ mod tests {
              wall_now()={now:?} is always > 0 (the absolute deadline). \
              This demonstrates why with_deadline_at_secs is WRONG for relative timeouts.",
         );
+    }
+
+    #[test]
+    fn dispatch_timeout_text_reports_evidence_without_generic_database_blame() {
+        let diagnostics = mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot {
+            client_deadline_us: 30_000_000,
+            stage: mcp_agent_mail_core::metrics::TimeoutStage::BlockingDispatch,
+            stage_exceeded_budget: false,
+            pool_acquire_p99_us: 9_000,
+            database_write_p99_us: 11_000,
+            archive_wbq_p99_us: 2_000,
+            archive_commit_p99_us: 16_778_000,
+            blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
+                inflight: 1,
+                zombies: 0,
+                timeouts_total: 1,
+            },
+        };
+
+        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics);
+        assert!(text.contains("stage=blocking_dispatch_unattributed"));
+        assert!(text.contains("stage_exceeded_budget=false"));
+        assert!(text.contains("pool_acquire_p99_ms=9"));
+        assert!(text.contains("archive_commit_p99_ms=16778"));
+        assert!(!text.contains("database may be under heavy contention"));
     }
 
     #[test]

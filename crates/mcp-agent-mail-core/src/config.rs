@@ -10,6 +10,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// Ecosystem clients abort a request after this many milliseconds. Health
+/// latency bounds are deliberately capped at this deadline so a "warning"
+/// cannot be configured past the point at which users already time out.
+pub const ECOSYSTEM_CLIENT_DEADLINE_MS: u64 = 30_000;
+
 /// ATC experience write mode: controls whether `atc_note_*` calls persist
 /// experience rows, log shadow traces, or are entirely suppressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -251,6 +256,9 @@ pub struct Config {
     pub health_sweep_enabled: bool,
     pub health_sweep_interval_seconds: u64,
     pub health_sweep_batch: usize,
+    /// Tail-latency bound at which the archive commit coalescer makes the
+    /// 30-second ecosystem client deadline functionally unsafe.
+    pub health_commit_coalescer_p99_degraded_ms: u64,
 
     // Boot-time archive git integrity check
     pub boot_check_mode: String,
@@ -1354,6 +1362,7 @@ impl Default for Config {
             health_sweep_enabled: true,
             health_sweep_interval_seconds: 900, // 15 minutes
             health_sweep_batch: 5,
+            health_commit_coalescer_p99_degraded_ms: 15_000,
             boot_check_mode: "warn".to_string(),
             boot_auto_repair_enabled: false,
 
@@ -1714,6 +1723,10 @@ impl std::fmt::Debug for Config {
                 &self.health_sweep_interval_seconds,
             )
             .field("health_sweep_batch", &self.health_sweep_batch)
+            .field(
+                "health_commit_coalescer_p99_degraded_ms",
+                &self.health_commit_coalescer_p99_degraded_ms,
+            )
             .field("boot_check_mode", &self.boot_check_mode)
             .field("boot_auto_repair_enabled", &self.boot_auto_repair_enabled)
             .field("log_level", &self.log_level)
@@ -1936,6 +1949,11 @@ impl Config {
         .max(1);
         config.health_sweep_batch =
             env_usize("AM_HEALTH_SWEEP_BATCH", config.health_sweep_batch).max(1);
+        config.health_commit_coalescer_p99_degraded_ms = env_u64(
+            "AM_HEALTH_COMMIT_COALESCER_P99_DEGRADED_MS",
+            config.health_commit_coalescer_p99_degraded_ms,
+        )
+        .clamp(1, ECOSYSTEM_CLIENT_DEADLINE_MS);
 
         // Boot-time archive integrity check
         if let Some(raw_mode) = env_value("AM_BOOT_CHECK_MODE") {
@@ -3867,8 +3885,20 @@ mod tests {
         assert!(config.health_sweep_enabled);
         assert_eq!(config.health_sweep_interval_seconds, 900);
         assert_eq!(config.health_sweep_batch, 5);
+        assert_eq!(config.health_commit_coalescer_p99_degraded_ms, 15_000);
         assert_eq!(config.boot_check_mode, "warn");
         assert!(!config.boot_auto_repair_enabled);
+    }
+
+    #[test]
+    fn test_commit_coalescer_health_bound_from_env_is_capped_at_client_deadline() {
+        let _env =
+            TestEnvOverrideGuard::set(&[("AM_HEALTH_COMMIT_COALESCER_P99_DEGRADED_MS", "40000")]);
+
+        assert_eq!(
+            Config::from_env().health_commit_coalescer_p99_degraded_ms,
+            ECOSYSTEM_CLIENT_DEADLINE_MS
+        );
     }
 
     #[test]
