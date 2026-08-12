@@ -294,6 +294,46 @@ fn guard_check_full_no_conflict_for_own_reservations_case_insensitively() {
 }
 
 #[test]
+fn guard_check_full_resolves_current_pane_identity_when_agent_name_is_unset() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvGuard::save(&[
+        "WORKTREES_ENABLED",
+        "AGENT_NAME",
+        "AGENT_MAIL_BYPASS",
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+        "TMUX_PANE",
+        "XDG_CONFIG_HOME",
+    ]);
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = make_archive_with_reservations(td.path());
+    let config_home = td.path().join("config");
+    let pane_id = "%guard-env-identity";
+
+    unsafe {
+        std::env::set_var("WORKTREES_ENABLED", "1");
+        std::env::remove_var("AGENT_NAME");
+        std::env::remove_var("AGENT_MAIL_BYPASS");
+        std::env::remove_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED");
+        std::env::set_var("TMUX_PANE", pane_id);
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    }
+
+    let identity_path =
+        mcp_agent_mail_core::canonical_identity_path(&archive.to_string_lossy(), pane_id);
+    std::fs::create_dir_all(identity_path.parent().expect("identity parent"))
+        .expect("create identity parent");
+    std::fs::write(identity_path, "MyAgent\n").expect("write identity");
+
+    let result = guard_check_full(&archive, &archive, &["my/stuff/file.txt".to_string()])
+        .expect("guard_check_full");
+    assert!(
+        result.conflicts.is_empty(),
+        "the resolved pane owner must not conflict with its own reservation"
+    );
+}
+
+#[test]
 fn guard_check_full_empty_archive_no_conflicts() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _guard = EnvGuard::save(&["WORKTREES_ENABLED", "AGENT_NAME", "AGENT_MAIL_BYPASS"]);
