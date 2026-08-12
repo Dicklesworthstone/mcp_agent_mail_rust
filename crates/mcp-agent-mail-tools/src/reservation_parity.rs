@@ -1037,8 +1037,7 @@ mod tests {
             true,
         );
 
-        let report =
-            check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
         assert_eq!(
             report.drift.archive_id_collisions, 0,
             "no cross-generation collisions: {:?}",
@@ -1085,8 +1084,7 @@ mod tests {
             true,
         );
 
-        let report =
-            check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
         assert_eq!(report.drift.archive_id_collisions, 1);
         assert_eq!(report.drift.foreign_generation_artifacts, 0);
     }

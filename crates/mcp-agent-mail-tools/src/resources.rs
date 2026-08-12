@@ -6686,7 +6686,11 @@ mod resource_shape_tests {
                 .expect("file reservations page");
                 let entries = parse_json(&payload);
                 let entries = entries.as_array().expect("reservations array");
-                assert_eq!(entries.len(), 1, "resource output must honor its page limit");
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "resource output must honor its page limit"
+                );
                 assert_eq!(
                     entries[0]["id"].as_i64(),
                     created.get(1).and_then(|row| row.id),
@@ -6989,7 +6993,6 @@ mod resource_shape_tests {
                     rows.iter().all(|row| row.released_ts.is_none()),
                     "a resource read must not release expired reservations"
                 );
-
             });
         });
     }
@@ -7056,9 +7059,14 @@ mod resource_shape_tests {
 
                 let projects = parse_json(&projects_list(&ctx).await.expect("projects list"));
                 let projects_array = projects.as_array().expect("projects array");
-                assert!(projects_array.is_empty(), "archive state must not replace the live read lane");
                 assert!(
-                    agents_list(&ctx, "/ahead-project".to_string()).await.is_err(),
+                    projects_array.is_empty(),
+                    "archive state must not replace the live read lane"
+                );
+                assert!(
+                    agents_list(&ctx, "/ahead-project".to_string())
+                        .await
+                        .is_err(),
                     "an archive-only project must not be reconstructed on a resource read"
                 );
 

@@ -1833,7 +1833,8 @@ pub async fn file_reservation_paths(
 ) -> McpResult<String> {
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
-    let idempotency_key = crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
+    let idempotency_key =
+        crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
 
     if paths.is_empty() {
         return Err(legacy_tool_error(
