@@ -411,33 +411,47 @@ fn retention_window_replays_in_window_but_prunes_after_expiry() {
     let pid = setup_project(&pool);
     let agent = setup_agent(&pool, pid, "GreenCastle");
 
+    // Prove retention via the idempotency_keys table itself (fully under this
+    // layer's control), not via reservation row counts — the reservation layer
+    // renews a holder's same-path lease instead of inserting a distinct row, so
+    // it is the wrong observable. `created_ts` of the single key record tells us
+    // whether a call recorded a NEW key (fresh) or left the record untouched
+    // (replay). The Fresh/Replayed outcomes are themselves the criterion-(c)
+    // proof; this corroborates them at the durable layer.
+    let key_count = || count_rows(&db_path, "SELECT COUNT(*) FROM idempotency_keys");
+    let key_created_ts = || count_rows(&db_path, "SELECT created_ts FROM idempotency_keys");
+
     // Fresh record (default 24h retention window).
     let fresh = reserve_idem(&pool, pid, agent, "docs/**", "TTL1", "fp-A");
     assert!(matches!(fresh, IdempotentOutcome::Fresh(_)));
-    assert_eq!(active_reservation_count(&pool, pid), 1);
+    assert_eq!(key_count(), 1);
+    let ts_original = key_created_ts();
+    assert!(ts_original > 0, "fresh key must record a created_ts");
 
-    // In-window retry replays (no new lease).
+    // In-window retry replays: the stored record is returned untouched.
     let in_window = reserve_idem(&pool, pid, agent, "docs/**", "TTL1", "fp-A");
     assert!(in_window.is_replayed(), "in-window retry must replay");
-    assert_eq!(active_reservation_count(&pool, pid), 1);
+    assert_eq!(key_count(), 1, "a replay records no new key");
+    assert_eq!(
+        key_created_ts(),
+        ts_original,
+        "a replay must not rewrite the key record"
+    );
 
-    // Age the key past its window; the next check prunes it and treats it fresh.
+    // Age the key past its window; the next call prunes it and is treated fresh.
     expire_all_idempotency_keys(&db_path);
     let after_expiry = reserve_idem(&pool, pid, agent, "docs/**", "TTL1", "fp-A");
     assert!(
         matches!(after_expiry, IdempotentOutcome::Fresh(_)),
-        "an expired key must be treated as fresh, got {after_expiry:?}"
+        "an expired key must be pruned and treated as fresh, got {after_expiry:?}"
     );
-    assert_eq!(
-        active_reservation_count(&pool, pid),
-        2,
-        "after expiry a fresh application creates a second reservation"
-    );
-    // The expired record was pruned and replaced by the fresh one.
-    assert_eq!(
-        count_rows(&db_path, "SELECT COUNT(*) FROM idempotency_keys"),
-        1,
-        "pruning must leave exactly the one fresh key"
+    // Exactly one key remains (expired pruned, fresh inserted), and it is a NEW
+    // record — a strictly newer created_ts proves the prune-then-record path ran
+    // rather than a stale replay.
+    assert_eq!(key_count(), 1, "pruning must leave exactly the one fresh key");
+    assert!(
+        key_created_ts() > ts_original,
+        "the pruned key was re-recorded fresh (newer created_ts)"
     );
 }
 
