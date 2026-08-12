@@ -26,6 +26,16 @@ pub struct ReservationParityDriftSummary {
     /// id that was later reused — NOT missing DB rows to insert (GH#167). They are
     /// safe to quarantine, never to reconstruct into `SQLite`.
     pub archive_id_collisions: usize,
+    /// Archive `id-<id>-g<generation>.json` artifacts whose embedded generation
+    /// token does NOT match the live database's generation (br-n8qh6). These are
+    /// debris from a *prior* DB generation (the DB was wiped and re-created); the
+    /// stable generation-stamped name guarantees they can never overwrite or
+    /// collide with the current generation's artifacts, so they are NOT drift and
+    /// must never be reconstructed into the live DB. Tracked for visibility and
+    /// deliberately excluded from `total()` — a clean parity run may still list
+    /// prior-generation artifacts. The archive-normalize reservation fixer
+    /// quarantines them.
+    pub foreign_generation_artifacts: usize,
     pub agent_id_mismatches: usize,
     pub released_ts_mismatches: usize,
     pub active_status_mismatches: usize,
@@ -203,6 +213,10 @@ impl DbReservationState {
 struct ArchiveReservationState {
     reservation_id: i64,
     project_slug: String,
+    /// The DB generation token parsed from the artifact filename
+    /// (`id-<id>-g<generation>.json`), or `None` for a legacy `id-<id>.json`
+    /// artifact that predates generation stamping (br-n8qh6).
+    generation: Option<String>,
     agent_name: String,
     thread_provenance: String,
     /// `None` when the archive artifact omits `path_pattern`/`path` entirely
@@ -655,21 +669,14 @@ fn scan_reservation_dir(
         {
             continue;
         }
-        let Some(raw_id) = path
+        let Some(parsed) = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("id-"))
-            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename)
         else {
             continue;
         };
-        let Ok(reservation_id) = raw_id.parse::<i64>() else {
-            continue;
-        };
-        if reservation_id <= 0 {
-            continue;
-        }
-        match parse_archive_reservation(&path, project_slug, reservation_id) {
+        match parse_archive_reservation(&path, project_slug, parsed.id, parsed.generation) {
             Ok(reservation) => reservations.push(reservation),
             Err(detail) => parse_errors.push(ArchiveParseError { path, detail }),
         }
@@ -751,6 +758,7 @@ fn parse_archive_reservation(
     path: &Path,
     project_slug: &str,
     reservation_id: i64,
+    generation: Option<String>,
 ) -> Result<ArchiveReservationState, String> {
     let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     let json: serde_json::Value =
@@ -764,6 +772,10 @@ fn parse_archive_reservation(
             "file name id {reservation_id} does not match JSON id {json_id}"
         ));
     }
+    // Prefer the generation parsed from the filename (authoritative for naming);
+    // fall back to the artifact's own `db_generation` field so a legacy-named
+    // file that nonetheless carries a token is still attributed (br-n8qh6).
+    let generation = generation.or_else(|| json_string(&json, "db_generation"));
     let agent_name =
         json_string(&json, "agent").ok_or_else(|| "agent is missing or blank".to_string())?;
     let thread_provenance = json_string(&json, "thread_id")
@@ -780,6 +792,7 @@ fn parse_archive_reservation(
     Ok(ArchiveReservationState {
         reservation_id,
         project_slug: project_slug.to_string(),
+        generation,
         agent_name,
         thread_provenance,
         path_pattern,

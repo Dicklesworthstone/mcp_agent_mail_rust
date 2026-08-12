@@ -95,6 +95,10 @@ pub struct ReservationResponse {
 pub struct ReservationConflictCheckResponse {
     pub conflict_free: bool,
     pub conflicts: Vec<ReservationConflict>,
+    /// The caller's active reservations from the same authoritative snapshot.
+    /// They are informational rather than peer conflicts.
+    #[serde(default)]
+    pub own_active: Vec<OwnActiveReservation>,
     pub clear_paths: Vec<String>,
     pub checked_paths: usize,
     pub total_conflicting_reservations: usize,
@@ -103,6 +107,15 @@ pub struct ReservationConflictCheckResponse {
     pub snapshot_ts: String,
     pub authoritative_source: String,
     pub read_only: bool,
+}
+
+/// An active reservation owned by the caller of a conflict check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnActiveReservation {
+    pub id: i64,
+    pub path_pattern: String,
+    pub exclusive: bool,
+    pub expires_ts: String,
 }
 
 /// Release result
@@ -1556,7 +1569,7 @@ fn acquire_outcome<T>(
 /// without registering identities, cleaning up leases, healing archives, or
 /// changing reservation state.
 #[tool(
-    description = "Check project-relative paths against authoritative active exclusive file reservations without mutating Agent Mail.\n\nThis is the guard-safe read API for pre-edit, pre-commit, and pre-push checks. It resolves the existing caller identity and active leases in one fresh database snapshot, ignores only reservations owned by that canonical caller ID, and reports exact, glob, and ancestor conflicts. Expired, released, and shared reservations do not block. Malformed request or stored patterns fail closed. The call never registers agents or projects, cleans up leases, releases reservations, heals archives, or writes mailbox state.\n\nParameters\n----------\nproject_key : str\n    Existing project human key or slug.\nagent_name : str\n    Existing caller identity. Case-insensitive lookup resolves the canonical lowest-ID identity.\npaths : list[str]\n    One to 200 project-relative paths or glob patterns.\n\nReturns\n-------\ndict\n    { conflict_free, conflicts, clear_paths, checked_paths, total_conflicting_reservations, output_truncated, project, snapshot_ts, authoritative_source, read_only }"
+    description = "Check project-relative paths against authoritative active exclusive file reservations without mutating Agent Mail.\n\nThis is the guard-safe read API for pre-edit, pre-commit, and pre-push checks. It resolves the existing caller identity and active leases in one fresh database snapshot, reports the caller's own active leases separately, and reports exact, glob, and ancestor conflicts from other agents. Expired, released, and shared reservations do not block. Malformed request or stored patterns fail closed. The call never registers agents or projects, cleans up leases, releases reservations, heals archives, or writes mailbox state.\n\nParameters\n----------\nproject_key : str\n    Existing project human key or slug.\nagent_name : str\n    Existing caller identity. Case-insensitive lookup resolves the canonical lowest-ID identity.\npaths : list[str]\n    One to 200 project-relative paths or glob patterns.\n\nReturns\n-------\ndict\n    { conflict_free, conflicts, own_active, clear_paths, checked_paths, total_conflicting_reservations, output_truncated, project, snapshot_ts, authoritative_source, read_only }"
 )]
 pub async fn check_file_reservation_conflicts(
     ctx: &McpContext,
@@ -1649,8 +1662,18 @@ pub async fn check_file_reservation_conflicts(
 
     let mut holder_by_agent = HashMap::with_capacity(snapshot.reservations.len());
     let mut indexed = Vec::with_capacity(snapshot.reservations.len());
+    let mut own_active = Vec::new();
     for reservation in &snapshot.reservations {
         if reservation.agent_id == snapshot.caller_agent_id {
+            own_active.push(OwnActiveReservation {
+                id: reservation.id,
+                path_pattern: reservation.path_pattern.clone(),
+                exclusive: reservation.exclusive,
+                expires_ts: micros_to_iso(reservation.expires_ts),
+            });
+            continue;
+        }
+        if !reservation.exclusive {
             continue;
         }
         let Some(holder) = reservation.agent_name.as_deref() else {
@@ -1760,6 +1783,7 @@ pub async fn check_file_reservation_conflicts(
     let response = ReservationConflictCheckResponse {
         conflict_free: conflicts.is_empty(),
         conflicts,
+        own_active,
         clear_paths,
         checked_paths: normalized_paths.len(),
         total_conflicting_reservations,
