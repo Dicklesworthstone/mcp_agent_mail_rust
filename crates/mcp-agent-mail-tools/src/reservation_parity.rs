@@ -94,18 +94,24 @@ impl ReservationParityReport {
     #[must_use]
     pub fn health_line(&self) -> String {
         if self.ok {
-            // `pruned_released_archived` is expected (retention), not drift, so it
-            // is reported only as an informational suffix when non-zero (br-5xbua).
+            // `pruned_released_archived` (retention) and `foreign_generation_artifacts`
+            // (prior-DB-generation debris, br-n8qh6) are expected, not drift, so they
+            // are reported only as informational suffixes when non-zero.
+            let mut suffix = String::new();
             if self.drift.pruned_released_archived > 0 {
-                return format!(
-                    "reservation_parity: ok db={} archive={} drift=0 pruned_released_archived={}",
-                    self.db_reservations,
-                    self.archive_reservations,
+                suffix.push_str(&format!(
+                    " pruned_released_archived={}",
                     self.drift.pruned_released_archived
-                );
+                ));
+            }
+            if self.drift.foreign_generation_artifacts > 0 {
+                suffix.push_str(&format!(
+                    " foreign_generation_artifacts={}",
+                    self.drift.foreign_generation_artifacts
+                ));
             }
             return format!(
-                "reservation_parity: ok db={} archive={} drift=0",
+                "reservation_parity: ok db={} archive={} drift=0{suffix}",
                 self.db_reservations, self.archive_reservations
             );
         }
@@ -304,6 +310,25 @@ where
         .collect()
 }
 
+/// Read the live database's generation token (br-n8qh6) via the parity query
+/// closure. Returns `None` when `db_identity` is absent/unseeded or the read
+/// fails — the caller then treats every archive artifact by legacy (project, id)
+/// semantics rather than attributing it to a generation.
+fn read_current_generation<F>(query: &mut F) -> Option<String>
+where
+    F: FnMut(&str, &[Value]) -> Result<Vec<Row>, String>,
+{
+    let rows = query(
+        "SELECT generation_id FROM db_identity WHERE singleton = 0",
+        &[],
+    )
+    .ok()?;
+    rows.first()?
+        .get_named::<String>("generation_id")
+        .ok()
+        .filter(|generation| !generation.is_empty())
+}
+
 pub fn check_reservation_parity_with_db_conn(
     conn: &mcp_agent_mail_db::DbConn,
     storage_root: &Path,
@@ -331,15 +356,19 @@ pub fn check_reservation_parity_with_canonical_conn(
 }
 
 fn check_reservation_parity_with_query<F>(
-    query: F,
+    mut query: F,
     storage_root: &Path,
 ) -> Result<ReservationParityReport, String>
 where
     F: FnMut(&str, &[Value]) -> Result<Vec<Row>, String>,
 {
-    let db_reservations = query_db_reservations_with(query)?;
+    // The live database's generation token (br-n8qh6). Archive artifacts stamped
+    // with a *different* generation are prior-generation debris, not drift. A
+    // missing/unseeded token (`None`) means we can't attribute generations, so we
+    // fall back to treating every artifact by its legacy (project, id) semantics.
+    let current_generation = read_current_generation(&mut query);
+    let db_reservations = query_db_reservations_with(&mut query)?;
     let archive_scan = scan_archive_reservations(storage_root);
-    let archive_reservations = archive_scan.reservations;
     let mut drift = ReservationParityDriftSummary {
         parse_errors: archive_scan.parse_errors.len(),
         ..ReservationParityDriftSummary::default()
@@ -355,6 +384,38 @@ where
             archive_value: error.path.display().to_string(),
             detail: error.detail,
         });
+    }
+
+    // Partition scanned artifacts: any stamped with a generation other than the
+    // live DB's is prior-generation debris — counted for visibility but excluded
+    // from parity comparison (and from `total()`), so a re-created DB writing to
+    // the same archive produces zero id collisions and clean parity.
+    let mut archive_reservations: Vec<ArchiveReservationState> = Vec::new();
+    for reservation in archive_scan.reservations {
+        let is_foreign = match (&current_generation, &reservation.generation) {
+            (Some(current), Some(generation)) => generation != current,
+            _ => false,
+        };
+        if is_foreign {
+            drift.foreign_generation_artifacts += 1;
+            if examples.len() < 32 {
+                examples.push(ReservationParityExample {
+                    reservation_id: reservation.reservation_id,
+                    project_slug: reservation.project_slug.clone(),
+                    field: "foreign_generation_artifact".to_string(),
+                    db_value: current_generation.clone().unwrap_or_default(),
+                    archive_value: reservation.generation.clone().unwrap_or_default(),
+                    detail: format!(
+                        "reservation_id={} archive artifact from prior DB generation (archive_generation={}, live_generation={}); not drift — quarantine candidate",
+                        reservation.reservation_id,
+                        reservation.generation.clone().unwrap_or_default(),
+                        current_generation.clone().unwrap_or_default(),
+                    ),
+                });
+            }
+        } else {
+            archive_reservations.push(reservation);
+        }
     }
 
     let db_by_key = db_reservations
@@ -857,6 +918,7 @@ mod tests {
         ArchiveReservationState {
             reservation_id: 1,
             project_slug: "proj".to_string(),
+            generation: None,
             agent_name: "Agent".to_string(),
             thread_provenance: "r".to_string(),
             path_pattern: path.map(str::to_string),
@@ -864,6 +926,169 @@ mod tests {
             released_ts: None,
             expires_ts: None,
         }
+    }
+
+    /// Write a reservation archive artifact at
+    /// `<storage_root>/projects/<slug>/file_reservations/<name>`, where the name
+    /// is generation-stamped iff `generation` is `Some`. Content mirrors what the
+    /// tools layer emits so parity comparison is faithful.
+    fn write_reservation_artifact(
+        storage_root: &Path,
+        slug: &str,
+        id: i64,
+        generation: Option<&str>,
+        agent: &str,
+        path_pattern: &str,
+        exclusive: bool,
+    ) {
+        let dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&dir).expect("create reservations dir");
+        let mut value = serde_json::json!({
+            "id": id,
+            "project": format!("/{slug}"),
+            "agent": agent,
+            "path_pattern": path_pattern,
+            "exclusive": exclusive,
+            "reason": "br-n8qh6",
+            "created_ts": 100_i64,
+            "expires_ts": 9_999_999_999_999_999_i64,
+        });
+        if let Some(generation) = generation {
+            value["db_generation"] = serde_json::Value::String(generation.to_string());
+        }
+        let name = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+            generation, id,
+        );
+        std::fs::write(dir.join(name), serde_json::to_vec_pretty(&value).unwrap())
+            .expect("write reservation artifact");
+    }
+
+    /// Build an in-memory DB with the base schema, a single project + agent, one
+    /// active reservation row (`id = 1`, project `proj-a`), and generation
+    /// `generation` seeded into `db_identity`.
+    fn seed_single_reservation_db(generation: &str) -> mcp_agent_mail_db::DbConn {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("create schema");
+        conn.execute_raw(&format!(
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, '{generation}')"
+        ))
+        .expect("seed generation");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'proj-a', '/proj-a', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'codex', 'gpt', '', 0, 0)",
+        )
+        .expect("insert agent");
+        conn.execute_raw(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (1, 1, 1, 'src/**', 1, 'br-n8qh6', 100, 9999999999999999, NULL)",
+        )
+        .expect("insert reservation");
+        conn
+    }
+
+    #[test]
+    fn two_generations_produce_zero_collisions_and_clean_parity() {
+        // br-n8qh6 acceptance: a re-created DB (generation G2) writing reservations
+        // to the same archive as a prior generation (G1) — including the exact
+        // cross-project global-id reuse that produced 607 archive_id_collisions —
+        // must yield zero collisions and clean parity.
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("aaaa2222");
+
+        // Current-generation artifact for the live row (proj-a, id 1).
+        write_reservation_artifact(
+            storage.path(),
+            "proj-a",
+            1,
+            Some("aaaa2222"),
+            "BlueLake",
+            "src/**",
+            true,
+        );
+        // Prior-generation debris: SAME global id 1 under a DIFFERENT project,
+        // written by generation G1. Pre-fix this was an archive_id_collision.
+        write_reservation_artifact(
+            storage.path(),
+            "proj-b",
+            1,
+            Some("bbbb1111"),
+            "OldHolder",
+            "legacy/**",
+            true,
+        );
+        // Prior-generation debris under the SAME project as the live row — the
+        // generation stamp keeps it at a distinct filename, so it never overwrote
+        // the current artifact.
+        write_reservation_artifact(
+            storage.path(),
+            "proj-a",
+            1,
+            Some("bbbb1111"),
+            "OldHolder",
+            "legacy/**",
+            true,
+        );
+
+        let report =
+            check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(
+            report.drift.archive_id_collisions, 0,
+            "no cross-generation collisions: {:?}",
+            report.examples
+        );
+        assert_eq!(
+            report.drift.total(),
+            0,
+            "clean parity: {:?}",
+            report.examples
+        );
+        assert_eq!(
+            report.drift.foreign_generation_artifacts, 2,
+            "both prior-generation artifacts are recognized as foreign debris"
+        );
+        assert!(report.ok);
+    }
+
+    #[test]
+    fn legacy_cross_project_id_reuse_is_still_a_collision() {
+        // Regression guard: an UN-stamped (legacy) artifact whose global id is
+        // reused across projects is still detected as a collision (GH#167). The
+        // generation-aware path must only exempt *stamped* foreign artifacts.
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("aaaa2222");
+
+        write_reservation_artifact(
+            storage.path(),
+            "proj-a",
+            1,
+            Some("aaaa2222"),
+            "BlueLake",
+            "src/**",
+            true,
+        );
+        // Legacy (no generation) artifact under a different project with the same id.
+        write_reservation_artifact(
+            storage.path(),
+            "proj-b",
+            1,
+            None,
+            "OldHolder",
+            "legacy/**",
+            true,
+        );
+
+        let report =
+            check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(report.drift.archive_id_collisions, 1);
+        assert_eq!(report.drift.foreign_generation_artifacts, 0);
     }
 
     fn run_compare(

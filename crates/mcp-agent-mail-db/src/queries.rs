@@ -33,7 +33,6 @@ use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
 use sqlmodel_query::{raw_execute, raw_query};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 fn cache_scope_for_pool(pool: &DbPool) -> String {
@@ -110,19 +109,6 @@ impl<'conn> TrackedConnection<'conn> {
 
 struct TrackedTransaction<'conn> {
     inner: <crate::DbConn as Connection>::Tx<'conn>,
-    /// A commit only belongs in the DB-write latency distribution after this
-    /// transaction actually executed a persistent mutation. Read-only
-    /// snapshots also issue transaction-control statements, so treating every
-    /// commit as a write would corrupt timeout attribution.
-    has_database_write: AtomicBool,
-}
-
-impl TrackedTransaction<'_> {
-    fn note_database_write(&self, sql: &str) {
-        if crate::tracking::is_database_write_statement(sql) {
-            self.has_database_write.store(true, Ordering::Relaxed);
-        }
-    }
 }
 
 impl TransactionOps for TrackedTransaction<'_> {
@@ -132,7 +118,6 @@ impl TransactionOps for TrackedTransaction<'_> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Vec<SqlRow>, SqlError>> + Send {
-        self.note_database_write(sql);
         let start = crate::tracking::query_timer();
         let fut = self.inner.query(cx, sql, params);
         async move {
@@ -149,7 +134,6 @@ impl TransactionOps for TrackedTransaction<'_> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Option<SqlRow>, SqlError>> + Send {
-        self.note_database_write(sql);
         let start = crate::tracking::query_timer();
         let fut = self.inner.query_one(cx, sql, params);
         async move {
@@ -166,7 +150,6 @@ impl TransactionOps for TrackedTransaction<'_> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<u64, SqlError>> + Send {
-        self.note_database_write(sql);
         let start = crate::tracking::query_timer();
         let fut = self.inner.execute(cx, sql, params);
         async move {
@@ -194,18 +177,7 @@ impl TransactionOps for TrackedTransaction<'_> {
     }
 
     fn commit(self, cx: &Cx) -> impl Future<Output = Outcome<(), SqlError>> + Send {
-        let had_database_write = self.has_database_write.load(Ordering::Relaxed);
-        let start = crate::tracking::query_timer();
-        let fut = self.inner.commit(cx);
-        async move {
-            let result = fut.await;
-            if had_database_write {
-                mcp_agent_mail_core::metrics::record_database_write_latency(
-                    crate::tracking::elapsed_us(start),
-                );
-            }
-            result
-        }
+        self.inner.commit(cx)
     }
 
     fn rollback(self, cx: &Cx) -> impl Future<Output = Outcome<(), SqlError>> + Send {
@@ -323,10 +295,7 @@ impl Connection for TrackedConnection<'_> {
         let fut = self.inner.begin_with(cx, isolation);
         async move {
             match fut.await {
-                Outcome::Ok(tx) => Outcome::Ok(TrackedTransaction {
-                    inner: tx,
-                    has_database_write: AtomicBool::new(false),
-                }),
+                Outcome::Ok(tx) => Outcome::Ok(TrackedTransaction { inner: tx }),
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
