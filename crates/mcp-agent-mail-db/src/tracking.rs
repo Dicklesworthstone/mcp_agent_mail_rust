@@ -611,11 +611,14 @@ pub fn global_tracker() -> &'static QueryTracker {
     &crate::QUERY_TRACKER
 }
 
-/// Return whether the leading SQL verb mutates database state.
+/// Return whether the leading SQL verb executes a persistent database mutation.
 ///
 /// The timeout diagnostic's write-latency histogram must remain cheap and
 /// available while optional query tracking is disabled, so classification is a
 /// small allocation-free leading-keyword check rather than a full SQL parser.
+/// Transaction control is intentionally excluded: a `BEGIN`/`COMMIT` pair can
+/// belong to a read-only snapshot, and attributing that wait time as a write
+/// would make timeout diagnostics dishonest.
 fn is_database_write_statement(sql: &str) -> bool {
     let keyword = sql
         .trim_start()
@@ -624,7 +627,6 @@ fn is_database_write_statement(sql: &str) -> bool {
         .unwrap_or("");
     [
         "INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP", "VACUUM", "REINDEX",
-        "COMMIT", "END", "BEGIN",
     ]
     .into_iter()
     .any(|write_keyword| keyword.eq_ignore_ascii_case(write_keyword))
@@ -878,14 +880,15 @@ mod tests {
             "INSERT INTO messages (body) VALUES (?)",
             " update agents SET last_active_ts = ?",
             "DELETE FROM file_reservations",
-            "COMMIT",
-            "BEGIN IMMEDIATE",
+            "VACUUM",
         ] {
             assert!(is_database_write_statement(sql), "expected write: {sql}");
         }
         for sql in [
             "SELECT * FROM messages",
             "PRAGMA table_info(messages)",
+            "BEGIN IMMEDIATE",
+            "COMMIT",
             "ROLLBACK",
         ] {
             assert!(
