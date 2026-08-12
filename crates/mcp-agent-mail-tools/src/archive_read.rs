@@ -3,8 +3,9 @@
 //! Degraded mailbox reads are expensive: they replay the Git archive and merge
 //! readable live-only state into a disposable `SQLite` database.  This module
 //! gives every tool and resource in a process one owner for that work.  A
-//! snapshot is published only after exact content generations taken before and
-//! after reconstruction agree, and its pool is incapable of mutation.
+//! snapshot is published only after indexed archive markers and exact live
+//! database generations taken before and after reconstruction agree, and its
+//! pool is incapable of mutation.
 
 use asupersync::Cx;
 use sha2::{Digest, Sha256};
@@ -45,13 +46,13 @@ struct Scope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Generation {
-    archive: [u8; 32],
+    archive: mcp_agent_mail_storage::ArchiveReadGeneration,
     live: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CheapGeneration {
-    archive: [u8; 32],
+    archive: mcp_agent_mail_storage::ArchiveReadGeneration,
     live: [u8; 32],
 }
 
@@ -459,44 +460,18 @@ fn hash_optional_file(
     }
 }
 
-fn hash_archive(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32], AcquireError> {
-    let mut hasher = Sha256::new();
-    hasher.update(if exact {
-        b"agent-mail-archive-generation-v1-exact".as_slice()
-    } else {
-        b"agent-mail-archive-generation-v1-cheap".as_slice()
-    });
-    hasher.update(scope.storage_root.as_os_str().as_encoded_bytes());
-    hash_tree(
-        &scope.storage_root,
-        &scope.storage_root.join("projects"),
-        &mut hasher,
-        exact,
-        deadline,
-    )?;
-
-    let git_dir = scope.storage_root.join(".git");
-    for relative in ["HEAD", "index", "packed-refs"] {
-        hash_optional_file(
-            &scope.storage_root,
-            &git_dir.join(relative),
-            &mut hasher,
-            exact,
-            deadline,
-        )?;
-    }
-    if let Ok(head) = fs::read_to_string(git_dir.join("HEAD"))
-        && let Some(reference) = head.trim().strip_prefix("ref: ")
-    {
-        hash_optional_file(
-            &scope.storage_root,
-            &git_dir.join(reference),
-            &mut hasher,
-            exact,
-            deadline,
-        )?;
-    }
-    Ok(hasher.finalize().into())
+fn archive_generation(
+    scope: &Scope,
+) -> Result<mcp_agent_mail_storage::ArchiveReadGeneration, AcquireError> {
+    mcp_agent_mail_storage::archive_read_generation(&scope.storage_root).map_err(
+        |error| match error {
+            mcp_agent_mail_storage::StorageError::LockContention { message }
+            | mcp_agent_mail_storage::StorageError::GitIndexLock { message, .. } => {
+                AcquireError::Busy(message)
+            }
+            error => AcquireError::failed(error),
+        },
+    )
 }
 
 /// Byte ranges of the `SQLite` file header that `FrankenSQLite` mutates on every
@@ -588,15 +563,17 @@ fn hash_live(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32], 
 }
 
 fn exact_generation(scope: &Scope, deadline: Instant) -> Result<Generation, AcquireError> {
+    check_deadline(deadline, "archive generation")?;
     Ok(Generation {
-        archive: hash_archive(scope, true, deadline)?,
+        archive: archive_generation(scope)?,
         live: hash_live(scope, true, deadline)?,
     })
 }
 
 fn cheap_generation(scope: &Scope, deadline: Instant) -> Result<CheapGeneration, AcquireError> {
+    check_deadline(deadline, "archive generation")?;
     Ok(CheapGeneration {
-        archive: hash_archive(scope, false, deadline)?,
+        archive: archive_generation(scope)?,
         live: hash_live(scope, false, deadline)?,
     })
 }
@@ -1373,6 +1350,11 @@ mod tests {
     }
 
     fn write_archive_fixture(root: &Path) {
+        let config = mcp_agent_mail_core::Config {
+            storage_root: root.to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        mcp_agent_mail_storage::ensure_archive_root(&config).expect("initialize archive root");
         let project = root.join("projects").join("single-flight-project");
         let agent = project.join("agents").join("Alice");
         let messages = project.join("messages").join("2026").join("07");
@@ -1416,7 +1398,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = tempfile::tempdir().expect("tempdir");
         let storage_root = directory.path().join("archive");
-        fs::create_dir_all(storage_root.join("projects")).expect("projects");
+        let config = mcp_agent_mail_core::Config {
+            storage_root: storage_root.clone(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        mcp_agent_mail_storage::ensure_archive_root(&config).expect("initialize archive root");
         let sqlite_path = directory.path().join("mailbox.sqlite3");
         fs::write(&sqlite_path, b"first-generation").expect("seed live input");
         let scope = scope(&storage_root, &sqlite_path).expect("scope");
@@ -1484,7 +1470,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn project_tree_symlink_traversal_fails_closed() {
+    fn archive_generation_does_not_walk_project_tree() {
         use std::os::unix::fs::symlink;
 
         let _guard = TEST_LOCK
@@ -1492,17 +1478,21 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = tempfile::tempdir().expect("tempdir");
         let storage_root = directory.path().join("archive");
+        let config = mcp_agent_mail_core::Config {
+            storage_root: storage_root.clone(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        mcp_agent_mail_storage::ensure_archive_root(&config).expect("initialize archive root");
         let project_root = storage_root.join("projects/project");
         fs::create_dir_all(&project_root).expect("project root");
         let outside = directory.path().join("outside.json");
         fs::write(&outside, b"{}").expect("outside file");
         symlink(&outside, project_root.join("project.json")).expect("project symlink");
-        let scope = scope(&storage_root, &directory.path().join("mailbox.sqlite3"))
-            .expect("snapshot scope");
-        assert!(matches!(
-            exact_generation(&scope, Instant::now() + Duration::from_secs(5)),
-            Err(AcquireError::Failed(message)) if message.contains("symlinked authority input")
-        ));
+        let first = mcp_agent_mail_storage::archive_read_generation(&storage_root)
+            .expect("indexed generation must not traverse project artifacts");
+        let second = mcp_agent_mail_storage::archive_read_generation(&storage_root)
+            .expect("indexed generation must remain stable without a writer");
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -1558,30 +1548,26 @@ mod tests {
     }
 
     #[test]
-    fn dirty_archive_content_and_head_movement_change_exact_generation() {
+    fn storage_mutation_epoch_and_head_movement_change_exact_generation() {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = tempfile::tempdir().expect("tempdir");
         let storage_root = directory.path().join("archive");
-        let artifact = storage_root.join("projects/project/project.json");
-        fs::create_dir_all(artifact.parent().expect("artifact parent")).expect("projects");
-        fs::create_dir_all(storage_root.join(".git/refs/heads")).expect("git refs");
-        fs::write(&artifact, b"generation-one").expect("artifact");
-        fs::write(storage_root.join(".git/HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
-        fs::write(storage_root.join(".git/refs/heads/main"), b"11111111\n").expect("ref");
+        write_archive_fixture(&storage_root);
         let scope = scope(&storage_root, &directory.path().join("mailbox.sqlite3"))
             .expect("snapshot scope");
         let first = exact_generation(&scope, Instant::now() + Duration::from_secs(5))
             .expect("first generation");
 
-        fs::write(&artifact, b"generation-two").expect("same-size dirty artifact");
-        let dirty = exact_generation(&scope, Instant::now() + Duration::from_secs(5))
-            .expect("dirty generation");
-        assert_ne!(dirty, first);
-
-        fs::write(&artifact, b"generation-one").expect("restore artifact");
-        fs::write(storage_root.join(".git/refs/heads/main"), b"22222222\n").expect("move HEAD ref");
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.storage_root.clone_from(&storage_root);
+        mcp_agent_mail_storage::write_op_sync(&mcp_agent_mail_storage::WriteOp::ClearSignal {
+            config,
+            project_slug: "single-flight-project".to_string(),
+            agent_name: "Alice".to_string(),
+        })
+        .expect("storage mutation");
         let moved = exact_generation(&scope, Instant::now() + Duration::from_secs(5))
             .expect("moved generation");
         assert_ne!(moved, first);
@@ -1594,7 +1580,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = tempfile::tempdir().expect("tempdir");
         let storage_root = directory.path().join("archive");
-        fs::create_dir_all(storage_root.join("projects")).expect("projects");
+        let config = mcp_agent_mail_core::Config {
+            storage_root: storage_root.clone(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        mcp_agent_mail_storage::ensure_archive_root(&config).expect("initialize archive root");
         let sqlite_path = directory.path().join("mailbox.sqlite3");
         let before = WRITER_EPOCH.load(Ordering::Acquire);
         let _ = cheap_generation(

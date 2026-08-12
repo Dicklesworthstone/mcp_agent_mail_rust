@@ -17,7 +17,7 @@ pub mod recovery;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{Read as IoRead, Seek as _, SeekFrom, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 // `Stdio` is referenced fully-qualified in the two remaining sites
 // (lines ~1290); removed the bare `use` after bead C5 deleted the
@@ -540,6 +540,169 @@ pub fn archive_mutation_epoch() -> u64 {
 #[must_use]
 pub fn archive_mutations_active() -> usize {
     ARCHIVE_MUTATIONS_ACTIVE.load(Ordering::Acquire)
+}
+
+/// O(1) archive marker for consumers that need to fence an archive-backed
+/// read without walking the `projects/` working tree.
+///
+/// The marker combines the resolved Git `HEAD`, the Git index's filesystem
+/// generation, and the in-process physical-mutation epoch.  Archive readers
+/// must sample it before and after their reconstruction and compare the two
+/// markers; storage writers advance the epoch on both edges of every physical
+/// mutation window.  This deliberately does not try to discover arbitrary
+/// uncoordinated writes beneath `projects/`: the storage write API and Git
+/// index/ref protocol are the archive authorities, and a full tree scan made
+/// the read gate scale with the whole mailbox instead of the read operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveReadGeneration {
+    head: Option<git2::Oid>,
+    index: ArchiveReadIndexStamp,
+    mutation_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ArchiveReadIndexStamp {
+    exists: bool,
+    len: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    trailer: [u8; 32],
+    trailer_len: u8,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_secs: i64,
+    #[cfg(unix)]
+    changed_nanos: i64,
+}
+
+fn archive_read_index_stamp(git_dir: &Path) -> Result<ArchiveReadIndexStamp> {
+    let lock_path = git_dir.join("index.lock");
+    match fs::symlink_metadata(&lock_path) {
+        Ok(_) => {
+            return Err(StorageError::LockContention {
+                message: format!(
+                    "archive-read generation cannot sample while Git index lock exists: {}",
+                    lock_path.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let index_path = git_dir.join("index");
+    let metadata = match fs::symlink_metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArchiveReadIndexStamp::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StorageError::InvalidPath(format!(
+            "archive-read generation requires a regular Git index: {}",
+            index_path.display()
+        )));
+    }
+    let modified = metadata
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // Git's index ends in its object-format checksum. Sampling the final 32
+    // bytes covers both SHA-1 (the last 20 bytes) and SHA-256 repositories
+    // without reading the path table; the whole marker remains O(1) in the
+    // archive working-tree size.
+    let trailer_len = usize::try_from(metadata.len().min(32))
+        .expect("index trailer length is capped at 32 bytes");
+    let mut trailer = [0_u8; 32];
+    if trailer_len != 0 {
+        let mut index = fs::File::open(&index_path)?;
+        let trailer_offset =
+            i64::try_from(trailer_len).expect("index trailer length is capped at 32 bytes");
+        index.seek(SeekFrom::End(-trailer_offset))?;
+        index.read_exact(&mut trailer[..trailer_len])?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(ArchiveReadIndexStamp {
+            exists: true,
+            len: metadata.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+            trailer,
+            trailer_len: u8::try_from(trailer_len)
+                .expect("index trailer length is capped at 32 bytes"),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed_secs: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ArchiveReadIndexStamp {
+            exists: true,
+            len: metadata.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+            trailer,
+            trailer_len: u8::try_from(trailer_len)
+                .expect("index trailer length is capped at 32 bytes"),
+        })
+    }
+}
+
+fn archive_read_head(repo: &Repository) -> Result<Option<git2::Oid>> {
+    match repo.head() {
+        Ok(head) => Ok(head.target()),
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Sample the indexed/incremental generation marker for an archive root.
+///
+/// This is constant with respect to archive working-tree size: it resolves
+/// `HEAD` and stats the Git index, rather than recursively hashing
+/// `projects/`. A concurrent in-process storage mutation or a Git
+/// `index.lock` is reported as contention so callers can retry instead of
+/// publishing a mixed read.
+pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGeneration> {
+    let mutation_epoch = archive_mutation_epoch();
+    if archive_mutations_active() != 0 {
+        return Err(StorageError::LockContention {
+            message: "archive-read generation cannot sample during a storage mutation".to_string(),
+        });
+    }
+
+    let repo = Repository::open(storage_root)?;
+    let head_before = archive_read_head(&repo)?;
+    let index_before = archive_read_index_stamp(repo.path())?;
+    let head_after = archive_read_head(&repo)?;
+    let index_after = archive_read_index_stamp(repo.path())?;
+    if head_before != head_after
+        || index_before != index_after
+        || archive_mutations_active() != 0
+        || archive_mutation_epoch() != mutation_epoch
+    {
+        return Err(StorageError::LockContention {
+            message: "archive-read generation changed while being sampled".to_string(),
+        });
+    }
+
+    Ok(ArchiveReadGeneration {
+        head: head_after,
+        index: index_after,
+        mutation_epoch,
+    })
 }
 
 fn new_write_behind_queue() -> WriteBehindQueue {
