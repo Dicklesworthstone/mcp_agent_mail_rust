@@ -8986,7 +8986,51 @@ pub async fn acknowledge_message(
     agent_id: i64,
     message_id: i64,
 ) -> Outcome<(i64, i64), DbError> {
+    match acknowledge_message_impl(cx, pool, agent_id, message_id, None).await {
+        Outcome::Ok(IdempotentOutcome::Fresh(ts) | IdempotentOutcome::Replayed(ts)) => {
+            Outcome::Ok(ts)
+        }
+        // Unreachable without a key: no claim means no prior record to conflict with.
+        Outcome::Ok(IdempotentOutcome::Conflict(_)) => Outcome::Err(DbError::Internal(
+            "acknowledge_message: unexpected idempotency conflict without a key".to_string(),
+        )),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Idempotent variant of [`acknowledge_message`]
+/// (br-idempotency-keys-mutating-tools-h0x9k).
+///
+/// `claim` (project + tool + client key + argument fingerprint) is recorded with
+/// the serialized `(read_ts, ack_ts)` result INSIDE the ack transaction. A retry
+/// with the same key + payload replays the original timestamps
+/// ([`IdempotentOutcome::Replayed`]); a retry with the same key + a different
+/// payload is rejected as [`IdempotentOutcome::Conflict`]. `claim.project_id`
+/// scopes the key (the ack tool only takes agent + message ids). Note the raw
+/// UPDATE is already COALESCE-idempotent at the data level; the key layer adds
+/// verbatim result replay + typed conflict detection on top.
+pub async fn acknowledge_message_idempotent(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    message_id: i64,
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<IdempotentOutcome<(i64, i64)>, DbError> {
+    acknowledge_message_impl(cx, pool, agent_id, message_id, Some(claim)).await
+}
+
+async fn acknowledge_message_impl(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    message_id: i64,
+    idempotency: Option<IdempotencyClaim<'_>>,
+) -> Outcome<IdempotentOutcome<(i64, i64)>, DbError> {
     let now = now_micros();
+    let idempotency_expires_ts =
+        now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -8998,6 +9042,41 @@ pub async fn acknowledge_message(
     let tracked = tracked(&*conn);
     run_with_mvcc_retry(cx, "acknowledge_message", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Idempotency key check (br-idempotency-keys-mutating-tools-h0x9k): a
+        // matching prior key replays the stored (read_ts, ack_ts) without
+        // re-touching the row; a differing payload aborts as a typed conflict.
+        if let Some(claim) = idempotency {
+            match idempotency_check_in_tx(cx, &tracked, claim, now).await {
+                Outcome::Ok(IdempotencyCheck::Proceed) => {}
+                Outcome::Ok(IdempotencyCheck::Replay(result_json)) => {
+                    rollback_tx(cx, &tracked).await;
+                    return match decode_idempotency_result::<(i64, i64)>(
+                        &result_json,
+                        "acknowledge_message",
+                    ) {
+                        Ok(ts) => Outcome::Ok(IdempotentOutcome::Replayed(ts)),
+                        Err(e) => Outcome::Err(e),
+                    };
+                }
+                Outcome::Ok(IdempotencyCheck::Conflict(info)) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Ok(IdempotentOutcome::Conflict(info));
+                }
+                Outcome::Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+        }
 
         // Idempotent: set read_ts if NULL; set ack_ts if NULL.
         let sql = "UPDATE message_recipients \
@@ -9078,8 +9157,36 @@ pub async fn acknowledge_message(
                 }
             };
 
+        // Record the idempotency key + serialized (read_ts, ack_ts) in the SAME
+        // transaction as the ack, so a crash cannot split the key from the write.
+        if let Some(claim) = idempotency {
+            let result_json = match serde_json::to_string(&(read_ts, ack_ts)) {
+                Ok(json) => json,
+                Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "idempotency record for {}: result is unserializable: {e}",
+                        claim.tool
+                    )));
+                }
+            };
+            try_in_tx!(
+                cx,
+                &tracked,
+                idempotency_record_in_tx(
+                    cx,
+                    &tracked,
+                    claim,
+                    &result_json,
+                    now,
+                    idempotency_expires_ts
+                )
+                .await
+            );
+        }
+
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        Outcome::Ok((read_ts, ack_ts))
+        Outcome::Ok(IdempotentOutcome::Fresh((read_ts, ack_ts)))
     })
     .await
 }
@@ -9965,8 +10072,68 @@ pub async fn create_file_reservations(
     exclusive: bool,
     reason: &str,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
+    match create_file_reservations_impl(
+        cx, pool, project_id, agent_id, paths, ttl_seconds, exclusive, reason, None,
+    )
+    .await
+    {
+        Outcome::Ok(IdempotentOutcome::Fresh(rows) | IdempotentOutcome::Replayed(rows)) => {
+            Outcome::Ok(rows)
+        }
+        // Unreachable without a key: no claim means no prior record to conflict with.
+        Outcome::Ok(IdempotentOutcome::Conflict(_)) => Outcome::Err(DbError::Internal(
+            "create_file_reservations: unexpected idempotency conflict without a key".to_string(),
+        )),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Idempotent variant of [`create_file_reservations`]
+/// (br-idempotency-keys-mutating-tools-h0x9k).
+///
+/// `claim` is recorded with the serialized created rows INSIDE the reservation
+/// transaction (which already uses `BEGIN IMMEDIATE`, serializing writers). A
+/// retry with the same key + payload replays the original reservation rows
+/// ([`IdempotentOutcome::Replayed`]) instead of inserting a second lease; a
+/// retry with the same key + a different payload is rejected as
+/// [`IdempotentOutcome::Conflict`]. `file_reservation_paths` passes its tool
+/// name so keys are scoped per (project, tool).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_file_reservations_idempotent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    paths: &[&str],
+    ttl_seconds: i64,
+    exclusive: bool,
+    reason: &str,
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<IdempotentOutcome<Vec<FileReservationRow>>, DbError> {
+    create_file_reservations_impl(
+        cx, pool, project_id, agent_id, paths, ttl_seconds, exclusive, reason, Some(claim),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_file_reservations_impl(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    paths: &[&str],
+    ttl_seconds: i64,
+    exclusive: bool,
+    reason: &str,
+    idempotency: Option<IdempotencyClaim<'_>>,
+) -> Outcome<IdempotentOutcome<Vec<FileReservationRow>>, DbError> {
     let now = now_micros();
     let expires = now.saturating_add(ttl_seconds.saturating_mul(1_000_000));
+    let idempotency_expires_ts =
+        now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
     run_with_mvcc_retry(cx, "create_file_reservations", || async {
         let conn = match acquire_conn(cx, pool).await {
