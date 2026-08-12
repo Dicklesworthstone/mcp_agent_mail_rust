@@ -378,20 +378,22 @@ pub fn inbox_delivery_events_from_conn(
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
     let (oldest_available_cursor, tail_cursor) = range_rows
         .first()
-        .map(|row| {
-            let oldest = row
-                .get_named::<Option<i64>>("oldest_cursor")
-                .map_err(|error| {
-                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
-                })?;
-            let tail = row
-                .get_named::<Option<i64>>("tail_cursor")
-                .map_err(|error| {
-                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
-                })?
-                .unwrap_or(0);
-            Ok((oldest, tail))
-        })
+        .map(
+            |row| -> Result<(Option<i64>, i64), InboxDeliveryEventError> {
+                let oldest = row
+                    .get_named::<Option<i64>>("oldest_cursor")
+                    .map_err(|error| {
+                        InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                    })?;
+                let tail = row
+                    .get_named::<Option<i64>>("tail_cursor")
+                    .map_err(|error| {
+                        InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                    })?
+                    .unwrap_or(0);
+                Ok((oldest, tail))
+            },
+        )
         .transpose()?
         .unwrap_or((None, 0));
 

@@ -2251,6 +2251,7 @@ pub async fn whois(
                     }
                 }
             }
+            Ok(None) => Vec::new(),
             Err(e) => {
                 tracing::warn!("Failed to ensure archive for commits: {e}");
                 Vec::new()
@@ -2434,8 +2435,8 @@ pub async fn list_agents(
     limit: Option<u32>,
     active_within_days: Option<u32>,
 ) -> McpResult<String> {
-    let pool = get_read_db_pool(ctx.cx()).await?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     // Bound the response. A caller-supplied limit is honored but clamped to the
@@ -2506,6 +2507,22 @@ mod tests {
             semantic_readiness: g(false),
             archive_db_parity: g(true),
             doctor_readiness: g(false),
+        }
+    }
+
+    fn test_timeout_diagnostics() -> TimeoutDiagnosticsResponse {
+        TimeoutDiagnosticsResponse {
+            client_deadline_ms: 30_000,
+            coalescer_degraded_p99_bound_ms: 15_000,
+            contended_path: "no_monitored_stage_exceeded_budget".into(),
+            stage_exceeded_client_deadline: false,
+            pool_acquire_p99_ms: 0,
+            database_write_p99_ms: 0,
+            archive_wbq_p99_ms: 0,
+            archive_commit_p99_ms: 0,
+            blocking_dispatch_inflight: 0,
+            blocking_dispatch_zombies: 0,
+            blocking_dispatch_timeouts_total: 0,
         }
     }
 
