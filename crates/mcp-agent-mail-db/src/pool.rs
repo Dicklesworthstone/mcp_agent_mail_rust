@@ -2244,6 +2244,10 @@ pub struct DbPool {
     cache_generation: u64,
     sqlite_path: String,
     storage_root: PathBuf,
+    /// Per-transaction ceiling for raw ATC experience rows in the isolated
+    /// telemetry sidecar. Captured when the pool is created so the hot write
+    /// path does not reparse process configuration for every experience.
+    atc_experience_max_rows: i64,
     init_sql: Arc<String>,
     run_migrations: bool,
     skip_startup_init: bool,
@@ -2322,6 +2326,8 @@ impl DbPool {
     ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
+        let atc_experience_max_rows =
+            mcp_agent_mail_core::Config::from_env().atc_experience_max_rows;
         let init_sql = Self::connection_init_sql(config, false);
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
         let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
@@ -2331,6 +2337,7 @@ impl DbPool {
             cache_generation,
             sqlite_path,
             storage_root,
+            atc_experience_max_rows,
             init_sql,
             run_migrations: config.run_migrations,
             skip_startup_init,
@@ -2351,6 +2358,8 @@ impl DbPool {
     ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
+        let atc_experience_max_rows =
+            mcp_agent_mail_core::Config::from_env().atc_experience_max_rows;
         let init_sql = Self::connection_init_sql(config, query_only);
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
@@ -2370,6 +2379,7 @@ impl DbPool {
             cache_generation,
             sqlite_path,
             storage_root,
+            atc_experience_max_rows,
             init_sql,
             run_migrations: config.run_migrations,
             skip_startup_init,
@@ -2428,6 +2438,14 @@ impl DbPool {
             return None;
         }
         Some(atc_sidecar_sqlite_path(&self.sqlite_path))
+    }
+
+    /// Hard raw-row ceiling applied inside every file-backed ATC append
+    /// transaction. `0` deliberately disables the ceiling for an operator who
+    /// has accepted the storage risk.
+    #[must_use]
+    pub const fn atc_experience_max_rows(&self) -> i64 {
+        self.atc_experience_max_rows
     }
 
     #[must_use]
@@ -5739,12 +5757,36 @@ pub struct AtcSidecarHealth {
     pub present: bool,
     /// File size in bytes (`0` when absent or unreadable).
     pub size_bytes: u64,
+    /// Size of the primary mailbox database in bytes (`0` when absent or
+    /// unreadable). ATC telemetry is intentionally excluded from this file.
+    pub primary_size_bytes: u64,
+    /// Combined on-disk size of the mailbox database and ATC sidecar.
+    pub total_size_bytes: u64,
+    /// ATC sidecar's exact share of the combined mailbox-plus-ATC footprint,
+    /// expressed in basis points (`10_000` means 100%). `None` when neither
+    /// file has a measurable size.
+    pub size_share_basis_points: Option<u16>,
+    /// Number of raw `atc_experiences` rows when the table can be read.
+    /// `None` means the sidecar was absent, corrupt, or did not yet receive its
+    /// ATC schema; it is deliberately distinct from a real zero-row ledger.
+    pub experience_rows: Option<u64>,
     /// `PRAGMA quick_check` verdict: `Some(true)` clean, `Some(false)` corrupt,
     /// `None` when not run (absent, in-memory, or could not open/probe).
     pub quick_check_ok: Option<bool>,
     /// First non-ok `quick_check` detail (or the open/probe error) when
     /// `quick_check_ok` is `Some(false)`/`None`; empty when clean.
     pub detail: String,
+}
+
+fn atc_sidecar_size_share_basis_points(sidecar_bytes: u64, total_bytes: u64) -> Option<u16> {
+    if total_bytes == 0 {
+        return None;
+    }
+    let basis_points = u128::from(sidecar_bytes)
+        .saturating_mul(10_000)
+        .checked_div(u128::from(total_bytes))?
+        .min(10_000);
+    u16::try_from(basis_points).ok()
 }
 
 /// Inspect the ATC telemetry sidecar's presence, size, and `quick_check`
@@ -5758,43 +5800,68 @@ pub struct AtcSidecarHealth {
 #[must_use]
 pub fn inspect_atc_sidecar_health(primary_sqlite_path: &str) -> AtcSidecarHealth {
     let path = atc_sidecar_sqlite_path(primary_sqlite_path);
+    let primary_size_bytes = if primary_sqlite_path == ":memory:" {
+        0
+    } else {
+        std::fs::metadata(primary_sqlite_path).map_or(0, |meta| meta.len())
+    };
     if primary_sqlite_path == ":memory:" || !Path::new(&path).exists() {
         return AtcSidecarHealth {
             path,
             present: false,
             size_bytes: 0,
+            primary_size_bytes,
+            total_size_bytes: primary_size_bytes,
+            size_share_basis_points: atc_sidecar_size_share_basis_points(0, primary_size_bytes),
+            experience_rows: None,
             quick_check_ok: None,
             detail: String::new(),
         };
     }
     let size_bytes = std::fs::metadata(&path).map_or(0, |meta| meta.len());
-    let (quick_check_ok, detail) = match crate::CanonicalDbConn::open_file(path.as_str()) {
-        Ok(conn) => {
-            let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
-            match crate::integrity::probe_check_rows(
-                |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
-                crate::integrity::CheckKind::Quick,
-            ) {
-                Ok(rows) => {
-                    let details = crate::integrity::extract_check_details(
-                        &rows,
-                        crate::integrity::CheckKind::Quick,
-                    );
-                    if crate::integrity::details_indicate_ok(&details) {
-                        (Some(true), String::new())
-                    } else {
-                        (Some(false), details.first().cloned().unwrap_or_default())
+    let total_size_bytes = primary_size_bytes.saturating_add(size_bytes);
+    let (quick_check_ok, experience_rows, detail) =
+        match crate::CanonicalDbConn::open_file(path.as_str()) {
+            Ok(conn) => {
+                let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
+                match crate::integrity::probe_check_rows(
+                    |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+                    crate::integrity::CheckKind::Quick,
+                ) {
+                    Ok(rows) => {
+                        let details = crate::integrity::extract_check_details(
+                            &rows,
+                            crate::integrity::CheckKind::Quick,
+                        );
+                        if crate::integrity::details_indicate_ok(&details) {
+                            let experience_rows = conn
+                                .query_sync("SELECT COUNT(*) AS c FROM atc_experiences", &[])
+                                .ok()
+                                .and_then(|rows| rows.into_iter().next())
+                                .and_then(|row| row.get_named::<i64>("c").ok())
+                                .and_then(|count| u64::try_from(count).ok());
+                            (Some(true), experience_rows, String::new())
+                        } else {
+                            (
+                                Some(false),
+                                None,
+                                details.first().cloned().unwrap_or_default(),
+                            )
+                        }
                     }
+                    Err(error) => (None, None, error),
                 }
-                Err(error) => (None, error),
             }
-        }
-        Err(error) => (None, error.to_string()),
-    };
+            Err(error) => (None, None, error.to_string()),
+        };
     AtcSidecarHealth {
         path,
         present: true,
         size_bytes,
+        primary_size_bytes,
+        total_size_bytes,
+        size_share_basis_points: atc_sidecar_size_share_basis_points(size_bytes, total_size_bytes),
+        experience_rows,
         quick_check_ok,
         detail,
     }
@@ -18151,6 +18218,7 @@ mod tests {
         let health = inspect_atc_sidecar_health(&primary.to_string_lossy());
         assert!(!health.present);
         assert_eq!(health.size_bytes, 0);
+        assert_eq!(health.experience_rows, None);
         assert_eq!(health.quick_check_ok, None);
         assert!(health.path.ends_with(ATC_SIDECAR_FILE_NAME));
     }
@@ -18173,8 +18241,40 @@ mod tests {
         let health = inspect_atc_sidecar_health(&primary_str);
         assert!(health.present);
         assert!(health.size_bytes > 0);
+        assert_eq!(health.experience_rows, Some(1));
+        assert_eq!(health.primary_size_bytes, 0);
+        assert_eq!(health.total_size_bytes, health.size_bytes);
+        assert_eq!(health.size_share_basis_points, Some(10_000));
         assert_eq!(health.quick_check_ok, Some(true));
         assert!(health.detail.is_empty());
+    }
+
+    #[test]
+    fn inspect_atc_sidecar_health_reports_telemetry_share_of_mailbox_footprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let primary_str = primary.to_string_lossy().into_owned();
+        let primary_conn =
+            crate::CanonicalDbConn::open_file(&primary_str).expect("open primary fixture");
+        primary_conn
+            .execute_raw("CREATE TABLE mailbox_fixture (id INTEGER PRIMARY KEY, body TEXT);")
+            .expect("create primary fixture table");
+        primary_conn
+            .execute_raw("INSERT INTO mailbox_fixture (body) VALUES ('coordination state');")
+            .expect("seed primary fixture table");
+        drop(primary_conn);
+
+        let sidecar = atc_sidecar_sqlite_path(&primary_str);
+        write_sidecar_fixture(&sidecar);
+
+        let health = inspect_atc_sidecar_health(&primary_str);
+        assert!(health.primary_size_bytes > 0);
+        assert!(health.size_bytes > 0);
+        assert_eq!(
+            health.total_size_bytes,
+            health.primary_size_bytes.saturating_add(health.size_bytes)
+        );
+        assert!(matches!(health.size_share_basis_points, Some(1..=9_999)));
     }
 
     #[test]
@@ -18190,6 +18290,7 @@ mod tests {
         let health = inspect_atc_sidecar_health(&primary_str);
         assert!(health.present);
         assert!(health.size_bytes > 0);
+        assert_eq!(health.experience_rows, None);
         assert_ne!(health.quick_check_ok, Some(true));
         assert!(!health.detail.is_empty());
     }

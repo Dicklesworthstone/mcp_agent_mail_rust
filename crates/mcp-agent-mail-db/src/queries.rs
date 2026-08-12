@@ -2244,12 +2244,29 @@ fn append_atc_experience_file_backed(
             row.resolved_ts_micros.map_or(Value::Null, Value::BigInt),
             context_json.map_or(Value::Null, Value::Text),
         ];
-        canonical_execute_atc(
+        let inserted = canonical_execute_atc(
             &conn,
             insert_sql,
             &insert_params,
             "append_atc_experience insert",
         )?;
+        // The periodic maintenance sweep is a catch-up/recovery path, not the
+        // safety boundary. Enforce the configured ceiling before this insert
+        // commits so a burst cannot recreate the historic unbounded-growth
+        // incident during the sweep interval.
+        if inserted > 0 && pool.atc_experience_max_rows() > 0 {
+            let evicted = crate::atc_queries::enforce_experience_row_ceiling_in_transaction(
+                &conn,
+                pool.atc_experience_max_rows(),
+            )?;
+            if evicted > 0 {
+                tracing::info!(
+                    evicted,
+                    max_rows = pool.atc_experience_max_rows(),
+                    "ATC append enforced raw experience row ceiling before commit"
+                );
+            }
+        }
         commit_canonical_atc_write_tx(&conn)
     })();
     if write_result.is_err() {
@@ -15197,6 +15214,64 @@ mod tests {
             assert_eq!(stored, expected);
             assert_eq!(stored.resolution_latency_micros(), Some(4_000));
         });
+    }
+
+    #[test]
+    fn append_atc_experience_enforces_configured_ceiling_before_commit() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXPERIENCE_MAX_ROWS", "2")],
+            || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let (cx, pool, _dir) = setup_test_pool("append_atc_experience_hard_cap.db");
+
+                rt.block_on(async {
+                    for offset in 0..3 {
+                        let row = make_insert_experience_test_row(
+                            5_000 + offset,
+                            6_000 + offset,
+                            ExperienceState::Resolved,
+                            1_700_000_000_000_000 + (offset as i64 * 10_000),
+                        );
+                        append_atc_experience(&cx, &pool, &row)
+                            .await
+                            .into_result()
+                            .expect("append terminal experience under hard cap");
+
+                        let conn = open_canonical_atc_conn(&pool, "verify append-time hard cap")
+                            .expect("open ATC sidecar verification connection");
+                        let raw_rows = canonical_query_atc_rows(
+                            &conn,
+                            "SELECT COUNT(*) AS c FROM atc_experiences",
+                            &[],
+                            "count append-time capped experiences",
+                        )
+                        .expect("count capped raw experiences");
+                        close_canonical_db_conn(
+                            conn,
+                            "append-time hard cap verification connection",
+                        );
+                        assert!(
+                            raw_rows.first().and_then(row_first_i64).unwrap_or(i64::MAX) <= 2,
+                            "every append transaction must commit at or below the configured cap"
+                        );
+                    }
+
+                    let rollups = crate::atc_queries::query_rollups(&cx, &pool)
+                        .await
+                        .into_result()
+                        .expect("query rollups after append-time compaction");
+                    assert_eq!(
+                        rollups.iter().map(|rollup| rollup.total_count).sum::<i64>(),
+                        3,
+                        "append-time compaction must preserve the aggregate learning signal"
+                    );
+                });
+            },
+        );
     }
 
     #[test]

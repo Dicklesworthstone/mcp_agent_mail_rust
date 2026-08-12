@@ -1199,63 +1199,69 @@ fn validate_retention_compaction(
     Ok(())
 }
 
+/// Fold terminal rows into their rollups and remove them while the caller owns
+/// an ATC write transaction. This is the transaction-aware core used both by
+/// ordinary retention and by the append-time hard ceiling.
+fn retention_compact_in_transaction(
+    conn: &impl RollupConn,
+    cutoff_ts_micros: i64,
+) -> Result<usize, DbError> {
+    let doomed_rows = conn
+        .rollup_query_sync(
+            RETENTION_COMPACT_SELECT_SQL,
+            &[Value::BigInt(cutoff_ts_micros)],
+        )
+        .map_err(|error| DbError::Sqlite(format!("retention_compact select: {error}")))?;
+    if doomed_rows.is_empty() {
+        return Ok(0);
+    }
+
+    let touched = query_touched_strata_from_experience_rows(&doomed_rows);
+    let existing = if touched.is_empty() {
+        BTreeMap::new()
+    } else {
+        let existing_sql = build_existing_rollups_query(touched.len());
+        let existing_params = touched.keys().cloned().map(Value::Text).collect::<Vec<_>>();
+        let existing_rows = conn
+            .rollup_query_sync(&existing_sql, &existing_params)
+            .map_err(|error| {
+                DbError::Sqlite(format!("retention_compact existing rows: {error}"))
+            })?;
+        decode_existing_rollups(&existing_rows)
+    };
+    let compacted_seed = existing
+        .iter()
+        .map(|(stratum_key, row)| (stratum_key.clone(), row.compacted.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let updated_compacted = finalize_rollups_with_seed(&doomed_rows, &compacted_seed);
+
+    for entry in updated_compacted.values() {
+        upsert_compacted_rollup_entry(conn, entry)?;
+    }
+    conn.rollup_execute_sync(
+        "DELETE FROM atc_experiences \
+         WHERE state IN ('resolved', 'censored', 'expired') \
+           AND resolved_ts IS NOT NULL \
+           AND resolved_ts <= ?",
+        &[Value::BigInt(cutoff_ts_micros)],
+    )
+    .map_err(|error| DbError::Sqlite(format!("retention_compact delete: {error}")))?;
+    Ok(doomed_rows.len())
+}
+
 fn retention_compact_with_conn(
     conn: &impl RollupConn,
     cutoff_ts_micros: i64,
 ) -> Result<usize, DbError> {
     conn.rollup_execute_sync("BEGIN IMMEDIATE", &[])
         .map_err(|error| DbError::Sqlite(format!("retention_compact begin: {error}")))?;
-    let result = (|| -> Result<usize, DbError> {
-        let doomed_rows = conn
-            .rollup_query_sync(
-                RETENTION_COMPACT_SELECT_SQL,
-                &[Value::BigInt(cutoff_ts_micros)],
-            )
-            .map_err(|error| DbError::Sqlite(format!("retention_compact select: {error}")))?;
-        if doomed_rows.is_empty() {
-            conn.rollup_execute_sync("COMMIT", &[])
-                .map_err(|error| DbError::Sqlite(format!("retention_compact commit: {error}")))?;
-            return Ok(0);
-        }
-
-        let touched = query_touched_strata_from_experience_rows(&doomed_rows);
-        let existing = if touched.is_empty() {
-            BTreeMap::new()
-        } else {
-            let existing_sql = build_existing_rollups_query(touched.len());
-            let existing_params = touched.keys().cloned().map(Value::Text).collect::<Vec<_>>();
-            let existing_rows = conn
-                .rollup_query_sync(&existing_sql, &existing_params)
-                .map_err(|error| {
-                    DbError::Sqlite(format!("retention_compact existing rows: {error}"))
-                })?;
-            decode_existing_rollups(&existing_rows)
-        };
-        let compacted_seed = existing
-            .iter()
-            .map(|(stratum_key, row)| (stratum_key.clone(), row.compacted.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let updated_compacted = finalize_rollups_with_seed(&doomed_rows, &compacted_seed);
-
-        for entry in updated_compacted.values() {
-            upsert_compacted_rollup_entry(conn, entry)?;
-        }
-        conn.rollup_execute_sync(
-            "DELETE FROM atc_experiences \
-             WHERE state IN ('resolved', 'censored', 'expired') \
-               AND resolved_ts IS NOT NULL \
-               AND resolved_ts <= ?",
-            &[Value::BigInt(cutoff_ts_micros)],
-        )
-        .map_err(|error| DbError::Sqlite(format!("retention_compact delete: {error}")))?;
-        conn.rollup_execute_sync("COMMIT", &[])
-            .map_err(|error| DbError::Sqlite(format!("retention_compact commit: {error}")))?;
-        Ok(doomed_rows.len())
-    })();
+    let result = retention_compact_in_transaction(conn, cutoff_ts_micros);
     if let Err(error) = result {
         let _ = conn.rollup_execute_sync("ROLLBACK", &[]);
         return Err(error);
     }
+    conn.rollup_execute_sync("COMMIT", &[])
+        .map_err(|error| DbError::Sqlite(format!("retention_compact commit: {error}")))?;
     result
 }
 
@@ -1369,11 +1375,11 @@ fn experience_eviction_cutoff_ts(conn: &impl RollupConn, to_evict: i64) -> Resul
         .unwrap_or(i64::MAX))
 }
 
-/// Roll up and evict the oldest terminal rows down to the hysteresis target when
-/// `atc_experiences` exceeds `max_rows`. See [`enforce_experience_row_ceiling`]
-/// for the contract; this is the connection-level core, factored out so it can be
-/// driven directly in tests.
-fn enforce_experience_row_ceiling_with_conn(
+/// Roll up and evict raw rows down to the hysteresis target while the caller
+/// owns an ATC write transaction. The transaction boundary makes the ceiling a
+/// real commit-time invariant: a new append cannot commit an over-cap table
+/// while a background sweep is delayed or starved.
+pub(crate) fn enforce_experience_row_ceiling_in_transaction(
     conn: &impl RollupConn,
     max_rows: i64,
 ) -> Result<usize, DbError> {
@@ -1403,7 +1409,7 @@ fn enforce_experience_row_ceiling_with_conn(
         } else {
             experience_eviction_cutoff_ts(conn, to_evict)?
         };
-        retention_compact_with_conn(conn, cutoff)?
+        retention_compact_in_transaction(conn, cutoff)?
     };
 
     let remaining = total.saturating_sub(i64::try_from(evicted).unwrap_or(i64::MAX));
@@ -1426,7 +1432,7 @@ fn enforce_experience_row_ceiling_with_conn(
     // oldest stale pending decisions, and rollups retain the aggregate signal for
     // resolved history.
     let surplus = remaining - target; // > 0 because remaining > max_rows >= target
-    let forced = force_rotate_oldest_experiences_with_conn(conn, surplus)?;
+    let forced = force_rotate_oldest_experiences_in_transaction(conn, surplus)?;
     let evicted_total = evicted.saturating_add(forced);
     tracing::warn!(
         total,
@@ -1442,6 +1448,29 @@ fn enforce_experience_row_ceiling_with_conn(
     Ok(evicted_total)
 }
 
+/// Run the experience ceiling under its own transaction for background sweeps
+/// and direct maintenance callers. Append-time enforcement uses
+/// [`enforce_experience_row_ceiling_in_transaction`] inside the insert
+/// transaction instead.
+fn enforce_experience_row_ceiling_with_conn(
+    conn: &impl RollupConn,
+    max_rows: i64,
+) -> Result<usize, DbError> {
+    if max_rows <= 0 {
+        return Ok(0);
+    }
+    conn.rollup_execute_sync("BEGIN IMMEDIATE", &[])
+        .map_err(|error| DbError::Sqlite(format!("atc experience ceiling begin: {error}")))?;
+    let result = enforce_experience_row_ceiling_in_transaction(conn, max_rows);
+    if let Err(error) = result {
+        let _ = conn.rollup_execute_sync("ROLLBACK", &[]);
+        return Err(error);
+    }
+    conn.rollup_execute_sync("COMMIT", &[])
+        .map_err(|error| DbError::Sqlite(format!("atc experience ceiling commit: {error}")))?;
+    result
+}
+
 const FORCE_ROTATE_CUTOFF_SQL: &str = "\
     SELECT experience_id AS eid FROM atc_experiences \
     ORDER BY experience_id ASC LIMIT 1 OFFSET ?";
@@ -1454,7 +1483,7 @@ const FORCE_ROTATE_DELETE_SQL: &str = "DELETE FROM atc_experiences WHERE experie
 /// Hard-cap backstop: delete the oldest `to_evict` rows by durable
 /// `experience_id` REGARDLESS of lifecycle state.
 ///
-/// Used only when [`enforce_experience_row_ceiling_with_conn`]'s terminal-row
+/// Used only when [`enforce_experience_row_ceiling_in_transaction`]'s terminal-row
 /// eviction cannot bound the table because the surplus is open/unresolved (a
 /// starved outcome-resolution pipeline). This intentionally drops raw learning
 /// detail for the oldest pending decisions so the ledger can never grow
@@ -1462,7 +1491,7 @@ const FORCE_ROTATE_DELETE_SQL: &str = "DELETE FROM atc_experiences WHERE experie
 /// history. `experience_id` is the durable monotone insertion sequence, so
 /// "oldest by `experience_id`" is a stable, gap-tolerant ordering. Returns the
 /// number of rows deleted.
-fn force_rotate_oldest_experiences_with_conn(
+fn force_rotate_oldest_experiences_in_transaction(
     conn: &impl RollupConn,
     to_evict: i64,
 ) -> Result<usize, DbError> {
@@ -1480,39 +1509,28 @@ fn force_rotate_oldest_experiences_with_conn(
         return Ok(0);
     };
 
-    conn.rollup_execute_sync("BEGIN IMMEDIATE", &[])
-        .map_err(|error| DbError::Sqlite(format!("atc force-rotate begin: {error}")))?;
-    let result = (|| -> Result<usize, DbError> {
-        let doomed = conn
-            .rollup_query_sync(FORCE_ROTATE_COUNT_SQL, &[Value::BigInt(cutoff_eid)])
-            .map_err(|error| DbError::Sqlite(format!("atc force-rotate count: {error}")))?
-            .first()
-            .and_then(|row| row.get_by_name("c"))
-            .and_then(experience_scalar_i64)
-            .unwrap_or(0);
-        conn.rollup_execute_sync(FORCE_ROTATE_DELETE_SQL, &[Value::BigInt(cutoff_eid)])
-            .map_err(|error| DbError::Sqlite(format!("atc force-rotate delete: {error}")))?;
-        conn.rollup_execute_sync("COMMIT", &[])
-            .map_err(|error| DbError::Sqlite(format!("atc force-rotate commit: {error}")))?;
-        Ok(usize::try_from(doomed).unwrap_or(0))
-    })();
-    if let Err(error) = result {
-        let _ = conn.rollup_execute_sync("ROLLBACK", &[]);
-        return Err(error);
-    }
-    result
+    let doomed = conn
+        .rollup_query_sync(FORCE_ROTATE_COUNT_SQL, &[Value::BigInt(cutoff_eid)])
+        .map_err(|error| DbError::Sqlite(format!("atc force-rotate count: {error}")))?
+        .first()
+        .and_then(|row| row.get_by_name("c"))
+        .and_then(experience_scalar_i64)
+        .unwrap_or(0);
+    conn.rollup_execute_sync(FORCE_ROTATE_DELETE_SQL, &[Value::BigInt(cutoff_eid)])
+        .map_err(|error| DbError::Sqlite(format!("atc force-rotate delete: {error}")))?;
+    Ok(usize::try_from(doomed).unwrap_or(0))
 }
 
 /// Enforce a hard row ceiling on `atc_experiences` for a file-backed pool.
 ///
 /// When the table exceeds `max_rows`, the oldest TERMINAL (resolved/censored/
 /// expired) rows are folded into the rollups and deleted down to a hysteresis
-/// target — preserving rollups and all open/unresolved rows. This is a SAFETY
-/// bound (not a fidelity policy): unbounded raw-experience growth corrupted
-/// SQLite and OOM'd the host on ts2 (859K rows / 3.36 GB), so the ceiling takes
-/// precedence over the age-based 365-day drop window. Open rows are never
-/// evicted (they are needed for outcome resolution); if they alone exceed the
-/// cap, the function logs a backlog warning and leaves them in place.
+/// target. This is a SAFETY bound (not a fidelity policy): unbounded
+/// raw-experience growth corrupted SQLite and OOM'd the host on ts2 (859K rows
+/// / 3.36 GB), so the ceiling takes precedence over the age-based 365-day drop
+/// window. If open rows alone exceed the cap, the oldest open rows are
+/// force-rotated as the last-resort backstop; preserving a wedged raw ledger is
+/// less safe than losing stale unresolved telemetry.
 ///
 /// No-op for `:memory:` pools and for `max_rows <= 0` (disabled). Returns the
 /// number of raw rows evicted.

@@ -7560,6 +7560,15 @@ struct ReservationsData {
     forecast: Option<ReservationForecast>,
 }
 
+/// Keeps the established reservation response shape while making its
+/// freshness/provenance explicit to CLI consumers.
+#[derive(Debug, Clone, Serialize)]
+struct AttestedReservationsData {
+    #[serde(flatten)]
+    reservations: ReservationsData,
+    reservation_read_attestation: ReservationReadAttestation,
+}
+
 /// Format remaining seconds with warning markers.
 fn format_remaining(seconds: i64) -> String {
     let base = format_age(seconds).replace(" ago", "");
@@ -11676,6 +11685,149 @@ fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_
     })
 }
 
+/// Runtime mailbox configuration advertised by a reachable local server.
+///
+/// The operator CLI can be launched with a different XDG environment than the
+/// daemon, so this is the only configuration snapshot that proves which
+/// SQLite/archive pair MCP is currently serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveServerMailboxConfig {
+    pub database_url: String,
+    pub storage_root: std::path::PathBuf,
+}
+
+fn live_server_mailbox_config_from_ws_state(
+    payload: &serde_json::Value,
+) -> crate::CliResult<LiveServerMailboxConfig> {
+    let config = payload.get("config").ok_or_else(|| {
+        CliError::Other("ws-state response missing server configuration".to_string())
+    })?;
+    let database_url = config
+        .get("database_url")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::Other("ws-state response missing server DATABASE_URL".to_string())
+        })?
+        .to_string();
+    let storage_root = config
+        .get("storage_root")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Other("ws-state response missing server STORAGE_ROOT".to_string())
+        })?;
+    Ok(LiveServerMailboxConfig {
+        database_url,
+        storage_root,
+    })
+}
+
+/// Resolve the SQLite/archive pair the reachable MCP server actually owns.
+///
+/// Unlike [`fetch_live_tui_liveness`], callers need the error when the server
+/// cannot be authenticated or its snapshot is malformed so they can label a
+/// local read as unattested instead of silently claiming currentness.
+pub(crate) fn fetch_live_server_mailbox_config(
+    config: &mcp_agent_mail_core::Config,
+) -> crate::CliResult<LiveServerMailboxConfig> {
+    let endpoint = atc_live_endpoint_from_config(config);
+    let payload = fetch_ws_state_payload(&endpoint)?;
+    live_server_mailbox_config_from_ws_state(&payload)
+}
+
+/// Provenance attached to every CLI reservation view. Reservation output is
+/// safety-critical: a local SQLite read that disagrees with a reachable MCP
+/// server must never look like an authoritative empty result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ReservationReadAttestation {
+    /// `current`, `stale_risk`, or `unattested`.
+    pub state: &'static str,
+    /// `local_config` when the CLI read target matches the live server;
+    /// otherwise `local_config_unattested`.
+    pub source: &'static str,
+    pub database_matches_server: Option<bool>,
+    pub storage_root_matches_server: Option<bool>,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+fn mailbox_database_identity(database_url: &str) -> String {
+    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url).map_or_else(
+        |_| database_url.to_string(),
+        |resolved| resolved.canonical_path.display().to_string(),
+    )
+}
+
+fn mailbox_storage_identity(storage_root: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(storage_root).unwrap_or_else(|_| storage_root.to_path_buf())
+}
+
+fn reservation_read_attestation_from_server_config(
+    config: &mcp_agent_mail_core::Config,
+    server_config: Option<LiveServerMailboxConfig>,
+    unavailable_detail: Option<String>,
+) -> ReservationReadAttestation {
+    let Some(server_config) = server_config else {
+        return ReservationReadAttestation {
+            state: "unattested",
+            source: "local_config_unattested",
+            database_matches_server: None,
+            storage_root_matches_server: None,
+            detail: unavailable_detail.unwrap_or_else(|| {
+                "live server mailbox configuration was unavailable; local reservation read cannot attest freshness"
+                    .to_string()
+            }),
+            action: Some("use MCP file-reservation tools before relying on this CLI result".to_string()),
+        };
+    };
+
+    let database_matches_server = mailbox_database_identity(&config.database_url)
+        == mailbox_database_identity(&server_config.database_url);
+    let storage_root_matches_server = mailbox_storage_identity(&config.storage_root)
+        == mailbox_storage_identity(&server_config.storage_root);
+    if database_matches_server && storage_root_matches_server {
+        return ReservationReadAttestation {
+            state: "current",
+            source: "local_config",
+            database_matches_server: Some(true),
+            storage_root_matches_server: Some(true),
+            detail: "CLI reservation read targets the same database and archive as the reachable MCP server"
+                .to_string(),
+            action: None,
+        };
+    }
+
+    ReservationReadAttestation {
+        state: "stale_risk",
+        source: "local_config_unattested",
+        database_matches_server: Some(database_matches_server),
+        storage_root_matches_server: Some(storage_root_matches_server),
+        detail: "CLI reservation read target differs from the reachable MCP server; this result may be stale or from another mailbox"
+            .to_string(),
+        action: Some("use MCP file-reservation tools; do not treat this CLI result as authoritative".to_string()),
+    }
+}
+
+pub(crate) fn reservation_read_attestation(
+    config: &mcp_agent_mail_core::Config,
+) -> ReservationReadAttestation {
+    match fetch_live_server_mailbox_config(config) {
+        Ok(server_config) => {
+            reservation_read_attestation_from_server_config(config, Some(server_config), None)
+        }
+        Err(error) => reservation_read_attestation_from_server_config(
+            config,
+            None,
+            Some(format!(
+                "live server mailbox configuration unavailable: {error}; local reservation read cannot attest freshness"
+            )),
+        ),
+    }
+}
+
 fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRobotSnapshot> {
     let ws_state_url = endpoint.url.clone();
     let payload = fetch_ws_state_payload(endpoint)?;
@@ -14074,6 +14226,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             expiring,
         } => {
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
+            let config = mcp_agent_mail_core::Config::from_env();
+            let read_attestation = reservation_read_attestation(&config);
             let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)?;
             let agent = scope.agent.clone();
             let (data, actions) = build_reservations_with_snapshot_cache(
@@ -14085,8 +14239,18 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 conflicts,
                 expiring,
             )?;
-            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                AttestedReservationsData {
+                    reservations: data,
+                    reservation_read_attestation: read_attestation.clone(),
+                },
+            );
             env._meta.project = Some(scope.project_slug);
+            if read_attestation.state != "current" {
+                env = env.with_alert("warn", read_attestation.detail, read_attestation.action);
+            }
             for a in actions {
                 env = env.with_action(&a);
             }
@@ -16319,6 +16483,82 @@ mod tests {
             url,
             "https://example.test:9999/mail/ws-state?limit=1&token=a%2Bb%2Fc"
         );
+    }
+
+    #[test]
+    fn live_server_mailbox_config_uses_the_server_advertised_paths() {
+        let parsed = live_server_mailbox_config_from_ws_state(&serde_json::json!({
+            "config": {
+                "database_url": "sqlite:////srv/agent-mail/server.sqlite3",
+                "storage_root": "/srv/agent-mail/archive"
+            }
+        }))
+        .expect("parse server mailbox config");
+
+        assert_eq!(
+            parsed.database_url,
+            "sqlite:////srv/agent-mail/server.sqlite3"
+        );
+        assert_eq!(
+            parsed.storage_root,
+            std::path::PathBuf::from("/srv/agent-mail/archive")
+        );
+    }
+
+    #[test]
+    fn live_server_mailbox_config_refuses_incomplete_snapshots() {
+        let error = live_server_mailbox_config_from_ws_state(&serde_json::json!({
+            "config": { "database_url": "sqlite:///storage.sqlite3" }
+        }))
+        .expect_err("storage root is required for an attested mailbox target");
+
+        assert!(error.to_string().contains("STORAGE_ROOT"), "{error}");
+    }
+
+    #[test]
+    fn reservation_read_attestation_marks_divergent_cli_targets_as_stale_risk() {
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:////tmp/cli-mailbox.sqlite3".to_string(),
+            storage_root: std::path::PathBuf::from("/tmp/cli-mailbox"),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let attestation = reservation_read_attestation_from_server_config(
+            &config,
+            Some(LiveServerMailboxConfig {
+                database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
+                storage_root: std::path::PathBuf::from("/srv/agent-mail/archive"),
+            }),
+            None,
+        );
+
+        assert_eq!(attestation.state, "stale_risk");
+        assert_eq!(attestation.database_matches_server, Some(false));
+        assert_eq!(attestation.storage_root_matches_server, Some(false));
+        assert!(attestation.action.is_some());
+    }
+
+    #[test]
+    fn reservation_read_attestation_marks_matching_live_target_current() {
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: storage_root.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let attestation = reservation_read_attestation_from_server_config(
+            &config,
+            Some(LiveServerMailboxConfig {
+                database_url: config.database_url.clone(),
+                storage_root: config.storage_root.clone(),
+            }),
+            None,
+        );
+
+        assert_eq!(attestation.state, "current");
+        assert_eq!(attestation.database_matches_server, Some(true));
+        assert_eq!(attestation.storage_root_matches_server, Some(true));
+        assert!(attestation.action.is_none());
     }
 
     #[test]
