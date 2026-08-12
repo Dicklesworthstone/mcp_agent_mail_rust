@@ -1248,9 +1248,21 @@ struct MailboxActivityLockMetadata {
     lock_path: String,
     acquired_at_micros: i64,
     executable_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_reap_evidence: Option<MailboxActivityLockStaleReapEvidence>,
 }
 
 const MAX_MAILBOX_ACTIVITY_LOCK_METADATA_BYTES: u64 = 16 * 1024;
+
+/// Evidence retained when a lock file's advisory owner record outlives the
+/// kernel lock. `flock` itself is released by the kernel at process exit, so
+/// metadata is never treated as authority to break a live lock.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct MailboxActivityLockStaleReapEvidence {
+    observed_at_micros: i64,
+    owner_pid_alive: bool,
+    recorded_executable_exists: Option<bool>,
+}
 
 impl MailboxActivityLockMetadata {
     fn new(
@@ -1270,24 +1282,87 @@ impl MailboxActivityLockMetadata {
             executable_path: std::env::current_exe()
                 .ok()
                 .map(|path| path.display().to_string()),
+            stale_reap_evidence: None,
         }
     }
 
     fn owner_hint(&self) -> String {
         let acquired_at = mcp_agent_mail_core::timestamps::micros_to_iso(self.acquired_at_micros);
+        let age = mailbox_activity_lock_age(self.acquired_at_micros);
         let executable = self.executable_path.as_deref().unwrap_or("<unknown>");
+        let stale_reap = self
+            .stale_reap_evidence
+            .as_ref()
+            .map_or_else(String::new, |evidence| {
+                format!(
+                    " stale_metadata_reaped_at={} owner_pid_alive={} recorded_exe_exists={}",
+                    mcp_agent_mail_core::timestamps::micros_to_iso(evidence.observed_at_micros),
+                    evidence.owner_pid_alive,
+                    evidence
+                        .recorded_executable_exists
+                        .map_or_else(|| "unknown".to_string(), |exists| exists.to_string())
+                )
+            });
         format!(
-            "pid={} mode={} subject={} {} acquired_at={} exe={}",
-            self.pid, self.mode, self.subject_kind, self.subject_path, acquired_at, executable
+            "pid={} age={} mode={} subject={} {} acquired_at={} exe={}{}",
+            self.pid,
+            age,
+            self.mode,
+            self.subject_kind,
+            self.subject_path,
+            acquired_at,
+            executable,
+            stale_reap
         )
     }
 }
 
-fn read_mailbox_activity_lock_owner_hint(lock_path: &Path) -> Option<String> {
-    let lock_file = fs::File::open(lock_path).ok()?;
+fn mailbox_activity_lock_age(acquired_at_micros: i64) -> String {
+    let elapsed_micros = mcp_agent_mail_core::timestamps::now_micros()
+        .saturating_sub(acquired_at_micros)
+        .max(0) as u64;
+    let elapsed_seconds = elapsed_micros / 1_000_000;
+    if elapsed_seconds < 60 {
+        return format!("{elapsed_seconds}s");
+    }
+    let elapsed_minutes = elapsed_seconds / 60;
+    if elapsed_minutes < 60 {
+        return format!("{elapsed_minutes}m {}s", elapsed_seconds % 60);
+    }
+    format!("{}h {}m", elapsed_minutes / 60, elapsed_minutes % 60)
+}
+
+#[cfg(target_os = "linux")]
+fn mailbox_activity_lock_owner_pid_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).is_dir()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mailbox_activity_lock_owner_pid_is_alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn mailbox_activity_lock_recorded_executable_exists(
+    metadata: &MailboxActivityLockMetadata,
+) -> Option<bool> {
+    metadata
+        .executable_path
+        .as_deref()
+        .map(|path| Path::new(path).is_file())
+}
+
+fn read_mailbox_activity_lock_metadata(
+    lock_file: &mut fs::File,
+) -> Option<MailboxActivityLockMetadata> {
     if lock_file.metadata().ok()?.len() > MAX_MAILBOX_ACTIVITY_LOCK_METADATA_BYTES {
         return None;
     }
+    lock_file.rewind().ok()?;
     let mut body = String::new();
     let mut reader = lock_file.take(MAX_MAILBOX_ACTIVITY_LOCK_METADATA_BYTES);
     reader.read_to_string(&mut body).ok()?;
@@ -1295,9 +1370,55 @@ fn read_mailbox_activity_lock_owner_hint(lock_path: &Path) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    serde_json::from_str::<MailboxActivityLockMetadata>(body)
-        .ok()
-        .map(|metadata| metadata.owner_hint())
+    serde_json::from_str(body).ok()
+}
+
+fn read_mailbox_activity_lock_owner_hint(lock_path: &Path) -> Option<String> {
+    let mut lock_file = fs::File::open(lock_path).ok()?;
+    read_mailbox_activity_lock_metadata(&mut lock_file).map(|metadata| metadata.owner_hint())
+}
+
+fn write_mailbox_activity_lock_metadata_document(
+    lock_file: &mut fs::File,
+    metadata: &MailboxActivityLockMetadata,
+) -> std::io::Result<()> {
+    let payload = serde_json::to_vec_pretty(metadata)
+        .map_err(|err| std::io::Error::other(format!("serialize lock metadata: {err}")))?;
+    lock_file.set_len(0)?;
+    lock_file.rewind()?;
+    lock_file.write_all(&payload)?;
+    lock_file.write_all(b"\n")?;
+    lock_file.flush()
+}
+
+/// Reap only the advisory record left behind after an activity lock is no
+/// longer flock-held. The exclusive probe is the safety proof: metadata is
+/// never changed while any process still owns the kernel lock. Reaping keeps
+/// the lock inode and retains PID/executable liveness evidence.
+fn reap_stale_mailbox_activity_lock_metadata(lock_file: &mut fs::File) -> std::io::Result<bool> {
+    match fs2::FileExt::try_lock_exclusive(lock_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(error),
+    }
+
+    let result = (|| {
+        let Some(mut metadata) = read_mailbox_activity_lock_metadata(lock_file) else {
+            return Ok(false);
+        };
+        if metadata.stale_reap_evidence.is_some() {
+            return Ok(false);
+        }
+        metadata.stale_reap_evidence = Some(MailboxActivityLockStaleReapEvidence {
+            observed_at_micros: mcp_agent_mail_core::timestamps::now_micros(),
+            owner_pid_alive: mailbox_activity_lock_owner_pid_is_alive(metadata.pid),
+            recorded_executable_exists: mailbox_activity_lock_recorded_executable_exists(&metadata),
+        });
+        write_mailbox_activity_lock_metadata_document(lock_file, &metadata)?;
+        Ok(true)
+    })();
+    let _ = fs2::FileExt::unlock(lock_file);
+    result
 }
 
 fn write_mailbox_activity_lock_metadata(
@@ -1312,13 +1433,7 @@ fn write_mailbox_activity_lock_metadata(
     }
 
     let metadata = MailboxActivityLockMetadata::new(subject_path, subject_kind, lock_path, mode);
-    let payload = serde_json::to_vec_pretty(&metadata)
-        .map_err(|err| std::io::Error::other(format!("serialize lock metadata: {err}")))?;
-    lock_file.set_len(0)?;
-    lock_file.rewind()?;
-    lock_file.write_all(&payload)?;
-    lock_file.write_all(b"\n")?;
-    lock_file.flush()
+    write_mailbox_activity_lock_metadata_document(lock_file, &metadata)
 }
 
 fn mailbox_activity_lock_contention_error(
@@ -1330,9 +1445,9 @@ fn mailbox_activity_lock_contention_error(
 ) -> std::io::Error {
     let owner_hint = read_mailbox_activity_lock_owner_hint(lock_path)
         .map(|hint| format!("; owner hint: {hint}"))
-        .unwrap_or_default();
+        .unwrap_or_else(|| "; owner hint: pid=unknown (lock metadata unavailable)".to_string());
     let detail = format!(
-        "mailbox activity lock is busy for {subject_kind} {} ({} lock {}): another Agent Mail runtime or mutating `am doctor` operation is already active; stop it or wait for it to finish{owner_hint}",
+        "mailbox activity lock is busy for {subject_kind} {} ({} lock {}): another Agent Mail runtime or mutating `am doctor` operation is already active{owner_hint}; safe next command: `am doctor locks --json` (read-only; do not remove lock files)",
         subject_path.display(),
         mode.label(),
         lock_path.display()
@@ -1364,6 +1479,19 @@ fn acquire_mailbox_activity_lock_for_subject(
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
+
+    match reap_stale_mailbox_activity_lock_metadata(&mut lock_file) {
+        Ok(true) => tracing::info!(
+            lock_path = %lock_path.display(),
+            "reaped stale advisory mailbox activity lock metadata after exclusive flock proof"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            lock_path = %lock_path.display(),
+            error = %error,
+            "could not inspect stale advisory mailbox activity lock metadata"
+        ),
+    }
 
     {
         let mut registry = MAILBOX_ACTIVITY_PROCESS_LOCKS
@@ -10373,47 +10501,19 @@ impl HttpState {
 
         let mut resp = self.handle_inner(req).await;
         apply_security_headers(&mut resp);
-        // The port-ownership probe must validate the real MCP POST route even
-        // when bearer auth rejects it. Carry the same non-secret server
-        // signature on every response so a signed 401 remains identifiable.
-        if !resp.headers.iter().any(|(name, _)| {
-            name.eq_ignore_ascii_case(startup_checks::HEALTH_SIGNATURE_HEADER_NAME)
-        }) {
-            resp.headers.push((
-                startup_checks::HEALTH_SIGNATURE_HEADER_NAME.to_string(),
-                startup_checks::HEALTH_SIGNATURE_HEADER_VALUE.to_string(),
-            ));
-        }
         self.request_diagnostics
             .record_completed(&method_name, &path_for_diag, resp.status);
         let elapsed = start.elapsed();
         let latency_us =
             u64::try_from(elapsed.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
-        let dur_ms =
-            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         metrics.http.record_response(resp.status, latency_us);
-
-        // Keep failed requests visible in the server log even when the optional
-        // high-volume request log is disabled. Clients such as Gemini can show
-        // only a blank MCP error, so method/path/status/client are the minimum
-        // correlation data operators need. Never include request bodies or
-        // authorization values here.
-        if resp.status >= 400 {
-            tracing::warn!(
-                event = "http_request_error",
-                method = %method_name,
-                path = %path_for_diag,
-                status = resp.status,
-                duration_ms = dur_ms,
-                client_ip = %client_ip.as_deref().unwrap_or("-"),
-                "HTTP request failed"
-            );
-        }
 
         if !needs_request_log {
             return resp;
         }
 
+        let dur_ms =
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         if let Some(dashboard) = dashboard.as_ref()
             && let (Some(method), Some(path), Some(client_ip)) =
                 (method.as_ref(), path.as_ref(), client_ip.as_ref())
@@ -11072,26 +11172,6 @@ impl HttpState {
         if self.config.http_jwt_enabled && self.decode_jwt_with_cx(cx, req).await.is_ok() {
             return None;
         }
-
-        let supplied_authorization = header_value(req, "authorization").is_some();
-        let auth_failure = if self.config.http_bearer_token.is_some() && supplied_authorization {
-            "stale_bearer_token"
-        } else if self.config.http_bearer_token.is_some() {
-            "missing_bearer_token"
-        } else {
-            "invalid_or_missing_jwt"
-        };
-        let client_ip = req
-            .peer_addr
-            .map_or_else(|| "-".to_string(), |addr| addr.ip().to_string());
-        tracing::warn!(
-            event = "http_bearer_auth_rejected",
-            method = %req.method.as_str(),
-            path = %path,
-            client_ip = %client_ip,
-            reason = auth_failure,
-            "HTTP authentication rejected; re-run `am setup status` to check client token drift"
-        );
 
         // D4: For browser HTML routes, return actionable HTML; for
         // machine/browser JSON routes, preserve JSON 401 responses.
@@ -18429,8 +18509,56 @@ first body
             "contention error should name the lock owner pid: {text}"
         );
         assert!(
+            text.contains("age="),
+            "contention error should name the lock owner age: {text}"
+        );
+        assert!(
             text.contains("mode=exclusive"),
             "contention error should name the owner lock mode: {text}"
+        );
+        assert!(
+            text.contains("safe next command: `am doctor locks --json`"),
+            "contention error should give the safe read-only next command: {text}"
+        );
+    }
+
+    #[test]
+    fn mailbox_activity_lock_reaper_retains_pid_and_executable_liveness_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("mailbox");
+
+        let lock = acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire exclusive storage-root lock");
+        drop(lock);
+
+        let lock_path = storage_root.join(".mailbox.activity.lock");
+        let mut lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open released activity lock");
+        assert!(
+            reap_stale_mailbox_activity_lock_metadata(&mut lock_file)
+                .expect("reap stale advisory metadata"),
+            "the released kernel lock makes its metadata eligible for evidence-preserving reaping"
+        );
+
+        let metadata = read_mailbox_activity_lock_metadata(&mut lock_file)
+            .expect("reaped lock metadata remains readable");
+        let evidence = metadata
+            .stale_reap_evidence
+            .expect("reaper must retain liveness evidence");
+        assert_eq!(metadata.pid, std::process::id());
+        assert!(
+            evidence.owner_pid_alive,
+            "the test process is the recorded owner"
+        );
+        assert!(
+            evidence.recorded_executable_exists.is_some(),
+            "the reaper must record executable-path evidence when it was advertised"
         );
     }
 
