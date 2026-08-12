@@ -340,6 +340,13 @@ pub struct Config {
     pub contact_auto_ttl_seconds: u64,
     pub messaging_auto_register_recipients: bool,
     pub messaging_auto_handshake_on_block: bool,
+    /// Opt-in fail-closed profile for `send_message`.
+    ///
+    /// When enabled, `send_message` requires a stored, matching sender
+    /// registration token, never auto-registers unknown recipients, and emits
+    /// a receipt that omits message payload fields. This remains opt-in so the
+    /// default MCP/Python-parity send contract is unchanged.
+    pub messaging_fail_closed_send_profile: bool,
 
     // Message size limits (bytes). 0 = unlimited.
     pub max_message_body_bytes: usize,
@@ -1438,6 +1445,7 @@ impl Default for Config {
             contact_auto_ttl_seconds: 86400, // 24 hours
             messaging_auto_register_recipients: true,
             messaging_auto_handshake_on_block: true,
+            messaging_fail_closed_send_profile: false,
 
             // Message size limits
             max_message_body_bytes: 1_048_576,   // 1 MiB
@@ -2128,6 +2136,10 @@ impl Config {
         config.messaging_auto_handshake_on_block = env_bool(
             "MESSAGING_AUTO_HANDSHAKE_ON_BLOCK",
             config.messaging_auto_handshake_on_block,
+        );
+        config.messaging_fail_closed_send_profile = env_bool(
+            "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
+            config.messaging_fail_closed_send_profile,
         );
 
         // Message size limits
@@ -3680,8 +3692,15 @@ mod tests {
             "sqlite+aiosqlite:///./storage.sqlite3".to_string()
         );
         assert!(config.contact_enforcement_enabled);
+        assert!(!config.messaging_fail_closed_send_profile);
         assert!(!config.allow_absolute_attachment_paths);
         assert!(!config.allow_ephemeral_projects_in_default_storage);
+    }
+
+    #[test]
+    fn fail_closed_send_profile_is_opt_in_and_env_configurable() {
+        let _env = TestEnvOverrideGuard::set(&[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true")]);
+        assert!(Config::from_env().messaging_fail_closed_send_profile);
     }
 
     #[test]
