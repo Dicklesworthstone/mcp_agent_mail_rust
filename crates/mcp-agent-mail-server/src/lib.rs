@@ -16557,7 +16557,7 @@ fn is_loopback_bind_host(host: &str) -> bool {
         || host
             .trim()
             .parse::<IpAddr>()
-            .map(IpAddr::is_loopback)
+            .map(|ip| ip.is_loopback())
             .unwrap_or(false)
 }
 
