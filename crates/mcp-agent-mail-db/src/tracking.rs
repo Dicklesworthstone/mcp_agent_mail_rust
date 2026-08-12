@@ -619,7 +619,7 @@ pub fn global_tracker() -> &'static QueryTracker {
 /// Transaction control is intentionally excluded: a `BEGIN`/`COMMIT` pair can
 /// belong to a read-only snapshot, and attributing that wait time as a write
 /// would make timeout diagnostics dishonest.
-fn is_database_write_statement(sql: &str) -> bool {
+pub(crate) fn is_database_write_statement(sql: &str) -> bool {
     let keyword = sql
         .trim_start()
         .split_ascii_whitespace()
