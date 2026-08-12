@@ -4347,6 +4347,27 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
+    fn setup_normalizes_quoted_toml_server_name_alias() {
+        let merged = merge_toml_section(
+            Some(
+                "[mcp_servers.\"mcp-agent-mail\"]\n\
+                 url = \"http://127.0.0.1:8765/api/\"\n\
+                 startup_timeout_sec = 5\n",
+            ),
+            "[mcp_servers.mcp_agent_mail]",
+            &[
+                ("url".to_string(), "\"http://127.0.0.1:8765/mcp/\"".to_string()),
+                ("startup_timeout_sec".to_string(), "15".to_string()),
+            ],
+        );
+
+        assert!(merged.contains("[mcp_servers.mcp_agent_mail]"));
+        assert!(!merged.contains("mcp-agent-mail"));
+        assert!(merged.contains("url = \"http://127.0.0.1:8765/mcp/\""));
+        assert!(merged.contains("startup_timeout_sec = 15"));
+    }
+
+    #[test]
     fn check_status_reports_unsupported_config_drift() {
         let tmp = tempfile::tempdir().unwrap();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
