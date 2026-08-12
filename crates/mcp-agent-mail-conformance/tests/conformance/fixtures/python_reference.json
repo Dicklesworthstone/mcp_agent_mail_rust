@@ -71,6 +71,7 @@
               "/recovery",
               "/semantic_readiness",
               "/storage_root",
+              "/timeout_diagnostics",
               "/two_tier_indexing",
               "/verdicts",
               "/failing_verdicts",
@@ -99,6 +100,8 @@
               "/queues/commit_coalescer/latency_p50_ms",
               "/queues/commit_coalescer/latency_p95_ms",
               "/queues/commit_coalescer/latency_p99_ms",
+              "/queues/commit_coalescer/degraded_p99_bound_ms",
+              "/queues/commit_coalescer/functionally_degraded",
               "/queues/commit_coalescer/over_80_for_s",
               "/queues/commit_coalescer/warning"
             ]
