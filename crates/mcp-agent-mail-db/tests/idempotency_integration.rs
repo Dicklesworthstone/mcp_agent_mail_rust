@@ -49,7 +49,9 @@ fn make_pool() -> (DbPool, tempfile::TempDir, PathBuf) {
         .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
         .expect("apply init PRAGMAs");
     let cx = asupersync::Cx::for_testing();
-    match common::spin_poll(mcp_agent_mail_db::schema::migrate_to_latest_base(&cx, &init_conn)) {
+    match common::spin_poll(mcp_agent_mail_db::schema::migrate_to_latest_base(
+        &cx, &init_conn,
+    )) {
         Outcome::Ok(_) => {}
         other => panic!("test pool migration failed: {other:?}"),
     }
@@ -319,7 +321,9 @@ fn acknowledge_message_idempotent_replays_and_conflicts() {
     let recipient = setup_agent(&pool, pid, "BlueLake");
 
     // Seed a message so there is a recipient row to acknowledge.
-    let fresh = send_idem(&pool, pid, sender, recipient, "ack me", "SEED-ACK", "fp-seed");
+    let fresh = send_idem(
+        &pool, pid, sender, recipient, "ack me", "SEED-ACK", "fp-seed",
+    );
     let IdempotentOutcome::Fresh(row) = fresh else {
         panic!("seed send must be Fresh");
     };
