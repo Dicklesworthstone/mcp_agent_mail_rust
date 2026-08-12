@@ -573,7 +573,9 @@ impl DbMetrics {
 }
 
 /// Always-on latency distribution for SQL statements that mutate database
-/// state. This is intentionally separate from the optional query tracker: a
+/// state.
+///
+/// This is intentionally separate from the optional query tracker: a
 /// timeout diagnostic cannot depend on instrumentation having been enabled
 /// before the incident.
 #[derive(Debug, Default)]
@@ -690,10 +692,11 @@ pub struct TimeoutDiagnosticsSnapshot {
     pub blocking_dispatch: BlockingDispatchMetricsSnapshot,
 }
 
-/// Classify timeout evidence from p99 samples. The slowest stage at or beyond
-/// the client deadline wins. If none crossed the deadline, dispatch contention
-/// is surfaced as explicitly unattributed rather than being mislabeled as DB
-/// contention.
+/// Classify timeout evidence from p99 samples.
+///
+/// The slowest stage at or beyond the client deadline wins. If none crossed
+/// the deadline, dispatch contention is surfaced as explicitly unattributed
+/// rather than being mislabeled as DB contention.
 #[must_use]
 pub fn timeout_diagnostics_from_samples(
     client_deadline_us: u64,

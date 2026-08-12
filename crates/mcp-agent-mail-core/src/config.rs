@@ -10,9 +10,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Ecosystem clients abort a request after this many milliseconds. Health
-/// latency bounds are deliberately capped at this deadline so a "warning"
-/// cannot be configured past the point at which users already time out.
+/// Ecosystem clients abort a request after this many milliseconds.
+///
+/// Health latency bounds are deliberately capped at this deadline so a
+/// "warning" cannot be configured past the point at which users already
+/// time out.
 pub const ECOSYSTEM_CLIENT_DEADLINE_MS: u64 = 30_000;
 
 /// ATC experience write mode: controls whether `atc_note_*` calls persist
