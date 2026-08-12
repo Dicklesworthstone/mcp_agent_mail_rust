@@ -10149,6 +10149,43 @@ async fn create_file_reservations_impl(
         // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
+        // Idempotency key check (br-idempotency-keys-mutating-tools-h0x9k): a
+        // matching prior key replays the original reservation rows without
+        // inserting a second lease; a differing payload aborts as a typed
+        // conflict. The BEGIN IMMEDIATE above already serializes writers, so a
+        // concurrent retry blocks here and then observes the recorded key.
+        if let Some(claim) = idempotency {
+            match idempotency_check_in_tx(cx, &tracked, claim, now).await {
+                Outcome::Ok(IdempotencyCheck::Proceed) => {}
+                Outcome::Ok(IdempotencyCheck::Replay(result_json)) => {
+                    rollback_tx(cx, &tracked).await;
+                    return match decode_idempotency_result::<Vec<FileReservationRow>>(
+                        &result_json,
+                        "create_file_reservations",
+                    ) {
+                        Ok(rows) => Outcome::Ok(IdempotentOutcome::Replayed(rows)),
+                        Err(e) => Outcome::Err(e),
+                    };
+                }
+                Outcome::Ok(IdempotencyCheck::Conflict(info)) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Ok(IdempotentOutcome::Conflict(info));
+                }
+                Outcome::Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(p);
+                }
+            }
+        }
+
         let exclusive_filter = if exclusive {
             ""
         } else {
@@ -10256,8 +10293,37 @@ async fn create_file_reservations_impl(
             out.push(row);
         }
 
+        // Record the idempotency key + serialized reservation rows in the SAME
+        // transaction as the inserts, so a crash cannot split the key from the
+        // leases (which would let a retry create a duplicate reservation set).
+        if let Some(claim) = idempotency {
+            let result_json = match serde_json::to_string(&out) {
+                Ok(json) => json,
+                Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "idempotency record for {}: result is unserializable: {e}",
+                        claim.tool
+                    )));
+                }
+            };
+            try_in_tx!(
+                cx,
+                &tracked,
+                idempotency_record_in_tx(
+                    cx,
+                    &tracked,
+                    claim,
+                    &result_json,
+                    now,
+                    idempotency_expires_ts
+                )
+                .await
+            );
+        }
+
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        Outcome::Ok(out)
+        Outcome::Ok(IdempotentOutcome::Fresh(out))
     })
     .await
 }
