@@ -210,6 +210,7 @@ pub async fn macro_start_session(
                 Some(ttl),
                 Some(true),
                 Some(reason),
+                None,
             )
             .await?;
             parse_json(reservation_json, "file_reservations")?
@@ -539,6 +540,7 @@ pub async fn macro_file_reservation_cycle(
                 .clone()
                 .unwrap_or_else(|| "macro-file_reservation".to_string()),
         ),
+        None,
     )
     .await
     {

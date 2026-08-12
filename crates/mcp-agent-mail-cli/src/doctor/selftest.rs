@@ -665,6 +665,7 @@ fn run_selftest_sequence_in_process(project_key: &str) -> WriteSelftestReport {
             Some(60),
             Some(true),
             Some("doctor write-selftest".to_string()),
+            None,
         )
         .await
         {

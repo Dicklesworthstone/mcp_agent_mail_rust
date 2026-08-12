@@ -1382,6 +1382,7 @@ impl ReservationsScreen {
             Some(payload.ttl_seconds),
             Some(payload.exclusive),
             payload.reason,
+            None,
         ));
 
         match result {

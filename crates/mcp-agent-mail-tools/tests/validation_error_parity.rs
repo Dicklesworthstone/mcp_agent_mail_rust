@@ -642,6 +642,7 @@ fn test_empty_paths_validation_message() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("empty paths should fail");
@@ -681,6 +682,7 @@ fn test_invalid_reservation_glob_validation_message() {
             project_key.clone(),
             "BlueLake".to_string(),
             vec!["src/[abc".to_string()],
+            None,
             None,
             None,
             None,

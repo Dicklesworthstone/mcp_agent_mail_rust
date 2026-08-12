@@ -100,6 +100,7 @@ fn test_empty_paths_error() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("empty paths should fail");
@@ -155,6 +156,7 @@ fn test_reservation_conflict_response_structure() {
             Some(3600),
             Some(true),
             Some("test".to_string()),
+            None,
         )
         .await
         .expect("initial reservation should succeed");
@@ -175,6 +177,7 @@ fn test_reservation_conflict_response_structure() {
             Some(3600),
             Some(true),
             Some("test".to_string()),
+            None,
         )
         .await
         .expect("conflicting reservation should succeed (returns conflicts, not error)");
@@ -267,6 +270,7 @@ fn test_glob_pattern_conflict() {
             Some(3600),
             Some(true),
             Some("test".to_string()),
+            None,
         )
         .await
         .expect("glob reservation should succeed");
@@ -280,6 +284,7 @@ fn test_glob_pattern_conflict() {
             Some(3600),
             Some(true),
             Some("test".to_string()),
+            None,
         )
         .await
         .expect("overlapping reservation returns conflicts");
@@ -371,6 +376,7 @@ fn test_granted_response_structure() {
             Some(3600),
             Some(true),
             Some("test".to_string()),
+            None,
         )
         .await
         .expect("reservation should succeed");
