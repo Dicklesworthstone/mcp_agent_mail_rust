@@ -917,6 +917,124 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     Ok(())
 }
 
+/// Summary returned to the legacy `archive-normalize` verb after it routes the
+/// reservation-artifact portion through the modern `mutate()` chokepoint.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct ArchiveNormalizeReservationArtifactOutcome {
+    pub findings_count: usize,
+    pub actions_taken: usize,
+    pub actions_skipped: usize,
+    pub quarantined_paths: Vec<PathBuf>,
+    pub run_dir: Option<PathBuf>,
+}
+
+/// Detect generation-keyed reservation archive artifacts for the
+/// `archive-normalize` compatibility verb. Kept separate from the mutation so
+/// the command can include these actions in its single confirmation prompt.
+pub(crate) fn detect_archive_normalize_reservation_artifacts(
+    storage_root: &Path,
+    database_path: Option<&Path>,
+) -> Vec<fixers::reservation_artifact_normalize::ReservationArtifactNormalizeFinding> {
+    let candidates = database_path.map_or_else(Vec::new, |path| vec![path.to_path_buf()]);
+    fixers::reservation_artifact_normalize::detect(Some(storage_root), &candidates)
+}
+
+/// Apply a pre-confirmed `archive-normalize` reservation artifact plan.
+///
+/// The old verb owns its user confirmation; this helper owns only the doctor
+/// run scaffold and the mutation contract. All writes still flow through the
+/// same hash-witnessed, undo-reversible `mutate()` chokepoint as `fix --only`.
+pub(crate) fn apply_archive_normalize_reservation_artifacts(
+    findings: &[fixers::reservation_artifact_normalize::ReservationArtifactNormalizeFinding],
+    storage_root: &Path,
+    dry_run: bool,
+) -> CliResult<ArchiveNormalizeReservationArtifactOutcome> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    if findings.is_empty() {
+        return Ok(ArchiveNormalizeReservationArtifactOutcome::default());
+    }
+
+    let started_at = Instant::now();
+    let repo_root =
+        std::env::current_dir().map_err(|e| CliError::Other(format!("getting cwd: {e}")))?;
+    let run_id = format!(
+        "{}__archive_normalize_reservation_artifacts_{}",
+        runs::now_iso_seconds(),
+        short_run_suffix(fixers::reservation_artifact_normalize::FM_ID),
+    );
+    let run_dir = if dry_run {
+        runs::doctor_root(&repo_root).join("dry-run").join(&run_id)
+    } else {
+        runs::scaffold_run_dir(&repo_root, &run_id)
+            .map_err(|e| CliError::Other(format!("scaffolding run dir: {e}")))?
+    };
+    let actions_file = if dry_run {
+        tempfile::tempfile()
+            .map_err(|e| CliError::Other(format!("creating dry-run actions sink: {e}")))?
+    } else {
+        runs::open_actions_log(&run_dir)
+            .map_err(|e| CliError::Other(format!("opening actions.jsonl: {e}")))?
+    };
+    let mut write_scopes = default_write_scopes();
+    write_scopes.extend([
+        repo_root.clone(),
+        run_dir.clone(),
+        storage_root.to_path_buf(),
+    ]);
+    let ctx = mutate::MutateContext {
+        run_id: run_id.clone(),
+        run_dir: run_dir.clone(),
+        capabilities: mutate::Capabilities { write_scopes },
+        actions_file: Mutex::new(actions_file),
+        fixer_id: fixers::reservation_artifact_normalize::FM_ID.to_string(),
+        repo_root: repo_root.clone(),
+        dry_run,
+        start: started_at,
+        extra_locks: Vec::new(),
+    };
+
+    let mut outcome = ArchiveNormalizeReservationArtifactOutcome {
+        findings_count: findings.len(),
+        ..ArchiveNormalizeReservationArtifactOutcome::default()
+    };
+    for finding in findings {
+        let result =
+            fixers::reservation_artifact_normalize::fix(&ctx, finding).map_err(|error| {
+                CliError::Other(format!(
+                    "archive-normalize reservation artifact mutation failed: {error}"
+                ))
+            })?;
+        outcome.actions_taken += result.actions_taken;
+        outcome.actions_skipped += result.actions_skipped;
+        outcome.quarantined_paths.extend(result.quarantined_paths);
+    }
+
+    if !dry_run && outcome.actions_taken > 0 {
+        let envelope = serde_json::json!({
+            "schema_version": "1.0",
+            "doctor_version": runs::DOCTOR_VERSION,
+            "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+            "fm_id": fixers::reservation_artifact_normalize::FM_ID,
+            "mode": "archive-normalize",
+            "run_id": run_id,
+            "duration_ms": started_at.elapsed().as_millis() as u64,
+            "outcome": &outcome,
+        });
+        runs::write_run_artifacts(&run_dir, &run_id, &envelope)
+            .map_err(|e| CliError::Other(format!("writing doctor run artifacts: {e}")))?;
+        if let Err(error) = manifest::seal_run_manifest_default(&run_dir, &run_id) {
+            eprintln!("warning: could not seal doctor undo manifest for {run_id}: {error}");
+        }
+        runs::update_latest_symlink(&repo_root, &run_id)
+            .map_err(|e| CliError::Other(format!("updating .doctor/latest: {e}")))?;
+        outcome.run_dir = Some(run_dir);
+    }
+
+    Ok(outcome)
+}
+
 /// Pass-16 verb: `am doctor fix --only <fm-id> --list`.
 ///
 /// Pure-detection variant — runs the FM's detector and prints a JSON

@@ -25975,6 +25975,9 @@ struct DoctorArchiveNormalizeResult {
     duplicate_files_quarantined: usize,
     duplicate_files_annotated: usize,
     reservation_archive_files_pruned: usize,
+    reservation_artifact_actions: usize,
+    reservation_artifacts_quarantined: usize,
+    reservation_artifact_normalize_run: Option<String>,
     unresolved_project_metadata_files: usize,
     unresolved_malformed_message_files: usize,
     unresolved_suspicious_projects: usize,
@@ -74203,6 +74206,15 @@ fn handle_doctor_archive_normalize(
     let storage_root = config.storage_root.clone();
     let _mailbox_storage_root_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
+    let reservation_artifact_db = sqlite_file_path_from_database_url(&config.database_url);
+    let reservation_artifact_findings = doctor::detect_archive_normalize_reservation_artifacts(
+        &storage_root,
+        reservation_artifact_db.as_deref(),
+    );
+    let reservation_artifact_actions_planned = reservation_artifact_findings
+        .iter()
+        .map(|finding| finding.to_finding().remediation.estimated_actions)
+        .sum::<usize>();
 
     // #173: optional, opt-in prune of released file-reservation archive JSON past
     // the retention horizon. Self-contained and independent of the project
@@ -74285,7 +74297,8 @@ fn handle_doctor_archive_normalize(
             .duplicate_canonical_groups
             .iter()
             .map(|group| group.duplicates.len())
-            .sum::<usize>();
+            .sum::<usize>()
+        + reservation_artifact_actions_planned;
     if actionable_count == 0 {
         if json {
             ftui_runtime::ftui_println!(
@@ -74322,7 +74335,7 @@ fn handle_doctor_archive_normalize(
 
     let confirm_msg = match apply_mode {
         NormalizeApplyMode::Quarantine => {
-            "Proceed with archive normalization (quarantine mode)? This can rewrite safely-normalizable project.json files and move duplicate canonical message files to a quarantine directory without deleting them."
+            "Proceed with archive normalization (quarantine mode)? This can rewrite safely-normalizable project.json files, migrate verified legacy reservation artifacts to generation-stamped keys, and move duplicate or foreign-generation artifacts to a quarantine directory without deleting them."
         }
         NormalizeApplyMode::Annotate => {
             "Proceed with archive normalization (annotate mode)? This can rewrite safely-normalizable project.json files and annotate duplicate canonical message files with sidecar metadata without moving or deleting them."
@@ -74424,6 +74437,30 @@ fn handle_doctor_archive_normalize(
                 }
             }
         }
+    }
+
+    let reservation_artifact_outcome = doctor::apply_archive_normalize_reservation_artifacts(
+        &reservation_artifact_findings,
+        &storage_root,
+        dry_run,
+    )?;
+    result.reservation_artifact_actions = reservation_artifact_outcome.actions_taken;
+    result.reservation_artifacts_quarantined = reservation_artifact_outcome.quarantined_paths.len();
+    result.reservation_artifact_normalize_run = reservation_artifact_outcome
+        .run_dir
+        .as_ref()
+        .map(|path| path.display().to_string());
+    if reservation_artifact_outcome.actions_taken > 0 {
+        result.actions.push(DoctorArchiveNormalizeAction {
+            kind: "normalize_reservation_artifact_generation_keys".to_string(),
+            path: storage_root.join("projects").display().to_string(),
+            detail: format!(
+                "{} action(s) across {} finding(s); {} artifact(s) quarantined through the doctor mutate() chokepoint",
+                reservation_artifact_outcome.actions_taken,
+                reservation_artifact_outcome.findings_count,
+                reservation_artifact_outcome.quarantined_paths.len(),
+            ),
+        });
     }
 
     if !dry_run {

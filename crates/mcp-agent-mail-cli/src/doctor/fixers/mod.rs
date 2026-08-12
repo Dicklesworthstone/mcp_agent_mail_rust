@@ -56,6 +56,7 @@ pub mod port_bound_by_foreign_process;
 pub mod quarantined_bak_files;
 pub mod recovered_tree_shadow;
 pub mod recovery_breaker_tripped;
+pub mod reservation_artifact_normalize;
 pub mod reservation_db_archive_parity;
 pub mod retained_autocommit_leak;
 pub mod runtime_pid_hint_symlink_toctou;
@@ -488,6 +489,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "automatic recovery is circuit-broken after repeated same-content failures; operator intervention required",
             source_module: "doctor::fixers::recovery_breaker_tripped",
+        },
+        FixerSpec {
+            id: reservation_artifact_normalize::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "Op::WriteFile + Op::Rename",
+            auto_fixable: true,
+            one_line_description: "Legacy id-N.json file-reservation archive artifacts are migrated to generation-stamped id-N-g<generation>.json keys only after live DB (project,id) verification; foreign-generation artifacts and redundant legacy duplicates are quarantined through mutate(), preserving bytes for am doctor undo.",
+            source_module: "doctor::fixers::reservation_artifact_normalize",
         },
         FixerSpec {
             id: reservation_db_archive_parity::FM_ID,
@@ -1645,6 +1655,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == reservation_artifact_normalize::FM_ID {
+        let findings = reservation_artifact_normalize::detect(
+            inputs.storage_root.as_deref(),
+            &inputs.db_file_candidates,
+        );
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = reservation_artifact_normalize::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+            outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
     } else if fm_id == retained_autocommit_leak::FM_ID {
         // Inspects mcp_agent_mail_db::schema constants; no
         // DispatchInputs field needed for production.
@@ -2264,6 +2287,14 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == reservation_db_archive_parity::FM_ID {
         reservation_db_archive_parity::detect(
+            inputs.storage_root.as_deref(),
+            &inputs.db_file_candidates,
+        )
+        .iter()
+        .map(|f| f.to_finding())
+        .collect()
+    } else if fm_id == reservation_artifact_normalize::FM_ID {
+        reservation_artifact_normalize::detect(
             inputs.storage_root.as_deref(),
             &inputs.db_file_candidates,
         )
