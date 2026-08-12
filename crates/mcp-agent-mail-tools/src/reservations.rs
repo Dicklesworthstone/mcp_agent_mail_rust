@@ -4291,7 +4291,7 @@ mod tests {
         std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
 
         let row = reservation_row(1, 7, "src/**", 9_999, Some(5_000));
-        let artifact = released_reservation_artifact_json("/abs/proj", "GreenCastle", &row);
+        let artifact = released_reservation_artifact_json("/abs/proj", "GreenCastle", &row, None);
         std::fs::write(
             reservation_dir.join("id-1.json"),
             serde_json::to_vec_pretty(&artifact).expect("serialize artifact"),
