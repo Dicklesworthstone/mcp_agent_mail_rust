@@ -2353,6 +2353,20 @@ pub enum DoctorCommand {
         /// Pass this flag only when you have already drained the owner.
         #[arg(long)]
         allow_live_owner: bool,
+        /// Perform a SUPERVISED TAKEOVER of a provably-dead mailbox owner, then
+        /// repair (br-z41ij).
+        ///
+        /// Unlike `--allow-live-owner` (a blunt override for any owner), this
+        /// only acts when `am doctor locks` classifies the owner as
+        /// `reclaimable` — a zombie, or a deleted-executable owner that is
+        /// unresponsive and idle past the threshold. It wins a per-mailbox
+        /// election lock, RE-VERIFIES the owner is still dead, quarantines its
+        /// stale activity-lock files (moved, never deleted), then repairs. It
+        /// NEVER signals or kills `am`. On a live or ambiguous owner it refuses
+        /// (exit 3) and points you at the supervised drain path — use this to
+        /// break the multi-day "wedged owner, nobody can repair" deadlock.
+        #[arg(long)]
+        take_ownership: bool,
     },
     Backups {
         /// Output format: table, json, or toon (default: auto-detect).
@@ -2390,6 +2404,11 @@ pub enum DoctorCommand {
         /// the mailbox; drain it first via `am doctor drain`.
         #[arg(long)]
         allow_live_owner: bool,
+        /// Supervised takeover of a provably-dead mailbox owner, then reconstruct
+        /// (see `am doctor repair --take-ownership`, br-z41ij). Only acts on a
+        /// `reclaimable` owner; never kills `am`.
+        #[arg(long)]
+        take_ownership: bool,
     },
     /// Report the supervised drain/restart protocol for the current mailbox
     /// owner without killing any process (read-only).
@@ -6681,8 +6700,10 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
             mcp_agent_mail_db::CheckKind::Full,
         )
         .ok()?;
-        let details =
-            mcp_agent_mail_db::integrity::extract_check_details(&rows, mcp_agent_mail_db::CheckKind::Full);
+        let details = mcp_agent_mail_db::integrity::extract_check_details(
+            &rows,
+            mcp_agent_mail_db::CheckKind::Full,
+        );
         if mcp_agent_mail_db::integrity::details_indicate_ok(&details) {
             return None;
         }
@@ -6697,9 +6718,10 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
 
     // Never reindex without a byte-exact backup of the current generation.
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let file_name = db_path
-        .file_name()
-        .map_or_else(|| "storage.sqlite3".to_string(), |n| n.to_string_lossy().into_owned());
+    let file_name = db_path.file_name().map_or_else(
+        || "storage.sqlite3".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let backup_path = backup_dir.join(format!("{file_name}.pre-reindex-{timestamp}"));
     if std::fs::create_dir_all(backup_dir).is_err() {
         return None;
@@ -7922,6 +7944,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             backup_dir,
             prune_orphan_recipients,
             allow_live_owner,
+            take_ownership,
         } => handle_doctor_repair(
             project,
             dry_run,
@@ -7929,6 +7952,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             backup_dir,
             prune_orphan_recipients,
             allow_live_owner,
+            take_ownership,
         ),
         DoctorCommand::Backups { format, json } => handle_doctor_backups(format, json),
         DoctorCommand::Restore {
@@ -7941,7 +7965,8 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             yes,
             json,
             allow_live_owner,
-        } => handle_doctor_reconstruct(dry_run, yes, json, allow_live_owner),
+            take_ownership,
+        } => handle_doctor_reconstruct(dry_run, yes, json, allow_live_owner, take_ownership),
         DoctorCommand::Drain { format, json } => handle_doctor_drain(format, json),
         DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
         DoctorCommand::ArchiveVerify { format, json } => handle_doctor_archive_verify(format, json),
@@ -9318,6 +9343,12 @@ enum DoctorLockOwnerClass {
     Live,
     Stale,
     Wedged,
+    /// A wedged owner whose evidence proves it is dead-or-stuck (zombie, or a
+    /// deleted-executable owner that is unresponsive and idle past the
+    /// threshold). Distinct from `Wedged` because a *supervised takeover*
+    /// (`am doctor repair --take-ownership`) may safely quarantine its stale
+    /// locks — see br-z41ij.
+    Reclaimable,
     UnsafeToTouch,
 }
 
@@ -9327,6 +9358,7 @@ impl DoctorLockOwnerClass {
             Self::Live => "live",
             Self::Stale => "stale",
             Self::Wedged => "wedged",
+            Self::Reclaimable => "reclaimable",
             Self::UnsafeToTouch => "unsafe-to-touch",
         }
     }
@@ -9337,6 +9369,12 @@ struct DoctorLockOwnerState {
     class: DoctorLockOwnerClass,
     reason: String,
     safe_next_command: String,
+    /// Per-holder reclaim evidence (br-z41ij). Non-empty only when `class` is
+    /// [`DoctorLockOwnerClass::Reclaimable`]; drives the supervised takeover and
+    /// is surfaced in the JSON report so agents can audit exactly why a takeover
+    /// is permitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reclaimable: Vec<crate::doctor::process_owner::ReclaimableOwnerEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9429,12 +9467,14 @@ fn build_doctor_locks_report_for(
         .into_iter()
         .chain(doctor_lock_waiters(&sqlite_lock))
         .collect::<Vec<_>>();
+    let reclaim_ctx = build_doctor_reclaim_context(&processes, memory_database);
     let owner_state = doctor_locks_owner_state(
         &ownership,
         &storage_root_lock,
         &sqlite_lock,
         &processes,
         &waiters,
+        &reclaim_ctx,
     );
     let recommended_next_action = doctor_locks_recommended_next_action(&owner_state, &waiters);
 
@@ -9561,6 +9601,20 @@ fn render_doctor_locks_report(report: &DoctorLocksReport) {
         report.owner_state.safe_next_command
     );
     ftui_runtime::ftui_println!("  owner_reason: {}", report.owner_state.reason);
+    if !report.owner_state.reclaimable.is_empty() {
+        ftui_runtime::ftui_println!("  reclaimable_owners:");
+        for ev in &report.owner_state.reclaimable {
+            ftui_runtime::ftui_println!(
+                "    pid={} verdict={} zombie={} exe_deleted={} mailbox_responsive={} age={}s",
+                ev.pid,
+                ev.verdict().as_str(),
+                ev.zombie,
+                ev.executable_deleted,
+                ev.mailbox_responsive,
+                ev.age_seconds.unwrap_or(0),
+            );
+        }
+    }
     ftui_runtime::ftui_println!("  detail: {}", report.detail);
     ftui_runtime::ftui_println!(
         "  recommended_next_action: {}",
@@ -9751,12 +9805,121 @@ fn system_time_age_seconds(time: std::time::SystemTime) -> Option<u64> {
     time.elapsed().ok().map(|duration| duration.as_secs())
 }
 
+/// Pure inputs for the reclaimable-owner branch of [`doctor_locks_owner_state`]
+/// (br-z41ij).
+///
+/// Gathered impurely by [`build_doctor_locks_report_for`] (zombie state via
+/// `/proc/<pid>/stat`, mailbox responsiveness via a bounded port connect) and
+/// passed in as plain data so the classifier stays a total function that unit
+/// tests can drive with synthetic evidence.
+#[derive(Debug, Clone)]
+struct DoctorReclaimContext {
+    /// A fresh liveness probe found the mailbox port serving. A responsive owner
+    /// is a working owner — never reclaimable.
+    mailbox_responsive: bool,
+    /// PIDs observed in the zombie/defunct state.
+    zombie_pids: BTreeSet<u32>,
+    /// Idle threshold for the deleted-executable branch.
+    min_idle_seconds: u64,
+}
+
+impl DoctorReclaimContext {
+    /// A context that can never classify anything reclaimable — the safe default
+    /// for unit tests exercising the non-reclaim branches (mailbox "responsive",
+    /// no zombies).
+    #[cfg(test)]
+    fn inert() -> Self {
+        Self {
+            mailbox_responsive: true,
+            zombie_pids: BTreeSet::new(),
+            min_idle_seconds: crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS,
+        }
+    }
+}
+
+/// Gather the impure reclaim evidence for the current host (br-z41ij): which
+/// lock-holding PIDs are zombies, and whether the mailbox's configured HTTP
+/// endpoint still answers a bounded connect probe.
+///
+/// A responsive mailbox pins every candidate to *not*-reclaimable, which is what
+/// protects a healthy in-place-upgraded server (also a deleted-executable owner)
+/// from ever being taken over. An in-memory (test) mailbox is always treated as
+/// responsive so unit fixtures never trip the reclaim path.
+fn build_doctor_reclaim_context(
+    processes: &[DoctorLockProcessReport],
+    memory_database: bool,
+) -> DoctorReclaimContext {
+    let zombie_pids = processes
+        .iter()
+        .map(|process| process.pid)
+        .filter(|&pid| pid_is_zombie_for_doctor_locks(pid))
+        .collect::<BTreeSet<_>>();
+    let mailbox_responsive = if memory_database {
+        true
+    } else {
+        let config = Config::from_env();
+        process_owner_port_reachable(&config.http_host, config.http_port)
+    };
+    DoctorReclaimContext {
+        mailbox_responsive,
+        zombie_pids,
+        min_idle_seconds: crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS,
+    }
+}
+
+/// Build per-holder reclaim evidence for a candidate owner set from the live
+/// process reports plus the impure reclaim context (br-z41ij).
+fn doctor_reclaimable_evidence_for_pids(
+    pids: &[u32],
+    processes: &[DoctorLockProcessReport],
+    ctx: &DoctorReclaimContext,
+) -> Vec<crate::doctor::process_owner::ReclaimableOwnerEvidence> {
+    use crate::doctor::process_owner::ReclaimableOwnerEvidence;
+    pids.iter()
+        .map(|&pid| {
+            let proc = processes.iter().find(|p| p.pid == pid);
+            ReclaimableOwnerEvidence {
+                pid,
+                zombie: ctx.zombie_pids.contains(&pid),
+                executable_deleted: proc.is_some_and(|p| p.executable_deleted),
+                mailbox_responsive: ctx.mailbox_responsive,
+                age_seconds: proc.and_then(|p| p.age_seconds),
+                min_idle_seconds: ctx.min_idle_seconds,
+            }
+        })
+        .collect()
+}
+
+/// A wedged owner returns [`DoctorLockOwnerClass::Reclaimable`] instead of
+/// `Wedged` when — and only when — every candidate holder is provably
+/// dead-or-stuck (br-z41ij). Otherwise the caller's original `Wedged` state is
+/// preserved verbatim, so a merely-unusual-but-live owner keeps refusing.
+fn doctor_locks_wedged_or_reclaimable(
+    candidate_pids: Vec<u32>,
+    processes: &[DoctorLockProcessReport],
+    ctx: &DoctorReclaimContext,
+    wedged: DoctorLockOwnerState,
+) -> DoctorLockOwnerState {
+    let evidence = doctor_reclaimable_evidence_for_pids(&candidate_pids, processes, ctx);
+    if crate::doctor::process_owner::owner_set_is_reclaimable(&evidence) {
+        return doctor_lock_owner_state_reclaimable(
+            format!(
+                "owner is reclaimable-with-evidence — {}; supervised takeover may quarantine its stale locks",
+                wedged.reason
+            ),
+            evidence,
+        );
+    }
+    wedged
+}
+
 fn doctor_locks_owner_state(
     ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
     storage_root_lock: &DoctorLockPathReport,
     sqlite_lock: &DoctorLockPathReport,
     processes: &[DoctorLockProcessReport],
     waiters: &[DoctorLockWaiterReport],
+    reclaim_ctx: &DoctorReclaimContext,
 ) -> DoctorLockOwnerState {
     use mcp_agent_mail_db::pool::MailboxOwnershipDisposition::{
         ActiveOtherOwner, DeletedExecutable, SplitBrain, StaleLiveProcess, Unowned,
@@ -9802,11 +9965,17 @@ fn doctor_locks_owner_state(
         .map(|process| process.pid)
         .collect::<Vec<_>>();
     if !live_without_activity_locks.is_empty() {
-        return doctor_lock_owner_state_value(
+        let wedged = doctor_lock_owner_state_value(
             DoctorLockOwnerClass::Wedged,
             "a live Agent Mail-looking PID owns storage.sqlite3 but no activity lock is visible"
                 .to_string(),
-            doctor_locks_process_inspection_command(live_without_activity_locks),
+            doctor_locks_process_inspection_command(live_without_activity_locks.iter().copied()),
+        );
+        return doctor_locks_wedged_or_reclaimable(
+            live_without_activity_locks,
+            processes,
+            reclaim_ctx,
+            wedged,
         );
     }
 
@@ -9834,17 +10003,33 @@ fn doctor_locks_owner_state(
             "a single live Agent Mail owner is visible with normal ownership evidence".to_string(),
             "am doctor health".to_string(),
         ),
-        StaleLiveProcess => doctor_lock_owner_state_value(
-            DoctorLockOwnerClass::Wedged,
-            "a live Agent Mail-looking process holds mailbox state without expected lock evidence"
-                .to_string(),
-            doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
-        ),
-        DeletedExecutable => doctor_lock_owner_state_value(
-            DoctorLockOwnerClass::Wedged,
-            "a live Agent Mail owner is running from a deleted executable".to_string(),
-            doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
-        ),
+        StaleLiveProcess => {
+            let wedged = doctor_lock_owner_state_value(
+                DoctorLockOwnerClass::Wedged,
+                "a live Agent Mail-looking process holds mailbox state without expected lock evidence"
+                    .to_string(),
+                doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
+            );
+            doctor_locks_wedged_or_reclaimable(
+                ownership.competing_pids.clone(),
+                processes,
+                reclaim_ctx,
+                wedged,
+            )
+        }
+        DeletedExecutable => {
+            let wedged = doctor_lock_owner_state_value(
+                DoctorLockOwnerClass::Wedged,
+                "a live Agent Mail owner is running from a deleted executable".to_string(),
+                doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
+            );
+            doctor_locks_wedged_or_reclaimable(
+                ownership.competing_pids.clone(),
+                processes,
+                reclaim_ctx,
+                wedged,
+            )
+        }
         SplitBrain => doctor_lock_owner_state_value(
             DoctorLockOwnerClass::UnsafeToTouch,
             "multiple Agent Mail owners are visible for the same mailbox".to_string(),
@@ -9862,6 +10047,22 @@ fn doctor_lock_owner_state_value(
         class,
         reason,
         safe_next_command,
+        reclaimable: Vec::new(),
+    }
+}
+
+/// Construct the [`DoctorLockOwnerClass::Reclaimable`] owner state, carrying the
+/// per-holder evidence that justified it (br-z41ij). The safe next command
+/// points at the supervised takeover rather than a plain refusal.
+fn doctor_lock_owner_state_reclaimable(
+    reason: String,
+    reclaimable: Vec<crate::doctor::process_owner::ReclaimableOwnerEvidence>,
+) -> DoctorLockOwnerState {
+    DoctorLockOwnerState {
+        class: DoctorLockOwnerClass::Reclaimable,
+        reason,
+        safe_next_command: "am doctor repair --take-ownership".to_string(),
+        reclaimable,
     }
 }
 
@@ -9904,6 +10105,10 @@ fn doctor_locks_recommended_next_action(
             "{waiter_prefix}Owner class wedged: inspect the reported process and use only a supervisor-managed drain/restart path after operator confirmation; do not terminate `am` directly. Safe next command: `{}`.",
             owner_state.safe_next_command
         ),
+        DoctorLockOwnerClass::Reclaimable => format!(
+            "{waiter_prefix}Owner class reclaimable: the mailbox owner is provably dead-or-wedged (zombie, or a deleted-executable owner that is unresponsive and idle past the threshold). A supervised takeover may quarantine its stale locks and repair — the FIRST agent to run the takeover wins an election lock; the rest see a stale/safe mailbox and proceed or defer. `am` is never killed. Safe next command: `{}`.",
+            owner_state.safe_next_command
+        ),
         DoctorLockOwnerClass::UnsafeToTouch => format!(
             "{waiter_prefix}Owner class unsafe-to-touch: do not run repair, reconstruct, or other mutating doctor work until the ownership evidence is reconciled. Safe next command: `{}`.",
             owner_state.safe_next_command
@@ -9916,10 +10121,14 @@ fn doctor_locks_recommended_next_action(
 /// Whether a mutating doctor op must be refused given the live-owner class.
 ///
 /// Only [`DoctorLockOwnerClass::Stale`] (no live owner visible) is safe to
-/// mutate without a supervised drain. `Live`, `Wedged`, and `UnsafeToTouch` all
-/// indicate a process is (or may be) actively using the mailbox, so repairing
-/// under them risks corruption — they require an explicit operator override
-/// (`--allow-live-owner`) performed *after* a supervised drain.
+/// mutate without a supervised drain. `Live`, `Wedged`, `Reclaimable`, and
+/// `UnsafeToTouch` all indicate a process is (or may be) actively using the
+/// mailbox, so a *plain* `repair`/`reconstruct` still refuses under them. Two
+/// overrides exist: `--allow-live-owner` (a blunt override for *any* class,
+/// used after a manual supervised drain) and, for `Reclaimable` only, the
+/// safer `--take-ownership` (br-z41ij) — which never bypasses this predicate
+/// but instead quarantines the dead owner's stale locks so the mailbox becomes
+/// `Stale` before repair proceeds.
 fn doctor_mutation_blocked_by_owner(class: DoctorLockOwnerClass, allow_live_owner: bool) -> bool {
     if allow_live_owner {
         return false;
@@ -9947,17 +10156,38 @@ fn supervised_drain_protocol_steps(safe_to_mutate: bool) -> Vec<String> {
     ]
 }
 
+/// The supervised-takeover protocol for a `Reclaimable` owner (br-z41ij). Unlike
+/// the generic drain steps, the owner here is provably dead-or-wedged, so the
+/// safe action is the automated takeover rather than asking a human to stop a
+/// process that is already gone.
+fn doctor_reclaimable_takeover_protocol_steps() -> Vec<String> {
+    vec![
+        "The mailbox owner is RECLAIMABLE: it is provably dead-or-wedged (a zombie, or a deleted-executable owner that is unresponsive and idle past the threshold)."
+            .to_string(),
+        "This is the canonical repair-owner election: the FIRST agent to run the takeover wins a per-mailbox election lock and heals; the rest see a stale/safe mailbox and proceed or defer — nobody waits forever."
+            .to_string(),
+        "1. Confirm the evidence: am doctor locks --json  (owner_class == \"reclaimable\").".to_string(),
+        "2. Take over and repair in one step: am doctor repair --take-ownership".to_string(),
+        "   (or `am doctor reconstruct --take-ownership` when no healthy DB remains).".to_string(),
+        "The takeover re-verifies the owner is still dead, quarantines its stale lock files (moved, never deleted), and NEVER signals or kills `am`."
+            .to_string(),
+    ]
+}
+
 /// Refuse a mutating doctor operation (`repair`/`reconstruct`) while a live
 /// mailbox owner is present, unless the operator already drained it
-/// (`--allow-live-owner`). Read-only previews (`dry_run`) are always allowed,
-/// and `--allow-live-owner` short-circuits the (slightly expensive) ownership
-/// scan so the startup self-heal subprocess stays a strict no-op for the guard.
+/// (`--allow-live-owner`) or is performing a supervised takeover of a provably
+/// dead owner (`--take-ownership`, br-z41ij). Read-only previews (`dry_run`) are
+/// always allowed, and `--allow-live-owner` short-circuits the (slightly
+/// expensive) ownership scan so the startup self-heal subprocess stays a strict
+/// no-op for the guard.
 fn enforce_supervised_owner_guard(
     database_url: &str,
     storage_root: &Path,
     op_label: &str,
     dry_run: bool,
     allow_live_owner: bool,
+    take_ownership: bool,
 ) -> CliResult<()> {
     if dry_run || allow_live_owner {
         return Ok(());
@@ -9966,8 +10196,294 @@ fn enforce_supervised_owner_guard(
     if !doctor_mutation_blocked_by_owner(report.owner_state.class, allow_live_owner) {
         return Ok(());
     }
+    if take_ownership {
+        return perform_supervised_takeover(database_url, storage_root, op_label, &report);
+    }
     emit_supervised_owner_refusal(op_label, &report);
     Err(CliError::ExitCode(3))
+}
+
+/// The outcome of a supervised takeover: which stale lock files were quarantined
+/// and where the witness/backups landed. Serialized into the witness JSON and
+/// echoed to stderr so an agent (or `am doctor undo`-style forensics) can audit
+/// exactly what moved (br-z41ij).
+#[derive(Debug, Clone, Serialize)]
+struct SupervisedTakeoverOutcome {
+    schema_version: &'static str,
+    op: String,
+    performed_at: String,
+    storage_root: String,
+    database_path: String,
+    reclaimed_pids: Vec<u32>,
+    reclaim_evidence: Vec<crate::doctor::process_owner::ReclaimableOwnerEvidence>,
+    quarantine_dir: String,
+    quarantined_locks: Vec<SupervisedTakeoverMovedLock>,
+    witness_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SupervisedTakeoverMovedLock {
+    name: &'static str,
+    from: String,
+    to: String,
+    holder_pids: Vec<u32>,
+}
+
+/// Perform a supervised takeover of a `Reclaimable` mailbox owner (br-z41ij).
+///
+/// This is the automated D4 drain/verify dance the bead asks for: instead of
+/// exit-3-and-give-up, it (1) wins a per-storage-root election lock so N agents
+/// don't race, (2) *re-verifies* the owner is still reclaimable against a fresh
+/// scan, (3) quarantines the dead owner's stale activity-lock files (rename into
+/// a timestamped `doctor/reclaimed-locks/` dir — nothing is ever deleted, per
+/// RULE 1), and (4) writes a witness record. It NEVER signals or kills the
+/// owner; a genuinely-dead flock is left attached to the renamed inode and the
+/// repair that follows acquires a fresh lock. If the class is not `Reclaimable`,
+/// `--take-ownership` is refused — it is not a blunt override.
+fn perform_supervised_takeover(
+    database_url: &str,
+    storage_root: &Path,
+    op_label: &str,
+    report: &DoctorLocksReport,
+) -> CliResult<()> {
+    if report.owner_state.class != DoctorLockOwnerClass::Reclaimable {
+        emit_takeover_not_reclaimable_refusal(op_label, report);
+        return Err(CliError::ExitCode(3));
+    }
+
+    // (1) Canonical repair-owner election: exactly one agent may perform the
+    // rotate step at a time. Losers get a clear "another agent is reclaiming"
+    // refusal and defer — after the winner rotates, the mailbox reads Stale, so
+    // the deferring agents' next attempt simply proceeds.
+    let Some(_election) = acquire_reclaim_election_lock(storage_root)? else {
+        emit_takeover_election_busy_refusal(op_label, report);
+        return Err(CliError::ExitCode(3));
+    };
+
+    // (2) Re-verify against a fresh scan: reclaimability evidence (responsiveness,
+    // zombie state, age) can change between the guard's read and now. Never
+    // reclaim on stale evidence.
+    let fresh = build_doctor_locks_report_for(database_url, storage_root)?;
+    match fresh.owner_state.class {
+        DoctorLockOwnerClass::Reclaimable => {}
+        // The owner recovered / drained while we waited for the election lock:
+        // if it is now Stale, repair is already safe — let the caller proceed.
+        DoctorLockOwnerClass::Stale => return Ok(()),
+        _ => {
+            emit_takeover_reverify_changed_refusal(op_label, &fresh);
+            return Err(CliError::ExitCode(3));
+        }
+    }
+
+    // (3) Quarantine the dead owner's stale lock files (rename, never delete).
+    let outcome = quarantine_reclaimable_owner_locks(op_label, storage_root, &fresh)?;
+    emit_takeover_success(&outcome);
+    Ok(())
+}
+
+/// Acquire the per-storage-root reclaim election lock. Returns `Ok(None)` when
+/// another agent already holds it (the loser path). The guard is released when
+/// dropped; the rotate step it protects is brief, and the fresh activity lock
+/// the subsequent repair acquires is the durable serializer for the repair
+/// itself.
+fn acquire_reclaim_election_lock(storage_root: &Path) -> CliResult<Option<ReclaimElectionGuard>> {
+    use fs2::FileExt;
+    let dir = storage_root.join("doctor");
+    std::fs::create_dir_all(&dir)?;
+    let lock_path = dir.join("reclaim.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ReclaimElectionGuard { file })),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) if mcp_agent_mail_db::is_lock_error(&err.to_string()) => Ok(None),
+        Err(err) => Err(CliError::Io(err)),
+    }
+}
+
+/// RAII holder for the reclaim election flock (br-z41ij).
+struct ReclaimElectionGuard {
+    file: std::fs::File,
+}
+
+impl Drop for ReclaimElectionGuard {
+    fn drop(&mut self) {
+        use fs2::FileExt;
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// Move the reclaimable owner's stale activity-lock files into a timestamped
+/// quarantine directory and write a witness record. A lock file is only moved
+/// when every one of its holder PIDs is in the reclaimable set (or it has no
+/// live holder); if any lock is held by a PID we did NOT judge reclaimable, the
+/// takeover aborts rather than steal it (defense in depth over the re-verify).
+fn quarantine_reclaimable_owner_locks(
+    op_label: &str,
+    storage_root: &Path,
+    report: &DoctorLocksReport,
+) -> CliResult<SupervisedTakeoverOutcome> {
+    let reclaimable_pids = report
+        .owner_state
+        .reclaimable
+        .iter()
+        .map(|ev| ev.pid)
+        .collect::<BTreeSet<_>>();
+
+    let ts = Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let quarantine_dir = storage_root
+        .join("doctor")
+        .join("reclaimed-locks")
+        .join(&ts);
+    std::fs::create_dir_all(&quarantine_dir)?;
+
+    let mut moved = Vec::new();
+    for lock in [&report.storage_root_lock, &report.sqlite_lock] {
+        if !lock.exists || lock.file_type != "file" {
+            continue;
+        }
+        // Safety: never move a lock a non-reclaimable process holds.
+        if lock
+            .holder_pids
+            .iter()
+            .any(|pid| !reclaimable_pids.contains(pid))
+        {
+            emit_takeover_holder_not_reclaimable_refusal(op_label, lock, &reclaimable_pids);
+            return Err(CliError::ExitCode(3));
+        }
+        let from = PathBuf::from(&lock.path);
+        let file_name = from
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(lock.name));
+        let to = quarantine_dir.join(&file_name);
+        std::fs::rename(&from, &to)?;
+        moved.push(SupervisedTakeoverMovedLock {
+            name: lock.name,
+            from: lock.path.clone(),
+            to: to.display().to_string(),
+            holder_pids: lock.holder_pids.clone(),
+        });
+    }
+
+    let witness_path = quarantine_dir.join("takeover.json");
+    let outcome = SupervisedTakeoverOutcome {
+        schema_version: "doctor_takeover.v1",
+        op: op_label.to_string(),
+        performed_at: ts,
+        storage_root: storage_root.display().to_string(),
+        database_path: report.database_path.clone(),
+        reclaimed_pids: reclaimable_pids.into_iter().collect(),
+        reclaim_evidence: report.owner_state.reclaimable.clone(),
+        quarantine_dir: quarantine_dir.display().to_string(),
+        quarantined_locks: moved,
+        witness_path: witness_path.display().to_string(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&outcome) {
+        let _ = std::fs::write(&witness_path, json);
+    }
+    Ok(outcome)
+}
+
+fn emit_takeover_success(outcome: &SupervisedTakeoverOutcome) {
+    let mut lines = vec![
+        format!(
+            "Supervised takeover: reclaimed a dead mailbox owner before `am doctor {}`.",
+            outcome.op
+        ),
+        "classification: supervised-takeover-performed".to_string(),
+        format!("reclaimed_pids: {:?}", outcome.reclaimed_pids),
+        format!("quarantined_locks: {}", outcome.quarantined_locks.len()),
+        format!("quarantine_dir: {}", outcome.quarantine_dir),
+        format!("witness: {}", outcome.witness_path),
+        "note: no process was signalled or killed; stale locks were moved (not deleted)."
+            .to_string(),
+    ];
+    if outcome.quarantined_locks.is_empty() {
+        lines.push(
+            "note: no lock files needed moving (holder already released them); proceeding."
+                .to_string(),
+        );
+    }
+    ftui_runtime::ftui_eprintln!("{}", lines.join("\n"));
+}
+
+fn emit_takeover_not_reclaimable_refusal(op_label: &str, report: &DoctorLocksReport) {
+    let lines = vec![
+        format!(
+            "Error: refusing `am doctor {op_label} --take-ownership` — the mailbox owner is not reclaimable."
+        ),
+        String::new(),
+        "classification: takeover-owner-not-reclaimable".to_string(),
+        format!("owner_class: {}", report.owner_state.class.as_str()),
+        format!("reason: {}", report.owner_state.reason),
+        "exit_code: 3".to_string(),
+        "retry_policy: do-not-retry-unchanged".to_string(),
+        String::new(),
+        "`--take-ownership` only reclaims a PROVABLY dead owner (a zombie, or a".to_string(),
+        "deleted-executable owner that is unresponsive and idle past the threshold).".to_string(),
+        "A live or ambiguously-owned mailbox must be drained via your supervisor:".to_string(),
+        format!("next_action: {}", report.recommended_next_action),
+    ];
+    ftui_runtime::ftui_eprintln!("{}", lines.join("\n"));
+}
+
+fn emit_takeover_election_busy_refusal(op_label: &str, report: &DoctorLocksReport) {
+    let lines = vec![
+        format!(
+            "Notice: another agent is already performing a supervised takeover of this mailbox; `am doctor {op_label} --take-ownership` is deferring."
+        ),
+        "classification: takeover-election-busy".to_string(),
+        format!("owner_class: {}", report.owner_state.class.as_str()),
+        "exit_code: 3".to_string(),
+        "retry_policy: retry-after-owner-becomes-stale".to_string(),
+        "next_action: wait a moment, then re-run `am doctor locks --json`; once the owner reads `stale`, repair is safe."
+            .to_string(),
+    ];
+    ftui_runtime::ftui_eprintln!("{}", lines.join("\n"));
+}
+
+fn emit_takeover_reverify_changed_refusal(op_label: &str, report: &DoctorLocksReport) {
+    let lines = vec![
+        format!(
+            "Error: refusing `am doctor {op_label} --take-ownership` — the owner is no longer reclaimable on re-verify."
+        ),
+        "classification: takeover-reverify-changed".to_string(),
+        format!("owner_class: {}", report.owner_state.class.as_str()),
+        format!("reason: {}", report.owner_state.reason),
+        "exit_code: 3".to_string(),
+        "retry_policy: do-not-retry-unchanged".to_string(),
+        format!("next_action: {}", report.recommended_next_action),
+    ];
+    ftui_runtime::ftui_eprintln!("{}", lines.join("\n"));
+}
+
+fn emit_takeover_holder_not_reclaimable_refusal(
+    op_label: &str,
+    lock: &DoctorLockPathReport,
+    reclaimable_pids: &BTreeSet<u32>,
+) {
+    let lines = vec![
+        format!(
+            "Error: refusing `am doctor {op_label} --take-ownership` — {} activity lock is held by a PID not judged reclaimable.",
+            lock.name
+        ),
+        "classification: takeover-holder-not-reclaimable".to_string(),
+        format!("lock_path: {}", lock.path),
+        format!("lock_holder_pids: {:?}", lock.holder_pids),
+        format!(
+            "reclaimable_pids: {:?}",
+            reclaimable_pids.iter().copied().collect::<Vec<_>>()
+        ),
+        "exit_code: 3".to_string(),
+        "next_action: inspect the extra holder with `am doctor locks --json`; do not force a takeover."
+            .to_string(),
+    ];
+    ftui_runtime::ftui_eprintln!("{}", lines.join("\n"));
 }
 
 /// Print the structured supervised-owner refusal to stderr (machine-greppable
@@ -10028,6 +10544,14 @@ fn handle_doctor_drain(format: Option<output::CliOutputFormat>, json: bool) -> C
     let config = Config::from_env();
     let locks = build_doctor_locks_report_with_config(&config)?;
     let safe_to_mutate = !doctor_mutation_blocked_by_owner(locks.owner_state.class, false);
+    // A reclaimable owner is not "safe to mutate" without a takeover, but the
+    // right next step is the supervised takeover, not a manual supervisor drain
+    // (br-z41ij).
+    let supervised_protocol = if locks.owner_state.class == DoctorLockOwnerClass::Reclaimable {
+        doctor_reclaimable_takeover_protocol_steps()
+    } else {
+        supervised_drain_protocol_steps(safe_to_mutate)
+    };
     let report = DoctorDrainReport {
         schema_version: "doctor_drain.v1",
         owner_class: locks.owner_state.class.as_str(),
@@ -10042,7 +10566,7 @@ fn handle_doctor_drain(format: Option<output::CliOutputFormat>, json: bool) -> C
         detail: locks.detail.clone(),
         recommended_next_action: locks.recommended_next_action.clone(),
         safe_next_command: locks.owner_state.safe_next_command.clone(),
-        supervised_protocol: supervised_drain_protocol_steps(safe_to_mutate),
+        supervised_protocol,
         read_only: true,
     };
     output::emit_output(&report, fmt, || render_doctor_drain_report(&report));
@@ -10234,6 +10758,33 @@ fn parse_proc_stat_start_ticks_for_doctor_locks(stat: &str) -> Option<u64> {
     // Fields after `comm` begin at field 3 (`state`), so starttime (field 22)
     // is offset 19 in this tail segment.
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Parse the process state character (field 3, immediately after `comm`) out of
+/// a `/proc/<pid>/stat` line. `comm` can itself contain spaces and parentheses,
+/// so we anchor on the final `)` exactly like the start-ticks parser (br-z41ij).
+#[cfg(any(test, target_os = "linux"))]
+fn parse_proc_stat_state_for_doctor_locks(stat: &str) -> Option<char> {
+    let close_paren = stat.rfind(')')?;
+    let rest = stat.get(close_paren + 2..)?;
+    rest.split_whitespace().next()?.chars().next()
+}
+
+/// Whether `pid` is a zombie/defunct process (`/proc/<pid>/stat` state `Z`). A
+/// zombie has already had every fd closed and every lock released by the kernel,
+/// so any mailbox lock file naming it is a stale artifact safe to reclaim
+/// (br-z41ij). Best-effort: any read/parse failure returns `false`.
+#[cfg(target_os = "linux")]
+fn pid_is_zombie_for_doctor_locks(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_proc_stat_state_for_doctor_locks(&stat))
+        == Some('Z')
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_is_zombie_for_doctor_locks(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -15478,14 +16029,38 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
         return handle_file_reservations_with_conn(&conn, action);
     }
 
-    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
+    let read_attestation = robot::reservation_read_attestation(&config);
     let opened = open_db_sync_canonical_read_with_database_url(
-        &cfg.database_url,
+        &config.database_url,
         Some(&config.storage_root),
         "file reservations",
     )?;
-    handle_file_reservations_with_conn(opened.conn(), action)
+    let result = handle_file_reservations_with_conn(opened.conn(), action);
+    if result.is_ok() {
+        emit_cli_reservation_read_attestation(&read_attestation);
+    }
+    result
+}
+
+/// Make the provenance of a direct CLI reservation read explicit. A readable
+/// SQLite file is not enough to call the result current when a reachable MCP
+/// server advertises another mailbox pair.
+fn emit_cli_reservation_read_attestation(attestation: &robot::ReservationReadAttestation) {
+    let next = attestation
+        .action
+        .as_deref()
+        .map(|action| format!("; next: {action}"))
+        .unwrap_or_default();
+    ftui_runtime::ftui_println!(
+        "reservation_read_attestation: state={} source={} database_matches_server={:?} storage_root_matches_server={:?}; {}{}",
+        attestation.state,
+        attestation.source,
+        attestation.database_matches_server,
+        attestation.storage_root_matches_server,
+        attestation.detail,
+        next,
+    );
 }
 
 /// Attempt a mutating `file_reservations` verb (reserve / renew / release)
@@ -25123,6 +25698,12 @@ fn doctor_database_next_action(strategy: &DoctorDatabaseFixStrategy) -> String {
 
 /// Pure composition of the supervised-owner unblock hint for a blocked class.
 fn doctor_owner_unblock_prefix(class: DoctorLockOwnerClass) -> String {
+    // br-z41ij: a reclaimable owner is provably dead-or-wedged — the unblock
+    // path is the automated supervised takeover, not asking a human to stop a
+    // process that is already gone.
+    if class == DoctorLockOwnerClass::Reclaimable {
+        return "The mailbox owner (class reclaimable) is provably dead-or-wedged: run `am doctor repair --take-ownership` (or `reconstruct --take-ownership`) to quarantine its stale locks and heal — the first agent to run it wins the election and the rest see a safe mailbox. `am` is never killed.".to_string();
+    }
     format!(
         "A live mailbox owner (class {}) will refuse `am doctor repair`/`reconstruct`: gracefully stop it via your supervisor (`am service restart`, or `systemctl --user stop` the agent-mail service — never a hard kill), then confirm `am doctor drain` reports safe_to_mutate=true.",
         class.as_str()
@@ -47193,6 +47774,7 @@ http_headers = { Authorization = "Bearer secret" }
                         backup_dir,
                         prune_orphan_recipients,
                         allow_live_owner,
+                        take_ownership,
                     },
             } => {
                 assert!(project.is_none());
@@ -47206,6 +47788,10 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(
                     !allow_live_owner,
                     "--allow-live-owner must default off (supervised-owner guard armed)"
+                );
+                assert!(
+                    !take_ownership,
+                    "--take-ownership must default off (supervised takeover is opt-in)"
                 );
             }
             _ => panic!("expected Doctor Repair"),
@@ -47225,6 +47811,7 @@ http_headers = { Authorization = "Bearer secret" }
             "/tmp/bak",
             "--prune-orphan-recipients",
             "--allow-live-owner",
+            "--take-ownership",
         ])
         .unwrap();
         match cli.command.expect("expected command") {
@@ -47237,6 +47824,7 @@ http_headers = { Authorization = "Bearer secret" }
                         backup_dir,
                         prune_orphan_recipients,
                         allow_live_owner,
+                        take_ownership,
                     },
             } => {
                 assert_eq!(project.as_deref(), Some("proj"));
@@ -47245,6 +47833,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert_eq!(backup_dir.unwrap(), PathBuf::from("/tmp/bak"));
                 assert!(prune_orphan_recipients);
                 assert!(allow_live_owner);
+                assert!(take_ownership);
             }
             _ => panic!("expected Doctor Repair"),
         }
@@ -47337,6 +47926,7 @@ http_headers = { Authorization = "Bearer secret" }
                         yes,
                         json,
                         allow_live_owner,
+                        take_ownership,
                     },
             } => {
                 assert!(!dry_run);
@@ -47345,6 +47935,10 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(
                     !allow_live_owner,
                     "--allow-live-owner must default off for reconstruct"
+                );
+                assert!(
+                    !take_ownership,
+                    "--take-ownership must default off for reconstruct"
                 );
             }
             _ => panic!("expected Doctor Reconstruct"),
@@ -47361,6 +47955,7 @@ http_headers = { Authorization = "Bearer secret" }
             "-y",
             "--json",
             "--allow-live-owner",
+            "--take-ownership",
         ])
         .unwrap();
         match cli.command.unwrap() {
@@ -47371,12 +47966,14 @@ http_headers = { Authorization = "Bearer secret" }
                         yes,
                         json,
                         allow_live_owner,
+                        take_ownership,
                     },
             } => {
                 assert!(dry_run);
                 assert!(yes);
                 assert!(json);
                 assert!(allow_live_owner);
+                assert!(take_ownership);
             }
             _ => panic!("expected Doctor Reconstruct"),
         }
@@ -47669,8 +48266,14 @@ http_headers = { Authorization = "Bearer secret" }
         let sqlite_lock = doctor_locks_test_lock("sqlite", true, vec![7]);
         let processes = vec![doctor_locks_test_process(7, true, true, true)];
 
-        let state =
-            doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &processes, &[]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &[],
+            &DoctorReclaimContext::inert(),
+        );
 
         assert_eq!(state.class, DoctorLockOwnerClass::Live);
         assert_eq!(state.safe_next_command, "am doctor health");
@@ -47685,7 +48288,14 @@ http_headers = { Authorization = "Bearer secret" }
         let storage_lock = doctor_locks_test_lock("storage_root", true, Vec::new());
         let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
 
-        let state = doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &[], &[]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &[],
+            &[],
+            &DoctorReclaimContext::inert(),
+        );
 
         assert_eq!(state.class, DoctorLockOwnerClass::Stale);
         assert_eq!(state.safe_next_command, "am doctor --dry-run --fix");
@@ -47702,8 +48312,14 @@ http_headers = { Authorization = "Bearer secret" }
         let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
         let processes = vec![doctor_locks_test_process(17, false, false, true)];
 
-        let state =
-            doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &processes, &[]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &[],
+            &DoctorReclaimContext::inert(),
+        );
         let action = doctor_locks_recommended_next_action(&state, &[]);
 
         assert_eq!(state.class, DoctorLockOwnerClass::Wedged);
@@ -47729,14 +48345,306 @@ http_headers = { Authorization = "Bearer secret" }
             doctor_locks_test_process(23, true, false, true),
         ];
 
-        let state =
-            doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &processes, &[]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &[],
+            &DoctorReclaimContext::inert(),
+        );
 
         assert_eq!(state.class, DoctorLockOwnerClass::UnsafeToTouch);
         assert_eq!(
             state.safe_next_command,
             "ps -p 17,23 -o pid,ppid,stat,lstart,cmd"
         );
+    }
+
+    // ─── br-z41ij: reclaimable-owner classification + supervised takeover ────
+
+    fn doctor_locks_reclaim_ctx(
+        mailbox_responsive: bool,
+        zombie_pids: &[u32],
+    ) -> DoctorReclaimContext {
+        DoctorReclaimContext {
+            mailbox_responsive,
+            zombie_pids: zombie_pids.iter().copied().collect(),
+            min_idle_seconds: crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS,
+        }
+    }
+
+    fn doctor_locks_wedged_deleted_process(pid: u32) -> DoctorLockProcessReport {
+        let mut process = doctor_locks_test_process(pid, true, false, true);
+        process.executable_deleted = true;
+        process.executable_path = Some("/usr/bin/am (deleted)".to_string());
+        process.age_seconds =
+            Some(crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS + 120);
+        process
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_reclaims_dead_deleted_executable_owner() {
+        // The fleet's actual corruption epoch: a live PID running a DELETED
+        // binary that still holds the exclusive lock, mailbox unresponsive,
+        // idle for days. This must classify as `Reclaimable`, not a bare
+        // `Wedged` that refuses forever.
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::DeletedExecutable,
+            vec![4242],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![4242]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        let processes = vec![doctor_locks_wedged_deleted_process(4242)];
+
+        let ctx = doctor_locks_reclaim_ctx(false, &[]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &[],
+            &ctx,
+        );
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Reclaimable);
+        assert_eq!(state.safe_next_command, "am doctor repair --take-ownership");
+        assert_eq!(state.reclaimable.len(), 1);
+        assert_eq!(state.reclaimable[0].pid, 4242);
+        assert!(state.reason.contains("reclaimable-with-evidence"));
+
+        let action = doctor_locks_recommended_next_action(&state, &[]);
+        assert!(action.contains("Owner class reclaimable"));
+        assert!(action.contains("--take-ownership"));
+        assert!(!action.to_lowercase().contains("kill"));
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_responsive_deleted_executable_stays_wedged() {
+        // The healthy in-place-upgraded server: same deleted-executable owner,
+        // but the mailbox still answers its port. Must remain `Wedged` (refuse)
+        // — never reclaim a working server.
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::DeletedExecutable,
+            vec![4242],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![4242]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        let processes = vec![doctor_locks_wedged_deleted_process(4242)];
+
+        let ctx = doctor_locks_reclaim_ctx(true, &[]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &[],
+            &ctx,
+        );
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Wedged);
+        assert!(state.reclaimable.is_empty());
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_reclaims_zombie_holder() {
+        // A zombie holder surfaced via the live-without-activity-locks branch:
+        // even without a deleted executable it is reclaimable because a zombie
+        // holds nothing.
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            vec![909],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", false, Vec::new());
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        // holds db file, no activity locks → live_without_activity_locks branch.
+        let processes = vec![doctor_locks_test_process(909, false, false, true)];
+
+        let ctx = doctor_locks_reclaim_ctx(false, &[909]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &[],
+            &ctx,
+        );
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Reclaimable);
+        assert_eq!(state.reclaimable.len(), 1);
+        assert!(state.reclaimable[0].zombie);
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_waiters_beat_reclaim() {
+        // A live waiter contending for the lock keeps the mailbox unsafe-to-touch
+        // even if the holder looks reclaimable — someone else is actively racing.
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::DeletedExecutable,
+            vec![4242],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![4242]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        let processes = vec![doctor_locks_wedged_deleted_process(4242)];
+        let waiters = vec![DoctorLockWaiterReport {
+            pid: 5555,
+            lock_name: "storage_root",
+            mode: "exclusive".to_string(),
+            command: Some("am serve-http".to_string()),
+            executable_path: None,
+            age_seconds: Some(3),
+        }];
+
+        let ctx = doctor_locks_reclaim_ctx(false, &[]);
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &waiters,
+            &ctx,
+        );
+
+        assert_eq!(state.class, DoctorLockOwnerClass::UnsafeToTouch);
+    }
+
+    #[test]
+    fn parse_proc_stat_state_handles_comm_with_spaces_and_parens() {
+        // `comm` can contain spaces and parentheses; state is the token right
+        // after the FINAL ')'.
+        assert_eq!(
+            parse_proc_stat_state_for_doctor_locks("1234 (weird )(name) Z 1 1 0"),
+            Some('Z')
+        );
+        assert_eq!(
+            parse_proc_stat_state_for_doctor_locks("42 (mcp-agent-mail) S 1 42 42"),
+            Some('S')
+        );
+        assert_eq!(parse_proc_stat_state_for_doctor_locks("garbage"), None);
+    }
+
+    #[test]
+    fn quarantine_reclaimable_owner_locks_moves_stale_locks_and_writes_witness() {
+        use crate::doctor::process_owner::ReclaimableOwnerEvidence;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path();
+        let storage_lock_path = storage_root.join(".mailbox.activity.lock");
+        let sqlite_lock_path = storage_root.join("storage.sqlite3.activity.lock");
+        std::fs::write(&storage_lock_path, b"stale").expect("write storage lock");
+        std::fs::write(&sqlite_lock_path, b"stale").expect("write sqlite lock");
+
+        let report = doctor_locks_test_report_for_takeover(
+            storage_root,
+            &storage_lock_path,
+            &sqlite_lock_path,
+            vec![4242],
+            vec![ReclaimableOwnerEvidence {
+                pid: 4242,
+                zombie: false,
+                executable_deleted: true,
+                mailbox_responsive: false,
+                age_seconds: Some(
+                    crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS + 60,
+                ),
+                min_idle_seconds: crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS,
+            }],
+        );
+
+        let outcome = quarantine_reclaimable_owner_locks("repair", storage_root, &report)
+            .expect("takeover should succeed");
+
+        assert_eq!(outcome.quarantined_locks.len(), 2, "both locks moved");
+        assert!(!storage_lock_path.exists(), "storage lock moved away");
+        assert!(!sqlite_lock_path.exists(), "sqlite lock moved away");
+        assert!(
+            PathBuf::from(&outcome.witness_path).exists(),
+            "witness written"
+        );
+        // Nothing deleted — the moved files still exist under quarantine.
+        for moved in &outcome.quarantined_locks {
+            assert!(PathBuf::from(&moved.to).exists(), "quarantined copy exists");
+        }
+    }
+
+    #[test]
+    fn quarantine_reclaimable_owner_locks_refuses_foreign_holder() {
+        use crate::doctor::process_owner::ReclaimableOwnerEvidence;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path();
+        let storage_lock_path = storage_root.join(".mailbox.activity.lock");
+        let sqlite_lock_path = storage_root.join("storage.sqlite3.activity.lock");
+        std::fs::write(&storage_lock_path, b"stale").expect("write storage lock");
+        std::fs::write(&sqlite_lock_path, b"stale").expect("write sqlite lock");
+
+        // storage lock is held by PID 9999 which is NOT in the reclaimable set.
+        let mut report = doctor_locks_test_report_for_takeover(
+            storage_root,
+            &storage_lock_path,
+            &sqlite_lock_path,
+            vec![4242],
+            vec![ReclaimableOwnerEvidence {
+                pid: 4242,
+                zombie: false,
+                executable_deleted: true,
+                mailbox_responsive: false,
+                age_seconds: Some(
+                    crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS + 60,
+                ),
+                min_idle_seconds: crate::doctor::process_owner::RECLAIMABLE_OWNER_MIN_IDLE_SECS,
+            }],
+        );
+        report.storage_root_lock.holder_pids = vec![9999];
+
+        let result = quarantine_reclaimable_owner_locks("repair", storage_root, &report);
+        assert!(matches!(result, Err(CliError::ExitCode(3))));
+        // The (unsafe) storage lock must NOT have been moved.
+        assert!(
+            storage_lock_path.exists(),
+            "lock held by a foreign PID must not be quarantined"
+        );
+    }
+
+    fn doctor_locks_test_report_for_takeover(
+        storage_root: &Path,
+        storage_lock_path: &Path,
+        sqlite_lock_path: &Path,
+        reclaimable_pids: Vec<u32>,
+        reclaimable: Vec<crate::doctor::process_owner::ReclaimableOwnerEvidence>,
+    ) -> DoctorLocksReport {
+        let mk_lock = |name: &'static str, path: &Path, holders: Vec<u32>| DoctorLockPathReport {
+            name,
+            path: path.display().to_string(),
+            exists: true,
+            file_type: "file".to_string(),
+            age_seconds: Some(600),
+            mode: Some("exclusive".to_string()),
+            holder_pids: holders,
+            waiter_pids: Vec::new(),
+            proc_records: Vec::new(),
+        };
+        DoctorLocksReport {
+            schema_version: "doctor_locks.v1",
+            inspected_at: "2026-08-12T00:00:00Z".to_string(),
+            storage_root: storage_root.display().to_string(),
+            database_path: storage_root.join("storage.sqlite3").display().to_string(),
+            memory_database: false,
+            disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition::DeletedExecutable,
+            owner_state: doctor_lock_owner_state_reclaimable(
+                "test reclaimable".to_string(),
+                reclaimable,
+            ),
+            detail: "test".to_string(),
+            supervised_restart_required: true,
+            storage_root_lock: mk_lock("storage_root", storage_lock_path, reclaimable_pids.clone()),
+            sqlite_lock: mk_lock("sqlite", sqlite_lock_path, reclaimable_pids),
+            sidecars: Vec::new(),
+            processes: Vec::new(),
+            waiters: Vec::new(),
+            recommended_next_action: "am doctor repair --take-ownership".to_string(),
+            read_only: true,
+        }
     }
 
     // ─── br-bvq1x.4.4 (D4): supervised-owner guard ──────────────────────────
@@ -47794,6 +48702,7 @@ http_headers = { Authorization = "Bearer secret" }
         for class in [
             DoctorLockOwnerClass::Live,
             DoctorLockOwnerClass::Wedged,
+            DoctorLockOwnerClass::Reclaimable,
             DoctorLockOwnerClass::UnsafeToTouch,
             DoctorLockOwnerClass::Stale,
         ] {
@@ -47812,12 +48721,20 @@ http_headers = { Authorization = "Bearer secret" }
         let bogus_db = "sqlite:///__definitely__/missing__/db.sqlite3";
         let storage = std::path::Path::new("/__definitely__/missing__");
         assert!(
-            enforce_supervised_owner_guard(bogus_db, storage, "repair", true, false).is_ok(),
+            enforce_supervised_owner_guard(bogus_db, storage, "repair", true, false, false).is_ok(),
             "dry_run must bypass the ownership scan"
         );
         assert!(
-            enforce_supervised_owner_guard(bogus_db, storage, "repair", false, true).is_ok(),
+            enforce_supervised_owner_guard(bogus_db, storage, "repair", false, true, false).is_ok(),
             "--allow-live-owner must bypass the ownership scan"
+        );
+        // --take-ownership must NOT bypass the scan (it needs the report to
+        // decide reclaimability); with an unresolvable DB the scan errors, which
+        // is the correct not-Ok outcome here.
+        assert!(
+            enforce_supervised_owner_guard(bogus_db, storage, "repair", false, false, true)
+                .is_err(),
+            "--take-ownership must still perform the ownership scan"
         );
     }
 
@@ -47881,6 +48798,7 @@ http_headers = { Authorization = "Bearer secret" }
             &sqlite_lock,
             &processes,
             &waiters,
+            &DoctorReclaimContext::inert(),
         );
         let action = doctor_locks_recommended_next_action(&owner_state, &waiters);
 
@@ -50365,7 +51283,10 @@ startup_timeout_sec = 42
                     .unwrap_or(0)
             })
             .sum();
-        assert_eq!(staged, 2, "both stale artifacts must be staged, not deleted");
+        assert_eq!(
+            staged, 2,
+            "both stale artifacts must be staged, not deleted"
+        );
     }
 
     #[test]
@@ -52558,7 +53479,17 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", db_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_repair(None, false, true, Some(backup_dir.clone()), false, true),
+            || {
+                handle_doctor_repair(
+                    None,
+                    false,
+                    true,
+                    Some(backup_dir.clone()),
+                    false,
+                    true,
+                    false,
+                )
+            },
         );
         assert!(
             result.is_ok(),
@@ -52964,7 +53895,7 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_reconstruct(true, true, false, true),
+            || handle_doctor_reconstruct(true, true, false, true, false),
         );
         let output = capture.drain_to_string();
 
@@ -69799,18 +70730,22 @@ fn handle_doctor_repair(
     backup_dir: Option<PathBuf>,
     prune_orphan_recipients: bool,
     allow_live_owner: bool,
+    take_ownership: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let database_url = &cfg.database_url;
     // br-bvq1x.4.4 (D4): refuse mutating repair while a live owner holds the
     // mailbox unless the operator drained it first (or passed --allow-live-owner).
+    // br-z41ij: --take-ownership performs a supervised takeover of a provably
+    // dead owner instead of refusing forever.
     enforce_supervised_owner_guard(
         database_url,
         &config.storage_root,
         "repair",
         dry_run,
         allow_live_owner,
+        take_ownership,
     )?;
     let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
     handle_doctor_repair_with_options(
@@ -70781,17 +71716,20 @@ fn handle_doctor_reconstruct(
     yes: bool,
     json: bool,
     allow_live_owner: bool,
+    take_ownership: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     // br-bvq1x.4.4 (D4): reconstruct replaces the live DB; refuse while a live
-    // owner is present unless the operator drained it first.
+    // owner is present unless the operator drained it first. br-z41ij:
+    // --take-ownership reclaims a provably dead owner instead of refusing.
     enforce_supervised_owner_guard(
         &cfg.database_url,
         &config.storage_root,
         "reconstruct",
         dry_run,
         allow_live_owner,
+        take_ownership,
     )?;
     handle_doctor_reconstruct_locked(&cfg.database_url, &config.storage_root, dry_run, yes, json)
 }

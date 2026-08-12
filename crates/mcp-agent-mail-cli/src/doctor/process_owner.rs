@@ -456,6 +456,146 @@ pub fn classify_service_manager_divergences(
     out
 }
 
+// ─── br-z41ij: reclaimable-owner classification for supervised takeover ───────
+//
+// ## The corruption-epoch deadlock this breaks
+//
+// When a mailbox owner PID wedges — most acutely a live process running a
+// *deleted* executable that keeps holding the exclusive activity lock — the
+// existing supervised-owner guard (br-bvq1x.4.4 / D4) correctly refuses every
+// mutating doctor verb (`repair`/`reconstruct` exit 3). That refusal is the
+// right default: repairing under a live writer risks interleaving. But when the
+// owner is genuinely *dead-or-wedged*, "refuse forever" is the worst possible
+// multi-agent outcome: fleet evidence (session 575f27e7, 2026-06-24..29) shows
+// a whole swarm on git-ledger fallback for ~5 days while a wedged deleted-binary
+// PID held the lock ~4.3 days, every agent correctly deferring, nobody able to
+// heal. `--allow-live-owner` is too blunt to offer an agent (it overrides *every*
+// class, including a healthy live server).
+//
+// This module supplies the pure, conservative discriminator that lets a
+// *supervised takeover* (`am doctor repair --take-ownership`) act only when the
+// owner is provably reclaimable, so a healthy in-place-upgraded server (also a
+// deleted-executable owner!) is never disturbed.
+//
+// ## Purity contract
+//
+// [`ReclaimableOwnerEvidence::verdict`] and [`owner_set_is_reclaimable`] are
+// total functions over plain-data evidence — no `/proc` reads, no port probes.
+// The impure half (reading `/proc/<pid>/stat` for the zombie state, the process
+// age, and probing the mailbox port for responsiveness) is gathered by the CLI
+// (`crates/mcp-agent-mail-cli/src/lib.rs`) and fed in as evidence, so the
+// classification stays trivially testable with synthetic inputs.
+
+/// Default idle threshold (seconds) a *non-zombie* deleted-executable owner must
+/// exceed before its stale mailbox locks are considered reclaimable without a
+/// supervised drain (br-z41ij).
+///
+/// A live binary upgrade re-opens the database within seconds; a process that
+/// has held the lock for this long while the mailbox is unresponsive is wedged,
+/// not mid-upgrade. 10 minutes is comfortably longer than any legitimate
+/// restart/upgrade window and far shorter than the multi-day epochs the fleet
+/// actually suffered.
+pub const RECLAIMABLE_OWNER_MIN_IDLE_SECS: u64 = 10 * 60;
+
+/// Why a lock-holding owner was (or was not) judged reclaimable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReclaimVerdict {
+    /// The holder is a zombie/defunct process (`/proc/<pid>/stat` state `Z`):
+    /// the kernel has already closed every fd and released every lock it held,
+    /// so any lock file naming it is a stale artifact.
+    ZombieHolder,
+    /// The holder runs a deleted executable, the mailbox is unresponsive, and it
+    /// has been idle past the threshold — a wedged owner, not a live upgrade.
+    WedgedDeletedExecutable,
+    /// Not reclaimable: the evidence is consistent with a live, working owner
+    /// (or is too weak to rule one out). The safe default.
+    NotReclaimable,
+}
+
+impl ReclaimVerdict {
+    /// Stable machine token used in evidence/report JSON.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ZombieHolder => "zombie_holder",
+            Self::WedgedDeletedExecutable => "wedged_deleted_executable",
+            Self::NotReclaimable => "not_reclaimable",
+        }
+    }
+
+    /// Whether this verdict permits a supervised takeover of the owner's locks.
+    #[must_use]
+    pub fn is_reclaimable(self) -> bool {
+        !matches!(self, Self::NotReclaimable)
+    }
+}
+
+/// Per-process evidence that a mailbox lock holder is dead-or-wedged and its
+/// activity locks can be safely quarantined so a repair owner can take over
+/// (br-z41ij).
+///
+/// Every field is plain data gathered by the CLI; [`Self::verdict`] is pure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReclaimableOwnerEvidence {
+    pub pid: u32,
+    /// `/proc/<pid>/stat` process state is `Z` (zombie/defunct).
+    pub zombie: bool,
+    /// The owner's executable was deleted/replaced out from under it
+    /// (`/proc/<pid>/exe` resolves to a `… (deleted)` path).
+    pub executable_deleted: bool,
+    /// A fresh liveness probe found the mailbox still serving (its configured
+    /// HTTP port accepted a connection). A responsive owner is a *working*
+    /// owner — never reclaimable — which is what protects a healthy server that
+    /// merely had its binary replaced in place.
+    pub mailbox_responsive: bool,
+    /// Age of the holding process in seconds, when resolvable from `/proc`.
+    /// Unknown age is treated as "too fresh to judge" (not reclaimable).
+    pub age_seconds: Option<u64>,
+    /// Idle threshold applied to the deleted-executable branch.
+    pub min_idle_seconds: u64,
+}
+
+impl ReclaimableOwnerEvidence {
+    /// Classify a single holder. Conservative by construction: a zombie is
+    /// reclaimable outright (it holds nothing); every other holder must clear
+    /// *all* of deleted-executable, unresponsive, and idle-past-threshold. Any
+    /// missing or ambiguous signal yields [`ReclaimVerdict::NotReclaimable`].
+    #[must_use]
+    pub fn verdict(&self) -> ReclaimVerdict {
+        if self.zombie {
+            return ReclaimVerdict::ZombieHolder;
+        }
+        let idle_long_enough = self
+            .age_seconds
+            .is_some_and(|age| age >= self.min_idle_seconds);
+        if self.executable_deleted && !self.mailbox_responsive && idle_long_enough {
+            return ReclaimVerdict::WedgedDeletedExecutable;
+        }
+        ReclaimVerdict::NotReclaimable
+    }
+
+    /// Convenience: whether this holder alone is reclaimable.
+    #[must_use]
+    pub fn is_reclaimable(&self) -> bool {
+        self.verdict().is_reclaimable()
+    }
+}
+
+/// Aggregate reclaimability over the full candidate-owner set.
+///
+/// The set is reclaimable only when it is **non-empty** and **every** candidate
+/// is individually reclaimable. A single live, non-reclaimable holder makes a
+/// supervised takeover unsafe — quarantining the shared lock would be stealing
+/// it from a process that may still be writing — so we refuse the whole set.
+#[must_use]
+pub fn owner_set_is_reclaimable(evidence: &[ReclaimableOwnerEvidence]) -> bool {
+    !evidence.is_empty()
+        && evidence
+            .iter()
+            .all(ReclaimableOwnerEvidence::is_reclaimable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,5 +1003,107 @@ mod tests {
         assert!(v.get("port").is_some());
         assert!(v.get("self_binary_path").is_some());
         assert!(v.get("db_path").is_some());
+    }
+
+    // ─── br-z41ij: reclaimable-owner classification ─────────────────────────
+
+    fn wedged_evidence(pid: u32) -> ReclaimableOwnerEvidence {
+        // A live (non-zombie) owner running a deleted binary, mailbox not
+        // serving, idle well past the threshold — the fleet's actual wedge.
+        ReclaimableOwnerEvidence {
+            pid,
+            zombie: false,
+            executable_deleted: true,
+            mailbox_responsive: false,
+            age_seconds: Some(RECLAIMABLE_OWNER_MIN_IDLE_SECS + 60),
+            min_idle_seconds: RECLAIMABLE_OWNER_MIN_IDLE_SECS,
+        }
+    }
+
+    #[test]
+    fn reclaim_zombie_is_reclaimable_regardless_of_other_signals() {
+        // A zombie holds nothing; it is reclaimable even if it looks "responsive"
+        // or has an intact executable or unknown age.
+        let ev = ReclaimableOwnerEvidence {
+            pid: 42,
+            zombie: true,
+            executable_deleted: false,
+            mailbox_responsive: true,
+            age_seconds: None,
+            min_idle_seconds: RECLAIMABLE_OWNER_MIN_IDLE_SECS,
+        };
+        assert_eq!(ev.verdict(), ReclaimVerdict::ZombieHolder);
+        assert!(ev.is_reclaimable());
+    }
+
+    #[test]
+    fn reclaim_wedged_deleted_binary_is_reclaimable() {
+        let ev = wedged_evidence(2860);
+        assert_eq!(ev.verdict(), ReclaimVerdict::WedgedDeletedExecutable);
+        assert!(ev.is_reclaimable());
+    }
+
+    #[test]
+    fn reclaim_responsive_owner_is_never_reclaimable() {
+        // The healthy in-place-upgraded server: deleted exe, old, but STILL
+        // serving. Must never be reclaimed — that is the whole safety point.
+        let mut ev = wedged_evidence(2860);
+        ev.mailbox_responsive = true;
+        assert_eq!(ev.verdict(), ReclaimVerdict::NotReclaimable);
+        assert!(!ev.is_reclaimable());
+    }
+
+    #[test]
+    fn reclaim_intact_executable_is_not_reclaimable() {
+        // No deleted-executable signal and not a zombie: never reclaimable, even
+        // if unresponsive and old (could be a healthy stdio server mid-hang that
+        // a supervised restart should handle, not a lock steal).
+        let mut ev = wedged_evidence(2860);
+        ev.executable_deleted = false;
+        assert_eq!(ev.verdict(), ReclaimVerdict::NotReclaimable);
+    }
+
+    #[test]
+    fn reclaim_requires_idle_past_threshold() {
+        let mut ev = wedged_evidence(2860);
+        ev.age_seconds = Some(RECLAIMABLE_OWNER_MIN_IDLE_SECS - 1);
+        assert_eq!(ev.verdict(), ReclaimVerdict::NotReclaimable);
+    }
+
+    #[test]
+    fn reclaim_unknown_age_is_not_reclaimable() {
+        // Conservative: an unknowable age is treated as too-fresh-to-judge.
+        let mut ev = wedged_evidence(2860);
+        ev.age_seconds = None;
+        assert_eq!(ev.verdict(), ReclaimVerdict::NotReclaimable);
+    }
+
+    #[test]
+    fn owner_set_reclaimable_requires_nonempty_and_unanimous() {
+        assert!(
+            !owner_set_is_reclaimable(&[]),
+            "empty set is never reclaimable"
+        );
+        assert!(owner_set_is_reclaimable(&[wedged_evidence(1)]));
+        assert!(owner_set_is_reclaimable(&[
+            wedged_evidence(1),
+            wedged_evidence(2)
+        ]));
+
+        // One live, non-reclaimable holder poisons the whole set: quarantining a
+        // shared lock would steal it from a working process.
+        let mut live = wedged_evidence(3);
+        live.mailbox_responsive = true;
+        assert!(!owner_set_is_reclaimable(&[wedged_evidence(1), live]));
+    }
+
+    #[test]
+    fn reclaim_verdict_tokens_stable() {
+        assert_eq!(ReclaimVerdict::ZombieHolder.as_str(), "zombie_holder");
+        assert_eq!(
+            ReclaimVerdict::WedgedDeletedExecutable.as_str(),
+            "wedged_deleted_executable"
+        );
+        assert_eq!(ReclaimVerdict::NotReclaimable.as_str(), "not_reclaimable");
     }
 }

@@ -30,7 +30,9 @@ pub mod undo;
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_tools::reservation_parity::check_reservation_parity_with_canonical_conn;
+use mcp_agent_mail_tools::reservation_parity::{
+    ReservationParityReport, check_reservation_parity_with_canonical_conn,
+};
 use serde::Serialize;
 use std::fs;
 use std::io::Read;
@@ -85,15 +87,36 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
     let root = runs::doctor_root(target);
     let report_path = latest_doctor_report_path_for_root(&root);
 
-    let report_value: serde_json::Value = if let Some(rp) = report_path.as_ref() {
-        read_json_file(rp)?
-    } else {
-        serde_json::json!({
-            "ok": null,
-            "summary": null,
-            "findings": [],
-        })
-    };
+    // A report is historical evidence, not a prerequisite for inspecting the
+    // live mailbox. An interrupted `--fix` can leave an empty or truncated
+    // report behind; treating that as a triage error hid the useful live probe
+    // behind an unrelated EOF parse failure.
+    let (report_value, report_warning): (serde_json::Value, Option<String>) =
+        if let Some(rp) = report_path.as_ref() {
+            match read_json_file(rp) {
+                Ok(value) => (value, None),
+                Err(error) => (
+                    serde_json::json!({
+                        "ok": null,
+                        "summary": null,
+                        "findings": [],
+                    }),
+                    Some(format!(
+                        "skipped unreadable historical report {}: {error}",
+                        rp.display()
+                    )),
+                ),
+            }
+        } else {
+            (
+                serde_json::json!({
+                    "ok": null,
+                    "summary": null,
+                    "findings": [],
+                }),
+                None,
+            )
+        };
 
     let summary = report_value
         .get("summary")
@@ -111,20 +134,29 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
     // GH#185: live read-only mailbox probe (identical to `am doctor health`,
     // safe while a server owns the mailbox). A failing live probe must never
     // hide behind a stale-but-green cached report.
-    let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let core_config = Config::from_env();
+    let probe_target = doctor_live_probe_target(&core_config);
+    let probe_source = probe_target.source;
     let (live_health, live_finding, live_recommended) =
         match crate::doctor_database_fix_strategy_read_only(
-            &db_cfg.database_url,
-            &core_config.storage_root,
+            &probe_target.database_url,
+            &probe_target.storage_root,
         ) {
             Ok(crate::DoctorDatabaseFixStrategy::None(detail)) => (
-                serde_json::json!({ "status": "ok", "detail": detail }),
+                serde_json::json!({
+                    "status": "ok",
+                    "detail": detail,
+                    "probe_target": probe_source,
+                }),
                 None,
                 None,
             ),
             Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => (
-                serde_json::json!({ "status": "fail", "detail": detail }),
+                serde_json::json!({
+                    "status": "fail",
+                    "detail": detail,
+                    "probe_target": probe_source,
+                }),
                 Some(serde_json::json!({
                     "id": "live-mailbox-needs-repair",
                     "severity": "P0",
@@ -135,7 +167,11 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
                 Some("am doctor repair --dry-run".to_string()),
             ),
             Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => (
-                serde_json::json!({ "status": "fail", "detail": detail }),
+                serde_json::json!({
+                    "status": "fail",
+                    "detail": detail,
+                    "probe_target": probe_source,
+                }),
                 Some(serde_json::json!({
                     "id": "live-mailbox-needs-reconstruct",
                     "severity": "P0",
@@ -146,7 +182,11 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
                 Some("am doctor reconstruct --dry-run".to_string()),
             ),
             Err(error) => (
-                serde_json::json!({ "status": "error", "detail": error.to_string() }),
+                serde_json::json!({
+                    "status": "error",
+                    "detail": error.to_string(),
+                    "probe_target": probe_source,
+                }),
                 Some(serde_json::json!({
                     "id": "live-mailbox-probe-failed",
                     "severity": "P0",
@@ -230,6 +270,7 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
         "quick": quick,
         "report_available": report_path.is_some(),
         "report_path": report_path.map(|p| p.to_string_lossy().into_owned()),
+        "report_warning": report_warning,
         "live_health": live_health,
         "summary": summary,
         "total_findings": total_findings,
@@ -244,6 +285,115 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
         .map_err(|e| CliError::Other(format!("serializing triage envelope: {e}")))?;
     println!("{s}");
     Ok(())
+}
+
+/// A small archive-only parity discrepancy is operational debt, not evidence
+/// that SQLite (the live reservation authority) is unable to serve locks.
+/// Keep the threshold deliberately tight: larger drift, parse failures, and
+/// any mismatch to reservation semantics remain unhealthy and retain exit 1.
+const COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD: usize = 3;
+
+fn reservation_parity_is_cosmetic(report: &ReservationParityReport) -> bool {
+    let drift = &report.drift;
+    report.drift.total() <= COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD
+        && drift.agent_id_mismatches == 0
+        && drift.released_ts_mismatches == 0
+        && drift.active_status_mismatches == 0
+        && drift.path_pattern_mismatches == 0
+        && drift.exclusive_mismatches == 0
+        && drift.thread_provenance_mismatches == 0
+        && drift.parse_errors == 0
+}
+
+fn json_usize(value: &serde_json::Value, key: &str) -> Option<usize> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+}
+
+/// A cached doctor report can only be downgraded when every finding is the
+/// reservation-parity FM and its serialized drift contains no semantic
+/// disagreement. The live parity check still runs first, so a stale cached
+/// warning never masks a current live failure.
+fn historical_report_has_only_cosmetic_reservation_parity(report: &serde_json::Value) -> bool {
+    const PARITY_FM: &str = "fm-db-state-files-reservation-db-archive-parity";
+    let Some(findings) = report.get("findings").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if findings.is_empty() {
+        return false;
+    }
+
+    findings.iter().all(|finding| {
+        if finding.get("id").and_then(serde_json::Value::as_str) != Some(PARITY_FM) {
+            return false;
+        }
+        let Some(drift) = finding.pointer("/evidence/report/drift") else {
+            return false;
+        };
+        let allowed_total = [
+            "missing_archive_artifacts",
+            "archive_without_db_rows",
+            "archive_id_collisions",
+        ]
+        .into_iter()
+        .map(|key| json_usize(drift, key))
+        .try_fold(0_usize, |total, count| {
+            count.map(|count| total.saturating_add(count))
+        });
+        let Some(allowed_total) = allowed_total else {
+            return false;
+        };
+        let semantic_is_clean = [
+            "agent_id_mismatches",
+            "released_ts_mismatches",
+            "active_status_mismatches",
+            "path_pattern_mismatches",
+            "exclusive_mismatches",
+            "thread_provenance_mismatches",
+            "parse_errors",
+        ]
+        .into_iter()
+        .all(|key| json_usize(drift, key) == Some(0));
+        semantic_is_clean
+            && (1..=COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD).contains(&allowed_total)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorLiveProbeTarget {
+    database_url: String,
+    storage_root: PathBuf,
+    source: &'static str,
+}
+
+fn doctor_live_probe_target_from_server_config(
+    config: &Config,
+    server_config: Option<crate::robot::LiveServerMailboxConfig>,
+) -> DoctorLiveProbeTarget {
+    if let Some(server_config) = server_config {
+        return DoctorLiveProbeTarget {
+            database_url: server_config.database_url,
+            storage_root: server_config.storage_root,
+            source: "live_server",
+        };
+    }
+    DoctorLiveProbeTarget {
+        database_url: config.database_url.clone(),
+        storage_root: config.storage_root.clone(),
+        source: "local_config_unattested",
+    }
+}
+
+/// Prefer the live MCP server's advertised mailbox pair. A CLI can have a
+/// different XDG environment from the daemon, and probing its local default
+/// would otherwise report a healthy-but-unrelated SQLite file.
+fn doctor_live_probe_target(config: &Config) -> DoctorLiveProbeTarget {
+    doctor_live_probe_target_from_server_config(
+        config,
+        crate::robot::fetch_live_server_mailbox_config(config).ok(),
+    )
 }
 
 /// `am doctor explain <finding-id>` — drill into a single finding.
@@ -2392,9 +2542,21 @@ fn redact_support_text(input: &str, ctx: &SupportRedactionContext) -> String {
 /// Cheap. For CI scheduling. Probes the live mailbox first, then reads
 /// `.doctor/latest/report.json` if present.
 pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
-    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
-    match crate::doctor_database_fix_strategy_read_only(&cfg.database_url, &config.storage_root) {
+    let probe_target = doctor_live_probe_target(&config);
+    if probe_target.source == "live_server" {
+        ftui_runtime::ftui_println!(
+            "database_target: live_server (using the running MCP server's DATABASE_URL)"
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "database_target: local_config_unattested (live server config unavailable)"
+        );
+    }
+    match crate::doctor_database_fix_strategy_read_only(
+        &probe_target.database_url,
+        &probe_target.storage_root,
+    ) {
         Ok(crate::DoctorDatabaseFixStrategy::None(_)) => {}
         Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => {
             ftui_runtime::ftui_println!(
@@ -2455,18 +2617,25 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
-    match crate::open_db_for_doctor_check_read_only_with_context(&cfg.database_url).and_then(
-        |opened| {
-            check_reservation_parity_with_canonical_conn(&opened.conn, &config.storage_root)
+    match crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
+        .and_then(|opened| {
+            check_reservation_parity_with_canonical_conn(&opened.conn, &probe_target.storage_root)
                 .map_err(|error| {
                     CliError::Other(format!("reservation parity check failed: {error}"))
                 })
-        },
-    ) {
+        }) {
         Ok(report) => {
             ftui_runtime::ftui_println!("{}", report.health_line());
             if !report.ok {
-                return Err(CliError::ExitCode(1));
+                if reservation_parity_is_cosmetic(&report) {
+                    ftui_runtime::ftui_println!(
+                        "warn: reservation parity has {} archive-only drift item(s), within cosmetic threshold {}; live SQLite reservations remain authoritative",
+                        report.drift.total(),
+                        COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD,
+                    );
+                } else {
+                    return Err(CliError::ExitCode(1));
+                }
             }
         }
         Err(error) => {
@@ -2479,23 +2648,39 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     // isolated from the mailbox DB (br-bvq1x.11.7), so a corrupt/large sidecar
     // is observability, not mailbox corruption: this line never changes the
     // health exit code. Quiet on a clean slate (no sidecar => ATC never wrote).
-    if let Ok(resolved) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url) {
+    if let Ok(resolved) =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+    {
         let sidecar = mcp_agent_mail_db::pool::inspect_atc_sidecar_health(&resolved.canonical_path);
         if sidecar.present {
             let size = crate::format_bytes(sidecar.size_bytes);
+            let rows = sidecar
+                .experience_rows
+                .map_or_else(|| "unknown".to_string(), |count| count.to_string());
+            let cap = if config.atc_experience_max_rows > 0 {
+                config.atc_experience_max_rows.to_string()
+            } else {
+                "disabled".to_string()
+            };
+            let share = sidecar.size_share_basis_points.map_or_else(
+                || "unknown".to_string(),
+                |basis_points| format!("{}.{:02}%", basis_points / 100, basis_points % 100),
+            );
             match sidecar.quick_check_ok {
                 Some(true) => {
-                    ftui_runtime::ftui_println!("atc_sidecar: ok size={size} quick_check=ok");
+                    ftui_runtime::ftui_println!(
+                        "atc_sidecar: ok rows={rows} cap={cap} size={size} share={share} quick_check=ok"
+                    );
                 }
                 Some(false) => {
                     ftui_runtime::ftui_println!(
-                        "atc_sidecar: warn size={size} quick_check=corrupt ({}); next: am atc reprocess-features --dry-run",
+                        "atc_sidecar: warn rows={rows} cap={cap} size={size} share={share} quick_check=corrupt ({}); next: am atc reprocess-features --dry-run",
                         sidecar.detail
                     );
                 }
                 None => {
                     ftui_runtime::ftui_println!(
-                        "atc_sidecar: warn size={size} quick_check=not_run ({})",
+                        "atc_sidecar: warn rows={rows} cap={cap} size={size} share={share} quick_check=not_run ({})",
                         sidecar.detail
                     );
                 }
@@ -2534,6 +2719,14 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
     let exit_code = v.get("exit_code").and_then(|n| n.as_i64()).unwrap_or(0);
+
+    if historical_report_has_only_cosmetic_reservation_parity(&v) {
+        ftui_runtime::ftui_println!(
+            "warn: {} historical reservation-parity finding(s) are archive-only cosmetic drift; exit 0",
+            total
+        );
+        return Ok(());
+    }
 
     if ok && total == 0 {
         ftui_runtime::ftui_println!("ok: 0 findings (last run exit {exit_code})");
@@ -2793,6 +2986,161 @@ mod tests {
             output.contains("reservation_parity: ok db=0 archive=0 drift=0"),
             "health output should include reservation parity line:\n{output}"
         );
+    }
+
+    #[test]
+    fn reservation_parity_classifies_small_archive_only_drift_as_cosmetic() {
+        let report = ReservationParityReport {
+            schema_version:
+                mcp_agent_mail_tools::reservation_parity::RESERVATION_PARITY_SCHEMA_VERSION,
+            ok: false,
+            db_reservations: 2,
+            archive_reservations: 0,
+            drift: mcp_agent_mail_tools::reservation_parity::ReservationParityDriftSummary {
+                missing_archive_artifacts: COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD,
+                ..Default::default()
+            },
+            examples: Vec::new(),
+        };
+
+        assert!(reservation_parity_is_cosmetic(&report));
+    }
+
+    #[test]
+    fn reservation_parity_keeps_semantic_drift_unhealthy_at_small_counts() {
+        let report = ReservationParityReport {
+            schema_version:
+                mcp_agent_mail_tools::reservation_parity::RESERVATION_PARITY_SCHEMA_VERSION,
+            ok: false,
+            db_reservations: 1,
+            archive_reservations: 1,
+            drift: mcp_agent_mail_tools::reservation_parity::ReservationParityDriftSummary {
+                path_pattern_mismatches: 1,
+                ..Default::default()
+            },
+            examples: Vec::new(),
+        };
+
+        assert!(!reservation_parity_is_cosmetic(&report));
+    }
+
+    #[test]
+    fn historical_report_downgrades_only_small_archive_parity_drift() {
+        let cosmetic = serde_json::json!({
+            "findings": [{
+                "id": "fm-db-state-files-reservation-db-archive-parity",
+                "evidence": { "report": { "drift": {
+                    "missing_archive_artifacts": 1,
+                    "archive_without_db_rows": 0,
+                    "archive_id_collisions": 0,
+                    "agent_id_mismatches": 0,
+                    "released_ts_mismatches": 0,
+                    "active_status_mismatches": 0,
+                    "path_pattern_mismatches": 0,
+                    "exclusive_mismatches": 0,
+                    "thread_provenance_mismatches": 0,
+                    "parse_errors": 0
+                }}}
+            }]
+        });
+        assert!(historical_report_has_only_cosmetic_reservation_parity(
+            &cosmetic
+        ));
+
+        let semantic = serde_json::json!({
+            "findings": [{
+                "id": "fm-db-state-files-reservation-db-archive-parity",
+                "evidence": { "report": { "drift": {
+                    "missing_archive_artifacts": 0,
+                    "archive_without_db_rows": 0,
+                    "archive_id_collisions": 0,
+                    "agent_id_mismatches": 0,
+                    "released_ts_mismatches": 0,
+                    "active_status_mismatches": 0,
+                    "path_pattern_mismatches": 1,
+                    "exclusive_mismatches": 0,
+                    "thread_provenance_mismatches": 0,
+                    "parse_errors": 0
+                }}}
+            }]
+        });
+        assert!(!historical_report_has_only_cosmetic_reservation_parity(
+            &semantic
+        ));
+    }
+
+    #[test]
+    fn doctor_live_probe_target_prefers_the_running_server_mailbox() {
+        let config = Config {
+            database_url: "sqlite:///cli-default.sqlite3".to_string(),
+            storage_root: PathBuf::from("/tmp/cli-default-storage"),
+            ..Config::default()
+        };
+        let target = doctor_live_probe_target_from_server_config(
+            &config,
+            Some(crate::robot::LiveServerMailboxConfig {
+                database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
+                storage_root: PathBuf::from("/srv/agent-mail/archive"),
+            }),
+        );
+
+        assert_eq!(target.source, "live_server");
+        assert_eq!(
+            target.database_url,
+            "sqlite:////srv/agent-mail/server.sqlite3"
+        );
+        assert_eq!(
+            target.storage_root,
+            PathBuf::from("/srv/agent-mail/archive")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_triage_skips_a_truncated_historical_report() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_healthy_live_mailbox(&db_path);
+
+        let doctor_root = target.path().join(".doctor");
+        let run_id = "2026-08-12T00-00-00Z__truncated";
+        let run_dir = doctor_root.join("runs").join(run_id);
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("report.json"), b"").unwrap();
+        std::os::unix::fs::symlink(Path::new("runs").join(run_id), doctor_root.join("latest"))
+            .unwrap();
+
+        let storage_root_s = storage_root.path().display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                ("HTTP_PORT", "47351"),
+            ],
+            || handle_triage(target.path(), false),
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+
+        assert!(
+            result.is_ok(),
+            "truncated report must not crash triage: {result:?}"
+        );
+        let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(report["report_available"], true);
+        assert!(
+            report["report_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("skipped unreadable historical report")),
+            "missing historical-report warning: {report}"
+        );
+        assert_eq!(report["live_health"]["status"], "ok");
     }
 
     #[cfg(unix)]
