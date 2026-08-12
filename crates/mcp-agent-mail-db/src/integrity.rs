@@ -251,6 +251,12 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
 /// [`integrity_details_are_suspect`]'s classes). Any other row — page-level
 /// damage, fragmentation accounting, b-tree errors — disqualifies the fast
 /// path and `None` is returned so callers escalate to repair/reconstruct.
+///
+/// The returned names are **diagnostic witnesses, not a complete repair
+/// target list**. SQLite's checker can identify one damaged secondary index
+/// while a sibling index on the same table also needs rebuilding. A repair
+/// caller must resolve each name to its owner table and issue `REINDEX` for
+/// every distinct owner table, which rebuilds all of that table's indexes.
 #[must_use]
 pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<String>> {
     fn index_name_from_detail(detail: &str) -> Option<&str> {

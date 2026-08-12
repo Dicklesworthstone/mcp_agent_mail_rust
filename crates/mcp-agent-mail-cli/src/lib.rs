@@ -6865,32 +6865,67 @@ fn cleanup_database_sidecars_after_startup_use(database_url: &str) -> CliResult<
     Ok(())
 }
 
+/// Resolve diagnostic index witnesses to the distinct tables whose complete
+/// index sets must be rebuilt. The integrity checker only names a witness; it
+/// does not promise to enumerate every damaged sibling index on that table.
+fn doctor_index_owner_tables_for_damage(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    damaged_indexes: &[String],
+) -> CliResult<Vec<String>> {
+    let mut tables = BTreeSet::new();
+    for index in damaged_indexes {
+        let rows = conn
+            .query_sync(
+                "SELECT tbl_name FROM sqlite_master \
+                 WHERE type = 'index' AND name = ? LIMIT 1",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::Text(index.clone())],
+            )
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "could not resolve damaged index {index} to its owner table: {error}"
+                ))
+            })?;
+        let row = rows.first().ok_or_else(|| {
+            CliError::Other(format!(
+                "damaged index {index} was not present in sqlite_master"
+            ))
+        })?;
+        let table: String = row.get_named("tbl_name").map_err(|error| {
+            CliError::Other(format!(
+                "could not decode owner table for damaged index {index}: {error}"
+            ))
+        })?;
+        if table.trim().is_empty() {
+            return Err(CliError::Other(format!(
+                "damaged index {index} has an empty owner table in sqlite_master"
+            )));
+        }
+        tables.insert(table);
+    }
+    if tables.is_empty() {
+        return Err(CliError::Other(
+            "index-only corruption classifier produced no damaged indexes".to_string(),
+        ));
+    }
+    Ok(tables.into_iter().collect())
+}
+
 /// br-mdfpz: attempt the cheap, non-lossy REINDEX fast path before archive
 /// reconstruction.
 ///
-/// When the FULL canonical `integrity_check` shows ONLY index-level damage
-/// (`wrong # of entries in index` / `row N missing from index`) with a clean
-/// `foreign_key_check`, the table b-trees are intact and a targeted `REINDEX`
-/// rebuilds the damaged indexes in seconds with zero row loss. Escalating that
-/// class to archive reconstruction is not just slow — when the archive lags the
-/// DB, the reconstruction promotion guard correctly REFUSES the lossy
-/// candidate, and a supervised startup then crash-loops (the 2026-08-12 csd
-/// incident: nine days of ~5-minute restart cycles, each leaving a ~45 MB
-/// candidate + forensic bundle, ~22 GB of debris — for damage `REINDEX` fixed
-/// in seconds).
-///
-/// The database file is byte-copied (with any `-wal`/`-shm` sidecars) into
-/// `backup_dir` before any write. Returns `Some(summary)` only when the
-/// canonical double-probe battery proves the database healthy afterwards;
-/// every other outcome returns `None` so the caller escalates to the existing
-/// repair/reconstruct strategy unchanged.
+/// When the FULL canonical `integrity_check` shows only index-level damage
+/// with a clean `foreign_key_check`, table b-trees are intact. Rebuild every
+/// index on each owner table named by an index-class diagnostic witness: the
+/// checker need not enumerate every damaged sibling index. The database and
+/// sidecars are byte-copied into `backup_dir` before any write, and only the
+/// canonical double-probe battery can declare the result healed.
 fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Option<String> {
     if db_path.as_os_str() == ":memory:" || !db_path.exists() {
         return None;
     }
 
     // Classify the damage on a read-only immutable connection first.
-    let damaged_indexes = {
+    let (damaged_indexes, affected_tables) = {
         let conn =
             match doctor_open_canonical_readonly_db_for_diagnostic(db_path, "index_only_reindex") {
                 Ok(conn) => conn,
@@ -6914,7 +6949,22 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
             Ok(violations) if violations.is_empty() => {}
             _ => return None,
         }
-        damaged
+        let tables = match doctor_index_owner_tables_for_damage(&conn, &damaged) {
+            Ok(tables) => tables,
+            Err(error) => {
+                // The global fallback below is still safe for the strictly
+                // index-only class. Keeping this diagnostic makes a future
+                // schema/catalog problem observable instead of silently
+                // narrowing the repair back to the reported index names.
+                tracing::warn!(
+                    db = %db_path.display(),
+                    %error,
+                    "index-only REINDEX fast path could not resolve all damaged index owner tables; global fallback will be required"
+                );
+                Vec::new()
+            }
+        };
+        (damaged, tables)
     };
 
     // Never reindex without a byte-exact backup of the current generation.
@@ -6947,39 +6997,62 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
         }
     }
 
-    // Rebuild the damaged indexes on the canonical engine, escalating a
-    // per-index failure to one global REINDEX before giving up.
-    {
+    // Rebuild all indexes on each affected owner table, not only the names
+    // emitted by integrity_check. The diagnostic names are witnesses; sibling
+    // indexes can be damaged without being named. If catalog resolution or a
+    // table-level reindex fails, retain the existing global REINDEX fallback.
+    let used_global_reindex = {
         let conn =
             match mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string()) {
                 Ok(conn) => conn,
                 Err(_) => return None,
             };
-        for index in &damaged_indexes {
-            let escaped = index.replace('"', "\"\"");
-            if conn.execute_raw(&format!("REINDEX \"{escaped}\"")).is_err() {
-                if let Err(error) = conn.execute_raw("REINDEX") {
-                    tracing::warn!(
-                        db = %db_path.display(),
-                        index = %index,
-                        %error,
-                        "index-only REINDEX fast path failed; escalating to repair/reconstruct"
-                    );
-                    return None;
-                }
+        let mut use_global = affected_tables.is_empty();
+        for table in &affected_tables {
+            let escaped = table.replace('"', "\"\"");
+            if let Err(error) = conn.execute_raw(&format!("REINDEX \"{escaped}\"")) {
+                tracing::warn!(
+                    db = %db_path.display(),
+                    table = %table,
+                    %error,
+                    "table-wide index-only REINDEX failed; trying global REINDEX fallback"
+                );
+                use_global = true;
                 break;
             }
         }
-    }
+        if use_global
+            && let Err(error) = conn.execute_raw("REINDEX")
+        {
+            tracing::warn!(
+                db = %db_path.display(),
+                %error,
+                "index-only REINDEX fast path failed; escalating to repair/reconstruct"
+            );
+            return None;
+        }
+        use_global
+    };
 
     // Only a full canonical battery pass counts as healed.
     match doctor_canonical_double_probe(db_path) {
-        DoctorCanonicalCrossCheck::Healthy => Some(format!(
-            "reindexed {} damaged index(es): {}; pre-reindex backup at {}",
-            damaged_indexes.len(),
-            damaged_indexes.join(", "),
-            backup_path.display()
-        )),
+        DoctorCanonicalCrossCheck::Healthy => {
+            let scope = if used_global_reindex {
+                "global REINDEX fallback".to_string()
+            } else {
+                format!(
+                    "all indexes on {} affected table(s): {}",
+                    affected_tables.len(),
+                    affected_tables.join(", ")
+                )
+            };
+            Some(format!(
+                "reindexed {scope} from {} named index witness(es): {}; pre-reindex backup at {}",
+                damaged_indexes.len(),
+                damaged_indexes.join(", "),
+                backup_path.display()
+            ))
+        }
         _ => None,
     }
 }
