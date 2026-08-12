@@ -40970,6 +40970,22 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn unresolved_live_server_is_reused_only_by_managed_service() {
+        assert!(should_reuse_unresolved_live_server(
+            AutoClearPortOutcome::LiveServerWithoutKillablePid,
+            true,
+        ));
+        assert!(!should_reuse_unresolved_live_server(
+            AutoClearPortOutcome::LiveServerWithoutKillablePid,
+            false,
+        ));
+        assert!(!should_reuse_unresolved_live_server(
+            AutoClearPortOutcome::Cleared,
+            true,
+        ));
+    }
+
+    #[test]
     fn clap_parses_serve_http_flags() {
         let cli = Cli::try_parse_from([
             "am",
