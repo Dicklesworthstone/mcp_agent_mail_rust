@@ -11285,7 +11285,27 @@ pub async fn list_file_reservations(
     active_only: bool,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     run_with_mvcc_retry(cx, "list_file_reservations", || {
-        list_file_reservations_once(cx, pool, project_id, active_only)
+        list_file_reservations_once(cx, pool, project_id, active_only, None, 0, false)
+    })
+    .await
+}
+
+/// List one deterministically ordered page of file reservations.
+///
+/// Resource handlers must use this instead of loading the historical table
+/// and truncating in Rust: long-lived projects can retain tens of thousands
+/// of released rows.  `limit` and `offset` are applied in SQLite before any
+/// caller performs per-row enrichment.
+pub async fn list_file_reservations_page(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    active_only: bool,
+    limit: usize,
+    offset: usize,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "list_file_reservations_page", || {
+        list_file_reservations_once(cx, pool, project_id, active_only, Some(limit), offset, true)
     })
     .await
 }
@@ -11295,6 +11315,9 @@ async fn list_file_reservations_once(
     pool: &DbPool,
     project_id: i64,
     active_only: bool,
+    limit: Option<usize>,
+    offset: usize,
+    order_by_created_ts: bool,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -11313,7 +11336,12 @@ async fn list_file_reservations_once(
         try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
     }
 
-    let (sql, params) = if active_only {
+    let order_by = if order_by_created_ts {
+        "fr.created_ts, fr.id"
+    } else {
+        "fr.id"
+    };
+    let (mut sql, mut params) = if active_only {
         let now = now_micros();
         // GH#180: candidate rows via the cheap `released_ts` predicate (no
         // release-ledger join, no `NOT IN`); the ledger is subtracted in Rust
@@ -11325,7 +11353,7 @@ async fn list_file_reservations_once(
                 "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                         fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts \
                  FROM file_reservations fr \
-                 WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ? ORDER BY fr.id"
+                 WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ? ORDER BY {order_by}"
             ),
             vec![Value::BigInt(project_id), Value::BigInt(now)],
         )
@@ -11335,7 +11363,8 @@ async fn list_file_reservations_once(
             // Coerce it to INTEGER microseconds so listing historical reservations can't crash.
             // Prefer the sidecar release ledger when present because it is the
             // authoritative release source for modern reservations.
-            "SELECT \
+            format!(
+                "SELECT \
                  fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts, \
                  COALESCE(rr.released_ts, CASE \
                      WHEN fr.released_ts IS NULL THEN NULL \
@@ -11349,11 +11378,19 @@ async fn list_file_reservations_once(
              FROM file_reservations fr \
              LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
              WHERE fr.project_id = ? \
-             ORDER BY fr.id"
-                .to_string(),
+             ORDER BY {order_by}"
+            ),
             vec![Value::BigInt(project_id)],
         )
     };
+
+    if let Some(limit) = limit {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        sql.push_str(" LIMIT ? OFFSET ?");
+        params.push(Value::BigInt(limit));
+        params.push(Value::BigInt(offset));
+    }
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     let mut result = match rows_out {

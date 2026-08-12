@@ -18,8 +18,9 @@ use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
-    get_read_db_pool, legacy_tool_error, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool,
+    get_coalescer_bypass_read_db_pool, get_db_pool, get_read_db_pool, legacy_tool_error,
+    resolve_existing_project, resolve_project,
 };
 
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
@@ -2196,13 +2197,13 @@ pub async fn whois(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_read_db_pool(ctx.cx()).await?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
 
     let include_commits = include_recent_commits.unwrap_or(true);
     let limit_raw = commit_limit.unwrap_or(5);
     let limit = usize::try_from(limit_raw).unwrap_or(0);
 
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     let agent_out =
@@ -2227,8 +2228,8 @@ pub async fn whois(
     // Fetch recent commits from the git archive if requested
     let recent_commits = if include_commits && limit > 0 {
         let config = &Config::get();
-        match mcp_agent_mail_storage::ensure_archive(config, &project.slug) {
-            Ok(archive) => {
+        match mcp_agent_mail_storage::open_archive(config, &project.slug) {
+            Ok(Some(archive)) => {
                 // Project-relative: get_recent_commits applies the
                 // projects/<slug>/ repo prefix itself.
                 let path_filter = format!("agents/{}", agent_row.name);
@@ -2253,7 +2254,7 @@ pub async fn whois(
             }
             Ok(None) => Vec::new(),
             Err(e) => {
-                tracing::warn!("Failed to ensure archive for commits: {e}");
+                tracing::warn!("Failed to open archive for commits: {e}");
                 Vec::new()
             }
         }
@@ -2507,22 +2508,6 @@ mod tests {
             semantic_readiness: g(false),
             archive_db_parity: g(true),
             doctor_readiness: g(false),
-        }
-    }
-
-    fn test_timeout_diagnostics() -> TimeoutDiagnosticsResponse {
-        TimeoutDiagnosticsResponse {
-            client_deadline_ms: 30_000,
-            coalescer_degraded_p99_bound_ms: 15_000,
-            contended_path: "no_monitored_stage_exceeded_budget".into(),
-            stage_exceeded_client_deadline: false,
-            pool_acquire_p99_ms: 0,
-            database_write_p99_ms: 0,
-            archive_wbq_p99_ms: 0,
-            archive_commit_p99_ms: 0,
-            blocking_dispatch_inflight: 0,
-            blocking_dispatch_zombies: 0,
-            blocking_dispatch_timeouts_total: 0,
         }
     }
 
@@ -3912,7 +3897,7 @@ body
     }
 
     #[test]
-    fn list_agents_uses_archive_snapshot_when_live_db_is_stale() {
+    fn list_agents_uses_live_read_lane_when_archive_is_ahead() {
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");
         let db_path = temp.path().join("stale-list-agents.sqlite3");
@@ -3948,14 +3933,12 @@ body
                 rt.block_on(async {
                     let cx = Cx::for_testing();
                     let ctx = McpContext::new(cx.clone(), 1);
-                    let response = list_agents(&ctx, "/archive-project".to_string(), None, None)
-                        .await
-                        .expect("list_agents should succeed");
-                    let value: serde_json::Value =
-                        serde_json::from_str(&response).expect("parse list_agents json");
-                    let agents = value.as_array().expect("agents array");
-                    assert_eq!(agents.len(), 1);
-                    assert_eq!(agents[0]["name"], "Alice");
+                    assert!(
+                        list_agents(&ctx, "/archive-project".to_string(), None, None)
+                            .await
+                            .is_err(),
+                        "an archive-only project must not be reconstructed by a read request"
+                    );
                 });
             },
         );

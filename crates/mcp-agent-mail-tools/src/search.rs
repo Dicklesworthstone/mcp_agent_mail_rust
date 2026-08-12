@@ -16,7 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::llm;
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_read_db_pool, legacy_tool_error, resolve_project,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_read_db_pool,
+    legacy_tool_error, resolve_existing_project, resolve_project,
 };
 
 const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
@@ -922,8 +923,8 @@ pub async fn search_messages(
         &[("date_to", date_to), ("before", before), ("until", until)],
     )?;
 
-    let pool = get_read_db_pool(ctx.cx()).await?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     phase.mark("scope_resolution");
 

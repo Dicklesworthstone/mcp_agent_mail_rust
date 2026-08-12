@@ -53,6 +53,12 @@ fn parse_bool_param(v: &str) -> bool {
 const RESOURCE_LIMIT_MAX: usize = 10_000;
 /// Default number of rows when no `limit` query parameter is supplied.
 const RESOURCE_LIMIT_DEFAULT: usize = 20;
+/// Largest supported offset for resource pagination.  Keeping this bounded
+/// avoids turning an untrusted URI into a pathological SQLite scan.
+const RESOURCE_OFFSET_MAX: usize = 1_000_000;
+/// Reservation entries require per-pattern activity enrichment, so their
+/// resource page is intentionally much smaller than generic list resources.
+const FILE_RESERVATION_RESOURCE_LIMIT_MAX: usize = 250;
 
 /// Parse the `limit` query parameter from a resource URI.
 ///
@@ -70,6 +76,19 @@ fn parse_resource_limit(query: &HashMap<String, String>) -> usize {
                 usize::try_from(v).map_or(RESOURCE_LIMIT_MAX, |u| u.min(RESOURCE_LIMIT_MAX))
             }
         })
+}
+
+/// Parse the optional zero-based `offset` for resource pagination.
+///
+/// Missing, malformed, and negative offsets fall back to the first page;
+/// positive offsets are clamped to a deliberately finite scan window.
+fn parse_resource_offset(query: &HashMap<String, String>) -> usize {
+    query
+        .get("offset")
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
+        .min(RESOURCE_OFFSET_MAX)
 }
 
 fn parse_resource_since_ts(query: &HashMap<String, String>) -> McpResult<Option<i64>> {
@@ -245,6 +264,7 @@ impl ResourceReadPool {
         }
     }
 
+    #[cfg(test)]
     fn snapshot(snapshot: Arc<crate::archive_read::SharedSnapshot>) -> Self {
         Self {
             pool: snapshot.pool(),
@@ -261,6 +281,7 @@ impl std::ops::Deref for ResourceReadPool {
     }
 }
 
+#[cfg(test)]
 fn open_resource_read_pool(
     cx: &asupersync::Cx,
 ) -> Result<Option<ResourceReadPool>, crate::archive_read::AcquireError> {
@@ -329,6 +350,7 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
 }
 
+#[allow(dead_code)]
 fn resource_live_database_missing_without_archive_state() -> bool {
     let config = Config::from_env();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
@@ -350,25 +372,15 @@ fn resource_live_database_missing_without_archive_state() -> bool {
 }
 
 // Intentionally async despite containing no awaits: this is the resource
-// handlers' pool contract and every caller awaits it. The underlying
-// archive-read gate wait is deliberately thread-blocking since GH#203
-// (runtime timers are not pumped under the sync dispatch bridge).
+// handlers' pool contract and every caller awaits it. Resource reads always
+// use the existing live query-only lane; they never acquire the archive-read
+// gate or wait behind an archive/write coalescer.
 #[allow(clippy::unused_async)]
 async fn get_resource_db_pool(cx: &asupersync::Cx) -> McpResult<ResourceReadPool> {
-    match open_resource_read_pool(cx) {
-        Ok(Some(pool)) => Ok(pool),
-        Ok(None) => open_live_resource_read_pool(),
-        Err(crate::archive_read::AcquireError::Cancelled) => Err(McpError::request_cancelled()),
-        Err(crate::archive_read::AcquireError::Busy(message)) => {
-            Err(db_error_to_mcp_error(DbError::ResourceBusy(message)))
-        }
-        Err(crate::archive_read::AcquireError::TimedOut(message)) => Err(db_error_to_mcp_error(
-            DbError::ResourceBusy(format!("archive snapshot timed out: {message}")),
-        )),
-        Err(crate::archive_read::AcquireError::Failed(message)) => {
-            Err(resource_sync_db_error_to_mcp_error(message))
-        }
+    if cx.is_cancel_requested() {
+        return Err(McpError::request_cancelled());
     }
+    open_live_resource_read_pool()
 }
 
 async fn acquire_resource_conn(
@@ -2184,13 +2196,7 @@ pub struct ProjectDetailResponse {
 )]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug, _query) = split_param_and_query(&slug);
-    let pool = match get_resource_db_pool(ctx.cx()).await {
-        Ok(pool) => pool,
-        Err(_) if resource_live_database_missing_without_archive_state() => {
-            return Err(resource_project_not_found_error());
-        }
-        Err(err) => return Err(err),
-    };
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug).await?;
 
@@ -4426,6 +4432,9 @@ fn reservation_row_is_active_at(
 }
 
 /// Get file reservations for a project.
+///
+/// Historical listings are paged with `limit` (default 20, max 250) and a
+/// zero-based `offset`; callers advance the offset by the page limit.
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://file_reservations/{slug}",
@@ -4457,230 +4466,22 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let workspace_rel = repo_info.as_ref().map(|(_, rel)| rel.as_path());
     let workspace_available = workspace.is_some();
 
-    // Cleanup: release any expired (TTL) reservations and any stale reservations.
-    //
-    // Parity with Python: this resource is allowed to perform best-effort cleanup.
-    //
-    // The mutations must NOT run on the resource pool: since GH#198 that pool
-    // is query-only (or an immutable snapshot), and a release attempt there
-    // fails with "attempt to write a readonly database" — which, propagated,
-    // turned this read surface into an error (br-lwwq5 surfaced this once the
-    // gate starvation was fixed). Cleanup writes take the normal write-path
-    // lease instead; if the mailbox cannot take writes right now, best-effort
-    // means serving the listing without cleanup, not failing the read.
-    let write_pool = crate::tool_util::get_db_pool().ok();
-    let cleanup_pool = write_pool.as_deref();
-    let mut released_ids: Vec<i64> = Vec::with_capacity(8);
+    // Resource reads remain strictly read-only: a listing must not acquire a
+    // write/coalescer lease for TTL or stale-reservation cleanup.  Lifecycle
+    // cleanup belongs to explicit reservation write paths.  Apply the page in
+    // SQLite before the per-row mail/filesystem/git enrichment below.
+    let limit = parse_resource_limit(&query).min(FILE_RESERVATION_RESOURCE_LIMIT_MAX);
+    let offset = parse_resource_offset(&query);
 
-    // We only need agents map + mail cache for stale evaluation.
-    let agent_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-    let agent_by_id: HashMap<i64, mcp_agent_mail_db::AgentRow> = agent_rows
-        .iter()
-        .filter_map(|row| row.id.map(|id| (id, row.clone())))
-        .collect();
-
-    let mut mail_activity_cache: HashMap<i64, Option<i64>> =
-        HashMap::with_capacity(agent_rows.len());
-    let mut pattern_activity_cache: HashMap<String, ReservationPatternActivity> =
-        HashMap::with_capacity(16);
-
-    // Cleanup only needs unreleased rows (including expired). Released history is unbounded and
-    // scanning it on every resource read can time out on long-lived projects.
-    let all_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_unreleased_file_reservations(ctx.cx(), &pool, project_id)
-            .await,
-    )?;
-
-    // Expire TTL-elapsed reservations (released_ts=NULL AND expires_ts <= now).
-    for row in all_rows.iter().filter(|r| r.expires_ts <= now_micros) {
-        let Some(write_db) = cleanup_pool else { break };
-        let Some(id) = row.id else { continue };
-        let updated = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::force_release_reservation(
-                ctx.cx(),
-                write_db,
-                id,
-                Some(row.expires_ts),
-            )
-            .await,
-        )?;
-        if updated == 0 {
-            continue;
-        }
-        released_ids.push(id);
-    }
-
-    // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
-    for row in all_rows.iter().filter(|r| r.expires_ts > now_micros) {
-        let Some(write_db) = cleanup_pool else { break };
-        let Some(id) = row.id else { continue };
-        let agent_last_active = agent_by_id
-            .get(&row.agent_id)
-            .map(|agent| agent.last_active_ts);
-        let agent_missing = agent_last_active.is_none();
-        let agent_inactive =
-            agent_last_active.is_none_or(|ts| now_micros.saturating_sub(ts) > inactivity_micros);
-
-        let mail_activity = if let Some(val) = mail_activity_cache.get(&row.agent_id) {
-            *val
-        } else {
-            let out = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::get_agent_last_mail_activity(
-                    ctx.cx(),
-                    &pool,
-                    row.agent_id,
-                    project_id,
-                )
-                .await,
-            )?;
-            mail_activity_cache.insert(row.agent_id, out);
-            out
-        };
-        let recent_mail =
-            mail_activity.is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
-
-        // When the holder agent's row is gone (DB pruned, never registered, etc.) the
-        // reservation is orphaned: there is no live owner to coordinate with. We must
-        // release the row regardless of workspace availability, since fs/git signals
-        // cannot tell us anything useful about a non-existent owner. Without this
-        // path, orphaned reservations become permanent phantoms that block other
-        // agents until expires_ts elapses.
-        if agent_missing && !recent_mail {
-            let updated = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::force_release_reservation(
-                    ctx.cx(),
-                    write_db,
-                    id,
-                    Some(row.expires_ts),
-                )
-                .await,
-            )?;
-            if updated > 0 {
-                released_ids.push(id);
-            }
-            continue;
-        }
-
-        if !workspace_available {
-            continue;
-        }
-
-        let pat_activity = if let Some(val) = pattern_activity_cache.get(&row.path_pattern) {
-            val.clone()
-        } else {
-            let path_pattern = row.path_pattern.clone();
-            let workspace_clone = workspace.as_deref().map(std::path::PathBuf::from);
-            let repo_root_clone = repo_root.map(std::path::PathBuf::from);
-            let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
-
-            let computed = asupersync::runtime::spawn_blocking(move || {
-                reservation_compute_pattern_activity(
-                    workspace_clone.as_deref(),
-                    repo_root_clone.as_deref(),
-                    workspace_rel_clone.as_deref(),
-                    &path_pattern,
-                )
-            })
-            .await;
-            pattern_activity_cache.insert(row.path_pattern.clone(), computed.clone());
-            computed
-        };
-        let recent_fs = pat_activity
-            .fs_activity_micros
-            .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
-        let recent_git = pat_activity
-            .git_activity_micros
-            .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
-
-        let stale = agent_inactive && !(recent_mail || recent_fs || recent_git);
-        if !stale {
-            continue;
-        }
-
-        let updated = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::force_release_reservation(
-                ctx.cx(),
-                write_db,
-                id,
-                Some(row.expires_ts),
-            )
-            .await,
-        )?;
-        if updated == 0 {
-            continue;
-        }
-
-        released_ids.push(id);
-    }
-    // The cleanup mutations are done; release the write lease before the
-    // read-only artifact lookups and the final listing.
-    drop(write_pool);
-
-    // Best-effort archive artifact writes for any releases.
-    if !released_ids.is_empty() {
-        let released_rows = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::get_reservations_by_ids(ctx.cx(), &pool, &released_ids)
-                .await,
-        )?;
-        let mut release_payloads: Vec<serde_json::Value> = Vec::with_capacity(released_rows.len());
-        for row in released_rows {
-            let Some(id) = row.id else { continue };
-            let Some(released_ts) = row.released_ts else {
-                tracing::warn!(
-                    project = project.slug.as_str(),
-                    reservation_id = id,
-                    "skipping reservation release artifact with missing released_ts"
-                );
-                continue;
-            };
-            let agent_name = agent_by_id.get(&row.agent_id).map_or_else(
-                || format!("[unknown-agent-{}]", row.agent_id),
-                |a| a.name.clone(),
-            );
-
-            release_payloads.push(serde_json::json!({
-                "id": id,
-                "project": project.human_key.clone(),
-                "agent": agent_name,
-                "path_pattern": row.path_pattern,
-                "exclusive": row.exclusive != 0,
-                "reason": row.reason,
-                "created_ts": micros_to_iso(row.created_ts),
-                "expires_ts": micros_to_iso(row.expires_ts),
-                "released_ts": micros_to_iso(released_ts),
-            }));
-        }
-
-        if release_payloads.is_empty() {
-            tracing::warn!(
-                project = project.slug.as_str(),
-                "reservation cleanup released rows but none were eligible for archive artifacts"
-            );
-        } else {
-            let op = mcp_agent_mail_storage::WriteOp::FileReservation {
-                project_slug: project.slug.clone(),
-                config: config.clone(),
-                reservations: release_payloads,
-            };
-            crate::messaging::try_dispatch_archive_write(
-                op,
-                &format!(
-                    "reservation release artifacts archive write project={}",
-                    project.slug
-                ),
-            );
-        }
-    }
-
-    // List file reservations for the resource output after cleanup.
+    // List only the requested reservation page for the resource output.
     let mut rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_file_reservations(
+        mcp_agent_mail_db::queries::list_file_reservations_page(
             ctx.cx(),
             &pool,
             project_id,
             active_only,
+            limit,
+            offset,
         )
         .await,
     )?;
@@ -4690,8 +4491,18 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         retain_active_file_reservations(&mut rows, now_micros);
     }
 
-    // Match Python ordering: created_ts asc (id is usually insertion order but not guaranteed).
-    rows.sort_by_key(|r| r.created_ts);
+    let agent_ids: Vec<i64> = rows.iter().map(|row| row.agent_id).collect();
+    let agent_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &agent_ids).await,
+    )?;
+    let agent_by_id: HashMap<i64, mcp_agent_mail_db::AgentRow> = agent_rows
+        .into_iter()
+        .filter_map(|row| row.id.map(|id| (id, row)))
+        .collect();
+    let mut mail_activity_cache: HashMap<i64, Option<i64>> =
+        HashMap::with_capacity(agent_by_id.len());
+    let mut pattern_activity_cache: HashMap<String, ReservationPatternActivity> =
+        HashMap::with_capacity(rows.len());
 
     let mut reservations: Vec<FileReservationResourceEntry> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -4805,9 +4616,11 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     }
 
     tracing::debug!(
-        "Getting file reservations for project {} (active_only: {})",
+        "Getting file reservations for project {} (active_only: {}, limit: {}, offset: {})",
         slug_str,
-        active_only
+        active_only,
+        limit,
+        offset
     );
 
     serde_json::to_string(&reservations)
@@ -6839,6 +6652,51 @@ mod resource_shape_tests {
     }
 
     #[test]
+    fn file_reservations_historical_reads_apply_limit_and_offset_in_sql() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let project_key = format!("/tmp/resources-page-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let agent_id = agent.id.unwrap_or(0);
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["first/**", "second/**", "third/**"],
+                    3600,
+                    true,
+                    "pagination test",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create reservations failed: {other:?}"),
+                };
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = file_reservations(
+                    &ctx,
+                    format!("{}?active_only=false&limit=1&offset=1", project.slug),
+                )
+                .await
+                .expect("file reservations page");
+                let entries = parse_json(&payload);
+                let entries = entries.as_array().expect("reservations array");
+                assert_eq!(entries.len(), 1, "resource output must honor its page limit");
+                assert_eq!(
+                    entries[0]["id"].as_i64(),
+                    created.get(1).and_then(|row| row.id),
+                    "resource offset must be applied before row enrichment"
+                );
+            });
+        });
+    }
+
+    #[test]
     fn file_reservations_missing_workspace_does_not_release_stale_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
@@ -6915,7 +6773,7 @@ mod resource_shape_tests {
     }
 
     #[test]
-    fn file_reservations_release_orphaned_holder_rows_when_other_signals_are_stale() {
+    fn file_reservations_read_does_not_release_orphaned_holder_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
                 let pool = seed_pool();
@@ -6983,7 +6841,7 @@ mod resource_shape_tests {
                 assert_eq!(entries[0]["id"].as_i64(), Some(reservation_id));
                 let expected_holder = format!("[unknown-agent-{holder_id}]");
                 assert_eq!(entries[0]["agent"].as_str(), Some(expected_holder.as_str()));
-                assert!(entries[0]["released_ts"].is_string());
+                assert!(entries[0]["released_ts"].is_null());
                 assert!(
                     entries[0]["stale_reasons"]
                         .as_array()
@@ -7004,8 +6862,8 @@ mod resource_shape_tests {
                     .find(|row| row.id == Some(reservation_id))
                     .expect("reservation row");
                 assert!(
-                    row.released_ts.is_some(),
-                    "orphaned stale row should auto-release"
+                    row.released_ts.is_none(),
+                    "a resource read must not auto-release an orphaned row"
                 );
             });
         });
@@ -7069,7 +6927,7 @@ mod resource_shape_tests {
     }
 
     #[test]
-    fn file_reservations_cleanup_artifacts_use_authoritative_release_timestamps() {
+    fn file_reservations_read_does_not_release_expired_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
                 mcp_agent_mail_storage::wbq_start();
@@ -7127,32 +6985,11 @@ mod resource_shape_tests {
                     other => panic!("get_reservations_by_ids failed: {other:?}"),
                 };
 
-                let config = mcp_agent_mail_core::Config::from_env();
-                let archive = mcp_agent_mail_storage::open_archive(&config, &project.slug)
-                    .expect("open archive")
-                    .expect("archive should exist");
+                assert!(
+                    rows.iter().all(|row| row.released_ts.is_none()),
+                    "a resource read must not release expired reservations"
+                );
 
-                for row in rows {
-                    let id = row.id.expect("released reservation id");
-                    let released_ts = row.released_ts.expect("released_ts should be recorded");
-                    let reservation_dir = archive.root.join("file_reservations");
-                    let artifact_path =
-                        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
-                            &reservation_dir,
-                            id,
-                        )
-                        .expect("locate released reservation artifact");
-                    let artifact_text =
-                        std::fs::read_to_string(&artifact_path).expect("read reservation artifact");
-                    let artifact_json: Value =
-                        serde_json::from_str(&artifact_text).expect("parse reservation artifact");
-                    let released_iso = micros_to_iso(released_ts);
-                    assert_eq!(
-                        artifact_json["released_ts"].as_str(),
-                        Some(released_iso.as_str()),
-                        "artifact should persist the DB-authoritative release timestamp"
-                    );
-                }
             });
         });
     }
@@ -7211,7 +7048,7 @@ mod resource_shape_tests {
     }
 
     #[test]
-    fn resources_use_archive_snapshot_when_live_db_is_stale() {
+    fn resources_read_the_live_query_only_lane_when_archive_is_ahead() {
         with_serialized_resources(|| {
             run_async(|cx: Cx| async move {
                 let ctx = McpContext::new(cx.clone(), 1);
@@ -7219,27 +7056,10 @@ mod resource_shape_tests {
 
                 let projects = parse_json(&projects_list(&ctx).await.expect("projects list"));
                 let projects_array = projects.as_array().expect("projects array");
-                assert_eq!(projects_array.len(), 1, "expected archive-backed project");
-                assert_eq!(projects_array[0]["slug"], "ahead-project");
-                assert_eq!(projects_array[0]["human_key"], "/ahead-project");
-
-                let agents = parse_json(
-                    &agents_list(&ctx, "/ahead-project".to_string())
-                        .await
-                        .expect("agents list"),
-                );
-                assert_eq!(agents["project"]["slug"], "ahead-project");
-                // The archive fixture contains Alice's `profile.json` plus a
-                // message she addressed to Bob.  `reconstruct_from_archive`
-                // synthesizes an agent row for Bob so the `message_recipients`
-                // foreign key is satisfiable — so the archive snapshot legitimately
-                // reports both agents.  The contract we're verifying is that the
-                // archive drives the snapshot (Alice must appear), not that Alice
-                // is the *only* agent surfaced.
-                let agents_array = agents["agents"].as_array().expect("agents array");
+                assert!(projects_array.is_empty(), "archive state must not replace the live read lane");
                 assert!(
-                    agents_array.iter().any(|entry| entry["name"] == "Alice"),
-                    "expected Alice (from archive profile.json) in snapshot: {agents_array:?}"
+                    agents_list(&ctx, "/ahead-project".to_string()).await.is_err(),
+                    "an archive-only project must not be reconstructed on a resource read"
                 );
 
                 let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
@@ -7271,7 +7091,7 @@ mod resource_shape_tests {
     }
 
     #[test]
-    fn resources_use_archive_snapshot_without_creating_missing_live_db() {
+    fn resources_refuse_missing_live_db_without_creating_it() {
         with_serialized_resources(|| {
             run_async(|cx: Cx| async move {
                 let ctx = McpContext::new(cx.clone(), 1);
@@ -7281,10 +7101,10 @@ mod resource_shape_tests {
                     "fixture must leave the live sqlite path absent before the resource read"
                 );
 
-                let projects = parse_json(&projects_list(&ctx).await.expect("projects list"));
-                let projects_array = projects.as_array().expect("projects array");
-                assert_eq!(projects_array.len(), 1, "expected archive-backed project");
-                assert_eq!(projects_array[0]["slug"], "ahead-project");
+                assert!(
+                    projects_list(&ctx).await.is_err(),
+                    "resource reads must not reconstruct a missing live database from archive state"
+                );
 
                 assert!(
                     !db_path.exists(),
@@ -7957,6 +7777,21 @@ mod query_param_tests {
         let mut query = HashMap::new();
         query.insert("limit".to_string(), "10000".to_string());
         assert_eq!(parse_resource_limit(&query), 10_000);
+    }
+
+    #[test]
+    fn parse_resource_offset_defaults_and_clamps() {
+        assert_eq!(parse_resource_offset(&HashMap::new()), 0);
+
+        let mut query = HashMap::new();
+        query.insert("offset".to_string(), "37".to_string());
+        assert_eq!(parse_resource_offset(&query), 37);
+
+        query.insert("offset".to_string(), "-1".to_string());
+        assert_eq!(parse_resource_offset(&query), 0);
+
+        query.insert("offset".to_string(), i64::MAX.to_string());
+        assert_eq!(parse_resource_offset(&query), RESOURCE_OFFSET_MAX);
     }
 
     #[test]

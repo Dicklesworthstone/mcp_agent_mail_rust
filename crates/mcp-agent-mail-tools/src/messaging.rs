@@ -23,9 +23,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_agent,
-    resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool,
+    get_db_pool, get_read_db_pool, legacy_tool_error, parse_attachment_metadata_json,
+    parse_recipients_lists, resolve_agent, resolve_existing_project, resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
@@ -3328,10 +3328,12 @@ pub async fn fetch_inbox(
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
-    // Use archive-aware read pool so that inbox reads fall back to archive
-    // snapshots when the live SQLite is suspect (DegradedReadOnly).
-    let read_pool = get_read_db_pool(ctx.cx()).await?;
-    let project = resolve_project(ctx, &read_pool, &project_key).await?;
+    // Fetching must return from the live query-only lane without waiting for
+    // archive reconstruction or the write-behind coalescer.  The optional
+    // read-receipt update below targets the live SQLite path directly after
+    // this bounded read has completed.
+    let read_pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_agent(
@@ -3524,9 +3526,7 @@ pub async fn fetch_inbox(
     // must leave read state untouched.
     if mark_read.unwrap_or(true) && !messages.is_empty() {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        let write_path = get_db_pool()
-            .ok()
-            .map(|live_pool| live_pool.sqlite_path().to_string());
+        let write_path = Some(read_pool.sqlite_path().to_string());
         if let Some(ref live_sqlite_path) = write_path {
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,

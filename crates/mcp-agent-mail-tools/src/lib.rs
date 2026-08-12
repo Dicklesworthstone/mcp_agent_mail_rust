@@ -746,6 +746,15 @@ pub mod tool_util {
             .map_err(|error| McpError::internal_error(error.to_string()))
     }
 
+    /// Open the live mailbox through the query-only lane used by request-path
+    /// reads that must not wait for archive reconciliation or the write-behind
+    /// coalescer.  The caller receives only an existing SQLite connection:
+    /// this path never starts migrations, recovery, reconciliation, or a
+    /// writer-generation transition.
+    pub(crate) fn get_coalescer_bypass_read_db_pool() -> McpResult<DbPool> {
+        get_live_read_db_pool()
+    }
+
     /// Reuse a hot authoritative live pool for health reads without advancing
     /// the writer generation. An initialized mailbox whose pool has merely
     /// been dropped (the pool cache holds weak references) opens through the
@@ -1305,6 +1314,28 @@ pub mod tool_util {
         pool: &DbPool,
         project_key: &str,
     ) -> McpResult<mcp_agent_mail_db::ProjectRow> {
+        resolve_project_with_mode(ctx, pool, project_key, true).await
+    }
+
+    /// Resolve a project that must already exist without allowing a read
+    /// request to create it.  This is the companion to the query-only read
+    /// lane: absolute project keys are looked up by `human_key` rather than
+    /// flowing through `ensure_project`.
+    pub async fn resolve_existing_project(
+        ctx: &McpContext,
+        pool: &DbPool,
+        project_key: &str,
+    ) -> McpResult<mcp_agent_mail_db::ProjectRow> {
+        resolve_project_with_mode(ctx, pool, project_key, false).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn resolve_project_with_mode(
+        ctx: &McpContext,
+        pool: &DbPool,
+        project_key: &str,
+        allow_create: bool,
+    ) -> McpResult<mcp_agent_mail_db::ProjectRow> {
         // 1. Empty/whitespace check
         if project_key.is_empty() || project_key.trim().is_empty() {
             return Err(legacy_tool_error(
@@ -1355,8 +1386,11 @@ pub mod tool_util {
         // the scoped path so the cache key matches the pool the SQL will
         // actually run against.
         let is_absolute = std::path::Path::new(raw_identifier).is_absolute();
-        let out = if is_absolute {
+        let out = if is_absolute && allow_create {
             mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, raw_identifier).await
+        } else if is_absolute {
+            mcp_agent_mail_db::queries::get_project_by_human_key(ctx.cx(), pool, raw_identifier)
+                .await
         } else {
             mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), pool, raw_identifier).await
         };
