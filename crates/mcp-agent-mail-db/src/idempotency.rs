@@ -61,9 +61,19 @@ pub const IDEMPOTENCY_RETENTION_ENV: &str = "AM_IDEMPOTENCY_RETENTION_SECS";
 /// fall back to [`DEFAULT_IDEMPOTENCY_RETENTION_SECS`].
 #[must_use]
 pub fn idempotency_retention_secs() -> i64 {
-    std::env::var(IDEMPOTENCY_RETENTION_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
+    parse_retention_secs(std::env::var(IDEMPOTENCY_RETENTION_ENV).ok().as_deref())
+}
+
+/// Pure parse of a retention override value (the testable core, so unit tests
+/// never mutate process env — `std::env::set_var` is `unsafe` under edition 2024
+/// and this crate `#![forbid(unsafe_code)]`).
+///
+/// A non-positive or unparseable value falls back to
+/// [`DEFAULT_IDEMPOTENCY_RETENTION_SECS`] so an override can never disable
+/// retention (which would let a legitimate in-window retry double-apply).
+#[must_use]
+fn parse_retention_secs(raw: Option<&str>) -> i64 {
+    raw.and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|secs| *secs > 0)
         .unwrap_or(DEFAULT_IDEMPOTENCY_RETENTION_SECS)
 }
@@ -163,40 +173,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retention_defaults_to_24h() {
-        // SAFETY: single-threaded test; we restore the prior value.
-        let prior = std::env::var(IDEMPOTENCY_RETENTION_ENV).ok();
-        unsafe { std::env::remove_var(IDEMPOTENCY_RETENTION_ENV) };
-        assert_eq!(
-            idempotency_retention_secs(),
-            DEFAULT_IDEMPOTENCY_RETENTION_SECS
-        );
+    fn retention_parse_defaults_and_overrides() {
+        // Test the pure parser directly — no process-env mutation, so this stays
+        // within `#![forbid(unsafe_code)]` and never races parallel tests.
         assert_eq!(DEFAULT_IDEMPOTENCY_RETENTION_SECS, 86_400);
-        if let Some(v) = prior {
-            unsafe { std::env::set_var(IDEMPOTENCY_RETENTION_ENV, v) };
-        }
-    }
-
-    #[test]
-    fn retention_env_override_is_honored() {
-        let prior = std::env::var(IDEMPOTENCY_RETENTION_ENV).ok();
-        unsafe { std::env::set_var(IDEMPOTENCY_RETENTION_ENV, "3600") };
-        assert_eq!(idempotency_retention_secs(), 3600);
-        // Non-positive / garbage falls back to the default (never disables retention).
-        unsafe { std::env::set_var(IDEMPOTENCY_RETENTION_ENV, "0") };
+        // Missing override -> default.
+        assert_eq!(parse_retention_secs(None), DEFAULT_IDEMPOTENCY_RETENTION_SECS);
+        // A valid positive override is honored (trimmed).
+        assert_eq!(parse_retention_secs(Some("3600")), 3600);
+        assert_eq!(parse_retention_secs(Some("  7200  ")), 7200);
+        // Non-positive / unparseable falls back to the default (never disables
+        // retention, which would let a legitimate in-window retry double-apply).
         assert_eq!(
-            idempotency_retention_secs(),
+            parse_retention_secs(Some("0")),
             DEFAULT_IDEMPOTENCY_RETENTION_SECS
         );
-        unsafe { std::env::set_var(IDEMPOTENCY_RETENTION_ENV, "not-a-number") };
         assert_eq!(
-            idempotency_retention_secs(),
+            parse_retention_secs(Some("-5")),
             DEFAULT_IDEMPOTENCY_RETENTION_SECS
         );
-        match prior {
-            Some(v) => unsafe { std::env::set_var(IDEMPOTENCY_RETENTION_ENV, v) },
-            None => unsafe { std::env::remove_var(IDEMPOTENCY_RETENTION_ENV) },
-        }
+        assert_eq!(
+            parse_retention_secs(Some("not-a-number")),
+            DEFAULT_IDEMPOTENCY_RETENTION_SECS
+        );
+        assert_eq!(
+            parse_retention_secs(Some("")),
+            DEFAULT_IDEMPOTENCY_RETENTION_SECS
+        );
     }
 
     #[test]
