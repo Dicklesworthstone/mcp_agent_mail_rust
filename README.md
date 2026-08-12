@@ -489,6 +489,12 @@ am serve-http --path api                # Use /api/ transport instead of /mcp/
 am --help                               # Full operator CLI
 ```
 
+When an interactive `am` finds a healthy Agent Mail service already serving the
+configured endpoint, it attaches a read-only terminal view to that service's
+`/mail/ws-state` snapshot. It does not stop or restart the service, acquire a
+mutation lock, or run service-control commands. `--takeover` remains the
+explicit opt-in for a local replacement.
+
 ### Dual-Mode Interface
 
 This project keeps MCP server and CLI command surfaces separate:
@@ -511,7 +517,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 
 | Surface | Subcommands / form | What it is for |
 |---------|--------------------|----------------|
-| Runtime | `serve-http`, `serve-stdio`, `service install|status|logs|restart`, `check-inbox` | Start the server, run stdio MCP, manage a background service, or poll inbox state from hooks/editors |
+| Runtime | `serve-http`, `serve-stdio`, `service install|status|logs|restart`, `check-inbox`, `inbox-events` | Start the server, run stdio MCP, manage a background service, poll inbox state, or resume a durable inbox monitor |
 | Quality gates | `ci`, `verify`, `lint`, `typecheck`, `bench` | Run the native quality pipeline, build-slot-protected verification lanes, and CLI/perf baselines |
 | E2E and determinism | `e2e list|run|show`, `golden capture|verify|list`, `flake-triage scan|reproduce|detect` | Test transports and workflows, guard CLI output contracts, and triage flaky failures |
 | Share and deploy | `share export|update|preview|verify|decrypt|wizard|static-export`, `share deploy validate|tooling|verify|verify-live` | Build portable mailbox bundles, preview them, and validate live static deployments |
@@ -567,6 +573,25 @@ token values.
 | `legacy` | `detect`, `import`, `status` |
 | `service` | `install`, `uninstall`, `status`, `logs`, `restart` |
 
+### Durable Inbox Event Cursors
+
+`am inbox-events` is the CLI for restart-safe inbox monitors. It reads
+append-only, body-free delivery events oldest first; its `--after` value is a
+delivery cursor, never a message ID. Persist `next_cursor` only after the
+corresponding events have been processed.
+
+```bash
+# Establish a durable starting position without consuming events.
+am inbox-events --project /abs/path --agent BlueLake --position-now --format json
+
+# Resume from the last processed delivery cursor.
+am inbox-events --project /abs/path --agent BlueLake --after 42 --limit 100 --format json
+```
+
+Each page includes `events`, `next_cursor`, `has_more`,
+`oldest_available_cursor`, and `tail_cursor`. A cursor below retained history
+returns `CURSOR_EXPIRED`; a cursor beyond the tail returns `CURSOR_AHEAD`.
+
 ---
 
 ## The 39 MCP Tools
@@ -584,6 +609,18 @@ token values.
 | Macros | 4 | `macro_start_session`, `macro_prepare_thread`, `macro_contact_handshake`, `macro_file_reservation_cycle` |
 | Product Bus | 5 | `ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product` |
 | Build Slots | 3 | `acquire_build_slot`, `renew_build_slot`, `release_build_slot` |
+
+`fetch_inbox_events` is the MCP equivalent of `am inbox-events`: it is a
+durable, recipient-scoped delivery feed for monitors, not a replacement for
+message-body inbox reads.
+
+`file_reservation_paths` accepts an optional `idempotency_key` for an exact
+retry after a timeout. The same key and normalized request replay the original
+grant without a second lease or archive write and mark the response
+`idempotent_replay: true`. Reusing a key with different arguments returns
+`IDEMPOTENCY_KEY_CONFLICT`. Keys are scoped to `(project, tool)`, expire after
+the configured retention window, and are optional; this is not a blanket
+idempotency claim for every mutating tool.
 
 ### 25 MCP Resources
 
@@ -641,6 +678,10 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 
 **Themes:** Cyberpunk Aurora, Darcula, Lumen Light, Nordic Frost, High Contrast. Accessibility support includes high-contrast mode and reduced motion.
 Archive Browser note: use `Enter` to expand/preview, `Tab` to switch tree vs preview pane, `/` to filter filenames, and `Ctrl+D/U` for preview paging.
+
+If an interactive `am` attaches to an already running service, this terminal is
+read-only and detaches with `Ctrl-C`; the service keeps serving MCP/API traffic.
+Use an explicit `--takeover` only when replacement is intended.
 
 ---
 
@@ -715,6 +756,21 @@ file_reservation_paths(project_key, agent_name, paths=["src/**"], ttl_seconds=36
 ```
 
 The pre-commit guard (`mcp-agent-mail-guard`) installs as a Git hook and blocks commits that touch files reserved by other agents. Reservations are advisory, TTL-based, and support glob patterns.
+
+New reservation artifacts are named
+`id-<reservation-id>-g<db-generation>.json` and carry the same generation in
+their JSON. This prevents a re-created SQLite database from overwriting an
+older generation's row-id artifact. Readers still recognize legacy
+`id-<reservation-id>.json` artifacts; parity reports stamped artifacts from a
+different live generation as foreign-generation debris rather than current
+reservation drift.
+
+The guard has narrow operational exemptions: `.beads/**` metadata is always
+exempt so shared task-state commits cannot be stranded, and an agent's own
+reservation does not conflict with its commit. Source files reserved by another
+agent remain protected. When no matching mailbox archive can be found (including
+a proven slug collision), the hook emits a warning and allows the commit rather
+than turning stale/missing mailbox state into a universal commit gate.
 
 | Area | Reserve glob |
 |------|-------------|
@@ -928,6 +984,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `AM_TUI_EFFECTS` | `true` | Enable text/animation effects |
 | `AM_TUI_AMBIENT` | `subtle` | Ambient mode (`off`/`subtle`/`full`) |
 | `AM_TUI_FULL_REDRAW_MAX_SECS` | `1.0` | Wall-clock bound (seconds) for a guaranteed full TUI redraw that repairs incremental-diff render desync; `<= 0` disables the bound |
+| `AM_IDEMPOTENCY_RETENTION_SECS` | `86400` | Retention window in seconds for `file_reservation_paths` idempotency keys; invalid or non-positive values fall back to 24 hours |
 | `WORKTREES_ENABLED` | `false` | Build slots feature flag |
 | `INTEGRITY_CHECK_ON_STARTUP` | `true` | Run `PRAGMA integrity_check` during startup self-heal (set `false` to fast-unblock a degraded boot) |
 | `STARTUP_READINESS_BIND_TIMEOUT_SECS` | `20` | Max seconds to wait for DB readiness before binding the listener anyway (`/healthz` stays up while the DB warms) |
@@ -1085,6 +1142,8 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 - **Conformance testing** against the Python reference implementation plus Rust-native extensions
 - **Advisory file reservations** with symmetric fnmatch, archive reading, and rename handling
 - **`#![forbid(unsafe_code)]`** across all crates
+- **Query-only read lane** — direct mailbox reads use an existing live SQLite pool and do not wait for archive reconstruction or write-behind coalescing
+- **Evidence-bearing timeouts** — timeout responses and health output expose the measured stage and latency evidence instead of assigning generic database blame
 - **asupersync exclusively** for all async operations (no Tokio, reqwest, hyper, or axum)
 
 ---
@@ -1174,7 +1233,7 @@ The important boundary is this: Git stores the durable human-auditable artifacts
 
 1. A resource read, robot command, TUI view, or web request asks for mailbox or tooling state.
 2. The server resolves scope: project, agent, product, thread, search query, or tooling view.
-3. For direct state, SQLite answers immediately. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is enabled.
+3. For direct state, an existing live SQLite mailbox answers through a query-only lane; it does not wait for archive reconstruction or the write-behind coalescer, and a read request does not create a missing project. `fetch_inbox` performs its optional read-receipt update separately after the bounded read. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is enabled.
 4. The result is rendered as MCP JSON, robot `toon`/`json`/`md`, TUI widgets, or HTML under `/mail/`.
 
 That consistency comes from a shared DB + archive + metrics pipeline. The TUI, web UI, robot CLI, and MCP resources are separate renderers over the same underlying state.
@@ -1203,6 +1262,7 @@ The dedicated `mcp-agent-mail-search-core` crate exists specifically so search p
 - **TTL instead of forever-locks.** Reservations and build slots expire, which makes the system robust to crashed or vanished agents.
 - **Wrong-surface denial.** MCP-only and CLI-only commands fail deterministically when invoked through the wrong entrypoint, reducing automation footguns.
 - **Idempotent session bootstrapping.** `ensure_project`, `register_agent`, and the session macros are designed so agents can safely retry startup without creating duplicate identity state.
+- **Durable monitor cursors.** Inbox-event consumers advance a recipient delivery cursor only after handling an oldest-first page; a message ID is never a safe cursor substitute.
 - **Contact approval as policy, not convention.** Cross-project messaging is gated by explicit contact workflows and per-agent contact policies.
 
 These are the design rules that let many agents share one checkout without immediately degenerating into chaos.
@@ -1214,6 +1274,7 @@ These are the design rules that let many agents share one checkout without immed
 - **SQLite is the live operational state.** MCP tools, resources, the TUI, the web UI, and robot/CLI reads use SQLite for current inboxes, message IDs, read/ack state, reservations, agents, products, and search planning.
 - **Git is the durable artifact ledger.** Canonical messages, inbox/outbox copies, reservation files, and agent profiles are written as files under per-project archives so the mailbox remains human-auditable and recoverable.
 - **Concurrent writes are queued, not hand-merged.** Parallel agents can send to the same thread at the same time; the server/DB layer serializes the indexed mutations, and the archive write-behind queue plus commit coalescer batches the corresponding Git artifact writes. There is no workflow where two agents create a Git merge conflict and a human resolver has to pick the winning message.
+- **Reservation artifacts have a database generation.** A new physical SQLite database gets a new generation token, so its reservation row IDs cannot overwrite a prior generation's archive artifacts. Foreign stamped artifacts remain inspectable without being treated as live parity drift.
 - **Repair is not reconstruct.** `am doctor repair` is the in-place hygiene path. `am doctor reconstruct` is the archive-first rebuild path when SQLite is no longer trustworthy.
 - **Backups are first-class.** `archive save`, doctor backups, and restore flows all exist because operational recovery is part of the product, not a manual afterthought.
 - **Stale lock cleanup is expected.** Guard hooks, archive lock management, and doctor checks assume agents crash and processes die unexpectedly.
@@ -1468,6 +1529,15 @@ am doctor backups               # List available backups
 am doctor restore /path/to/backup.sqlite3
 ```
 
+`am doctor locks --json` is the read-only owner report. Repair and reconstruct
+refuse a live, wedged, or unsafe-to-touch owner by default. A separate
+`reclaimable` class covers only a zombie or an unresponsive deleted-executable
+owner that has exceeded the idle threshold. For that class alone,
+`am doctor repair --take-ownership` (or `reconstruct --take-ownership`) wins a
+per-mailbox election, rechecks the evidence, moves stale activity-lock files
+into a witnessed quarantine, and then repairs. It never signals or kills the
+owner; all other owner classes still require the supervised drain path.
+
 What `check` inspects:
 
 | Check | Detects |
@@ -1497,10 +1567,13 @@ What `check` inspects:
 | TUI appears **frozen** (render/input stuck, but the process is still serving MCP/API) | Do **not** kill the process. Run the non-interactive freeze escape hatch `am tui-dump --format json`: it returns the same situational snapshot the TUI renders, fetched live from `/mail/ws-state` (including a per-loop liveness verdict that names the stalled loop) and falling back to a local SQLite read if the whole process is wedged. Always exits 0. `am robot health --format json` also classifies the stall and points at the same read-out. If the freeze persists, restart headless: `mcp-agent-mail serve --no-tui`. |
 | TUI shows **garbled / stale cells** (render corruption that clears on resize) | A guaranteed full redraw is bounded by wall clock: `AM_TUI_FULL_REDRAW_MAX_SECS` (default `1.0`s). Lower it (e.g. `0.25`) to repair incremental-diff desync faster, or set `<= 0` to disable the bound. Ensure you are on the latest build — confirm with `am --version` and reinstall via `./install-local.sh` if stale, since render fixes ship in the binary, not the running session. |
 | TUI becomes **mostly blank after running for a while** | Upgrade to `v0.3.21` or later and confirm with `am --version`. Older builds could mistake a healthy 100 ms frame for a missed 16.6 ms budget and then replace most content with an `EssentialOnly` frame. Current builds keep the console at full visual fidelity under load; `am e2e run --project . tui_full_traversal` verifies this against an emulated terminal screen. |
+| `Resource is temporarily busy` | The message includes the activity-lock owner PID, age, mode, subject, and executable when metadata is available. Run the read-only `am doctor locks --json`; do not remove lock files. Stale advisory metadata is reaped only after an exclusive-lock probe proves no kernel holder and records PID/executable liveness evidence. |
+| Interactive `am` while a service is running | It attaches a read-only TUI snapshot and leaves the service running. Restart coordination uses a single mailbox mutex with bounded jittered backoff, so concurrent starts wait for a live peer instead of restart-fighting. Use `--takeover` only for an intentional replacement. |
+| `CURSOR_EXPIRED` from `am inbox-events` | The saved delivery cursor fell below retained history. Start from `--position-now` for a new tail position, or choose a recovery policy using `oldest_available_cursor`; do not substitute a message ID. |
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
-| Tools time out / "Database corruption detected" under heavy load | Run `am robot health --include-host --format json` and read the `host` section. If `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, the problem is **host overload, not mailbox corruption** — relieve host pressure before reconstructing. |
+| Tools time out / "Database corruption detected" under heavy load | Inspect the timeout response or `health_check` timeout diagnostics: they report `contended_path`, whether that stage exceeded the client deadline, p99 pool-acquire/database-write/archive queue/archive-commit latency, and blocking-dispatch occupancy. An unattributed dispatch timeout is reported as such, not blamed on SQLite. Also run `am robot health --include-host --format json`; if `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, relieve host pressure before reconstructing. |
 | `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. Fast unblock: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. |
 | Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
 | `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all --dry-run`. |

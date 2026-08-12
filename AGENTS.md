@@ -647,6 +647,7 @@ All configuration via environment variables. Key variables:
 | `AM_TUI_COACH_HINTS_ENABLED` | `true` | Enable contextual coach-hint toasts |
 | `AM_TUI_EFFECTS` | `true` | Enable ambient text/render effects |
 | `AM_TUI_AMBIENT` | `subtle` | Ambient effects level (`off`/`subtle`/`full`) |
+| `AM_IDEMPOTENCY_RETENTION_SECS` | `86400` | Retention window (seconds) for `file_reservation_paths` retry keys; invalid or non-positive values fall back to 24h |
 | `WORKTREES_ENABLED` | `false` | Build slots feature flag |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
@@ -671,6 +672,8 @@ For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.r
 - **Dual-mode interface** — MCP server and CLI share tools but enforce surface separation
 - **Advisory file reservations** — symmetric fnmatch with archive reading and rename handling
 - **Pre-commit guard** — enforces reservation compliance at `git commit` time
+- **Query-only reads** — direct reads use an existing live SQLite pool and do not wait for archive reconstruction or write-behind coalescing
+- **Honest timeout diagnostics** — timeout replies and health data name the measured bottleneck (or explicit lack of attribution) with p99 latency evidence
 - **asupersync exclusively** — NO tokio/reqwest/hyper. All async via `Cx` + structured concurrency
 - **Structured tracing** throughout — every tool call emits spans with latency
 - **Port discipline** — `127.0.0.1:8765` is canonical, must maintain Python parity
@@ -685,6 +688,11 @@ mcp-agent-mail serve --no-tui             # Headless server (no interactive TUI)
 mcp-agent-mail                            # stdio transport (for MCP client integration)
 am --help                                 # Full operator CLI
 ```
+
+When an interactive `am` finds a healthy Agent Mail service already serving the
+configured endpoint, it attaches read-only to that service's `/mail/ws-state`
+snapshot instead of stopping or restarting it. The attachment takes no mutation
+lock and exits with `Ctrl-C`; `--takeover` remains explicit opt-in replacement.
 
 ### Robot Mode (`am robot`)
 
@@ -789,6 +797,19 @@ Before editing, agents should reserve file paths to avoid conflicts:
 | TUI | `crates/mcp-agent-mail-server/src/tui_*.rs` |
 | CLI/launcher | `crates/mcp-agent-mail-cli/src/**` |
 
+Reservation artifacts from a seeded database use
+`id-<reservation-id>-g<db-generation>.json` and carry `db_generation` in the
+JSON. The generation makes a re-created database's reused row IDs distinct from
+older artifacts. Legacy `id-<reservation-id>.json` artifacts remain readable;
+foreign stamped generations are visible for cleanup but are not current parity
+drift.
+
+The pre-commit guard is deliberately narrow: `.beads/**` is exempt so shared
+task metadata remains committable, and a holder's own lease does not conflict
+with that holder. It still blocks source paths under another agent's active
+exclusive reservation. If no matching archive exists, it warns and allows
+rather than making missing mailbox state a universal commit gate.
+
 ---
 
 ## MCP Agent Mail — Multi-Agent Coordination
@@ -813,6 +834,12 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
    ```
    file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)
    ```
+   For an exact retry after a timeout, `file_reservation_paths` alone accepts a
+   stable optional `idempotency_key`. Reusing that key with the same normalized
+   request replays the grant with `idempotent_replay: true`; different arguments
+   return `IDEMPOTENCY_KEY_CONFLICT`. Keys are scoped to `(project, tool)` and
+   retained for `AM_IDEMPOTENCY_RETENTION_SECS` (24h by default). Do not imply
+   that every mutating tool currently exposes this key.
 
 3. **Communicate with threads:**
    ```
@@ -826,6 +853,10 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
    resource://inbox/{Agent}?project=<abs-path>&limit=20
    resource://thread/{id}?project=<abs-path>&include_bodies=true
    ```
+   For restart-safe monitoring, use `fetch_inbox_events` or
+   `am inbox-events --project <abs-path> --agent <Agent> --after <cursor>`.
+   Events are body-free and oldest-first. Persist `next_cursor` only after
+   handling its page; `after` is a delivery cursor, never a message ID.
 
 ### Macros vs Granular Tools
 
@@ -836,7 +867,29 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 
 - `"from_agent not registered"`: Always `register_agent` in the correct `project_key` first
 - `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
+- `CURSOR_EXPIRED` / `CURSOR_AHEAD`: Use `oldest_available_cursor` or `tail_cursor` from `inbox-events`; never replace a delivery cursor with a message ID
 - **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
+
+### Shared Mailbox Lifecycle and Read Safety
+
+- A `Resource is temporarily busy` activity-lock error names the owner PID and
+  age (plus mode, subject, and executable when available) and tells you to run
+  `am doctor locks --json`. That command is read-only; never remove lock files.
+- Stale activity-lock metadata is reaped only after an exclusive-lock probe
+  proves the kernel lock is free. The lock record retains observed PID and
+  executable-liveness evidence rather than treating old metadata as authority
+  to break a live lock.
+- Concurrent server starts share a per-mailbox restart mutex and use bounded
+  PID-jittered backoff while probing for a healthy peer. Do not add external
+  restart loops that fight that coordination.
+- Direct state reads take a query-only live SQLite lane: they do not wait for
+  archive reconstruction or write-behind coalescing, and they do not create a
+  missing project. `fetch_inbox` performs its optional read receipt separately
+  after the read.
+- Timeout replies and health output expose `contended_path`, whether it reached
+  the client deadline, p99 pool/database/archive timings, and blocking-dispatch
+  occupancy. Treat an explicitly unattributed timeout as unattributed; do not
+  label it a database failure without evidence.
 
 ---
 
