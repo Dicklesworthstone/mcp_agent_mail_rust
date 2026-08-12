@@ -719,11 +719,7 @@ pub fn timeout_diagnostics_from_samples(
         }
     }
     let stage_exceeded_budget = slowest_p99_us > 0;
-    if !stage_exceeded_budget
-        && (blocking_dispatch.inflight > 0
-            || blocking_dispatch.zombies > 0
-            || blocking_dispatch.timeouts_total > 0)
-    {
+    if !stage_exceeded_budget && (blocking_dispatch.inflight > 0 || blocking_dispatch.zombies > 0) {
         stage = TimeoutStage::BlockingDispatch;
     }
 
