@@ -10501,19 +10501,45 @@ impl HttpState {
 
         let mut resp = self.handle_inner(req).await;
         apply_security_headers(&mut resp);
+        // The port-ownership probe validates the real MCP POST route even when
+        // bearer auth rejects it. Carry a non-secret signature on every
+        // response so a signed 401 remains identifiable.
+        if !resp.headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case(startup_checks::HEALTH_SIGNATURE_HEADER_NAME)
+        }) {
+            resp.headers.push((
+                startup_checks::HEALTH_SIGNATURE_HEADER_NAME.to_string(),
+                startup_checks::HEALTH_SIGNATURE_HEADER_VALUE.to_string(),
+            ));
+        }
         self.request_diagnostics
             .record_completed(&method_name, &path_for_diag, resp.status);
         let elapsed = start.elapsed();
         let latency_us =
             u64::try_from(elapsed.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+        let dur_ms =
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         metrics.http.record_response(resp.status, latency_us);
+
+        // Clients such as Gemini can show only a blank MCP error. Emit failed
+        // requests even when the optional high-volume request log is disabled;
+        // never include body or authorization data.
+        if resp.status >= 400 {
+            tracing::warn!(
+                event = "http_request_error",
+                method = %method_name,
+                path = %path_for_diag,
+                status = resp.status,
+                duration_ms = dur_ms,
+                client_ip = %client_ip.as_deref().unwrap_or("-"),
+                "HTTP request failed"
+            );
+        }
 
         if !needs_request_log {
             return resp;
         }
 
-        let dur_ms =
-            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         if let Some(dashboard) = dashboard.as_ref()
             && let (Some(method), Some(path), Some(client_ip)) =
                 (method.as_ref(), path.as_ref(), client_ip.as_ref())
@@ -11172,6 +11198,26 @@ impl HttpState {
         if self.config.http_jwt_enabled && self.decode_jwt_with_cx(cx, req).await.is_ok() {
             return None;
         }
+
+        let supplied_authorization = header_value(req, "authorization").is_some();
+        let auth_failure = if self.config.http_bearer_token.is_some() && supplied_authorization {
+            "stale_bearer_token"
+        } else if self.config.http_bearer_token.is_some() {
+            "missing_bearer_token"
+        } else {
+            "invalid_or_missing_jwt"
+        };
+        let client_ip = req
+            .peer_addr
+            .map_or_else(|| "-".to_string(), |addr| addr.ip().to_string());
+        tracing::warn!(
+            event = "http_bearer_auth_rejected",
+            method = %req.method.as_str(),
+            path = %path,
+            client_ip = %client_ip,
+            reason = auth_failure,
+            "HTTP authentication rejected; re-run `am setup status` to check client token drift"
+        );
 
         // D4: For browser HTML routes, return actionable HTML; for
         // machine/browser JSON routes, preserve JSON 401 responses.
