@@ -1715,7 +1715,9 @@ fn collect_project_reservation_artifacts(
         // parse as no id and vanish from the index, manufacturing false
         // missing-artifact anomalies for every current-generation reservation.
         let Some(parsed) =
-            mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename(file_name)
+            mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename(
+                file_name,
+            )
         else {
             continue;
         };

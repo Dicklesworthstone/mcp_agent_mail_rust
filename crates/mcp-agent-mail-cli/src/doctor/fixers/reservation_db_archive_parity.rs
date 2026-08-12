@@ -437,10 +437,12 @@ pub fn fix(
             .join("file_reservations");
         // Idempotent: if the duplicate already vanished between detect and fix,
         // there is nothing to quarantine.
-        let Some(archive_path) = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
-            &reservation_dir,
-            example.reservation_id,
-        ) else {
+        let Some(archive_path) =
+            mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                &reservation_dir,
+                example.reservation_id,
+            )
+        else {
             actions_skipped += 1;
             continue;
         };

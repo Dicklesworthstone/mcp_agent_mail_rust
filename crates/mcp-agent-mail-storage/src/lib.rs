@@ -1139,8 +1139,10 @@ impl ArchiveRetryBacklog {
     }
 
     fn store_depth(&self, queue: &VecDeque<ArchiveBacklogEntry>) {
-        self.depth
-            .store(u64::try_from(queue.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.depth.store(
+            u64::try_from(queue.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Durably journal and enqueue an op. `cap` bounds the in-memory queue; on
@@ -1193,9 +1195,9 @@ impl ArchiveRetryBacklog {
     fn backlog_state(&self) -> (u64, u64) {
         let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-        let oldest = queue
-            .front()
-            .map_or(0, |entry| duration_as_micros_u64(entry.first_enqueued_at.elapsed()));
+        let oldest = queue.front().map_or(0, |entry| {
+            duration_as_micros_u64(entry.first_enqueued_at.elapsed())
+        });
         (depth, oldest)
     }
 
@@ -12023,10 +12025,9 @@ mod tests {
         assert!(res_dir.join("id-42-gab12cd34.json").exists());
         assert!(!res_dir.join("id-42.json").exists());
         // The locator resolves the stamped artifact by id.
-        let located = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
-            &res_dir, 42,
-        )
-        .expect("locate stamped artifact");
+        let located =
+            mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(&res_dir, 42)
+                .expect("locate stamped artifact");
         assert_eq!(
             located.file_name().and_then(|name| name.to_str()),
             Some("id-42-gab12cd34.json")
@@ -16498,7 +16499,11 @@ mod tests {
                 .count()
             })
         };
-        assert_eq!(journal_count(&journal_dir), 1, "journaled durably before drain");
+        assert_eq!(
+            journal_count(&journal_dir),
+            1,
+            "journaled durably before drain"
+        );
 
         assert!(matches!(
             backlog.drain_step(),
@@ -16600,7 +16605,10 @@ mod tests {
             vec!["a.txt".to_string()],
         );
 
-        assert!(coalescer.pending_requests() >= 1, "enqueue registers pending");
+        assert!(
+            coalescer.pending_requests() >= 1,
+            "enqueue registers pending"
+        );
         std::thread::sleep(Duration::from_millis(3));
         assert!(
             coalescer.oldest_pending_age_us() > 0,

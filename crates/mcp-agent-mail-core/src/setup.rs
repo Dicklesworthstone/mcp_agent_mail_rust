@@ -4356,7 +4356,10 @@ http_headers = { Authorization = "Bearer tok" }
             ),
             "[mcp_servers.mcp_agent_mail]",
             &[
-                ("url".to_string(), "\"http://127.0.0.1:8765/mcp/\"".to_string()),
+                (
+                    "url".to_string(),
+                    "\"http://127.0.0.1:8765/mcp/\"".to_string(),
+                ),
                 ("startup_timeout_sec".to_string(), "15".to_string()),
             ],
         );
