@@ -599,8 +599,11 @@ pub async fn list_contacts(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_read_db_pool(ctx.cx()).await?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Contact listing is a live, read-only surface. It must not reconstruct an
+    // archive snapshot (or wait behind archive coalescing) merely to report a
+    // missing project.
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_agent(
