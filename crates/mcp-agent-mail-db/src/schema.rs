@@ -175,6 +175,45 @@ CREATE TABLE IF NOT EXISTS proof_gate_consumed_nonces (
 );
 CREATE INDEX IF NOT EXISTS idx_proof_nonces_retain_until ON proof_gate_consumed_nonces(retain_until);
 
+-- Client-supplied idempotency keys for mutating tool calls (br-idempotency-keys-...-h0x9k).
+-- A mutating tool call (send_message / reply_message / acknowledge_message /
+-- file_reservation_paths) that carries an `idempotency_key` records the key here
+-- INSIDE the same transaction as the mutation itself, so a client that hits its
+-- 30 s JSON-RPC deadline and retries after the write already committed cannot
+-- double-apply it (grounded in br-hpv61: writes land silently while the client
+-- sees a timeout). Keys are scoped per (project_id, tool) so unrelated tools can
+-- never collide; the composite PRIMARY KEY makes the INSERT the atomic replay
+-- check. `payload_fingerprint` is a hash of the normalized arguments — a retry
+-- with the SAME key but a DIFFERENT payload is a typed conflict, never a silent
+-- apply. `result_json` is the serialized original DB result, replayed verbatim.
+-- `expires_ts` bounds the retention window (default 24 h); expired rows are
+-- pruned on access so the table stays bounded without a background sweeper.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    project_id INTEGER NOT NULL,
+    tool TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_ts INTEGER NOT NULL,
+    expires_ts INTEGER NOT NULL,
+    PRIMARY KEY (project_id, tool, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires ON idempotency_keys(expires_ts);
+
+-- Per-physical-DB generation identity (br-n8qh6). A single row holds a random
+-- hex token minted once, when this database file is first created. It survives
+-- restarts (the row persists) but is re-minted whenever the DB is wiped and
+-- re-created — i.e. exactly at a database *generation* boundary. File
+-- reservation archive artifacts embed this token in their filename
+-- (`id-<id>-g<generation>.json`) so a new generation's rowid-1 artifact can
+-- never overwrite or collide with a prior generation's, and parity/reconstruct
+-- can attribute each archive artifact to the generation that wrote it. The
+-- CHECK pins the table to a single logical row.
+CREATE TABLE IF NOT EXISTS db_identity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    generation_id TEXT NOT NULL
+);
+
 -- FTS5 virtual table for message search
 -- Porter stemmer: run/running/runs → run. Unicode61: Unicode-aware tokenization.
 -- remove_diacritics 2: normalize accented characters. prefix='2 3': fast prefix queries.

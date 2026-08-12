@@ -1030,6 +1030,38 @@ pub struct PoolUtilizationResponse {
 pub struct QueuesHealthResponse {
     pub wbq: WbqQueueHealthResponse,
     pub commit_coalescer: CommitCoalescerHealthResponse,
+    /// Archive-materialization lag: how far the git archive trails the
+    /// authoritative DB (br-ack-fast-storage-commit-reply-3ac88).
+    pub archive_lag: ArchiveLagHealthResponse,
+}
+
+/// Live archive-materialization lag surfaced through `health_check`. The tool
+/// reply is decoupled from git-archive materialization (ack-fast), so this
+/// metric is how operators observe the eventual-consistency window: the age of
+/// the oldest write that is durable in the DB but not yet in the archive, plus
+/// the depth of the durable retry backlog and commit coalescer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveLagHealthResponse {
+    /// Ops in the durable retry backlog (WBQ-unavailable fallback path).
+    pub backlog_depth: u64,
+    /// Age of the oldest op in the retry backlog, milliseconds.
+    pub backlog_oldest_age_ms: u64,
+    /// Enqueued-but-not-committed requests in the commit coalescer.
+    pub coalescer_pending: u64,
+    /// Age of the oldest uncommitted coalescer request, milliseconds.
+    pub coalescer_oldest_age_ms: u64,
+    /// Age of the oldest unmaterialized archive write overall, milliseconds.
+    pub oldest_unmaterialized_ms: u64,
+    /// Lifetime totals for the retry backlog.
+    pub backlog_enqueued_total: u64,
+    pub backlog_drained_total: u64,
+    /// Ops dropped because the retry backlog was full (DB stays authoritative).
+    pub backlog_dropped_total: u64,
+    /// Configured warn/critical bounds (ms) for the oldest-unmaterialized age.
+    pub warn_threshold_ms: u64,
+    pub critical_threshold_ms: u64,
+    /// True when the oldest-unmaterialized age is at/over the warn bound.
+    pub warning: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1180,6 +1212,15 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             .saturating_div(1_000_000)
     };
 
+    // Ack-fast archive-materialization lag (br-ack-fast-storage-commit-reply-3ac88):
+    // tool replies are decoupled from git-archive materialization, so this is the
+    // eventual-consistency window operators watch. Bounds degrade health_level so a
+    // stuck archive can never read fully green (acceptance criterion (b)).
+    let archive_lag = mcp_agent_mail_storage::archive_lag_snapshot();
+    let archive_lag_warn_us = mcp_agent_mail_storage::archive_lag_warn_threshold_us();
+    let archive_lag_critical_us = mcp_agent_mail_storage::archive_lag_critical_threshold_us();
+    let archive_lag_oldest_us = archive_lag.oldest_unmaterialized_us;
+
     // Refresh the cached health level (pressure-derived) from live metrics.
     let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
 
@@ -1197,6 +1238,14 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // process. Never report fully green readiness in that state (status stays
     // "ok" — it is degraded, not down — but health_level drops to at least yellow).
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
+        effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Yellow);
+    }
+    // Archive lag past the configured bounds degrades readiness (never green)
+    // without flipping the top-level `status` to "error": a lagging archive is
+    // eventual-consistency degradation, not a down critical subsystem.
+    if archive_lag_oldest_us >= archive_lag_critical_us {
+        effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Red);
+    } else if archive_lag_oldest_us >= archive_lag_warn_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Yellow);
     }
     let failing_verdicts = verdicts.failing_names();
@@ -1280,6 +1329,19 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     latency_p99_ms: us_to_ms_ceil(metrics.storage.commit_queue_latency_us.p99),
                     over_80_for_s: commit_over_80_for_s,
                     warning: commit_over_80_for_s >= 300,
+                },
+                archive_lag: ArchiveLagHealthResponse {
+                    backlog_depth: archive_lag.backlog_depth,
+                    backlog_oldest_age_ms: us_to_ms_ceil(archive_lag.backlog_oldest_age_us),
+                    coalescer_pending: archive_lag.coalescer_pending,
+                    coalescer_oldest_age_ms: us_to_ms_ceil(archive_lag.coalescer_oldest_age_us),
+                    oldest_unmaterialized_ms: us_to_ms_ceil(archive_lag_oldest_us),
+                    backlog_enqueued_total: archive_lag.enqueued_total,
+                    backlog_drained_total: archive_lag.drained_total,
+                    backlog_dropped_total: archive_lag.dropped_total,
+                    warn_threshold_ms: archive_lag_warn_us.div_ceil(1_000),
+                    critical_threshold_ms: archive_lag_critical_us.div_ceil(1_000),
+                    warning: archive_lag_oldest_us >= archive_lag_warn_us,
                 },
             }
         }),

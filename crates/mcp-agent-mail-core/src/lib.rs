@@ -59,6 +59,7 @@ pub mod metrics;
 pub mod models;
 pub mod pane_identity;
 pub mod pattern_overlap;
+pub mod reservation_artifact;
 pub mod search_types;
 pub mod setup;
 pub mod slo;

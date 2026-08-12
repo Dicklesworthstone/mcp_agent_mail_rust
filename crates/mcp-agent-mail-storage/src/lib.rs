@@ -867,6 +867,615 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Durable archive retry backlog (br-ack-fast-storage-commit-reply-3ac88)
+// ---------------------------------------------------------------------------
+//
+// Ack-fast decoupling: a mutating tool call must return as soon as its SQLite
+// row is durable; git-archive materialization is strictly asynchronous. The
+// write-behind queue (WBQ) already moves archive writes off the request thread,
+// but when the WBQ is momentarily unavailable (channel full past the enqueue
+// deadline, or the drain thread wedged) the previous fallback ran
+// `write_op_sync` INLINE ON THE REQUEST THREAD — re-coupling the tool reply to
+// git/coalescer latency (the p99 17-24 s tail measured in br-hpv61).
+//
+// This backlog replaces that inline fallback with a durable retry queue drained
+// by a dedicated background thread:
+//   * `archive_backlog_push` is non-blocking for the reply path except for a
+//     single small local-disk journal write (bounded by fsync, NOT git) so the
+//     op survives a crash — the tool reply is never gated on the archive.
+//   * A dedicated `archive-backlog-drain` thread retries `wbq_enqueue`; after a
+//     bounded number of failed re-enqueues it materializes the op with
+//     `write_op_sync` ON THE BACKLOG THREAD (never the request thread).
+//   * Each queued op is journaled to `<storage_root>/.archive_backlog/` and the
+//     journal entry is removed only once the op is materialized, so a process
+//     killed after the DB commit but before the archive write re-materializes
+//     the message on restart via `archive_backlog_recover` (messages have no
+//     DB->archive reconcile-on-read, unlike reservations, so the journal is the
+//     crash-safety mechanism).
+//   * On backlog overflow (or a journal-write failure) the op is dropped: the
+//     DB row stays authoritative and the loss is bounded and surfaced via the
+//     `dropped_total` counter and the archive-lag health metric.
+
+/// Default cap on ops held in the archive retry backlog before overflow drops
+/// the op (DB stays authoritative). Overridable via `AM_ARCHIVE_BACKLOG_CAP`.
+const ARCHIVE_BACKLOG_CAP_DEFAULT: u64 = 8_192;
+/// Poll interval for the drain thread while the backlog is non-empty and the
+/// WBQ is refusing re-enqueue.
+const ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS: u64 = 100;
+/// Idle poll interval for the drain thread while the backlog is empty.
+const ARCHIVE_BACKLOG_IDLE_INTERVAL_MS: u64 = 500;
+/// Upper bound on the drain thread's per-entry retry backoff.
+const ARCHIVE_BACKLOG_MAX_BACKOFF_MS: u64 = 5_000;
+/// Default warn/critical bounds (milliseconds) for the oldest-unmaterialized
+/// archive write age surfaced through `health_check`.
+const ARCHIVE_LAG_WARN_MS_DEFAULT: u64 = 5_000;
+const ARCHIVE_LAG_CRITICAL_MS_DEFAULT: u64 = 30_000;
+
+fn archive_backlog_cap() -> u64 {
+    config::env_value("AM_ARCHIVE_BACKLOG_CAP")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(ARCHIVE_BACKLOG_CAP_DEFAULT)
+}
+
+/// Configured warn bound (microseconds) for the oldest-unmaterialized archive
+/// write age. Overridable via `AM_ARCHIVE_LAG_WARN_MS`.
+#[must_use]
+pub fn archive_lag_warn_threshold_us() -> u64 {
+    config::env_value("AM_ARCHIVE_LAG_WARN_MS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(ARCHIVE_LAG_WARN_MS_DEFAULT)
+        .saturating_mul(1_000)
+}
+
+/// Configured critical bound (microseconds) for the oldest-unmaterialized
+/// archive write age. Overridable via `AM_ARCHIVE_LAG_CRITICAL_MS`.
+#[must_use]
+pub fn archive_lag_critical_threshold_us() -> u64 {
+    config::env_value("AM_ARCHIVE_LAG_CRITICAL_MS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(ARCHIVE_LAG_CRITICAL_MS_DEFAULT)
+        .saturating_mul(1_000)
+}
+
+/// Outcome of pushing an op onto the archive retry backlog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveBacklogPush {
+    /// The op was durably queued for background retry.
+    Queued,
+    /// The backlog was at capacity; the op was dropped. The DB row remains
+    /// authoritative (parity tooling reports the drift as DB-ahead).
+    Dropped,
+}
+
+/// A `WriteOp` payload stripped of its runtime `Config` so the backlog journal
+/// stays small and serializable; the `Config` is rehydrated from `Config::get()`
+/// (or the recovery config) at drain/replay time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum PersistedWriteOp {
+    MessageBundle {
+        project_slug: String,
+        message_json: serde_json::Value,
+        body_md: String,
+        sender: String,
+        recipients: Vec<String>,
+        extra_paths: Vec<String>,
+    },
+    AgentProfile {
+        project_slug: String,
+        agent_json: serde_json::Value,
+    },
+    FileReservation {
+        project_slug: String,
+        reservations: Vec<serde_json::Value>,
+    },
+    NotificationSignal {
+        project_slug: String,
+        agent_name: String,
+        metadata: Option<NotificationMessage>,
+    },
+    ClearSignal {
+        project_slug: String,
+        agent_name: String,
+    },
+}
+
+impl PersistedWriteOp {
+    fn from_op(op: &WriteOp) -> Self {
+        match op {
+            WriteOp::MessageBundle {
+                project_slug,
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                extra_paths,
+                ..
+            } => Self::MessageBundle {
+                project_slug: project_slug.clone(),
+                message_json: message_json.clone(),
+                body_md: body_md.clone(),
+                sender: sender.clone(),
+                recipients: recipients.clone(),
+                extra_paths: extra_paths.clone(),
+            },
+            WriteOp::AgentProfile {
+                project_slug,
+                agent_json,
+                ..
+            } => Self::AgentProfile {
+                project_slug: project_slug.clone(),
+                agent_json: agent_json.clone(),
+            },
+            WriteOp::FileReservation {
+                project_slug,
+                reservations,
+                ..
+            } => Self::FileReservation {
+                project_slug: project_slug.clone(),
+                reservations: reservations.clone(),
+            },
+            WriteOp::NotificationSignal {
+                project_slug,
+                agent_name,
+                metadata,
+                ..
+            } => Self::NotificationSignal {
+                project_slug: project_slug.clone(),
+                agent_name: agent_name.clone(),
+                metadata: metadata.clone(),
+            },
+            WriteOp::ClearSignal {
+                project_slug,
+                agent_name,
+                ..
+            } => Self::ClearSignal {
+                project_slug: project_slug.clone(),
+                agent_name: agent_name.clone(),
+            },
+        }
+    }
+
+    fn into_op(self, config: Config) -> WriteOp {
+        match self {
+            Self::MessageBundle {
+                project_slug,
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                extra_paths,
+            } => WriteOp::MessageBundle {
+                project_slug,
+                config,
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                extra_paths,
+            },
+            Self::AgentProfile {
+                project_slug,
+                agent_json,
+            } => WriteOp::AgentProfile {
+                project_slug,
+                config,
+                agent_json,
+            },
+            Self::FileReservation {
+                project_slug,
+                reservations,
+            } => WriteOp::FileReservation {
+                project_slug,
+                config,
+                reservations,
+            },
+            Self::NotificationSignal {
+                project_slug,
+                agent_name,
+                metadata,
+            } => WriteOp::NotificationSignal {
+                config,
+                project_slug,
+                agent_name,
+                metadata,
+            },
+            Self::ClearSignal {
+                project_slug,
+                agent_name,
+            } => WriteOp::ClearSignal {
+                config,
+                project_slug,
+                agent_name,
+            },
+        }
+    }
+}
+
+struct ArchiveBacklogEntry {
+    op: WriteOp,
+    /// On-disk journal file backing this entry (None if journaling was disabled
+    /// or the journal write failed; then the entry is in-memory only).
+    journal_path: Option<PathBuf>,
+    /// Monotonic enqueue instant, used for the archive-lag age. Reset on
+    /// recovery (the pre-crash age is not recoverable and not worth persisting).
+    first_enqueued_at: Instant,
+    attempts: u32,
+}
+
+struct ArchiveRetryBacklog {
+    queue: Mutex<VecDeque<ArchiveBacklogEntry>>,
+    drain_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    lifecycle: Mutex<()>,
+    depth: AtomicU64,
+    enqueued_total: AtomicU64,
+    drained_total: AtomicU64,
+    dropped_total: AtomicU64,
+}
+
+static ARCHIVE_BACKLOG: LazyLock<ArchiveRetryBacklog> = LazyLock::new(|| ArchiveRetryBacklog {
+    queue: Mutex::new(VecDeque::new()),
+    drain_handle: Mutex::new(None),
+    lifecycle: Mutex::new(()),
+    depth: AtomicU64::new(0),
+    enqueued_total: AtomicU64::new(0),
+    drained_total: AtomicU64::new(0),
+    dropped_total: AtomicU64::new(0),
+});
+
+/// Per-process monotonic sequence for journal filenames. Combined with a
+/// wall-clock prefix so filenames sort in enqueue order and never collide with
+/// leftover files from a previous process.
+static ARCHIVE_BACKLOG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
+    config.storage_root.join(".archive_backlog")
+}
+
+/// Borrow the runtime `Config` carried by any `WriteOp` variant.
+fn write_op_config(op: &WriteOp) -> &Config {
+    match op {
+        WriteOp::MessageBundle { config, .. }
+        | WriteOp::AgentProfile { config, .. }
+        | WriteOp::FileReservation { config, .. }
+        | WriteOp::NotificationSignal { config, .. }
+        | WriteOp::ClearSignal { config, .. } => config,
+    }
+}
+
+fn archive_backlog_write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Durably journal an op; returns the final journal path, or `None` if
+/// journaling is unavailable (the entry then lives in memory only and heals via
+/// reconcile on the next successful drain or is bounded-lost on crash).
+fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
+    let dir = archive_backlog_journal_dir_for(write_op_config(op));
+    if let Err(error) = fs::create_dir_all(&dir) {
+        tracing::warn!(
+            error = %error,
+            dir = %dir.display(),
+            "archive backlog: cannot create journal dir; entry is in-memory only"
+        );
+        return None;
+    }
+    let persisted = PersistedWriteOp::from_op(op);
+    let bytes = match serde_json::to_vec(&persisted) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "archive backlog: journal serialize failed; in-memory only");
+            return None;
+        }
+    };
+    let seq = ARCHIVE_BACKLOG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let final_path = dir.join(format!("{:020}-{seq:010}.json", now_micros_u64()));
+    let tmp_path = final_path.with_extension("json.tmp");
+    if let Err(error) = archive_backlog_write_tmp(&tmp_path, &bytes) {
+        tracing::warn!(error = %error, "archive backlog: journal write failed; in-memory only");
+        let _ = fs::remove_file(&tmp_path);
+        return None;
+    }
+    if let Err(error) = fs::rename(&tmp_path, &final_path) {
+        tracing::warn!(error = %error, "archive backlog: journal rename failed; in-memory only");
+        let _ = fs::remove_file(&tmp_path);
+        return None;
+    }
+    Some(final_path)
+}
+
+fn archive_backlog_journal_remove(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(
+                error = %error,
+                path = %path.display(),
+                "archive backlog: journal remove failed (cleaned on next recover)"
+            );
+        }
+    }
+}
+
+fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
+    let _lifecycle = backlog.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let handle = backlog
+            .drain_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if handle.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+    }
+    let handle = std::thread::Builder::new()
+        .name("archive-backlog-drain".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
+        .spawn(move || archive_backlog_drain_loop(backlog))
+        .unwrap_or_else(|error| panic!("failed to spawn archive-backlog-drain thread: {error}"));
+    *backlog
+        .drain_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+}
+
+/// Background drain loop. Single drainer, so the front entry is stable across
+/// the unlocked `write_op_sync` call (only pushes append to the back). Never
+/// returns; a panic is caught by `ensure_drain`'s respawn.
+///
+/// Materialization is via `write_op_sync` (NOT `wbq_enqueue`): the write-behind
+/// queue is in-memory, so handing the op back to it and dropping the journal
+/// would re-expose the crash gap. `write_op_sync` writes the archive files
+/// synchronously (durable on return) and enqueues the git commit into the async
+/// coalescer, so the journal entry is removed only once the artifact is durable
+/// on disk — while the git commit still batches. This runs on the backlog
+/// thread, never the request thread, so the tool reply stays decoupled.
+fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
+    loop {
+        let front = {
+            let queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue
+                .front()
+                .map(|entry| (entry.op.clone(), entry.attempts, entry.journal_path.clone()))
+        };
+        let Some((op, attempts, journal_path)) = front else {
+            std::thread::sleep(Duration::from_millis(ARCHIVE_BACKLOG_IDLE_INTERVAL_MS));
+            continue;
+        };
+
+        match write_op_sync(&op) {
+            Ok(()) => {
+                let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
+                queue.pop_front();
+                let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                drop(queue);
+                backlog.depth.store(depth, Ordering::Relaxed);
+                backlog.drained_total.fetch_add(1, Ordering::Relaxed);
+                if let Some(path) = journal_path {
+                    archive_backlog_journal_remove(&path);
+                }
+                // Fall through immediately to the next entry (no sleep) for fast drain.
+            }
+            Err(error) => {
+                let next_attempts = attempts.saturating_add(1);
+                tracing::warn!(
+                    error = %error,
+                    attempts = next_attempts,
+                    "archive backlog: materialization failed; will retry (journal retained)"
+                );
+                {
+                    let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(front) = queue.front_mut() {
+                        front.attempts = next_attempts;
+                    }
+                }
+                let backoff = ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS
+                    .saturating_mul(u64::from(next_attempts.min(50)))
+                    .min(ARCHIVE_BACKLOG_MAX_BACKOFF_MS);
+                std::thread::sleep(Duration::from_millis(backoff));
+            }
+        }
+    }
+}
+
+/// Durably queue an archive write op for strictly-asynchronous background retry.
+///
+/// This is the ack-fast replacement for the inline `write_op_sync` fallback used
+/// when the write-behind queue is unavailable: the reply path incurs at most one
+/// small local-disk journal fsync (not a git commit), then returns.
+pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
+    let backlog = &*ARCHIVE_BACKLOG;
+    let cap = archive_backlog_cap();
+    {
+        let queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if u64::try_from(queue.len()).unwrap_or(u64::MAX) >= cap {
+            drop(queue);
+            backlog.dropped_total.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                cap,
+                "archive retry backlog full; dropping archive op (DB authoritative; \
+                 parity report may show DB-ahead until operator backfills)"
+            );
+            return ArchiveBacklogPush::Dropped;
+        }
+    }
+    // Journal outside the queue lock: the fsync must not stall other pushers.
+    let journal_path = archive_backlog_journal_write(&op);
+    let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
+    queue.push_back(ArchiveBacklogEntry {
+        op,
+        journal_path,
+        first_enqueued_at: Instant::now(),
+        attempts: 0,
+    });
+    let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+    drop(queue);
+    backlog.depth.store(depth, Ordering::Relaxed);
+    backlog.enqueued_total.fetch_add(1, Ordering::Relaxed);
+    archive_backlog_ensure_drain(backlog);
+    ArchiveBacklogPush::Queued
+}
+
+/// Re-enqueue journaled archive writes left behind by a process that was killed
+/// after the DB commit but before the archive materialized. Idempotent and safe
+/// to call at every boot; message re-materialization is path-keyed by message id
+/// so a replay after a partially-written bundle rewrites the same files (never a
+/// duplicate).
+pub fn archive_backlog_recover(config: &Config) {
+    let dir = archive_backlog_journal_dir_for(config);
+    let read_dir = match fs::read_dir(&dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %error,
+                    dir = %dir.display(),
+                    "archive backlog: cannot scan journal dir during recovery"
+                );
+            }
+            return;
+        }
+    };
+    let mut files: Vec<PathBuf> = read_dir
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+
+    let backlog = &*ARCHIVE_BACKLOG;
+    let mut recovered = 0u64;
+    for path in files {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(error = %error, path = %path.display(), "archive backlog: unreadable journal entry");
+                continue;
+            }
+        };
+        let persisted: PersistedWriteOp = match serde_json::from_slice(&bytes) {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %path.display(),
+                    "archive backlog: corrupt journal entry; quarantining"
+                );
+                let _ = fs::rename(&path, path.with_extension("corrupt"));
+                continue;
+            }
+        };
+        let op = persisted.into_op(config.clone());
+        {
+            let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.push_back(ArchiveBacklogEntry {
+                op,
+                journal_path: Some(path),
+                first_enqueued_at: Instant::now(),
+                attempts: 0,
+            });
+            let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+            backlog.depth.store(depth, Ordering::Relaxed);
+        }
+        recovered = recovered.saturating_add(1);
+    }
+    if recovered > 0 {
+        backlog
+            .enqueued_total
+            .fetch_add(recovered, Ordering::Relaxed);
+        tracing::warn!(
+            recovered,
+            "archive backlog: recovered pending archive writes from journal after restart"
+        );
+        archive_backlog_ensure_drain(backlog);
+    }
+}
+
+/// Current number of ops waiting in the archive retry backlog.
+#[must_use]
+pub fn archive_backlog_depth() -> u64 {
+    ARCHIVE_BACKLOG.depth.load(Ordering::Relaxed)
+}
+
+/// Block until the archive retry backlog drains to empty or the timeout elapses.
+/// Returns true if it fully drained. Test/shutdown helper.
+#[must_use]
+pub fn archive_backlog_flush_blocking(timeout: Duration) -> bool {
+    let backlog = &*ARCHIVE_BACKLOG;
+    archive_backlog_ensure_drain(backlog);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if backlog
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Live archive-materialization lag: how far the git archive trails the
+/// authoritative DB. `oldest_unmaterialized_us` is the age of the oldest write
+/// that has landed in the DB but not yet in the archive (max of the retry
+/// backlog and the commit coalescer), and the depth counters are the current
+/// unmaterialized-write backlog. Surfaced via `health_check` (br-hpv61 ask #1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveLagSnapshot {
+    /// Ops in the durable retry backlog (WBQ-unavailable fallback path).
+    pub backlog_depth: u64,
+    /// Age (microseconds) of the oldest op in the retry backlog, 0 if empty.
+    pub backlog_oldest_age_us: u64,
+    /// Enqueued-but-not-committed requests in the commit coalescer.
+    pub coalescer_pending: u64,
+    /// Age (microseconds) of the oldest uncommitted coalescer request, 0 if none.
+    pub coalescer_oldest_age_us: u64,
+    /// Age (microseconds) of the oldest unmaterialized archive write overall.
+    pub oldest_unmaterialized_us: u64,
+    /// Lifetime count of ops queued into the retry backlog.
+    pub enqueued_total: u64,
+    /// Lifetime count of ops materialized out of the retry backlog (each via an
+    /// off-request-path `write_op_sync` on the backlog thread).
+    pub drained_total: u64,
+    /// Lifetime count of ops dropped because the retry backlog was full.
+    pub dropped_total: u64,
+}
+
+/// Snapshot the live archive-materialization lag for `health_check`.
+#[must_use]
+pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
+    let backlog = &*ARCHIVE_BACKLOG;
+    let (backlog_depth, backlog_oldest_age_us) = {
+        let queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+        let oldest = queue
+            .front()
+            .map_or(0, |entry| duration_as_micros_u64(entry.first_enqueued_at.elapsed()));
+        (depth, oldest)
+    };
+    let (coalescer_pending, coalescer_oldest_age_us) = COMMIT_COALESCER.get().map_or((0, 0), |c| {
+        (c.pending_requests(), c.oldest_pending_age_us())
+    });
+    ArchiveLagSnapshot {
+        backlog_depth,
+        backlog_oldest_age_us,
+        coalescer_pending,
+        coalescer_oldest_age_us,
+        oldest_unmaterialized_us: backlog_oldest_age_us.max(coalescer_oldest_age_us),
+        enqueued_total: backlog.enqueued_total.load(Ordering::Relaxed),
+        drained_total: backlog.drained_total.load(Ordering::Relaxed),
+        dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
+    }
+}
+
 /// Failure modes for delivering a control message (`Flush`/`Shutdown`) to the
 /// drain thread within a bounded deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3466,6 +4075,39 @@ impl CommitCoalescer {
         }
 
         self.force_flush.store(false, Ordering::Release);
+    }
+
+    /// Current number of archive requests enqueued but not yet committed to git.
+    #[must_use]
+    pub fn pending_requests(&self) -> u64 {
+        self.pending_requests.load(Ordering::Relaxed)
+    }
+
+    /// Age (microseconds) of the oldest archive request still waiting to be
+    /// committed across all per-repo queues and spill buffers, or 0 if none.
+    /// Used by [`archive_lag_snapshot`] to report commit-lag as unmaterialized
+    /// archive age.
+    #[must_use]
+    pub fn oldest_pending_age_us(&self) -> u64 {
+        let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        let mut oldest: Option<Instant> = None;
+        for rq in repos.values() {
+            {
+                let queue = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(front) = queue.front() {
+                    oldest = Some(oldest.map_or(front.enqueued_at, |o| o.min(front.enqueued_at)));
+                }
+            }
+            {
+                let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(repo) = spill.inner.as_ref() {
+                    oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
+                        o.min(repo.earliest_enqueued_at)
+                    }));
+                }
+            }
+        }
+        oldest.map_or(0, |instant| duration_as_micros_u64(instant.elapsed()))
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -6182,9 +6824,21 @@ pub fn write_file_reservation_records(
         write_json(&legacy_path, &normalized, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &legacy_path)?);
 
-        // Stable per-reservation artifact: id-<id>.json
+        // Stable per-reservation artifact, keyed by (db_generation, id). The
+        // generation token (br-n8qh6) makes the name unique across DB
+        // generations so a re-created DB's rowid-1 artifact can never overwrite
+        // a prior generation's. A reservation with no `db_generation` (an
+        // unseeded / legacy DB) falls back to the legacy `id-<id>.json` name.
         if let Some(id) = normalized.get("id").and_then(serde_json::Value::as_i64) {
-            let id_path = reservation_dir.join(format!("id-{id}.json"));
+            let generation = normalized
+                .get("db_generation")
+                .and_then(serde_json::Value::as_str)
+                .filter(|generation| !generation.is_empty());
+            let id_path = reservation_dir.join(
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                    generation, id,
+                ),
+            );
             write_json(&id_path, &normalized, true)?;
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
         }
@@ -11299,6 +11953,38 @@ mod tests {
 
         let id_path = res_dir.join("id-42.json");
         assert!(id_path.exists());
+    }
+
+    #[test]
+    fn test_write_file_reservation_record_stamps_generation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let reservation = serde_json::json!({
+            "id": 42,
+            "agent": "TestAgent",
+            "path_pattern": "src/**/*.rs",
+            "exclusive": true,
+            "db_generation": "ab12cd34",
+        });
+
+        write_file_reservation_record(&archive, &config, &reservation).unwrap();
+
+        let res_dir = archive.root.join("file_reservations");
+        // The stable artifact is generation-stamped; the legacy plain id name is
+        // NOT written (a re-created DB generation would otherwise collide on it).
+        assert!(res_dir.join("id-42-gab12cd34.json").exists());
+        assert!(!res_dir.join("id-42.json").exists());
+        // The locator resolves the stamped artifact by id.
+        let located = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+            &res_dir, 42,
+        )
+        .expect("locate stamped artifact");
+        assert_eq!(
+            located.file_name().and_then(|name| name.to_str()),
+            Some("id-42-gab12cd34.json")
+        );
     }
 
     #[test]

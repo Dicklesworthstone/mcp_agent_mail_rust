@@ -48,9 +48,25 @@ pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, co
             // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
         }
         mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-            tracing::warn!("{context}; WBQ unavailable, falling back to direct archive write");
-            if let Err(error) = mcp_agent_mail_storage::write_op_sync(&op) {
-                tracing::warn!(error = %error, "{context}; direct archive write failed");
+            // Ack-fast (br-ack-fast-storage-commit-reply-3ac88): the tool reply must
+            // not wait on archive IO. The old inline `write_op_sync` fallback ran a
+            // synchronous git-archive write ON THIS (request) THREAD, re-coupling the
+            // reply to the coalescer's 17-24 s p99 tail (br-hpv61). Instead, durably
+            // journal the op to the background retry backlog and return immediately;
+            // the DB row is authoritative and the backlog re-materializes the archive
+            // off the request path (and replays it after a crash).
+            match mcp_agent_mail_storage::archive_backlog_push(op) {
+                mcp_agent_mail_storage::ArchiveBacklogPush::Queued => {
+                    tracing::debug!(
+                        "{context}; WBQ unavailable, queued for durable background archive retry"
+                    );
+                }
+                mcp_agent_mail_storage::ArchiveBacklogPush::Dropped => {
+                    tracing::warn!(
+                        "{context}; WBQ unavailable and retry backlog full; archive op dropped \
+                         (DB authoritative; surfaced via archive-lag health metric)"
+                    );
+                }
             }
         }
     }

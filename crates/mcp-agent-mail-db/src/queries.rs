@@ -13,6 +13,10 @@ use crate::models::{
     AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
     MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
 };
+use crate::idempotency::{
+    IdempotencyCheck, IdempotencyClaim, IdempotencyConflict, IdempotentOutcome,
+    idempotency_retention_secs,
+};
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
 use asupersync::{CancelReason, Outcome};
@@ -4282,6 +4286,100 @@ pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, D
 }
 
 // =============================================================================
+// Database generation identity (br-n8qh6)
+// =============================================================================
+
+const SELECT_DB_GENERATION_SQL: &str = "SELECT generation_id FROM db_identity WHERE singleton = 0";
+
+/// Read this database's generation identity token, seeding it on first access.
+///
+/// The token is a per-physical-DB random hex string persisted in the
+/// `db_identity` table. It is minted lazily on the first call against a fresh DB
+/// — a write path, so the very first reservation grant already stamps a
+/// generation into its archive artifact name — and is then stable for the life
+/// of that DB file. When the DB is wiped and re-created (a new *generation*), the
+/// next call mints a fresh token.
+///
+/// Returns `Ok(None)` only when `db_identity` is unavailable (e.g. a hand-rolled
+/// test schema) or the CSPRNG is unavailable, in which case reservation writers
+/// fall back to legacy un-stamped `id-<id>.json` artifact naming. A read/seed
+/// error is never fatal to the caller.
+pub async fn db_generation_id(cx: &Cx, pool: &DbPool) -> Outcome<Option<String>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    // Fast path: already seeded.
+    match traw_query(cx, &tracked, SELECT_DB_GENERATION_SQL, &[]).await {
+        Outcome::Ok(rows) => {
+            if let Some(generation) = rows
+                .first()
+                .and_then(|row| row.get_named::<String>("generation_id").ok())
+                .filter(|generation| !generation.is_empty())
+            {
+                return Outcome::Ok(Some(generation));
+            }
+        }
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+        // Missing table / read error → legacy behavior, not fatal.
+        Outcome::Err(_) => return Outcome::Ok(None),
+    }
+
+    // Seed: mint a token and persist it. INSERT OR IGNORE keeps a concurrent
+    // seeder's value if it landed first, so all writers agree on one token.
+    let Ok(token) = mcp_agent_mail_core::setup::generate_token() else {
+        return Outcome::Ok(None);
+    };
+    match traw_execute(
+        cx,
+        &tracked,
+        "INSERT OR IGNORE INTO db_identity (singleton, generation_id) VALUES (0, ?)",
+        &[Value::Text(token)],
+    )
+    .await
+    {
+        Outcome::Ok(_) => {}
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+        Outcome::Err(_) => return Outcome::Ok(None),
+    }
+
+    // Re-read to return the durable value (ours, or a racing writer's).
+    match traw_query(cx, &tracked, SELECT_DB_GENERATION_SQL, &[]).await {
+        Outcome::Ok(rows) => Outcome::Ok(
+            rows.first()
+                .and_then(|row| row.get_named::<String>("generation_id").ok())
+                .filter(|generation| !generation.is_empty()),
+        ),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Outcome::Err(_) => Outcome::Ok(None),
+    }
+}
+
+/// Read this database's generation identity token from a raw synchronous
+/// connection (read-only; never seeds).
+///
+/// Used by reconstruct and the doctor parity fixer, which hold a `DbConn` that
+/// may be opened immutable. Returns `None` when `db_identity` is absent or
+/// unseeded — callers then treat archive artifacts by their legacy semantics.
+#[must_use]
+pub fn db_generation_id_conn(conn: &crate::DbConn) -> Option<String> {
+    let rows = conn.query_sync(SELECT_DB_GENERATION_SQL, &[]).ok()?;
+    let generation = rows.first()?.get_named::<String>("generation_id").ok()?;
+    if generation.is_empty() {
+        None
+    } else {
+        Some(generation)
+    }
+}
+
+// =============================================================================
 // Agent Queries
 // =============================================================================
 
@@ -5797,7 +5895,7 @@ async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Out
 /// On MVCC write conflicts (`BEGIN CONCURRENT` page collision), the entire
 /// transaction is retried up to `FSQLITE_CONCURRENT_RETRIES` times (default 5)
 /// with exponential backoff (10–200 ms).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients(
     cx: &Cx,
     pool: &DbPool,
@@ -5811,6 +5909,74 @@ pub async fn create_message_with_recipients(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<MessageRow, DbError> {
+    match create_message_with_recipients_impl(
+        cx, pool, project_id, sender_id, subject, body_md, thread_id, importance, ack_required,
+        attachments, recipients, None,
+    )
+    .await
+    {
+        Outcome::Ok(IdempotentOutcome::Fresh(row) | IdempotentOutcome::Replayed(row)) => {
+            Outcome::Ok(row)
+        }
+        // Unreachable without a key: no claim means no prior record to conflict with.
+        Outcome::Ok(IdempotentOutcome::Conflict(_)) => Outcome::Err(DbError::Internal(
+            "create_message_with_recipients: unexpected idempotency conflict without a key"
+                .to_string(),
+        )),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Idempotent variant of [`create_message_with_recipients`]
+/// (br-idempotency-keys-mutating-tools-h0x9k).
+///
+/// The `claim` (project + tool + client key + argument fingerprint) is recorded
+/// together with the serialized result row INSIDE the same transaction as the
+/// message insert. A retry with the same key and byte-identical payload replays
+/// the original message id without inserting a second row
+/// ([`IdempotentOutcome::Replayed`]); a retry with the same key but a different
+/// payload is rejected as [`IdempotentOutcome::Conflict`]. `send_message` and
+/// `reply_message` pass their own tool name so keys are scoped per (project,
+/// tool). See [`crate::idempotency`] for the full contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_message_with_recipients_idempotent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    recipients: &[(i64, &str)],
+    claim: IdempotencyClaim<'_>,
+) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    create_message_with_recipients_impl(
+        cx, pool, project_id, sender_id, subject, body_md, thread_id, importance, ack_required,
+        attachments, recipients, Some(claim),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn create_message_with_recipients_impl(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    recipients: &[(i64, &str)], // (agent_id, kind)
+    idempotency: Option<IdempotencyClaim<'_>>,
+) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     // Use the owned guard because this critical section intentionally spans
     // async database and archive I/O. The borrowed guard is deliberately
     // thread-affine, which would make this public future non-Send.
@@ -5851,6 +6017,8 @@ pub async fn create_message_with_recipients(
     };
     let recipients = deduped_recipients.as_slice();
     let now = now_micros();
+    let idempotency_expires_ts =
+        now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
     let (row, writer_post_commit_counts) = {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
@@ -5889,7 +6057,7 @@ pub async fn create_message_with_recipients(
         };
         let message_id = id_allocator.allocate(db_floor, archive_seed);
 
-        let row = match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
+        let created_outcome = match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
             create_message_with_recipients_tx(
                 cx,
                 &tracked,
@@ -5904,11 +6072,22 @@ pub async fn create_message_with_recipients(
                 recipients,
                 now,
                 message_id,
+                idempotency,
+                idempotency_expires_ts,
             )
         })
         .await
         {
-            Outcome::Ok(created) => {
+            Outcome::Ok(created) => created,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        // A replay or conflict short-circuits: nothing new was written this call,
+        // so the post-commit visibility probe (which re-proves a fresh insert
+        // landed) and the writer-count sample below must be skipped entirely.
+        let row = match created_outcome {
+            IdempotentOutcome::Fresh(created) => {
                 let Some(_message_id) = created.id else {
                     return Outcome::Err(DbError::Internal(
                         "message commit succeeded but returned row has no id".to_string(),
@@ -5916,9 +6095,14 @@ pub async fn create_message_with_recipients(
                 };
                 created
             }
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+            IdempotentOutcome::Replayed(created) => {
+                // `conn` drops on return; the fresh-handle post-commit probe is
+                // deliberately skipped because this call wrote nothing.
+                return Outcome::Ok(IdempotentOutcome::Replayed(created));
+            }
+            IdempotentOutcome::Conflict(info) => {
+                return Outcome::Ok(IdempotentOutcome::Conflict(info));
+            }
         };
 
         let writer_post_commit_counts = if let Some(message_id) = row.id {
@@ -6039,7 +6223,7 @@ pub async fn create_message_with_recipients(
     for agent_id in &recipient_agent_ids {
         cache.invalidate_inbox_stats_scoped(&cache_scope, *agent_id);
     }
-    Outcome::Ok(row)
+    Outcome::Ok(IdempotentOutcome::Fresh(row))
 }
 
 /// Inner transaction body for [`create_message_with_recipients`].
@@ -6061,9 +6245,49 @@ async fn create_message_with_recipients_tx(
     recipients: &[(i64, &str)],
     now: i64,
     message_id: i64,
-) -> Outcome<MessageRow, DbError> {
+    idempotency: Option<IdempotencyClaim<'_>>,
+    idempotency_expires_ts: i64,
+) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
+
+    // Idempotency check (br-idempotency-keys-mutating-tools-h0x9k): if this call
+    // carries a client key, resolve it BEFORE writing anything. A matching
+    // fingerprint replays the stored message id without inserting a second row;
+    // a differing fingerprint aborts as a typed conflict. Both roll back the
+    // (empty) transaction. The authoritative record happens below, in this same
+    // transaction, so a crash can never split the message insert from its key.
+    if let Some(claim) = idempotency {
+        match idempotency_check_in_tx(cx, tracked, claim, now).await {
+            Outcome::Ok(IdempotencyCheck::Proceed) => {}
+            Outcome::Ok(IdempotencyCheck::Replay(result_json)) => {
+                rollback_tx(cx, tracked).await;
+                return match decode_idempotency_result::<MessageRow>(
+                    &result_json,
+                    "create_message_with_recipients",
+                ) {
+                    Ok(row) => Outcome::Ok(IdempotentOutcome::Replayed(row)),
+                    Err(e) => Outcome::Err(e),
+                };
+            }
+            Outcome::Ok(IdempotencyCheck::Conflict(info)) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Ok(IdempotentOutcome::Conflict(info));
+            }
+            Outcome::Err(e) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Panicked(p);
+            }
+        }
+    }
 
     // Fetch recipient names to build recipients_json
     let mut to_names = Vec::new();
@@ -6209,10 +6433,166 @@ async fn create_message_with_recipients_tx(
         rebuild_agents_inbox_stats_in_tx(cx, tracked, &recipient_agent_ids).await
     );
 
+    // Record the idempotency key + serialized result in the SAME transaction as
+    // the message insert, so a crash cannot commit the message without its key
+    // (which would let a retry double-send) nor the key without the message.
+    if let Some(claim) = idempotency {
+        let result_json = match serde_json::to_string(&row) {
+            Ok(json) => json,
+            Err(e) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "idempotency record for {}: result is unserializable: {e}",
+                    claim.tool
+                )));
+            }
+        };
+        try_in_tx!(
+            cx,
+            tracked,
+            idempotency_record_in_tx(cx, tracked, claim, &result_json, now, idempotency_expires_ts)
+                .await
+        );
+    }
+
     // COMMIT (single fsync)
     try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
 
-    Outcome::Ok(row)
+    Outcome::Ok(IdempotentOutcome::Fresh(row))
+}
+
+// ── Idempotency key helpers (br-idempotency-keys-mutating-tools-h0x9k) ───────
+//
+// These operate INSIDE a caller-owned transaction (the caller is responsible
+// for BEGIN/COMMIT/ROLLBACK) so the key record commits atomically with the
+// mutation it guards. See `crate::idempotency` for the durability rationale.
+
+/// Resolve an idempotency claim against `idempotency_keys` inside an already-open
+/// transaction.
+///
+/// Prunes expired rows first (opportunistic GC that keeps the table bounded and
+/// makes an expired key behave as fresh), then looks up `(project, tool, key)`:
+/// absent → [`IdempotencyCheck::Proceed`]; present with a matching fingerprint →
+/// [`IdempotencyCheck::Replay`] carrying the stored result JSON; present with a
+/// different fingerprint → [`IdempotencyCheck::Conflict`].
+async fn idempotency_check_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    claim: IdempotencyClaim<'_>,
+    now: i64,
+) -> Outcome<IdempotencyCheck, DbError> {
+    // Opportunistic prune: expired keys must be treated as fresh, and this keeps
+    // the table bounded without a background sweeper.
+    match map_sql_outcome(
+        traw_execute(
+            cx,
+            tracked,
+            "DELETE FROM idempotency_keys WHERE expires_ts < ?",
+            &[Value::BigInt(now)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(_) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT payload_fingerprint, result_json, created_ts FROM idempotency_keys \
+             WHERE project_id = ? AND tool = ? AND idempotency_key = ?",
+            &[
+                Value::BigInt(claim.project_id),
+                Value::Text(claim.tool.to_string()),
+                Value::Text(claim.key.to_string()),
+            ],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let Some(row) = rows.first() else {
+        return Outcome::Ok(IdempotencyCheck::Proceed);
+    };
+    let stored_fingerprint = row.get_as::<String>(0).unwrap_or_default();
+    let result_json = row.get_as::<String>(1).unwrap_or_default();
+    let original_created_ts = row.get_as::<i64>(2).unwrap_or(0);
+
+    if stored_fingerprint == claim.fingerprint {
+        Outcome::Ok(IdempotencyCheck::Replay(result_json))
+    } else {
+        Outcome::Ok(IdempotencyCheck::Conflict(IdempotencyConflict {
+            tool: claim.tool.to_string(),
+            key: claim.key.to_string(),
+            original_fingerprint: stored_fingerprint,
+            attempted_fingerprint: claim.fingerprint.to_string(),
+            original_created_ts,
+        }))
+    }
+}
+
+/// Record an idempotency key + fingerprint + serialized result inside an
+/// already-open transaction (committing atomically with the mutation).
+///
+/// `ON CONFLICT DO NOTHING`: within one transaction the row is new (the check
+/// ran first); a concurrent transaction that recorded the same key first
+/// surfaces at COMMIT as an MVCC write conflict, which the caller's retry loop
+/// resolves by re-running — the retry's check then replays instead of applying
+/// a duplicate (the same race protocol `consume_proof_nonce` relies on).
+async fn idempotency_record_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    claim: IdempotencyClaim<'_>,
+    result_json: &str,
+    now: i64,
+    expires_ts: i64,
+) -> Outcome<(), DbError> {
+    match map_sql_outcome(
+        traw_execute(
+            cx,
+            tracked,
+            "INSERT INTO idempotency_keys \
+             (project_id, tool, idempotency_key, payload_fingerprint, result_json, created_ts, expires_ts) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(project_id, tool, idempotency_key) DO NOTHING",
+            &[
+                Value::BigInt(claim.project_id),
+                Value::Text(claim.tool.to_string()),
+                Value::Text(claim.key.to_string()),
+                Value::Text(claim.fingerprint.to_string()),
+                Value::Text(result_json.to_string()),
+                Value::BigInt(now),
+                Value::BigInt(expires_ts),
+            ],
+        )
+        .await,
+    ) {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Decode a stored idempotency result blob back into the original result type
+/// for a replay. A decode failure is an internal error: the blob was written by
+/// this same code path, so a mismatch means real corruption, never a client bug.
+fn decode_idempotency_result<T: DeserializeOwned>(
+    result_json: &str,
+    tool: &str,
+) -> Result<T, DbError> {
+    serde_json::from_str::<T>(result_json).map_err(|e| {
+        DbError::Internal(format!(
+            "idempotency replay for {tool}: stored result is undecodable: {e}"
+        ))
+    })
 }
 
 /// Fetch detailed message information for a batch of message IDs.

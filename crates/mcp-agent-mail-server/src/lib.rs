@@ -1535,6 +1535,11 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     disk_monitor::start(config);
     maintenance::start(config);
     mcp_agent_mail_storage::wbq_start();
+    // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88): replay any
+    // archive writes journaled by a process killed after the DB commit but before
+    // materialization. Messages have no DB->archive reconcile-on-read, so this is
+    // their crash-safety path.
+    mcp_agent_mail_storage::archive_backlog_recover(config);
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
@@ -3446,6 +3451,8 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     heal_storage_lock_artifacts(config);
     init_search_bridge(config);
     mcp_agent_mail_storage::wbq_start();
+    // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
+    mcp_agent_mail_storage::archive_backlog_recover(config);
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
@@ -3534,6 +3541,8 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // ── 2. Pre-paint essentials only ────────────────────────────────
     heal_storage_lock_artifacts(config);
     mcp_agent_mail_storage::wbq_start();
+    // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
+    mcp_agent_mail_storage::archive_backlog_recover(config);
     atc::init_global_atc(config);
     start_atc_operator_runtime(config);
 
@@ -4794,6 +4803,20 @@ static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<HealthCountCacheValue>> =
         // CLOCK_MONOTONIC starts from zero.)
         Mutex::new((Instant::now(), None))
     });
+
+/// Cached ATC sidecar footprint snapshot for `/health`. Inspecting the sidecar
+/// includes a real SQLite quick-check and row count, so it must share the
+/// readiness endpoint's short observability cadence rather than run per probe.
+#[derive(Debug, Clone)]
+struct AtcExperienceHealthCacheEntry {
+    database_url: String,
+    health: Option<mcp_agent_mail_db::pool::AtcSidecarHealth>,
+}
+
+type AtcExperienceHealthCacheValue = (Instant, Option<AtcExperienceHealthCacheEntry>);
+
+static ATC_EXPERIENCE_HEALTH_CACHE: std::sync::LazyLock<Mutex<AtcExperienceHealthCacheValue>> =
+    std::sync::LazyLock::new(|| Mutex::new((Instant::now(), None)));
 
 /// TTL for cached semantic readiness validation.
 ///
@@ -10624,6 +10647,8 @@ impl HttpState {
                 enrich_readiness_response(
                     &self.config.database_url,
                     self.config.storage_root.as_path(),
+                    self.config.atc_experience_max_rows,
+                    self.config.atc_write_mode,
                     &mut body,
                 );
                 // Keep generic readiness distinct from the heavier durability
@@ -15242,6 +15267,109 @@ fn health_count(conn: &DbConn, sql: &str) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
+fn fetch_atc_experience_health(
+    database_url: &str,
+) -> Option<mcp_agent_mail_db::pool::AtcSidecarHealth> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let sqlite_path = resolve_server_database_url_sqlite_path(database_url)?;
+    Some(mcp_agent_mail_db::pool::inspect_atc_sidecar_health(
+        sqlite_path.to_string_lossy().as_ref(),
+    ))
+}
+
+fn cached_atc_experience_health(
+    database_url: &str,
+) -> Option<mcp_agent_mail_db::pool::AtcSidecarHealth> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+
+    let guard = lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE);
+    let (last_refresh, cached_entry) = &*guard;
+    let cached_for_database = cached_entry
+        .as_ref()
+        .filter(|entry| entry.database_url == database_url)
+        .cloned();
+    if let Some(entry) = cached_for_database.as_ref()
+        && last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL
+    {
+        return entry.health.clone();
+    }
+
+    drop(guard);
+    let fresh = fetch_atc_experience_health(database_url);
+    let health = fresh.or_else(|| cached_for_database.and_then(|entry| entry.health));
+    *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (
+        Instant::now(),
+        Some(AtcExperienceHealthCacheEntry {
+            database_url: database_url.to_string(),
+            health: health.clone(),
+        }),
+    );
+    health
+}
+
+fn atc_experience_health_json(
+    database_url: &str,
+    atc_experience_max_rows: i64,
+    atc_write_mode: mcp_agent_mail_core::config::AtcWriteMode,
+) -> serde_json::Value {
+    let write_mode = atc_write_mode.to_string();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return serde_json::json!({
+            "storage": "in_memory",
+            "write_mode": write_mode,
+            "row_cap": atc_experience_max_rows,
+            "row_cap_enforced": false,
+            "raw_row_count": serde_json::Value::Null,
+            "sidecar_present": false,
+            "sidecar_bytes": 0,
+            "primary_bytes": 0,
+            "total_bytes": 0,
+            "size_share_basis_points": serde_json::Value::Null,
+            "quick_check": "not_run",
+        });
+    }
+
+    match cached_atc_experience_health(database_url) {
+        Some(health) => {
+            let quick_check = match health.quick_check_ok {
+                Some(true) => "ok",
+                Some(false) => "corrupt",
+                None => "not_run",
+            };
+            serde_json::json!({
+                "storage": "sidecar",
+                "write_mode": write_mode,
+                "row_cap": atc_experience_max_rows,
+                "row_cap_enforced": atc_experience_max_rows > 0,
+                "raw_row_count": health.experience_rows,
+                "sidecar_present": health.present,
+                "sidecar_bytes": health.size_bytes,
+                "primary_bytes": health.primary_size_bytes,
+                "total_bytes": health.total_size_bytes,
+                "size_share_basis_points": health.size_share_basis_points,
+                "quick_check": quick_check,
+            })
+        }
+        None => serde_json::json!({
+            "storage": "unavailable",
+            "write_mode": write_mode,
+            "row_cap": atc_experience_max_rows,
+            "row_cap_enforced": atc_experience_max_rows > 0,
+            "raw_row_count": serde_json::Value::Null,
+            "sidecar_present": false,
+            "sidecar_bytes": serde_json::Value::Null,
+            "primary_bytes": serde_json::Value::Null,
+            "total_bytes": serde_json::Value::Null,
+            "size_share_basis_points": serde_json::Value::Null,
+            "quick_check": "not_run",
+        }),
+    }
+}
+
 /// Enrich a readiness JSON response with database identity metadata so
 /// operators can verify the correct DB file is active at a glance.
 ///
@@ -15252,6 +15380,8 @@ fn health_count(conn: &DbConn, sql: &str) -> Option<u64> {
 fn enrich_readiness_response(
     database_url: &str,
     storage_root: &Path,
+    atc_experience_max_rows: i64,
+    atc_write_mode: mcp_agent_mail_core::config::AtcWriteMode,
     body: &mut serde_json::Value,
 ) {
     // Version — always available at compile time.
@@ -15312,6 +15442,8 @@ fn enrich_readiness_response(
         body["project_count"] = serde_json::Value::Null;
         body["message_count"] = serde_json::Value::Null;
     }
+    body["atc_experience_store"] =
+        atc_experience_health_json(database_url, atc_experience_max_rows, atc_write_mode);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -18602,10 +18734,12 @@ first body
         clear_startup_readiness_fast_path();
         *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
         *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
         let result = f();
         clear_startup_readiness_fast_path();
         *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
         *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
         result
     }
 
@@ -18679,8 +18813,10 @@ first body
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
         let result = f();
         *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        *lock_mutex(&ATC_EXPERIENCE_HEALTH_CACHE) = (Instant::now(), None);
         result
     }
 
@@ -25749,6 +25885,16 @@ first body
                 body.get("message_count").is_some(),
                 "message_count field must be present"
             );
+            assert_eq!(body["atc_experience_store"]["storage"], "in_memory");
+            assert_eq!(body["atc_experience_store"]["write_mode"], "off");
+            assert_eq!(
+                body["atc_experience_store"]["row_cap"],
+                serde_json::json!(50_000)
+            );
+            assert_eq!(
+                body["atc_experience_store"]["row_cap_enforced"],
+                serde_json::json!(false)
+            );
             assert_eq!(body["database_path"], ":memory:");
             assert_eq!(body["durability_state"], "not_probed");
         });
@@ -25768,7 +25914,13 @@ first body
 
             let current_storage = PathBuf::from("/tmp/current-storage");
             let mut body = serde_json::json!({});
-            enrich_readiness_response("sqlite:///:memory:", current_storage.as_path(), &mut body);
+            enrich_readiness_response(
+                "sqlite:///:memory:",
+                current_storage.as_path(),
+                50_000,
+                mcp_agent_mail_core::config::AtcWriteMode::Off,
+                &mut body,
+            );
 
             assert_eq!(body["project_count"], serde_json::json!(0));
             assert_eq!(body["message_count"], serde_json::json!(0));
@@ -25799,7 +25951,13 @@ first body
             );
 
             let mut body = serde_json::json!({});
-            enrich_readiness_response(&database_url, &storage_root, &mut body);
+            enrich_readiness_response(
+                &database_url,
+                &storage_root,
+                50_000,
+                mcp_agent_mail_core::config::AtcWriteMode::Off,
+                &mut body,
+            );
 
             assert_eq!(body["project_count"], serde_json::json!(11));
             assert_eq!(body["message_count"], serde_json::json!(13));
@@ -25810,6 +25968,51 @@ first body
             assert_eq!(entry.database_url, database_url);
             assert_eq!(entry.storage_root, storage_root);
             assert_eq!(entry.counts, expected_counts);
+        });
+    }
+
+    #[test]
+    fn health_atc_experience_store_reports_sidecar_rows_and_size_share() {
+        with_serialized_health_count_cache(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let primary_path = dir.path().join("storage.sqlite3");
+            let primary_path_str = primary_path.to_string_lossy().into_owned();
+            let primary = mcp_agent_mail_db::CanonicalDbConn::open_file(&primary_path_str)
+                .expect("open primary fixture");
+            primary
+                .execute_raw("CREATE TABLE mailbox_fixture (id INTEGER PRIMARY KEY, body TEXT);")
+                .expect("create primary fixture");
+            drop(primary);
+
+            let sidecar_path =
+                mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary_path_str.as_str());
+            let sidecar = mcp_agent_mail_db::CanonicalDbConn::open_file(sidecar_path.as_str())
+                .expect("open ATC sidecar fixture");
+            sidecar
+                .execute_raw("CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT);")
+                .expect("create ATC experience table");
+            sidecar
+                .execute_raw("INSERT INTO atc_experiences (state) VALUES ('resolved');")
+                .expect("seed ATC experience");
+            drop(sidecar);
+
+            let body = atc_experience_health_json(
+                format!("sqlite:///{primary_path_str}").as_str(),
+                2,
+                mcp_agent_mail_core::config::AtcWriteMode::Live,
+            );
+            assert_eq!(body["storage"], "sidecar");
+            assert_eq!(body["write_mode"], "live");
+            assert_eq!(body["row_cap"], serde_json::json!(2));
+            assert_eq!(body["row_cap_enforced"], serde_json::json!(true));
+            assert_eq!(body["raw_row_count"], serde_json::json!(1));
+            assert_eq!(body["quick_check"], "ok");
+            assert!(
+                body["size_share_basis_points"]
+                    .as_u64()
+                    .is_some_and(|share| share > 0),
+                "ATC sidecar should report a non-zero share of the combined footprint"
+            );
         });
     }
 

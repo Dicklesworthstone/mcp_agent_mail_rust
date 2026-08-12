@@ -41,6 +41,7 @@ pub mod coalesce;
 pub mod error;
 pub mod forensics;
 pub mod id_floor;
+pub mod idempotency;
 pub mod integrity;
 pub mod invariants;
 pub mod mail_explorer;
@@ -224,6 +225,10 @@ pub use error::{
 pub use forensics::{
     ForensicFileLock, ForensicPreSnapshot, ForensicProcessHolder, MailboxForensicCapture,
     capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,
+};
+pub use idempotency::{
+    DEFAULT_IDEMPOTENCY_RETENTION_SECS, IDEMPOTENCY_RETENTION_ENV, IdempotencyClaim,
+    IdempotencyConflict, IdempotentOutcome, idempotency_retention_secs,
 };
 pub use integrity::{
     CheckKind, IntegrityCheckResult, IntegrityMetrics, MailboxIntegrityStatus,
