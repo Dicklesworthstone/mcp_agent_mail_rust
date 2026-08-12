@@ -8142,7 +8142,7 @@ fn handle_inbox_events(
                     .to_string(),
             ]);
         }
-        table.print();
+        table.render();
         ftui_runtime::ftui_println!(
             "next_cursor={} has_more={} tail_cursor={}",
             page.next_cursor,
@@ -36105,7 +36105,7 @@ mod mail_server_cli_bridge_tests {
         CliError, PENDING_SEND_SCHEMA_VERSION, PENDING_SEND_UNSENT_STATUS, PendingMailSendEnvelope,
         ServerToolCall, acquire_doctor_mailbox_activity_lock_for_database_url,
         acquire_doctor_mailbox_activity_lock_for_sqlite_path,
-        acquire_doctor_mailbox_activity_lock_for_storage_root,
+        acquire_doctor_mailbox_activity_lock_for_storage_root, mailbox_activity_lock_cli_error,
         build_server_create_agent_identity_arguments, build_server_fetch_inbox_product_arguments,
         build_server_list_agents_arguments, build_server_macro_start_session_arguments,
         build_server_register_agent_arguments, build_server_reply_message_arguments,
@@ -49415,6 +49415,7 @@ http_headers = { Authorization = "Bearer secret" }
                 class: DoctorLockOwnerClass::Live,
                 reason: "test live owner".to_string(),
                 safe_next_command: "am doctor health".to_string(),
+                reclaimable: Vec::new(),
             },
             detail: "owner pid 7".to_string(),
             supervised_restart_required: false,

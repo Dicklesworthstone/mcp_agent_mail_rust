@@ -11757,7 +11757,7 @@ pub(crate) struct ReservationReadAttestation {
 fn mailbox_database_identity(database_url: &str) -> String {
     mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url).map_or_else(
         |_| database_url.to_string(),
-        |resolved| resolved.canonical_path.display().to_string(),
+        |resolved| resolved.canonical_path,
     )
 }
 
