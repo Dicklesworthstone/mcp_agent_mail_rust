@@ -238,6 +238,67 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
         })
 }
 
+/// br-mdfpz: names of damaged indexes when EVERY integrity-check detail row is
+/// index-level-only damage that a plain `REINDEX` can rebuild from the intact
+/// table b-trees — the class behind the 2026-08-12 csd incident, where two
+/// corrupt `file_reservations` indexes routed startup into a nine-day archive
+/// reconstruction crash loop that a seconds-long `REINDEX` would have healed.
+///
+/// Returns `Some(index_names)` only when at least one row is index-class
+/// damage (`wrong # of entries in index <name>` or `row <N> missing from
+/// index <name>`) and every other row is either the `*** in database ... ***`
+/// section header or a benign finding (freelist/sidecar slack, per
+/// [`integrity_details_are_suspect`]'s classes). Any other row — page-level
+/// damage, fragmentation accounting, b-tree errors — disqualifies the fast
+/// path and `None` is returned so callers escalate to repair/reconstruct.
+#[must_use]
+pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<String>> {
+    fn index_name_from_detail(detail: &str) -> Option<&str> {
+        let trimmed = detail.trim();
+        if let Some(name) = trimmed.strip_prefix("wrong # of entries in index ") {
+            return Some(name.trim());
+        }
+        if trimmed.starts_with("row ")
+            && let Some(pos) = trimmed.find(" missing from index ")
+        {
+            let name = trimmed[pos + " missing from index ".len()..].trim();
+            // The prefix between "row " and the marker must be a bare rowid;
+            // anything else is a message we did not anticipate.
+            let rowid = &trimmed["row ".len()..pos];
+            if !rowid.is_empty() && rowid.chars().all(|c| c.is_ascii_digit()) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    fn detail_is_ignorable(detail: &str) -> bool {
+        let trimmed = detail.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        // Section headers like "*** in database main ***" carry no verdict.
+        (trimmed.starts_with("***") && trimmed.ends_with("***"))
+            || lower == "ok"
+            || lower.contains("never used")
+            || lower.contains("unused")
+            || lower.contains("wal without shm")
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for detail in details {
+        if let Some(name) = index_name_from_detail(detail) {
+            if name.is_empty() {
+                return None;
+            }
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.to_string());
+            }
+        } else if !detail_is_ignorable(detail) {
+            return None;
+        }
+    }
+    if names.is_empty() { None } else { Some(names) }
+}
+
 /// Run `PRAGMA quick_check` on an open connection.
 ///
 /// This is fast (typically <100ms) and catches most common corruption.
@@ -826,6 +887,76 @@ mod tests {
         assert!(debug.contains("ok: false"));
         assert!(debug.contains("Full"));
         assert!(debug.contains("12345"));
+    }
+
+    // ── br-mdfpz: index-only corruption classifier ─────────────────
+
+    #[test]
+    fn index_only_classifier_accepts_pure_index_damage() {
+        // The exact shape from the 2026-08-12 csd incident: two damaged
+        // file_reservations indexes, nothing else.
+        let details = vec![
+            "wrong # of entries in index idx_file_reservations_project_agent_released".to_string(),
+            "wrong # of entries in index idx_file_reservations_project_released_expires"
+                .to_string(),
+        ];
+        let names = index_only_corruption_index_names(&details).expect("index-only class");
+        assert_eq!(
+            names,
+            vec![
+                "idx_file_reservations_project_agent_released",
+                "idx_file_reservations_project_released_expires"
+            ]
+        );
+    }
+
+    #[test]
+    fn index_only_classifier_accepts_missing_rows_and_headers_and_dedups() {
+        let details = vec![
+            "*** in database main ***".to_string(),
+            "row 21 missing from index idx_r_pa".to_string(),
+            "row 35 missing from index idx_r_pa".to_string(),
+            "wrong # of entries in index idx_r_pa".to_string(),
+        ];
+        let names = index_only_corruption_index_names(&details).expect("index-only class");
+        assert_eq!(names, vec!["idx_r_pa"]);
+    }
+
+    #[test]
+    fn index_only_classifier_rejects_mixed_damage() {
+        // A fragmentation/page row alongside index rows must disqualify —
+        // REINDEX cannot be assumed to fix page-level accounting damage.
+        let details = vec![
+            "Fragmentation of 33 bytes reported as 0 on page 3".to_string(),
+            "wrong # of entries in index idx_r_pa".to_string(),
+        ];
+        assert!(index_only_corruption_index_names(&details).is_none());
+    }
+
+    #[test]
+    fn index_only_classifier_rejects_non_index_and_healthy_inputs() {
+        for details in [
+            vec!["ok".to_string()],
+            vec![],
+            vec!["database disk image is malformed".to_string()],
+            vec!["Page 5 is never used".to_string()], // benign-only: nothing to reindex
+            vec!["row X missing from index idx_r".to_string()], // non-numeric rowid form
+        ] {
+            assert!(
+                index_only_corruption_index_names(&details).is_none(),
+                "should reject: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_only_classifier_tolerates_benign_rows_alongside_index_damage() {
+        let details = vec![
+            "wrong # of entries in index idx_r_pa".to_string(),
+            "Page 7 is never used".to_string(),
+        ];
+        let names = index_only_corruption_index_names(&details).expect("benign rows tolerated");
+        assert_eq!(names, vec!["idx_r_pa"]);
     }
 
     #[test]

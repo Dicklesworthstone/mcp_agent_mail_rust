@@ -6600,16 +6600,39 @@ where
             output::info(&format!(
                 "Automatic mailbox repair completed; {post_repair_detail}; continuing startup"
             ));
+            auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
             Ok(())
         }
         StartupDatabaseSelfHealAction::Reconstruct(detail) => {
             let reconstruct_db_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+            // br-mdfpz: index-only corruption is fully repairable in place with
+            // a targeted REINDEX (table b-trees intact, zero row loss). Archive
+            // reconstruction for that class is not only slow — when the archive
+            // lags the DB, the promotion guard correctly refuses the lossy
+            // candidate and a supervised startup crash-loops. Try the fast path
+            // first; skip reconstruction only if the strategy re-check comes
+            // back clean (a persisting archive-drift verdict still reconstructs).
+            if let Some(summary) = doctor_attempt_index_only_reindex(
+                &reconstruct_db_path,
+                &storage_root.join("backups"),
+            ) && matches!(
+                startup_database_self_heal_action(database_url, storage_root),
+                Ok(StartupDatabaseSelfHealAction::None(_))
+            ) {
+                output::info(&format!(
+                    "Startup healed index-only mailbox corruption in place ({summary}); archive reconstruction skipped; continuing startup"
+                ));
+                cleanup_stale_db_artifacts(&reconstruct_db_path)?;
+                auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
+                return Ok(());
+            }
             output::info(&format!(
                 "Startup detected mailbox database issues; reconstructing from archive ({detail})"
             ));
             run_startup_doctor_subcommand_quietly(|| run_reconstruct(&reconstruct_db_path))?;
             cleanup_stale_db_artifacts(&reconstruct_db_path)?;
             output::info("Automatic mailbox reconstruction completed; continuing startup");
+            auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
             Ok(())
         }
     }
@@ -6620,6 +6643,184 @@ fn cleanup_database_sidecars_after_startup_use(database_url: &str) -> CliResult<
         cleanup_stale_db_artifacts(&db_path)?;
     }
     Ok(())
+}
+
+/// br-mdfpz: attempt the cheap, non-lossy REINDEX fast path before archive
+/// reconstruction.
+///
+/// When the FULL canonical `integrity_check` shows ONLY index-level damage
+/// (`wrong # of entries in index` / `row N missing from index`) with a clean
+/// `foreign_key_check`, the table b-trees are intact and a targeted `REINDEX`
+/// rebuilds the damaged indexes in seconds with zero row loss. Escalating that
+/// class to archive reconstruction is not just slow — when the archive lags the
+/// DB, the reconstruction promotion guard correctly REFUSES the lossy
+/// candidate, and a supervised startup then crash-loops (the 2026-08-12 csd
+/// incident: nine days of ~5-minute restart cycles, each leaving a ~45 MB
+/// candidate + forensic bundle, ~22 GB of debris — for damage `REINDEX` fixed
+/// in seconds).
+///
+/// The database file is byte-copied (with any `-wal`/`-shm` sidecars) into
+/// `backup_dir` before any write. Returns `Some(summary)` only when the
+/// canonical double-probe battery proves the database healthy afterwards;
+/// every other outcome returns `None` so the caller escalates to the existing
+/// repair/reconstruct strategy unchanged.
+fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Option<String> {
+    if db_path.as_os_str() == ":memory:" || !db_path.exists() {
+        return None;
+    }
+
+    // Classify the damage on a read-only immutable connection first.
+    let damaged_indexes = {
+        let conn =
+            match doctor_open_canonical_readonly_db_for_diagnostic(db_path, "index_only_reindex") {
+                Ok(conn) => conn,
+                Err(_) => return None,
+            };
+        let rows = sqlite_query_check_rows(
+            |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
+            mcp_agent_mail_db::CheckKind::Full,
+        )
+        .ok()?;
+        let details =
+            mcp_agent_mail_db::integrity::extract_check_details(&rows, mcp_agent_mail_db::CheckKind::Full);
+        if mcp_agent_mail_db::integrity::details_indicate_ok(&details) {
+            return None;
+        }
+        let damaged = mcp_agent_mail_db::integrity::index_only_corruption_index_names(&details)?;
+        // Any foreign-key violation means the damage is not index-only.
+        match doctor_foreign_key_violations_canonical(&conn) {
+            Ok(violations) if violations.is_empty() => {}
+            _ => return None,
+        }
+        damaged
+    };
+
+    // Never reindex without a byte-exact backup of the current generation.
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let file_name = db_path
+        .file_name()
+        .map_or_else(|| "storage.sqlite3".to_string(), |n| n.to_string_lossy().into_owned());
+    let backup_path = backup_dir.join(format!("{file_name}.pre-reindex-{timestamp}"));
+    if std::fs::create_dir_all(backup_dir).is_err() {
+        return None;
+    }
+    if let Err(error) = std::fs::copy(db_path, &backup_path) {
+        tracing::warn!(
+            db = %db_path.display(),
+            backup = %backup_path.display(),
+            %error,
+            "index-only REINDEX fast path skipped: pre-reindex backup copy failed"
+        );
+        return None;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(db_path, suffix);
+        if sidecar.exists() {
+            let mut target = backup_path.clone().into_os_string();
+            target.push(suffix);
+            if std::fs::copy(&sidecar, PathBuf::from(&target)).is_err() {
+                return None;
+            }
+        }
+    }
+
+    // Rebuild the damaged indexes on the canonical engine, escalating a
+    // per-index failure to one global REINDEX before giving up.
+    {
+        let conn =
+            match mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string()) {
+                Ok(conn) => conn,
+                Err(_) => return None,
+            };
+        for index in &damaged_indexes {
+            let escaped = index.replace('"', "\"\"");
+            if conn.execute_raw(&format!("REINDEX \"{escaped}\"")).is_err() {
+                if let Err(error) = conn.execute_raw("REINDEX") {
+                    tracing::warn!(
+                        db = %db_path.display(),
+                        index = %index,
+                        %error,
+                        "index-only REINDEX fast path failed; escalating to repair/reconstruct"
+                    );
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+
+    // Only a full canonical battery pass counts as healed.
+    match doctor_canonical_double_probe(db_path) {
+        DoctorCanonicalCrossCheck::Healthy => Some(format!(
+            "reindexed {} damaged index(es): {}; pre-reindex backup at {}",
+            damaged_indexes.len(),
+            damaged_indexes.join(", "),
+            backup_path.display()
+        )),
+        _ => None,
+    }
+}
+
+/// br-fx7sx: after a SUCCESSFUL startup self-heal, consolidate the stale
+/// recovery debris the failure episode left behind so operators never have to
+/// run `am doctor reclaim` by hand after the doctor solved the problem.
+///
+/// Semantics match `am doctor reclaim --yes` with an age cutoff of zero: the
+/// `doctor_retention_keep_min` newest artifacts per category survive as
+/// forensics for the episode just resolved, everything older is MOVED (never
+/// deleted — RULE 1) into `<storage_root>/doctor/reclaimable/<ts>/`. Age-based
+/// retention is deliberately not applied here: a crash-loop's debris is
+/// minutes old, so an age floor would exempt exactly the junk this cleans up.
+/// Disabled with `DOCTOR_AUTO_RECLAIM_ON_HEAL=false`. Never fails the startup:
+/// every error degrades to a warning.
+fn auto_reclaim_recovery_debris_after_heal(database_url: &str, storage_root: &Path) {
+    use mcp_agent_mail_db::recovery_retention as rr;
+    let config = Config::from_env();
+    if !config.doctor_auto_reclaim_on_heal {
+        return;
+    }
+    let Some(db_path) = sqlite_file_path_from_database_url(database_url) else {
+        return;
+    };
+    let artifacts = rr::enumerate_recovery_debris(storage_root, &db_path);
+    if artifacts.is_empty() {
+        return;
+    }
+    let plan = rr::select_recovery_debris_to_reclaim(
+        artifacts,
+        rr::RetentionPolicy {
+            keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
+            max_age_secs: 0,
+        },
+        chrono::Utc::now().timestamp_micros(),
+    );
+    if !plan.has_reclaimable() {
+        return;
+    }
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let dest = storage_root.join("doctor").join("reclaimable").join(&ts);
+    match rr::consolidate_debris(&plan, &dest) {
+        Ok(outcome) => {
+            output::info(&format!(
+                "Consolidated {} stale recovery artifact(s) ({}) from the resolved incident into {} (moved, never deleted; remove that directory to free the disk)",
+                outcome.moved,
+                format_bytes(outcome.moved_bytes),
+                dest.display()
+            ));
+            for (path, error) in &outcome.failures {
+                output::warn(&format!(
+                    "post-heal reclaim could not move {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        Err(error) => {
+            output::warn(&format!(
+                "post-heal recovery-debris reclaim skipped ({} artifact(s) remain in place): {error}",
+                plan.prune.len()
+            ));
+        }
+    }
 }
 
 fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
@@ -49899,6 +50100,274 @@ startup_timeout_sec = 42
         );
     }
 
+    /// br-mdfpz: seed a real-schema mailbox DB whose archive identity matches
+    /// (so archive drift is not authoritative), then corrupt ONLY the
+    /// `idx_agents_project_name` index b-tree by flipping one payload byte in
+    /// an index cell — the table b-trees stay intact, `foreign_key_check`
+    /// stays clean, and a full `integrity_check` reports only
+    /// index-class rows (`row N missing from index ...`).
+    fn seed_index_only_corrupt_mailbox(db_path: &Path) {
+        let db_path_text = db_path.display().to_string();
+        init_schema_sqlite_canonical(&db_path_text).expect("init schema");
+        {
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
+                .expect("open canonical fixture db");
+            conn.query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'ahead-project', '/ahead-project', 0)",
+                &[],
+            )
+            .expect("insert archive-matching project");
+            for i in 1..=50i64 {
+                conn.query_sync(
+                    &format!(
+                        "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                         VALUES ({i}, 1, 'ReindexAgent{i:02}', 'coder', 'test', 0, 0)"
+                    ),
+                    &[],
+                )
+                .expect("insert agent row");
+            }
+            conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("checkpoint fixture db");
+        }
+        let root_page = {
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
+                .expect("reopen for rootpage lookup");
+            let rows = conn
+                .query_sync(
+                    "SELECT rootpage FROM sqlite_master WHERE name = 'idx_agents_project_name'",
+                    &[],
+                )
+                .expect("query index rootpage");
+            let root: i64 = rows
+                .first()
+                .and_then(|row| row.get_as(0).ok())
+                .expect("index rootpage row");
+            usize::try_from(root).expect("rootpage fits usize")
+        };
+        let mut bytes = std::fs::read(db_path).expect("read fixture db bytes");
+        let raw_page_size = u16::from_be_bytes([bytes[16], bytes[17]]);
+        let page_size = if raw_page_size == 1 {
+            65_536usize
+        } else {
+            usize::from(raw_page_size)
+        };
+        let page_start = (root_page - 1) * page_size;
+        let page = &bytes[page_start..page_start + page_size];
+        let needle = b"ReindexAgent";
+        let hit = page
+            .windows(needle.len())
+            .skip(16)
+            .position(|window| window == needle)
+            .expect("index page must contain an agent-name key")
+            + 16;
+        // Flip one key byte inside the index cell: the table row's key no
+        // longer matches its index entry, and nothing else in the file changes.
+        bytes[page_start + hit + 7] ^= 0x01;
+        std::fs::write(db_path, &bytes).expect("write corrupted index page");
+    }
+
+    #[test]
+    fn startup_database_self_heal_reindexes_index_only_corruption_without_reconstruct() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_archive_mailbox_project(dir.path());
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_index_only_corrupt_mailbox(&db_path);
+
+        // The fixture must classify as index-only damage...
+        let conn = doctor_open_canonical_readonly_db_for_diagnostic(&db_path, "fixture probe")
+            .expect("readonly probe open");
+        let rows = sqlite_query_check_rows(
+            |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
+            mcp_agent_mail_db::CheckKind::Full,
+        )
+        .expect("integrity rows");
+        let details = mcp_agent_mail_db::integrity::extract_check_details(
+            &rows,
+            mcp_agent_mail_db::CheckKind::Full,
+        );
+        assert!(
+            !mcp_agent_mail_db::integrity::details_indicate_ok(&details),
+            "fixture integrity_check must fail: {details:?}"
+        );
+        let damaged = mcp_agent_mail_db::integrity::index_only_corruption_index_names(&details)
+            .unwrap_or_else(|| panic!("fixture damage must be index-only: {details:?}"));
+        assert_eq!(damaged, vec!["idx_agents_project_name"]);
+        drop(conn);
+
+        // ...and route the startup strategy to the (lossy-prone) reconstruct arm.
+        let action = startup_database_self_heal_action(&db_url, dir.path())
+            .expect("classify startup database issue");
+        assert!(
+            matches!(action, StartupDatabaseSelfHealAction::Reconstruct(_)),
+            "index corruption with an authoritative archive must classify as reconstruct: {action:?}"
+        );
+
+        let reconstruct_called = std::cell::Cell::new(false);
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || panic!("index-only corruption must not run the repair subprocess"),
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should succeed via the REINDEX fast path");
+
+        assert!(
+            !reconstruct_called.get(),
+            "REINDEX fast path must heal index-only corruption without archive reconstruction"
+        );
+        match doctor_database_fix_strategy(&db_url, dir.path()).expect("post-heal strategy") {
+            DoctorDatabaseFixStrategy::None(_) => {}
+            other => panic!("post-REINDEX strategy should be clean: {other:?}"),
+        }
+        // Zero row loss and a pre-reindex backup exists.
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("reopen healed db");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS c FROM agents", &[])
+            .expect("count agents");
+        let agents: i64 = rows
+            .first()
+            .and_then(|row| row.get_named("c").ok())
+            .unwrap_or(-1);
+        assert_eq!(agents, 50, "REINDEX must not lose table rows");
+        let backups: Vec<_> = std::fs::read_dir(dir.path().join("backups"))
+            .expect("backups dir")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".pre-reindex-")
+            })
+            .collect();
+        assert!(
+            !backups.is_empty(),
+            "REINDEX fast path must capture a pre-reindex backup"
+        );
+    }
+
+    #[test]
+    fn doctor_attempt_index_only_reindex_declines_non_index_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("malformed.sqlite3");
+        seed_malformed_btree_db(&db_path);
+        assert!(
+            doctor_attempt_index_only_reindex(&db_path, &dir.path().join("backups")).is_none(),
+            "table b-tree damage must escalate to repair/reconstruct, never fast-path REINDEX"
+        );
+        assert!(
+            doctor_attempt_index_only_reindex(
+                &dir.path().join("missing.sqlite3"),
+                &dir.path().join("backups")
+            )
+            .is_none(),
+            "a missing database has nothing to reindex"
+        );
+    }
+
+    #[test]
+    fn quarantine_refused_reconstruct_candidate_renames_into_retention_category() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"live-db").expect("write live db");
+        let candidate = dir
+            .path()
+            .join("storage.sqlite3.reconstruct-20260812_151007_159.sqlite3");
+        std::fs::write(&candidate, b"refused-candidate").expect("write candidate");
+        std::fs::write(
+            sqlite_sidecar_path(&candidate, "-wal"),
+            b"refused-candidate-wal",
+        )
+        .expect("write candidate wal");
+
+        let quarantined = quarantine_refused_reconstruct_candidate(&db_path, &candidate)
+            .expect("quarantine rename")
+            .expect("candidate existed");
+        assert!(!candidate.exists(), "candidate must be renamed away");
+        assert!(quarantined.exists());
+        assert!(sqlite_sidecar_path(&quarantined, "-wal").exists());
+        let name = quarantined.file_name().unwrap().to_string_lossy();
+        assert!(
+            mcp_agent_mail_db::recovery_retention::is_quarantine_name(&name),
+            "quarantine name must be enumerable by recovery-debris retention: {name}"
+        );
+        // The refused-promotion candidates from the 2026-08-12 csd loop are now
+        // enumerable debris.
+        let debris =
+            mcp_agent_mail_db::recovery_retention::enumerate_recovery_debris(dir.path(), &db_path);
+        assert!(
+            debris.iter().any(|artifact| artifact.path == quarantined),
+            "quarantined candidate must appear in recovery-debris enumeration: {debris:?}"
+        );
+        // Idempotent: a second call is a clean no-op.
+        assert!(
+            quarantine_refused_reconstruct_candidate(&db_path, &candidate)
+                .expect("second call ok")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auto_reclaim_after_heal_consolidates_stale_debris_and_respects_disable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"live-db").expect("write live db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let quarantine_names: Vec<String> = (1..=3)
+            .map(|i| format!("storage.sqlite3.reconstruct-failed-2026081{i}_000000_000.sqlite3"))
+            .collect();
+        let seed_debris = |names: &[String]| {
+            for name in names {
+                std::fs::write(dir.path().join(name), b"stale").expect("write debris");
+            }
+        };
+
+        // Disabled: nothing moves.
+        seed_debris(&quarantine_names);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DOCTOR_AUTO_RECLAIM_ON_HEAL", "false"),
+                ("DOCTOR_RETENTION_KEEP_MIN", "1"),
+            ],
+            || auto_reclaim_recovery_debris_after_heal(&db_url, dir.path()),
+        );
+        for name in &quarantine_names {
+            assert!(
+                dir.path().join(name).exists(),
+                "disabled auto-reclaim must not move {name}"
+            );
+        }
+
+        // Enabled with keep_min=1: the newest quarantine survives, the two
+        // older ones are MOVED (not deleted) into doctor/reclaimable/.
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DOCTOR_RETENTION_KEEP_MIN", "1")],
+            || auto_reclaim_recovery_debris_after_heal(&db_url, dir.path()),
+        );
+        let remaining = quarantine_names
+            .iter()
+            .filter(|name| dir.path().join(name).exists())
+            .count();
+        assert_eq!(remaining, 1, "keep_min=1 must retain exactly one artifact");
+        assert!(db_path.exists(), "the live database is never touched");
+        let reclaimable_root = dir.path().join("doctor").join("reclaimable");
+        let staged: usize = std::fs::read_dir(&reclaimable_root)
+            .expect("reclaimable dir")
+            .flatten()
+            .map(|ts_dir| {
+                std::fs::read_dir(ts_dir.path())
+                    .map(|entries| entries.count())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(staged, 2, "both stale artifacts must be staged, not deleted");
+    }
+
     #[test]
     fn startup_database_self_heal_dispatches_repair_for_corrupt_db_without_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -70681,6 +71150,30 @@ fn cleanup_doctor_temp_sqlite_artifact(path: &Path) {
     }
 }
 
+/// br-fx7sx: rename a healthy-but-refused reconstruction candidate (and any
+/// sidecars) under the `.reconstruct-failed-` quarantine name so the bounded
+/// recovery-debris retention (br-mudrv) enumerates it. Rename only — never a
+/// delete (RULE 1). Returns the quarantine path, or `Ok(None)` when the
+/// candidate no longer exists (e.g. promotion failed after activation).
+fn quarantine_refused_reconstruct_candidate(
+    db_path: &Path,
+    candidate_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if !candidate_path.exists() {
+        return Ok(None);
+    }
+    let target = next_doctor_artifact_path(db_path, "reconstruct-failed", "sqlite3");
+    std::fs::rename(candidate_path, &target).map_err(|e| e.to_string())?;
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let sidecar = sqlite_sidecar_path(candidate_path, suffix);
+        if sidecar.exists() {
+            let quarantined_sidecar = sqlite_sidecar_path(&target, suffix);
+            std::fs::rename(&sidecar, &quarantined_sidecar).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(Some(target))
+}
+
 fn doctor_temp_sqlite_artifact_conflicts(candidate: &Path, extension: &str) -> bool {
     path_is_occupied(candidate)
         || (extension.eq_ignore_ascii_case("sqlite3")
@@ -71282,8 +71775,28 @@ fn handle_doctor_reconstruct_with(
 
     mcp_agent_mail_db::promote_recovery_candidate(&db_path, &temp_db_path, &storage_root).map_err(
         |err| {
+            // br-fx7sx: a refused promotion errors strictly pre-receipt-commit,
+            // leaving the healthy-but-refused candidate behind with no
+            // retention category — on the 2026-08-12 csd crash loop these
+            // accumulated to 491 × ~45 MB. Rename it (never delete — RULE 1)
+            // under the `.reconstruct-failed-` quarantine name so the bounded
+            // retention policy (br-mudrv) and post-heal auto-reclaim cover it.
+            let quarantine_note = match quarantine_refused_reconstruct_candidate(
+                &db_path,
+                &temp_db_path,
+            ) {
+                Ok(Some(quarantined)) => format!(
+                    "; refused candidate quarantined at {}",
+                    quarantined.display()
+                ),
+                Ok(None) => String::new(),
+                Err(quarantine_error) => format!(
+                    "; refused candidate left at {} (quarantine rename failed: {quarantine_error})",
+                    temp_db_path.display()
+                ),
+            };
             CliError::Other(format!(
-                "reconstruction succeeded but final database promotion failed: {err}"
+                "reconstruction succeeded but final database promotion failed: {err}{quarantine_note}"
             ))
         },
     )?;

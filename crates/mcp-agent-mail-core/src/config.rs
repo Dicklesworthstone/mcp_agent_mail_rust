@@ -241,6 +241,11 @@ pub struct Config {
     pub doctor_retention_max_age_secs: u64,
     pub doctor_retention_alert_bytes: u64,
     pub doctor_retention_sweep_interval_secs: u64,
+    // br-fx7sx: after a SUCCESSFUL startup self-heal, automatically
+    // consolidate the stale recovery debris the failure episode left behind
+    // (keeps the `doctor_retention_keep_min` newest per category as
+    // forensics; MOVES into doctor/reclaimable/, never deletes).
+    pub doctor_auto_reclaim_on_heal: bool,
 
     // Periodic git health sweep (read-only orphan-ref detection)
     pub health_sweep_enabled: bool,
@@ -1336,6 +1341,7 @@ impl Default for Config {
             doctor_retention_max_age_secs: 1_209_600, // always keep < 14 days old
             doctor_retention_alert_bytes: 5_368_709_120, // warn at 5 GiB reclaimable
             doctor_retention_sweep_interval_secs: 3_600, // hourly observe+alert sweep
+            doctor_auto_reclaim_on_heal: true, // br-fx7sx: tidy debris after a successful heal
 
             // Periodic git health sweep
             health_sweep_enabled: true,
@@ -1817,6 +1823,10 @@ impl Config {
         config.doctor_retention_sweep_interval_secs = env_u64(
             "DOCTOR_RETENTION_SWEEP_INTERVAL_SECS",
             config.doctor_retention_sweep_interval_secs,
+        );
+        config.doctor_auto_reclaim_on_heal = env_bool(
+            "DOCTOR_AUTO_RECLAIM_ON_HEAL",
+            config.doctor_auto_reclaim_on_heal,
         );
 
         // FrankenSQLite MVCC / RaptorQ
