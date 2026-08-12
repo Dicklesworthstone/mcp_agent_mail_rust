@@ -175,19 +175,19 @@ CREATE TABLE IF NOT EXISTS proof_gate_consumed_nonces (
 );
 CREATE INDEX IF NOT EXISTS idx_proof_nonces_retain_until ON proof_gate_consumed_nonces(retain_until);
 
--- Client-supplied idempotency keys for mutating tool calls (br-idempotency-keys-...-h0x9k).
--- A mutating tool call (send_message / reply_message / acknowledge_message /
--- file_reservation_paths) that carries an `idempotency_key` records the key here
--- INSIDE the same transaction as the mutation itself, so a client that hits its
--- 30 s JSON-RPC deadline and retries after the write already committed cannot
--- double-apply it (grounded in br-hpv61: writes land silently while the client
--- sees a timeout). Keys are scoped per (project_id, tool) so unrelated tools can
--- never collide; the composite PRIMARY KEY makes the INSERT the atomic replay
--- check. `payload_fingerprint` is a hash of the normalized arguments — a retry
--- with the SAME key but a DIFFERENT payload is a typed conflict, never a silent
--- apply. `result_json` is the serialized original DB result, replayed verbatim.
--- `expires_ts` bounds the retention window (default 24 h); expired rows are
--- pruned on access so the table stays bounded without a background sweeper.
+-- Client-supplied idempotency keys for mutating tool calls
+-- (br-idempotency-keys-mutating-tools-h0x9k). A send_message / reply_message /
+-- acknowledge_message / file_reservation_paths call carrying an `idempotency_key`
+-- records the key here INSIDE the mutation's own transaction, so a client that
+-- retries after its 30 s deadline (while the write already committed, per
+-- br-hpv61) cannot double-apply it. Scoped per (project_id, tool). The composite
+-- PRIMARY KEY makes the INSERT the atomic replay check. `payload_fingerprint`
+-- detects same-key different-payload conflicts, `result_json` is the replayed
+-- original result, and `expires_ts` bounds the retention window (default 24 h,
+-- pruned on access). See crate::idempotency for the full contract.
+-- NOTE: this comment must not contain a semicolon character -- CREATE_TABLES_SQL
+-- is split on the statement separator to derive migrations, so one here would
+-- corrupt the migration.
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     project_id INTEGER NOT NULL,
     tool TEXT NOT NULL,
