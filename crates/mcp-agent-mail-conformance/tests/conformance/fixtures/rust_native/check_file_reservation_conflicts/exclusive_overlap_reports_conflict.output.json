@@ -13,6 +13,7 @@
       ]
     }
   ],
+  "own_active": [],
   "clear_paths": ["docs/notes.md"],
   "checked_paths": 2,
   "total_conflicting_reservations": 1,
