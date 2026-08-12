@@ -280,6 +280,8 @@ fn error_code_catalog_is_stable() {
         "RESERVATION_SNAPSHOT_TOO_LARGE",
         "RESOURCE_BUSY",
         "SENDER_TOKEN_MISMATCH",
+        "SENDER_TOKEN_REQUIRED",
+        "SENDER_TOKEN_UNAVAILABLE",
         "SNAPSHOT_TIMEOUT",
         "SUSPICIOUS_PATTERN",
         "TOO_MANY_PATHS",
