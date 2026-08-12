@@ -893,6 +893,18 @@ mod tests {
                 "must not attribute read/control statement as a write: {sql}"
             );
         }
+
+        let before = mcp_agent_mail_core::metrics::database_write_metrics_snapshot()
+            .latency_us
+            .count;
+        record_query("INSERT INTO messages (body) VALUES (?)", 500);
+        let after = mcp_agent_mail_core::metrics::database_write_metrics_snapshot()
+            .latency_us
+            .count;
+        assert!(
+            after >= before.saturating_add(1),
+            "database writes must be visible even when query tracking is disabled"
+        );
     }
 
     // ── TableId round-trip ──────────────────────────────────────────────
