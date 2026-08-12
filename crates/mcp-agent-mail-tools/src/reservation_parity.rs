@@ -728,11 +728,17 @@ pub fn read_project_archive_reservation(
     if reservation_id <= 0 {
         return None;
     }
-    let path = storage_root
+    // Locate the stable artifact by id, matching either the generation-stamped
+    // (`id-<id>-g<generation>.json`) or legacy (`id-<id>.json`) name (br-n8qh6),
+    // so reconcile-on-read finds a stamped artifact and never spuriously re-heals.
+    let reservation_dir = storage_root
         .join("projects")
         .join(project_slug)
-        .join("file_reservations")
-        .join(format!("id-{reservation_id}.json"));
+        .join("file_reservations");
+    let path = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+        &reservation_dir,
+        reservation_id,
+    )?;
     if path_is_symlink(&path) {
         return None;
     }

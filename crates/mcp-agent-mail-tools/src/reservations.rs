@@ -368,8 +368,9 @@ fn active_reservation_artifact_json(
     project_human_key: &str,
     agent_name: &str,
     row: &mcp_agent_mail_db::FileReservationRow,
+    db_generation: Option<&str>,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "id": row.id.unwrap_or(0),
         "project": project_human_key,
         "agent": agent_name,
@@ -378,7 +379,9 @@ fn active_reservation_artifact_json(
         "reason": &row.reason,
         "created_ts": micros_to_iso(row.created_ts),
         "expires_ts": micros_to_iso(row.expires_ts),
-    })
+    });
+    stamp_db_generation(&mut value, db_generation);
+    value
 }
 
 /// Build the canonical archive JSON for one released reservation row, authored
@@ -389,8 +392,9 @@ fn released_reservation_artifact_json(
     project_human_key: &str,
     agent_name: &str,
     row: &mcp_agent_mail_db::FileReservationRow,
+    db_generation: Option<&str>,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "id": row.id.unwrap_or(0),
         "project": project_human_key,
         "agent": agent_name,
@@ -400,7 +404,35 @@ fn released_reservation_artifact_json(
         "created_ts": micros_to_iso(row.created_ts),
         "expires_ts": micros_to_iso(row.expires_ts),
         "released_ts": released_ts_json_value(row.released_ts),
-    })
+    });
+    stamp_db_generation(&mut value, db_generation);
+    value
+}
+
+/// Stamp the DB generation token (br-n8qh6) onto a reservation archive artifact
+/// object, so the storage layer names the stable artifact
+/// `id-<id>-g<generation>.json` and readers can attribute it to the generation
+/// that wrote it. A `None`/empty generation (an unseeded / legacy DB) leaves the
+/// object untouched, preserving legacy `id-<id>.json` naming exactly.
+fn stamp_db_generation(value: &mut Value, db_generation: Option<&str>) {
+    if let Some(generation) = db_generation.filter(|generation| !generation.is_empty())
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "db_generation".to_string(),
+            Value::String(generation.to_string()),
+        );
+    }
+}
+
+/// Best-effort read of this database's generation token for stamping reservation
+/// archive artifacts. Returns `None` (legacy naming) on any error — a missing
+/// generation must never fail a reservation mutation.
+async fn fetch_db_generation(ctx: &McpContext, pool: &mcp_agent_mail_db::DbPool) -> Option<String> {
+    match mcp_agent_mail_db::queries::db_generation_id(ctx.cx(), pool).await {
+        asupersync::Outcome::Ok(value) => value,
+        _ => None,
+    }
 }
 
 fn ts_is_positive(ts: Option<i64>) -> bool {
@@ -463,6 +495,7 @@ fn reservation_rows_needing_archive_heal(
     active_rows: &[mcp_agent_mail_db::FileReservationRow],
     agent_names: &HashMap<i64, String>,
     archive_present: &BTreeMap<i64, crate::reservation_parity::ArchiveReservationView>,
+    db_generation: Option<&str>,
 ) -> Vec<Value> {
     let mut heal = Vec::new();
     for row in active_rows {
@@ -480,6 +513,7 @@ fn reservation_rows_needing_archive_heal(
                 project_human_key,
                 agent_name,
                 row,
+                db_generation,
             ));
         }
     }
@@ -502,6 +536,7 @@ fn reconcile_active_reservation_archive(
     active_rows: &[mcp_agent_mail_db::FileReservationRow],
     agent_names: &HashMap<i64, String>,
     config: &Config,
+    db_generation: Option<&str>,
 ) -> usize {
     if active_rows.is_empty() {
         return 0;
@@ -524,6 +559,7 @@ fn reconcile_active_reservation_archive(
         active_rows,
         agent_names,
         &present,
+        db_generation,
     );
     if heal.is_empty() {
         return 0;
@@ -560,6 +596,7 @@ fn released_rows_needing_archive_heal(
     released_rows: &[mcp_agent_mail_db::FileReservationRow],
     agent_names: &HashMap<i64, String>,
     archive_present: &BTreeMap<i64, crate::reservation_parity::ArchiveReservationView>,
+    db_generation: Option<&str>,
 ) -> Vec<Value> {
     let mut heal = Vec::new();
     for row in released_rows {
@@ -580,6 +617,7 @@ fn released_rows_needing_archive_heal(
                 project_human_key,
                 agent_name,
                 row,
+                db_generation,
             ));
         }
     }
@@ -604,6 +642,7 @@ fn reconcile_released_reservation_archive(
     released_rows: &[mcp_agent_mail_db::FileReservationRow],
     agent_names: &HashMap<i64, String>,
     config: &Config,
+    db_generation: Option<&str>,
 ) -> usize {
     if released_rows.is_empty() {
         return 0;
@@ -626,6 +665,7 @@ fn reconcile_released_reservation_archive(
         released_rows,
         agent_names,
         &present,
+        db_generation,
     );
     if heal.is_empty() {
         return 0;
@@ -1180,13 +1220,14 @@ fn dispatch_release_archive_write(
     agent: &mcp_agent_mail_db::AgentRow,
     released_rows: &[mcp_agent_mail_db::FileReservationRow],
     config: &Config,
+    db_generation: Option<&str>,
 ) {
     if released_rows.is_empty() {
         return;
     }
     let res_jsons: Vec<Value> = released_rows
         .iter()
-        .map(|r| released_reservation_artifact_json(&project.human_key, &agent.name, r))
+        .map(|r| released_reservation_artifact_json(&project.human_key, &agent.name, r, db_generation))
         .collect();
 
     let op = mcp_agent_mail_storage::WriteOp::FileReservation {
