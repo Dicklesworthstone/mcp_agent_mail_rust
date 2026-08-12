@@ -18871,6 +18871,19 @@ mod tests {
     }
 
     #[test]
+    fn archive_read_generation_tracks_uncommitted_project_metadata_write() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "generation-metadata").unwrap();
+        let before = archive_read_generation(&archive.repo_root).unwrap();
+
+        write_project_metadata_with_config(&archive, &config, "/tmp/generation-metadata").unwrap();
+
+        let after = archive_read_generation(&archive.repo_root).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
     fn archive_read_generation_refuses_an_active_git_index_lock() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
