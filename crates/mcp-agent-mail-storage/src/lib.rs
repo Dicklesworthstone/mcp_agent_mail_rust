@@ -1115,15 +1115,135 @@ struct ArchiveRetryBacklog {
     dropped_total: AtomicU64,
 }
 
-static ARCHIVE_BACKLOG: LazyLock<ArchiveRetryBacklog> = LazyLock::new(|| ArchiveRetryBacklog {
-    queue: Mutex::new(VecDeque::new()),
-    drain_handle: Mutex::new(None),
-    lifecycle: Mutex::new(()),
-    depth: AtomicU64::new(0),
-    enqueued_total: AtomicU64::new(0),
-    drained_total: AtomicU64::new(0),
-    dropped_total: AtomicU64::new(0),
-});
+static ARCHIVE_BACKLOG: LazyLock<ArchiveRetryBacklog> = LazyLock::new(ArchiveRetryBacklog::new);
+
+/// Outcome of one `drain_step`: nothing to do, one op materialized, or the front
+/// op failed to materialize and should be retried after `backoff(attempts)`.
+enum ArchiveBacklogDrainStep {
+    Empty,
+    Materialized,
+    RetryLater(u32),
+}
+
+impl ArchiveRetryBacklog {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            drain_handle: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            depth: AtomicU64::new(0),
+            enqueued_total: AtomicU64::new(0),
+            drained_total: AtomicU64::new(0),
+            dropped_total: AtomicU64::new(0),
+        }
+    }
+
+    fn store_depth(&self, queue: &VecDeque<ArchiveBacklogEntry>) {
+        self.depth
+            .store(u64::try_from(queue.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Durably journal and enqueue an op. `cap` bounds the in-memory queue; on
+    /// overflow the op is dropped (DB stays authoritative). Non-blocking apart
+    /// from the single local-disk journal fsync.
+    fn push(&self, op: WriteOp, cap: u64) -> ArchiveBacklogPush {
+        {
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if u64::try_from(queue.len()).unwrap_or(u64::MAX) >= cap {
+                drop(queue);
+                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    cap,
+                    "archive retry backlog full; dropping archive op (DB authoritative; \
+                     parity report may show DB-ahead until operator backfills)"
+                );
+                return ArchiveBacklogPush::Dropped;
+            }
+        }
+        // Journal outside the queue lock: the fsync must not stall other pushers.
+        let journal_path = archive_backlog_journal_write(&op);
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.push_back(ArchiveBacklogEntry {
+            op,
+            journal_path,
+            first_enqueued_at: Instant::now(),
+            attempts: 0,
+        });
+        self.store_depth(&queue);
+        drop(queue);
+        self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        ArchiveBacklogPush::Queued
+    }
+
+    /// Enqueue an op recovered from its on-disk journal (already durable).
+    fn push_recovered(&self, op: WriteOp, journal_path: PathBuf) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.push_back(ArchiveBacklogEntry {
+            op,
+            journal_path: Some(journal_path),
+            first_enqueued_at: Instant::now(),
+            attempts: 0,
+        });
+        self.store_depth(&queue);
+        drop(queue);
+        self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current `(depth, oldest_age_us)` of the backlog.
+    fn backlog_state(&self) -> (u64, u64) {
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+        let oldest = queue
+            .front()
+            .map_or(0, |entry| duration_as_micros_u64(entry.first_enqueued_at.elapsed()));
+        (depth, oldest)
+    }
+
+    /// Process the front entry once (single-drainer; the front is stable across
+    /// the unlocked `write_op_sync` because only pushes append to the back).
+    /// Materialize via `write_op_sync` — which writes the archive files durably
+    /// AND enqueues the batched async git commit — so the journal is removed only
+    /// once the artifact is on disk.
+    fn drain_step(&self) -> ArchiveBacklogDrainStep {
+        let front = {
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue
+                .front()
+                .map(|entry| (entry.op.clone(), entry.attempts, entry.journal_path.clone()))
+        };
+        let Some((op, attempts, journal_path)) = front else {
+            return ArchiveBacklogDrainStep::Empty;
+        };
+        match write_op_sync(&op) {
+            Ok(()) => {
+                let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                queue.pop_front();
+                self.store_depth(&queue);
+                drop(queue);
+                self.drained_total.fetch_add(1, Ordering::Relaxed);
+                if let Some(path) = journal_path {
+                    archive_backlog_journal_remove(&path);
+                }
+                ArchiveBacklogDrainStep::Materialized
+            }
+            Err(error) => {
+                let next_attempts = attempts.saturating_add(1);
+                tracing::warn!(
+                    error = %error,
+                    attempts = next_attempts,
+                    "archive backlog: materialization failed; will retry (journal retained)"
+                );
+                {
+                    let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(front) = queue.front_mut() {
+                        front.attempts = next_attempts;
+                    }
+                }
+                ArchiveBacklogDrainStep::RetryLater(next_attempts)
+            }
+        }
+    }
+}
 
 /// Per-process monotonic sequence for journal filenames. Combined with a
 /// wall-clock prefix so filenames sort in enqueue order and never collide with
@@ -1236,45 +1356,15 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
 /// thread, never the request thread, so the tool reply stays decoupled.
 fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
     loop {
-        let front = {
-            let queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
-            queue
-                .front()
-                .map(|entry| (entry.op.clone(), entry.attempts, entry.journal_path.clone()))
-        };
-        let Some((op, attempts, journal_path)) = front else {
-            std::thread::sleep(Duration::from_millis(ARCHIVE_BACKLOG_IDLE_INTERVAL_MS));
-            continue;
-        };
-
-        match write_op_sync(&op) {
-            Ok(()) => {
-                let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
-                queue.pop_front();
-                let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-                drop(queue);
-                backlog.depth.store(depth, Ordering::Relaxed);
-                backlog.drained_total.fetch_add(1, Ordering::Relaxed);
-                if let Some(path) = journal_path {
-                    archive_backlog_journal_remove(&path);
-                }
-                // Fall through immediately to the next entry (no sleep) for fast drain.
+        match backlog.drain_step() {
+            ArchiveBacklogDrainStep::Empty => {
+                std::thread::sleep(Duration::from_millis(ARCHIVE_BACKLOG_IDLE_INTERVAL_MS));
             }
-            Err(error) => {
-                let next_attempts = attempts.saturating_add(1);
-                tracing::warn!(
-                    error = %error,
-                    attempts = next_attempts,
-                    "archive backlog: materialization failed; will retry (journal retained)"
-                );
-                {
-                    let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(front) = queue.front_mut() {
-                        front.attempts = next_attempts;
-                    }
-                }
+            // Materialized: loop immediately to drain the next entry with no sleep.
+            ArchiveBacklogDrainStep::Materialized => {}
+            ArchiveBacklogDrainStep::RetryLater(attempts) => {
                 let backoff = ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS
-                    .saturating_mul(u64::from(next_attempts.min(50)))
+                    .saturating_mul(u64::from(attempts.min(50)))
                     .min(ARCHIVE_BACKLOG_MAX_BACKOFF_MS);
                 std::thread::sleep(Duration::from_millis(backoff));
             }
@@ -1289,35 +1379,11 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
 /// small local-disk journal fsync (not a git commit), then returns.
 pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
     let backlog = &*ARCHIVE_BACKLOG;
-    let cap = archive_backlog_cap();
-    {
-        let queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if u64::try_from(queue.len()).unwrap_or(u64::MAX) >= cap {
-            drop(queue);
-            backlog.dropped_total.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                cap,
-                "archive retry backlog full; dropping archive op (DB authoritative; \
-                 parity report may show DB-ahead until operator backfills)"
-            );
-            return ArchiveBacklogPush::Dropped;
-        }
+    let outcome = backlog.push(op, archive_backlog_cap());
+    if outcome == ArchiveBacklogPush::Queued {
+        archive_backlog_ensure_drain(backlog);
     }
-    // Journal outside the queue lock: the fsync must not stall other pushers.
-    let journal_path = archive_backlog_journal_write(&op);
-    let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
-    queue.push_back(ArchiveBacklogEntry {
-        op,
-        journal_path,
-        first_enqueued_at: Instant::now(),
-        attempts: 0,
-    });
-    let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-    drop(queue);
-    backlog.depth.store(depth, Ordering::Relaxed);
-    backlog.enqueued_total.fetch_add(1, Ordering::Relaxed);
-    archive_backlog_ensure_drain(backlog);
-    ArchiveBacklogPush::Queued
+    outcome
 }
 
 /// Re-enqueue journaled archive writes left behind by a process that was killed
@@ -1369,23 +1435,10 @@ pub fn archive_backlog_recover(config: &Config) {
             }
         };
         let op = persisted.into_op(config.clone());
-        {
-            let mut queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
-            queue.push_back(ArchiveBacklogEntry {
-                op,
-                journal_path: Some(path),
-                first_enqueued_at: Instant::now(),
-                attempts: 0,
-            });
-            let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-            backlog.depth.store(depth, Ordering::Relaxed);
-        }
+        backlog.push_recovered(op, path);
         recovered = recovered.saturating_add(1);
     }
     if recovered > 0 {
-        backlog
-            .enqueued_total
-            .fetch_add(recovered, Ordering::Relaxed);
         tracing::warn!(
             recovered,
             "archive backlog: recovered pending archive writes from journal after restart"
@@ -1453,14 +1506,7 @@ pub struct ArchiveLagSnapshot {
 #[must_use]
 pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
     let backlog = &*ARCHIVE_BACKLOG;
-    let (backlog_depth, backlog_oldest_age_us) = {
-        let queue = backlog.queue.lock().unwrap_or_else(|e| e.into_inner());
-        let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-        let oldest = queue
-            .front()
-            .map_or(0, |entry| duration_as_micros_u64(entry.first_enqueued_at.elapsed()));
-        (depth, oldest)
-    };
+    let (backlog_depth, backlog_oldest_age_us) = backlog.backlog_state();
     let (coalescer_pending, coalescer_oldest_age_us) = COMMIT_COALESCER.get().map_or((0, 0), |c| {
         (c.pending_requests(), c.oldest_pending_age_us())
     });
