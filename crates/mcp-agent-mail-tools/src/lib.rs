@@ -1,9 +1,9 @@
 //! MCP tools and resources implementation for MCP Agent Mail
 //!
-//! This crate provides implementations for all 37 MCP tools:
+//! This crate provides implementations for all 38 MCP tools:
 //! - Infrastructure cluster (4 tools)
 //! - Identity cluster (6 tools)
-//! - Messaging cluster (5 tools)
+//! - Messaging cluster (6 tools)
 //! - Contact cluster (4 tools)
 //! - File reservation cluster (4 tools)
 //! - Search cluster (2 tools)
@@ -28,6 +28,7 @@ mod archive_read;
 pub mod build_slots;
 pub mod contacts;
 pub mod degraded_intents;
+pub mod idempotency;
 pub mod identity;
 pub mod llm;
 pub mod macros;
@@ -2567,6 +2568,7 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("send_message", clusters::MESSAGING),
     ("reply_message", clusters::MESSAGING),
     ("fetch_inbox", clusters::MESSAGING),
+    ("fetch_inbox_events", clusters::MESSAGING),
     ("mark_message_read", clusters::MESSAGING),
     ("acknowledge_message", clusters::MESSAGING),
     // Contact
