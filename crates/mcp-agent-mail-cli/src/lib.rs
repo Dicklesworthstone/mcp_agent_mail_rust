@@ -5311,17 +5311,32 @@ fn preserve_startup_sqlite_sidecar_snapshot(snapshot: Option<PathBuf>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoClearPortOutcome {
+    Cleared,
+    LiveServerWithoutKillablePid,
+}
+
+fn should_reuse_unresolved_live_server(
+    outcome: AutoClearPortOutcome,
+    managed_service: bool,
+) -> bool {
+    managed_service && outcome == AutoClearPortOutcome::LiveServerWithoutKillablePid
+}
+
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
 ///
-/// Refuses to terminate non-Agent-Mail processes.
-fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
+/// Refuses to terminate non-Agent-Mail processes. A verified listener without
+/// a trustworthy PID is returned explicitly so a managed duplicate can exit
+/// successfully rather than crash-looping while a healthy peer serves traffic.
+fn auto_clear_port(host: &str, port: u16) -> Result<AutoClearPortOutcome, CliError> {
     use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
 
     match bind_tcp_listener(host, port) {
-        Ok(_listener) => return Ok(()),
+        Ok(_listener) => return Ok(AutoClearPortOutcome::Cleared),
         Err(error) if error.kind() != std::io::ErrorKind::AddrInUse => {
             eprintln!("[warn] Could not check port {port}: {error} — proceeding anyway");
-            return Ok(());
+            return Ok(AutoClearPortOutcome::Cleared);
         }
         Err(_) => {
             // Port is in use — the health probe we're about to send may cause the
@@ -5333,12 +5348,16 @@ fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
 
     let status = check_port_status(host, port);
     match status {
-        PortStatus::Free => Ok(()),
+        PortStatus::Free => Ok(AutoClearPortOutcome::Cleared),
         PortStatus::AgentMailServer => {
+            let pids = resolved_agent_mail_listener_pids(host, port);
+            if pids.is_empty() {
+                return Ok(AutoClearPortOutcome::LiveServerWithoutKillablePid);
+            }
             eprintln!(
                 "[info] Existing Agent Mail server on {host}:{port} — stopping it to start fresh"
             );
-            kill_port_holder(host, port)
+            kill_port_holder_with_pids(host, port, pids).map(|()| AutoClearPortOutcome::Cleared)
         }
         PortStatus::OtherProcess { ref description } => Err(CliError::Other(format!(
             "Port {host}:{port} is in use by another process ({description}). \
@@ -5346,7 +5365,7 @@ fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
         ))),
         PortStatus::Error { ref message, .. } => {
             eprintln!("[warn] Could not check port {port}: {message} — proceeding anyway");
-            Ok(())
+            Ok(AutoClearPortOutcome::Cleared)
         }
     }
 }
@@ -6521,7 +6540,28 @@ fn handle_serve_http(
     // Kill any existing Agent Mail server on the port FIRST — on macOS
     // we can't find processes by DB file handle (no /proc), but we CAN
     // find them by port.  This also handles Codex-spawned `am serve-http`.
-    auto_clear_port(&config.http_host, config.http_port)?;
+    match auto_clear_port(&config.http_host, config.http_port)? {
+        AutoClearPortOutcome::Cleared => {}
+        outcome
+            if should_reuse_unresolved_live_server(outcome, running_under_managed_service()) =>
+        {
+            // Managed units use Restart=on-failure. An exit-success preserves
+            // the verified peer and prevents retry storms on hosts where PID
+            // enumeration is unavailable.
+            tracing::warn!(
+                host = %config.http_host,
+                port = config.http_port,
+                "verified Agent Mail peer is already serving but no safe listener PID is available; managed duplicate exits successfully"
+            );
+            return Ok(());
+        }
+        AutoClearPortOutcome::LiveServerWithoutKillablePid => {
+            return Err(CliError::Other(format!(
+                "Agent Mail is already serving on {}:{}, but no trustworthy listener PID is available to stop it safely. Reuse the live server or stop its supervisor before retrying.",
+                config.http_host, config.http_port
+            )));
+        }
+    }
     // Clear remaining stale Agent Mail processes holding the database file and
     // clean up stale lock/WAL artifacts, then run doctor-grade startup self-heal
     // before boot. Under the default (no --takeover), a LIVE peer serving this
@@ -10334,19 +10374,15 @@ fn quarantine_reclaimable_owner_locks(
         .map(|ev| ev.pid)
         .collect::<BTreeSet<_>>();
 
-    let ts = Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
-    let quarantine_dir = storage_root
-        .join("doctor")
-        .join("reclaimed-locks")
-        .join(&ts);
-    std::fs::create_dir_all(&quarantine_dir)?;
-
-    let mut moved = Vec::new();
+    // Validation pass (no mutation): decide which existing lock files are safe
+    // to quarantine BEFORE moving any. A lock held by a PID we did not judge
+    // reclaimable aborts the whole takeover — never a partial move, never an
+    // empty quarantine dir left behind on refusal.
+    let mut candidates = Vec::new();
     for lock in [&report.storage_root_lock, &report.sqlite_lock] {
         if !lock.exists || lock.file_type != "file" {
             continue;
         }
-        // Safety: never move a lock a non-reclaimable process holds.
         if lock
             .holder_pids
             .iter()
@@ -10355,6 +10391,20 @@ fn quarantine_reclaimable_owner_locks(
             emit_takeover_holder_not_reclaimable_refusal(op_label, lock, &reclaimable_pids);
             return Err(CliError::ExitCode(3));
         }
+        candidates.push(lock);
+    }
+
+    let ts = Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let quarantine_dir = storage_root
+        .join("doctor")
+        .join("reclaimed-locks")
+        .join(&ts);
+    std::fs::create_dir_all(&quarantine_dir)?;
+
+    // Mutation pass: move each validated lock into quarantine (rename, never
+    // delete — RULE 1).
+    let mut moved = Vec::new();
+    for lock in candidates {
         let from = PathBuf::from(&lock.path);
         let file_name = from
             .file_name()

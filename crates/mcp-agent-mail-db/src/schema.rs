@@ -507,6 +507,19 @@ const TRG_INBOX_STATS_INSERT_COMPAT_SQL: &str = "CREATE TRIGGER IF NOT EXISTS tr
              WHERE agent_id = NEW.agent_id; \
          END";
 
+/// Every recipient insertion receives a durable, recipient-local delivery
+/// sequence in the same transaction as the message. It is deliberately
+/// independent from `messages.id`: archive recovery and historical imports may
+/// preserve message ids without preserving a monitor's delivery position.
+const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF NOT EXISTS trg_inbox_delivery_events_recipient_insert \
+         AFTER INSERT ON message_recipients \
+         BEGIN \
+             INSERT OR IGNORE INTO inbox_delivery_events \
+                 (project_id, agent_id, message_id, kind, delivered_ts) \
+             SELECT m.project_id, NEW.agent_id, NEW.message_id, NEW.kind, m.created_ts \
+             FROM messages AS m WHERE m.id = NEW.message_id; \
+         END";
+
 /// Return the complete list of schema migrations.
 ///
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
@@ -2171,6 +2184,55 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v25: durable recipient delivery cursors (GH#238) ───────────────
+    //
+    // `fetch_inbox` is intentionally a bounded, mutable snapshot. Monitors
+    // need an append-only cursor that survives process restarts and unread
+    // state changes, so every recipient insertion receives its own sequence
+    // row in the same transaction. The sequence is not a message id: it is
+    // scoped to the recipient and never depends on message-id allocation.
+    migrations.push(Migration::new(
+        "v25_create_inbox_delivery_events".to_string(),
+        "GH#238: create durable per-recipient inbox delivery event ledger".to_string(),
+        "CREATE TABLE IF NOT EXISTS inbox_delivery_events (\
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,\
+            project_id INTEGER NOT NULL REFERENCES projects(id),\
+            agent_id INTEGER NOT NULL REFERENCES agents(id),\
+            message_id INTEGER NOT NULL REFERENCES messages(id),\
+            kind TEXT NOT NULL,\
+            delivered_ts INTEGER NOT NULL,\
+            UNIQUE(agent_id, message_id)\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v25_idx_inbox_delivery_events_agent_seq".to_string(),
+        "GH#238: paginate recipient inbox delivery events by durable sequence".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_inbox_delivery_events_agent_seq \
+         ON inbox_delivery_events(agent_id, seq)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v25_backfill_inbox_delivery_events".to_string(),
+        "GH#238: backfill durable inbox delivery events from existing recipients".to_string(),
+        "INSERT OR IGNORE INTO inbox_delivery_events \
+            (project_id, agent_id, message_id, kind, delivered_ts) \
+         SELECT m.project_id, r.agent_id, r.message_id, r.kind, m.created_ts \
+         FROM message_recipients AS r \
+         JOIN messages AS m ON m.id = r.message_id \
+         ORDER BY m.created_ts ASC, m.id ASC, r.agent_id ASC"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v25_trg_inbox_delivery_events_recipient_insert".to_string(),
+        "GH#238: append recipient delivery event in the message transaction".to_string(),
+        TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL.to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -2801,6 +2863,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "agents",
         "messages",
         "message_recipients",
+        "inbox_delivery_events",
         "file_reservations",
         "file_reservation_releases",
         "agent_links",
@@ -2811,10 +2874,14 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "idx_agents_project_name_nocase",
         "idx_messages_ack_required_id",
         "idx_mr_ack_message",
+        "idx_inbox_delivery_events_agent_seq",
         "idx_file_reservations_released_expires_id",
         "idx_file_reservation_releases_ts",
     ];
-    const REQUIRED_TRIGGERS: &[&str] = &["trg_messages_default_recipients_json"];
+    const REQUIRED_TRIGGERS: &[&str] = &[
+        "trg_messages_default_recipients_json",
+        "trg_inbox_delivery_events_recipient_insert",
+    ];
     const FORBIDDEN_FTS_TABLES: &[&str] = &["fts_messages", "fts_agents", "fts_projects"];
     const FORBIDDEN_FTS_TRIGGERS: &[&str] = &[
         "messages_ai",
@@ -2865,6 +2932,17 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         (
             "message_recipients",
             &["message_id", "agent_id", "kind", "read_ts", "ack_ts"],
+        ),
+        (
+            "inbox_delivery_events",
+            &[
+                "seq",
+                "project_id",
+                "agent_id",
+                "message_id",
+                "kind",
+                "delivered_ts",
+            ],
         ),
         (
             "file_reservations",
@@ -3210,7 +3288,7 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     cx: &Cx,
     conn: &C,
 ) -> Outcome<(), SqlError> {
-    const REBUILD_SQL: [&str; 24] = [
+    const REBUILD_SQL: [&str; 25] = [
         "DROP TRIGGER IF EXISTS fts_messages_ai",
         "DROP TRIGGER IF EXISTS fts_messages_ad",
         "DROP TRIGGER IF EXISTS fts_messages_au",
@@ -3220,6 +3298,11 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "DROP TRIGGER IF EXISTS trg_inbox_stats_insert",
         "DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read",
         "DROP TRIGGER IF EXISTS trg_inbox_stats_ack",
+        // GH#238: this trigger references `messages`, which this legacy
+        // migration drops and recreates below. Drop it before the rebuild;
+        // recreate it after only when the event table exists (v25 may not yet
+        // have run on a historical database).
+        "DROP TRIGGER IF EXISTS trg_inbox_delivery_events_recipient_insert",
         "DROP TRIGGER IF EXISTS trg_messages_default_recipients_json",
         "DROP TABLE IF EXISTS messages_v15_rebuild",
         "CREATE TABLE messages_v15_rebuild (\
@@ -3267,7 +3350,39 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         }
     }
 
-    Outcome::Ok(())
+    ensure_inbox_delivery_events_recipient_insert_trigger(cx, conn).await
+}
+
+async fn ensure_inbox_delivery_events_recipient_insert_trigger<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    let table_rows = match conn
+        .query(
+            cx,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'inbox_delivery_events' LIMIT 1",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if table_rows.is_empty() {
+        return Outcome::Ok(());
+    }
+
+    match conn
+        .execute(cx, TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL, &[])
+        .await
+    {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
 }
 
 async fn execute_v3b_rebuild_projects_created_at_integer_affinity<C: Connection>(

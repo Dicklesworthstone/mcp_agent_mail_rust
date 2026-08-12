@@ -786,6 +786,9 @@ pub fn ensure_gitignore_entries(
 // ---------------------------------------------------------------------------
 
 /// Merge or append a TOML section, replacing keys in the target section.
+///
+/// Codex's canonical spelling is `mcp_agent_mail`; rewrite the quoted hyphen
+/// alias when setup encounters it so clients do not retain two server names.
 fn merge_toml_section(
     existing: Option<&str>,
     section_header: &str,
@@ -810,9 +813,13 @@ fn merge_toml_section(
                         merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
                     }
 
-                    in_target_section = section == section_header.trim_matches(['[', ']']);
+                    in_target_section = toml_section_matches_target(section, section_header);
                     saw_target_section |= in_target_section;
-                    merged.push(raw_line.to_string());
+                    if in_target_section {
+                        merged.push(section_header.to_string());
+                    } else {
+                        merged.push(raw_line.to_string());
+                    }
                     continue;
                 }
 
@@ -849,6 +856,12 @@ fn merge_toml_section(
             section
         }
     }
+}
+
+fn toml_section_matches_target(section: &str, section_header: &str) -> bool {
+    let target = section_header.trim_matches(['[', ']']);
+    section == target
+        || (target == "mcp_servers.mcp_agent_mail" && section == "mcp_servers.\"mcp-agent-mail\"")
 }
 
 fn strip_toml_inline_comment(line: &str) -> &str {
@@ -2422,7 +2435,14 @@ fn setup_status_remediation(
         return format!("inspect unsupported config, then {dry_run}; {fix}");
     }
     if reasons.contains(&ConfigDriftReason::WrongBearerHeader) {
-        return format!("verify HTTP_BEARER_TOKEN/config.env token source, then {dry_run}; {fix}");
+        return format!(
+            "stale bearer token suspected: verify HTTP_BEARER_TOKEN/config.env token source, then {dry_run}; {fix}"
+        );
+    }
+    if reasons.contains(&ConfigDriftReason::DuplicateServerEntries) {
+        return format!(
+            "server-name alias conflict (`mcp-agent-mail` vs `mcp_agent_mail`): {dry_run}; {fix}"
+        );
     }
     format!("{dry_run}; {fix}")
 }

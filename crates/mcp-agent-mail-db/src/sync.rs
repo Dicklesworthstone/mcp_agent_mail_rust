@@ -11,6 +11,44 @@ use sqlmodel_core::Value;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
+/// A body-free, durable delivery event for one inbox recipient.
+///
+/// `seq` is a recipient-local cursor, not a message identifier. Consumers
+/// must persist it only after processing the matching event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxDeliveryEvent {
+    pub seq: i64,
+    pub message_id: i64,
+    pub kind: String,
+    pub delivered_ts: i64,
+    pub subject: String,
+    pub sender_name: String,
+    pub importance: String,
+    pub ack_required: bool,
+}
+
+/// One oldest-first cursor page from [`inbox_delivery_events_from_conn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxDeliveryEventPage {
+    pub events: Vec<InboxDeliveryEvent>,
+    pub next_cursor: i64,
+    pub has_more: bool,
+    pub oldest_available_cursor: Option<i64>,
+    pub tail_cursor: i64,
+}
+
+/// A cursor condition is explicit so monitor clients never confuse retention
+/// loss or an invalid future position with a valid empty page.
+#[derive(Debug, thiserror::Error)]
+pub enum InboxDeliveryEventError {
+    #[error("inbox delivery cursor {after} expired; oldest available cursor is {oldest_available}")]
+    CursorExpired { after: i64, oldest_available: i64 },
+    #[error("inbox delivery cursor {after} is ahead of durable tail {tail}")]
+    CursorAhead { after: i64, tail: i64 },
+    #[error("inbox delivery event query failed: {0}")]
+    Database(#[from] DbError),
+}
+
 /// Synchronously update the thread ID of a message.
 ///
 /// Returns `Ok(true)` if the thread ID was updated, `Ok(false)` if it was already the target ID.
@@ -297,6 +335,145 @@ fn fetch_inbox_rows_from_conn_impl(
     }
 
     Ok(out)
+}
+
+/// Read an append-only, recipient-scoped inbox delivery page.
+///
+/// This intentionally does not inspect `read_ts`: marking mail read changes a
+/// snapshot but never changes which delivery events a monitor must observe.
+/// Rows are ordered oldest-first so a consumer can safely persist
+/// `next_cursor` after processing each page.
+pub fn inbox_delivery_events_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    after: Option<i64>,
+    limit: usize,
+) -> Result<InboxDeliveryEventPage, InboxDeliveryEventError> {
+    if limit == 0 {
+        return Err(InboxDeliveryEventError::Database(DbError::invalid(
+            "limit",
+            "inbox event limit must be at least 1",
+        )));
+    }
+    let limit_with_probe = limit.checked_add(1).ok_or_else(|| {
+        InboxDeliveryEventError::Database(DbError::invalid(
+            "limit",
+            "inbox event limit is too large",
+        ))
+    })?;
+    let limit_i64 = i64::try_from(limit_with_probe).map_err(|_| {
+        InboxDeliveryEventError::Database(DbError::invalid(
+            "limit",
+            "inbox event limit exceeds i64::MAX",
+        ))
+    })?;
+
+    let range_rows = conn
+        .query_sync(
+            "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor \
+             FROM inbox_delivery_events WHERE project_id = ? AND agent_id = ?",
+            &[Value::BigInt(project_id), Value::BigInt(agent_id)],
+        )
+        .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
+    let (oldest_available_cursor, tail_cursor) = range_rows
+        .first()
+        .map(|row| {
+            let oldest = row
+                .get_named::<Option<i64>>("oldest_cursor")
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })?;
+            let tail = row
+                .get_named::<Option<i64>>("tail_cursor")
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })?
+                .unwrap_or(0);
+            Ok((oldest, tail))
+        })
+        .transpose()?
+        .unwrap_or((None, 0));
+
+    if let Some(after) = after {
+        if let Some(oldest) = oldest_available_cursor
+            && after < oldest.saturating_sub(1)
+        {
+            return Err(InboxDeliveryEventError::CursorExpired {
+                after,
+                oldest_available: oldest,
+            });
+        }
+        if after > tail_cursor {
+            return Err(InboxDeliveryEventError::CursorAhead {
+                after,
+                tail: tail_cursor,
+            });
+        }
+    }
+
+    let cursor = after.unwrap_or(0);
+    let rows = conn
+        .query_sync(
+            "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
+                    COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
+             FROM inbox_delivery_events AS e \
+             JOIN messages AS m ON m.id = e.message_id \
+             LEFT JOIN agents AS sender ON sender.id = m.sender_id \
+             WHERE e.project_id = ? AND e.agent_id = ? AND e.seq > ? \
+             ORDER BY e.seq ASC LIMIT ?",
+            &[
+                Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+                Value::BigInt(project_id),
+                Value::BigInt(agent_id),
+                Value::BigInt(cursor),
+                Value::BigInt(limit_i64),
+            ],
+        )
+        .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
+
+    let mut events = Vec::with_capacity(rows.len().min(limit));
+    for row in rows {
+        events.push(InboxDeliveryEvent {
+            seq: row.get_named("seq").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            message_id: row.get_named("message_id").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            kind: row.get_named("kind").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            delivered_ts: row.get_named("delivered_ts").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            subject: row.get_named("subject").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            sender_name: row.get_named("sender_name").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            importance: row.get_named("importance").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            ack_required: row.get_named::<i64>("ack_required").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })? != 0,
+        });
+    }
+    let has_more = events.len() > limit;
+    if has_more {
+        events.pop();
+    }
+    let next_cursor = events.last().map_or(cursor, |event| event.seq);
+
+    Ok(InboxDeliveryEventPage {
+        events,
+        next_cursor,
+        has_more,
+        oldest_available_cursor,
+        tail_cursor,
+    })
 }
 
 /// Fetch inbox rows using a short-lived synchronous FrankenSQLite connection.
@@ -982,6 +1159,86 @@ mod tests {
             metadata_rows[0].message.body_md.is_empty(),
             "metadata-only inbox reads should not materialize message bodies"
         );
+    }
+
+    #[test]
+    fn inbox_delivery_events_are_append_only_paginated_and_cursor_checked() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "Sender");
+        let recipient_id = insert_agent(&conn, project_id, "Recipient");
+        let mut message_ids = Vec::new();
+        for thread_id in ["thread-1", "thread-2", "thread-3"] {
+            let message_id = insert_message(&conn, project_id, sender_id, thread_id);
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+                &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+            )
+            .expect("insert recipient and durable delivery event");
+            message_ids.push(message_id);
+        }
+
+        let first = inbox_delivery_events_from_conn(&conn, project_id, recipient_id, None, 2)
+            .expect("first event page");
+        assert_eq!(first.events.len(), 2);
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.message_id)
+                .collect::<Vec<_>>(),
+            message_ids[..2]
+        );
+        assert!(
+            first.events[0].seq < first.events[1].seq,
+            "recipient events must be oldest-first by independent cursor"
+        );
+        assert_eq!(first.events[0].subject, "test subject");
+        assert_eq!(first.events[0].sender_name, "Sender");
+        assert_eq!(first.events[0].kind, "to");
+
+        // Draining unread state changes the snapshot but never rewrites or
+        // hides a delivery event that a restart-safe monitor still needs.
+        conn.execute_sync(
+            "UPDATE message_recipients SET read_ts = 2000000 WHERE agent_id = ?1",
+            &[Value::BigInt(recipient_id)],
+        )
+        .expect("mark recipients read");
+        let second = inbox_delivery_events_from_conn(
+            &conn,
+            project_id,
+            recipient_id,
+            Some(first.next_cursor),
+            2,
+        )
+        .expect("second event page");
+        assert_eq!(second.events.len(), 1);
+        assert!(!second.has_more);
+        assert_eq!(second.events[0].message_id, message_ids[2]);
+        assert_eq!(second.next_cursor, second.events[0].seq);
+
+        let ahead = inbox_delivery_events_from_conn(
+            &conn,
+            project_id,
+            recipient_id,
+            Some(second.tail_cursor + 1),
+            1,
+        )
+        .expect_err("future cursors must never look like empty delivery");
+        assert!(matches!(ahead, InboxDeliveryEventError::CursorAhead { .. }));
+
+        conn.execute_sync(
+            "DELETE FROM inbox_delivery_events WHERE seq = ?1",
+            &[Value::BigInt(first.events[0].seq)],
+        )
+        .expect("simulate a pruned historical event");
+        let expired = inbox_delivery_events_from_conn(&conn, project_id, recipient_id, Some(0), 1)
+            .expect_err("cursor before retained floor must be explicit");
+        assert!(matches!(
+            expired,
+            InboxDeliveryEventError::CursorExpired { .. }
+        ));
     }
 
     // ── update_message_thread_id tests ───────────────────────────────

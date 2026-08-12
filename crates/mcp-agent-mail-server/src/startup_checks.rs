@@ -577,9 +577,13 @@ fn normalize_connect_host_for_health_check(host: &str) -> std::borrow::Cow<'_, s
     }
 }
 
-/// Attempt to connect to a port and verify it's an Agent Mail server via health check.
+/// Attempt to connect to a port and verify it is an Agent Mail server through
+/// the MCP transport it actually serves.
 ///
-/// Sends a minimal HTTP GET request to `/health` and checks for a valid response.
+/// A liveness endpoint alone cannot detect a broken mounted MCP route. Send a
+/// small JSON-RPC POST to the canonical MCP path instead. A signed 401 still
+/// proves the request reached Agent Mail's bearer-auth gate without requiring
+/// this ownership probe to know the secret.
 fn agent_mail_health_probe(host: &str, port: u16) -> HealthProbeStatus {
     let connect_host = normalize_connect_host_for_health_check(host);
     let host_for_resolution = connect_host
@@ -638,13 +642,19 @@ fn probe_agent_mail_health_addr(
     let _ = stream.set_read_timeout(Some(HEALTH_CHECK_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HEALTH_CHECK_TIMEOUT));
 
-    // Send HTTP GET /health request
+    let body = r#"{"jsonrpc":"2.0","id":"startup-port-probe","method":"tools/list","params":{}}"#;
+    // Exercise the actual MCP POST route so trailing-slash regressions are not
+    // hidden behind a green liveness endpoint.
     let request = format!(
-        "GET /health HTTP/1.1\r\n\
+        "POST /mcp/ HTTP/1.1\r\n\
          Host: {connect_host}:{port}\r\n\
          Connection: close\r\n\
          User-Agent: mcp-agent-mail-startup-check\r\n\
-         \r\n"
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {body}",
+        body.len(),
     );
 
     let mut stream = stream;
@@ -661,8 +671,8 @@ fn probe_agent_mail_health_addr(
             return false;
         }
 
-        // Check for valid HTTP response (2xx or 3xx status codes are acceptable)
-        // Agent Mail returns 200 OK for /health
+        // A 2xx response proves MCP dispatch worked. A signed 401 proves this
+        // protected server reached its MCP auth gate. A 405 must never pass.
         if !status_line.starts_with("HTTP/1.") {
             return false;
         }
@@ -678,7 +688,7 @@ fn probe_agent_mail_health_addr(
             Err(_) => return false,
         };
 
-        if !(200..=399).contains(&status_code) {
+        if !(200..=299).contains(&status_code) && status_code != 401 {
             return false;
         }
 
@@ -3871,6 +3881,11 @@ mod tests {
         let server_thread = std::thread::spawn(move || {
             let (mut stream, _) = live_listener.accept().expect("accept health request");
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            assert_eq!(request_line, "POST /mcp/ HTTP/1.1\r\n");
             loop {
                 let mut line = String::new();
                 let bytes = reader.read_line(&mut line).expect("read request line");
@@ -3902,6 +3917,37 @@ mod tests {
             [dead_addr, live_addr]
         ));
 
+        server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn signed_mcp_post_405_is_not_treated_as_agent_mail() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept MCP probe");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            assert_eq!(request_line, "POST /mcp/ HTTP/1.1\r\n");
+            let response = "HTTP/1.1 405 Method Not Allowed\r\n\
+                X-Agent-Mail-Health: 1\r\n\
+                Content-Length: 0\r\n\
+                Connection: close\r\n\
+                \r\n";
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        assert!(matches!(
+            check_port_status("127.0.0.1", port),
+            PortStatus::OtherProcess { .. }
+        ));
         server_thread.join().expect("join test server");
     }
 
