@@ -51988,6 +51988,50 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn auto_reclaim_after_heal_applies_byte_budget_to_archive_reconcile_copies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"live-db").expect("write live db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let oldest = dir
+            .path()
+            .join("storage.sqlite3.archive-reconcile-20260810_000000_000");
+        let newest = dir
+            .path()
+            .join("storage.sqlite3.archive-reconcile-20260811_000000_000");
+        std::fs::write(&oldest, vec![0_u8; 100]).expect("write oldest snapshot");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&newest, vec![0_u8; 100]).expect("write newest snapshot");
+
+        // Both copies are below the count target. The 150-byte ceiling must
+        // nevertheless stage the older incident-time copy through the existing
+        // move-only reclaim flow, leaving the live DB and newest witness alone.
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DOCTOR_RETENTION_KEEP_MIN", "5"),
+                ("DOCTOR_RETENTION_MAX_BYTES_PER_CATEGORY", "150"),
+            ],
+            || auto_reclaim_recovery_debris_after_heal(&db_url, dir.path()),
+        );
+
+        assert!(!oldest.exists(), "older oversized copy should be staged");
+        assert!(newest.exists(), "newest incident witness should remain");
+        assert!(db_path.exists(), "live database must never be moved");
+        let reclaimable_root = dir.path().join("doctor").join("reclaimable");
+        let staged = std::fs::read_dir(&reclaimable_root)
+            .expect("reclaimable root")
+            .flatten()
+            .flat_map(|run| {
+                std::fs::read_dir(run.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .any(|entry| entry.file_name() == oldest.file_name().expect("oldest file name"));
+        assert!(staged, "older copy must be moved, never deleted");
+    }
+
+    #[test]
     fn startup_database_self_heal_dispatches_repair_for_corrupt_db_without_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("corrupt.sqlite3");
