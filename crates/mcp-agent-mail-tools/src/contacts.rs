@@ -16,8 +16,8 @@ use crate::messaging::{
     enqueue_agent_semantic_index, enqueue_message_semantic_index, try_write_message_archive,
 };
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_db_pool, get_read_db_pool, legacy_tool_error, resolve_agent,
-    resolve_project,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
+    resolve_agent, resolve_existing_project, resolve_project,
 };
 
 /// Contact link state (tool-facing).
@@ -270,9 +270,27 @@ pub async fn request_contact(
     model: Option<String>,
     task_description: Option<String>,
 ) -> McpResult<String> {
+    let register_if_missing = register_if_missing.unwrap_or(true);
+
+    // A caller that explicitly forbids implicit registration needs a typed
+    // source-project result before this mutation path opens its archive-aware
+    // write pool. In particular, a fresh database can legitimately have no
+    // archive repository yet; that must not turn a missing project into an
+    // unrelated archive-open DATABASE_ERROR.
+    let existing_source_project = if !register_if_missing {
+        let read_pool = get_coalescer_bypass_read_db_pool()?;
+        Some(resolve_existing_project(ctx, &read_pool, &project_key).await?)
+    } else {
+        None
+    };
+
     let pool = get_db_pool()?;
 
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = if existing_source_project.is_some() {
+        resolve_existing_project(ctx, &pool, &project_key).await?
+    } else {
+        resolve_project(ctx, &pool, &project_key).await?
+    };
     let project_id = project.id.unwrap_or(0);
 
     let from_row = resolve_or_register_sender(
@@ -280,7 +298,7 @@ pub async fn request_contact(
         &pool,
         project_id,
         &from_agent,
-        register_if_missing.unwrap_or(true),
+        register_if_missing,
         program,
         model,
         task_description.as_deref(),
