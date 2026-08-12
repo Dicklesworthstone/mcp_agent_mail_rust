@@ -684,7 +684,28 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
     }
 
     let storage_root = mcp_agent_mail_core::disk::simplify_verbatim_path(storage_root);
-    let repo = Repository::open(&storage_root)?;
+    let repo = match Repository::open(&storage_root) {
+        Ok(repo) => repo,
+        // A storage root with no initialized Git archive — whether the path is
+        // missing entirely (`class=Os`, ENOENT) or exists but is not a Git repo
+        // (`class=Repository`) — has no commit-based generation. Return a stable
+        // "null archive" generation instead of hard-failing so archive reads
+        // still proceed (reading plain-file artifacts under `projects/`, or
+        // falling back to the live DB) rather than surfacing the read as a
+        // database error. This also covers the ack-fast window where the DB has
+        // rows the archive has not yet materialized
+        // (br-ack-fast-storage-commit-reply-3ac88): a read must not fail merely
+        // because the git archive lags or is uninitialized. Both underlying
+        // libgit2 failures report `ErrorCode::NotFound`.
+        Err(error) if error.code() == ErrorCode::NotFound => {
+            return Ok(ArchiveReadGeneration {
+                head: None,
+                index: ArchiveReadIndexStamp::default(),
+                mutation_epoch,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
     let head_before = archive_read_head(&repo)?;
     let index_before = archive_read_index_stamp(repo.path())?;
     let head_after = archive_read_head(&repo)?;
@@ -18958,6 +18979,34 @@ mod tests {
         let second = archive_read_generation(&config.storage_root)
             .expect("generation marker must be stable without an archive write");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn archive_read_generation_tolerates_missing_or_nongit_storage_root() {
+        // Regression: archive reads (fetch_inbox_product / search / summarize /
+        // resource drift) must NOT surface a database error when the storage
+        // root has no initialized Git archive. Both an absent path (ENOENT) and
+        // a plain-file archive directory (present but not a Git repo) must yield
+        // a stable "null" generation so the archive-backed read proceeds against
+        // the plain artifacts or falls back to the live DB. Also covers the
+        // ack-fast window where the DB has rows the archive has not materialized.
+        let tmp = TempDir::new().unwrap();
+
+        // (1) Path does not exist at all.
+        let missing = tmp.path().join("no-such-storage");
+        let gen_missing = archive_read_generation(&missing)
+            .expect("missing storage root must yield a null generation, not a hard error");
+        assert!(gen_missing.head.is_none());
+        assert_eq!(gen_missing.index, ArchiveReadIndexStamp::default());
+
+        // (2) Directory exists with plain archive artifacts but no Git repo.
+        let plain = tmp.path().join("storage");
+        fs::create_dir_all(plain.join("projects/p/messages/2026/04")).unwrap();
+        fs::write(plain.join("projects/p/project.json"), b"{}").unwrap();
+        let gen_plain = archive_read_generation(&plain)
+            .expect("non-git storage root must yield a null generation, not a hard error");
+        assert!(gen_plain.head.is_none());
+        assert_eq!(gen_plain.index, ArchiveReadIndexStamp::default());
     }
 
     #[test]
