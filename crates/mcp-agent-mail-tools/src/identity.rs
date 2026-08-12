@@ -310,6 +310,45 @@ const fn us_to_ms_ceil(us: u64) -> u64 {
     us.saturating_add(999).saturating_div(1000)
 }
 
+fn timeout_diagnostics_response(
+    diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
+    coalescer_degraded_p99_bound_ms: u64,
+) -> TimeoutDiagnosticsResponse {
+    let dispatch = &diagnostics.blocking_dispatch;
+    TimeoutDiagnosticsResponse {
+        client_deadline_ms: us_to_ms_ceil(diagnostics.client_deadline_us),
+        coalescer_degraded_p99_bound_ms,
+        contended_path: diagnostics.stage.as_str().to_string(),
+        stage_exceeded_client_deadline: diagnostics.stage_exceeded_budget,
+        pool_acquire_p99_ms: us_to_ms_ceil(diagnostics.pool_acquire_p99_us),
+        database_write_p99_ms: us_to_ms_ceil(diagnostics.database_write_p99_us),
+        archive_wbq_p99_ms: us_to_ms_ceil(diagnostics.archive_wbq_p99_us),
+        archive_commit_p99_ms: us_to_ms_ceil(diagnostics.archive_commit_p99_us),
+        blocking_dispatch_inflight: dispatch.inflight,
+        blocking_dispatch_zombies: dispatch.zombies,
+        blocking_dispatch_timeouts_total: dispatch.timeouts_total,
+    }
+}
+
+fn coalescer_latency_health_level(
+    coalescer_p99_us: u64,
+    configured_bound_ms: u64,
+) -> mcp_agent_mail_core::HealthLevel {
+    let client_deadline_us =
+        mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS.saturating_mul(1_000);
+    let degraded_bound_us = configured_bound_ms
+        .clamp(1, mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS)
+        .saturating_mul(1_000);
+
+    if coalescer_p99_us >= client_deadline_us {
+        mcp_agent_mail_core::HealthLevel::Red
+    } else if coalescer_p99_us >= degraded_bound_us {
+        mcp_agent_mail_core::HealthLevel::Yellow
+    } else {
+        mcp_agent_mail_core::HealthLevel::Green
+    }
+}
+
 fn percentage_clamped(value: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
@@ -935,6 +974,10 @@ pub struct HealthCheckResponse {
     pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
+    /// Stage-level timeout evidence. This stays populated even when pool
+    /// gauges are idle so a blocking-dispatch stall is never hidden behind an
+    /// all-zero pool utilization report.
+    pub timeout_diagnostics: TimeoutDiagnosticsResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queues: Option<QueuesHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1026,6 +1069,27 @@ pub struct PoolUtilizationResponse {
     pub warning: bool,
 }
 
+/// Timeout evidence shared with the HTTP dispatch timeout error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutDiagnosticsResponse {
+    /// The ecosystem request deadline used for stage attribution.
+    pub client_deadline_ms: u64,
+    /// Coalescer p99 threshold that prevents a green health result.
+    pub coalescer_degraded_p99_bound_ms: u64,
+    /// The measured bottleneck, or an explicit unattributed dispatch state.
+    pub contended_path: String,
+    /// True only when the named measured stage reached the client deadline.
+    pub stage_exceeded_client_deadline: bool,
+    pub pool_acquire_p99_ms: u64,
+    pub database_write_p99_ms: u64,
+    pub archive_wbq_p99_ms: u64,
+    pub archive_commit_p99_ms: u64,
+    /// Non-pool occupancy from the blocking dispatch handoff.
+    pub blocking_dispatch_inflight: u64,
+    pub blocking_dispatch_zombies: u64,
+    pub blocking_dispatch_timeouts_total: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuesHealthResponse {
     pub wbq: WbqQueueHealthResponse,
@@ -1094,6 +1158,10 @@ pub struct CommitCoalescerHealthResponse {
     pub latency_p50_ms: u64,
     pub latency_p95_ms: u64,
     pub latency_p99_ms: u64,
+    /// Configured p99 bound below the 30-second client deadline.
+    pub degraded_p99_bound_ms: u64,
+    /// True when p99 has reached the configured functional-degradation bound.
+    pub functionally_degraded: bool,
     pub over_80_for_s: u64,
     pub warning: bool,
 }
@@ -1197,6 +1265,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     mcp_agent_mail_storage::wbq_start();
     let _ = mcp_agent_mail_storage::get_commit_coalescer();
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
+    let timeout_diagnostics = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(
+        mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS.saturating_mul(1_000),
+    );
+    let coalescer_latency_level = coalescer_latency_health_level(
+        metrics.storage.commit_queue_latency_us.p99,
+        config.health_commit_coalescer_p99_degraded_ms,
+    );
     let disk_sample = if config.disk_space_monitor_enabled {
         Some(mcp_agent_mail_core::disk::sample_and_record(config))
     } else {
@@ -1248,6 +1323,10 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     } else if archive_lag_oldest_us >= archive_lag_warn_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Yellow);
     }
+    // A coalescer can have an empty queue now while its tail latency is already
+    // consuming most of the fixed ecosystem client deadline. Treat that as
+    // functional degradation so an all-zero pool snapshot cannot hide it.
+    effective_level = effective_level.max(coalescer_latency_level);
     let failing_verdicts = verdicts.failing_names();
 
     let response = HealthCheckResponse {
@@ -1276,6 +1355,10 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             over_80_for_s,
             warning: over_80_for_s >= 300,
         }),
+        timeout_diagnostics: timeout_diagnostics_response(
+            &timeout_diagnostics,
+            config.health_commit_coalescer_p99_degraded_ms,
+        ),
         queues: Some({
             let wbq_over_80_for_s = if metrics.storage.wbq_over_80_since_us == 0 {
                 0
@@ -1327,8 +1410,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     latency_p50_ms: us_to_ms_ceil(metrics.storage.commit_queue_latency_us.p50),
                     latency_p95_ms: us_to_ms_ceil(metrics.storage.commit_queue_latency_us.p95),
                     latency_p99_ms: us_to_ms_ceil(metrics.storage.commit_queue_latency_us.p99),
+                    degraded_p99_bound_ms: config.health_commit_coalescer_p99_degraded_ms,
+                    functionally_degraded: coalescer_latency_level
+                        != mcp_agent_mail_core::HealthLevel::Green,
                     over_80_for_s: commit_over_80_for_s,
-                    warning: commit_over_80_for_s >= 300,
+                    warning: commit_over_80_for_s >= 300
+                        || coalescer_latency_level != mcp_agent_mail_core::HealthLevel::Green,
                 },
                 archive_lag: ArchiveLagHealthResponse {
                     backlog_depth: archive_lag.backlog_depth,
@@ -2422,6 +2509,22 @@ mod tests {
         }
     }
 
+    fn test_timeout_diagnostics() -> TimeoutDiagnosticsResponse {
+        TimeoutDiagnosticsResponse {
+            client_deadline_ms: 30_000,
+            coalescer_degraded_p99_bound_ms: 15_000,
+            contended_path: "no_monitored_stage_exceeded_budget".into(),
+            stage_exceeded_client_deadline: false,
+            pool_acquire_p99_ms: 0,
+            database_write_p99_ms: 0,
+            archive_wbq_p99_ms: 0,
+            archive_commit_p99_ms: 0,
+            blocking_dispatch_inflight: 0,
+            blocking_dispatch_zombies: 0,
+            blocking_dispatch_timeouts_total: 0,
+        }
+    }
+
     // ── C1 (br-bvq1x.3.1): decomposed verdicts + strict roll-up ──────────
 
     fn semantic(status: &str, detail: &str) -> SemanticReadinessResponse {
@@ -2732,6 +2835,7 @@ mod tests {
                 detail: "aligned".into(),
             },
             pool_utilization: None,
+            timeout_diagnostics: test_timeout_diagnostics(),
             queues: None,
             disk: None,
             integrity: None,
@@ -2747,6 +2851,7 @@ mod tests {
         assert_eq!(json["semantic_readiness"]["status"], "ok");
         assert_eq!(json["http_port"], 8765);
         assert_eq!(json["storage_root"], "/data");
+        assert_eq!(json["timeout_diagnostics"]["client_deadline_ms"], 30_000);
         assert_eq!(json["verdicts"]["db_health"]["status"], "green");
     }
 
@@ -3186,6 +3291,50 @@ mod tests {
     }
 
     #[test]
+    fn coalescer_tail_latency_never_leaves_health_green_past_its_bound() {
+        use mcp_agent_mail_core::HealthLevel;
+
+        assert_eq!(
+            coalescer_latency_health_level(14_999_000, 15_000),
+            HealthLevel::Green
+        );
+        assert_eq!(
+            coalescer_latency_health_level(15_000_000, 15_000),
+            HealthLevel::Yellow
+        );
+        assert_eq!(
+            coalescer_latency_health_level(30_000_000, 15_000),
+            HealthLevel::Red
+        );
+    }
+
+    #[test]
+    fn timeout_diagnostics_expose_blocking_dispatch_when_pool_is_idle() {
+        let response = timeout_diagnostics_response(
+            &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot {
+                client_deadline_us: 30_000_000,
+                stage: mcp_agent_mail_core::metrics::TimeoutStage::BlockingDispatch,
+                stage_exceeded_budget: false,
+                pool_acquire_p99_us: 0,
+                database_write_p99_us: 0,
+                archive_wbq_p99_us: 0,
+                archive_commit_p99_us: 16_778_000,
+                blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
+                    inflight: 1,
+                    zombies: 0,
+                    timeouts_total: 1,
+                },
+            },
+            15_000,
+        );
+
+        assert_eq!(response.contended_path, "blocking_dispatch_unattributed");
+        assert_eq!(response.pool_acquire_p99_ms, 0);
+        assert_eq!(response.blocking_dispatch_inflight, 1);
+        assert_eq!(response.archive_commit_p99_ms, 16_778);
+    }
+
+    #[test]
     fn percentage_clamped_handles_large_values() {
         assert_eq!(percentage_clamped(0, 0), 0);
         assert_eq!(percentage_clamped(50, 100), 50);
@@ -3210,6 +3359,7 @@ mod tests {
                 detail: "memory".into(),
             },
             pool_utilization: None,
+            timeout_diagnostics: test_timeout_diagnostics(),
             queues: None,
             disk: None,
             integrity: None,
