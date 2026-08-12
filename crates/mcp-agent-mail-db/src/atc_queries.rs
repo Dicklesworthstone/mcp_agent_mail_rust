@@ -182,7 +182,7 @@ struct ExperienceAggregateRow {
     resolved_ts_micros: Option<i64>,
 }
 
-trait RollupConn {
+pub(crate) trait RollupConn {
     fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String>;
     fn rollup_execute_sync(&self, sql: &str, params: &[Value]) -> Result<(), String>;
 }
@@ -909,12 +909,16 @@ pub struct OpenExperienceSummary {
     pub executed_ts_micros: Option<i64>,
 }
 
+fn saturating_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 impl From<&ExperienceRow> for OpenExperienceSummary {
     fn from(row: &ExperienceRow) -> Self {
         Self {
-            experience_id: i64::try_from(row.experience_id).unwrap_or(i64::MAX),
-            decision_id: i64::try_from(row.decision_id).unwrap_or(i64::MAX),
-            effect_id: i64::try_from(row.effect_id).unwrap_or(i64::MAX),
+            experience_id: saturating_u64_to_i64(row.experience_id),
+            decision_id: saturating_u64_to_i64(row.decision_id),
+            effect_id: saturating_u64_to_i64(row.effect_id),
             trace_id: row.trace_id.clone(),
             state: row.state.to_string(),
             subsystem: row.subsystem.to_string(),
@@ -1376,7 +1380,9 @@ fn experience_eviction_cutoff_ts(conn: &impl RollupConn, to_evict: i64) -> Resul
 }
 
 /// Roll up and evict raw rows down to the hysteresis target while the caller
-/// owns an ATC write transaction. The transaction boundary makes the ceiling a
+/// owns an ATC write transaction.
+///
+/// The transaction boundary makes the ceiling a
 /// real commit-time invariant: a new append cannot commit an over-cap table
 /// while a background sweep is delayed or starved.
 pub(crate) fn enforce_experience_row_ceiling_in_transaction(
@@ -1705,6 +1711,20 @@ mod tests {
 
     static TEST_POOL_ID: AtomicU64 = AtomicU64::new(1);
     static TEST_POOL_DIRS: OnceLock<Mutex<Vec<tempfile::TempDir>>> = OnceLock::new();
+
+    #[test]
+    fn u64_ids_saturate_at_the_sqlite_integer_ceiling() {
+        let sqlite_i64_max = u64::try_from(i64::MAX).expect("i64::MAX is non-negative");
+
+        assert_eq!(saturating_u64_to_i64(0), 0);
+        assert_eq!(saturating_u64_to_i64(sqlite_i64_max), i64::MAX);
+        assert_eq!(
+            saturating_u64_to_i64(sqlite_i64_max.saturating_add(1)),
+            i64::MAX,
+            "IDs above SQLite's signed INTEGER range must saturate, never wrap"
+        );
+        assert_eq!(saturating_u64_to_i64(u64::MAX), i64::MAX);
+    }
 
     fn make_row(names: Vec<&str>, values: Vec<Value>) -> Row {
         Row::new(names.into_iter().map(String::from).collect(), values)
