@@ -103,7 +103,8 @@
               "/queues/commit_coalescer/degraded_p99_bound_ms",
               "/queues/commit_coalescer/functionally_degraded",
               "/queues/commit_coalescer/over_80_for_s",
-              "/queues/commit_coalescer/warning"
+              "/queues/commit_coalescer/warning",
+              "/queues/archive_lag"
             ]
           }
         }
