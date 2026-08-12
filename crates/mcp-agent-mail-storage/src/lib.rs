@@ -18794,6 +18794,84 @@ mod tests {
     }
 
     #[test]
+    fn archive_read_generation_advances_after_a_committed_archive_change() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "generation-marker").unwrap();
+        let before = archive_read_generation(&archive.repo_root).unwrap();
+
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, r#"{"name":"TestAgent"}"#).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        commit_paths_lockfree(
+            &repo,
+            &config,
+            "advance archive generation",
+            &[rel.as_str()],
+        )
+        .unwrap();
+
+        let after = archive_read_generation(&archive.repo_root).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn archive_read_generation_tracks_an_index_only_change() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "generation-index").unwrap();
+        let before = archive_read_generation(&archive.repo_root).unwrap();
+
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, r#"{"name":"TestAgent"}"#).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(&rel)).unwrap();
+        index.write().unwrap();
+
+        let after = archive_read_generation(&archive.repo_root).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn archive_read_generation_refuses_an_active_git_index_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "generation-index-lock").unwrap();
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        fs::write(&lock_path, "active test lock").unwrap();
+
+        assert!(matches!(
+            archive_read_generation(&archive.repo_root),
+            Err(StorageError::LockContention { message }) if message.contains("index lock")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_read_generation_does_not_walk_projects_tree() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive(&config, "generation-no-walk").unwrap();
+        let project_root = config.storage_root.join("projects/generation-no-walk");
+        let outside = tmp.path().join("outside.json");
+        fs::write(&outside, b"{}").unwrap();
+        symlink(&outside, project_root.join("project.json")).unwrap();
+
+        let first = archive_read_generation(&config.storage_root)
+            .expect("generation marker must not traverse project artifacts");
+        let second = archive_read_generation(&config.storage_root)
+            .expect("generation marker must be stable without an archive write");
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn lockfree_commit_missing_file_records_deletion() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
