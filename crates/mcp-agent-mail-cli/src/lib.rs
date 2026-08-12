@@ -8973,8 +8973,12 @@ fn handle_doctor_reclaim(
         output::kv(
             "Policy",
             &format!(
-                "keep >= {} newest per category, keep < {} days old",
-                report.keep_min, report.max_age_days
+                "keep >= {} newest per category, keep < {} days old, max {} per category",
+                report.keep_min,
+                report.max_age_days,
+                report
+                    .max_bytes_per_category
+                    .map_or_else(|| "disabled".to_string(), format_bytes),
             ),
         );
         output::kv(
@@ -57202,8 +57206,6 @@ startup_timeout_sec = 42
             "--search-root",
             "--db",
             "--storage-root",
-            "--in-place",
-            "--copy",
             "--target-db",
             "--target-storage-root",
             "--dry-run",
@@ -61346,8 +61348,6 @@ startup_timeout_sec = 42
                         search_root,
                         db,
                         storage_root,
-                        in_place,
-                        copy,
                         target_db,
                         target_storage_root,
                         dry_run,
@@ -61360,8 +61360,6 @@ startup_timeout_sec = 42
                 assert!(search_root.is_none());
                 assert!(db.is_none());
                 assert!(storage_root.is_none());
-                assert!(!in_place);
-                assert!(!copy);
                 assert!(target_db.is_none());
                 assert!(target_storage_root.is_none());
                 assert!(dry_run);
@@ -61374,7 +61372,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn clap_parses_legacy_import_copy_with_explicit_targets() {
+    fn clap_parses_legacy_import_with_explicit_targets() {
         let cli = Cli::try_parse_from([
             "am",
             "legacy",
@@ -61383,7 +61381,6 @@ startup_timeout_sec = 42
             "/tmp/legacy.sqlite3",
             "--storage-root",
             "/tmp/legacy-storage",
-            "--copy",
             "--target-db",
             "/tmp/rust.sqlite3",
             "--target-storage-root",
@@ -61398,8 +61395,6 @@ startup_timeout_sec = 42
                         auto,
                         db,
                         storage_root,
-                        in_place,
-                        copy,
                         target_db,
                         target_storage_root,
                         json,
@@ -61409,8 +61404,6 @@ startup_timeout_sec = 42
                 assert!(!auto);
                 assert_eq!(db, Some(PathBuf::from("/tmp/legacy.sqlite3")));
                 assert_eq!(storage_root, Some(PathBuf::from("/tmp/legacy-storage")));
-                assert!(!in_place);
-                assert!(copy);
                 assert_eq!(target_db, Some(PathBuf::from("/tmp/rust.sqlite3")));
                 assert_eq!(
                     target_storage_root,

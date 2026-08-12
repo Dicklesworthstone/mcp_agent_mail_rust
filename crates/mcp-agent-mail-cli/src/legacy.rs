@@ -13,10 +13,10 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::{
-    is_sqlite_memory_database_url, sqlite_file_path_from_database_url, sqlite_sidecar_path,
+    is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
 };
-use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::schema;
+use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -57,16 +57,10 @@ pub enum LegacyCommand {
         /// Explicit source storage root path.
         #[arg(long)]
         storage_root: Option<PathBuf>,
-        /// Force in-place migration (default mode).
-        #[arg(long, default_value_t = false, conflicts_with = "copy")]
-        in_place: bool,
-        /// Copy source DB/storage to target paths, then migrate the copy.
-        #[arg(long, default_value_t = false, conflicts_with = "in_place")]
-        copy: bool,
-        /// Optional target DB path when `--copy` is used.
+        /// Optional target DB path. Imports always migrate a new copy.
         #[arg(long)]
         target_db: Option<PathBuf>,
-        /// Optional target storage root when `--copy` is used.
+        /// Optional target storage root. Imports always migrate a new copy.
         #[arg(long)]
         target_storage_root: Option<PathBuf>,
         /// Show planned operations without making any changes.
@@ -213,7 +207,6 @@ struct LegacyDetectReport {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ImportMode {
-    InPlace,
     Copy,
 }
 
@@ -240,24 +233,18 @@ struct LegacyImportMailboxLocks {
 }
 
 fn legacy_import_lock_specs(plan: &ImportPlan) -> Vec<(LegacyImportMailboxLockKind, PathBuf)> {
-    let mut specs = vec![
-        (
-            LegacyImportMailboxLockKind::StorageRoot,
-            plan.source_storage_root.clone(),
-        ),
-        (LegacyImportMailboxLockKind::Sqlite, plan.source_db.clone()),
-    ];
+    let mut specs = Vec::new();
 
-    // Copy-mode targets are usually fresh paths. Only lock them when they already
-    // exist so a failed import does not create brand-new directories just for
-    // advisory lock files.
-    if plan.mode == ImportMode::InPlace || plan.target_storage_root.exists() {
+    // The source is strictly read-only: creating activity-lock metadata beside
+    // it would violate that contract. Fresh targets also remain lock-free until
+    // the import creates them, avoiding stale lock artifacts on a failed run.
+    if plan.target_storage_root.exists() {
         specs.push((
             LegacyImportMailboxLockKind::StorageRoot,
             plan.target_storage_root.clone(),
         ));
     }
-    if plan.mode == ImportMode::InPlace || plan.target_db.exists() {
+    if plan.target_db.exists() {
         specs.push((LegacyImportMailboxLockKind::Sqlite, plan.target_db.clone()));
     }
 
@@ -303,8 +290,6 @@ struct LegacyImportReceipt {
     source_storage_root: String,
     target_db: String,
     target_storage_root: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backup_root: Option<String>,
     migrated_migration_ids: Vec<String>,
     integrity_check_ok: bool,
     core_table_counts: BTreeMap<String, i64>,
@@ -353,8 +338,6 @@ pub fn handle_legacy(args: LegacyArgs) -> CliResult<()> {
             search_root,
             db,
             storage_root,
-            in_place,
-            copy,
             target_db,
             target_storage_root,
             dry_run,
@@ -368,8 +351,6 @@ pub fn handle_legacy(args: LegacyArgs) -> CliResult<()> {
                 search_root,
                 db,
                 storage_root,
-                in_place,
-                copy,
                 target_db,
                 target_storage_root,
                 dry_run,
@@ -420,8 +401,6 @@ pub fn handle_upgrade(args: UpgradeArgs) -> CliResult<()> {
         search_root: Some(root),
         db: None,
         storage_root: None,
-        in_place: false,
-        copy: false,
         target_db: None,
         target_storage_root: None,
         dry_run: args.dry_run,
@@ -430,8 +409,7 @@ pub fn handle_upgrade(args: UpgradeArgs) -> CliResult<()> {
     let plan = build_import_plan(&import_opts)?;
 
     if args.dry_run {
-        report.action =
-            "dry-run: legacy detected; would run in-place import + setup refresh".into();
+        report.action = "dry-run: legacy detected; would copy-import + setup refresh".into();
         output::emit_output(&report, fmt, || {
             ftui_runtime::ftui_println!("Upgrade summary");
             ftui_runtime::ftui_println!("- Search root: {}", report.search_root);
@@ -624,8 +602,6 @@ struct ImportOptions {
     search_root: Option<PathBuf>,
     db: Option<PathBuf>,
     storage_root: Option<PathBuf>,
-    in_place: bool,
-    copy: bool,
     target_db: Option<PathBuf>,
     target_storage_root: Option<PathBuf>,
     dry_run: bool,
@@ -673,9 +649,6 @@ fn run_legacy_import(opts: ImportOptions, fmt: output::CliOutputFormat) -> CliRe
         ftui_runtime::ftui_println!("- Mode: {:?}", receipt.mode);
         ftui_runtime::ftui_println!("- Target DB: {}", receipt.target_db);
         ftui_runtime::ftui_println!("- Target storage: {}", receipt.target_storage_root);
-        if let Some(path) = &receipt.backup_root {
-            ftui_runtime::ftui_println!("- Backup root: {path}");
-        }
         ftui_runtime::ftui_println!(
             "- Integrity check: {}",
             if receipt.integrity_check_ok {
@@ -731,65 +704,45 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         )));
     }
 
-    let mode = match (opts.in_place, opts.copy) {
-        (false, true) => ImportMode::Copy,
-        (true, false) | (false, false) => ImportMode::InPlace,
-        (true, true) => {
-            return Err(CliError::InvalidArgument(
-                "--in-place and --copy are mutually exclusive".to_string(),
-            ));
-        }
-    };
+    let mode = ImportMode::Copy;
+    let target_db = opts
+        .target_db
+        .clone()
+        .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
+        .unwrap_or_else(|| default_copy_target_db(&source_db));
+    let target_storage = opts
+        .target_storage_root
+        .clone()
+        .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
+        .unwrap_or_else(|| default_copy_target_storage(&source_storage));
 
-    let (target_db, target_storage) = match mode {
-        ImportMode::InPlace => {
-            if opts.target_db.is_some() || opts.target_storage_root.is_some() {
-                return Err(CliError::InvalidArgument(
-                    "--target-db/--target-storage-root require --copy".to_string(),
-                ));
-            }
-            (source_db.clone(), source_storage.clone())
-        }
-        ImportMode::Copy => {
-            let target_db = opts
-                .target_db
-                .clone()
-                .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
-                .unwrap_or_else(|| default_copy_target_db(&source_db));
-            let target_storage = opts
-                .target_storage_root
-                .clone()
-                .map(|v| normalize_input_path(&v.to_string_lossy(), &root))
-                .unwrap_or_else(|| default_copy_target_storage(&source_storage));
-            (target_db, target_storage)
-        }
-    };
-
-    if mode == ImportMode::Copy && source_db == target_db {
+    if source_db == target_db {
         return Err(CliError::InvalidArgument(
-            "copy mode requires target DB path different from source DB".to_string(),
+            "legacy import requires a target DB path different from source DB".to_string(),
         ));
     }
-    if mode == ImportMode::Copy && target_db.exists() {
+    if fs::symlink_metadata(&target_db).is_ok() {
         return Err(CliError::InvalidArgument(format!(
-            "copy mode requires target DB path that does not already exist: {}",
+            "legacy import requires target DB path that does not already exist: {}",
             target_db.display()
         )));
     }
-    if mode == ImportMode::Copy && source_storage == target_storage {
+    if source_storage == target_storage {
         return Err(CliError::InvalidArgument(
-            "copy mode requires target storage root different from source storage root".to_string(),
+            "legacy import requires target storage root different from source storage root"
+                .to_string(),
         ));
     }
-    if mode == ImportMode::Copy && target_storage.exists() && !target_storage.is_dir() {
+    if target_storage.exists() && !target_storage.is_dir() {
         return Err(CliError::InvalidArgument(format!(
-            "copy mode requires target storage root to be a directory path: {}",
+            "legacy import requires target storage root to be a directory path: {}",
             target_storage.display()
         )));
     }
-    if mode == ImportMode::Copy && paths_overlap(&source_storage, &target_storage) {
+    if paths_overlap(&source_storage, &target_storage) {
         return Err(CliError::InvalidArgument(
-            "copy mode requires target storage root to be outside source storage root".to_string(),
+            "legacy import requires target storage root to be outside source storage root"
+                .to_string(),
         ));
     }
 
@@ -799,24 +752,20 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         "resolve source storage root: {}",
         source_storage.display()
     ));
-    match mode {
-        ImportMode::InPlace => {
-            operations.push("create safety backup of source DB and storage root".to_string());
-            operations.push("run schema::migrate_to_latest against source DB".to_string());
-        }
-        ImportMode::Copy => {
-            operations.push(format!(
-                "copy source DB to target DB: {}",
-                target_db.display()
-            ));
-            operations.push(format!(
-                "copy source storage root to target storage root: {}",
-                target_storage.display()
-            ));
-            operations.push("run schema::migrate_to_latest against target DB".to_string());
-        }
-    }
-    operations.push("run integrity_check and core-table sanity queries".to_string());
+    operations.push(
+        "verify source DB through canonical SQLite read-only access before copying".to_string(),
+    );
+    operations.push(format!(
+        "copy source DB to target DB with a canonical SQLite online backup: {}",
+        target_db.display()
+    ));
+    operations.push(format!(
+        "copy source storage root to target storage root: {}",
+        target_storage.display()
+    ));
+    operations.push("run schema::migrate_to_latest against target DB only".to_string());
+    operations.push("verify source and target DB readability before recording success".to_string());
+    operations.push("run target integrity_check and core-table sanity queries".to_string());
     operations.push("write JSON receipt under target storage root".to_string());
     operations.push("refresh agent MCP config via setup run".to_string());
 
@@ -832,38 +781,25 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
 }
 
 fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<LegacyImportReceipt> {
-    // Legacy import checkpoints, copies, and may migrate the live mailbox in
-    // place. Fence those paths before any backup/copy work begins.
+    // Import only locks existing target paths. Source paths stay entirely
+    // read-only, including during detection and the SQLite online backup.
     let _mailbox_locks = acquire_legacy_import_mailbox_locks(&plan)?;
     let now = Utc::now();
     let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
     let mut warnings = Vec::new();
-    let mut backup_root: Option<PathBuf> = None;
 
-    match plan.mode {
-        ImportMode::InPlace => {
-            let backup_dir = default_backup_dir(&plan.source_storage_root, &timestamp);
-            backup_db_with_sidecars(&plan.source_db, &backup_dir.join("db"))?;
-            copy_dir_recursive(
-                &plan.source_storage_root,
-                &backup_dir.join("storage_root_backup"),
-            )?;
-            backup_root = Some(backup_dir);
-        }
-        ImportMode::Copy => {
-            if plan.target_storage_root.exists() {
-                let mut iter = fs::read_dir(&plan.target_storage_root)?;
-                if iter.next().is_some() {
-                    return Err(CliError::InvalidArgument(format!(
-                        "target storage root {} already exists and is not empty; choose a different path",
-                        plan.target_storage_root.display()
-                    )));
-                }
-            }
-            copy_db_with_sidecars(&plan.source_db, &plan.target_db)?;
-            copy_dir_recursive(&plan.source_storage_root, &plan.target_storage_root)?;
+    verify_canonical_sqlite_readable(&plan.source_db, "source DB")?;
+    if plan.target_storage_root.exists() {
+        let mut iter = fs::read_dir(&plan.target_storage_root)?;
+        if iter.next().is_some() {
+            return Err(CliError::InvalidArgument(format!(
+                "target storage root {} already exists and is not empty; choose a different path",
+                plan.target_storage_root.display()
+            )));
         }
     }
+    copy_db_via_sqlite_backup(&plan.source_db, &plan.target_db)?;
+    copy_dir_recursive(&plan.source_storage_root, &plan.target_storage_root)?;
 
     let migrated_ids = migrate_sqlite_db(&plan.target_db)?;
     let integrity_ok = integrity_check_ok(&plan.target_db)?;
@@ -874,6 +810,9 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
         )));
     }
     let core_counts = query_core_table_counts(&plan.target_db)?;
+    verify_canonical_sqlite_readable(&plan.source_db, "source DB")?;
+    verify_canonical_sqlite_readable(&plan.target_db, "target DB")?;
+    verify_runtime_sqlite_readable(&plan.target_db, "target DB")?;
 
     let setup_ok = if should_refresh_setup {
         match run_setup_refresh_once(Some(plan.search_root.clone())) {
@@ -896,7 +835,6 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
         source_storage_root: plan.source_storage_root.display().to_string(),
         target_db: plan.target_db.display().to_string(),
         target_storage_root: plan.target_storage_root.display().to_string(),
-        backup_root: backup_root.as_ref().map(|p| p.display().to_string()),
         migrated_migration_ids: migrated_ids,
         integrity_check_ok: integrity_ok,
         core_table_counts: core_counts,
@@ -1368,7 +1306,10 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
     if !path.exists() {
         return None;
     }
-    let conn = match DbConn::open_file(path.display().to_string()) {
+    // Detection is part of the source-import path. Do not let the writable
+    // runtime engine establish namespace metadata or attempt schema repair on
+    // a legacy source simply to identify it.
+    let conn = match open_canonical_read_only(path) {
         Ok(v) => v,
         Err(_) => {
             return Some(LegacyDbSignature {
@@ -1747,64 +1688,59 @@ fn default_copy_target_storage(source_storage: &Path) -> PathBuf {
     source_storage.with_file_name(format!("{name}-rust-copy"))
 }
 
-fn default_backup_dir(source_storage_root: &Path, timestamp: &str) -> PathBuf {
-    let parent = source_storage_root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    parent.join("mcp-agent-mail-legacy-backups").join(timestamp)
+fn open_canonical_read_only(path: &Path) -> CliResult<CanonicalDbConn> {
+    let path_text = path.to_string_lossy().into_owned();
+    let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(path_text)
+        .flags(mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_only());
+    CanonicalDbConn::open(&config).map_err(|error| {
+        CliError::Other(format!(
+            "cannot open SQLite DB read-only {}: {error}",
+            path.display()
+        ))
+    })
 }
 
-const SQLITE_IMPORT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
-
-fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult<()> {
-    fs::create_dir_all(destination_root)?;
-    let db_name = db_path
-        .file_name()
-        .map(|v| v.to_owned())
-        .unwrap_or_else(|| "storage.sqlite3".into());
-    fs::copy(db_path, destination_root.join(db_name))?;
-    for suffix in SQLITE_IMPORT_SIDECAR_SUFFIXES {
-        let sidecar = sqlite_sidecar_path(db_path, suffix);
-        if sidecar.exists() {
-            let file_name = sidecar
-                .file_name()
-                .ok_or_else(|| CliError::Other("invalid sidecar filename".to_string()))?;
-            fs::copy(&sidecar, destination_root.join(file_name))?;
-        }
+fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
+    let conn = open_canonical_read_only(path)?;
+    let rows = conn
+        .query_sync("PRAGMA quick_check", &[])
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{label} canonical SQLite quick_check failed for {}: {error}",
+                path.display()
+            ))
+        })?;
+    let value = rows
+        .first()
+        .and_then(|row| row.get_named::<String>("quick_check").ok())
+        .unwrap_or_default();
+    if value != "ok" {
+        return Err(CliError::Other(format!(
+            "{label} canonical SQLite quick_check is not ok for {}: {value}",
+            path.display()
+        )));
     }
     Ok(())
 }
 
-fn checkpoint_sqlite_for_copy(db_path: &Path) -> CliResult<()> {
-    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
-        .map_err(|e| CliError::Other(format!("WAL checkpoint failed before copy: {e}")))?;
+fn verify_runtime_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
+    let conn = DbConn::open_file_read_only(path.display().to_string()).map_err(|error| {
+        CliError::Other(format!(
+            "{label} runtime SQLite read-only open failed for {}: {error}",
+            path.display()
+        ))
+    })?;
+    conn.query_sync("SELECT COUNT(*) AS c FROM sqlite_master", &[])
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{label} runtime SQLite read failed for {}: {error}",
+                path.display()
+            ))
+        })?;
     Ok(())
 }
 
-fn remove_stale_target_sidecar(target_sidecar: &Path) -> CliResult<()> {
-    match fs::symlink_metadata(target_sidecar) {
-        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
-            fs::remove_file(target_sidecar).map_err(|e| {
-                CliError::Other(format!(
-                    "failed to clear stale target sidecar {}: {e}",
-                    target_sidecar.display()
-                ))
-            })
-        }
-        Ok(_) => Err(CliError::Other(format!(
-            "failed to clear stale target sidecar {}: sidecar is not a file or symlink",
-            target_sidecar.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CliError::Other(format!(
-            "failed to inspect stale target sidecar {}: {error}",
-            target_sidecar.display()
-        ))),
-    }
-}
-
-fn copy_db_with_sidecars(source_db: &Path, target_db: &Path) -> CliResult<()> {
+fn copy_db_via_sqlite_backup(source_db: &Path, target_db: &Path) -> CliResult<()> {
     if !source_db.exists() {
         return Err(CliError::Other(format!(
             "source database does not exist: {}",
@@ -1812,20 +1748,26 @@ fn copy_db_with_sidecars(source_db: &Path, target_db: &Path) -> CliResult<()> {
         )));
     }
 
-    checkpoint_sqlite_for_copy(source_db)?;
+    if fs::symlink_metadata(target_db).is_ok() {
+        return Err(CliError::InvalidArgument(format!(
+            "target database path must not already exist: {}",
+            target_db.display()
+        )));
+    }
 
     if let Some(parent) = target_db.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(source_db, target_db)?;
-
-    // Avoid transporting stale rollback-journal/WAL/SHM sidecars into the
-    // imported database. Sidecars are ephemeral and can be inconsistent with
-    // the copied main DB.
-    for suffix in SQLITE_IMPORT_SIDECAR_SUFFIXES {
-        let target_sidecar = sqlite_sidecar_path(target_db, suffix);
-        remove_stale_target_sidecar(&target_sidecar)?;
-    }
+    let source = open_canonical_read_only(source_db)?;
+    source
+        .backup_to_path(target_db.to_string_lossy().as_ref())
+        .map_err(|error| {
+            CliError::Other(format!(
+                "canonical SQLite backup from {} to {} failed: {error}",
+                source_db.display(),
+                target_db.display()
+            ))
+        })?;
     Ok(())
 }
 
@@ -1901,13 +1843,12 @@ mod tests {
         LegacyImportReceipt {
             receipt_version: 1,
             created_at: created_at.to_string(),
-            mode: ImportMode::InPlace,
+            mode: ImportMode::Copy,
             search_root: "/tmp/project".to_string(),
             source_db: "/tmp/storage.sqlite3".to_string(),
             source_storage_root: "/tmp/storage-root".to_string(),
             target_db: target_db.to_string(),
             target_storage_root: "/tmp/storage-root".to_string(),
-            backup_root: Some("/tmp/backup".to_string()),
             migrated_migration_ids: vec!["20260216_add_indexes".to_string()],
             integrity_check_ok: true,
             core_table_counts: counts,
@@ -2078,7 +2019,7 @@ mod tests {
     }
 
     #[test]
-    fn build_import_plan_in_place_uses_source_paths() {
+    fn build_import_plan_generates_distinct_default_targets() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("legacy.sqlite3");
         let storage = tmp.path().join("legacy-storage");
@@ -2089,40 +2030,6 @@ mod tests {
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(db.clone()),
             storage_root: Some(storage.clone()),
-            in_place: true,
-            copy: false,
-            target_db: None,
-            target_storage_root: None,
-            dry_run: true,
-            yes: true,
-        })
-        .unwrap();
-        assert_eq!(plan.mode, ImportMode::InPlace);
-        assert_eq!(plan.source_db, db);
-        assert_eq!(plan.target_db, plan.source_db);
-        assert_eq!(plan.source_storage_root, storage);
-        assert_eq!(plan.target_storage_root, plan.source_storage_root);
-        assert!(
-            plan.operations
-                .iter()
-                .any(|op| op.contains("create safety backup"))
-        );
-    }
-
-    #[test]
-    fn build_import_plan_copy_generates_default_targets() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("legacy.sqlite3");
-        let storage = tmp.path().join("legacy-storage");
-        fs::write(&db, b"sqlite").unwrap();
-        fs::create_dir_all(&storage).unwrap();
-        let plan = build_import_plan(&ImportOptions {
-            auto: false,
-            search_root: Some(tmp.path().to_path_buf()),
-            db: Some(db.clone()),
-            storage_root: Some(storage.clone()),
-            in_place: false,
-            copy: true,
             target_db: None,
             target_storage_root: None,
             dry_run: true,
@@ -2156,8 +2063,6 @@ mod tests {
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(db.clone()),
             storage_root: Some(storage.clone()),
-            in_place: false,
-            copy: true,
             target_db: Some(db),
             target_storage_root: Some(storage),
             dry_run: true,
@@ -2166,7 +2071,7 @@ mod tests {
         .unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("copy mode requires target DB path different"));
+                assert!(msg.contains("target DB path different"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
@@ -2185,8 +2090,6 @@ mod tests {
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(source_db_dir.clone()),
             storage_root: Some(source_storage),
-            in_place: true,
-            copy: false,
             target_db: None,
             target_storage_root: None,
             dry_run: true,
@@ -2216,8 +2119,6 @@ mod tests {
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(source_db),
             storage_root: Some(source_storage_file.clone()),
-            in_place: true,
-            copy: false,
             target_db: None,
             target_storage_root: None,
             dry_run: true,
@@ -2249,8 +2150,6 @@ mod tests {
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(db),
             storage_root: Some(storage),
-            in_place: false,
-            copy: true,
             target_db: Some(target_db.clone()),
             target_storage_root: Some(tmp.path().join("target-storage")),
             dry_run: true,
@@ -2282,8 +2181,6 @@ mod tests {
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(db),
             storage_root: Some(storage),
-            in_place: false,
-            copy: true,
             target_db: Some(tmp.path().join("target.sqlite3")),
             target_storage_root: Some(target_storage_file.clone()),
             dry_run: true,
@@ -2314,8 +2211,6 @@ mod tests {
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(db),
             storage_root: Some(storage),
-            in_place: false,
-            copy: true,
             target_db: Some(tmp.path().join("target.sqlite3")),
             target_storage_root: Some(nested_target_storage),
             dry_run: true,
@@ -2389,7 +2284,7 @@ mod tests {
         let parsed: LegacyImportReceipt =
             serde_json::from_str(&fs::read_to_string(receipt_path).unwrap()).unwrap();
         assert_eq!(parsed.receipt_version, 1);
-        assert_eq!(parsed.mode, ImportMode::InPlace);
+        assert_eq!(parsed.mode, ImportMode::Copy);
         assert_eq!(parsed.source_db, "/tmp/storage.sqlite3");
     }
 
@@ -2442,18 +2337,6 @@ mod tests {
     }
 
     #[test]
-    fn default_backup_dir_includes_timestamp() {
-        let root = PathBuf::from("/tmp/.mcp_agent_mail_git_mailbox_repo");
-        let backup = default_backup_dir(&root, "20260217T000000Z");
-        assert!(
-            backup
-                .to_string_lossy()
-                .contains("mcp-agent-mail-legacy-backups")
-        );
-        assert!(backup.to_string_lossy().ends_with("20260217T000000Z"));
-    }
-
-    #[test]
     fn paths_overlap_detects_nested_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
@@ -2477,358 +2360,154 @@ mod tests {
         assert!(!paths_overlap(&source, &sibling_via_parent));
     }
 
-    #[test]
-    fn legacy_import_in_place_reports_busy_before_mutating_mailbox() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_db = tmp.path().join("legacy_in_place_busy.sqlite3");
-        drop(DbConn::open_file(source_db.display().to_string()).unwrap());
-        let source_storage = tmp.path().join("legacy-storage");
-        fs::create_dir_all(&source_storage).unwrap();
+    fn seed_v20_agents_fixture(path: &Path) {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
 
-        let plan = build_import_plan(&ImportOptions {
-            auto: false,
-            search_root: Some(tmp.path().to_path_buf()),
-            db: Some(source_db.clone()),
-            storage_root: Some(source_storage.clone()),
-            in_place: true,
-            copy: false,
-            target_db: None,
-            target_storage_root: None,
-            dry_run: false,
-            yes: true,
-        })
-        .unwrap();
-
-        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
-            &source_db,
-            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        let conn = CanonicalDbConn::open_file(path.display().to_string())
+            .expect("open canonical v20 fixture DB");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable fixture foreign keys");
+        conn.execute_raw(&schema::init_schema_sql_base())
+            .expect("create current base tables for v20 fixture");
+        conn.execute_raw("DROP TABLE agents")
+            .expect("replace agents with Python v20 shape");
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER NOT NULL,\
+                project_id INTEGER NOT NULL,\
+                name VARCHAR(128) NOT NULL,\
+                program VARCHAR(128) NOT NULL,\
+                model VARCHAR(128) NOT NULL,\
+                task_description TEXT NOT NULL DEFAULT '',\
+                inception_ts INTEGER NOT NULL,\
+                last_active_ts INTEGER NOT NULL,\
+                attachments_policy VARCHAR(32) NOT NULL DEFAULT 'auto',\
+                contact_policy VARCHAR(32) NOT NULL DEFAULT 'auto',\
+                reaper_exempt INTEGER NOT NULL DEFAULT 0,\
+                registration_token VARCHAR(64),\
+                retired_at DATETIME,\
+                PRIMARY KEY (id),\
+                CONSTRAINT uq_agent_project_name UNIQUE (project_id, name),\
+                FOREIGN KEY (project_id) REFERENCES projects (id)\
+            )",
         )
-        .unwrap()
-        .unwrap();
-
-        let err = execute_import(plan, false).unwrap_err();
-        let err_text = err.to_string();
-        assert!(
-            err_text.contains("temporarily busy")
-                || err_text.contains("mailbox activity lock is busy"),
-            "unexpected error: {err_text}"
-        );
-        assert!(
-            !tmp.path().join("mcp-agent-mail-legacy-backups").exists(),
-            "busy import must fail before creating backup directories"
-        );
-        assert!(
-            !source_storage.join("legacy_import_receipts").exists(),
-            "busy import must fail before writing a receipt"
-        );
-
-        let verify = DbConn::open_file(source_db.display().to_string()).unwrap();
-        let rows = verify
-            .query_sync(
-                "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='mcp_agent_mail_migrations'",
-                &[],
+        .expect("create Python v20 agents table");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("v20-project".to_string()),
+                Value::Text("/tmp/v20-project".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert v20 project");
+        conn.execute_sync(
+            "INSERT INTO agents (\
+                 id, project_id, name, program, model, task_description, inception_ts, last_active_ts\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("V20Agent".to_string()),
+                Value::Text("python".to_string()),
+                Value::Text("legacy".to_string()),
+                Value::Text("v20 source fixture".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert v20 agent");
+        conn.execute_raw(
+            "CREATE TABLE mcp_agent_mail_migrations (\
+                id TEXT PRIMARY KEY,\
+                description TEXT NOT NULL,\
+                applied_at INTEGER NOT NULL\
+            )",
+        )
+        .expect("create migration ledger");
+        for migration in schema::schema_migrations_base() {
+            if matches!(
+                migration.id.as_str(),
+                "v20_agents_registration_token" | "v20_idx_agents_registration_token"
+            ) {
+                continue;
+            }
+            conn.execute_sync(
+                "INSERT INTO mcp_agent_mail_migrations (id, description, applied_at) VALUES (?, ?, ?)",
+                &[
+                    Value::Text(migration.id),
+                    Value::Text(migration.description),
+                    Value::BigInt(0),
+                ],
             )
-            .unwrap();
-        let migration_table_count = rows
-            .first()
-            .and_then(|row| row.get_named::<i64>("c").ok())
-            .unwrap_or(0);
-        assert_eq!(
-            migration_table_count, 0,
-            "busy import must fail before migrating the live database"
-        );
+            .expect("seed already-applied migration");
+        }
     }
 
     #[test]
-    fn legacy_import_copy_reports_busy_before_creating_targets() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_db = tmp.path().join("legacy_copy_busy.sqlite3");
-        drop(DbConn::open_file(source_db.display().to_string()).unwrap());
+    fn legacy_import_v20_autoindex_fixture_preserves_source_and_migrates_copy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_db = tmp.path().join("legacy-v20.sqlite3");
         let source_storage = tmp.path().join("legacy-storage");
-        fs::create_dir_all(&source_storage).unwrap();
         let target_db = tmp.path().join("rust-copy.sqlite3");
         let target_storage = tmp.path().join("rust-storage");
+        fs::create_dir_all(&source_storage).expect("create source storage");
+        fs::write(source_storage.join("message.json"), "legacy archive")
+            .expect("seed source storage");
+        seed_v20_agents_fixture(&source_db);
+
+        let source_conn =
+            open_canonical_read_only(&source_db).expect("open source fixture read-only");
+        let indexes = source_conn
+            .query_sync("PRAGMA index_list(agents)", &[])
+            .expect("inspect implicit agents indexes");
+        assert!(
+            indexes.iter().any(|row| {
+                row.get_named::<String>("name")
+                    .is_ok_and(|name| name == "sqlite_autoindex_agents_1")
+            }),
+            "fixture must carry the implicit UNIQUE autoindex that v20 preflight reconstructs"
+        );
+        drop(source_conn);
+        let source_bytes_before = fs::read(&source_db).expect("read source fixture bytes");
 
         let plan = build_import_plan(&ImportOptions {
             auto: false,
             search_root: Some(tmp.path().to_path_buf()),
             db: Some(source_db.clone()),
             storage_root: Some(source_storage.clone()),
-            in_place: false,
-            copy: true,
             target_db: Some(target_db.clone()),
             target_storage_root: Some(target_storage.clone()),
             dry_run: false,
             yes: true,
         })
-        .unwrap();
+        .expect("build copy-only import plan");
+        let receipt = execute_import(plan, false).expect("import v20 fixture into a copy");
 
-        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
-            &source_db,
-            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
-        )
-        .unwrap()
-        .unwrap();
-
-        let err = execute_import(plan, false).unwrap_err();
-        let err_text = err.to_string();
-        assert!(
-            err_text.contains("temporarily busy")
-                || err_text.contains("mailbox activity lock is busy"),
-            "unexpected error: {err_text}"
-        );
-        assert!(
-            !target_db.exists(),
-            "busy copy import must fail before creating the target database"
-        );
-        assert!(
-            !target_storage.exists(),
-            "busy copy import must fail before creating the target storage root"
-        );
-        assert!(
-            !source_storage.join("legacy_import_receipts").exists(),
-            "busy copy import must fail before writing a receipt"
-        );
-    }
-
-    #[test]
-    fn import_fixture_copy_mode_migrates_and_writes_receipt() {
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../legacy_python_mcp_agent_mail_code/mcp_agent_mail/storage.sqlite3");
-        if !fixture.exists() {
-            println!(
-                "skipping test: missing legacy fixture DB at {}",
-                fixture.display()
-            );
-            return;
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let source_db = tmp.path().join("legacy_fixture.sqlite3");
-        fs::copy(&fixture, &source_db).unwrap();
-
-        let source_storage = tmp.path().join("legacy-storage");
-        fs::create_dir_all(&source_storage).unwrap();
-        fs::write(source_storage.join(".placeholder"), "legacy-storage-root").unwrap();
-
-        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
-        let source_rows = source_conn
-            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
-            .unwrap();
-        let source_message_count = source_rows
-            .first()
-            .and_then(|r| r.get_named::<i64>("c").ok())
-            .unwrap_or(0);
-
-        let target_db = tmp.path().join("rust_import.sqlite3");
-        let target_storage = tmp.path().join("rust-storage");
-        let plan = build_import_plan(&ImportOptions {
-            auto: false,
-            search_root: Some(tmp.path().to_path_buf()),
-            db: Some(source_db.clone()),
-            storage_root: Some(source_storage),
-            in_place: false,
-            copy: true,
-            target_db: Some(target_db.clone()),
-            target_storage_root: Some(target_storage.clone()),
-            dry_run: false,
-            yes: true,
-        })
-        .unwrap();
-
-        let receipt = execute_import(plan, false).unwrap();
         assert!(receipt.integrity_check_ok);
-        assert!(target_db.exists(), "target DB missing after import");
-        let receipts_dir = target_storage.join("legacy_import_receipts");
-        assert!(receipts_dir.exists(), "receipt directory should exist");
-        let receipt_files: Vec<PathBuf> = fs::read_dir(&receipts_dir)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .collect();
         assert!(
-            receipt_files.iter().any(|p| {
-                p.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("legacy_import_"))
-            }),
-            "expected at least one legacy import receipt file"
+            receipt
+                .migrated_migration_ids
+                .iter()
+                .any(|id| id == "v20_agents_registration_token"),
+            "v20 already-satisfied preflight should be recorded on the target"
         );
-
-        let conn = DbConn::open_file(target_db.display().to_string()).unwrap();
-        let migration_rows = conn
-            .query_sync("SELECT COUNT(*) AS c FROM mcp_agent_mail_migrations", &[])
-            .unwrap();
-        let migration_count = migration_rows
-            .first()
-            .and_then(|r| r.get_named::<i64>("c").ok())
-            .unwrap_or(0);
-        assert!(migration_count > 0, "expected applied migration rows");
-
-        let message_rows = conn
-            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
-            .unwrap();
-        let target_message_count = message_rows
-            .first()
-            .and_then(|r| r.get_named::<i64>("c").ok())
-            .unwrap_or(0);
         assert_eq!(
-            target_message_count, source_message_count,
-            "message row count should be preserved"
+            fs::read(&source_db).expect("reread source fixture bytes"),
+            source_bytes_before,
+            "legacy source DB bytes must remain unchanged by import"
         );
-
-        let trigger_rows = conn
-            .query_sync(
-                "SELECT COUNT(*) AS c FROM sqlite_master WHERE type='trigger' \
-                 AND name IN ('fts_messages_ai','fts_messages_ad','fts_messages_au')",
-                &[],
-            )
-            .unwrap();
-        let trigger_count = trigger_rows
-            .first()
-            .and_then(|r| r.get_named::<i64>("c").ok())
-            .unwrap_or(0);
-        assert_eq!(trigger_count, 0, "legacy FTS triggers should be removed");
-    }
-
-    #[test]
-    fn copy_db_with_sidecars_omits_source_sidecars_and_preserves_main_db() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_db = tmp.path().join("source.sqlite3");
-        let target_db = tmp.path().join("target.sqlite3");
-
-        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
-        source_conn
-            .execute_raw("CREATE TABLE marker(value TEXT)")
-            .unwrap();
-        source_conn
-            .execute_raw("INSERT INTO marker(value) VALUES('from-source')")
-            .unwrap();
-        let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-        drop(source_conn);
-
-        let source_wal = PathBuf::from(format!("{}-wal", source_db.display()));
-        let source_shm = PathBuf::from(format!("{}-shm", source_db.display()));
-        fs::write(&source_wal, b"source-sidecar-wal").unwrap();
-        fs::write(&source_shm, b"source-sidecar-shm").unwrap();
-
-        copy_db_with_sidecars(&source_db, &target_db).unwrap();
-
-        let target_wal = PathBuf::from(format!("{}-wal", target_db.display()));
-        let target_shm = PathBuf::from(format!("{}-shm", target_db.display()));
+        verify_canonical_sqlite_readable(&source_db, "source DB")
+            .expect("source remains readable after import");
+        verify_canonical_sqlite_readable(&target_db, "target DB")
+            .expect("target remains readable after import");
+        verify_runtime_sqlite_readable(&target_db, "target DB")
+            .expect("target remains runtime-readable after import");
         assert!(
-            !target_wal.exists(),
-            "target copy should not include stale source WAL sidecar"
+            target_storage.join("legacy_import_receipts").exists(),
+            "successful copy import must write its receipt under target storage"
         );
-        assert!(
-            !target_shm.exists(),
-            "target copy should not include stale source SHM sidecar"
-        );
-
-        let target_conn = DbConn::open_file(target_db.display().to_string()).unwrap();
-        let rows = target_conn
-            .query_sync("SELECT value FROM marker LIMIT 1", &[])
-            .unwrap();
-        let marker = rows
-            .first()
-            .and_then(|row| row.get_named::<String>("value").ok())
-            .unwrap();
-        assert_eq!(marker, "from-source");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn backup_db_with_sidecars_copies_non_utf8_sidecars() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join(OsStr::from_bytes(b"legacy-\xFF.sqlite3"));
-        let backup_dir = tmp.path().join("backup");
-        fs::write(&db_path, b"db").unwrap();
-        let journal_path = sqlite_sidecar_path(&db_path, "-journal");
-        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
-        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
-        fs::write(&journal_path, b"journal").unwrap();
-        fs::write(&wal_path, b"wal").unwrap();
-        fs::write(&shm_path, b"shm").unwrap();
-
-        backup_db_with_sidecars(&db_path, &backup_dir).unwrap();
-
-        assert!(backup_dir.join(db_path.file_name().unwrap()).exists());
-        assert!(backup_dir.join(journal_path.file_name().unwrap()).exists());
-        assert!(backup_dir.join(wal_path.file_name().unwrap()).exists());
-        assert!(backup_dir.join(shm_path.file_name().unwrap()).exists());
-    }
-
-    #[test]
-    fn copy_db_with_sidecars_fails_when_stale_target_sidecar_cannot_be_cleared() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source_db = tmp.path().join("source.sqlite3");
-        let target_db = tmp.path().join("target.sqlite3");
-
-        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
-        source_conn
-            .execute_raw("CREATE TABLE marker(value TEXT)")
-            .unwrap();
-        source_conn
-            .execute_raw("INSERT INTO marker(value) VALUES('from-source')")
-            .unwrap();
-        let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-        drop(source_conn);
-
-        let target_journal = sqlite_sidecar_path(&target_db, "-journal");
-        fs::create_dir_all(&target_journal).unwrap();
-
-        let err = copy_db_with_sidecars(&source_db, &target_db).unwrap_err();
-        match err {
-            CliError::Other(message) => {
-                assert!(message.contains("failed to clear stale target sidecar"));
-                assert!(message.contains(target_journal.to_string_lossy().as_ref()));
-            }
-            other => panic!("expected copy failure, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn copy_db_with_sidecars_removes_broken_stale_target_sidecar_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let source_db = tmp.path().join("source.sqlite3");
-        let target_db = tmp.path().join("target.sqlite3");
-
-        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
-        source_conn
-            .execute_raw("CREATE TABLE marker(value TEXT)")
-            .unwrap();
-        source_conn
-            .execute_raw("INSERT INTO marker(value) VALUES('from-source')")
-            .unwrap();
-        let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-        drop(source_conn);
-
-        let target_wal = sqlite_sidecar_path(&target_db, "-wal");
-        let missing_target = tmp.path().join("missing-target-wal");
-        symlink(&missing_target, &target_wal).unwrap();
-
-        copy_db_with_sidecars(&source_db, &target_db).unwrap();
-
-        assert!(
-            fs::symlink_metadata(&target_wal)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-            "broken target WAL symlink should be removed"
-        );
-        let target_conn = DbConn::open_file(target_db.display().to_string()).unwrap();
-        let rows = target_conn
-            .query_sync("SELECT value FROM marker LIMIT 1", &[])
-            .unwrap();
-        let marker = rows
-            .first()
-            .and_then(|row| row.get_named::<String>("value").ok())
-            .unwrap();
-        assert_eq!(marker, "from-source");
     }
 
     #[cfg(unix)]
