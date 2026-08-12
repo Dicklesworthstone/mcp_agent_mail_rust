@@ -1324,7 +1324,14 @@ async fn replay_single_release_intent(
             return Err((format!("panicked: {}", panic.message()), true));
         }
     };
-    dispatch_release_archive_write(&project, &agent, &released_rows, config);
+    let db_generation = fetch_db_generation(ctx, pool).await;
+    dispatch_release_archive_write(
+        &project,
+        &agent,
+        &released_rows,
+        config,
+        db_generation.as_deref(),
+    );
     Ok(released_rows.len())
 }
 
@@ -1931,7 +1938,14 @@ pub async fn file_reservation_paths(
             .into_iter()
             .filter_map(|row| row.id.map(|id| (id, row.name)))
             .collect();
-        reconcile_active_reservation_archive(&project, &active, &agent_names, &Config::get());
+        let db_generation = fetch_db_generation(ctx, &pool).await;
+        reconcile_active_reservation_archive(
+            &project,
+            &active,
+            &agent_names,
+            &Config::get(),
+            db_generation.as_deref(),
+        );
         if let asupersync::Outcome::Ok(released_rows) =
             mcp_agent_mail_db::queries::list_released_unexpired_reservations(
                 ctx.cx(),
@@ -1945,6 +1959,7 @@ pub async fn file_reservation_paths(
                 &released_rows,
                 &agent_names,
                 &Config::get(),
+                db_generation.as_deref(),
             );
         }
     }
@@ -2394,7 +2409,14 @@ pub async fn release_file_reservations(
     };
 
     // Update archive artifacts for the released items
-    dispatch_release_archive_write(&project, &agent, &released_rows, &config);
+    let db_generation = fetch_db_generation(ctx, &pool).await;
+    dispatch_release_archive_write(
+        &project,
+        &agent,
+        &released_rows,
+        &config,
+        db_generation.as_deref(),
+    );
     replay_queued_release_intents(ctx, &pool, &config).await;
 
     // F3 (br-bvq1x.6.3): releasing reconciles both stores. The released rows'
@@ -2416,7 +2438,13 @@ pub async fn release_file_reservations(
             .into_iter()
             .filter_map(|row| row.id.map(|id| (id, row.name)))
             .collect();
-        reconcile_active_reservation_archive(&project, &active_rows, &agent_names, &config);
+        reconcile_active_reservation_archive(
+            &project,
+            &active_rows,
+            &agent_names,
+            &config,
+            db_generation.as_deref(),
+        );
         if let asupersync::Outcome::Ok(released_unexpired) =
             mcp_agent_mail_db::queries::list_released_unexpired_reservations(
                 ctx.cx(),
@@ -2430,6 +2458,7 @@ pub async fn release_file_reservations(
                 &released_unexpired,
                 &agent_names,
                 &config,
+                db_generation.as_deref(),
             );
         }
     }
@@ -4151,7 +4180,7 @@ mod tests {
         std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
 
         let row = reservation_row(1, 7, "src/**", 9_999, None);
-        let artifact = active_reservation_artifact_json("/abs/proj", "GreenCastle", &row);
+        let artifact = active_reservation_artifact_json("/abs/proj", "GreenCastle", &row, None);
         std::fs::write(
             reservation_dir.join("id-1.json"),
             serde_json::to_vec_pretty(&artifact).expect("serialize artifact"),
