@@ -100,11 +100,63 @@ fn sha256_hex(data: &str) -> String {
 
 struct TrackedConnection<'conn> {
     inner: &'conn crate::DbConn,
+    transaction_write_intent: TransactionWriteIntent,
 }
 
 impl<'conn> TrackedConnection<'conn> {
     fn new(inner: &'conn crate::DbConn) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            transaction_write_intent: TransactionWriteIntent::default(),
+        }
+    }
+}
+
+/// Tracks whether the currently open SQL transaction has executed a durable
+/// mutation.  `BEGIN`/`COMMIT`/`ROLLBACK` are deliberately not writes by
+/// themselves: read snapshots issue the same control statements.  A commit
+/// contributes to the DB-write p99 only when this tracker saw a mutation
+/// between the begin and commit.
+#[derive(Default)]
+struct TransactionWriteIntent {
+    has_database_write: AtomicBool,
+}
+
+impl TransactionWriteIntent {
+    fn note_database_write(&self, sql: &str) {
+        if crate::tracking::is_database_write_statement(sql) {
+            self.has_database_write.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Observe a statement executed through a connection and return whether
+    /// its elapsed time belongs in the DB-write distribution as a mutating
+    /// transaction commit.
+    fn observe_execute_statement(&self, sql: &str) -> bool {
+        let keyword = sql
+            .trim_start()
+            .split(|character: char| character.is_ascii_whitespace() || character == ';')
+            .next()
+            .unwrap_or_default();
+
+        if keyword.eq_ignore_ascii_case("BEGIN") {
+            self.has_database_write.store(false, Ordering::Relaxed);
+            return false;
+        }
+        if keyword.eq_ignore_ascii_case("ROLLBACK") {
+            self.has_database_write.store(false, Ordering::Relaxed);
+            return false;
+        }
+        if keyword.eq_ignore_ascii_case("COMMIT") || keyword.eq_ignore_ascii_case("END") {
+            return self.has_database_write.swap(false, Ordering::Relaxed);
+        }
+
+        self.note_database_write(sql);
+        false
+    }
+
+    fn take_for_commit(&self) -> bool {
+        self.has_database_write.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -114,14 +166,12 @@ struct TrackedTransaction<'conn> {
     /// transaction actually executed a persistent mutation. Read-only
     /// snapshots also issue transaction-control statements, so treating every
     /// commit as a write would corrupt timeout attribution.
-    has_database_write: AtomicBool,
+    write_intent: TransactionWriteIntent,
 }
 
 impl TrackedTransaction<'_> {
     fn note_database_write(&self, sql: &str) {
-        if crate::tracking::is_database_write_statement(sql) {
-            self.has_database_write.store(true, Ordering::Relaxed);
-        }
+        self.write_intent.note_database_write(sql);
     }
 }
 
@@ -194,7 +244,7 @@ impl TransactionOps for TrackedTransaction<'_> {
     }
 
     fn commit(self, cx: &Cx) -> impl Future<Output = Outcome<(), SqlError>> + Send {
-        let had_database_write = self.has_database_write.load(Ordering::Relaxed);
+        let had_database_write = self.write_intent.take_for_commit();
         let start = crate::tracking::query_timer();
         let fut = self.inner.commit(cx);
         async move {
@@ -229,6 +279,7 @@ impl Connection for TrackedConnection<'_> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Vec<SqlRow>, SqlError>> + Send {
+        self.transaction_write_intent.note_database_write(sql);
         let start = crate::tracking::query_timer();
         let fut = self.inner.query(cx, sql, params);
         async move {
@@ -245,6 +296,7 @@ impl Connection for TrackedConnection<'_> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<Option<SqlRow>, SqlError>> + Send {
+        self.transaction_write_intent.note_database_write(sql);
         let start = crate::tracking::query_timer();
         let fut = self.inner.query_one(cx, sql, params);
         async move {
@@ -261,12 +313,16 @@ impl Connection for TrackedConnection<'_> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<u64, SqlError>> + Send {
+        let record_commit_latency = self.transaction_write_intent.observe_execute_statement(sql);
         let start = crate::tracking::query_timer();
         let fut = self.inner.execute(cx, sql, params);
         async move {
             let result = fut.await;
             let elapsed = crate::tracking::elapsed_us(start);
             crate::tracking::record_query(sql, elapsed);
+            if record_commit_latency {
+                mcp_agent_mail_core::metrics::record_database_write_latency(elapsed);
+            }
             result
         }
     }
@@ -277,6 +333,7 @@ impl Connection for TrackedConnection<'_> {
         sql: &str,
         params: &[Value],
     ) -> impl Future<Output = Outcome<i64, SqlError>> + Send {
+        self.transaction_write_intent.note_database_write(sql);
         let start = crate::tracking::query_timer();
         let fut = self.inner.insert(cx, sql, params);
         async move {
@@ -296,10 +353,16 @@ impl Connection for TrackedConnection<'_> {
         async move {
             let mut results = Vec::with_capacity(statements.len());
             for (sql, params) in statements {
+                let record_commit_latency = self
+                    .transaction_write_intent
+                    .observe_execute_statement(&sql);
                 let start = crate::tracking::query_timer();
                 let out = self.inner.execute(cx, &sql, &params).await;
                 let elapsed = crate::tracking::elapsed_us(start);
                 crate::tracking::record_query(&sql, elapsed);
+                if record_commit_latency {
+                    mcp_agent_mail_core::metrics::record_database_write_latency(elapsed);
+                }
                 match out {
                     Outcome::Ok(n) => results.push(n),
                     Outcome::Err(e) => return Outcome::Err(e),
@@ -325,7 +388,7 @@ impl Connection for TrackedConnection<'_> {
             match fut.await {
                 Outcome::Ok(tx) => Outcome::Ok(TrackedTransaction {
                     inner: tx,
-                    has_database_write: AtomicBool::new(false),
+                    write_intent: TransactionWriteIntent::default(),
                 }),
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -15016,6 +15079,46 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Id, Metadata, Subscriber, span};
+
+    #[test]
+    fn transaction_write_intent_marks_only_mutating_commits_for_latency() {
+        let write_intent = TransactionWriteIntent::default();
+
+        assert!(
+            !write_intent.observe_execute_statement("BEGIN"),
+            "beginning a read transaction must not count as a write"
+        );
+        assert!(
+            !write_intent.observe_execute_statement("SELECT id FROM messages"),
+            "reads inside a transaction must not set write intent"
+        );
+        assert!(
+            !write_intent.observe_execute_statement("COMMIT"),
+            "a read-only transaction commit must not enter DB-write p99"
+        );
+
+        assert!(!write_intent.observe_execute_statement("BEGIN IMMEDIATE"));
+        assert!(
+            !write_intent.observe_execute_statement("UPDATE agents SET last_active_ts = 1"),
+            "the mutation itself is timed separately from its transaction commit"
+        );
+        assert!(
+            write_intent.observe_execute_statement("COMMIT"),
+            "a mutating transaction commit must enter DB-write p99"
+        );
+        assert!(
+            !write_intent.observe_execute_statement("COMMIT"),
+            "write intent must be consumed once so a later control statement cannot inherit it"
+        );
+
+        assert!(!write_intent.observe_execute_statement("BEGIN"));
+        assert!(!write_intent.observe_execute_statement("DELETE FROM file_reservations"));
+        assert!(
+            !write_intent.observe_execute_statement("ROLLBACK"),
+            "rolled-back mutations must not make a later commit look like a write"
+        );
+        assert!(!write_intent.observe_execute_statement("END"));
+    }
 
     #[derive(Clone, Default)]
     struct EventCapture {
