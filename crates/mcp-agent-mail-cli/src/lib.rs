@@ -7021,9 +7021,7 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
                 break;
             }
         }
-        if use_global
-            && let Err(error) = conn.execute_raw("REINDEX")
-        {
+        if use_global && let Err(error) = conn.execute_raw("REINDEX") {
             tracing::warn!(
                 db = %db_path.display(),
                 %error,
@@ -36178,7 +36176,7 @@ mod mail_server_cli_bridge_tests {
         CliError, PENDING_SEND_SCHEMA_VERSION, PENDING_SEND_UNSENT_STATUS, PendingMailSendEnvelope,
         ServerToolCall, acquire_doctor_mailbox_activity_lock_for_database_url,
         acquire_doctor_mailbox_activity_lock_for_sqlite_path,
-        acquire_doctor_mailbox_activity_lock_for_storage_root, mailbox_activity_lock_cli_error,
+        acquire_doctor_mailbox_activity_lock_for_storage_root,
         build_server_create_agent_identity_arguments, build_server_fetch_inbox_product_arguments,
         build_server_list_agents_arguments, build_server_macro_start_session_arguments,
         build_server_register_agent_arguments, build_server_reply_message_arguments,
@@ -36188,13 +36186,13 @@ mod mail_server_cli_bridge_tests {
         fetch_inbox_server_rejection_allows_local_fallback, get_blocking_http_request,
         is_resource_busy_cli_error, load_pending_send_artifact, load_pending_send_receipt,
         load_sender_identity_token, mail_server_rejection_allows_local_fallback,
-        normalize_cli_product_inbox_agent_name, parse_blocking_http_url,
-        parse_cli_fetch_inbox_product_limit, parse_cli_search_limit, pending_send_content_hash,
-        pending_send_failure_from_error, pending_send_receipt_path, persist_sender_identity_token,
-        persist_sender_identity_token_from_agent_payload, post_jsonrpc_request_blocking_http,
-        product_inbox_row_to_json, reject_local_fallback_with_ownership_probe,
-        reject_local_registration_when_gate, resolve_sender_token,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        mailbox_activity_lock_cli_error, normalize_cli_product_inbox_agent_name,
+        parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
+        pending_send_content_hash, pending_send_failure_from_error, pending_send_receipt_path,
+        persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
+        post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
+        reject_local_fallback_with_ownership_probe, reject_local_registration_when_gate,
+        resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
         validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
     };
@@ -39548,6 +39546,31 @@ mod tests {
             build_systemd_exec_start(Path::new("/tmp/Agent Mail/bin/am"), "127.0.0.1", 8765, true);
         assert!(exec_start.starts_with("\"/tmp/Agent Mail/bin/am\""));
         assert!(exec_start.contains(" --host 127.0.0.1 --port 8765 --no-tui --no-auth"));
+    }
+
+    #[test]
+    fn managed_service_default_keeps_the_loopback_serve_http_contract() {
+        let systemd =
+            build_systemd_exec_start(Path::new("/usr/local/bin/am"), "127.0.0.1", 8765, false);
+        assert!(
+            systemd.contains("serve-http --host 127.0.0.1 --port 8765 --no-tui"),
+            "managed systemd service must pass the loopback bind to serve-http"
+        );
+        assert!(
+            !systemd.contains("--no-auth"),
+            "default service install must preserve an explicitly configured auth mode"
+        );
+
+        let launchd =
+            build_launchd_args_xml(Path::new("/usr/local/bin/am"), "127.0.0.1", 8765, false);
+        assert!(
+            launchd.contains("<string>127.0.0.1</string>"),
+            "managed launchd service must pass the loopback bind to serve-http"
+        );
+        assert!(
+            !launchd.contains("<string>--no-auth</string>"),
+            "default service install must preserve an explicitly configured auth mode"
+        );
     }
 
     #[test]
@@ -51703,6 +51726,41 @@ startup_timeout_sec = 42
         // longer matches its index entry, and nothing else in the file changes.
         bytes[page_start + hit + 7] ^= 0x01;
         std::fs::write(db_path, &bytes).expect("write corrupted index page");
+    }
+
+    #[test]
+    fn index_only_reindex_expands_index_witnesses_to_distinct_owner_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("owner-tables.sqlite3");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open fixture db");
+        conn.execute_raw(
+            "CREATE TABLE alpha (id INTEGER PRIMARY KEY, left_key TEXT, right_key TEXT)",
+        )
+        .expect("create alpha");
+        conn.execute_raw("CREATE INDEX idx_alpha_left ON alpha(left_key)")
+            .expect("create first alpha index");
+        conn.execute_raw("CREATE INDEX idx_alpha_right ON alpha(right_key)")
+            .expect("create second alpha index");
+        conn.execute_raw("CREATE TABLE beta (id INTEGER PRIMARY KEY, lookup_key TEXT)")
+            .expect("create beta");
+        conn.execute_raw("CREATE INDEX idx_beta_lookup ON beta(lookup_key)")
+            .expect("create beta index");
+
+        let tables = doctor_index_owner_tables_for_damage(
+            &conn,
+            &[
+                "idx_beta_lookup".to_string(),
+                "idx_alpha_left".to_string(),
+                "idx_alpha_right".to_string(),
+            ],
+        )
+        .expect("resolve owner tables");
+        assert_eq!(tables, vec!["alpha", "beta"]);
+        assert!(
+            doctor_index_owner_tables_for_damage(&conn, &["missing_index".to_string()]).is_err(),
+            "unknown diagnostic witnesses must not silently narrow table-wide repair"
+        );
     }
 
     #[test]
