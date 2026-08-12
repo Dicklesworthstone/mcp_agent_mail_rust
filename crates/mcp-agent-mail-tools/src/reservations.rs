@@ -2195,10 +2195,11 @@ pub async fn file_reservation_paths(
     // Write reservation artifacts to git archive (best-effort, via WBQ)
     if !granted_rows.is_empty() {
         let config = &Config::get();
+        let db_generation = fetch_db_generation(ctx, &pool).await;
         let res_jsons: Vec<serde_json::Value> = granted_rows
             .iter()
             .map(|r| {
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "id": r.id.unwrap_or(0),
                     "project": &project.human_key,
                     "agent": &agent.name,
@@ -2207,7 +2208,9 @@ pub async fn file_reservation_paths(
                     "reason": &r.reason,
                     "created_ts": micros_to_iso(r.created_ts),
                     "expires_ts": micros_to_iso(r.expires_ts),
-                })
+                });
+                stamp_db_generation(&mut value, db_generation.as_deref());
+                value
             })
             .collect();
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -2528,10 +2531,11 @@ pub async fn renew_file_reservations(
     )?;
 
     if !renewed_rows.is_empty() {
+        let db_generation = fetch_db_generation(ctx, &pool).await;
         let res_jsons: Vec<serde_json::Value> = renewed_rows
             .iter()
             .map(|r| {
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "id": r.id.unwrap_or(0),
                     "project": &project.human_key,
                     "agent": &agent.name,
@@ -2540,7 +2544,9 @@ pub async fn renew_file_reservations(
                     "reason": &r.reason,
                     "created_ts": micros_to_iso(r.created_ts),
                     "expires_ts": micros_to_iso(r.expires_ts),
-                })
+                });
+                stamp_db_generation(&mut value, db_generation.as_deref());
+                value
             })
             .collect();
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -2829,7 +2835,8 @@ pub async fn force_release_file_reservation(
     let released_iso = micros_to_iso(released_ts);
 
     if released_count > 0 {
-        let res_json = serde_json::json!({
+        let db_generation = fetch_db_generation(ctx, &pool).await;
+        let mut res_json = serde_json::json!({
             "id": reservation.id.unwrap_or(0),
             "project": &project.human_key,
             "agent": &holder_agent_name,
@@ -2840,6 +2847,7 @@ pub async fn force_release_file_reservation(
             "expires_ts": micros_to_iso(reservation.expires_ts),
             "released_ts": released_iso.clone(),
         });
+        stamp_db_generation(&mut res_json, db_generation.as_deref());
 
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
             project_slug: project.slug.clone(),
