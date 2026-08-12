@@ -178,7 +178,10 @@ mod tests {
         // within `#![forbid(unsafe_code)]` and never races parallel tests.
         assert_eq!(DEFAULT_IDEMPOTENCY_RETENTION_SECS, 86_400);
         // Missing override -> default.
-        assert_eq!(parse_retention_secs(None), DEFAULT_IDEMPOTENCY_RETENTION_SECS);
+        assert_eq!(
+            parse_retention_secs(None),
+            DEFAULT_IDEMPOTENCY_RETENTION_SECS
+        );
         // A valid positive override is honored (trimmed).
         assert_eq!(parse_retention_secs(Some("3600")), 3600);
         assert_eq!(parse_retention_secs(Some("  7200  ")), 7200);
