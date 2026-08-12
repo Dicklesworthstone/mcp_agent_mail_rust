@@ -9802,6 +9802,7 @@ pub struct ReservationConflictSnapshotRow {
     pub agent_id: i64,
     pub agent_name: Option<String>,
     pub path_pattern: String,
+    pub exclusive: bool,
     pub expires_ts: i64,
 }
 
@@ -9928,10 +9929,9 @@ pub async fn get_reservation_conflict_snapshot(
         let sql_limit = i64::try_from(max_reservations.saturating_add(1)).unwrap_or(i64::MAX);
         let active_predicate = active_reservation_predicate_for("fr");
         let reservation_sql = format!(
-            "SELECT fr.id, fr.agent_id, fr.path_pattern, fr.expires_ts \
+            "SELECT fr.id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.expires_ts \
              FROM file_reservations AS fr \
-             WHERE fr.project_id = ? AND fr.\"exclusive\" = 1 \
-               AND {active_predicate} AND fr.expires_ts > ? \
+             WHERE fr.project_id = ? AND {active_predicate} AND fr.expires_ts > ? \
              ORDER BY fr.id ASC LIMIT ?"
         );
         let reservation_rows = try_in_tx!(
@@ -9987,13 +9987,19 @@ pub async fn get_reservation_conflict_snapshot(
                     "active reservation {id} has no valid path pattern"
                 )));
             };
-            let Some(expires_ts) = row.get(3).and_then(value_as_i64) else {
+            let Some(exclusive) = row.get(3).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "active reservation {id} has no valid exclusivity"
+                )));
+            };
+            let Some(expires_ts) = row.get(4).and_then(value_as_i64) else {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Err(DbError::Internal(format!(
                     "active reservation {id} has no valid expiry"
                 )));
             };
-            undecoded.push((id, agent_id, path_pattern, expires_ts));
+            undecoded.push((id, agent_id, path_pattern, exclusive != 0, expires_ts));
             holder_ids.push(agent_id);
         }
 
@@ -10038,11 +10044,12 @@ pub async fn get_reservation_conflict_snapshot(
         let reservations = undecoded
             .into_iter()
             .map(
-                |(id, agent_id, path_pattern, expires_ts)| ReservationConflictSnapshotRow {
+                |(id, agent_id, path_pattern, exclusive, expires_ts)| ReservationConflictSnapshotRow {
                     id,
                     agent_id,
                     agent_name: holder_names.get(&agent_id).cloned(),
                     path_pattern,
+                    exclusive,
                     expires_ts,
                 },
             )
@@ -10131,7 +10138,8 @@ async fn create_file_reservations_impl(
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<Vec<FileReservationRow>>, DbError> {
     let now = now_micros();
-    let expires = now.saturating_add(ttl_seconds.saturating_mul(1_000_000));
+    let lease_extension = ttl_seconds.saturating_mul(1_000_000);
+    let expires = now.saturating_add(lease_extension);
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
 
@@ -10230,6 +10238,67 @@ async fn create_file_reservations_impl(
 
         let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
         for path in paths {
+            // A reservation is a lease keyed by (project, agent, path).  The
+            // transaction already serializes writers, so re-acquiring an active
+            // exact path can safely renew the existing lease instead of creating
+            // a sibling row that a later release-by-id could accidentally leave
+            // behind.  Keep every pre-existing legacy sibling visible to the
+            // caller and renew it; release-by-id expands to that exact path set
+            // in the tools layer and can clean those historical duplicates up.
+            let existing_sql = format!(
+                "{FILE_RESERVATION_SELECT_COLUMNS_SQL} \
+                 WHERE project_id = ? AND agent_id = ? AND path_pattern = ? \
+                   AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
+                 ORDER BY id ASC"
+            );
+            let existing_params = [
+                Value::BigInt(project_id),
+                Value::BigInt(agent_id),
+                Value::Text((*path).to_string()),
+                Value::BigInt(now),
+            ];
+            let existing_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_query(cx, &tracked, &existing_sql, &existing_params).await
+                )
+            );
+            if !existing_rows.is_empty() {
+                for existing in existing_rows {
+                    let mut row = match decode_file_reservation_row(&existing) {
+                        Ok(row) => row,
+                        Err(error) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(error);
+                        }
+                    };
+                    let Some(id) = row.id else {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(DbError::Internal(format!(
+                            "active reservation for project_id={project_id} agent_id={agent_id} path={path} has no id"
+                        )));
+                    };
+                    row.expires_ts = row.expires_ts.max(now).saturating_add(lease_extension);
+                    let renew_params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
+                    try_in_tx!(
+                        cx,
+                        &tracked,
+                        map_sql_outcome(
+                            traw_execute(
+                                cx,
+                                &tracked,
+                                "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                                &renew_params,
+                            )
+                            .await
+                        )
+                    );
+                    out.push(row);
+                }
+                continue;
+            }
+
             let mut row = FileReservationRow {
                 id: None,
                 project_id,
