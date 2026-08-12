@@ -4164,12 +4164,7 @@ async fn spawn_http_server_instance(
     // The loopback default is safe, but `HTTP_HOST=0.0.0.0`/a LAN IP with no
     // bearer token or JWT exposes every route — including the mail UI's mutating
     // POSTs — to the network unauthenticated.
-    let host_is_loopback = config.http_host.eq_ignore_ascii_case("localhost")
-        || config
-            .http_host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false);
+    let host_is_loopback = is_loopback_bind_host(&config.http_host);
     let auth_configured = config.http_bearer_token.is_some() || config.http_jwt_enabled;
     if !host_is_loopback && !auth_configured {
         tracing::warn!(
@@ -11200,6 +11195,23 @@ impl HttpState {
         }
     }
 
+    /// Resolve the role for a request that has no configured authentication.
+    ///
+    /// A fresh `am serve-http` (and the service unit it installs) binds to
+    /// loopback and configures neither bearer nor JWT auth. That local control
+    /// plane must be able to use mutating MCP tools. A no-auth listener exposed
+    /// beyond loopback deliberately keeps the restrictive default role instead.
+    fn unauthenticated_default_rbac_roles(&self) -> Vec<String> {
+        let loopback_no_auth = self.config.http_bearer_token.is_none()
+            && !self.config.http_jwt_enabled
+            && is_loopback_bind_host(&self.config.http_host);
+        if loopback_no_auth {
+            self.static_bearer_rbac_roles()
+        } else {
+            vec![self.config.http_rbac_default_role.clone()]
+        }
+    }
+
     fn request_cx(&self) -> Cx {
         let budget = if self.request_timeout_secs == 0 {
             Budget::INFINITE
@@ -11752,7 +11764,7 @@ to skip auth for local requests.</p>
         } else if has_static_bearer {
             (self.static_bearer_rbac_roles(), None)
         } else {
-            (vec![self.config.http_rbac_default_role.clone()], None)
+            (self.unauthenticated_default_rbac_roles(), None)
         };
 
         // RBAC (mirrors legacy python behavior)
@@ -16538,6 +16550,15 @@ fn is_local_peer_addr(peer_addr: Option<SocketAddr>) -> bool {
         return false;
     };
     is_loopback_ip(addr.ip())
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    host.trim().eq_ignore_ascii_case("localhost")
+        || host
+            .trim()
+            .parse::<IpAddr>()
+            .map(IpAddr::is_loopback)
+            .unwrap_or(false)
 }
 
 fn is_loopback_ip(ip: IpAddr) -> bool {
@@ -21953,6 +21974,72 @@ first body
             &resp,
             403,
             serde_json::json!(33),
+            i32::from(McpErrorCode::ResourceForbidden),
+            "Forbidden",
+        );
+    }
+
+    #[test]
+    fn fresh_loopback_no_auth_server_does_not_forbid_send_message() {
+        // This is the config produced by a fresh `am serve-http`: the default
+        // listener is loopback and neither bearer nor JWT auth is configured.
+        // The request still exercises the actual HTTP JSON-RPC RBAC path rather
+        // than calling the role helper directly.
+        let config = mcp_agent_mail_core::Config::default();
+        assert_eq!(config.http_host, "127.0.0.1");
+        assert!(config.http_bearer_token.is_none());
+        assert!(!config.http_jwt_enabled);
+        let state = build_state(config);
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[],
+            Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "send_message", "arguments": {} })),
+            34_i64,
+        ))
+        .expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200, "request should reach tool dispatch");
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_ne!(
+            body["error"]["code"],
+            serde_json::json!(i32::from(McpErrorCode::ResourceForbidden)),
+            "fresh loopback no-auth serve-http must not reject send_message as reader-only: {body}"
+        );
+    }
+
+    #[test]
+    fn fresh_non_loopback_no_auth_server_keeps_send_message_reader_restricted() {
+        let config = mcp_agent_mail_core::Config {
+            http_host: "0.0.0.0".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[],
+            Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+        );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "send_message", "arguments": {} })),
+            35_i64,
+        ))
+        .expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_jsonrpc_error_response(
+            &resp,
+            403,
+            serde_json::json!(35),
             i32::from(McpErrorCode::ResourceForbidden),
             "Forbidden",
         );
