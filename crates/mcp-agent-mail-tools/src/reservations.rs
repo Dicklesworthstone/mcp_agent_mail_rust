@@ -4488,16 +4488,17 @@ mod tests {
                     .and_then(|row| row.id)
                     .expect("reserved row exists");
 
-                let artifact_path = config
+                let reservation_dir = config
                     .storage_root
                     .join("projects")
                     .join(&project.slug)
-                    .join("file_reservations")
-                    .join(format!("id-{reservation_id}.json"));
-                assert!(
-                    artifact_path.exists(),
-                    "archive artifact must exist after the initial reservation"
-                );
+                    .join("file_reservations");
+                let artifact_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        reservation_id,
+                    )
+                    .expect("archive artifact must exist after the initial reservation");
 
                 // Inject the crash gap: the DB row stays committed but its archive
                 // artifact vanishes (the archive write was lost).
@@ -4585,12 +4586,17 @@ mod tests {
                     .find(|row| row.agent_id == holder_id)
                     .and_then(|row| row.id)
                     .expect("reserved row exists");
-                let artifact_path = config
+                let reservation_dir = config
                     .storage_root
                     .join("projects")
                     .join(&project.slug)
-                    .join("file_reservations")
-                    .join(format!("id-{reservation_id}.json"));
+                    .join("file_reservations");
+                let artifact_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        reservation_id,
+                    )
+                    .expect("active reservation artifact must exist");
                 let active_artifact_bytes =
                     std::fs::read(&artifact_path).expect("snapshot ACTIVE artifact bytes");
 
@@ -4924,13 +4930,17 @@ mod tests {
                     .find(|row| row.agent_id == holder_id)
                     .and_then(|row| row.id)
                     .expect("holder reservation exists");
-                let artifact_path = config
+                let reservation_dir = config
                     .storage_root
                     .join("projects")
                     .join(&project.slug)
-                    .join("file_reservations")
-                    .join(format!("id-{holder_reservation_id}.json"));
-                assert!(artifact_path.exists(), "holder artifact written");
+                    .join("file_reservations");
+                let artifact_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        holder_reservation_id,
+                    )
+                    .expect("holder artifact written");
                 std::fs::remove_file(&artifact_path).expect("inject crash gap");
 
                 // BlueLake releases its OWN reservation; the release path reconciles
