@@ -246,6 +246,9 @@ pub struct Config {
     pub doctor_retention_enabled: bool,
     pub doctor_retention_keep_min: u64,
     pub doctor_retention_max_age_secs: u64,
+    /// Per recovery-debris category byte ceiling. `0` disables the size rule.
+    /// The effective cap self-scales to at least five times the live DB size.
+    pub doctor_retention_max_bytes_per_category: u64,
     pub doctor_retention_alert_bytes: u64,
     pub doctor_retention_sweep_interval_secs: u64,
     // br-fx7sx: after a SUCCESSFUL startup self-heal, automatically
@@ -1354,10 +1357,11 @@ impl Default for Config {
 
             // Doctor recovery-debris retention (br-mudrv)
             doctor_retention_enabled: true,
-            doctor_retention_keep_min: 5, // always keep the 5 newest per category
-            doctor_retention_max_age_secs: 1_209_600, // always keep < 14 days old
-            doctor_retention_alert_bytes: 5_368_709_120, // warn at 5 GiB reclaimable
-            doctor_retention_sweep_interval_secs: 3_600, // hourly observe+alert sweep
+            doctor_retention_keep_min: 5, // count/age retention target per category
+            doctor_retention_max_age_secs: 1_209_600, // retain < 14 days old unless size-bound
+            doctor_retention_max_bytes_per_category: 1_073_741_824, // 1 GiB floor, scaled to >= 5x live DB
+            doctor_retention_alert_bytes: 5_368_709_120,            // warn at 5 GiB reclaimable
+            doctor_retention_sweep_interval_secs: 3_600,            // hourly observe+alert sweep
             doctor_auto_reclaim_on_heal: true, // br-fx7sx: tidy debris after a successful heal
 
             // Periodic git health sweep
@@ -1827,8 +1831,9 @@ impl Config {
             config.db_journal_size_limit_bytes,
         );
 
-        // Doctor recovery-debris retention (br-mudrv). `*_KEEP_MIN` newest and
-        // anything younger than `*_MAX_AGE_SECS` are always retained;
+        // Doctor recovery-debris retention (br-mudrv, GH#210). Count/age rules
+        // select stale artifacts; the optional byte ceiling independently
+        // selects oversized incident artifacts for move-only reclamation.
         // `DOCTOR_RETENTION_ENABLED=false` disables the background alert sweep.
         config.doctor_retention_enabled =
             env_bool("DOCTOR_RETENTION_ENABLED", config.doctor_retention_enabled);
@@ -1839,6 +1844,10 @@ impl Config {
         config.doctor_retention_max_age_secs = env_u64(
             "DOCTOR_RETENTION_MAX_AGE_SECS",
             config.doctor_retention_max_age_secs,
+        );
+        config.doctor_retention_max_bytes_per_category = env_u64(
+            "DOCTOR_RETENTION_MAX_BYTES_PER_CATEGORY",
+            config.doctor_retention_max_bytes_per_category,
         );
         config.doctor_retention_alert_bytes = env_u64(
             "DOCTOR_RETENTION_ALERT_BYTES",

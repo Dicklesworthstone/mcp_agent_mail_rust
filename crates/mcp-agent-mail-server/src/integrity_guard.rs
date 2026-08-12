@@ -521,11 +521,17 @@ fn run_db_maintenance_cycle(
             .ok()
             .and_then(|d| i64::try_from(d.as_micros()).ok())
             .unwrap_or(0);
+        let live_database_bytes = std::fs::metadata(sqlite_path).map_or(0, |meta| meta.len());
         let plan = mcp_agent_mail_db::recovery_retention::select_recovery_debris_to_reclaim(
             artifacts,
             mcp_agent_mail_db::recovery_retention::RetentionPolicy {
                 keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
                 max_age_secs: config.doctor_retention_max_age_secs,
+                max_total_bytes_per_category:
+                    mcp_agent_mail_db::recovery_retention::effective_byte_budget_per_category(
+                        config.doctor_retention_max_bytes_per_category,
+                        live_database_bytes,
+                    ),
             },
             now_us,
         );

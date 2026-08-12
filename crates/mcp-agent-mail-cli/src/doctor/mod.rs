@@ -34,6 +34,7 @@ use mcp_agent_mail_tools::reservation_parity::{
     ReservationParityReport, check_reservation_parity_with_canonical_conn,
 };
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -366,6 +367,81 @@ struct DoctorLiveProbeTarget {
     database_url: String,
     storage_root: PathBuf,
     source: &'static str,
+}
+
+/// Read-only retention footprint for the same mailbox selected by the health
+/// probe. The resident total de-duplicates archive-reconcile files, which are
+/// visible both to direct backup rotation and recovery-debris reclaim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorRetentionResidentStats {
+    recovery_debris_artifacts: usize,
+    direct_backup_only_artifacts: usize,
+    reclaimable_staging_bytes: u64,
+    resident_bytes: u64,
+    live_database_bytes: Option<u64>,
+}
+
+fn doctor_retention_resident_stats(
+    probe_target: &DoctorLiveProbeTarget,
+) -> Result<DoctorRetentionResidentStats, String> {
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+        .map_err(|error| format!("resolving live database path: {error}"))?;
+    let database_path = PathBuf::from(&resolved.canonical_path);
+    let recovery_debris = mcp_agent_mail_db::recovery_retention::enumerate_recovery_debris(
+        &probe_target.storage_root,
+        &database_path,
+    );
+    let recovery_paths = recovery_debris
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect::<BTreeSet<_>>();
+    let recovery_bytes = recovery_debris
+        .iter()
+        .map(|artifact| artifact.bytes)
+        .fold(0_u64, u64::saturating_add);
+
+    let backup_inventory =
+        mcp_agent_mail_server::backup_rotation::inspect_storage_backups(&probe_target.storage_root)
+            .map_err(|error| format!("inspecting direct backup retention: {error}"))?;
+    let direct_backup_only = backup_inventory
+        .artifacts
+        .iter()
+        .filter(|artifact| !recovery_paths.contains(&artifact.path))
+        .collect::<Vec<_>>();
+    let direct_backup_only_bytes = direct_backup_only
+        .iter()
+        .map(|artifact| artifact.bytes)
+        .fold(0_u64, u64::saturating_add);
+    let reclaimable_staging_bytes =
+        mcp_agent_mail_db::recovery_retention::reclaimable_staging_bytes(
+            &probe_target.storage_root,
+        );
+
+    Ok(DoctorRetentionResidentStats {
+        recovery_debris_artifacts: recovery_debris.len(),
+        direct_backup_only_artifacts: direct_backup_only.len(),
+        reclaimable_staging_bytes,
+        resident_bytes: recovery_bytes
+            .saturating_add(direct_backup_only_bytes)
+            .saturating_add(reclaimable_staging_bytes),
+        live_database_bytes: fs::metadata(database_path)
+            .ok()
+            .map(|metadata| metadata.len()),
+    })
+}
+
+fn format_resident_to_live_database_ratio(
+    resident_bytes: u64,
+    live_database_bytes: Option<u64>,
+) -> String {
+    let Some(live_database_bytes) = live_database_bytes.filter(|bytes| *bytes > 0) else {
+        return "unavailable".to_string();
+    };
+    let hundredths = u128::from(resident_bytes)
+        .saturating_mul(100)
+        .checked_div(u128::from(live_database_bytes))
+        .unwrap_or(0);
+    format!("{}.{:02}x", hundredths / 100, hundredths % 100)
 }
 
 fn doctor_live_probe_target_from_server_config(
@@ -2688,6 +2764,36 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
+    // GH#210: make retention debt visible in the cheap health surface. This
+    // is informational rather than a mailbox-integrity failure: forensics are
+    // evidence, and reclaim only moves them into a reversible staging area.
+    // The ratio uses the exact live mailbox target selected above, never the
+    // CLI's potentially unrelated XDG default.
+    match doctor_retention_resident_stats(&probe_target) {
+        Ok(stats) => {
+            let live_database = stats
+                .live_database_bytes
+                .map_or_else(|| "unavailable".to_string(), crate::format_bytes);
+            let ratio = format_resident_to_live_database_ratio(
+                stats.resident_bytes,
+                stats.live_database_bytes,
+            );
+            ftui_runtime::ftui_println!(
+                "retention_resident: {} active artifact(s) (recovery_debris={} direct_backups={} reclaimable_staged={}) resident={} live_db={} ratio={}",
+                stats.recovery_debris_artifacts + stats.direct_backup_only_artifacts,
+                stats.recovery_debris_artifacts,
+                stats.direct_backup_only_artifacts,
+                crate::format_bytes(stats.reclaimable_staging_bytes),
+                crate::format_bytes(stats.resident_bytes),
+                live_database,
+                ratio,
+            );
+        }
+        Err(error) => {
+            ftui_runtime::ftui_println!("retention_resident: not_run ({error})");
+        }
+    }
+
     let root = runs::doctor_root(target);
     let latest = root.join("latest");
     let runs_dir = root.join("runs");
@@ -2985,6 +3091,77 @@ mod tests {
         assert!(
             output.contains("reservation_parity: ok db=0 archive=0 drift=0"),
             "health output should include reservation parity line:\n{output}"
+        );
+    }
+
+    #[test]
+    fn doctor_health_surfaces_deduplicated_retention_resident_ratio() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_healthy_live_mailbox(&db_path);
+
+        // Direct archive-reconcile snapshots are seen by both backup rotation
+        // and recovery-debris enumeration. Health must count its bytes once.
+        std::fs::write(
+            storage_root
+                .path()
+                .join("storage.sqlite3.archive-reconcile-20260618_145230_042"),
+            vec![0_u8; 100],
+        )
+        .unwrap();
+        let forensic = storage_root
+            .path()
+            .join("doctor/forensics/storage.sqlite3/repair-20260618_145230_042/sqlite");
+        std::fs::create_dir_all(&forensic).unwrap();
+        std::fs::write(forensic.join("storage.sqlite3"), vec![0_u8; 200]).unwrap();
+
+        let storage_root_s = storage_root.path().display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                ("HTTP_PORT", "47351"),
+            ],
+            || handle_health(target.path()),
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+
+        assert!(
+            result.is_ok(),
+            "health should stay informational: {result:?}"
+        );
+        assert!(
+            output.contains(
+                "retention_resident: 2 active artifact(s) (recovery_debris=2 direct_backups=0 reclaimable_staged=0 B) resident=300 B"
+            ),
+            "health must deduplicate direct backup bytes from recovery debris:\n{output}"
+        );
+        assert!(
+            output.contains("ratio="),
+            "health must expose the resident/live-DB ratio:\n{output}"
+        );
+    }
+
+    #[test]
+    fn resident_to_live_database_ratio_is_null_safe_and_precise() {
+        assert_eq!(
+            format_resident_to_live_database_ratio(22_000, Some(1)),
+            "22000.00x"
+        );
+        assert_eq!(
+            format_resident_to_live_database_ratio(22_000, None),
+            "unavailable"
+        );
+        assert_eq!(
+            format_resident_to_live_database_ratio(22_000, Some(0)),
+            "unavailable"
         );
     }
 

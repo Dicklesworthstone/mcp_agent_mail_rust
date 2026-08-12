@@ -75,6 +75,27 @@ pub struct RotateKindSummary {
     pub bytes_reclaimed: u64,
 }
 
+/// Read-only inventory of backup files eligible for rotation.
+///
+/// This excludes the live DB and its sidecars by way of
+/// [`classify_backup_file`], so consumers such as `am doctor health` can
+/// report retention resident bytes without accidentally treating mailbox state
+/// as disposable backup material.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackupInventory {
+    pub artifact_count: usize,
+    pub resident_bytes: u64,
+    /// Individual classified paths, for read-only consumers that need to
+    /// de-duplicate these files from another retention inventory.
+    pub artifacts: Vec<BackupInventoryArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupInventoryArtifact {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
 /// Classify a `storage_root`-relative filename into a `BackupKind`.
 ///
 /// Returns `None` for the live DB, Codex DB, and any file that doesn't
@@ -149,6 +170,41 @@ pub fn resolved_keep_per_kind() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_KEEP_PER_KIND)
         .max(MIN_KEEP_PER_KIND)
+}
+
+/// Return the count and bytes of direct backup files eligible for rotation.
+/// Missing storage roots produce an empty inventory, matching rotation's
+/// no-op behavior during first-run bootstrap.
+pub fn inspect_storage_backups(storage_root: &Path) -> std::io::Result<BackupInventory> {
+    let entries = match fs::read_dir(storage_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BackupInventory::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut inventory = BackupInventory::default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if classify_backup_file(&name).is_some() {
+            inventory.artifact_count = inventory.artifact_count.saturating_add(1);
+            inventory.resident_bytes = inventory.resident_bytes.saturating_add(metadata.len());
+            inventory.artifacts.push(BackupInventoryArtifact {
+                path,
+                bytes: metadata.len(),
+            });
+        }
+    }
+    Ok(inventory)
 }
 
 /// Rotate backup files in `storage_root`, keeping `keep_per_kind` newest of
@@ -461,5 +517,27 @@ mod tests {
         let report = rotate_storage_backups(tmp.path(), 0).expect("rotate");
         assert_eq!(report.kept, 1);
         assert_eq!(report.removed, 4);
+    }
+
+    #[test]
+    fn backup_inventory_excludes_live_database_and_reports_rotatable_bytes() {
+        let tmp = TempDir::new().unwrap();
+        touch(&tmp.path().join("storage.sqlite3"), 1_000);
+        touch(
+            &tmp.path()
+                .join("storage.sqlite3.archive-reconcile-20260419_120000_000"),
+            400,
+        );
+        touch(&tmp.path().join("unrelated.txt"), 600);
+
+        let inventory = inspect_storage_backups(tmp.path()).expect("inventory");
+        assert_eq!(inventory.artifact_count, 1);
+        assert_eq!(inventory.resident_bytes, 400);
+        assert_eq!(inventory.artifacts.len(), 1);
+        assert!(
+            inventory.artifacts[0]
+                .path
+                .ends_with("storage.sqlite3.archive-reconcile-20260419_120000_000")
+        );
     }
 }

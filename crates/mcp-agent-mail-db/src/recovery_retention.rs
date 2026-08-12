@@ -18,13 +18,13 @@
 //! exhaustively unit-testable; the filesystem enumeration and the move are
 //! thin IO wrappers around it.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Which kind of recovery debris an artifact is. Retention is applied
 /// independently per category so a burst of one kind cannot evict the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DebrisCategory {
     /// A `doctor/forensics/<db_family>/<cmd>-<ts>/` bundle directory (each holds
     /// a full copy of the DB + sidecars, so they are large).
@@ -32,6 +32,11 @@ pub enum DebrisCategory {
     /// A quarantined corrupt DB / sidecar sibling of the live database, e.g.
     /// `storage.sqlite3.corrupt-<ts>` or `storage.sqlite3-wal.reconstruct-failed-<ts>`.
     CorruptQuarantine,
+    /// A direct `storage.sqlite3.archive-reconcile-<ts>` incident snapshot.
+    /// These are also known to server-side `backup_rotation`, but reclaim
+    /// consolidates them through the reversible, move-only doctor path rather
+    /// than adding a new automatic file-deletion rule.
+    ArchiveReconcileBackup,
     /// A startup-time WAL/SHM sidecar snapshot next to the live database, e.g.
     /// `storage.sqlite3-wal.startup-precheckpoint-<ts>` (copied before the
     /// startup `wal_checkpoint(TRUNCATE)`) or `*.startup-quarantine-<ts>`.
@@ -48,6 +53,7 @@ impl DebrisCategory {
         match self {
             Self::ForensicBundle => "forensic_bundle",
             Self::CorruptQuarantine => "corrupt_quarantine",
+            Self::ArchiveReconcileBackup => "archive_reconcile_backup",
             Self::SidecarSnapshot => "sidecar_snapshot",
         }
     }
@@ -64,12 +70,39 @@ pub struct DebrisArtifact {
     pub category: DebrisCategory,
 }
 
-/// Retention policy: within each category keep the `keep_min` NEWEST artifacts
-/// plus anything younger than `max_age_secs`; everything else is reclaimable.
+/// Retention policy for one recovery-debris category.
+///
+/// The count/age rules retain the `keep_min` newest artifacts plus anything
+/// younger than `max_age_secs`. An optional byte ceiling adds a second,
+/// independent selection rule: when a category's resident bytes exceed it,
+/// oldest artifacts are selected until the category fits the ceiling. This
+/// byte rule deliberately takes precedence over count/age retention: keeping
+/// three incident-time multi-gigabyte copies forever is the size-blind failure
+/// GH#210 exposed. Selection still only feeds the move-only reclaim surface;
+/// it never deletes forensic evidence.
 #[derive(Debug, Clone, Copy)]
 pub struct RetentionPolicy {
     pub keep_min: usize,
     pub max_age_secs: u64,
+    /// Maximum resident bytes per [`DebrisCategory`]. `None` disables the
+    /// size rule, preserving the legacy count-and-age-only behavior.
+    pub max_total_bytes_per_category: Option<u64>,
+}
+
+/// Compute the effective per-category ceiling for recovery debris.
+///
+/// A nonzero configured floor is scaled to at least five times the live
+/// database size. This keeps a legitimately large mailbox from shedding its
+/// incident evidence too aggressively while preventing a recovered tiny DB
+/// from retaining multi-gigabyte incident copies indefinitely. A configured
+/// floor of zero explicitly disables byte-based selection.
+#[must_use]
+pub fn effective_byte_budget_per_category(
+    configured_floor_bytes: u64,
+    live_database_bytes: u64,
+) -> Option<u64> {
+    (configured_floor_bytes > 0)
+        .then(|| configured_floor_bytes.max(live_database_bytes.saturating_mul(5)))
 }
 
 /// The result of applying a [`RetentionPolicy`] to a set of artifacts.
@@ -93,12 +126,13 @@ impl ReclaimPlan {
 
 /// PURE: choose which debris artifacts to reclaim under `policy`.
 ///
-/// Within each [`DebrisCategory`], the `keep_min` newest artifacts are always
-/// retained, and any artifact younger than `max_age_secs` is always retained.
-/// Only artifacts that are BOTH older than `max_age_secs` AND beyond the
-/// `keep_min` newest are reclaimed. A negative/zero/unknown `modified_us` is
-/// treated as very old (eligible once past `keep_min`). The returned prune list
-/// is ordered oldest-first for a stable reclaim order.
+/// Within each [`DebrisCategory`], the count-and-age rule selects artifacts
+/// that are BOTH older than `max_age_secs` AND beyond the `keep_min` newest.
+/// A negative/zero/unknown `modified_us` is treated as very old. If
+/// `max_total_bytes_per_category` is set, the planner additionally selects
+/// oldest artifacts from any category above that ceiling, even when those
+/// artifacts would otherwise be protected by count or age. The returned prune
+/// list is ordered oldest-first for a stable reclaim order.
 #[must_use]
 pub fn select_recovery_debris_to_reclaim(
     mut artifacts: Vec<DebrisArtifact>,
@@ -113,27 +147,63 @@ pub fn select_recovery_debris_to_reclaim(
     let max_age_us = i128::from(policy.max_age_secs).saturating_mul(1_000_000);
 
     // Newest-first so `keep_min` protects the most recent artifacts. Stable so
-    // equal-mtime ties keep a deterministic order.
+    // equal-mtime ties keep a deterministic order. Grouping keeps the byte
+    // budget genuinely per category rather than letting a large forensic
+    // bundle evict a small sidecar snapshot.
     artifacts.sort_by_key(|art| std::cmp::Reverse(art.modified_us));
-
-    let mut rank_per_category: HashMap<DebrisCategory, usize> = HashMap::new();
-    let mut prune = Vec::new();
-    for art in artifacts {
-        let rank = rank_per_category.entry(art.category).or_insert(0);
-        let within_keep_min = *rank < policy.keep_min;
-        *rank += 1;
-        if within_keep_min {
-            continue;
-        }
-        let age_us = i128::from(now_us).saturating_sub(i128::from(art.modified_us));
-        let young = age_us < max_age_us;
-        if young {
-            continue;
-        }
-        prune.push(art);
+    let mut by_category: BTreeMap<DebrisCategory, Vec<DebrisArtifact>> = BTreeMap::new();
+    for artifact in artifacts {
+        by_category
+            .entry(artifact.category)
+            .or_default()
+            .push(artifact);
     }
 
-    prune.sort_by_key(|art| art.modified_us);
+    let mut prune = Vec::new();
+    for (_category, artifacts) in by_category {
+        let mut selected = vec![false; artifacts.len()];
+        for (rank, artifact) in artifacts.iter().enumerate() {
+            let within_keep_min = rank < policy.keep_min;
+            let age_us = i128::from(now_us).saturating_sub(i128::from(artifact.modified_us));
+            let young = age_us < max_age_us;
+            selected[rank] = !within_keep_min && !young;
+        }
+
+        if let Some(max_bytes) = policy.max_total_bytes_per_category {
+            let mut retained_bytes = artifacts
+                .iter()
+                .zip(&selected)
+                .filter(|(_, selected)| !**selected)
+                .map(|(artifact, _)| artifact.bytes)
+                .fold(0_u64, u64::saturating_add);
+
+            // Artifacts are newest-first; select oldest retained artifacts
+            // first so a category converges on its byte ceiling with the most
+            // recent evidence left in place whenever the budget allows it.
+            for index in (0..artifacts.len()).rev() {
+                if retained_bytes <= max_bytes {
+                    break;
+                }
+                if !selected[index] {
+                    selected[index] = true;
+                    retained_bytes = retained_bytes.saturating_sub(artifacts[index].bytes);
+                }
+            }
+        }
+
+        prune.extend(
+            artifacts
+                .into_iter()
+                .zip(selected)
+                .filter_map(|(artifact, selected)| selected.then_some(artifact)),
+        );
+    }
+
+    prune.sort_by(|left, right| {
+        left.modified_us
+            .cmp(&right.modified_us)
+            .then_with(|| left.path.cmp(&right.path))
+    });
     let reclaimable_bytes = prune
         .iter()
         .map(|a| a.bytes)
@@ -151,14 +221,33 @@ pub fn select_recovery_debris_to_reclaim(
 /// Enumerate all recovery debris under `storage_root` / next to `db_path`.
 ///
 /// Combines forensic bundles (`doctor/forensics/.../`) with quarantine siblings
-/// (`<db>.corrupt-*`, `<db>.reconstruct-failed-*`, `<db>.archive-reconcile-restore-*`)
-/// and startup sidecar snapshots (`<db>-wal.startup-precheckpoint-*`,
+/// (`<db>.corrupt-*`, `<db>.reconstruct-failed-*`), archive-reconcile incident
+/// snapshots (`<db>.archive-reconcile-*`), and startup sidecar snapshots (`<db>-wal.startup-precheckpoint-*`,
 /// `<db>-shm.startup-precheckpoint-*`, `<db>*.startup-quarantine-*`).
 #[must_use]
 pub fn enumerate_recovery_debris(storage_root: &Path, db_path: &Path) -> Vec<DebrisArtifact> {
     let mut out = enumerate_forensic_bundles(storage_root);
     out.extend(enumerate_corrupt_quarantines(db_path));
     out
+}
+
+/// Bytes still resident under the move-only reclaim staging area.
+///
+/// Consolidation deliberately does not free disk space: it moves evidence to
+/// `doctor/reclaimable/` for an operator to inspect and eventually remove.
+/// Health must include those bytes in its resident/live-DB ratio rather than
+/// reporting a false all-clear immediately after a successful consolidation.
+#[must_use]
+pub fn reclaimable_staging_bytes(storage_root: &Path) -> u64 {
+    let root = storage_root.join("doctor").join("reclaimable");
+    let Ok(metadata) = std::fs::symlink_metadata(&root) else {
+        return 0;
+    };
+    metadata
+        .file_type()
+        .is_dir()
+        .then(|| dir_size_bytes(&root))
+        .unwrap_or(0)
 }
 
 /// Enumerate forensic bundle directories under `<storage_root>/doctor/forensics/`.
@@ -221,7 +310,9 @@ pub fn enumerate_corrupt_quarantines(db_path: &Path) -> Vec<DebrisArtifact> {
         if !name.starts_with(db_name) {
             continue;
         }
-        let category = if is_quarantine_name(name) {
+        let category = if is_archive_reconcile_backup_name(name) {
+            DebrisCategory::ArchiveReconcileBackup
+        } else if is_quarantine_name(name) {
             DebrisCategory::CorruptQuarantine
         } else if is_sidecar_snapshot_name(name) {
             DebrisCategory::SidecarSnapshot
@@ -250,9 +341,18 @@ pub fn enumerate_corrupt_quarantines(db_path: &Path) -> Vec<DebrisArtifact> {
 /// `-wal`/`-shm` sidecar.
 #[must_use]
 pub fn is_quarantine_name(name: &str) -> bool {
-    name.contains(".corrupt-")
-        || name.contains(".reconstruct-failed-")
-        || name.contains(".archive-reconcile-restore-")
+    name.contains(".corrupt-") || name.contains(".reconstruct-failed-")
+}
+
+/// Whether a filename is a direct archive-reconcile incident snapshot.
+///
+/// These files are count-rotated by the server, but count alone does not bound
+/// their incident-time size. Include them in the doctor retention inventory so
+/// an explicit reclaim or a successful-heal auto-reclaim can consolidate the
+/// oldest oversized copies without deleting evidence.
+#[must_use]
+pub fn is_archive_reconcile_backup_name(name: &str) -> bool {
+    name.contains(".archive-reconcile-")
 }
 
 /// Whether a filename is a startup-time WAL/SHM sidecar snapshot.
@@ -392,6 +492,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_min: 2,
             max_age_secs: 14 * 24 * 3_600,
+            max_total_bytes_per_category: None,
         };
         let plan = select_recovery_debris_to_reclaim(artifacts, policy, now);
         // b3 + b4 are the 2 newest → kept; b1 + b2 are old + beyond keep_min → pruned.
@@ -410,6 +511,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_min: 1,
             max_age_secs: 14 * 24 * 3_600,
+            max_total_bytes_per_category: None,
         };
         let artifacts = vec![
             art(
@@ -443,6 +545,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_min: 1,
             max_age_secs: 0, // nothing is "young"; only keep_min protects
+            max_total_bytes_per_category: None,
         };
         let artifacts = vec![
             art(
@@ -484,12 +587,102 @@ mod tests {
     }
 
     #[test]
+    fn byte_budget_selects_oldest_young_artifacts_per_category() {
+        let now = 100 * DAY_US;
+        let policy = RetentionPolicy {
+            // The legacy count/age rules would keep every one of these: all
+            // forensic bundles are young and within the count target.
+            keep_min: 3,
+            max_age_secs: 14 * 24 * 3_600,
+            max_total_bytes_per_category: Some(250),
+        };
+        let artifacts = vec![
+            art(
+                "forensic-old",
+                100,
+                now - 3 * DAY_US,
+                DebrisCategory::ForensicBundle,
+            ),
+            art(
+                "forensic-mid",
+                100,
+                now - 2 * DAY_US,
+                DebrisCategory::ForensicBundle,
+            ),
+            art(
+                "forensic-new",
+                100,
+                now - DAY_US,
+                DebrisCategory::ForensicBundle,
+            ),
+            // This category is below its own ceiling even though the combined
+            // resident total exceeds 250 bytes; budgets must not cross-evict.
+            art(
+                "quarantine-only",
+                200,
+                now - DAY_US,
+                DebrisCategory::CorruptQuarantine,
+            ),
+        ];
+
+        let plan = select_recovery_debris_to_reclaim(artifacts, policy, now);
+
+        assert_eq!(plan.prune.len(), 1);
+        assert_eq!(plan.prune[0].path, PathBuf::from("forensic-old"));
+        assert_eq!(plan.reclaimable_bytes, 100);
+        assert_eq!(plan.kept_count, 3);
+        assert_eq!(plan.total_bytes, 500);
+    }
+
+    #[test]
+    fn byte_budget_can_select_the_only_incident_size_artifact() {
+        let now = 100 * DAY_US;
+        let plan = select_recovery_debris_to_reclaim(
+            vec![art(
+                "single-huge-bundle",
+                1_024,
+                now - DAY_US,
+                DebrisCategory::ForensicBundle,
+            )],
+            RetentionPolicy {
+                keep_min: 5,
+                max_age_secs: 14 * 24 * 3_600,
+                max_total_bytes_per_category: Some(512),
+            },
+            now,
+        );
+
+        // A hard ceiling must not reproduce the old "three enormous copies
+        // are retained forever" failure mode. Reclaim selection remains a
+        // move to doctor/reclaimable, never a deletion.
+        assert_eq!(plan.prune.len(), 1);
+        assert_eq!(plan.prune[0].path, PathBuf::from("single-huge-bundle"));
+        assert_eq!(plan.reclaimable_bytes, 1_024);
+    }
+
+    #[test]
+    fn byte_budget_scales_with_live_database_and_can_be_disabled() {
+        assert_eq!(
+            effective_byte_budget_per_category(1_024, 100),
+            Some(1_024),
+            "configured floor protects small live databases"
+        );
+        assert_eq!(
+            effective_byte_budget_per_category(1_024, 1_000),
+            Some(5_000),
+            "large live databases self-scale the evidence ceiling"
+        );
+        assert_eq!(effective_byte_budget_per_category(0, 1_000), None);
+    }
+
+    #[test]
     fn empty_input_is_noop() {
         let plan = select_recovery_debris_to_reclaim(
             Vec::new(),
             RetentionPolicy {
                 keep_min: 5,
                 max_age_secs: 0,
+                max_total_bytes_per_category: None,
             },
             0,
         );
@@ -503,6 +696,7 @@ mod tests {
         let policy = RetentionPolicy {
             keep_min: 1,
             max_age_secs: 14 * 24 * 3_600,
+            max_total_bytes_per_category: None,
         };
         let artifacts = vec![
             art(
@@ -530,7 +724,7 @@ mod tests {
         assert!(is_quarantine_name(
             "storage.sqlite3.reconstruct-failed-20260618_145230_042"
         ));
-        assert!(is_quarantine_name(
+        assert!(!is_quarantine_name(
             "storage.sqlite3.archive-reconcile-restore-20260618_145230_042"
         ));
         // Not quarantines: live DB, backup, live sidecars.
@@ -539,6 +733,33 @@ mod tests {
         assert!(!is_quarantine_name("storage.sqlite3-wal"));
         assert!(!is_quarantine_name("storage.sqlite3-shm"));
         assert!(!is_quarantine_name("storage.sqlite3.bak.meta.json"));
+    }
+
+    #[test]
+    fn archive_reconcile_backup_name_classification() {
+        assert!(is_archive_reconcile_backup_name(
+            "storage.sqlite3.archive-reconcile-20260618_145230_042"
+        ));
+        assert!(is_archive_reconcile_backup_name(
+            "storage.sqlite3.archive-reconcile-restore-20260618_145230_042"
+        ));
+        assert!(!is_archive_reconcile_backup_name("storage.sqlite3"));
+        assert!(!is_archive_reconcile_backup_name("storage.sqlite3.bak"));
+    }
+
+    #[test]
+    fn enumerates_archive_reconcile_backup_as_its_own_byte_budget_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path();
+        let db_path = storage_root.join("storage.sqlite3");
+        std::fs::write(&db_path, b"live-db").unwrap();
+        let backup = storage_root.join("storage.sqlite3.archive-reconcile-20260618_145230_042");
+        std::fs::write(&backup, vec![0_u8; 100]).unwrap();
+
+        let debris = enumerate_recovery_debris(storage_root, &db_path);
+        assert!(debris.iter().any(|artifact| {
+            artifact.path == backup && artifact.category == DebrisCategory::ArchiveReconcileBackup
+        }));
     }
 
     #[test]
@@ -607,6 +828,7 @@ mod tests {
             RetentionPolicy {
                 keep_min: 0,
                 max_age_secs: 0,
+                max_total_bytes_per_category: None,
             },
             i64::MAX,
         );
@@ -678,6 +900,7 @@ mod tests {
             RetentionPolicy {
                 keep_min: 0,
                 max_age_secs: 0,
+                max_total_bytes_per_category: None,
             },
             i64::MAX,
         );
@@ -701,6 +924,11 @@ mod tests {
         assert!(
             dest.join("storage.sqlite3.corrupt-20260101_000000_000")
                 .exists()
+        );
+        assert_eq!(
+            reclaimable_staging_bytes(storage_root),
+            3_000,
+            "move-only consolidation remains resident until an operator removes the staging dir"
         );
     }
 }

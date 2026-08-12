@@ -2626,11 +2626,11 @@ pub enum DoctorCommand {
     /// `am doctor repair`/`reconstruct` and the startup self-heal capture a
     /// forensic bundle + quarantine the bad DB on every recovery event, with no
     /// retention — across repeated events this grew to ~19 GB on a prod box and
-    /// wedged startup (br-mudrv). This verb CONSOLIDATES the stale debris (older
-    /// than `--max-age-days` and beyond the `--keep` newest per category) into
-    /// one reversible `<storage_root>/doctor/reclaimable/<ts>/` directory which
-    /// you can then remove. It NEVER deletes and never touches the live DB, so
-    /// it is safe to run while the server is up. Default (no `--yes`) previews.
+    /// wedged startup (br-mudrv). This verb CONSOLIDATES debris selected by the
+    /// count/age policy or an oversized per-category byte ceiling into one
+    /// reversible `<storage_root>/doctor/reclaimable/<ts>/` directory. It NEVER
+    /// deletes and never touches the live DB, so it is safe to run while the
+    /// server is up. Default (no `--yes`) previews.
     Reclaim {
         /// Preview the reclaim plan without moving anything (default behavior).
         #[arg(long)]
@@ -2638,12 +2638,14 @@ pub enum DoctorCommand {
         /// Apply: move stale debris into doctor/reclaimable/<ts>/.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Always keep at least this many newest artifacts per category
-        /// (default: DOCTOR_RETENTION_KEEP_MIN).
+        /// Count/age retention target per category (default:
+        /// DOCTOR_RETENTION_KEEP_MIN). An active byte ceiling can still select
+        /// oversized incident artifacts for move-only consolidation.
         #[arg(long)]
         keep: Option<u64>,
-        /// Always keep artifacts younger than this many days
-        /// (default: DOCTOR_RETENTION_MAX_AGE_SECS).
+        /// Count/age rule retains artifacts younger than this many days
+        /// (default: DOCTOR_RETENTION_MAX_AGE_SECS), unless an oversized byte
+        /// ceiling selects them for move-only consolidation.
         #[arg(long)]
         max_age_days: Option<u64>,
         /// Output JSON (shorthand for machine-readable output).
@@ -7059,9 +7061,9 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
 /// recovery debris the failure episode left behind so operators never have to
 /// run `am doctor reclaim` by hand after the doctor solved the problem.
 ///
-/// Semantics match `am doctor reclaim --yes` with an age cutoff of zero: the
-/// `doctor_retention_keep_min` newest artifacts per category survive as
-/// forensics for the episode just resolved, everything older is MOVED (never
+/// Semantics match `am doctor reclaim --yes` with an age cutoff of zero. The
+/// count target preserves the newest evidence when it fits the byte budget;
+/// incident-time artifacts above the per-category ceiling are MOVED (never
 /// deleted — RULE 1) into `<storage_root>/doctor/reclaimable/<ts>/`. Age-based
 /// retention is deliberately not applied here: a crash-loop's debris is
 /// minutes old, so an age floor would exempt exactly the junk this cleans up.
@@ -7080,11 +7082,16 @@ fn auto_reclaim_recovery_debris_after_heal(database_url: &str, storage_root: &Pa
     if artifacts.is_empty() {
         return;
     }
+    let live_database_bytes = std::fs::metadata(&db_path).map_or(0, |meta| meta.len());
     let plan = rr::select_recovery_debris_to_reclaim(
         artifacts,
         rr::RetentionPolicy {
             keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
             max_age_secs: 0,
+            max_total_bytes_per_category: rr::effective_byte_budget_per_category(
+                config.doctor_retention_max_bytes_per_category,
+                live_database_bytes,
+            ),
         },
         chrono::Utc::now().timestamp_micros(),
     );
@@ -8844,6 +8851,8 @@ struct DoctorReclaimReport {
     database: String,
     keep_min: u64,
     max_age_days: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_bytes_per_category: Option<u64>,
     applied: bool,
     total_artifacts: usize,
     total_bytes: u64,
@@ -8896,12 +8905,18 @@ fn handle_doctor_reclaim(
     };
 
     let artifacts = rr::enumerate_recovery_debris(&storage_root, &db_path);
+    let live_database_bytes = std::fs::metadata(&db_path).map_or(0, |meta| meta.len());
+    let max_bytes_per_category = rr::effective_byte_budget_per_category(
+        config.doctor_retention_max_bytes_per_category,
+        live_database_bytes,
+    );
     let now_us = chrono::Utc::now().timestamp_micros();
     let plan = rr::select_recovery_debris_to_reclaim(
         artifacts,
         rr::RetentionPolicy {
             keep_min: usize::try_from(keep_min).unwrap_or(usize::MAX),
             max_age_secs,
+            max_total_bytes_per_category: max_bytes_per_category,
         },
         now_us,
     );
@@ -8943,6 +8958,7 @@ fn handle_doctor_reclaim(
         database: resolved.clone(),
         keep_min,
         max_age_days: max_age_secs / 86_400,
+        max_bytes_per_category,
         applied: apply,
         total_artifacts: plan.total_count,
         total_bytes: plan.total_bytes,
