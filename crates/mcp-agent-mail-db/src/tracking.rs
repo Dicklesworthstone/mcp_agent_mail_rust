@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use mcp_agent_mail_core::{
     LockLevel, OrderedMutex,
-    metrics::{HistogramSnapshot, Log2Histogram},
+    metrics::{HistogramSnapshot, Log2Histogram, record_database_write_latency},
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -611,11 +611,34 @@ pub fn global_tracker() -> &'static QueryTracker {
     &crate::QUERY_TRACKER
 }
 
+/// Return whether the leading SQL verb mutates database state.
+///
+/// The timeout diagnostic's write-latency histogram must remain cheap and
+/// available while optional query tracking is disabled, so classification is a
+/// small allocation-free leading-keyword check rather than a full SQL parser.
+fn is_database_write_statement(sql: &str) -> bool {
+    let keyword = sql
+        .trim_start()
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("");
+    [
+        "INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP", "VACUUM", "REINDEX",
+        "COMMIT", "END", "BEGIN",
+    ]
+    .into_iter()
+    .any(|write_keyword| keyword.eq_ignore_ascii_case(write_keyword))
+}
+
 /// Record a query against the active tracker (or the global fallback).
 ///
 /// Called by `TrackedConnection` / `TrackedTransaction` after each SQL execution.
-/// No-op when tracking is disabled.
+/// Query-tracker recording remains opt-in, but SQL write latency is always
+/// recorded for honest timeout attribution.
 pub fn record_query(sql: &str, duration_us: u64) {
+    if is_database_write_statement(sql) {
+        record_database_write_latency(duration_us);
+    }
     if let Some(tracker) = active_tracker() {
         tracker.record(sql, duration_us);
     } else {
@@ -847,6 +870,29 @@ mod tests {
             extract_table_id("UPDATE    projects   SET archived=1"),
             TableId::Projects
         );
+    }
+
+    #[test]
+    fn timeout_write_metric_classifies_mutations_without_tracking() {
+        for sql in [
+            "INSERT INTO messages (body) VALUES (?)",
+            " update agents SET last_active_ts = ?",
+            "DELETE FROM file_reservations",
+            "COMMIT",
+            "BEGIN IMMEDIATE",
+        ] {
+            assert!(is_database_write_statement(sql), "expected write: {sql}");
+        }
+        for sql in [
+            "SELECT * FROM messages",
+            "PRAGMA table_info(messages)",
+            "ROLLBACK",
+        ] {
+            assert!(
+                !is_database_write_statement(sql),
+                "must not attribute read/control statement as a write: {sql}"
+            );
+        }
     }
 
     // ── TableId round-trip ──────────────────────────────────────────────

@@ -572,6 +572,173 @@ impl DbMetrics {
     }
 }
 
+/// Always-on latency distribution for SQL statements that mutate database
+/// state. This is intentionally separate from the optional query tracker: a
+/// timeout diagnostic cannot depend on instrumentation having been enabled
+/// before the incident.
+#[derive(Debug, Default)]
+pub struct DatabaseWriteMetrics {
+    pub latency_us: Log2Histogram,
+}
+
+/// Serializable view of [`DatabaseWriteMetrics`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DatabaseWriteMetricsSnapshot {
+    pub latency_us: HistogramSnapshot,
+}
+
+impl DatabaseWriteMetrics {
+    #[must_use]
+    pub fn snapshot(&self) -> DatabaseWriteMetricsSnapshot {
+        DatabaseWriteMetricsSnapshot {
+            latency_us: self.latency_us.snapshot(),
+        }
+    }
+}
+
+static DATABASE_WRITE_METRICS: LazyLock<DatabaseWriteMetrics> =
+    LazyLock::new(DatabaseWriteMetrics::default);
+
+/// Record one SQL write independently of the opt-in query tracker.
+#[inline]
+pub fn record_database_write_latency(duration_us: u64) {
+    DATABASE_WRITE_METRICS.latency_us.record(duration_us);
+}
+
+/// Snapshot the always-on database-write latency distribution.
+#[must_use]
+pub fn database_write_metrics_snapshot() -> DatabaseWriteMetricsSnapshot {
+    DATABASE_WRITE_METRICS.snapshot()
+}
+
+/// Live status of the blocking-dispatch handoff. The server owns admission,
+/// but every health consumer needs to see this non-pool contention path.
+#[derive(Debug, Default)]
+pub struct BlockingDispatchMetrics {
+    pub inflight: GaugeU64,
+    pub zombies: GaugeU64,
+    pub timeouts_total: Counter,
+}
+
+/// Serializable view of [`BlockingDispatchMetrics`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BlockingDispatchMetricsSnapshot {
+    pub inflight: u64,
+    pub zombies: u64,
+    pub timeouts_total: u64,
+}
+
+impl BlockingDispatchMetrics {
+    #[must_use]
+    pub fn snapshot(&self) -> BlockingDispatchMetricsSnapshot {
+        BlockingDispatchMetricsSnapshot {
+            inflight: self.inflight.load(),
+            zombies: self.zombies.load(),
+            timeouts_total: self.timeouts_total.load(),
+        }
+    }
+}
+
+static BLOCKING_DISPATCH_METRICS: LazyLock<BlockingDispatchMetrics> =
+    LazyLock::new(BlockingDispatchMetrics::default);
+
+/// Access process-wide blocking-dispatch contention metrics.
+#[must_use]
+pub fn blocking_dispatch_metrics() -> &'static BlockingDispatchMetrics {
+    &BLOCKING_DISPATCH_METRICS
+}
+
+/// The stage which the observed p99 supports as the timeout bottleneck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum TimeoutStage {
+    PoolAcquire,
+    DatabaseWrite,
+    ArchiveWbq,
+    ArchiveCommit,
+    BlockingDispatch,
+    NoMonitoredStage,
+}
+
+impl TimeoutStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolAcquire => "pool_acquire",
+            Self::DatabaseWrite => "database_write",
+            Self::ArchiveWbq => "archive_wbq",
+            Self::ArchiveCommit => "archive_commit",
+            Self::BlockingDispatch => "blocking_dispatch_unattributed",
+            Self::NoMonitoredStage => "no_monitored_stage_exceeded_budget",
+        }
+    }
+}
+
+/// Timeout evidence shared by the HTTP dispatch error and `health_check`.
+///
+/// `stage_exceeded_budget` is deliberately separate from `stage`: a live
+/// blocking dispatch can be reported without inventing a deeper root cause
+/// when no measured stage reached the client deadline.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeoutDiagnosticsSnapshot {
+    pub client_deadline_us: u64,
+    pub stage: TimeoutStage,
+    pub stage_exceeded_budget: bool,
+    pub pool_acquire_p99_us: u64,
+    pub database_write_p99_us: u64,
+    pub archive_wbq_p99_us: u64,
+    pub archive_commit_p99_us: u64,
+    pub blocking_dispatch: BlockingDispatchMetricsSnapshot,
+}
+
+/// Classify timeout evidence from p99 samples. The slowest stage at or beyond
+/// the client deadline wins. If none crossed the deadline, dispatch contention
+/// is surfaced as explicitly unattributed rather than being mislabeled as DB
+/// contention.
+#[must_use]
+pub fn timeout_diagnostics_from_samples(
+    client_deadline_us: u64,
+    pool_acquire_p99_us: u64,
+    database_write_p99_us: u64,
+    archive_wbq_p99_us: u64,
+    archive_commit_p99_us: u64,
+    blocking_dispatch: BlockingDispatchMetricsSnapshot,
+) -> TimeoutDiagnosticsSnapshot {
+    let mut stage = TimeoutStage::NoMonitoredStage;
+    let mut slowest_p99_us = 0;
+    if client_deadline_us > 0 {
+        for (candidate, p99_us) in [
+            (TimeoutStage::PoolAcquire, pool_acquire_p99_us),
+            (TimeoutStage::DatabaseWrite, database_write_p99_us),
+            (TimeoutStage::ArchiveWbq, archive_wbq_p99_us),
+            (TimeoutStage::ArchiveCommit, archive_commit_p99_us),
+        ] {
+            if p99_us >= client_deadline_us && p99_us > slowest_p99_us {
+                stage = candidate;
+                slowest_p99_us = p99_us;
+            }
+        }
+    }
+    let stage_exceeded_budget = slowest_p99_us > 0;
+    if !stage_exceeded_budget
+        && (blocking_dispatch.inflight > 0
+            || blocking_dispatch.zombies > 0
+            || blocking_dispatch.timeouts_total > 0)
+    {
+        stage = TimeoutStage::BlockingDispatch;
+    }
+
+    TimeoutDiagnosticsSnapshot {
+        client_deadline_us,
+        stage,
+        stage_exceeded_budget,
+        pool_acquire_p99_us,
+        database_write_p99_us,
+        archive_wbq_p99_us,
+        archive_commit_p99_us,
+        blocking_dispatch,
+    }
+}
+
 /// File-descriptor pressure for the current process, sampled live from the OS.
 ///
 /// Unlike the pool gauges in [`DbMetricsSnapshot`] (which accumulate over a
@@ -2081,9 +2248,63 @@ pub fn global_metrics() -> &'static GlobalMetrics {
     &GLOBAL_METRICS
 }
 
+/// Capture all stage evidence needed to explain a client-side dispatch timeout.
+#[must_use]
+pub fn timeout_diagnostics_snapshot(client_deadline_us: u64) -> TimeoutDiagnosticsSnapshot {
+    let metrics = global_metrics().snapshot();
+    timeout_diagnostics_from_samples(
+        client_deadline_us,
+        metrics.db.pool_acquire_latency_us.p99,
+        database_write_metrics_snapshot().latency_us.p99,
+        metrics.storage.wbq_queue_latency_us.p99,
+        metrics.storage.commit_queue_latency_us.p99,
+        blocking_dispatch_metrics().snapshot(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_diagnostics_names_only_a_stage_that_exceeded_the_budget() {
+        let diagnostics = timeout_diagnostics_from_samples(
+            30_000_000,
+            9_000,
+            0,
+            0,
+            32_000_000,
+            BlockingDispatchMetricsSnapshot {
+                inflight: 4,
+                zombies: 0,
+                timeouts_total: 1,
+            },
+        );
+
+        assert_eq!(diagnostics.stage, TimeoutStage::ArchiveCommit);
+        assert!(diagnostics.stage_exceeded_budget);
+        assert_eq!(diagnostics.stage.as_str(), "archive_commit");
+    }
+
+    #[test]
+    fn timeout_diagnostics_leaves_sub_budget_stalls_unattributed_to_the_database() {
+        let diagnostics = timeout_diagnostics_from_samples(
+            30_000_000,
+            9_000,
+            12_000,
+            2_000,
+            16_000_000,
+            BlockingDispatchMetricsSnapshot {
+                inflight: 1,
+                zombies: 0,
+                timeouts_total: 1,
+            },
+        );
+
+        assert_eq!(diagnostics.stage, TimeoutStage::BlockingDispatch);
+        assert!(!diagnostics.stage_exceeded_budget);
+        assert_eq!(diagnostics.stage.as_str(), "blocking_dispatch_unattributed");
+    }
 
     #[test]
     fn fd_metrics_snapshot_shape_and_consistency() {
