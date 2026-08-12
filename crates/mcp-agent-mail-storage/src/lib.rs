@@ -6250,17 +6250,26 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         if path.extension().is_none_or(|e| e != "lock") {
             return;
         }
-        // Never remove Git's index lock via generic flock heuristics.
-        // Git index.lock is existence-based and can be active even when no
-        // advisory file lock is held.
-        if path
+        // Never remove Git's existence-based locks via generic flock
+        // heuristics. They can be active even when no advisory lock is held.
+        // `objects/maintenance.lock` is owned and reaped by the server's
+        // PID-evidenced maintenance lane (GH#234); doing it here would turn
+        // the startup healer into an unproven lock breaker.
+        let is_git_index_lock = path
             .file_name()
             .is_some_and(|name| name == std::ffi::OsStr::new("index.lock"))
             && path
                 .parent()
                 .and_then(Path::file_name)
-                .is_some_and(|name| name == std::ffi::OsStr::new(".git"))
-        {
+                .is_some_and(|name| name == std::ffi::OsStr::new(".git"));
+        let is_git_maintenance_lock = path
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("maintenance.lock"))
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == std::ffi::OsStr::new("objects"));
+        if is_git_index_lock || is_git_maintenance_lock {
             return;
         }
 
@@ -14893,6 +14902,30 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with(".git/index.lock")),
             "healer must not report index.lock quarantine"
+        );
+    }
+
+    #[test]
+    fn test_heal_archive_locks_never_quarantines_git_maintenance_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive_root(&config).unwrap();
+
+        let maintenance_lock = tmp.path().join(".git/objects/maintenance.lock");
+        fs::create_dir_all(maintenance_lock.parent().unwrap()).unwrap();
+        fs::write(&maintenance_lock, "existence-based git maintenance lock").unwrap();
+
+        let result = heal_archive_locks(&config).unwrap();
+        assert!(
+            maintenance_lock.exists(),
+            "the generic startup healer must defer maintenance.lock to PID-evidenced recovery"
+        );
+        assert!(
+            !result
+                .locks_quarantined
+                .iter()
+                .any(|path| path.contains("maintenance.lock")),
+            "healer must not report maintenance.lock quarantine"
         );
     }
 

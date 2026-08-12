@@ -1,8 +1,9 @@
 //! Background worker for archive git maintenance (loose-object repack).
 //!
-//! Runs `git maintenance run --task=loose-objects --task=incremental-repack`
-//! on the archive's `.git` directory periodically to prevent unbounded
-//! loose-object accumulation from high-frequency commit patterns.
+//! Runs `git maintenance run --task=loose-objects` and, when packs already
+//! exist, `--task=incremental-repack` on the archive's `.git` directory
+//! periodically to prevent unbounded loose-object accumulation from
+//! high-frequency commit patterns.
 //!
 //! Respects:
 //! - `AM_ARCHIVE_MAINTENANCE_DISABLED=1` — disables the worker entirely
@@ -11,21 +12,29 @@
 use mcp_agent_mail_core::Config;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+static MAINTENANCE_LOCK_QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const STARTUP_DELAY_SECS: u64 = 15;
 const MIN_INTERVAL_SECS: u64 = 60;
 const MAINTENANCE_COMMAND_TIMEOUT_SECS: u64 = 20 * 60;
+const MAINTENANCE_TERMINATION_GRACE_SECS: u64 = 5;
+const MAX_MAINTENANCE_LOCK_EVIDENCE_BYTES: u64 = 16 * 1024;
+const MAINTENANCE_LOCK_EVIDENCE_PREFIX: &str = "maintenance.lock.agent-mail-stale-";
+const MAINTENANCE_ACTIVE_EVIDENCE_PREFIX: &str = "maintenance.lock.agent-mail-active-";
+const MAINTENANCE_COMPLETED_EVIDENCE_PREFIX: &str = "maintenance.lock.agent-mail-completed-";
 const PLAN_TOP_LIMIT: usize = 8;
 const LOOSE_OBJECTS_WATCH_AT: u64 = 1_000;
 const LOOSE_OBJECTS_CRITICAL_AT: u64 = 10_000;
@@ -44,8 +53,62 @@ pub struct MaintenanceReport {
     pub pack_count_after: Option<u64>,
     pub disk_bytes_before: Option<u64>,
     pub disk_bytes_after: Option<u64>,
+    pub observed_effect: MaintenanceObservedEffect,
+    pub lock_reaped: bool,
+    pub lock_evidence: Option<String>,
     pub success: bool,
     pub error: Option<String>,
+}
+
+/// What the maintenance run measurably accomplished.
+///
+/// A zero exit status alone is not sufficient evidence: Git returns success
+/// when `objects/maintenance.lock` makes it skip every requested task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MaintenanceObservedEffect {
+    #[default]
+    Unknown,
+    NoWorkRequired,
+    ProgressObserved,
+    NoProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedProcessLiveness {
+    Alive,
+    Dead,
+    Reused,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct MaintenanceLockFingerprint {
+    bytes: u64,
+    modified_unix_nanos: u64,
+}
+
+/// Durable evidence that this process terminated a Git maintenance child while
+/// its existence-based lock remained. The record lets a later worker distinguish
+/// that known-dead child from an unrelated, currently-running Git invocation.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct TerminatedMaintenanceLockEvidence {
+    schema_version: u8,
+    git_pid: u32,
+    git_process_start_ticks: Option<u64>,
+    termination_reason: String,
+    observed_at_unix_micros: u64,
+    lock_fingerprint: Option<MaintenanceLockFingerprint>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveMaintenanceEvidence {
+    path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct MaintenanceLockPreflight {
+    reaped: bool,
+    evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -322,11 +385,15 @@ fn executable_on_path(name: &str) -> bool {
 /// exec-fail with exit 127 and broke every archive-maintenance run plus
 /// `am doctor pack-archive`. `nice` is POSIX and kept when present; when neither
 /// wrapper is available we fall back to a bare `git`, which always exists.
-fn build_git_maintenance_command(git_dir: &Path, work_tree: &Path) -> Command {
+fn build_git_maintenance_command(
+    git_dir: &Path,
+    work_tree: &Path,
+    include_incremental_repack: bool,
+) -> Command {
     let use_ionice = cfg!(target_os = "linux") && executable_on_path("ionice");
     let use_nice = executable_on_path("nice");
 
-    let mut argv: Vec<String> = Vec::with_capacity(14);
+    let mut argv: Vec<String> = Vec::with_capacity(15);
     if use_nice {
         argv.extend(["nice".to_string(), "-n".to_string(), "19".to_string()]);
     }
@@ -342,13 +409,569 @@ fn build_git_maintenance_command(git_dir: &Path, work_tree: &Path) -> Command {
         "maintenance".to_string(),
         "run".to_string(),
         "--task=loose-objects".to_string(),
-        "--task=incremental-repack".to_string(),
     ]);
+    if include_incremental_repack {
+        argv.push("--task=incremental-repack".to_string());
+    }
+    // Git otherwise emits no diagnostic while a maintenance.lock makes it
+    // skip every task but still exits successfully (GH#234).
+    argv.push("--no-quiet".to_string());
 
     // `argv[0]` is always set (`git` at minimum).
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]);
     command
+}
+
+fn maintenance_lock_path(git_dir: &Path) -> PathBuf {
+    git_dir.join("objects").join("maintenance.lock")
+}
+
+fn maintenance_lock_fingerprint(path: &Path) -> Option<MaintenanceLockFingerprint> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .try_into()
+        .ok()?;
+    Some(MaintenanceLockFingerprint {
+        bytes: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
+fn maintenance_lock_evidence_path(
+    objects_dir: &Path,
+    pid: u32,
+    observed_at_micros: u64,
+) -> PathBuf {
+    let nonce = MAINTENANCE_LOCK_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    objects_dir.join(format!(
+        "{MAINTENANCE_LOCK_EVIDENCE_PREFIX}{observed_at_micros}-pid-{pid}-{nonce:06}.json"
+    ))
+}
+
+fn active_maintenance_evidence_path(
+    objects_dir: &Path,
+    pid: u32,
+    observed_at_micros: u64,
+) -> PathBuf {
+    let nonce = MAINTENANCE_LOCK_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    objects_dir.join(format!(
+        "{MAINTENANCE_ACTIVE_EVIDENCE_PREFIX}{observed_at_micros}-pid-{pid}-{nonce:06}.json"
+    ))
+}
+
+fn maintenance_lock_quarantine_path(lock_path: &Path) -> Option<PathBuf> {
+    let observed_at_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    for _ in 0..1024 {
+        let nonce = MAINTENANCE_LOCK_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let file_name = format!(
+            "maintenance.lock.agent-mail-quarantine-{observed_at_micros}-{}-{nonce:06}",
+            std::process::id()
+        );
+        let candidate = lock_path.with_file_name(file_name);
+        if matches!(fs::symlink_metadata(&candidate), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close_paren = stat.rfind(')')?;
+        let tail = stat.get(close_paren + 2..)?;
+        // Fields after `comm` start with field 3. Process start time is field
+        // 22, therefore position 19 in this tail segment.
+        return tail.split_whitespace().nth(19)?.parse().ok();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn recorded_process_liveness(
+    evidence: &TerminatedMaintenanceLockEvidence,
+) -> RecordedProcessLiveness {
+    if evidence.git_pid == 0 {
+        return RecordedProcessLiveness::Unknown;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let proc_path = Path::new("/proc").join(evidence.git_pid.to_string());
+        if !proc_path.is_dir() {
+            return RecordedProcessLiveness::Dead;
+        }
+        if let (Some(expected), Some(actual)) = (
+            evidence.git_process_start_ticks,
+            process_start_ticks(evidence.git_pid),
+        ) && expected != actual
+        {
+            return RecordedProcessLiveness::Reused;
+        }
+        return RecordedProcessLiveness::Alive;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let status = Command::new("ps")
+            .args(["-p", &evidence.git_pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        return match status {
+            Ok(status) if status.success() => RecordedProcessLiveness::Alive,
+            Ok(_) => RecordedProcessLiveness::Dead,
+            Err(_) => RecordedProcessLiveness::Unknown,
+        };
+    }
+}
+
+/// Returns `Some` only when process inspection is available. A true value
+/// means a related Git maintenance process still exists, so the lock is not
+/// safe to reap even if its original parent was killed.
+fn related_git_maintenance_process_running(git_dir: &Path) -> Option<bool> {
+    let git_dir = git_dir.to_string_lossy();
+
+    #[cfg(target_os = "linux")]
+    {
+        let proc_dir = fs::read_dir("/proc").ok()?;
+        for entry in proc_dir.flatten() {
+            let pid = entry.file_name();
+            if pid.to_string_lossy().parse::<u32>().is_err() {
+                continue;
+            }
+            let Ok(command) = fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let command = String::from_utf8_lossy(&command).replace('\0', " ");
+            if command.contains(git_dir.as_ref())
+                && command.contains("git")
+                && command.contains("maintenance")
+            {
+                return Some(true);
+            }
+        }
+        return Some(false);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-ax", "-o", "command="])
+            .output()
+            .ok()?;
+        let commands = String::from_utf8_lossy(&output.stdout);
+        Some(commands.lines().any(|command| {
+            command.contains(git_dir.as_ref())
+                && command.contains("git")
+                && command.contains("maintenance")
+        }))
+    }
+}
+
+fn read_matching_maintenance_lock_evidence(
+    git_dir: &Path,
+    fingerprint: MaintenanceLockFingerprint,
+) -> Option<TerminatedMaintenanceLockEvidence> {
+    let objects_dir = git_dir.join("objects");
+    fs::read_dir(objects_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy();
+            if !name.starts_with(MAINTENANCE_LOCK_EVIDENCE_PREFIX)
+                || path.extension().is_none_or(|extension| extension != "json")
+            {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file()
+                || metadata.len() > MAX_MAINTENANCE_LOCK_EVIDENCE_BYTES
+            {
+                return None;
+            }
+            let evidence = serde_json::from_str::<TerminatedMaintenanceLockEvidence>(
+                &fs::read_to_string(path).ok()?,
+            )
+            .ok()?;
+            (evidence.lock_fingerprint == Some(fingerprint)).then_some(evidence)
+        })
+        .max_by_key(|evidence| evidence.observed_at_unix_micros)
+}
+
+fn read_active_maintenance_evidence(git_dir: &Path) -> Option<TerminatedMaintenanceLockEvidence> {
+    let objects_dir = git_dir.join("objects");
+    fs::read_dir(objects_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy();
+            if !name.starts_with(MAINTENANCE_ACTIVE_EVIDENCE_PREFIX)
+                || path.extension().is_none_or(|extension| extension != "json")
+            {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file()
+                || metadata.len() > MAX_MAINTENANCE_LOCK_EVIDENCE_BYTES
+            {
+                return None;
+            }
+            let evidence = serde_json::from_str::<TerminatedMaintenanceLockEvidence>(
+                &fs::read_to_string(path).ok()?,
+            )
+            .ok()?;
+            evidence.lock_fingerprint.is_none().then_some(evidence)
+        })
+        .max_by_key(|evidence| evidence.observed_at_unix_micros)
+}
+
+fn write_maintenance_lock_evidence(
+    evidence_path: &Path,
+    evidence: &TerminatedMaintenanceLockEvidence,
+) -> bool {
+    let Ok(payload) = serde_json::to_vec_pretty(evidence) else {
+        return false;
+    };
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(evidence_path)
+    else {
+        return false;
+    };
+    file.write_all(&payload).is_ok() && file.write_all(b"\n").is_ok() && file.flush().is_ok()
+}
+
+fn record_active_maintenance_evidence(
+    git_dir: &Path,
+    git_pid: u32,
+    git_process_start_ticks: Option<u64>,
+) -> Option<ActiveMaintenanceEvidence> {
+    let objects_dir = git_dir.join("objects");
+    let observed_at_unix_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .try_into()
+        .ok()?;
+    let evidence = TerminatedMaintenanceLockEvidence {
+        schema_version: 1,
+        git_pid,
+        git_process_start_ticks,
+        termination_reason: "maintenance child started".to_string(),
+        observed_at_unix_micros,
+        lock_fingerprint: None,
+    };
+    let path = active_maintenance_evidence_path(&objects_dir, git_pid, observed_at_unix_micros);
+    write_maintenance_lock_evidence(&path, &evidence).then_some(ActiveMaintenanceEvidence { path })
+}
+
+fn mark_maintenance_evidence_completed(evidence: &ActiveMaintenanceEvidence) -> Result<(), String> {
+    let Some(file_name) = evidence.path.file_name().and_then(|name| name.to_str()) else {
+        return Err(format!(
+            "active maintenance evidence has no UTF-8 file name: {}",
+            evidence.path.display()
+        ));
+    };
+    let Some(completed_name) = file_name.strip_prefix(MAINTENANCE_ACTIVE_EVIDENCE_PREFIX) else {
+        return Err(format!(
+            "active maintenance evidence has unexpected name: {}",
+            evidence.path.display()
+        ));
+    };
+    let completed_path = evidence.path.with_file_name(format!(
+        "{MAINTENANCE_COMPLETED_EVIDENCE_PREFIX}{completed_name}"
+    ));
+    if fs::symlink_metadata(&completed_path).is_ok() {
+        return Err(format!(
+            "refusing to overwrite completed maintenance evidence at {}",
+            completed_path.display()
+        ));
+    }
+    fs::rename(&evidence.path, &completed_path).map_err(|error| {
+        format!(
+            "could not retain completed maintenance evidence at {}: {error}",
+            completed_path.display()
+        )
+    })
+}
+
+fn record_terminated_maintenance_lock(
+    git_dir: &Path,
+    git_pid: u32,
+    git_process_start_ticks: Option<u64>,
+    termination_reason: &str,
+) -> Option<String> {
+    let lock_path = maintenance_lock_path(git_dir);
+    let fingerprint = maintenance_lock_fingerprint(&lock_path)?;
+    let objects_dir = lock_path.parent()?;
+    let observed_at_unix_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .try_into()
+        .ok()?;
+    let evidence = TerminatedMaintenanceLockEvidence {
+        schema_version: 1,
+        git_pid,
+        git_process_start_ticks,
+        termination_reason: termination_reason.to_string(),
+        observed_at_unix_micros,
+        lock_fingerprint: Some(fingerprint),
+    };
+    let evidence_path =
+        maintenance_lock_evidence_path(objects_dir, git_pid, observed_at_unix_micros);
+    write_maintenance_lock_evidence(&evidence_path, &evidence).then_some(())?;
+    Some(format!(
+        "recorded stale maintenance lock evidence at {} for git pid {git_pid}",
+        evidence_path.display()
+    ))
+}
+
+/// Reap only a lock left by a maintenance child that this worker previously
+/// terminated. A matching fingerprint prevents an older dead PID record from
+/// being applied to a newer external Git invocation.
+fn preflight_maintenance_lock(git_dir: &Path) -> MaintenanceLockPreflight {
+    let lock_path = maintenance_lock_path(git_dir);
+    let Some(fingerprint) = maintenance_lock_fingerprint(&lock_path) else {
+        if lock_path.exists() {
+            return MaintenanceLockPreflight {
+                evidence: Some(format!(
+                    "refusing maintenance lock at {} because it is not a regular file",
+                    lock_path.display()
+                )),
+                ..Default::default()
+            };
+        }
+        return MaintenanceLockPreflight::default();
+    };
+
+    let (evidence, evidence_kind) = if let Some(evidence) =
+        read_matching_maintenance_lock_evidence(git_dir, fingerprint)
+    {
+        (evidence, "matching terminated-child")
+    } else if let Some(evidence) = read_active_maintenance_evidence(git_dir) {
+        // A server SIGKILL prevents the controlled termination path from
+        // fingerprinting the lock. Its active record still proves which Git
+        // child was launched; process-tree liveness below is the safety gate.
+        (evidence, "active-child")
+    } else {
+        return MaintenanceLockPreflight {
+            evidence: Some(format!(
+                "maintenance lock at {} has no terminated-child PID evidence; refusing to run a silently skipped maintenance command",
+                lock_path.display()
+            )),
+            ..Default::default()
+        };
+    };
+
+    let liveness = recorded_process_liveness(&evidence);
+    if !matches!(
+        liveness,
+        RecordedProcessLiveness::Dead | RecordedProcessLiveness::Reused
+    ) {
+        return MaintenanceLockPreflight {
+            evidence: Some(format!(
+                "maintenance lock at {} belongs to {evidence_kind} git pid {} ({liveness:?}); not reaping",
+                lock_path.display(),
+                evidence.git_pid
+            )),
+            ..Default::default()
+        };
+    }
+    match related_git_maintenance_process_running(git_dir) {
+        Some(false) => {}
+        Some(true) => {
+            return MaintenanceLockPreflight {
+                evidence: Some(format!(
+                    "maintenance lock at {} has dead/reused {evidence_kind} owner pid {} but a related Git maintenance process remains alive; not reaping",
+                    lock_path.display(),
+                    evidence.git_pid
+                )),
+                ..Default::default()
+            };
+        }
+        None => {
+            return MaintenanceLockPreflight {
+                evidence: Some(format!(
+                    "maintenance lock at {} has dead/reused {evidence_kind} owner pid {} but process-tree liveness is unavailable; not reaping",
+                    lock_path.display(),
+                    evidence.git_pid
+                )),
+                ..Default::default()
+            };
+        }
+    }
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return MaintenanceLockPreflight {
+                evidence: Some(format!(
+                    "could not open stale maintenance lock {} for an exclusive safety probe: {error}",
+                    lock_path.display()
+                )),
+                ..Default::default()
+            };
+        }
+    };
+    if fs2::FileExt::try_lock_exclusive(&file).is_err()
+        || maintenance_lock_fingerprint(&lock_path) != Some(fingerprint)
+    {
+        let _ = fs2::FileExt::unlock(&file);
+        return MaintenanceLockPreflight {
+            evidence: Some(format!(
+                "maintenance lock at {} changed or is advisory-lock busy during stale-lock verification; not reaping",
+                lock_path.display()
+            )),
+            ..Default::default()
+        };
+    }
+
+    let Some(quarantine_path) = maintenance_lock_quarantine_path(&lock_path) else {
+        let _ = fs2::FileExt::unlock(&file);
+        return MaintenanceLockPreflight {
+            evidence: Some(format!(
+                "could not allocate a non-overwriting quarantine path for stale maintenance lock {}",
+                lock_path.display()
+            )),
+            ..Default::default()
+        };
+    };
+    let reaped = fs::rename(&lock_path, &quarantine_path).is_ok();
+    let _ = fs2::FileExt::unlock(&file);
+    if reaped {
+        MaintenanceLockPreflight {
+            reaped: true,
+            evidence: Some(format!(
+                "quarantined stale maintenance lock at {} after {evidence_kind} git pid {} was {liveness:?}; retained lock artifact at {}",
+                lock_path.display(),
+                evidence.git_pid,
+                quarantine_path.display()
+            )),
+        }
+    } else {
+        MaintenanceLockPreflight {
+            evidence: Some(format!(
+                "failed to quarantine stale maintenance lock at {} after {evidence_kind} git pid {} was {liveness:?}",
+                lock_path.display(),
+                evidence.git_pid
+            )),
+            ..Default::default()
+        }
+    }
+}
+
+fn maintenance_observed_effect(
+    loose_before: Option<u64>,
+    loose_after: Option<u64>,
+    pack_before: Option<u64>,
+    pack_after: Option<u64>,
+    disk_before: Option<u64>,
+    disk_after: Option<u64>,
+) -> MaintenanceObservedEffect {
+    let Some(loose_before) = loose_before else {
+        return MaintenanceObservedEffect::Unknown;
+    };
+    if loose_before < LOOSE_OBJECTS_WATCH_AT {
+        return MaintenanceObservedEffect::NoWorkRequired;
+    }
+    let (
+        Some(loose_after),
+        Some(pack_before),
+        Some(pack_after),
+        Some(disk_before),
+        Some(disk_after),
+    ) = (
+        loose_after,
+        pack_before,
+        pack_after,
+        disk_before,
+        disk_after,
+    )
+    else {
+        return MaintenanceObservedEffect::Unknown;
+    };
+    if loose_after < loose_before || pack_after != pack_before || disk_after < disk_before {
+        MaintenanceObservedEffect::ProgressObserved
+    } else {
+        MaintenanceObservedEffect::NoProgress
+    }
+}
+
+fn git_reported_maintenance_lock(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("maintenance.lock") || stderr.contains("maintenance is already running")
+}
+
+fn terminate_maintenance_child(
+    child: &mut std::process::Child,
+    git_dir: &Path,
+    termination_reason: &str,
+) -> Option<String> {
+    let git_pid = child.id();
+    let git_process_start_ticks = process_start_ticks(git_pid);
+
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &git_pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+
+    let grace_deadline = Instant::now() + Duration::from_secs(MAINTENANCE_TERMINATION_GRACE_SECS);
+    while Instant::now() < grace_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return record_terminated_maintenance_lock(
+                    git_dir,
+                    git_pid,
+                    git_process_start_ticks,
+                    termination_reason,
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    record_terminated_maintenance_lock(
+        git_dir,
+        git_pid,
+        git_process_start_ticks,
+        termination_reason,
+    )
 }
 
 /// Run the maintenance tasks on a given archive git directory.
@@ -358,19 +981,74 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
     let loose_before = count_loose_objects(git_dir);
     let pack_before = count_pack_files(git_dir);
     let disk_before = measure_objects_disk_usage(git_dir);
+    let lock_preflight = preflight_maintenance_lock(git_dir);
+    if lock_preflight.evidence.is_some() && !lock_preflight.reaped {
+        return MaintenanceReport {
+            loose_before,
+            loose_after: count_loose_objects(git_dir),
+            pack_count_before: pack_before,
+            pack_count_after: count_pack_files(git_dir),
+            disk_bytes_before: disk_before,
+            disk_bytes_after: measure_objects_disk_usage(git_dir),
+            lock_evidence: lock_preflight.evidence.clone(),
+            error: lock_preflight.evidence,
+            ..Default::default()
+        };
+    }
+    // A fresh archive can have loose objects but no `.pack` file. Git's
+    // incremental-repack task treats that as an error (GH#233), so it must
+    // only be requested after the loose-objects task has created a pack.
+    let include_incremental_repack = pack_before.is_some_and(|count| count > 0);
 
-    let mut child = match build_git_maintenance_command(git_dir, work_tree)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
+    let mut child =
+        match build_git_maintenance_command(git_dir, work_tree, include_incremental_repack)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                return MaintenanceReport {
+                    loose_before,
+                    pack_count_before: pack_before,
+                    disk_bytes_before: disk_before,
+                    lock_reaped: lock_preflight.reaped,
+                    lock_evidence: lock_preflight.evidence,
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                };
+            }
+        };
+    let active_evidence = match record_active_maintenance_evidence(
+        git_dir,
+        child.id(),
+        process_start_ticks(child.id()),
+    ) {
+        Some(evidence) => evidence,
+        None => {
+            let lock_evidence = terminate_maintenance_child(
+                &mut child,
+                git_dir,
+                "maintenance launch could not persist active PID evidence",
+            );
             return MaintenanceReport {
                 loose_before,
+                loose_after: count_loose_objects(git_dir),
                 pack_count_before: pack_before,
+                pack_count_after: count_pack_files(git_dir),
                 disk_bytes_before: disk_before,
-                error: Some(e.to_string()),
+                disk_bytes_after: measure_objects_disk_usage(git_dir),
+                lock_reaped: lock_preflight.reaped,
+                lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
+                error: Some(lock_evidence.map_or_else(
+                    || {
+                        "could not persist active Git maintenance PID evidence; maintenance child was terminated"
+                            .to_string()
+                    },
+                    |evidence| format!(
+                        "could not persist active Git maintenance PID evidence; maintenance child was terminated; {evidence}"
+                    ),
+                )),
                 ..Default::default()
             };
         }
@@ -384,25 +1062,41 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
             Ok(Some(_status)) => break child.wait_with_output(),
             Ok(None) => {
                 if SHUTDOWN.load(Ordering::Acquire) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let lock_evidence =
+                        terminate_maintenance_child(&mut child, git_dir, "interrupted by shutdown");
                     return MaintenanceReport {
                         loose_before,
+                        loose_after: count_loose_objects(git_dir),
                         pack_count_before: pack_before,
+                        pack_count_after: count_pack_files(git_dir),
                         disk_bytes_before: disk_before,
-                        error: Some("interrupted by shutdown".to_string()),
+                        disk_bytes_after: measure_objects_disk_usage(git_dir),
+                        lock_reaped: lock_preflight.reaped,
+                        lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
+                        error: Some(lock_evidence.map_or_else(
+                            || "interrupted by shutdown".to_string(),
+                            |evidence| format!("interrupted by shutdown; {evidence}"),
+                        )),
                         ..Default::default()
                     };
                 }
                 if started.elapsed() >= Duration::from_secs(MAINTENANCE_COMMAND_TIMEOUT_SECS) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let timeout_error =
+                        format!("timed out after {MAINTENANCE_COMMAND_TIMEOUT_SECS}s");
+                    let lock_evidence =
+                        terminate_maintenance_child(&mut child, git_dir, &timeout_error);
                     return MaintenanceReport {
                         loose_before,
+                        loose_after: count_loose_objects(git_dir),
                         pack_count_before: pack_before,
+                        pack_count_after: count_pack_files(git_dir),
                         disk_bytes_before: disk_before,
-                        error: Some(format!(
-                            "timed out after {MAINTENANCE_COMMAND_TIMEOUT_SECS}s"
+                        disk_bytes_after: measure_objects_disk_usage(git_dir),
+                        lock_reaped: lock_preflight.reaped,
+                        lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
+                        error: Some(lock_evidence.map_or_else(
+                            || timeout_error.clone(),
+                            |evidence| format!("{timeout_error}; {evidence}"),
                         )),
                         ..Default::default()
                     };
@@ -415,21 +1109,63 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
         }
     };
 
+    let evidence_completion_error = mark_maintenance_evidence_completed(&active_evidence).err();
+
+    let loose_after = count_loose_objects(git_dir);
+    let pack_after = count_pack_files(git_dir);
+    let disk_after = measure_objects_disk_usage(git_dir);
+    let observed_effect = maintenance_observed_effect(
+        loose_before,
+        loose_after,
+        pack_before,
+        pack_after,
+        disk_before,
+        disk_after,
+    );
+    let lock_after = maintenance_lock_path(git_dir).exists();
     let (success, error) = match output {
-        Ok(output) if output.status.success() => (true, None),
-        Ok(output) => {
+        Ok(output) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             (
                 false,
                 Some(format!("exit {}: {}", output.status, stderr.trim())),
             )
         }
+        Ok(output) if git_reported_maintenance_lock(&String::from_utf8_lossy(&output.stderr)) => (
+            false,
+            Some(
+                "git maintenance reported an existing maintenance lock; no task effect was accepted"
+                    .to_string(),
+            ),
+        ),
+        Ok(_) if lock_after => (
+            false,
+            Some(
+                "git maintenance returned success but objects/maintenance.lock remains; refusing to accept a silent no-op"
+                    .to_string(),
+            ),
+        ),
+        Ok(_) if observed_effect == MaintenanceObservedEffect::NoProgress => (
+            false,
+            Some(
+                "git maintenance returned success but high loose-object pressure had no observed effect"
+                    .to_string(),
+            ),
+        ),
+        Ok(_) if observed_effect == MaintenanceObservedEffect::Unknown => (
+            false,
+            Some(
+                "git maintenance returned success but object metrics were unavailable, so its effect could not be verified"
+                    .to_string(),
+            ),
+        ),
+        Ok(_) if evidence_completion_error.is_some() => (
+            false,
+            evidence_completion_error,
+        ),
+        Ok(_) => (true, None),
         Err(e) => (false, Some(e.to_string())),
     };
-
-    let loose_after = count_loose_objects(git_dir);
-    let pack_after = count_pack_files(git_dir);
-    let disk_after = measure_objects_disk_usage(git_dir);
 
     MaintenanceReport {
         loose_before,
@@ -438,6 +1174,9 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
         pack_count_after: pack_after,
         disk_bytes_before: disk_before,
         disk_bytes_after: disk_after,
+        observed_effect,
+        lock_reaped: lock_preflight.reaped,
+        lock_evidence: lock_preflight.evidence,
         success,
         error,
     }
@@ -461,12 +1200,18 @@ fn log_report(report: &MaintenanceReport, git_dir: &Path) {
             packs_before = report.pack_count_before,
             packs_after = report.pack_count_after,
             bytes_reclaimed = reclaimed,
+            observed_effect = ?report.observed_effect,
+            lock_reaped = report.lock_reaped,
+            lock_evidence = report.lock_evidence.as_deref().unwrap_or("none"),
             "archive maintenance completed"
         );
     } else {
         warn!(
             git_dir = %git_dir.display(),
             error = report.error.as_deref().unwrap_or("unknown"),
+            observed_effect = ?report.observed_effect,
+            lock_reaped = report.lock_reaped,
+            lock_evidence = report.lock_evidence.as_deref().unwrap_or("none"),
             "archive maintenance failed"
         );
     }
@@ -783,13 +1528,15 @@ mod tests {
 
     #[test]
     fn build_git_maintenance_command_is_well_formed_and_guards_ionice() {
-        let cmd = build_git_maintenance_command(Path::new("/tmp/x/.git"), Path::new("/tmp/x"));
+        let cmd =
+            build_git_maintenance_command(Path::new("/tmp/x/.git"), Path::new("/tmp/x"), true);
         let program = cmd.get_program().to_string_lossy().into_owned();
         let argv: Vec<String> = std::iter::once(program.clone())
             .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
             .collect();
 
-        // git is always invoked, with the maintenance subcommand and both tasks.
+        // git is always invoked, with the maintenance subcommand and both tasks
+        // when a pack already exists.
         assert!(!program.is_empty());
         assert!(argv.iter().any(|a| a == "git"), "git missing: {argv:?}");
         assert!(
@@ -799,6 +1546,25 @@ mod tests {
         );
         assert!(argv.iter().any(|a| a == "--task=loose-objects"));
         assert!(argv.iter().any(|a| a == "--task=incremental-repack"));
+        assert!(argv.iter().any(|a| a == "--no-quiet"));
+
+        let zero_pack =
+            build_git_maintenance_command(Path::new("/tmp/x/.git"), Path::new("/tmp/x"), false);
+        let zero_pack_argv: Vec<String> =
+            std::iter::once(zero_pack.get_program().to_string_lossy().into_owned())
+                .chain(
+                    zero_pack
+                        .get_args()
+                        .map(|argument| argument.to_string_lossy().into_owned()),
+                )
+                .collect();
+        assert!(zero_pack_argv.iter().any(|a| a == "--task=loose-objects"));
+        assert!(
+            !zero_pack_argv
+                .iter()
+                .any(|a| a == "--task=incremental-repack"),
+            "a fresh zero-pack archive must not request incremental-repack: {zero_pack_argv:?}"
+        );
 
         // #137: ionice (util-linux only) must never be invoked off Linux.
         if !cfg!(target_os = "linux") {
@@ -963,11 +1729,107 @@ mod tests {
     #[test]
     fn run_maintenance_on_empty_git_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let git_dir = tmp.path().join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let archive_root = tmp.path().join("archive");
+        let init = Command::new("git")
+            .args(["init", "--quiet", &archive_root.display().to_string()])
+            .output()
+            .expect("spawn git init");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        let git_dir = archive_root.join(".git");
+
+        SHUTDOWN.store(false, Ordering::Release);
         let report = run_maintenance(&git_dir);
         assert_eq!(report.loose_before, Some(0));
         assert_eq!(report.pack_count_before, Some(0));
+        assert_eq!(
+            report.observed_effect,
+            MaintenanceObservedEffect::NoWorkRequired
+        );
+        assert!(
+            report.success,
+            "a fresh zero-pack archive must not invoke incremental-repack: {report:?}"
+        );
+    }
+
+    #[test]
+    fn stale_maintenance_lock_with_dead_recorded_pid_is_quarantined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let lock_path = maintenance_lock_path(&git_dir);
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, b"stale maintenance sentinel").unwrap();
+        let evidence = record_terminated_maintenance_lock(
+            &git_dir,
+            u32::MAX,
+            None,
+            "test killed maintenance child",
+        );
+        assert!(evidence.is_some(), "must record stale-lock PID evidence");
+
+        let preflight = preflight_maintenance_lock(&git_dir);
+        assert!(
+            preflight.reaped,
+            "dead child lock must be reaped: {preflight:?}"
+        );
+        assert!(
+            !lock_path.exists(),
+            "stale maintenance.lock must be moved aside"
+        );
+        assert!(
+            preflight
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("retained lock artifact")),
+            "reap result must retain a durable audit trail: {preflight:?}"
+        );
+    }
+
+    #[test]
+    fn stale_maintenance_lock_from_abruptly_killed_worker_is_quarantined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let lock_path = maintenance_lock_path(&git_dir);
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, b"stale lock after worker kill").unwrap();
+        let active = record_active_maintenance_evidence(&git_dir, u32::MAX, None);
+        assert!(
+            active.is_some(),
+            "a launched child must have durable PID evidence before it can be killed"
+        );
+
+        let preflight = preflight_maintenance_lock(&git_dir);
+        assert!(
+            preflight.reaped,
+            "a dead active child record must make its stale lock recoverable: {preflight:?}"
+        );
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn maintenance_lock_with_live_recorded_pid_is_not_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let lock_path = maintenance_lock_path(&git_dir);
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, b"possibly live maintenance sentinel").unwrap();
+        let evidence = record_terminated_maintenance_lock(
+            &git_dir,
+            std::process::id(),
+            process_start_ticks(std::process::id()),
+            "test live process",
+        );
+        assert!(evidence.is_some(), "must record stale-lock PID evidence");
+
+        let preflight = preflight_maintenance_lock(&git_dir);
+        assert!(!preflight.reaped, "live PID lock must not be reaped");
+        assert!(lock_path.exists(), "live PID lock must remain in place");
+        assert!(
+            preflight
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("Alive")),
+            "the refusal must disclose PID liveness evidence: {preflight:?}"
+        );
     }
 
     #[test]
