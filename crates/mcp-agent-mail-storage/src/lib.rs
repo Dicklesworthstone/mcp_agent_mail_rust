@@ -683,7 +683,8 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
         });
     }
 
-    let repo = Repository::open(storage_root)?;
+    let storage_root = mcp_agent_mail_core::disk::simplify_verbatim_path(storage_root);
+    let repo = Repository::open(&storage_root)?;
     let head_before = archive_read_head(&repo)?;
     let index_before = archive_read_index_stamp(repo.path())?;
     let head_after = archive_read_head(&repo)?;
@@ -1416,7 +1417,7 @@ impl ArchiveRetryBacklog {
 static ARCHIVE_BACKLOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
-    config.storage_root.join(".archive_backlog")
+    archive_storage_root(config).join(".archive_backlog")
 }
 
 /// Borrow the runtime `Config` carried by any `WriteOp` variant.
@@ -2085,7 +2086,11 @@ fn wbq_circuit_breaker_threshold() -> u64 {
 }
 
 /// Per-archive identity `(storage_root, project_slug)` for every `WriteOp`.
-fn write_op_archive_identity(op: &WriteOp) -> (&Path, &str) {
+///
+/// Keep the archive key in the same safe path form used by libgit2. Otherwise
+/// a directly-constructed Windows config can write with a verbatim root while
+/// the circuit breaker tries to inspect the unsimplified root (GH#216).
+fn write_op_archive_identity(op: &WriteOp) -> (PathBuf, &str) {
     match op {
         WriteOp::MessageBundle {
             project_slug,
@@ -2111,7 +2116,7 @@ fn write_op_archive_identity(op: &WriteOp) -> (&Path, &str) {
             config,
             project_slug,
             ..
-        } => (config.storage_root.as_path(), project_slug.as_str()),
+        } => (archive_storage_root(config), project_slug.as_str()),
     }
 }
 
@@ -2130,7 +2135,7 @@ fn note_archive_write_outcome(op: &WriteOp, failed: bool) {
         WBQ_CIRCUIT_BREAKER_COOLDOWN_MICROS,
     );
     if trip {
-        wbq_circuit_breaker_escalate(storage_root, project_slug, state.consecutive_failures);
+        wbq_circuit_breaker_escalate(&storage_root, project_slug, state.consecutive_failures);
     }
 }
 
@@ -6214,7 +6219,7 @@ pub fn commit_paths_with_retry(
 ///
 /// Should be called at application startup.
 pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
-    let root = &config.storage_root;
+    let root = archive_storage_root(config);
     if !root.exists() {
         return Ok(HealResult::default());
     }
@@ -6396,9 +6401,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     }
 
     if should_force_deep_scan() {
-        walk_recursive(root, &mut result, &mut metadata_candidates)?;
+        walk_recursive(&root, &mut result, &mut metadata_candidates)?;
     } else {
-        for dir in gather_lock_scan_dirs(root)? {
+        for dir in gather_lock_scan_dirs(&root)? {
             scan_dir_shallow(&dir, &mut result, &mut metadata_candidates)?;
         }
     }
@@ -6596,7 +6601,21 @@ fn canonicalize_path_cached(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn normalize_repo_root_key(repo_root: &Path) -> PathBuf {
-    canonicalize_path_cached(repo_root).unwrap_or_else(|_| repo_root.to_path_buf())
+    canonicalize_path_cached(repo_root)
+        .unwrap_or_else(|_| mcp_agent_mail_core::disk::simplify_verbatim_path(repo_root))
+}
+
+/// Return the archive root in the form safe for git2/libgit2.
+///
+/// `Config::from_env` normally applies this simplification while resolving the
+/// storage root, but storage APIs also accept directly-constructed `Config`
+/// values in tests, embeddings, and recovery paths. Keeping this defensive
+/// boundary at every archive entrypoint prevents a Windows `\\?\C:\...` root
+/// from reaching libgit2 and turning every write-back into `os error 1`
+/// (GH#216). Unsafe-to-simplify verbatim paths remain unchanged by the core
+/// helper.
+fn archive_storage_root(config: &Config) -> PathBuf {
+    mcp_agent_mail_core::disk::simplify_verbatim_path(&config.storage_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -6611,7 +6630,7 @@ const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
 ///
 /// Returns `(repo_root, was_freshly_initialized)`.
 pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
-    let root = config.storage_root.clone();
+    let root = archive_storage_root(config);
     ensure_dir(&root)?;
 
     let fresh = ensure_repo(&root, config)?;
@@ -6632,7 +6651,7 @@ pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive
         ));
     }
 
-    let repo_root = config.storage_root.clone();
+    let repo_root = archive_storage_root(config);
     let project_root = repo_root.join("projects").join(slug);
     if path_existing_prefix_has_symlink(&project_root)? {
         return Ok(None);
@@ -10551,7 +10570,7 @@ fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &Path) -> bool {
 
 /// Collect lock status information for diagnostics.
 pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
-    let root = &config.storage_root;
+    let root = archive_storage_root(config);
     if !root.exists() {
         return Ok(serde_json::json!({
             "archive_root": root.display().to_string(),
@@ -10604,7 +10623,7 @@ pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
         Ok(())
     }
 
-    walk_locks(root, &mut locks)?;
+    walk_locks(&root, &mut locks)?;
 
     Ok(serde_json::json!({
         "archive_root": root.display().to_string(),
@@ -11939,6 +11958,30 @@ mod tests {
         // Second call should not re-initialize
         let (_root2, fresh2) = ensure_archive_root(&config).unwrap();
         assert!(!fresh2);
+    }
+
+    #[test]
+    fn archive_storage_root_simplifies_safe_windows_verbatim_paths() {
+        let mut config = test_config(Path::new("/tmp/archive-root-test"));
+        config.storage_root = PathBuf::from(r"\\?\C:\dev\agent-mail");
+        assert_eq!(
+            archive_storage_root(&config),
+            PathBuf::from(r"C:\dev\agent-mail")
+        );
+
+        config.storage_root = PathBuf::from(r"\\?\UNC\server\share\agent-mail");
+        assert_eq!(
+            archive_storage_root(&config),
+            PathBuf::from(r"\\server\share\agent-mail")
+        );
+
+        // The core helper deliberately retains paths whose legacy spelling
+        // would be lossy, and the archive boundary must preserve that rule.
+        config.storage_root = PathBuf::from(r"\\?\C:\dev\trailing.\agent-mail");
+        assert_eq!(
+            archive_storage_root(&config),
+            PathBuf::from(r"\\?\C:\dev\trailing.\agent-mail")
+        );
     }
 
     #[test]

@@ -102,7 +102,9 @@ impl GitRepoLocks {
 /// fall through without a lock.
 #[must_use]
 pub fn canonicalize_repo(repo: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(repo).ok()
+    std::fs::canonicalize(repo)
+        .ok()
+        .map(|canonical| crate::disk::simplify_verbatim_path(&canonical))
 }
 
 /// Resolve the admin directory (`.git/`, bare repo root, or worktree's
