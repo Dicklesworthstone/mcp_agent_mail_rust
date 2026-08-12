@@ -1620,6 +1620,18 @@ fn reconstruct_from_archive_impl(
         // Maps for deduplication: ((project_id, name) → agent_id)
         let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
 
+        // Reservation dedup state, GLOBAL across all projects (br-n8qh6): reservation
+        // ids are a global AUTOINCREMENT, so an id reused across DB generations (or
+        // across projects in a pre-generation archive) must not silently overwrite an
+        // earlier reservation. `used_reservation_ids` tracks which archived ids we
+        // have already preserved verbatim; a later artifact whose id is already taken
+        // is re-inserted under a fresh id instead of collapsing via INSERT OR REPLACE.
+        // `seen_reservations` dedups the two on-disk artifacts of one reservation (the
+        // `id-<id>[-g<gen>].json` file and its `sha1(pattern).json` mirror) plus exact
+        // re-scans, keyed by (project, generation, archived id).
+        let mut used_reservation_ids: HashSet<i64> = HashSet::new();
+        let mut seen_reservations: HashSet<(i64, String, i64)> = HashSet::new();
+
         // Phase 1: Replay projects discovered before opening the target DB.
         for (slug, project_path) in &project_dirs {
             let now = crate::now_micros();
@@ -1653,6 +1665,8 @@ fn reconstruct_from_archive_impl(
                     &reservations_dir,
                     pid,
                     &mut agent_ids,
+                    &mut used_reservation_ids,
+                    &mut seen_reservations,
                     &mut stats,
                 )?;
             }
@@ -2458,6 +2472,11 @@ fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) ->
 
 struct ArchivedFileReservation {
     reservation_id: Option<i64>,
+    /// DB generation token this artifact was written by (br-n8qh6), from the
+    /// filename (`id-<id>-g<generation>.json`) or the artifact's `db_generation`
+    /// field. `None` for a legacy artifact. Used to keep cross-generation
+    /// reservations that share an id from overwriting one another.
+    generation: Option<String>,
     agent_name: String,
     path_pattern: String,
     exclusive: bool,
@@ -2547,8 +2566,19 @@ fn parse_archived_file_reservation(
         .and_then(serde_json::Value::as_i64)
         .filter(|id| *id > 0);
 
+    // Generation token: prefer the filename (`id-<id>-g<generation>.json`), then
+    // fall back to the artifact's own `db_generation` field so a mirror
+    // (`sha1(pattern).json`) or a legacy-named-but-stamped file still attributes.
+    let generation = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename)
+        .and_then(|parsed| parsed.generation)
+        .or_else(|| json_str(&reservation, "db_generation").map(str::to_string));
+
     Some(ArchivedFileReservation {
         reservation_id,
+        generation,
         agent_name,
         path_pattern,
         exclusive,
@@ -2565,14 +2595,59 @@ fn insert_archived_file_reservation(
     reservation: &ArchivedFileReservation,
     file_path: &Path,
     agent_ids: &mut HashMap<(i64, String), i64>,
+    used_reservation_ids: &mut HashSet<i64>,
+    seen_reservations: &mut HashSet<(i64, String, i64)>,
 ) -> DbResult<()> {
     let agent_id = ensure_agent_exists(conn, project_id, &reservation.agent_name, agent_ids)?;
 
-    if let Some(id) = reservation.reservation_id {
+    let columns_no_id = "project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts";
+    let values_no_id = [
+        Value::BigInt(project_id),
+        Value::BigInt(agent_id),
+        Value::Text(reservation.path_pattern.clone()),
+        Value::BigInt(i64::from(reservation.exclusive)),
+        Value::Text(reservation.reason.clone()),
+        Value::BigInt(reservation.created_ts),
+        Value::BigInt(reservation.expires_ts),
+        reservation.released_ts.map_or(Value::Null, Value::BigInt),
+    ];
+
+    // A fresh-id insert (no explicit id) — used for legacy no-id artifacts and for
+    // any archived id already claimed by an earlier generation's reservation.
+    let insert_fresh = |conn: &DbConn| -> DbResult<()> {
         conn.execute_sync(
-            "INSERT OR REPLACE INTO file_reservations \
-             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &format!(
+                "INSERT INTO file_reservations ({columns_no_id}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
+            &values_no_id,
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct: insert file reservation {}: {e}",
+                file_path.display()
+            ))
+        })
+        .map(|_| ())
+    };
+
+    let Some(id) = reservation.reservation_id else {
+        return insert_fresh(conn);
+    };
+
+    // Dedup the two on-disk artifacts of one reservation (id file + sha1 mirror)
+    // and exact re-scans: same (project, generation, id) is written once.
+    let generation_key = reservation.generation.clone().unwrap_or_default();
+    if !seen_reservations.insert((project_id, generation_key, id)) {
+        return Ok(());
+    }
+
+    if used_reservation_ids.insert(id) {
+        // First artifact to claim this id — preserve it verbatim.
+        conn.execute_sync(
+            &format!(
+                "INSERT OR REPLACE INTO file_reservations (id, {columns_no_id}) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
             &[
                 Value::BigInt(id),
                 Value::BigInt(project_id),
@@ -2591,31 +2666,13 @@ fn insert_archived_file_reservation(
                 file_path.display()
             ))
         })?;
+        Ok(())
     } else {
-        conn.execute_sync(
-            "INSERT INTO file_reservations \
-             (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            &[
-                Value::BigInt(project_id),
-                Value::BigInt(agent_id),
-                Value::Text(reservation.path_pattern.clone()),
-                Value::BigInt(i64::from(reservation.exclusive)),
-                Value::Text(reservation.reason.clone()),
-                Value::BigInt(reservation.created_ts),
-                Value::BigInt(reservation.expires_ts),
-                reservation.released_ts.map_or(Value::Null, Value::BigInt),
-            ],
-        )
-        .map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct: insert file reservation {}: {e}",
-                file_path.display()
-            ))
-        })?;
+        // The archived id is already taken by an earlier (different-generation or
+        // different-project) reservation — re-key under a fresh id so this row is
+        // preserved instead of overwriting the earlier one (br-n8qh6).
+        insert_fresh(conn)
     }
-
-    Ok(())
 }
 
 fn discover_file_reservations(
@@ -2623,13 +2680,23 @@ fn discover_file_reservations(
     reservations_dir: &Path,
     project_id: i64,
     agent_ids: &mut HashMap<(i64, String), i64>,
+    used_reservation_ids: &mut HashSet<i64>,
+    seen_reservations: &mut HashSet<(i64, String, i64)>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     for file_path in reservation_artifact_paths(reservations_dir) {
         let Some(reservation) = parse_archived_file_reservation(&file_path, stats) else {
             continue;
         };
-        insert_archived_file_reservation(conn, project_id, &reservation, &file_path, agent_ids)?;
+        insert_archived_file_reservation(
+            conn,
+            project_id,
+            &reservation,
+            &file_path,
+            agent_ids,
+            used_reservation_ids,
+            seen_reservations,
+        )?;
     }
 
     Ok(())
@@ -7635,6 +7702,61 @@ body
         assert_eq!(
             rows[1].get_named::<String>("reason").unwrap(),
             "python-compat"
+        );
+    }
+
+    #[test]
+    fn reconstruct_preserves_cross_generation_reservations_with_reused_id() {
+        // br-n8qh6: two DB generations wrote a reservation with the SAME global id
+        // 1 to the same archive. The generation-stamped filenames keep both
+        // artifacts on disk, and reconstruct must recover BOTH rows (one at the
+        // preserved id, one re-keyed under a fresh id) instead of collapsing them
+        // to one via INSERT OR REPLACE — the silent-loss the bead reports.
+        let storage_root = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = storage_root.path().join("projects").join("gen-project");
+        let agents_dir = project_dir.join("agents").join("CoralMarsh");
+        let reservations_dir = project_dir.join("file_reservations");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        std::fs::create_dir_all(&reservations_dir).expect("reservations dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"gen-project","human_key":"/gen-project","created_at":0}"#,
+        )
+        .expect("project meta");
+        std::fs::write(
+            agents_dir.join("profile.json"),
+            r#"{"name":"CoralMarsh","program":"codex-cli","model":"gpt-5","task_description":"","inception_ts":"2026-03-13T21:21:02Z","last_active_ts":"2026-03-13T21:21:02Z"}"#,
+        )
+        .expect("agent profile");
+
+        let gen1 = r#"{"id":1,"db_generation":"aaaa1111","project":"/gen-project","agent":"CoralMarsh","path_pattern":"src/first.rs","exclusive":true,"reason":"gen1","created_ts":"2026-03-13T21:36:47.221175Z","expires_ts":"2026-03-13T23:36:47.221175Z"}"#;
+        let gen2 = r#"{"id":1,"db_generation":"bbbb2222","project":"/gen-project","agent":"CoralMarsh","path_pattern":"src/second.rs","exclusive":true,"reason":"gen2","created_ts":"2026-03-13T21:36:47.221175Z","expires_ts":"2026-03-13T23:36:47.221175Z"}"#;
+        std::fs::write(reservations_dir.join("id-1-gaaaa1111.json"), gen1).expect("gen1");
+        std::fs::write(reservations_dir.join("id-1-gbbbb2222.json"), gen2).expect("gen2");
+
+        let db_path = db_dir.path().join("gen.sqlite3");
+        reconstruct_from_archive(&db_path, storage_root.path()).expect("reconstruct");
+
+        let conn = SqliteDbConn::open_file(db_path.display().to_string()).expect("open db");
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern FROM file_reservations ORDER BY path_pattern ASC",
+                &[],
+            )
+            .expect("query reservations");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both generations' reservations must survive reconstruct (no id collapse)"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("path_pattern").unwrap(),
+            "src/first.rs"
+        );
+        assert_eq!(
+            rows[1].get_named::<String>("path_pattern").unwrap(),
+            "src/second.rs"
         );
     }
 

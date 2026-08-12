@@ -7135,10 +7135,13 @@ mod resource_shape_tests {
                 for row in rows {
                     let id = row.id.expect("released reservation id");
                     let released_ts = row.released_ts.expect("released_ts should be recorded");
-                    let artifact_path = archive
-                        .root
-                        .join("file_reservations")
-                        .join(format!("id-{id}.json"));
+                    let reservation_dir = archive.root.join("file_reservations");
+                    let artifact_path =
+                        mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                            &reservation_dir,
+                            id,
+                        )
+                        .expect("locate released reservation artifact");
                     let artifact_text =
                         std::fs::read_to_string(&artifact_path).expect("read reservation artifact");
                     let artifact_json: Value =

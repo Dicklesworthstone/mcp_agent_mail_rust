@@ -255,11 +255,15 @@ fn build_archive_release_rewrite(
     reservation_id: i64,
     released_ts: i64,
 ) -> Option<ArchiveReleaseRewrite> {
-    let path = storage_root
+    // Locate the stable artifact by id (generation-stamped or legacy, br-n8qh6).
+    let reservation_dir = storage_root
         .join("projects")
         .join(project_slug)
-        .join("file_reservations")
-        .join(format!("id-{reservation_id}.json"));
+        .join("file_reservations");
+    let path = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+        &reservation_dir,
+        reservation_id,
+    )?;
     let raw = std::fs::read_to_string(&path).ok()?;
     let mut json: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let object = json.as_object_mut()?;
@@ -424,20 +428,22 @@ pub fn fix(
         if example.field != "archive_id_collision" {
             continue;
         }
-        // Reconstruct the active-scan archive artifact path from the project slug
-        // (the directory the stale duplicate lives under) and the reservation id.
-        let archive_path = finding
+        // Locate the stale duplicate artifact (generation-stamped or legacy,
+        // br-n8qh6) under the project slug it lives beneath, by reservation id.
+        let reservation_dir = finding
             .storage_root
             .join("projects")
             .join(&example.project_slug)
-            .join("file_reservations")
-            .join(format!("id-{}.json", example.reservation_id));
+            .join("file_reservations");
         // Idempotent: if the duplicate already vanished between detect and fix,
         // there is nothing to quarantine.
-        if !archive_path.exists() {
+        let Some(archive_path) = mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+            &reservation_dir,
+            example.reservation_id,
+        ) else {
             actions_skipped += 1;
             continue;
-        }
+        };
         let quarantine = ctx
             .run_dir
             .join("quarantine")

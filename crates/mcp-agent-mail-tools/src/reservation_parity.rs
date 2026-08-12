@@ -669,11 +669,9 @@ fn scan_reservation_dir(
         {
             continue;
         }
-        let Some(parsed) = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename)
-        else {
+        let Some(parsed) = path.file_name().and_then(|name| name.to_str()).and_then(
+            mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename,
+        ) else {
             continue;
         };
         match parse_archive_reservation(&path, project_slug, parsed.id, parsed.generation) {
@@ -749,7 +747,13 @@ pub fn read_project_archive_reservation(
     if path_is_symlink(&path) {
         return None;
     }
-    parse_archive_reservation(&path, project_slug, reservation_id)
+    // Attribute the generation from the located filename (stamped or legacy).
+    let generation = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename)
+        .and_then(|parsed| parsed.generation);
+    parse_archive_reservation(&path, project_slug, reservation_id, generation)
         .ok()
         .map(ArchiveReservationView::from)
 }

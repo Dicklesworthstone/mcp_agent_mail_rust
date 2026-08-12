@@ -1710,25 +1710,25 @@ fn collect_project_reservation_artifacts(
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(raw_id) = file_name
-            .strip_prefix("id-")
-            .and_then(|rest| rest.strip_suffix(".json"))
+        // Recognize both the generation-stamped (`id-<id>-g<generation>.json`) and
+        // legacy (`id-<id>.json`) names (br-n8qh6). Without this, stamped artifacts
+        // parse as no id and vanish from the index, manufacturing false
+        // missing-artifact anomalies for every current-generation reservation.
+        let Some(parsed) =
+            mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename(file_name)
         else {
             continue;
         };
-        let Ok(reservation_id) = raw_id.parse::<i64>() else {
-            continue;
+        let key = ArchiveReservationKey {
+            project_slug: project_slug.to_string(),
+            reservation_id: parsed.id,
         };
-        if reservation_id <= 0 {
-            continue;
+        // Prefer a generation-stamped artifact over a legacy sibling at the same id.
+        if parsed.generation.is_some() || !index.reservation_artifacts.contains_key(&key) {
+            index
+                .reservation_artifacts
+                .insert(key, read_json_file_artifact(&path));
         }
-        index.reservation_artifacts.insert(
-            ArchiveReservationKey {
-                project_slug: project_slug.to_string(),
-                reservation_id,
-            },
-            read_json_file_artifact(&path),
-        );
     }
 }
 

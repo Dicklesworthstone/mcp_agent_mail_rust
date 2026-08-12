@@ -9,13 +9,13 @@
 #![allow(clippy::explicit_auto_deref)]
 
 use crate::error::DbError;
-use crate::models::{
-    AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
-    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
-};
 use crate::idempotency::{
     IdempotencyCheck, IdempotencyClaim, IdempotencyConflict, IdempotentOutcome,
     idempotency_retention_secs,
+};
+use crate::models::{
+    AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
+    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
@@ -5910,8 +5910,18 @@ pub async fn create_message_with_recipients(
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<MessageRow, DbError> {
     match create_message_with_recipients_impl(
-        cx, pool, project_id, sender_id, subject, body_md, thread_id, importance, ack_required,
-        attachments, recipients, None,
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        importance,
+        ack_required,
+        attachments,
+        recipients,
+        None,
     )
     .await
     {
@@ -5956,8 +5966,18 @@ pub async fn create_message_with_recipients_idempotent(
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     create_message_with_recipients_impl(
-        cx, pool, project_id, sender_id, subject, body_md, thread_id, importance, ack_required,
-        attachments, recipients, Some(claim),
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        importance,
+        ack_required,
+        attachments,
+        recipients,
+        Some(claim),
     )
     .await
 }
@@ -6057,32 +6077,33 @@ async fn create_message_with_recipients_impl(
         };
         let message_id = id_allocator.allocate(db_floor, archive_seed);
 
-        let created_outcome = match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
-            create_message_with_recipients_tx(
-                cx,
-                &tracked,
-                project_id,
-                sender_id,
-                subject,
-                body_md,
-                thread_id,
-                importance,
-                ack_required,
-                attachments,
-                recipients,
-                now,
-                message_id,
-                idempotency,
-                idempotency_expires_ts,
-            )
-        })
-        .await
-        {
-            Outcome::Ok(created) => created,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+        let created_outcome =
+            match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
+                create_message_with_recipients_tx(
+                    cx,
+                    &tracked,
+                    project_id,
+                    sender_id,
+                    subject,
+                    body_md,
+                    thread_id,
+                    importance,
+                    ack_required,
+                    attachments,
+                    recipients,
+                    now,
+                    message_id,
+                    idempotency,
+                    idempotency_expires_ts,
+                )
+            })
+            .await
+            {
+                Outcome::Ok(created) => created,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
         // A replay or conflict short-circuits: nothing new was written this call,
         // so the post-commit visibility probe (which re-proves a fresh insert
         // landed) and the writer-count sample below must be skipped entirely.
@@ -6450,8 +6471,15 @@ async fn create_message_with_recipients_tx(
         try_in_tx!(
             cx,
             tracked,
-            idempotency_record_in_tx(cx, tracked, claim, &result_json, now, idempotency_expires_ts)
-                .await
+            idempotency_record_in_tx(
+                cx,
+                tracked,
+                claim,
+                &result_json,
+                now,
+                idempotency_expires_ts
+            )
+            .await
         );
     }
 
@@ -7307,6 +7335,46 @@ pub struct InboxRow {
     pub sender_name: String,
     pub read_ts: Option<i64>,
     pub ack_ts: Option<i64>,
+}
+
+/// Fetch one durable, body-free recipient delivery page for monitor clients.
+///
+/// The synchronous implementation is shared with direct CLI reads so daemon
+/// and co-located paths apply identical cursor semantics. Cursor conditions
+/// are retained in the [`DbError::InvalidArgument`] message with a stable
+/// prefix so protocol adapters can render machine-readable `cursor_expired`
+/// and `cursor_ahead` responses instead of false empty pages.
+pub async fn fetch_inbox_delivery_events(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    after: Option<i64>,
+    limit: usize,
+) -> Outcome<crate::sync::InboxDeliveryEventPage, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match crate::sync::inbox_delivery_events_from_conn(&conn, project_id, agent_id, after, limit) {
+        Ok(page) => Outcome::Ok(page),
+        Err(crate::sync::InboxDeliveryEventError::Database(error)) => Outcome::Err(error),
+        Err(crate::sync::InboxDeliveryEventError::CursorExpired {
+            after,
+            oldest_available,
+        }) => Outcome::Err(DbError::invalid(
+            "after",
+            format!("cursor_expired after={after} oldest_available_cursor={oldest_available}"),
+        )),
+        Err(crate::sync::InboxDeliveryEventError::CursorAhead { after, tail }) => {
+            Outcome::Err(DbError::invalid(
+                "after",
+                format!("cursor_ahead after={after} tail_cursor={tail}"),
+            ))
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -10043,16 +10111,16 @@ pub async fn get_reservation_conflict_snapshot(
 
         let reservations = undecoded
             .into_iter()
-            .map(
-                |(id, agent_id, path_pattern, exclusive, expires_ts)| ReservationConflictSnapshotRow {
+            .map(|(id, agent_id, path_pattern, exclusive, expires_ts)| {
+                ReservationConflictSnapshotRow {
                     id,
                     agent_id,
                     agent_name: holder_names.get(&agent_id).cloned(),
                     path_pattern,
                     exclusive,
                     expires_ts,
-                },
-            )
+                }
+            })
             .collect();
 
         try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
@@ -10080,7 +10148,15 @@ pub async fn create_file_reservations(
     reason: &str,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     match create_file_reservations_impl(
-        cx, pool, project_id, agent_id, paths, ttl_seconds, exclusive, reason, None,
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        paths,
+        ttl_seconds,
+        exclusive,
+        reason,
+        None,
     )
     .await
     {
@@ -10120,7 +10196,15 @@ pub async fn create_file_reservations_idempotent(
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<Vec<FileReservationRow>>, DbError> {
     create_file_reservations_impl(
-        cx, pool, project_id, agent_id, paths, ttl_seconds, exclusive, reason, Some(claim),
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        paths,
+        ttl_seconds,
+        exclusive,
+        reason,
+        Some(claim),
     )
     .await
 }

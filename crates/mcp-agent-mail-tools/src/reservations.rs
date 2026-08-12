@@ -1240,7 +1240,9 @@ fn dispatch_release_archive_write(
     }
     let res_jsons: Vec<Value> = released_rows
         .iter()
-        .map(|r| released_reservation_artifact_json(&project.human_key, &agent.name, r, db_generation))
+        .map(|r| {
+            released_reservation_artifact_json(&project.human_key, &agent.name, r, db_generation)
+        })
         .collect();
 
     let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -1827,9 +1829,11 @@ pub async fn file_reservation_paths(
     ttl_seconds: Option<i64>,
     exclusive: Option<bool>,
     reason: Option<String>,
+    idempotency_key: Option<String>,
 ) -> McpResult<String> {
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    let idempotency_key = crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
 
     if paths.is_empty() {
         return Err(legacy_tool_error(
@@ -1854,6 +1858,24 @@ pub async fn file_reservation_paths(
 
     let is_exclusive = exclusive.unwrap_or(true);
     let reason_str = reason.unwrap_or_default();
+
+    // Idempotency fingerprint over the normalized request payload (computed only
+    // when a key was supplied). A retry with the same key must carry the same
+    // logical payload; anything else is a typed conflict.
+    let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
+        let mut sorted_paths = paths.clone();
+        sorted_paths.sort();
+        crate::idempotency::compute_fingerprint(
+            "file_reservation_paths",
+            &[
+                ("agent", agent_name.clone()),
+                ("paths", sorted_paths.join("\u{1f}")),
+                ("ttl", ttl.to_string()),
+                ("exclusive", is_exclusive.to_string()),
+                ("reason", reason_str.clone()),
+            ],
+        )
+    });
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -2110,21 +2132,62 @@ pub async fn file_reservation_paths(
     // missed (e.g. due to a stale WAL read snapshot — Bug #86), convert
     // the ResourceBusy error into a structured conflict response instead
     // of propagating an opaque MCP error.
+    let mut idempotent_replay = false;
     let (granted_rows, conflicts) = if paths_to_grant.is_empty() {
         (vec![], conflicts)
     } else {
-        match mcp_agent_mail_db::queries::create_file_reservations(
-            ctx.cx(),
-            &pool,
-            project_id,
-            agent_id,
-            &paths_to_grant,
-            ttl,
-            is_exclusive,
-            &reason_str,
-        )
-        .await
-        {
+        // Route through the idempotent DB entry point when the client supplied a
+        // key: a matching prior key replays the original grant (no second lease,
+        // no second archive write); a differing payload is a typed conflict.
+        let create_outcome = if let Some(fingerprint) = idempotency_fingerprint.as_deref() {
+            let key = idempotency_key.as_deref().unwrap_or_default();
+            let claim = mcp_agent_mail_db::IdempotencyClaim {
+                project_id,
+                tool: "file_reservation_paths",
+                key,
+                fingerprint,
+            };
+            match mcp_agent_mail_db::queries::create_file_reservations_idempotent(
+                ctx.cx(),
+                &pool,
+                project_id,
+                agent_id,
+                &paths_to_grant,
+                ttl,
+                is_exclusive,
+                &reason_str,
+                claim,
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(mcp_agent_mail_db::IdempotentOutcome::Fresh(rows)) => {
+                    asupersync::Outcome::Ok(rows)
+                }
+                asupersync::Outcome::Ok(mcp_agent_mail_db::IdempotentOutcome::Replayed(rows)) => {
+                    idempotent_replay = true;
+                    asupersync::Outcome::Ok(rows)
+                }
+                asupersync::Outcome::Ok(mcp_agent_mail_db::IdempotentOutcome::Conflict(info)) => {
+                    return Err(crate::idempotency::idempotency_conflict_error(&info));
+                }
+                asupersync::Outcome::Err(e) => asupersync::Outcome::Err(e),
+                asupersync::Outcome::Cancelled(r) => asupersync::Outcome::Cancelled(r),
+                asupersync::Outcome::Panicked(p) => asupersync::Outcome::Panicked(p),
+            }
+        } else {
+            mcp_agent_mail_db::queries::create_file_reservations(
+                ctx.cx(),
+                &pool,
+                project_id,
+                agent_id,
+                &paths_to_grant,
+                ttl,
+                is_exclusive,
+                &reason_str,
+            )
+            .await
+        };
+        match create_outcome {
             asupersync::Outcome::Ok(rows) => (rows, conflicts),
             asupersync::Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(msg)) => {
                 // The DB layer detected a conflict that the tool layer's
@@ -2231,8 +2294,10 @@ pub async fn file_reservation_paths(
         })
         .collect();
 
-    // Write reservation artifacts to git archive (best-effort, via WBQ)
-    if !granted_rows.is_empty() {
+    // Write reservation artifacts to git archive (best-effort, via WBQ).
+    // Skipped on an idempotent replay: the original grant already produced the
+    // archive artifacts, so a retry must not enqueue a second bundle.
+    if !granted_rows.is_empty() && !idempotent_replay {
         let config = &Config::get();
         let db_generation = fetch_db_generation(ctx, &pool).await;
         let res_jsons: Vec<serde_json::Value> = granted_rows
@@ -2277,6 +2342,7 @@ pub async fn file_reservation_paths(
     );
 
     serde_json::to_string(&response)
+        .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -4005,6 +4071,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert_eq!(heal.len(), 1, "a missing artifact must be healed");
         assert_eq!(heal[0]["id"], 1);
@@ -4029,6 +4096,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert_eq!(heal.len(), 1);
         assert_eq!(
@@ -4050,6 +4118,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert_eq!(heal.len(), 1, "a divergent reserved path must be healed");
         assert_eq!(heal[0]["path_pattern"], "src/a.rs");
@@ -4070,6 +4139,7 @@ mod tests {
             &[row],
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert_eq!(heal.len(), 1);
         assert_eq!(heal[0]["exclusive"], false);
@@ -4090,6 +4160,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert_eq!(heal.len(), 1);
     }
@@ -4142,6 +4213,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert_eq!(heal.len(), 1, "stale pre-renew expiry must heal");
     }
@@ -4160,6 +4232,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert!(heal.is_empty(), "a matching expiry must not re-emit");
     }
@@ -4177,6 +4250,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert!(
             heal.is_empty(),
@@ -4196,6 +4270,7 @@ mod tests {
             &rows,
             &names(&[(9, "Other")]),
             &present,
+            None,
         );
         assert!(
             heal.is_empty(),
@@ -4216,6 +4291,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert!(
             heal.is_empty(),
@@ -4279,6 +4355,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert_eq!(heal.len(), 1, "stale-active artifact must be rewritten");
         assert_eq!(heal[0]["agent"], "GreenCastle");
@@ -4301,6 +4378,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert!(
             heal.is_empty(),
@@ -4327,6 +4405,7 @@ mod tests {
             &rows,
             &names(&[(7, "GreenCastle")]),
             &present,
+            None,
         );
         assert!(
             heal.is_empty(),
@@ -4392,6 +4471,7 @@ mod tests {
                     Some(3600),
                     Some(true),
                     Some("f1 reconcile holder".to_string()),
+                    None,
                 )
                 .await
                 .expect("initial reservation");
@@ -4435,6 +4515,7 @@ mod tests {
                     Some(3600),
                     Some(false),
                     Some("f1 reconcile next access".to_string()),
+                    None,
                 )
                 .await
                 .expect("second reservation triggers reconcile-on-read");
@@ -4488,6 +4569,7 @@ mod tests {
                     Some(3600),
                     Some(true),
                     Some("released-heal holder".to_string()),
+                    None,
                 )
                 .await
                 .expect("initial reservation");
@@ -4547,6 +4629,7 @@ mod tests {
                     Some(3600),
                     Some(false),
                     Some("released-heal next access".to_string()),
+                    None,
                 )
                 .await
                 .expect("second reservation triggers released-row reconcile");
@@ -4593,6 +4676,7 @@ mod tests {
                     vec!["src/**".to_string()],
                     Some(3600),
                     Some(true),
+                    None,
                     None,
                 )
                 .await
@@ -4812,6 +4896,7 @@ mod tests {
                     Some(3600),
                     Some(true),
                     None,
+                    None,
                 )
                 .await
                 .expect("holder reserve");
@@ -4822,6 +4907,7 @@ mod tests {
                     vec!["docs/**".to_string()],
                     Some(3600),
                     Some(false),
+                    None,
                     None,
                 )
                 .await
@@ -4899,6 +4985,7 @@ mod tests {
                     Some(3600),
                     Some(true),
                     None,
+                    None,
                 )
                 .await
                 .expect("holder reserve");
@@ -4947,6 +5034,7 @@ mod tests {
                     vec!["src/**".to_string()],
                     Some(3600),
                     Some(true),
+                    None,
                     None,
                 )
                 .await
