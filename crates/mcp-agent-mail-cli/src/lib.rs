@@ -4713,6 +4713,68 @@ fn managed_service_display_name(kind: ManagedServiceKind) -> &'static str {
     }
 }
 
+/// An interactive terminal follows an already-serving peer instead of trying
+/// to acquire its activity lock. `--takeover` remains the explicit opt-in path
+/// for a local replacement.
+const fn should_attach_read_only_tui(
+    interactive_tui: bool,
+    peer_is_serving: bool,
+    takeover: bool,
+) -> bool {
+    interactive_tui && peer_is_serving && !takeover
+}
+
+/// Check the live endpoint before a local TUI launch. This is intentionally
+/// read-only: a healthy service keeps serving MCP/API while the terminal uses
+/// its `/mail/ws-state` snapshot.
+fn should_attach_read_only_tui_to_live_service(
+    host: &str,
+    port: u16,
+    interactive_tui: bool,
+    takeover: bool,
+) -> bool {
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+
+    let peer_is_serving = matches!(check_port_status(host, port), PortStatus::AgentMailServer);
+    if !should_attach_read_only_tui(interactive_tui, peer_is_serving, takeover) {
+        return false;
+    }
+
+    if let Some((kind, binding)) = active_conflicting_managed_service(host, port) {
+        let service_name = managed_service_display_name(kind);
+        eprintln!(
+            "[info] Attached read-only to {service_name} on {}:{}; the running service will not be stopped or restarted",
+            binding.host, binding.port
+        );
+    } else {
+        eprintln!(
+            "[info] Attached read-only to the Agent Mail server on {host}:{port}; the running service will not be stopped or restarted"
+        );
+    }
+    true
+}
+
+/// Follow a running service's read-only TUI snapshot. This uses the existing
+/// `tui-dump` transport, whose primary path is `/mail/ws-state`; it never
+/// starts a server, acquires a mutation lock, or invokes service control.
+fn run_read_only_tui_attachment() -> CliResult<()> {
+    use std::io::Write as _;
+
+    eprintln!("[info] Read-only TUI attachment active; press Ctrl-C to detach.");
+    loop {
+        print!("\x1b[2J\x1b[H");
+        std::io::stdout().flush().map_err(CliError::Io)?;
+        robot::handle_robot(robot::RobotArgs {
+            format: Some(robot::OutputFormat::Toon),
+            json: false,
+            project: None,
+            agent: None,
+            command: robot::RobotSubcommand::TuiDump,
+        })?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 fn stop_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
     match kind {
         ManagedServiceKind::Systemd => run_systemctl_user(&["stop", SYSTEMD_UNIT_NAME]),
@@ -4751,15 +4813,11 @@ impl Drop for ManagedServiceRestoreGuard {
     }
 }
 
-/// Stop a managed service (systemd/launchd) that is holding this storage root's
-/// port so the interactive TUI can take over for its session.
+/// Legacy compatibility hook for interactive launch setup.
 ///
-/// Returns `Some(kind)` when a managed service was stopped (so the caller can
-/// restart it on TUI exit — true coexistence), or `None` when there was nothing
-/// to stop (or the stop failed best-effort). Even when the port does not free
-/// after the stop it returns `Some(kind)` so the caller still restores the
-/// service on exit; the downstream port/preflight checks report the occupied
-/// port honestly rather than leaving the operator's background service stopped.
+/// A live service is no longer stopped to make room for a terminal TUI. The
+/// caller attaches read-only before reaching this hook; if it races with a
+/// newly-live peer, this hook remains a safe no-op.
 fn maybe_stop_conflicting_managed_service(
     host: &str,
     port: u16,
@@ -4779,28 +4837,10 @@ fn maybe_stop_conflicting_managed_service(
     if let Some((kind, binding)) = active_conflicting_managed_service(host, port) {
         let service_name = managed_service_display_name(kind);
         eprintln!(
-            "[info] {service_name} is active on {}:{} — stopping it for this interactive TUI session (it will be restarted when you quit)",
+            "[info] {service_name} is active on {}:{}; preserving it for read-only attachment",
             binding.host, binding.port
         );
-        if let Err(e) = stop_managed_service(kind) {
-            eprintln!(
-                "[warn] Failed to stop {service_name}: {e}. \
-                 You may need to stop it manually before relaunching interactive Agent Mail."
-            );
-            // We did not stop it, so there is nothing to restore on exit.
-            return None;
-        }
-        if wait_for_port_release(host, port, std::time::Duration::from_secs(6)) {
-            return Some(kind);
-        }
-        // Stopped the service but the port is still held (a foreign process?).
-        // Return `Some` anyway so the caller's restore guard still restarts the
-        // service when the session ends.
-        eprintln!(
-            "[warn] Stopped {service_name} but {host}:{port} is still in use by another process; \
-             continuing — {service_name} will be restarted when this session ends"
-        );
-        return Some(kind);
+        return None;
     }
 
     None
@@ -6228,6 +6268,8 @@ fn emit_pre_tui_startup_banner(config: &Config) {
 /// yet — see [`RestartDecision::ContendedAliveHolder`]). While waiting it
 /// re-probes `/healthz`, so a peer that binds during the wait short-circuits this.
 const RESTART_COORD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const RESTART_COORD_BACKOFF_BASE_MILLIS: u64 = 40;
+const RESTART_COORD_BACKOFF_CAP_MILLIS: u64 = 640;
 
 /// Single-owner restart-coordination lock for one storage root.
 ///
@@ -6292,6 +6334,21 @@ fn restart_lock_path(storage_root: &Path) -> PathBuf {
     storage_root.join(".am-restart.lock")
 }
 
+/// Decorrelate restart-mutex contenders. The PID-derived jitter prevents
+/// concurrently spawned agents from retrying in lock-step; the cap keeps a
+/// newly released lock responsive.
+fn restart_coordination_retry_delay(attempt: u32, pid: u32) -> std::time::Duration {
+    let exponent = 1_u64 << attempt.min(4);
+    let backoff =
+        (RESTART_COORD_BACKOFF_BASE_MILLIS * exponent).min(RESTART_COORD_BACKOFF_CAP_MILLIS);
+    let jitter_window = (backoff / 4).max(1);
+    let mixed = u64::from(pid)
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add(u64::from(attempt).wrapping_mul(12_345));
+    let jitter = mixed % (jitter_window + 1);
+    std::time::Duration::from_millis((backoff + jitter).min(RESTART_COORD_BACKOFF_CAP_MILLIS))
+}
+
 /// Coordinate a server (re)start for `config.storage_root`.
 ///
 /// Returns the terminal [`RestartDecision`] and, when it is [`RestartDecision::Proceed`],
@@ -6324,6 +6381,7 @@ fn coordinate_server_restart(
     };
 
     let deadline = Instant::now() + wait;
+    let mut retry_attempt = 0_u32;
     loop {
         if file.try_lock_exclusive().is_ok() {
             return (
@@ -6338,7 +6396,8 @@ fn coordinate_server_restart(
             }
             RestartDecision::ProceedUnlocked => return (RestartDecision::ProceedUnlocked, None),
             RestartDecision::KeepWaiting => {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     // The flock is still held by a live process that is not
                     // answering /healthz — a peer mid-boot (reconstruct or
                     // salvage can run far longer than this wait). Proceeding
@@ -6349,7 +6408,10 @@ fn coordinate_server_restart(
                     // to start and let the supervisor retry.
                     return (RestartDecision::ContendedAliveHolder, None);
                 }
-                std::thread::sleep(Duration::from_millis(150));
+                let retry_delay =
+                    restart_coordination_retry_delay(retry_attempt, std::process::id());
+                retry_attempt = retry_attempt.saturating_add(1);
+                std::thread::sleep(retry_delay.min(deadline - now));
             }
             RestartDecision::Proceed => unreachable!("acquired is handled above the probe"),
             RestartDecision::ContendedAliveHolder => {
@@ -6412,6 +6474,39 @@ mod restart_coordination_tests {
         assert_eq!(
             decide_restart_coordination(false, false, false),
             RestartDecision::KeepWaiting
+        );
+    }
+
+    #[test]
+    fn restart_mutex_uses_bounded_pid_jittered_backoff() {
+        let first = restart_coordination_retry_delay(0, 10_001);
+        let peer = restart_coordination_retry_delay(0, 10_002);
+        let later = restart_coordination_retry_delay(2, 10_001);
+
+        assert!(
+            first >= Duration::from_millis(RESTART_COORD_BACKOFF_BASE_MILLIS)
+                && first <= Duration::from_millis(RESTART_COORD_BACKOFF_BASE_MILLIS * 5 / 4),
+            "first retry must use bounded jitter: {first:?}"
+        );
+        assert_ne!(
+            first, peer,
+            "different contenders must not retry in lock-step"
+        );
+        assert!(later > first, "later retries must exponentially back off");
+        assert!(
+            later <= Duration::from_millis(RESTART_COORD_BACKOFF_CAP_MILLIS),
+            "backoff must stay capped for responsive lock handoff"
+        );
+    }
+
+    #[test]
+    fn interactive_tui_attaches_read_only_to_live_peer_without_takeover() {
+        assert!(should_attach_read_only_tui(true, true, false));
+        assert!(!should_attach_read_only_tui(false, true, false));
+        assert!(!should_attach_read_only_tui(true, false, false));
+        assert!(
+            !should_attach_read_only_tui(true, true, true),
+            "explicit takeover must retain its documented opt-in semantics"
         );
     }
 
@@ -6484,23 +6579,26 @@ fn handle_serve_http(
     let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
     apply_release_logging_defaults(suppress_runtime_logs_for_tui);
 
+    // A healthy service remains the mailbox owner. Attaching avoids disrupting
+    // active agents and avoids manufacturing a restart-fighting window merely
+    // so an interactive terminal can display the TUI.
+    if should_attach_read_only_tui_to_live_service(
+        &config.http_host,
+        config.http_port,
+        config.tui_enabled,
+        takeover,
+    ) {
+        return run_read_only_tui_attachment();
+    }
+
     // ts2 (br-bvq1x.4.5): serialize concurrent (re)starts for this storage root
     // so racing `am serve-http` invocations don't kill each other's freshly-bound
     // servers and wedge the mailbox in degraded_read_only. The winner holds the
     // lock for this server's lifetime; a late arrival that finds a live peer backs
     // off instead of fighting. `--takeover` seizes immediately; lock-infra failure
     // fails open (proceed unlocked = legacy behavior).
-    // Coexistence (br-bvq1x.9.4 / I4): if a managed service (systemd/launchd) is
-    // serving this storage root and we're launching the interactive TUI, stop it
-    // FIRST so it releases the restart-coordination lock + the port, then restore
-    // it when the TUI exits (via the drop guard). Without this, the
-    // `coordinate_server_restart` check below would see the service's live
-    // `/healthz` + held lock and dead-end with "connect to it" — but there is no
-    // client-attach mode, so the operator could never see the TUI while their
-    // background service runs. Stopping/restarting a *managed* service is fully
-    // reversible (unlike killing a foreground peer), which is what makes this
-    // take-over-and-restore safe. The guard restarts the service on every exit
-    // path (normal quit, `?` early-return, panic unwind).
+    // The compatibility hook is now intentionally a no-op around a live peer;
+    // the read-only attachment above is the only interactive coexistence path.
     let _managed_service_restore = ManagedServiceRestoreGuard {
         kind: maybe_stop_conflicting_managed_service(
             &config.http_host,
@@ -10905,9 +11003,13 @@ fn mailbox_activity_lock_cli_error(err: std::io::Error) -> CliError {
         || mcp_agent_mail_db::is_lock_error(&err.to_string())
         || err.to_string().contains("mailbox activity lock is busy")
     {
-        CliError::Other(format!(
-            "Resource is temporarily busy. Wait a moment and try again. ({err})"
-        ))
+        let detail = err.to_string();
+        let safe_next = if detail.contains("safe next command:") {
+            String::new()
+        } else {
+            " Safe next command: `am doctor locks --json` (read-only).".to_string()
+        };
+        CliError::Other(format!("Resource is temporarily busy. {detail}{safe_next}"))
     } else {
         CliError::Io(err)
     }
@@ -36494,6 +36596,24 @@ mod mail_server_cli_bridge_tests {
         assert!(!is_resource_busy_cli_error(&CliError::Other(
             "disk i/o error while opening sqlite file".to_string(),
         )));
+    }
+
+    #[test]
+    fn mailbox_activity_lock_busy_error_preserves_owner_evidence_and_safe_command() {
+        let error = mailbox_activity_lock_cli_error(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "mailbox activity lock is busy; owner hint: pid=4242 age=17s; safe next command: `am doctor locks --json` (read-only)",
+        ));
+        let text = error.to_string();
+
+        assert!(text.starts_with("Resource is temporarily busy."));
+        assert!(text.contains("pid=4242"));
+        assert!(text.contains("age=17s"));
+        assert!(text.contains("safe next command: `am doctor locks --json`"));
+        assert!(
+            !text.contains("Wait a moment and try again"),
+            "the generic retry trap must not discard owner evidence: {text}"
+        );
     }
 
     #[test]
