@@ -16406,6 +16406,208 @@ mod tests {
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
     }
 
+    // ── Ack-fast durable archive retry backlog (br-ack-fast-storage-commit-reply-3ac88) ──
+
+    fn backlog_test_message_op(config: &Config, slug: &str, id: i64) -> WriteOp {
+        WriteOp::MessageBundle {
+            project_slug: slug.to_string(),
+            config: config.clone(),
+            message_json: serde_json::json!({
+                "id": id,
+                "from": "Sender",
+                "to": ["Receiver"],
+                "subject": format!("ack-fast backlog {id}"),
+                "created": "2025-01-01T00:00:00+00:00",
+                "thread_id": "ACK-FAST",
+                "importance": "normal",
+            }),
+            body_md: format!("Body for message {id}"),
+            sender: "Sender".to_string(),
+            recipients: vec!["Receiver".to_string()],
+            extra_paths: vec![],
+        }
+    }
+
+    #[test]
+    fn persisted_write_op_round_trips_message_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let op = backlog_test_message_op(&config, "rt-proj", 5);
+        let persisted = PersistedWriteOp::from_op(&op);
+        // Survives a serialize/deserialize cycle (the on-disk journal format).
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        let parsed: PersistedWriteOp = serde_json::from_slice(&bytes).unwrap();
+        match parsed.into_op(config.clone()) {
+            WriteOp::MessageBundle {
+                project_slug,
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                config: rehydrated,
+                ..
+            } => {
+                assert_eq!(project_slug, "rt-proj");
+                assert_eq!(message_json["id"], 5);
+                assert_eq!(body_md, "Body for message 5");
+                assert_eq!(sender, "Sender");
+                assert_eq!(recipients, vec!["Receiver".to_string()]);
+                // Config is rehydrated from the runtime, not the journal.
+                assert_eq!(rehydrated.storage_root, config.storage_root);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_backlog_journal_persists_and_parses() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let op = backlog_test_message_op(&config, "journal-proj", 9);
+        let path = archive_backlog_journal_write(&op).expect("journal write");
+        assert!(path.exists());
+        assert!(path.starts_with(config.storage_root.join(".archive_backlog")));
+        let bytes = std::fs::read(&path).unwrap();
+        let parsed: PersistedWriteOp = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(parsed, PersistedWriteOp::MessageBundle { .. }));
+        archive_backlog_journal_remove(&path);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn archive_backlog_push_then_drain_step_materializes_and_removes_journal() {
+        // Deterministic single-step drain on a LOCAL backlog (no global thread,
+        // no cross-test interference).
+        let backlog = ArchiveRetryBacklog::new();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let op = backlog_test_message_op(&config, "local-drain", 8080);
+
+        assert_eq!(backlog.push(op, 8_192), ArchiveBacklogPush::Queued);
+        assert_eq!(backlog.backlog_state().0, 1, "op is queued");
+
+        let journal_dir = config.storage_root.join(".archive_backlog");
+        let journal_count = |dir: &Path| {
+            std::fs::read_dir(dir).map_or(0, |rd| {
+                rd.filter(|e| {
+                    e.as_ref()
+                        .ok()
+                        .and_then(|e| e.path().extension().map(|x| x == "json"))
+                        .unwrap_or(false)
+                })
+                .count()
+            })
+        };
+        assert_eq!(journal_count(&journal_dir), 1, "journaled durably before drain");
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert_eq!(backlog.backlog_state().0, 0, "backlog drained");
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            journal_count(&journal_dir),
+            0,
+            "journal removed only after durable materialization"
+        );
+        // The message is now durably in the git archive.
+        let archive = ensure_archive(&config, "local-drain").unwrap();
+        assert!(!get_recent_commits(&archive, 4, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_reports_lag_while_op_is_stuck() {
+        // storage_root points AT A FILE, so `write_op_sync` (ensure_archive) fails
+        // deterministically and the op stays in the backlog — letting us assert the
+        // lag metric reports nonzero while the archive has not converged (b).
+        let tmp = TempDir::new().unwrap();
+        let bad_root = tmp.path().join("not_a_dir");
+        std::fs::write(&bad_root, b"x").unwrap();
+        let config = test_config(&bad_root);
+        let op = backlog_test_message_op(&config, "stuck-proj", 1);
+
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push(op, 8_192), ArchiveBacklogPush::Queued);
+        assert_eq!(backlog.backlog_state().0, 1);
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        // Still stuck (never materialized), so the lag metric keeps reporting it.
+        let (depth, _) = backlog.backlog_state();
+        assert_eq!(depth, 1, "unmaterialized op stays in the backlog");
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(
+            backlog.backlog_state().1 > 0,
+            "oldest-unmaterialized age is reported while the archive lags"
+        );
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn archive_backlog_recover_replays_journaled_op_after_crash() {
+        // Crash-safety (c): an op journaled but never materialized (process killed
+        // after DB commit, before archive write) is replayed on restart and drains
+        // to the durable archive. Messages have no DB->archive reconcile-on-read, so
+        // the journal is their crash-safety path. Uses the GLOBAL backlog + recover.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project_slug = "backlog-recover-proj";
+        let _archive = ensure_archive(&config, project_slug).unwrap();
+
+        // Simulate the crash gap: journal exists, archive bundle does not.
+        let op = backlog_test_message_op(&config, project_slug, 4242);
+        let journal_path = archive_backlog_journal_write(&op).expect("journal write");
+        assert!(journal_path.exists(), "journaled op present pre-recovery");
+
+        // Restart path replays and drains.
+        archive_backlog_recover(&config);
+        assert!(
+            archive_backlog_flush_blocking(Duration::from_secs(20)),
+            "backlog should drain after recovery"
+        );
+        wbq_flush();
+        flush_async_commits();
+
+        assert!(
+            !journal_path.exists(),
+            "journal entry removed only after the archive artifact is durable"
+        );
+        let archive = ensure_archive(&config, project_slug).unwrap();
+        assert!(
+            !get_recent_commits(&archive, 8, None).unwrap().is_empty(),
+            "recovered message materialized into the git archive"
+        );
+    }
+
+    #[test]
+    fn commit_coalescer_oldest_pending_age_tracks_enqueue() {
+        // Long flush interval so the worker cannot drain during the test window.
+        let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
+        assert_eq!(coalescer.pending_requests(), 0);
+        assert_eq!(coalescer.oldest_pending_age_us(), 0);
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let repo_root = config.storage_root.join("projects").join("cproj");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        coalescer.enqueue(
+            repo_root,
+            &config,
+            "commit msg".to_string(),
+            vec!["a.txt".to_string()],
+        );
+
+        assert!(coalescer.pending_requests() >= 1, "enqueue registers pending");
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(
+            coalescer.oldest_pending_age_us() > 0,
+            "oldest uncommitted request reports commit-lag age"
+        );
+    }
+
     #[test]
     fn wbq_send_control_with_deadline_times_out_on_full_channel_without_blocking() {
         // br-lrrry: a full channel with a non-consuming receiver must bound the
