@@ -9024,14 +9024,6 @@ pub fn emit_notification_signal(
         "agent": agent_name,
     });
 
-    // The mutable per-agent signal is only a wake-up hint, but its message ID
-    // must remain visible even when content metadata is intentionally
-    // suppressed. Consumers can then bind it to the immutable receipt ledger
-    // instead of attributing a later signal to the wrong concurrent message.
-    if let Some(message_id) = message_metadata.and_then(|metadata| metadata.id) {
-        signal_data["message_id"] = serde_json::json!(message_id);
-    }
-
     if config.notifications_include_metadata
         && let Some(meta) = message_metadata
     {
@@ -13539,35 +13531,6 @@ mod tests {
 
         let signals2 = list_pending_signals(&config, Some("proj"));
         assert!(signals2.is_empty());
-    }
-
-    #[test]
-    fn test_notification_signal_binds_message_id_without_content_metadata() {
-        let tmp = TempDir::new().expect("tempdir");
-        let mut config = test_config(tmp.path());
-        config.notifications_enabled = true;
-        config.notifications_include_metadata = false;
-        config.notifications_signals_dir = tmp.path().join("signals");
-        config.notifications_debounce_ms = 0;
-
-        let metadata = NotificationMessage {
-            id: Some(77),
-            from: Some("Sender".to_string()),
-            subject: Some("private subject".to_string()),
-            importance: Some("high".to_string()),
-        };
-        assert_eq!(
-            emit_notification_signal(&config, "proj", "Recipient", Some(&metadata)),
-            SignalEmitOutcome::Emitted
-        );
-
-        let signals = list_pending_signals(&config, Some("proj"));
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0]["message_id"], 77);
-        assert!(
-            signals[0].get("message").is_none(),
-            "content metadata must remain opt-in"
-        );
     }
 
     #[test]

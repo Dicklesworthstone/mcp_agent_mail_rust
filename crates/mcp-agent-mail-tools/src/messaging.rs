@@ -16,7 +16,6 @@ use mcp_agent_mail_core::{
 };
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -159,66 +158,6 @@ fn normalize_agent_names_or_original(names: Vec<String>) -> Vec<String> {
 
 fn normalize_optional_agent_names(names: Option<Vec<String>>) -> Option<Vec<String>> {
     names.map(normalize_agent_names_or_original)
-}
-
-fn notification_signal_path_digest(
-    config: &Config,
-    project_slug: &str,
-    agent_name: &str,
-) -> String {
-    let signal_path = config
-        .notifications_signals_dir
-        .join("projects")
-        .join(project_slug)
-        .join("agents")
-        .join(format!("{agent_name}.signal"));
-    hex::encode(Sha256::digest(signal_path.to_string_lossy().as_bytes()))
-}
-
-async fn append_signal_delivery_receipt_after_emit(
-    ctx: &McpContext,
-    pool: &mcp_agent_mail_db::DbPool,
-    config: &Config,
-    project_slug: &str,
-    message_id: i64,
-    recipient_id: i64,
-    recipient_name: &str,
-) {
-    let signal_path_digest = notification_signal_path_digest(config, project_slug, recipient_name);
-    match mcp_agent_mail_db::queries::append_message_delivery_signal_receipt(
-        ctx.cx(),
-        pool,
-        message_id,
-        recipient_id,
-        "filesystem_signal",
-        &signal_path_digest,
-        mcp_agent_mail_db::now_micros(),
-    )
-    .await
-    {
-        Outcome::Ok(()) => {}
-        Outcome::Err(error) => tracing::warn!(
-            project = %project_slug,
-            message_id,
-            recipient = %recipient_name,
-            error = %error,
-            "notification signal succeeded but its durable delivery receipt could not be appended"
-        ),
-        Outcome::Cancelled(reason) => tracing::warn!(
-            project = %project_slug,
-            message_id,
-            recipient = %recipient_name,
-            reason = %reason,
-            "notification signal succeeded but delivery receipt append was cancelled"
-        ),
-        Outcome::Panicked(payload) => tracing::warn!(
-            project = %project_slug,
-            message_id,
-            recipient = %recipient_name,
-            panic = %payload.message(),
-            "notification signal succeeded but delivery receipt append panicked"
-        ),
-    }
 }
 
 fn is_agent_unique_constraint_error(message: &str) -> bool {
@@ -2341,30 +2280,6 @@ effective_free_bytes={free}"
                 name,
                 Some(&notification_meta),
             ) {
-                mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
-                    if let Some(recipient_id) = recipient_map
-                        .get(&name.to_lowercase())
-                        .and_then(|agent| agent.id)
-                    {
-                        append_signal_delivery_receipt_after_emit(
-                            ctx,
-                            &pool,
-                            config,
-                            &project.slug,
-                            message_id,
-                            recipient_id,
-                            name,
-                        )
-                        .await;
-                    } else {
-                        tracing::warn!(
-                            project = %project.slug,
-                            message_id,
-                            recipient = %name,
-                            "signal emitted for recipient without a resolvable delivery receipt identity"
-                        );
-                    }
-                }
                 mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
                     project = %project.slug,
                     recipient = %name,
@@ -3230,30 +3145,6 @@ effective_free_bytes={free}"
                 name,
                 Some(&notification_meta),
             ) {
-                mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
-                    if let Some(recipient_id) = recipient_map
-                        .get(&name.to_lowercase())
-                        .and_then(|agent| agent.id)
-                    {
-                        append_signal_delivery_receipt_after_emit(
-                            ctx,
-                            &pool,
-                            config,
-                            &project.slug,
-                            reply_id,
-                            recipient_id,
-                            name,
-                        )
-                        .await;
-                    } else {
-                        tracing::warn!(
-                            project = %project.slug,
-                            message_id = reply_id,
-                            recipient = %name,
-                            "signal emitted for recipient without a resolvable delivery receipt identity"
-                        );
-                    }
-                }
                 mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
                     project = %project.slug,
                     recipient = %name,
@@ -3840,67 +3731,6 @@ fn inbox_delivery_cursor_number(message: &str, key: &str) -> Option<i64> {
         .trim_end_matches(|ch: char| !ch.is_ascii_digit() && ch != '-')
         .parse()
         .ok()
-}
-
-/// Look up message-ID-bound delivery facts without reading mutable signal files
-/// or exposing message content.
-#[tool(
-    description = "Return durable delivery receipt facts for one message ID. The response distinguishes persisted, signaled, and acknowledged per recipient. `signaled` is true only when a message-ID-bound signal receipt was appended after a successful signal write; a debounced or failed signal remains persisted but not signaled."
-)]
-pub async fn get_message_delivery_receipt(
-    ctx: &McpContext,
-    project_key: String,
-    message_id: i64,
-) -> McpResult<String> {
-    let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
-    let project_id = project.id.unwrap_or(0);
-    let receipt = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::get_message_delivery_receipt(
-            ctx.cx(),
-            &pool,
-            project_id,
-            message_id,
-        )
-        .await,
-    )?;
-
-    let recipients = receipt
-        .recipients
-        .into_iter()
-        .map(|recipient| {
-            let signal_receipts = recipient
-                .signal_receipts
-                .into_iter()
-                .map(|signal| {
-                    json!({
-                        "delivery_route": signal.delivery_route,
-                        "signal_path_digest": signal.signal_path_digest,
-                        "observed_at": micros_to_iso(signal.observed_ts),
-                    })
-                })
-                .collect::<Vec<_>>();
-            let acknowledged = recipient.acknowledged_ts.is_some();
-            json!({
-                "recipient": recipient.recipient,
-                "kind": recipient.kind,
-                "persisted": true,
-                "signaled": !signal_receipts.is_empty(),
-                "signal_receipts": signal_receipts,
-                "acknowledged": acknowledged,
-                "acknowledged_at": recipient.acknowledged_ts.map(micros_to_iso),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::to_string(&json!({
-        "message_id": receipt.message_id,
-        "project_id": receipt.project_id,
-        "persisted": true,
-        "persisted_at": micros_to_iso(receipt.persisted_ts),
-        "recipients": recipients,
-    }))
-    .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
 }
 
 fn apply_auto_read_timestamp(

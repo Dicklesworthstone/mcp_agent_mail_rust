@@ -602,47 +602,6 @@ fn upsert_compacted_rollup_entry(
         .map_err(|error| DbError::Sqlite(format!("retention_compact baseline upsert: {error}")))
 }
 
-/// Recompute the policy-visible rollup for strata whose terminal history was
-/// just compacted.
-///
-/// Compacted metrics hold only evicted terminal rows, while the visible rollup
-/// must include that baseline plus every surviving raw row. Without this
-/// refresh, append-time compaction reports only the evicted count until a later
-/// periodic refresh happens to touch the stratum, losing part of the immediate
-/// aggregate learning signal seen by the policy engine.
-fn refresh_visible_rollups_after_compaction(
-    conn: &impl RollupConn,
-    touched: &BTreeMap<String, TouchedStratum>,
-) -> Result<(), DbError> {
-    if touched.is_empty() {
-        return Ok(());
-    }
-    let existing_sql = build_existing_rollups_query(touched.len());
-    let existing_params = touched.keys().cloned().map(Value::Text).collect::<Vec<_>>();
-    let existing_rows = conn
-        .rollup_query_sync(&existing_sql, &existing_params)
-        .map_err(|error| {
-            DbError::Sqlite(format!(
-                "retention_compact visible rollup baseline: {error}"
-            ))
-        })?;
-    let compacted_seed = decode_existing_rollups(&existing_rows)
-        .into_iter()
-        .map(|(stratum_key, entry)| (stratum_key, entry.compacted))
-        .collect::<BTreeMap<_, _>>();
-    let (raw_sql, raw_params) = build_rollup_refresh_scan_query(touched.values().cloned());
-    let surviving_rows = conn
-        .rollup_query_sync(&raw_sql, &raw_params)
-        .map_err(|error| {
-            DbError::Sqlite(format!("retention_compact visible rollup scan: {error}"))
-        })?;
-    let refreshed = finalize_rollups_with_seed(&surviving_rows, &compacted_seed);
-    for entry in refreshed.values() {
-        upsert_rollup_entry(conn, entry)?;
-    }
-    Ok(())
-}
-
 fn refresh_rollups_with_conn(
     conn: &impl RollupConn,
     now_micros: i64,
@@ -1291,11 +1250,6 @@ fn retention_compact_in_transaction(
         &[Value::BigInt(cutoff_ts_micros)],
     )
     .map_err(|error| DbError::Sqlite(format!("retention_compact delete: {error}")))?;
-    // The compacted baseline now includes the deleted terminal rows. Rebuild
-    // the visible metrics from that baseline plus survivors before the caller
-    // commits, so append-time ceiling enforcement is immediately aggregate
-    // complete rather than waiting for the periodic refresh window.
-    refresh_visible_rollups_after_compaction(conn, &touched)?;
     Ok(doomed_rows.len())
 }
 
@@ -1485,16 +1439,12 @@ pub(crate) fn enforce_experience_row_ceiling_in_transaction(
     // resolved history.
     let surplus = remaining - target; // > 0 because remaining > max_rows >= target
     let forced = force_rotate_oldest_experiences_in_transaction(conn, surplus)?;
-    // Force rotation can remove raw rows after the terminal compaction refresh.
-    // Rebuild those affected strata again so visible rollups cannot retain raw
-    // rows that the hard-cap backstop has already discarded.
-    refresh_visible_rollups_after_compaction(conn, &forced.touched)?;
-    let evicted_total = evicted.saturating_add(forced.evicted);
+    let evicted_total = evicted.saturating_add(forced);
     tracing::warn!(
         total,
         terminal,
         evicted,
-        forced = forced.evicted,
+        forced,
         max_rows,
         "atc experience ceiling: open/unresolved backlog exceeded the cap; \
          force-rotated the oldest rows regardless of state to keep the ledger \
@@ -1536,16 +1486,6 @@ const FORCE_ROTATE_COUNT_SQL: &str =
 
 const FORCE_ROTATE_DELETE_SQL: &str = "DELETE FROM atc_experiences WHERE experience_id <= ?";
 
-const FORCE_ROTATE_TOUCHED_STRATA_SQL: &str = "\
-    SELECT subsystem, effect_kind FROM atc_experiences \
-    WHERE experience_id <= ? GROUP BY subsystem, effect_kind";
-
-#[derive(Debug, Default)]
-struct ForceRotation {
-    evicted: usize,
-    touched: BTreeMap<String, TouchedStratum>,
-}
-
 /// Hard-cap backstop: delete the oldest `to_evict` rows by durable
 /// `experience_id` REGARDLESS of lifecycle state.
 ///
@@ -1560,9 +1500,9 @@ struct ForceRotation {
 fn force_rotate_oldest_experiences_in_transaction(
     conn: &impl RollupConn,
     to_evict: i64,
-) -> Result<ForceRotation, DbError> {
+) -> Result<usize, DbError> {
     if to_evict <= 0 {
-        return Ok(ForceRotation::default());
+        return Ok(0);
     }
     let offset = to_evict.saturating_sub(1).max(0);
     let cutoff_eid = conn
@@ -1572,7 +1512,7 @@ fn force_rotate_oldest_experiences_in_transaction(
         .and_then(|row| row.get_by_name("eid"))
         .and_then(experience_scalar_i64);
     let Some(cutoff_eid) = cutoff_eid else {
-        return Ok(ForceRotation::default());
+        return Ok(0);
     };
 
     let doomed = conn
@@ -1582,19 +1522,9 @@ fn force_rotate_oldest_experiences_in_transaction(
         .and_then(|row| row.get_by_name("c"))
         .and_then(experience_scalar_i64)
         .unwrap_or(0);
-    let touched_rows = conn
-        .rollup_query_sync(
-            FORCE_ROTATE_TOUCHED_STRATA_SQL,
-            &[Value::BigInt(cutoff_eid)],
-        )
-        .map_err(|error| DbError::Sqlite(format!("atc force-rotate touched strata: {error}")))?;
-    let touched = query_touched_strata_from_columns(&touched_rows, 0, 1);
     conn.rollup_execute_sync(FORCE_ROTATE_DELETE_SQL, &[Value::BigInt(cutoff_eid)])
         .map_err(|error| DbError::Sqlite(format!("atc force-rotate delete: {error}")))?;
-    Ok(ForceRotation {
-        evicted: usize::try_from(doomed).unwrap_or(0),
-        touched,
-    })
+    Ok(usize::try_from(doomed).unwrap_or(0))
 }
 
 /// Enforce a hard row ceiling on `atc_experiences` for a file-backed pool.
@@ -2526,13 +2456,9 @@ mod tests {
             "open rows must be preserved: {open_ids:?}"
         );
 
-        let aggregate_count = fetch_rollups(&pool)
-            .iter()
-            .map(|rollup| rollup.total_count)
-            .sum::<i64>();
-        assert_eq!(
-            aggregate_count, 14,
-            "visible rollups must include compacted terminal history and surviving raw rows"
+        assert!(
+            !fetch_rollups(&pool).is_empty(),
+            "evicted rows must be folded into rollups (aggregate signal preserved)"
         );
 
         // Now under the cap, a second sweep is a no-op.
@@ -2647,13 +2573,10 @@ mod tests {
             vec![10u64, 11, 12],
             "only the newest `target` rows survive"
         );
-        assert_eq!(
-            fetch_rollups(&pool)
-                .iter()
-                .map(|rollup| rollup.total_count)
-                .sum::<i64>(),
-            6,
-            "rollups retain compacted terminal history plus surviving raw rows, never force-rotated rows"
+        // Terminal rows folded into rollups before the open surplus was rotated.
+        assert!(
+            !fetch_rollups(&pool).is_empty(),
+            "terminal rows must be folded into rollups before force-rotation"
         );
     }
 

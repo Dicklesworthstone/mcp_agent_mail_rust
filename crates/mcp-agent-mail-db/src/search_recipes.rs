@@ -533,15 +533,44 @@ pub fn touch_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
 pub fn prune_recipes(conn: &DbConn, keep: usize) -> Result<u64, String> {
     ensure_recipe_schema(conn)?;
     let keep_val = i64::try_from(keep.min(10_000)).unwrap_or(200);
-    // Keep all pinned recipes unconditionally, plus the `keep` most recently
-    // updated non-pinned recipes.
-    let sql = "DELETE FROM search_recipes WHERE pinned = 0 AND id NOT IN ( \
-        SELECT id FROM search_recipes WHERE pinned = 0 \
-        ORDER BY updated_ts DESC LIMIT ? \
-    )";
     with_sync_write_tx(conn, |conn| {
-        conn.execute_sync(sql, &[Value::BigInt(keep_val)])
-            .map_err(|e| e.to_string())
+        // Keep all pinned recipes unconditionally, plus the `keep` most recently
+        // updated non-pinned recipes.
+        //
+        // Engine-portability workaround (upstream frankensqlite bd-brzp8): fsqlite
+        // 0.3.0's VDBE cannot codegen `NOT IN (SELECT ... ORDER BY ... LIMIT ?)`
+        // ("IN probe codegen invariant failed: unsupported probe source"). Resolve the
+        // keep-set in Rust and DELETE against a literal id list — a supported probe
+        // source. The ids are i64 values read back from this DB, so inlining them is
+        // injection-safe. Revert to the single-statement subquery form once bd-brzp8
+        // lands and the fsqlite pin is bumped.
+        let keep_rows = conn
+            .query_sync(
+                "SELECT id FROM search_recipes WHERE pinned = 0 \
+                 ORDER BY updated_ts DESC LIMIT ?",
+                &[Value::BigInt(keep_val)],
+            )
+            .map_err(|e| e.to_string())?;
+        let mut keep_ids: Vec<i64> = Vec::with_capacity(keep_rows.len());
+        for row in &keep_rows {
+            let id = row_named_i64(row, "id")
+                .ok_or_else(|| "prune: failed to read recipe id".to_string())?;
+            keep_ids.push(id);
+        }
+        if keep_ids.is_empty() {
+            // keep == 0 or no non-pinned rows: drop every non-pinned recipe.
+            return conn
+                .execute_sync("DELETE FROM search_recipes WHERE pinned = 0", &[])
+                .map_err(|e| e.to_string());
+        }
+        let id_list = keep_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql =
+            format!("DELETE FROM search_recipes WHERE pinned = 0 AND id NOT IN ({id_list})");
+        conn.execute_sync(&sql, &[]).map_err(|e| e.to_string())
     })
 }
 
