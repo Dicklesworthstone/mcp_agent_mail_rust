@@ -13161,7 +13161,14 @@ struct CanonicalSnapshotSource {
 }
 
 fn canonical_snapshot_tempdir(prefix: &str, context: &str) -> CliResult<tempfile::TempDir> {
-    let temp_dir = std::env::temp_dir();
+    canonical_snapshot_tempdir_in(&std::env::temp_dir(), prefix, context)
+}
+
+fn canonical_snapshot_tempdir_in(
+    temp_dir: &Path,
+    prefix: &str,
+    context: &str,
+) -> CliResult<tempfile::TempDir> {
     let canonical_temp_dir = std::fs::canonicalize(&temp_dir).map_err(|e| {
         CliError::Other(format!(
             "{context} snapshot tempdir {} is unusable: {e}",
@@ -13235,10 +13242,7 @@ impl CanonicalSnapshotSource {
         source_path: &Path,
         context: &str,
     ) -> CliResult<Self> {
-        let snapshot_dir = tempfile::Builder::new()
-            .prefix("canonical-mailbox-full-snapshot-")
-            .tempdir()
-            .map_err(|e| CliError::Other(format!("{context} full snapshot tempdir failed: {e}")))?;
+        let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-full-snapshot-", context)?;
         let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
         vacuum_into_sqlite_snapshot(source_path, &actual_path, context)?;
         Ok(Self {
@@ -62452,6 +62456,28 @@ startup_timeout_sec = 42
             0,
             "local mail search should not mutate the live sqlite index"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_snapshot_tempdir_resolves_symlinked_tmpdir() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let real_tmpdir = fixture.path().join("private-var");
+        let aliased_tmpdir = fixture.path().join("var");
+        std::fs::create_dir_all(&real_tmpdir).expect("create canonical tmpdir");
+        symlink(&real_tmpdir, &aliased_tmpdir).expect("create tmpdir alias");
+
+        let snapshot = canonical_snapshot_tempdir_in(
+            &aliased_tmpdir,
+            "canonical-mailbox-snapshot-test-",
+            "symlink fixture",
+        )
+        .expect("symlinked tempdir should resolve to its canonical directory");
+
+        assert_eq!(snapshot.path().parent(), Some(real_tmpdir.as_path()));
+        assert!(snapshot.path().is_dir());
     }
 
     #[test]
