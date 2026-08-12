@@ -2288,7 +2288,7 @@ pub async fn file_reservation_paths(
 /// - `project_key`: Project identifier
 /// - `agent_name`: Agent releasing reservations
 /// - `paths`: Restrict release to matching path patterns
-/// - `file_reservation_ids`: Restrict release to matching IDs
+/// - `file_reservation_ids`: Select held paths by ID only when `paths` is omitted; supplied paths release every matching active row and all of their exact-path siblings
 ///
 /// # Conformance
 /// Python-parity.
@@ -2389,18 +2389,49 @@ pub async fn release_file_reservations(
             }
             other => db_outcome_to_mcp_result(other)?,
         };
-        let mut ids = Vec::new();
-        for res in existing_rows {
-            if renewal_filter_matches(
-                &res,
-                agent_id,
-                normalized_paths.as_deref(),
-                file_reservation_ids.as_deref(),
-            ) && let Some(rid) = res.id
-            {
-                ids.push(rid);
-            }
-        }
+        let selected_rows = existing_rows
+            .iter()
+            .filter(|res| {
+                renewal_filter_matches(
+                    res,
+                    agent_id,
+                    normalized_paths.as_deref(),
+                    // Paths describe the release scope. When present they must
+                    // not be narrowed by a stale/incomplete ID list, or a
+                    // release-by-path call can report success while siblings
+                    // still block peers.
+                    normalized_paths
+                        .is_none()
+                        .then_some(file_reservation_ids.as_deref())
+                        .flatten(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // A historical retry could leave several active rows for the same
+        // `(agent, path_pattern)`. An ID is a selector for a held path, not
+        // permission to leave its active siblings behind.
+        let mut ids = if file_reservation_ids.is_some() {
+            let selected_paths = selected_rows
+                .iter()
+                .map(|res| res.path_pattern.as_str())
+                .collect::<HashSet<_>>();
+            existing_rows
+                .iter()
+                .filter(|res| {
+                    renewal_filter_matches(res, agent_id, None, None)
+                        && selected_paths.contains(res.path_pattern.as_str())
+                })
+                .filter_map(|res| res.id)
+                .collect::<Vec<_>>()
+        } else {
+            selected_rows
+                .iter()
+                .filter_map(|res| res.id)
+                .collect::<Vec<_>>()
+        };
+        ids.sort_unstable();
+        ids.dedup();
         Some(ids)
     } else {
         None
@@ -3563,6 +3594,9 @@ mod tests {
                 assert!(response.read_only);
                 assert_eq!(response.authoritative_source, "database_snapshot");
                 assert_eq!(response.checked_paths, 9);
+                assert_eq!(response.own_active.len(), 1);
+                assert_eq!(response.own_active[0].path_pattern, "own/**");
+                assert!(response.own_active[0].exclusive);
                 let conflict_paths = response
                     .conflicts
                     .iter()
@@ -4597,6 +4631,156 @@ mod tests {
                     second["released"].as_i64(),
                     Some(0),
                     "double release must be a clean no-op (0 released, no error)"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn macro_cycle_renews_paths_and_id_release_cleans_legacy_siblings() {
+        // br-3f3vv: repeating the macro must keep one active lease per
+        // (agent, path), and selecting any historical duplicate by ID must not
+        // leave its same-path siblings active.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/br-3f3vv-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let agent_id = agent.id.expect("agent id");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let paths = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+
+                let mut first_ids = None;
+                for attempt in 0..5 {
+                    let response: Value = serde_json::from_str(
+                        &crate::macros::macro_file_reservation_cycle(
+                            &ctx,
+                            project_key.clone(),
+                            agent.name.clone(),
+                            paths.clone(),
+                            Some(3_600),
+                            Some(true),
+                            Some("br-3f3vv macro cycle".to_string()),
+                            Some(false),
+                        )
+                        .await
+                        .expect("macro reservation cycle"),
+                    )
+                    .expect("macro response JSON");
+                    let ids = response["file_reservations"]["granted"]
+                        .as_array()
+                        .expect("granted reservations")
+                        .iter()
+                        .map(|reservation| reservation["id"].as_i64().expect("reservation id"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(ids.len(), 2, "macro attempt {attempt} grants both paths");
+                    if let Some(first_ids) = &first_ids {
+                        assert_eq!(ids, *first_ids, "macro attempt {attempt} must renew");
+                    } else {
+                        first_ids = Some(ids);
+                    }
+                }
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("active reservation read failed: {other:?}"),
+                };
+                assert_eq!(
+                    active.iter().filter(|row| row.agent_id == agent_id).count(),
+                    2,
+                    "five macro calls must leave one active lease per path"
+                );
+
+                let released: Value = serde_json::from_str(
+                    &release_file_reservations(
+                        &ctx,
+                        project_key.clone(),
+                        agent.name.clone(),
+                        Some(paths),
+                        None,
+                    )
+                    .await
+                    .expect("release macro paths"),
+                )
+                .expect("release response JSON");
+                assert_eq!(released["released"].as_i64(), Some(2));
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("post-path-release read failed: {other:?}"),
+                };
+                assert!(
+                    active.iter().all(|row| row.agent_id != agent_id),
+                    "one path release must leave no active macro reservations"
+                );
+
+                // Simulate rows written by the former non-idempotent acquire
+                // path. This must remain repairable even after new acquisition
+                // stops creating such duplicates.
+                let now = mcp_agent_mail_db::now_micros();
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("acquire failed: {error}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                for legacy_copy in 0..13_i64 {
+                    conn.execute_sync(
+                        "INSERT INTO file_reservations \
+                         (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                        &[
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id),
+                            mcp_agent_mail_db::sqlmodel::Value::Text("src/legacy.rs".to_string()),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(1),
+                            mcp_agent_mail_db::sqlmodel::Value::Text(format!(
+                                "legacy sibling {legacy_copy}"
+                            )),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(now),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                                now.saturating_add(3_600_000_000),
+                            ),
+                        ],
+                    )
+                    .expect("insert legacy duplicate");
+                }
+                drop(conn);
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("legacy active reservation read failed: {other:?}"),
+                };
+                let legacy_ids = active
+                    .iter()
+                    .filter(|row| row.agent_id == agent_id && row.path_pattern == "src/legacy.rs")
+                    .filter_map(|row| row.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(legacy_ids.len(), 13, "legacy fixture has thirteen siblings");
+
+                let released: Value = serde_json::from_str(
+                    &release_file_reservations(
+                        &ctx,
+                        project_key,
+                        agent.name,
+                        None,
+                        Some(vec![legacy_ids[0]]),
+                    )
+                    .await
+                    .expect("release one legacy id"),
+                )
+                .expect("legacy release response JSON");
+                assert_eq!(released["released"].as_i64(), Some(13));
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("post-id-release read failed: {other:?}"),
+                };
+                assert!(
+                    active.iter().all(|row| {
+                        row.agent_id != agent_id || row.path_pattern != "src/legacy.rs"
+                    }),
+                    "release by one id must clear every active same-path sibling"
                 );
             });
         });
