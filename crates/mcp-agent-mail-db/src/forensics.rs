@@ -175,12 +175,13 @@ struct RecoveryReceiptBody {
     db_path: String,
     storage_root: String,
     source_path: Option<String>,
-    /// Present only when the source was confirmed corrupt and could not be
-    /// semantically inventoried. The digest records the exact probe failure
-    /// without leaking paths or row contents into the receipt. In this case
-    /// `source` is the empty snapshot and `delta` is candidate-relative; the
-    /// receipt attests the promoted generation but cannot claim losslessness
-    /// against unreadable bytes.
+    /// Present only when the source could not provide verifiable continuity:
+    /// either it was confirmed corrupt during semantic inventory or it
+    /// predates recovery-marker persistence. The digest records the exact
+    /// probe failure without leaking paths or row contents into the receipt.
+    /// In this case `source` is the empty snapshot and `delta` is
+    /// candidate-relative; the receipt attests the promoted generation but
+    /// cannot claim losslessness against the unverified source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_snapshot_failure_sha256: Option<String>,
     candidate_path: String,
@@ -2325,6 +2326,16 @@ fn verify_finalized_recovery_receipt_chain(
 
 const RECOVERY_RECEIPT_MARKERS_TABLE: &str = "mailbox_recovery_receipt_markers";
 
+/// True only when SQLite reports that a source predates recovery-marker
+/// persistence entirely. This is distinct from a missing marker row or any
+/// other marker verification failure, both of which remain promotion-blocking.
+fn is_missing_recovery_receipt_markers_table_error(error: &SqlError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    let table = RECOVERY_RECEIPT_MARKERS_TABLE.to_ascii_lowercase();
+    message.contains(&format!("no such table: {table}"))
+        || message.contains(&format!("no such table: main.{table}"))
+}
+
 fn install_candidate_recovery_marker(
     candidate_path: &Path,
     document: &RecoveryReceiptDocument,
@@ -2518,9 +2529,10 @@ pub(crate) fn verify_recovery_receipt_state(
 ///
 /// A finalized chain must remain structurally valid and no pending intent may
 /// exist. A readable source must also carry the chain-tip marker. The sole
-/// exception is a source independently confirmed unhealthy: corruption can
-/// make its marker unreadable, and blocking recovery in that state would make
-/// a previously receipted mailbox impossible to repair after a later incident.
+/// exceptions are a source independently confirmed unhealthy or a source that
+/// predates recovery-marker persistence: both cannot prove the chain tip, and
+/// blocking recovery in either state would make a receipted mailbox impossible
+/// to repair after a later incident.
 pub(crate) fn verify_recovery_receipt_state_for_promotion(
     storage_root: &Path,
     db_path: &Path,
@@ -2543,6 +2555,15 @@ pub(crate) fn verify_recovery_receipt_state_for_promotion(
     };
     match verify_live_recovery_marker(db_path, &chain.latest) {
         Ok(()) => Ok(()),
+        Err(marker_error) if is_missing_recovery_receipt_markers_table_error(&marker_error) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                receipt_id = %chain.latest.body.receipt_id,
+                error = %marker_error,
+                "source predates recovery-marker persistence; preserving the verified chain as the predecessor for an attested recovery"
+            );
+            Ok(())
+        }
         Err(marker_error) => match crate::pool::sqlite_file_is_healthy(db_path) {
             Ok(false) => {
                 tracing::warn!(
@@ -2591,7 +2612,7 @@ fn collect_recovery_receipt_evidence(
     archive_identity_overrides: &BTreeMap<String, String>,
 ) -> Result<RecoveryReceiptEvidence, SqlError> {
     let chain = verify_finalized_recovery_receipt_chain(receipts_dir)?;
-    let (source_sets, source_snapshot_failure_sha256) = match source_path {
+    let (mut source_sets, mut source_snapshot_failure_sha256) = match source_path {
         Some(path) => {
             match collect_recovery_continuity_sets_with_overrides(path, archive_identity_overrides)
             {
@@ -2636,11 +2657,28 @@ fn collect_recovery_receipt_evidence(
             )
         })?;
         // A readable source must carry the marker for the current chain tip.
-        // When corruption has made the source unreadable, the verified chain
+        // When corruption has made the source unreadable, or the source
+        // predates recovery-marker persistence entirely, the verified chain
         // remains the durable predecessor and this receipt explicitly records
         // that source continuity could not be re-inventoried.
         if source_snapshot_failure_sha256.is_none() {
-            verify_live_recovery_marker(source_path, &existing_chain.latest)?;
+            match verify_live_recovery_marker(source_path, &existing_chain.latest) {
+                Ok(()) => {}
+                Err(marker_error)
+                    if is_missing_recovery_receipt_markers_table_error(&marker_error) =>
+                {
+                    tracing::warn!(
+                        source = %source_path.display(),
+                        receipt_id = %existing_chain.latest.body.receipt_id,
+                        error = %marker_error,
+                        "source predates recovery-marker persistence; recording an attested unmarked source for recovery receipt continuity"
+                    );
+                    source_sets = RecoveryContinuitySets::default();
+                    source_snapshot_failure_sha256 =
+                        Some(recovery_sha256(marker_error.to_string().as_bytes()));
+                }
+                Err(marker_error) => return Err(marker_error),
+            }
         }
     }
     let candidate_sets = collect_recovery_continuity_sets(candidate_path)?;
@@ -2690,9 +2728,10 @@ fn collect_recovery_receipt_evidence(
             recovery_category_blocking_loss(&delta.proof_gate_consumed_nonces),
         )));
     }
-    // Multiplicity inflation is meaningful only relative to a readable source.
-    // When the source is corrupt, preserve the candidate's full multiset and
-    // let the explicit unreadable-source attestation carry that uncertainty.
+    // Multiplicity inflation is meaningful only relative to a verifiable
+    // source. When the source is corrupt or predates recovery markers,
+    // preserve the candidate's full multiset and let the explicit source
+    // attestation carry that uncertainty.
     // Compared on identity keys: payload normalization must not be able to
     // disguise a duplicate replay of the same message as "new" content.
     if source_snapshot_failure_sha256.is_none() {
@@ -4054,7 +4093,7 @@ mod tests {
         finalize_recovery_receipt_with_injected_post_rename_failure,
         finalized_recovery_receipt_paths, parse_ps_output_value, pending_recovery_receipt_paths,
         prepare_recovery_receipt, read_sqlite_header_fields, redact_database_url,
-        verify_recovery_receipt_state,
+        verify_recovery_receipt_state, verify_recovery_receipt_state_for_promotion,
     };
     #[cfg(unix)]
     use std::ffi::OsString;
@@ -4233,6 +4272,79 @@ mod tests {
             chain_error.to_string().contains("schema check")
                 || chain_error.to_string().contains("self-hash check")
                 || chain_error.to_string().contains("chain-link check")
+        );
+    }
+
+    #[test]
+    fn recovery_receipt_promotes_attested_source_without_marker_table_and_preserves_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_candidate = dir.path().join("candidate-first.sqlite3");
+        let second_candidate = dir.path().join("candidate-second.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&first_candidate, true);
+        seed_recovery_receipt_db(&second_candidate, true);
+
+        let first = prepare_recovery_receipt(&storage_root, &primary, None, &first_candidate)
+            .expect("prepare first receipt");
+        std::fs::rename(&first_candidate, &primary).expect("activate first candidate");
+        finalize_recovery_receipt(&first).expect("finalize first receipt");
+        let first_receipt_bytes = std::fs::read(&first.final_path).expect("read first receipt");
+        let first_receipt_bytes_sha256 = super::recovery_sha256(&first_receipt_bytes);
+
+        let source_conn = crate::CanonicalDbConn::open_file(primary.to_string_lossy().as_ref())
+            .expect("open marked source");
+        source_conn
+            .execute_raw("DROP TABLE mailbox_recovery_receipt_markers")
+            .expect("remove marker table to simulate an older source generation");
+        let marker_table_rows = source_conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mailbox_recovery_receipt_markers'",
+                &[],
+            )
+            .expect("query source marker-table inventory");
+        assert!(
+            marker_table_rows.is_empty(),
+            "fixture source must lack the recovery-marker table entirely"
+        );
+        drop(source_conn);
+
+        verify_recovery_receipt_state_for_promotion(&storage_root, &primary)
+            .expect("an unmarked source must remain eligible for an attested promotion");
+        let second =
+            prepare_recovery_receipt(&storage_root, &primary, Some(&primary), &second_candidate)
+                .expect("source without the marker table must prepare an attested receipt");
+        let second_document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&second.pending_path).expect("read attested pending receipt"),
+        )
+        .expect("decode attested pending receipt");
+        assert!(
+            second_document
+                .body
+                .source_snapshot_failure_sha256
+                .is_some(),
+            "receipt must explicitly attest that source continuity was unverifiable"
+        );
+        assert_eq!(second_document.body.source.projects.count, 0);
+        assert_eq!(
+            second_document
+                .body
+                .previous_receipt_bytes_sha256
+                .as_deref(),
+            Some(first_receipt_bytes_sha256.as_str())
+        );
+
+        let prior_generation = dir.path().join("storage.sqlite3.unmarked-source");
+        std::fs::rename(&primary, &prior_generation).expect("preserve unmarked source");
+        std::fs::rename(&second_candidate, &primary).expect("activate second candidate");
+        finalize_recovery_receipt(&second).expect("finalize attested promotion");
+        verify_recovery_receipt_state(&storage_root, &primary)
+            .expect("attested promotion must preserve a valid receipt chain");
+        assert_eq!(
+            finalized_recovery_receipt_paths(second.final_path.parent().expect("receipt parent"),)
+                .expect("list finalized receipt chain")
+                .len(),
+            2
         );
     }
 
@@ -4826,6 +4938,20 @@ mod tests {
         let marked_generation = dir.path().join("marked-generation.sqlite3");
         std::fs::rename(&primary, &marked_generation).expect("preserve marked generation");
         seed_recovery_receipt_db(&primary, true);
+        let wrong_source_conn =
+            crate::CanonicalDbConn::open_file(primary.to_string_lossy().as_ref())
+                .expect("open wrong source generation");
+        wrong_source_conn
+            .execute_raw(
+                "CREATE TABLE mailbox_recovery_receipt_markers (\
+                     receipt_id TEXT PRIMARY KEY, \
+                     receipt_self_sha256 TEXT NOT NULL, \
+                     candidate_snapshot_sha256 TEXT NOT NULL, \
+                     prepared_at_us INTEGER NOT NULL\
+                 )",
+            )
+            .expect("create empty marker table on wrong source generation");
+        drop(wrong_source_conn);
         let error =
             prepare_recovery_receipt(&storage_root, &primary, Some(&primary), &second_candidate)
                 .expect_err("wrong source generation must not extend finalized chain");
