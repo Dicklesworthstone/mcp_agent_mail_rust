@@ -3909,6 +3909,166 @@ mod tests {
         }
     }
 
+    #[test]
+    fn send_message_delivers_all_recipients_after_recipient_row_replacement() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("messaging upsert test tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+            ],
+            || {
+                Config::reset_cached();
+                let cx = Cx::for_testing();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let project_key = format!(
+                        "/data/projects/messaging-upsert-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+
+                    crate::ensure_project(&ctx, project_key.clone(), None)
+                        .await
+                        .expect("ensure project");
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("BlueLake".to_string()),
+                        Some("sender".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register sender");
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("GreenStone".to_string()),
+                        Some("stable recipient".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register stable recipient");
+                    let initial = crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("AzureCanyon".to_string()),
+                        Some("recipient before replacement".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register replaceable recipient");
+                    let initial: serde_json::Value =
+                        serde_json::from_str(&initial).expect("parse initial recipient");
+                    let initial_id = initial["id"].as_i64().expect("initial recipient id");
+                    let refreshed = crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5.1".to_string(),
+                        Some("AzureCanyon".to_string()),
+                        Some("recipient activity refresh".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("idempotent recipient refresh");
+                    let refreshed: serde_json::Value =
+                        serde_json::from_str(&refreshed).expect("parse refreshed recipient");
+                    assert_eq!(refreshed["id"].as_i64(), Some(initial_id));
+
+                    let pool = get_db_pool().expect("get test pool");
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire test connection");
+                    conn.execute_raw(&format!("DELETE FROM agents WHERE id = {initial_id}"))
+                        .expect("replace recipient row");
+                    drop(conn);
+                    drop(pool);
+
+                    // This mirrors a recipient re-registering after its row was
+                    // replaced between recipient resolution attempts.
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("AzureCanyon".to_string()),
+                        Some("replacement recipient".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("idempotent replacement registration");
+
+                    let sent = send_message(
+                        &ctx,
+                        project_key,
+                        "BlueLake".to_string(),
+                        vec!["GreenStone".to_string(), "AzureCanyon".to_string()],
+                        "recipient replacement does not abort send".to_string(),
+                        "both recipients must receive this message".to_string(),
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        None,
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("multi-recipient send after replacement");
+                    let sent: serde_json::Value =
+                        serde_json::from_str(&sent).expect("parse send response");
+                    assert_eq!(sent["count"].as_u64(), Some(1));
+                    assert_eq!(
+                        sent["deliveries"][0]["payload"]["to"]
+                            .as_array()
+                            .map(Vec::len),
+                        Some(2)
+                    );
+                });
+            },
+        );
+        Config::reset_cached();
+    }
+
     // ── Durable ack-intent replay (br-bvq1x.8.3 / H3) ────────────────────────
 
     #[test]

@@ -4289,19 +4289,6 @@ pub async fn register_agent(
         ));
     }
     let now = now_micros();
-    let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                     registration_token \
-                     FROM agents \
-                     WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                     ORDER BY id ASC LIMIT 1";
-    let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-    let existing_before = match durability_probe_query(cx, pool, fetch_sql, &fetch_params).await {
-        Outcome::Ok(rows) => rows.first().map(decode_agent_row_indexed),
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
     let (provisional, durable) = {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
@@ -4323,13 +4310,49 @@ pub async fn register_agent(
                     || "auto".to_string(),
                     std::string::ToString::to_string,
                 );
-                let insert_sql = "INSERT INTO agents \
+                let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                                 inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                                 registration_token \
+                                 FROM agents \
+                                 WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                                 ORDER BY id ASC LIMIT 1";
+                let fetch_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
+                let existing = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+                )
+                .first()
+                .map(decode_agent_row_indexed);
+
+                // Retain the canonical stored spelling when an older database lacks
+                // the NOCASE unique index.  Otherwise a case-only re-registration
+                // could insert a second row instead of refreshing the first.
+                let upsert_name = existing
+                    .as_ref()
+                    .map_or_else(|| name_s.clone(), |agent| agent.name.clone());
+                let mut update_sets = vec![
+                    "program = excluded.program",
+                    "model = excluded.model",
+                    "task_description = excluded.task_description",
+                    "last_active_ts = excluded.last_active_ts",
+                ];
+                if attachments_policy.is_some() {
+                    update_sets.push("attachments_policy = excluded.attachments_policy");
+                }
+                if reaper_exempt.is_some() {
+                    update_sets.push("reaper_exempt = excluded.reaper_exempt");
+                }
+                let upsert_sql = format!(
+                    "INSERT INTO agents \
                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                    ON CONFLICT(project_id, name) DO NOTHING";
-                let insert_params = [
+                    ON CONFLICT(project_id, name) DO UPDATE SET {}",
+                    update_sets.join(", ")
+                );
+                let upsert_params = [
                     Value::BigInt(project_id),
-                    Value::Text(name_s.clone()),
+                    Value::Text(upsert_name),
                     Value::Text(program_s.clone()),
                     Value::Text(model_s.clone()),
                     Value::Text(insert_task_desc.clone()),
@@ -4339,108 +4362,38 @@ pub async fn register_agent(
                     Value::Text("auto".to_string()),
                     Value::BigInt(i64::from(reaper_exempt.unwrap_or(false))),
                 ];
-                let mut inserted_new = false;
-                let mut inserted_id = None;
-                if existing_before.is_none() {
-                    let inserted_rows = try_in_tx!(
-                        cx,
-                        &tracked,
-                        map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+                let affected_rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &upsert_sql, &upsert_params).await)
+                );
+                if affected_rows == 0 {
+                    // Some SQLite backends report zero for a conflict update whose
+                    // values were already current.  The authoritative re-select
+                    // below decides whether the identity exists; a row count alone
+                    // must never abort registration or a multi-recipient send.
+                    tracing::warn!(
+                        project_id,
+                        agent = %name,
+                        "agent UPSERT reported zero affected rows; verifying canonical row"
                     );
-                    inserted_new = inserted_rows > 0;
-                    if inserted_new {
-                        let id_rows = try_in_tx!(
-                            cx,
-                            &tracked,
-                            map_sql_outcome(
-                                traw_query(cx, &tracked, "SELECT last_insert_rowid() AS id", &[]).await
-                            )
-                        );
-                        let Some(id) = id_rows.first().and_then(row_first_i64) else {
-                            rollback_tx(cx, &tracked).await;
-                            return Outcome::Err(DbError::Internal(format!(
-                                "agent insert succeeded but last_insert_rowid() returned no row for {project_id}:{name}"
-                            )));
-                        };
-                        inserted_id = Some(id);
-                    }
                 }
 
-                if !inserted_new {
-                    // Keep behavior consistent with insert path: omitted task_description clears
-                    // to empty string instead of preserving stale content.
-                    let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
-                    let mut normalize_params = vec![
-                        Value::Text(program_s.clone()),
-                        Value::Text(model_s.clone()),
-                        Value::BigInt(now),
-                        Value::Text(insert_task_desc.clone()),
-                    ];
-                    normalize_sets.push("task_description = ?");
-                    if let Some(ap) = attachments_policy {
-                        normalize_sets.push("attachments_policy = ?");
-                        normalize_params.push(Value::Text(ap.to_string()));
-                    }
-                    if let Some(exempt) = reaper_exempt {
-                        normalize_sets.push("reaper_exempt = ?");
-                        normalize_params.push(Value::BigInt(i64::from(exempt)));
-                    }
-                    let normalize_sql = format!(
-                        "UPDATE agents SET {} WHERE project_id = ? AND name = ? COLLATE NOCASE",
-                        normalize_sets.join(", ")
-                    );
-                    normalize_params.push(Value::BigInt(project_id));
-                    normalize_params.push(Value::Text(name_s.clone()));
-                    let updated_rows = try_in_tx!(
-                        cx,
-                        &tracked,
-                        map_sql_outcome(
-                            traw_execute(cx, &tracked, &normalize_sql, &normalize_params).await
-                        )
-                    );
-                    if updated_rows == 0 {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Err(DbError::Internal(format!(
-                            "agent upsert affected zero rows for {project_id}:{name}"
-                        )));
-                    }
-                }
+                let rows = try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+                );
+                let Some(provisional) = rows.first().map(decode_agent_row_indexed) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "agent UPSERT completed without a query-visible row for {project_id}:{name}"
+                    )));
+                };
 
                 try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
-                let build_inserted_agent = || AgentRow {
-                    id: inserted_id,
-                    project_id,
-                    name: name_s.clone(),
-                    program: program_s.clone(),
-                    model: model_s.clone(),
-                    task_description: insert_task_desc.clone(),
-                    inception_ts: now,
-                    last_active_ts: now,
-                    attachments_policy: attach_pol.clone(),
-                    contact_policy: "auto".to_string(),
-                    reaper_exempt: i64::from(reaper_exempt.unwrap_or(false)),
-                    registration_token: None,
-                };
-                let mut provisional = if inserted_new {
-                    build_inserted_agent()
-                } else if let Some(existing) = existing_before.clone() {
-                    existing
-                } else {
-                    build_inserted_agent()
-                };
-                provisional.program = program_s;
-                provisional.model = model_s;
-                provisional.task_description = insert_task_desc;
-                provisional.last_active_ts = now;
-                if let Some(ap) = attachments_policy {
-                    provisional.attachments_policy = ap.to_string();
-                }
-                if let Some(exempt) = reaper_exempt {
-                    provisional.reaper_exempt = i64::from(exempt);
-                }
-
-                Outcome::Ok((provisional, inserted_new))
+                Outcome::Ok((provisional, existing.is_none()))
             })
             .await
             {
