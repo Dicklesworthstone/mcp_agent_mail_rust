@@ -28,6 +28,7 @@ Commands:
   guard                       Install, check, and manage the pre-commit file-reservation guard hook
   health                      Direct alias for `am robot health`
   inbox                       Direct alias for `am robot inbox`
+  inbox-events                Read durable, restart-safe inbox delivery events for one recipient
   legacy                      Legacy Python installation detection, migration/import, and status
   lint                        Run clippy lints across the workspace (`cargo clippy --all-targets -D warnings`)
   list-acks                   List acknowledgement status for an agent's recent messages
@@ -66,6 +67,7 @@ MCP tool-name corrections:
   macro_start_session -> am macros start-session --project <abs-path> --program <program> --model <model>
   send/send-message/send_message -> am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>
   inbox/fetch_inbox -> am inbox --project <project> --agent <agent>
+  fetch_inbox_events -> am inbox-events --project <project> --agent <agent> [--after <cursor>]
   acknowledge_message -> am mail ack --project <project> --agent <agent> <message-id>
   list_agents -> am agents list --project <project>
   whois -> am agents show --project <project> <agent>

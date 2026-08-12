@@ -111,6 +111,7 @@ fn compat_rbac_readonly_tools_contract() {
         "whois",
         "search_messages",
         "summarize_thread",
+        "fetch_inbox_events",
         "fetch_inbox_product",
     ];
     for tool in &expected {

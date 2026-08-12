@@ -3585,6 +3585,154 @@ pub async fn fetch_inbox(
     Ok(response)
 }
 
+/// Read durable, body-free inbox delivery events for a monitor.
+///
+/// Unlike `fetch_inbox`, this never marks a message read and does not expose a
+/// mutable newest-message window. Consumers persist `next_cursor` after
+/// processing each oldest-first page and can resume safely after restart.
+#[tool(
+    description = "Read durable recipient inbox delivery events for restart-safe monitors.\n\nEvents are append-only, body-free, oldest-first, and addressed to exactly one recipient. Persist `next_cursor` only after processing the corresponding events. `after` is a delivery cursor, never a message id.\n\nReturns `{ events, next_cursor, has_more, oldest_available_cursor, tail_cursor }`. A cursor below retained history produces `CURSOR_EXPIRED`; one beyond the durable tail produces `CURSOR_AHEAD`.\n\nParameters:\n- `project_key`: project identity\n- `agent_name`: recipient identity\n- `after`: optional last processed delivery cursor\n- `limit`: page size, 1 through 1000\n- `position_now`: return the durable tail cursor without events; cannot be combined with `after`."
+)]
+#[allow(clippy::too_many_lines)]
+pub async fn fetch_inbox_events(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    after: Option<i64>,
+    limit: Option<i32>,
+    position_now: Option<bool>,
+) -> McpResult<String> {
+    let agent_name = normalize_agent_name_or_original(agent_name);
+    if position_now.unwrap_or(false) && after.is_some() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "position_now cannot be combined with after",
+            true,
+            json!({ "field": "after" }),
+        ));
+    }
+    let requested_limit = limit.unwrap_or(100);
+    if !(1..=1000).contains(&requested_limit) {
+        return Err(legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit must be between 1 and 1000, got {requested_limit}"),
+            true,
+            json!({ "provided": requested_limit, "min": 1, "max": 1000 }),
+        ));
+    }
+    let limit = usize::try_from(requested_limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit exceeds supported range: {requested_limit}"),
+            true,
+            json!({ "provided": requested_limit, "min": 1, "max": 1000 }),
+        )
+    })?;
+
+    // Cursor delivery is a durable database contract. Do not use the
+    // archive-reconstruction read pool here: an archive snapshot has no
+    // independent event sequence and would turn a degraded source into a
+    // dishonest empty monitor page.
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    let agent_id = agent.id.unwrap_or(0);
+
+    let page = match mcp_agent_mail_db::queries::fetch_inbox_delivery_events(
+        ctx.cx(),
+        &pool,
+        project_id,
+        agent_id,
+        if position_now.unwrap_or(false) {
+            None
+        } else {
+            after
+        },
+        limit,
+    )
+    .await
+    {
+        Outcome::Ok(page) => page,
+        Outcome::Err(DbError::InvalidArgument {
+            field: "after",
+            message,
+        }) if message.starts_with("cursor_expired ") => {
+            let oldest_available_cursor =
+                inbox_delivery_cursor_number(&message, "oldest_available_cursor");
+            return Err(legacy_tool_error(
+                "CURSOR_EXPIRED",
+                message,
+                false,
+                json!({ "after": after, "oldest_available_cursor": oldest_available_cursor }),
+            ));
+        }
+        Outcome::Err(DbError::InvalidArgument {
+            field: "after",
+            message,
+        }) if message.starts_with("cursor_ahead ") => {
+            let tail_cursor = inbox_delivery_cursor_number(&message, "tail_cursor");
+            return Err(legacy_tool_error(
+                "CURSOR_AHEAD",
+                message,
+                true,
+                json!({ "after": after, "tail_cursor": tail_cursor }),
+            ));
+        }
+        outcome => db_outcome_to_mcp_result(outcome)?,
+    };
+
+    let events = if position_now.unwrap_or(false) {
+        Vec::new()
+    } else {
+        page.events
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "cursor": event.seq,
+                    "message_id": event.message_id,
+                    "kind": event.kind,
+                    "delivered_ts": micros_to_iso(event.delivered_ts),
+                    "subject": event.subject,
+                    "from": event.sender_name,
+                    "importance": event.importance,
+                    "ack_required": event.ack_required,
+                })
+            })
+            .collect()
+    };
+    serde_json::to_string(&json!({
+        "events": events,
+        "next_cursor": if position_now.unwrap_or(false) {
+            page.tail_cursor
+        } else {
+            page.next_cursor
+        },
+        "has_more": if position_now.unwrap_or(false) { false } else { page.has_more },
+        "oldest_available_cursor": page.oldest_available_cursor,
+        "tail_cursor": page.tail_cursor,
+    }))
+    .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+}
+
+fn inbox_delivery_cursor_number(message: &str, key: &str) -> Option<i64> {
+    let (_, value) = message.split_once(&format!("{key}="))?;
+    value
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(|ch: char| !ch.is_ascii_digit() && ch != '-')
+        .parse()
+        .ok()
+}
+
 fn apply_auto_read_timestamp(
     messages: &mut [InboxMessage],
     updated_message_ids: &[i64],

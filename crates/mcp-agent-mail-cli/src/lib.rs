@@ -198,6 +198,11 @@ define_mcp_tool_cli_corrections! {
         mcp_tool: Some("fetch_inbox"),
     },
     {
+        attempted_names: ["fetch_inbox_events"],
+        cli: "am inbox-events --project <project> --agent <agent> [--after <cursor>]",
+        mcp_tool: Some("fetch_inbox_events"),
+    },
+    {
         attempted_names: ["acknowledge_message"],
         cli: "am mail ack --project <project> --agent <agent> <message-id>",
         mcp_tool: Some("acknowledge_message"),
@@ -567,6 +572,40 @@ pub enum Commands {
         /// Project key to check (default: AGENT_MAIL_PROJECT env var or current directory).
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Read durable, restart-safe inbox delivery events for one recipient.
+    #[command(name = "inbox-events")]
+    InboxEvents {
+        /// Agent name (default: AGENT_NAME or AGENT_MAIL_AGENT).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Project key (default: AGENT_MAIL_PROJECT or current directory).
+        #[arg(long)]
+        project: Option<String>,
+        /// Last fully processed delivery cursor. This is not a message ID.
+        #[arg(long)]
+        after: Option<i64>,
+        /// Maximum events to return (1 through 1000).
+        #[arg(long, default_value_t = 100, value_parser = parse_positive_usize_arg)]
+        limit: usize,
+        /// Return the current durable tail cursor with no events.
+        #[arg(long)]
+        position_now: bool,
+        /// Allow a direct SQLite read only when no daemon is reachable.
+        #[arg(long)]
+        direct: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Server host for HTTP mode (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Server port for HTTP mode (default: 8765).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
     },
     /// Run the unified local pre-release quality gate.
     #[command(name = "check")]
@@ -3399,6 +3438,7 @@ fn command_is_read_only(command: &Commands) -> bool {
         | Commands::Thread { .. }
         | Commands::Health { .. }
         | Commands::CheckInbox { .. }
+        | Commands::InboxEvents { .. }
         | Commands::Status { .. }
         // `tui-dump` only reads `/mail/ws-state` over HTTP and (on fallback)
         // runs the read-only situational status builder — never mutates. It
@@ -3638,6 +3678,29 @@ fn execute(cli: Cli) -> CliResult<()> {
             port,
             project,
         } => handle_check_inbox(agent, rate_limit, direct, format, json, host, port, project),
+        Commands::InboxEvents {
+            agent,
+            project,
+            after,
+            limit,
+            position_now,
+            direct,
+            format,
+            json,
+            host,
+            port,
+        } => handle_inbox_events(
+            agent,
+            project,
+            after,
+            limit,
+            position_now,
+            direct,
+            format,
+            json,
+            host,
+            port,
+        ),
         Commands::Check {
             quick,
             report,
@@ -7901,6 +7964,211 @@ fn handle_check_inbox(
     });
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_inbox_events(
+    agent: Option<String>,
+    project: Option<String>,
+    after: Option<i64>,
+    limit: usize,
+    position_now: bool,
+    direct: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    host: String,
+    port: u16,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    if position_now && after.is_some() {
+        return emit_inbox_events_error(
+            fmt,
+            "invalid_argument",
+            "--position-now cannot be combined with --after",
+            serde_json::json!({ "field": "after" }),
+        );
+    }
+    if limit > 1000 {
+        return emit_inbox_events_error(
+            fmt,
+            "invalid_limit",
+            "--limit must be between 1 and 1000",
+            serde_json::json!({ "provided": limit, "min": 1, "max": 1000 }),
+        );
+    }
+
+    let agent_name = agent
+        .or_else(|| std::env::var("AGENT_NAME").ok())
+        .or_else(|| std::env::var("AGENT_MAIL_AGENT").ok())
+        .filter(|value| !value_looks_like_template(value));
+    let Some(agent_name) = agent_name else {
+        return emit_inbox_events_error(
+            fmt,
+            "agent_required",
+            "agent is required; pass --agent or set AGENT_MAIL_AGENT",
+            serde_json::json!({}),
+        );
+    };
+    let project_key = project
+        .or_else(|| std::env::var("AGENT_MAIL_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        });
+    if value_looks_like_template(&project_key) {
+        return emit_inbox_events_error(
+            fmt,
+            "project_required",
+            "project is required; pass --project or set AGENT_MAIL_PROJECT",
+            serde_json::json!({}),
+        );
+    }
+
+    let direct_config = InboxEventsDirectConfig {
+        project_key: project_key.clone(),
+        agent_name: agent_name.clone(),
+        after,
+        limit,
+        position_now,
+    };
+    let daemon_reachable = direct && process_owner_port_reachable(&host, port);
+    let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
+    let result = if use_daemon {
+        let config = Config::from_env();
+        let rpc_config = resolve_check_inbox_rpc_config_reader(
+            |key| std::env::var(key).ok(),
+            &project_key,
+            &agent_name,
+            &host,
+            port,
+            &config.http_path,
+        );
+        let server_urls = rpc_config.server_urls.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|error| CliError::Other(format!("runtime error: {error}")));
+        match runtime {
+            Ok(runtime) => {
+                let daemon_result = runtime.block_on(async {
+                    fetch_inbox_events_via_jsonrpc_with_fallback(
+                        &rpc_config,
+                        &server_urls,
+                        after,
+                        limit,
+                        position_now,
+                    )
+                    .await
+                });
+                if direct && daemon_result.is_err() {
+                    inbox_events_direct(&direct_config)
+                } else {
+                    daemon_result
+                }
+            }
+            Err(error) => Err(InboxEventsReadError::Other(error)),
+        }
+    } else {
+        inbox_events_direct(&direct_config)
+    };
+
+    let page = match result {
+        Ok(page) => page,
+        Err(InboxEventsReadError::CursorExpired {
+            after,
+            oldest_available_cursor,
+        }) => {
+            return emit_inbox_events_error(
+                fmt,
+                "cursor_expired",
+                "cursor is older than retained delivery history",
+                serde_json::json!({
+                    "after": after,
+                    "oldest_available_cursor": oldest_available_cursor,
+                }),
+            );
+        }
+        Err(InboxEventsReadError::CursorAhead { after, tail_cursor }) => {
+            return emit_inbox_events_error(
+                fmt,
+                "cursor_ahead",
+                "cursor is beyond the durable delivery tail",
+                serde_json::json!({ "after": after, "tail_cursor": tail_cursor }),
+            );
+        }
+        Err(InboxEventsReadError::Other(error)) => {
+            return emit_inbox_events_error(
+                fmt,
+                "inbox_events_unavailable",
+                &error.to_string(),
+                serde_json::json!({}),
+            );
+        }
+    };
+    let data = serde_json::json!({
+        "events": page.events,
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+        "oldest_available_cursor": page.oldest_available_cursor,
+        "tail_cursor": page.tail_cursor,
+    });
+    output::emit_output(&data, fmt, || {
+        if position_now {
+            ftui_runtime::ftui_println!("durable inbox cursor: {}", page.tail_cursor);
+            return;
+        }
+        let mut table = output::CliTable::new(vec!["CURSOR", "MESSAGE", "FROM", "SUBJECT"]);
+        for event in &page.events {
+            table.add_row(vec![
+                event
+                    .get("cursor")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default()
+                    .to_string(),
+                event
+                    .get("message_id")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default()
+                    .to_string(),
+                event
+                    .get("from")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                event
+                    .get("subject")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ]);
+        }
+        table.print();
+        ftui_runtime::ftui_println!(
+            "next_cursor={} has_more={} tail_cursor={}",
+            page.next_cursor,
+            page.has_more,
+            page.tail_cursor
+        );
+    });
+    Ok(())
+}
+
+fn emit_inbox_events_error(
+    fmt: output::CliOutputFormat,
+    code: &str,
+    message: &str,
+    details: serde_json::Value,
+) -> CliResult<()> {
+    let payload = serde_json::json!({
+        "status": "error",
+        "code": code,
+        "message": message,
+        "details": details,
+    });
+    output::emit_output(&payload, fmt, || {
+        ftui_runtime::ftui_eprintln!("inbox-events {code}: {message}");
+    });
+    Err(CliError::ExitCode(1))
 }
 
 fn normalize_http_path(raw: &str) -> String {
@@ -40286,6 +40554,98 @@ http_headers = { Authorization = "Bearer secret" }
         // GH#207: check-inbox is a non-consuming peek — it must always ask
         // the daemon's fetch_inbox NOT to mark the returned messages read.
         assert_eq!(payload["params"]["arguments"]["mark_read"], false);
+    }
+
+    #[test]
+    fn inbox_events_jsonrpc_request_uses_delivery_cursor_not_message_id() {
+        let config = CheckInboxRpcConfig {
+            server_url: "http://127.0.0.1:8765/mcp/".to_string(),
+            server_urls: vec!["http://127.0.0.1:8765/mcp/".to_string()],
+            bearer_token: None,
+            project_key: "/tmp/proj".to_string(),
+            agent_name: "BlueLake".to_string(),
+            limit: 10,
+            include_bodies: false,
+            timeout_seconds: 3,
+        };
+        let payload = build_fetch_inbox_events_jsonrpc_request(&config, Some(41), 25, false);
+
+        assert_eq!(payload["params"]["name"], "fetch_inbox_events");
+        assert_eq!(payload["params"]["arguments"]["after"], 41);
+        assert_eq!(payload["params"]["arguments"]["limit"], 25);
+        assert_eq!(payload["params"]["arguments"]["position_now"], false);
+    }
+
+    #[test]
+    fn inbox_events_response_requires_body_free_page_shape() {
+        let page = parse_inbox_events_page(serde_json::json!({
+            "events": [{
+                "cursor": 7,
+                "message_id": 123,
+                "kind": "to",
+                "delivered_ts": "2026-08-12T00:00:00Z",
+                "subject": "deploy",
+                "from": "RedHarbor"
+            }],
+            "next_cursor": 7,
+            "has_more": false,
+            "oldest_available_cursor": null,
+            "tail_cursor": 7
+        }))
+        .expect("valid body-free page");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_cursor, 7);
+        assert!(page.oldest_available_cursor.is_none());
+
+        let error = parse_inbox_events_page(serde_json::json!({
+            "events": [{ "cursor": 8, "body_md": "must never be exposed" }],
+            "next_cursor": 8,
+            "has_more": false,
+            "oldest_available_cursor": 8,
+            "tail_cursor": 8
+        }))
+        .expect_err("body-bearing event response must fail closed");
+        assert!(matches!(error, InboxEventsReadError::Other(_)));
+    }
+
+    #[test]
+    fn inbox_events_jsonrpc_cursor_errors_preserve_restart_coordinates() {
+        let expired = parse_inbox_events_cursor_error(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "message": "inbox delivery cursor 4 expired",
+                "data": { "error": {
+                    "type": "CURSOR_EXPIRED",
+                    "message": "cursor_expired after=4 oldest_available_cursor=9",
+                    "data": { "after": 4, "oldest_available_cursor": 9 }
+                }}
+            }
+        }));
+        assert!(matches!(
+            expired,
+            Some(InboxEventsReadError::CursorExpired {
+                after: 4,
+                oldest_available_cursor: 9
+            })
+        ));
+
+        let ahead = parse_inbox_events_cursor_error(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "data": { "error": {
+                    "type": "CURSOR_AHEAD",
+                    "message": "cursor_ahead after=15 tail_cursor=12",
+                    "data": { "after": 15, "tail_cursor": 12 }
+                }}
+            }
+        }));
+        assert!(matches!(
+            ahead,
+            Some(InboxEventsReadError::CursorAhead {
+                after: 15,
+                tail_cursor: 12
+            })
+        ));
     }
 
     #[test]
@@ -73963,6 +74323,37 @@ pub struct CheckInboxRpcResult {
     pub messages: Vec<CheckInboxMessage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboxEventsDirectConfig {
+    project_key: String,
+    agent_name: String,
+    after: Option<i64>,
+    limit: usize,
+    position_now: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboxEventsPage {
+    events: Vec<serde_json::Value>,
+    next_cursor: i64,
+    has_more: bool,
+    oldest_available_cursor: Option<i64>,
+    tail_cursor: i64,
+}
+
+#[derive(Debug)]
+enum InboxEventsReadError {
+    CursorExpired {
+        after: i64,
+        oldest_available_cursor: i64,
+    },
+    CursorAhead {
+        after: i64,
+        tail_cursor: i64,
+    },
+    Other(CliError),
+}
+
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -75171,6 +75562,273 @@ async fn fetch_inbox_via_jsonrpc_with_fallback(
     }
     attempt_config.server_urls = merged;
     fetch_inbox_via_jsonrpc(&attempt_config).await
+}
+
+fn build_fetch_inbox_events_jsonrpc_request(
+    config: &CheckInboxRpcConfig,
+    after: Option<i64>,
+    limit: usize,
+    position_now: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "inbox-events",
+        "method": "tools/call",
+        "params": {
+            "name": "fetch_inbox_events",
+            "arguments": {
+                "project_key": config.project_key,
+                "agent_name": config.agent_name,
+                "after": after,
+                "limit": limit,
+                "position_now": position_now,
+            }
+        }
+    })
+}
+
+fn parse_inbox_events_page(
+    value: serde_json::Value,
+) -> Result<InboxEventsPage, InboxEventsReadError> {
+    let value = coerce_tool_result_json(value).ok_or_else(|| {
+        InboxEventsReadError::Other(CliError::Other(
+            "unexpected fetch_inbox_events response shape".to_string(),
+        ))
+    })?;
+    let events = value
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            InboxEventsReadError::Other(CliError::Other(
+                "fetch_inbox_events response missing events array".to_string(),
+            ))
+        })?;
+    if events.iter().any(|event| event.get("body_md").is_some()) {
+        return Err(InboxEventsReadError::Other(CliError::Other(
+            "fetch_inbox_events response illegally included message body content".to_string(),
+        )));
+    }
+    let next_cursor = value
+        .get("next_cursor")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            InboxEventsReadError::Other(CliError::Other(
+                "fetch_inbox_events response missing next_cursor".to_string(),
+            ))
+        })?;
+    let has_more = value
+        .get("has_more")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            InboxEventsReadError::Other(CliError::Other(
+                "fetch_inbox_events response missing has_more".to_string(),
+            ))
+        })?;
+    let oldest_available_cursor = match value.get("oldest_available_cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(cursor) => Some(cursor.as_i64().ok_or_else(|| {
+            InboxEventsReadError::Other(CliError::Other(
+                "fetch_inbox_events response has invalid oldest_available_cursor".to_string(),
+            ))
+        })?),
+    };
+    let tail_cursor = value
+        .get("tail_cursor")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            InboxEventsReadError::Other(CliError::Other(
+                "fetch_inbox_events response missing tail_cursor".to_string(),
+            ))
+        })?;
+    Ok(InboxEventsPage {
+        events,
+        next_cursor,
+        has_more,
+        oldest_available_cursor,
+        tail_cursor,
+    })
+}
+
+fn parse_inbox_events_cursor_error(payload: &serde_json::Value) -> Option<InboxEventsReadError> {
+    let tool_error = payload.pointer("/error/data/error")?;
+    let error_type = tool_error.get("type")?.as_str()?;
+    let details = tool_error.get("data").unwrap_or(&serde_json::Value::Null);
+    let message = tool_error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+        })?;
+    let after = details
+        .get("after")
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| inbox_events_cursor_number(message, "after"))?;
+
+    match error_type {
+        "CURSOR_EXPIRED" => details
+            .get("oldest_available_cursor")
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| inbox_events_cursor_number(message, "oldest_available_cursor"))
+            .map(
+                |oldest_available_cursor| InboxEventsReadError::CursorExpired {
+                    after,
+                    oldest_available_cursor,
+                },
+            ),
+        "CURSOR_AHEAD" => details
+            .get("tail_cursor")
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| inbox_events_cursor_number(message, "tail_cursor"))
+            .map(|tail_cursor| InboxEventsReadError::CursorAhead { after, tail_cursor }),
+        _ => None,
+    }
+}
+
+fn inbox_events_cursor_number(message: &str, key: &str) -> Option<i64> {
+    let (_, value) = message.split_once(&format!("{key}="))?;
+    value
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(|ch: char| !ch.is_ascii_digit() && ch != '-')
+        .parse()
+        .ok()
+}
+
+async fn fetch_inbox_events_via_jsonrpc_with_fallback(
+    config: &CheckInboxRpcConfig,
+    server_urls: &[String],
+    after: Option<i64>,
+    limit: usize,
+    position_now: bool,
+) -> Result<InboxEventsPage, InboxEventsReadError> {
+    let mut urls = Vec::with_capacity(config.server_urls.len() + server_urls.len() + 1);
+    urls.push(config.server_url.clone());
+    for url in server_urls.iter().chain(config.server_urls.iter()) {
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.clone());
+        }
+    }
+
+    let mut last_error = None;
+    for server_url in urls {
+        let payload = match post_jsonrpc_request(
+            &server_url,
+            config.bearer_token.as_deref(),
+            &build_fetch_inbox_events_jsonrpc_request(config, after, limit, position_now),
+            config.timeout_seconds,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = Some(InboxEventsReadError::Other(error));
+                continue;
+            }
+        };
+        if let Some(cursor_error) = parse_inbox_events_cursor_error(&payload) {
+            return Err(cursor_error);
+        }
+        if let Some(error) = parse_jsonrpc_error(&payload) {
+            last_error = Some(InboxEventsReadError::Other(CliError::Other(error)));
+            continue;
+        }
+        let Some(result) = payload.get("result").cloned() else {
+            last_error = Some(InboxEventsReadError::Other(CliError::Other(
+                "missing JSON-RPC result payload".to_string(),
+            )));
+            continue;
+        };
+        match parse_inbox_events_page(result) {
+            Ok(page) => return Ok(page),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        InboxEventsReadError::Other(CliError::Other(
+            "no server URLs configured for inbox-events HTTP mode".to_string(),
+        ))
+    }))
+}
+
+fn inbox_events_page_from_direct(
+    page: mcp_agent_mail_db::sync::InboxDeliveryEventPage,
+    position_now: bool,
+) -> InboxEventsPage {
+    let events = if position_now {
+        Vec::new()
+    } else {
+        page.events
+            .into_iter()
+            .map(|event| {
+                serde_json::json!({
+                    "cursor": event.seq,
+                    "message_id": event.message_id,
+                    "kind": event.kind,
+                    "delivered_ts": format_micros_as_iso(event.delivered_ts),
+                    "subject": event.subject,
+                    "from": event.sender_name,
+                    "importance": event.importance,
+                    "ack_required": event.ack_required,
+                })
+            })
+            .collect()
+    };
+    InboxEventsPage {
+        events,
+        next_cursor: if position_now {
+            page.tail_cursor
+        } else {
+            page.next_cursor
+        },
+        has_more: !position_now && page.has_more,
+        oldest_available_cursor: page.oldest_available_cursor,
+        tail_cursor: page.tail_cursor,
+    }
+}
+
+fn inbox_events_direct(
+    config: &InboxEventsDirectConfig,
+) -> Result<InboxEventsPage, InboxEventsReadError> {
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)
+        .map_err(InboxEventsReadError::Other)?;
+    let project = crate::context::resolve_project(read_db.conn(), &config.project_key)
+        .map_err(InboxEventsReadError::Other)?;
+    let agent_id = resolve_agent_id_for_inbox_check(read_db.conn(), project.id, &config.agent_name)
+        .map_err(InboxEventsReadError::Other)?;
+    let page = mcp_agent_mail_db::sync::inbox_delivery_events_from_conn(
+        read_db.conn(),
+        project.id,
+        agent_id,
+        if config.position_now {
+            None
+        } else {
+            config.after
+        },
+        config.limit,
+    );
+    match page {
+        Ok(page) => Ok(inbox_events_page_from_direct(page, config.position_now)),
+        Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorExpired {
+            after,
+            oldest_available,
+        }) => Err(InboxEventsReadError::CursorExpired {
+            after,
+            oldest_available_cursor: oldest_available,
+        }),
+        Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorAhead { after, tail }) => {
+            Err(InboxEventsReadError::CursorAhead {
+                after,
+                tail_cursor: tail,
+            })
+        }
+        Err(error) => Err(InboxEventsReadError::Other(CliError::Other(
+            error.to_string(),
+        ))),
+    }
 }
 
 /// Configuration for direct DB inbox check (bypasses HTTP).

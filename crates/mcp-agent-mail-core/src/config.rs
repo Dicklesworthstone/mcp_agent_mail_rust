@@ -1425,6 +1425,7 @@ impl Default for Config {
                 "search_messages".to_string(),
                 "summarize_thread".to_string(),
                 "list_contacts".to_string(),
+                "fetch_inbox_events".to_string(),
                 "fetch_inbox_product".to_string(),
                 "search_messages_product".to_string(),
                 "summarize_thread_product".to_string(),
@@ -4395,6 +4396,13 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "fetch_inbox"),
             "fetch_inbox records read state and must require a writer role"
+        );
+        assert!(
+            config
+                .http_rbac_readonly_tools
+                .iter()
+                .any(|tool| tool == "fetch_inbox_events"),
+            "fetch_inbox_events is non-mutating and should remain reader-accessible"
         );
         assert!(
             config

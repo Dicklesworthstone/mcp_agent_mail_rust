@@ -163,16 +163,16 @@ use mcp_agent_mail_db::{
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
-    CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxProduct,
-    FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation, HealthCheck,
-    IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
-    MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
-    MailboxResource, MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource,
-    OutboxResource, ProductDetailsResource, ProductsLink, ProjectDetailsResource,
-    ProjectsListQueryResource, ProjectsListResource, RegisterAgent, ReleaseBuildSlot,
-    ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage, RequestContact,
-    ResolvePaneIdentity, RespondContact, SearchMessages, SearchMessagesProduct, SendMessage,
-    SetContactPolicy, SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource,
+    CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxEvents,
+    FetchInboxProduct, FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation,
+    HealthCheck, IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents,
+    ListContacts, MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread,
+    MacroStartSession, MailboxResource, MailboxWithCommitsResource, MarkMessageRead,
+    MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
+    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
+    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
+    RequestContact, ResolvePaneIdentity, RespondContact, SearchMessages, SearchMessagesProduct,
+    SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource,
     ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource,
     ToolingDirectoryQueryResource, ToolingDirectoryResource, ToolingLocksQueryResource,
     ToolingLocksResource, ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource,
@@ -645,6 +645,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "fetch_inbox",
         clusters::MESSAGING,
         FetchInbox,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "fetch_inbox_events",
+        clusters::MESSAGING,
+        FetchInboxEvents,
     );
     let server = add_tool(
         server,
@@ -32778,6 +32785,35 @@ first body
             }),
         );
         assert_forbidden(&resp);
+    }
+
+    #[test]
+    fn rbac_reader_role_on_durable_inbox_events_allowed() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "name": "fetch_inbox_events", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        assert!(
+            resp.is_none(),
+            "durable inbox event reads do not mark messages read and must be reader-accessible"
+        );
     }
 
     #[test]

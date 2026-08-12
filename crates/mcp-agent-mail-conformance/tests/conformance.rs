@@ -2274,6 +2274,7 @@ fn rust_native_fixture_coverage_matches_classification() {
     let expected: BTreeSet<String> = [
         "check_file_reservation_conflicts",
         "cleanup_pane_identities",
+        "fetch_inbox_events",
         "list_agents",
         "resolve_pane_identity",
     ]

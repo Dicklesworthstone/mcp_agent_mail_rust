@@ -1,6 +1,6 @@
 //! MCP tools and resources implementation for MCP Agent Mail
 //!
-//! This crate provides implementations for all 38 MCP tools:
+//! This crate provides implementations for all 39 MCP tools:
 //! - Infrastructure cluster (4 tools)
 //! - Identity cluster (6 tools)
 //! - Messaging cluster (6 tools)

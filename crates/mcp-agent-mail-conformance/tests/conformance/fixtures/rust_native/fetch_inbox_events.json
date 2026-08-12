@@ -1,0 +1,53 @@
+{
+  "version": "rust-native@2026-08-12",
+  "generated_at": "2026-08-12T00:00:00Z",
+  "tool": "fetch_inbox_events",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "position_now_empty_recipient",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/inbox-events-empty",
+        "agent_name": "BlueLake",
+        "position_now": true
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/inbox-events-empty"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/inbox-events-empty",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "BlueLake"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/fetch_inbox_events/position_now_empty_recipient.output.json"
+      }
+    },
+    {
+      "name": "position_now_rejects_after",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/inbox-events-invalid",
+        "agent_name": "BlueLake",
+        "after": 1,
+        "position_now": true
+      },
+      "expect": {
+        "err": {
+          "error_type": "INVALID_ARGUMENT",
+          "message_contains": "position_now cannot be combined with after"
+        }
+      }
+    }
+  ]
+}

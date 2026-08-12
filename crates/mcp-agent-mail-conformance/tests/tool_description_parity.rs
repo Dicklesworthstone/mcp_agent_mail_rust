@@ -44,6 +44,7 @@ const PYTHON_ONLY_TOOLS: &[&str] = &[
 const RUST_NATIVE_TOOLS: &[&str] = &[
     "check_file_reservation_conflicts",
     "cleanup_pane_identities",
+    "fetch_inbox_events",
     "list_agents",
     "resolve_pane_identity",
 ];
@@ -514,7 +515,7 @@ fn cluster_identity_descriptions() {
     check_cluster_descriptions(&["register_agent", "create_agent_identity", "whois"]);
 }
 
-/// Messaging cluster: send_message, reply_message, fetch_inbox, mark_message_read, acknowledge_message
+/// Messaging cluster: send_message, reply_message, fetch_inbox, fetch_inbox_events, mark_message_read, acknowledge_message
 #[test]
 fn cluster_messaging_descriptions() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -522,6 +523,7 @@ fn cluster_messaging_descriptions() {
         "send_message",
         "reply_message",
         "fetch_inbox",
+        "fetch_inbox_events",
         "mark_message_read",
         "acknowledge_message",
     ]);
