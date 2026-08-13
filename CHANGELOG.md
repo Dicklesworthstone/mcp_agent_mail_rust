@@ -12,6 +12,144 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## v0.3.26 — 2026-08-13 (pending release)
+
+Recovery-convergence and field-report release. v0.3.24 (the last published
+build) is ~290 commits stale and is the version implicated in most open field
+reports; this release ships every fix landed since, plus a sweep that closed
+or advanced all sixteen open GitHub issues. Upgrading is strongly recommended:
+one production mailbox crash-looped through **75,347 systemd restarts** on a
+failure mode this release removes.
+
+### Fixed — recovery must always converge
+
+- **Reconstruct can no longer destroy real messages on canonical-id
+  collisions ([#213](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/213) family, br-r6awv).**
+  Cross-project (and same-project generation-reuse) collision losers were
+  inserted mid-walk under `max(rowid)+1`, which could occupy a *later* archive
+  file's canonical id; that real file was then silently dropped as a
+  "duplicate". Collision losers now insert in a second pass after every
+  canonical id is settled; duplicate detection compares identity
+  (`created_ts` + subject), never numeric id alone; the canonical insert is a
+  plain `INSERT` (loud, not destructive); salvage recognizes content the
+  candidate already carries under a different id and maps instead of
+  re-inserting.
+- **A duplicate-polluted or id-reused source can no longer wedge promotion
+  forever.** The promotion guard treats reduced multiplicity of a surviving
+  identity as deduplication, not loss (only fully absent identities refuse
+  promotion), and canonical files without parseable timestamps get a
+  deterministic `created_ts` from the filename stamp instead of a fresh
+  `now_micros()` per parse — which had bred new junk rows on every rebuild.
+- **Every integrity surface stops under-reporting
+  ([#214](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/214)).**
+  The canonical-disagreement fail-open is narrowed to the known COLLATE NOCASE
+  false-positive class; anything else keeps the primary probe's verdict. The
+  GH#213 CI tripwire now actually probes (NOT INDEXED table scans, forced
+  index plans, `sqlite_master`-enumerated indexes) instead of reading one
+  btree five ways. `health_check` retains failed full-integrity evidence.
+- **Archive maintenance self-heals stale locks
+  ([#233](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/233),
+  [#234](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/234)).**
+  A `maintenance.lock` left by a killed pre-0.3.25 run is quarantined (rename,
+  never delete) once provably unowned and stale; the reap is TOCTOU-hardened
+  with dev/ino fingerprints; evidence records move out of `.git/objects/` and
+  are pruned move-only; an evidence-write failure under disk pressure no
+  longer aborts the one job that reclaims space; a fresh repo's first cycle
+  no longer fails on zero packfiles.
+
+### Fixed — security
+
+- **Loopback RBAC no longer fail-opens behind reverse proxies
+  ([#231](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/231)).**
+  The unauthenticated loopback writer grant (which fixed the fresh-install
+  403s) now additionally requires no forwarded headers and a loopback peer
+  address, so a proxied deployment cannot hand writer roles to remote
+  callers. RBAC denials are diagnosable: the 403 names the applied role, the
+  denied tool, and the remediation, and emits an `http_rbac_denied` warning.
+- **`reply_message` honors the fail-closed send profile
+  ([#237](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/237)).**
+  Reply was a token-free path to speak as any registered agent while the
+  profile was on; it now routes through the same sender verification as
+  `send_message`, before any write.
+- **The pre-commit guard fails closed on archive-resolution errors
+  ([#228](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/228)).**
+  Permission/IO errors during archive resolution were coerced into
+  "no project matches → allow"; a chmod-000 storage root could bypass an
+  active exclusive reservation. Resolution errors now route through
+  `fail_closed` (honoring `AGENT_MAIL_GUARD_MODE=warn` and advertising
+  `AGENT_MAIL_BYPASS=1`).
+
+### Fixed — field reports
+
+- **macOS: `am mail search` and share/export work with `/var`-rooted TMPDIRs
+  ([#230](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/230)).**
+  One strict firmlink predicate in core now backs every symlink guard,
+  including all six share-crate export/deploy paths.
+- **Windows: extended-length (`\\?\`) storage roots
+  ([#216](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/216)).**
+  Project identity (`human_key` and slug) no longer persists the verbatim
+  spelling, with upgrade-in-place matching for rows written by older builds.
+- **`am inbox` no longer consumes messages it never displays
+  ([#229](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/229)):**
+  robot inbox listings pass `mark_read: false`; the unread-only default is
+  documented.
+- **`resource://file_reservations` reads through a query-only pool
+  ([#241](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/241))**
+  and no longer fails with "attempt to write a readonly database".
+- **Idle mailboxes stop logging `no such table: atc_experiences` every
+  ~6 minutes ([#232](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/232)):**
+  ATC ticks gate on sidecar schema presence and never create a 0-byte
+  sidecar as a side effect.
+- **Inbox-event cursors bootstrap correctly
+  ([#238](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/238)):**
+  a monitor positioned on an empty inbox no longer gets `CURSOR_EXPIRED`
+  when unrelated recipients advance the global sequence; expiry requires
+  actual pruning evidence.
+- **`am legacy import` preserves the source database
+  ([#236](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/236)):**
+  copy-only import, `immutable=1` source opens (WAL-safe via staging copy),
+  failure receipts with staged partial targets so retries are unblocked, and
+  an already-satisfied v20 migration is detected without triggering the
+  engine schema reload.
+- **Backup rotation stages instead of deleting
+  ([#210](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/210)):**
+  evictions move to `doctor/reclaimable/rotation-<ts>/`;
+  `AM_BACKUP_ROTATION_DELETE=1` restores the old behavior; recovery
+  retention is byte-budgeted per category.
+
+### Added
+
+- **`get_message_delivery_receipt` (tool count 39 → 40,
+  [#218](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/218)):**
+  message-ID-bound delivery facts — persisted, signaled (via the durable
+  signal-receipt ledger), and acknowledged per recipient — now registered and
+  reachable.
+- **`am agents resolve-pane`
+  ([#240](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/240)):**
+  read-only pane-identity resolution with identity source categories.
+- **`idempotency_key` on `send_message` / `reply_message` /
+  `acknowledge_message`:** exact retries after timeouts replay the original
+  grant instead of duplicating.
+- **`am inbox-events` / `fetch_inbox_events`:** durable, restart-safe
+  per-recipient delivery cursors ([#238](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/238)).
+
+---
+
+## v0.3.25 — 2026-07-25 **[Tag only]**
+
+Tagged but never published. Contains the GH#208 recovery-guard
+identity/volatile split, the GH#229 robot-inbox `mark_read` fix, and the
+GH#203/#204 follow-ups. All of it ships in v0.3.26.
+
+---
+
+## v0.3.24 — 2026-07-25 **[Release]**
+
+Point release after v0.3.23; see the git history between the tags for the
+full commit-level detail.
+
+---
+
 ## [v0.3.23](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.23) — 2026-07-24 **[Release]**
 
 Reliability release. v0.3.22 aborted the daemon on Linux at production scale
