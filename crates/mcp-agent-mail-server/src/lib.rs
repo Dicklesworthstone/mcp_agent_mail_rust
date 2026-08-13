@@ -11207,12 +11207,18 @@ impl HttpState {
     ///
     /// A fresh `am serve-http` (and the service unit it installs) binds to
     /// loopback and configures neither bearer nor JWT auth. That local control
-    /// plane must be able to use mutating MCP tools. A no-auth listener exposed
-    /// beyond loopback deliberately keeps the restrictive default role instead.
-    fn unauthenticated_default_rbac_roles(&self) -> Vec<String> {
+    /// plane must be able to use mutating MCP tools (GH#231). The writer grant
+    /// requires the REQUEST to actually be local, not just the bind host: a
+    /// loopback-bound backend behind a reverse proxy receives remote traffic
+    /// on 127.0.0.1, so forwarded headers or a non-loopback peer keep the
+    /// restrictive default role — otherwise this grant would hand writer
+    /// roles to unauthenticated remote callers.
+    fn unauthenticated_default_rbac_roles(&self, req: &Http1Request) -> Vec<String> {
         let loopback_no_auth = self.config.http_bearer_token.is_none()
             && !self.config.http_jwt_enabled
-            && is_loopback_bind_host(&self.config.http_host);
+            && is_loopback_bind_host(&self.config.http_host)
+            && !has_forwarded_headers(req)
+            && is_local_peer_addr(req.peer_addr);
         if loopback_no_auth {
             self.static_bearer_rbac_roles()
         } else {
@@ -11772,7 +11778,7 @@ to skip auth for local requests.</p>
         } else if has_static_bearer {
             (self.static_bearer_rbac_roles(), None)
         } else {
-            (self.unauthenticated_default_rbac_roles(), None)
+            (self.unauthenticated_default_rbac_roles(req), None)
         };
 
         // RBAC (mirrors legacy python behavior)
@@ -11787,6 +11793,30 @@ to skip auth for local requests.</p>
                 .iter()
                 .any(|r| self.config.http_rbac_writer_roles.contains(r));
 
+            // A denial must be diagnosable from the response and the log: the
+            // bare "Forbidden" of GH#231 left operators guessing which role
+            // was applied and why an unauthenticated loopback deploy could
+            // not write.
+            let rbac_denied = |required: &str| {
+                let tool = tool_name.as_deref().unwrap_or("*");
+                tracing::warn!(
+                    event = "http_rbac_denied",
+                    tool,
+                    roles = %roles.join(","),
+                    required,
+                    peer = %req
+                        .peer_addr
+                        .map_or_else(|| "unknown".to_string(), |addr| addr.to_string()),
+                    forwarded = has_forwarded_headers(req),
+                    "RBAC denied tool call"
+                );
+                format!(
+                    "Forbidden: role(s) [{}] cannot call {tool:?} (requires a {required} role). \
+                     Configure HTTP_BEARER_TOKEN/JWT auth, adjust HTTP_RBAC_DEFAULT_ROLE, or use \
+                     a direct loopback connection.",
+                    roles.join(",")
+                )
+            };
             if kind == RequestKind::Resources {
                 // Legacy python allows resources regardless of role membership.
             } else if kind == RequestKind::Tools && json_rpc.method == "tools/call" {
@@ -11798,7 +11828,7 @@ to skip auth for local requests.</p>
                                 json_rpc,
                                 403,
                                 McpErrorCode::ResourceForbidden,
-                                "Forbidden",
+                                &rbac_denied("reader or writer"),
                             ));
                         }
                     } else if !is_writer {
@@ -11807,7 +11837,7 @@ to skip auth for local requests.</p>
                             json_rpc,
                             403,
                             McpErrorCode::ResourceForbidden,
-                            "Forbidden",
+                            &rbac_denied("writer"),
                         ));
                     }
                 } else if !is_writer {
@@ -11816,7 +11846,7 @@ to skip auth for local requests.</p>
                         json_rpc,
                         403,
                         McpErrorCode::ResourceForbidden,
-                        "Forbidden",
+                        &rbac_denied("writer"),
                     ));
                 }
             }
@@ -18929,7 +18959,13 @@ first body
         if let Some(error) = body.get("error") {
             assert_eq!(body["jsonrpc"], "2.0");
             assert_eq!(error["code"], i32::from(McpErrorCode::ResourceForbidden));
-            assert_eq!(error["message"], "Forbidden");
+            // RBAC denials carry a role/tool diagnosis after "Forbidden"
+            // (GH#231); non-RBAC forbidden paths keep the bare word.
+            let message = error["message"].as_str().unwrap_or_default();
+            assert!(
+                message.starts_with("Forbidden"),
+                "unexpected forbidden message: {message}"
+            );
         } else {
             assert_eq!(body["detail"], "Forbidden");
         }
@@ -21977,12 +22013,30 @@ first body
         .expect("serialize json-rpc");
 
         let resp = block_on(state.handle(req));
-        assert_jsonrpc_error_response(
-            &resp,
-            403,
-            serde_json::json!(33),
-            i32::from(McpErrorCode::ResourceForbidden),
-            "Forbidden",
+        assert_rbac_denied_response(&resp, serde_json::json!(33), "reader", "send_message");
+    }
+
+    /// GH#231 diagnosability: an RBAC 403 must name the applied role and the
+    /// denied tool instead of a bare "Forbidden".
+    fn assert_rbac_denied_response(
+        resp: &Http1Response,
+        id: serde_json::Value,
+        role: &str,
+        tool: &str,
+    ) {
+        assert_eq!(resp.status, 403);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("json-rpc error response json");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], id);
+        assert_eq!(
+            body["error"]["code"],
+            i32::from(McpErrorCode::ResourceForbidden)
+        );
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("Forbidden") && message.contains(role) && message.contains(tool),
+            "RBAC denial must name the role and tool: {message}"
         );
     }
 
@@ -22043,13 +22097,68 @@ first body
         .expect("serialize json-rpc");
 
         let resp = block_on(state.handle(req));
-        assert_jsonrpc_error_response(
-            &resp,
-            403,
-            serde_json::json!(35),
-            i32::from(McpErrorCode::ResourceForbidden),
-            "Forbidden",
+        assert_rbac_denied_response(&resp, serde_json::json!(35), "reader", "send_message");
+    }
+
+    /// GH#231 fail-open regression: a loopback-BOUND backend behind a reverse
+    /// proxy receives remote traffic on 127.0.0.1. Forwarded headers must keep
+    /// the restrictive default role — the unauthenticated writer grant is for
+    /// direct local callers only.
+    #[test]
+    fn loopback_bind_with_forwarded_header_keeps_send_message_forbidden() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        for (header, value) in [
+            ("X-Forwarded-For", "203.0.113.9"),
+            ("Forwarded", "for=203.0.113.9"),
+            ("X-Forwarded-Host", "mail.example.com"),
+            ("X-Forwarded-Proto", "https"),
+        ] {
+            let mut req = make_request_with_peer_addr(
+                Http1Method::Post,
+                "/api",
+                &[(header, value)],
+                Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+            );
+            req.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({ "name": "send_message", "arguments": {} })),
+                36_i64,
+            ))
+            .expect("serialize json-rpc");
+
+            let resp = block_on(state.handle(req));
+            assert_eq!(
+                resp.status, 403,
+                "forwarded header {header} must keep the reader default"
+            );
+        }
+    }
+
+    /// GH#231 fail-open regression: a non-loopback PEER on a loopback bind
+    /// (misconfigured forwarding, container networking) must not receive the
+    /// unauthenticated writer grant.
+    #[test]
+    fn loopback_bind_with_non_local_peer_keeps_send_message_forbidden() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api",
+            &[],
+            Some(SocketAddr::from(([203, 0, 113, 9], 4321))),
         );
+        req.body = serde_json::to_vec(&JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({ "name": "send_message", "arguments": {} })),
+            37_i64,
+        ))
+        .expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_rbac_denied_response(&resp, serde_json::json!(37), "reader", "send_message");
     }
 
     #[test]
@@ -22224,12 +22333,11 @@ first body
 
         // Reader role is forbidden for send_message (writer tool).
         let reader_resp = block_on(state.handle(make_send_message_call(reader_auth.as_str(), 40)));
-        assert_jsonrpc_error_response(
+        assert_rbac_denied_response(
             &reader_resp,
-            403,
             serde_json::json!(40),
-            i32::from(McpErrorCode::ResourceForbidden),
-            "Forbidden",
+            "reader",
+            "send_message",
         );
 
         // First writer request with same sub should still pass rate limit gate.
