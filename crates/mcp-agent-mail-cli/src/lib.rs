@@ -28541,6 +28541,8 @@ fn doctor_database_fix_strategy_read_only_probes(
         &fk_violations,
         &missing_agent_only_recipient_rowids,
     );
+    let preserved_orphaned_file_reservations =
+        doctor_preserved_orphaned_file_reservation_count(&fk_violations);
     if repairable_fk_violations > 0 || missing_message_recipients > 0 {
         let mut details = Vec::new();
         if repairable_fk_violations > 0 {
@@ -28561,6 +28563,12 @@ fn doctor_database_fix_strategy_read_only_probes(
                 missing_agent_only_recipients
             ));
         }
+        if preserved_orphaned_file_reservations > 0 {
+            details.push(format!(
+                "{} preserved orphaned file-reservation row(s)",
+                preserved_orphaned_file_reservations
+            ));
+        }
         return Ok(DoctorDatabaseFixStrategy::Repair(format!(
             "Database consistency issues detected in {} ({}): {}",
             opened.opened_path,
@@ -28568,12 +28576,32 @@ fn doctor_database_fix_strategy_read_only_probes(
             details.join(", ")
         )));
     }
-    if missing_agent_only_recipients > 0 {
+    if missing_agent_only_recipients > 0 || preserved_orphaned_file_reservations > 0 {
+        // br-d75xt: orphaned-holder file_reservations are preserved-by-design (kept
+        // visible, and their leases lapse via expires_ts), so they are NOT counted
+        // repairable — this attests them and returns None instead of routing to a
+        // Repair that never touches them, which is what looped self-heal forever.
+        let mut preserved = Vec::new();
+        if missing_agent_only_recipients > 0 {
+            preserved.push(format!(
+                "{} recipient row(s) with missing agent metadata \
+                 (run `am doctor repair --prune-orphan-recipients` to delete them)",
+                missing_agent_only_recipients
+            ));
+        }
+        if preserved_orphaned_file_reservations > 0 {
+            preserved.push(format!(
+                "{} orphaned file-reservation row(s) whose holder agent/project no longer exists \
+                 (kept visible as `[unknown-agent-<id>]`; leases lapse via expires_ts)",
+                preserved_orphaned_file_reservations
+            ));
+        }
         return Ok(DoctorDatabaseFixStrategy::None(format!(
             "Database at {} passed file, integrity, and relational consistency probes; \
-             preserved {} recipient row(s) with missing agent metadata \
-             (run `am doctor repair --prune-orphan-recipients` to delete them); diagnostics: {}",
-            opened.opened_path, missing_agent_only_recipients, relational_diagnostic_detail
+             preserved {}; diagnostics: {}",
+            opened.opened_path,
+            preserved.join("; "),
+            relational_diagnostic_detail
         )));
     }
 
@@ -28867,6 +28895,8 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         &fk_violations,
         &missing_agent_only_recipient_rowids,
     );
+    let preserved_orphaned_file_reservations =
+        doctor_preserved_orphaned_file_reservation_count(&fk_violations);
     if repairable_fk_violations > 0 || missing_message_recipients > 0 {
         let mut details = Vec::new();
         if repairable_fk_violations > 0 {
@@ -28887,6 +28917,12 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                 missing_agent_only_recipients
             ));
         }
+        if preserved_orphaned_file_reservations > 0 {
+            details.push(format!(
+                "{} preserved orphaned file-reservation row(s)",
+                preserved_orphaned_file_reservations
+            ));
+        }
         return Ok(DoctorDatabaseFixStrategy::Repair(format!(
             "Database consistency issues detected in {} ({}): {}",
             opened.opened_path,
@@ -28894,12 +28930,32 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             details.join(", ")
         )));
     }
-    if missing_agent_only_recipients > 0 {
+    if missing_agent_only_recipients > 0 || preserved_orphaned_file_reservations > 0 {
+        // br-d75xt: orphaned-holder file_reservations are preserved-by-design (kept
+        // visible, and their leases lapse via expires_ts), so they are NOT counted
+        // repairable — this attests them and returns None instead of routing to a
+        // Repair that never touches them, which is what looped self-heal forever.
+        let mut preserved = Vec::new();
+        if missing_agent_only_recipients > 0 {
+            preserved.push(format!(
+                "{} recipient row(s) with missing agent metadata \
+                 (run `am doctor repair --prune-orphan-recipients` to delete them)",
+                missing_agent_only_recipients
+            ));
+        }
+        if preserved_orphaned_file_reservations > 0 {
+            preserved.push(format!(
+                "{} orphaned file-reservation row(s) whose holder agent/project no longer exists \
+                 (kept visible as `[unknown-agent-<id>]`; leases lapse via expires_ts)",
+                preserved_orphaned_file_reservations
+            ));
+        }
         return Ok(DoctorDatabaseFixStrategy::None(format!(
             "Database at {} passed file, integrity, and relational consistency probes; \
-             preserved {} recipient row(s) with missing agent metadata \
-             (run `am doctor repair --prune-orphan-recipients` to delete them); diagnostics: {}",
-            opened.opened_path, missing_agent_only_recipients, relational_diagnostic_detail
+             preserved {}; diagnostics: {}",
+            opened.opened_path,
+            preserved.join("; "),
+            relational_diagnostic_detail
         )));
     }
 
@@ -52113,6 +52169,135 @@ startup_timeout_sec = 42
         assert!(
             !reconstruct_called.get(),
             "missing-agent-only recipient rows should not trigger reconstruction"
+        );
+    }
+
+    fn seed_startup_self_heal_orphaned_file_reservation(db_path: &Path) {
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'startup-orphan-res', '/tmp/startup-orphan-res', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES (1, 1, 'RedLake', 'codex-cli', 'gpt-5', 'startup self-heal test', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert live agent");
+        // Orphaned reservation: agent_id 999 does not exist, so foreign_key_check
+        // reports a file_reservations -> agents violation (the field-report shape:
+        // agent gone, reservation row left behind by a delete that skipped the
+        // agent-delete cascade trigger).
+        conn.execute_raw(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 999, 'src/**', 1, 'ghost lease', 0, 9999999999999999, NULL)",
+        )
+        .expect("insert orphaned file reservation");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint fixture rows");
+        conn.close_sync()
+            .expect("close orphaned reservation fixture db");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
+            .expect("truncate reservation fixture WAL");
+    }
+
+    #[test]
+    fn doctor_repairable_foreign_key_violation_count_excludes_orphaned_file_reservations() {
+        // br-d75xt: file_reservations orphans (missing agent OR project parent) are
+        // preserved-by-design; only the genuinely-repairable violation is counted.
+        let violations = vec![
+            DoctorForeignKeyViolation {
+                table: "file_reservations".to_string(),
+                rowid: 1,
+                parent: "agents".to_string(),
+                fkid: 0,
+            },
+            DoctorForeignKeyViolation {
+                table: "file_reservations".to_string(),
+                rowid: 2,
+                parent: "projects".to_string(),
+                fkid: 0,
+            },
+            DoctorForeignKeyViolation {
+                table: "messages".to_string(),
+                rowid: 3,
+                parent: "projects".to_string(),
+                fkid: 0,
+            },
+        ];
+        let no_preserved_recipients = std::collections::BTreeSet::new();
+        assert_eq!(
+            doctor_preserved_orphaned_file_reservation_count(&violations),
+            2
+        );
+        assert_eq!(
+            doctor_repairable_foreign_key_violation_count(&violations, &no_preserved_recipients),
+            1,
+            "only the messages->projects violation is repairable; the two file_reservations \
+             orphans are preserved-by-design"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_preserves_orphaned_file_reservation_and_does_not_loop() {
+        // br-d75xt regression: an orphaned-holder file_reservations row must be
+        // attested as preserved (strategy None), idempotently across repeated
+        // probes, and must NOT trigger startup repair/reconstruct. Before the fix,
+        // the strategy counted it repairable -> Repair, but repair only pruned
+        // orphaned message_recipients, so the reservation survived and every
+        // startup re-repaired it forever (the macOS field-report loop).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("startup_orphan_reservation.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_startup_self_heal_orphaned_file_reservation(&db_path);
+
+        for pass in 0..2 {
+            match doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy") {
+                DoctorDatabaseFixStrategy::None(detail) => {
+                    assert!(
+                        detail.contains("orphaned file-reservation row")
+                            && detail.contains("holder agent/project no longer exists"),
+                        "pass {pass}: expected preserved orphaned-file-reservation detail, got: {detail}"
+                    );
+                }
+                other => panic!(
+                    "pass {pass}: orphaned file_reservation must not trigger repair (that is the loop): {other:?}"
+                ),
+            }
+        }
+
+        let repair_called = std::cell::Cell::new(false);
+        let reconstruct_called = std::cell::Cell::new(false);
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || {
+                repair_called.set(true);
+                Ok(())
+            },
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should accept preserved orphaned file reservations");
+
+        assert!(
+            !repair_called.get(),
+            "orphaned file_reservation must not trigger startup repair (the endless loop)"
+        );
+        assert!(
+            !reconstruct_called.get(),
+            "orphaned file_reservation must not trigger reconstruction"
         );
     }
 
