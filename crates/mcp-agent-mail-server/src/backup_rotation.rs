@@ -6,9 +6,13 @@
 //! 25 `.corrupt-*`, 17 `.reconstruct-failed-*`, and 40+ `.archive-reconcile-*`
 //! files totaling ~1.3 GB in a single storage_root.
 //!
-//! This module keeps the N most recent of each *kind* and deletes the rest.
-//! Kinds are classified by filename suffix pattern so we never touch the
-//! live DB (`storage.sqlite3`), the Codex sidecar DB, or unrelated files.
+//! This module keeps the N most recent of each *kind* and quarantines the
+//! rest by moving them into `doctor/reclaimable/rotation-<ts>/` inside the
+//! storage root, where an operator (or `am doctor`) can inspect and reclaim
+//! them later. Nothing is hard-deleted unless the operator explicitly opts
+//! back in via `AM_BACKUP_ROTATION_DELETE`. Kinds are classified by filename
+//! suffix pattern so we never touch the live DB (`storage.sqlite3`), the
+//! Codex sidecar DB, or unrelated files.
 //!
 //! Default `keep_per_kind = 3`; override via `AM_BACKUP_KEEP_COUNT`.
 
@@ -60,19 +64,39 @@ impl BackupKind {
 }
 
 /// Report returned by `rotate_storage_backups`. One entry per non-empty kind.
+///
+/// "Staged" means moved into the `doctor/reclaimable/rotation-<ts>/`
+/// quarantine directory (the default); "deleted" means hard-removed, which
+/// only happens behind the explicit `AM_BACKUP_ROTATION_DELETE` opt-in.
+/// Staged bytes are *not* reclaimed disk — they still live in the storage
+/// root until an operator reclaims them — so the fields say what actually
+/// happened rather than claiming savings that didn't occur.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RotateReport {
     pub kept: usize,
-    pub removed: usize,
-    pub bytes_reclaimed: u64,
+    pub staged: usize,
+    pub deleted: usize,
+    pub bytes_staged: u64,
+    pub bytes_deleted: u64,
     pub per_kind: BTreeMap<&'static str, RotateKindSummary>,
+}
+
+impl RotateReport {
+    /// Total files evicted from retention, regardless of whether they were
+    /// staged into quarantine or hard-deleted under the opt-in.
+    #[must_use]
+    pub const fn evicted(&self) -> usize {
+        self.staged.saturating_add(self.deleted)
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RotateKindSummary {
     pub kept: usize,
-    pub removed: usize,
-    pub bytes_reclaimed: u64,
+    pub staged: usize,
+    pub deleted: usize,
+    pub bytes_staged: u64,
+    pub bytes_deleted: u64,
 }
 
 /// Read-only inventory of backup files eligible for rotation.
@@ -100,7 +124,10 @@ pub struct BackupInventoryArtifact {
 ///
 /// Returns `None` for the live DB, Codex DB, and any file that doesn't
 /// match our known backup patterns. This is the *single* place that
-/// decides whether rotation can touch a file.
+/// decides whether a file counts as backup material at all; rotation
+/// additionally skips [`BackupKind::ArchiveReconcile`] (owned by the
+/// recovery-retention reclaim planner) even though it classifies here so
+/// inventory consumers still see it.
 #[must_use]
 pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
     // Explicitly never-delete live state.
@@ -172,6 +199,23 @@ pub fn resolved_keep_per_kind() -> usize {
         .max(MIN_KEEP_PER_KIND)
 }
 
+/// Whether the operator opted back into legacy hard-delete rotation.
+///
+/// Read from `AM_BACKUP_ROTATION_DELETE`. Default (unset or falsy) stages
+/// evicted backups under `doctor/reclaimable/` instead of deleting them, so
+/// rotation never destroys data on its own.
+///
+/// Uses the same truthy vocabulary as `mcp_agent_mail_core`'s bool parsing.
+#[must_use]
+pub fn rotation_delete_opted_in() -> bool {
+    mcp_agent_mail_core::config::process_env_value("AM_BACKUP_ROTATION_DELETE").is_some_and(|v| {
+        matches!(
+            v.trim().to_lowercase().as_str(),
+            "1" | "true" | "t" | "yes" | "y"
+        )
+    })
+}
+
 /// Return the count and bytes of direct backup files eligible for rotation.
 /// Missing storage roots produce an empty inventory, matching rotation's
 /// no-op behavior during first-run bootstrap.
@@ -207,21 +251,27 @@ pub fn inspect_storage_backups(storage_root: &Path) -> std::io::Result<BackupInv
     Ok(inventory)
 }
 
-/// Rotate backup files in `storage_root`, keeping `keep_per_kind` newest of
-/// each kind and deleting the rest.
+/// Rotate backup files in `storage_root`, staging evictions for reclaim.
+///
+/// Keeps `keep_per_kind` newest of each kind and stages the rest into
+/// `<storage_root>/doctor/reclaimable/rotation-<UTC ts>/` for operator
+/// reclaim. With the explicit `AM_BACKUP_ROTATION_DELETE` opt-in the evicted
+/// files are hard-deleted instead (the legacy behavior).
 ///
 /// Non-backup files (live DB, Codex DB, projects/, search_index/, .git/,
 /// etc.) are never touched. Rotation only applies to files classified as
-/// backups.
+/// backups. `storage.sqlite3.archive-reconcile-*` files are additionally
+/// excluded even though they classify as backups — see the comment inside.
 ///
 /// Returns a `RotateReport` with per-kind counts. Errors on individual
-/// deletes are logged and counted as `kept` so partial failures don't mask
-/// themselves.
+/// stage/delete operations are logged and counted as `kept` so partial
+/// failures don't mask themselves.
 pub fn rotate_storage_backups(
     storage_root: &Path,
     keep_per_kind: usize,
 ) -> std::io::Result<RotateReport> {
     let keep = keep_per_kind.max(MIN_KEEP_PER_KIND);
+    let delete_opted_in = rotation_delete_opted_in();
 
     let mut report = RotateReport::default();
     let entries = match fs::read_dir(storage_root) {
@@ -243,6 +293,15 @@ pub fn rotate_storage_backups(
         let Some(kind) = classify_backup_file(&name) else {
             continue;
         };
+        // Single ownership: `storage.sqlite3.archive-reconcile-*` snapshots
+        // are owned by the recovery-retention reclaim planner
+        // (`mcp-agent-mail-db/src/recovery_retention.rs`), which stages them
+        // with its own policy. If rotation also evicted them, a snapshot
+        // could disappear before the planner stages it — so rotation leaves
+        // this kind alone entirely.
+        if kind == BackupKind::ArchiveReconcile {
+            continue;
+        }
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         by_kind
             .entry(kind)
@@ -250,10 +309,21 @@ pub fn rotate_storage_backups(
             .push((entry.path(), mtime, meta.len()));
     }
 
+    // Quarantine directory for this rotation pass. Created lazily on the
+    // first staged file so a no-op rotation leaves no empty directories.
+    let quarantine_dir = storage_root
+        .join("doctor")
+        .join("reclaimable")
+        .join(format!(
+            "rotation-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        ));
+    let mut quarantine_ready = false;
+
     for (kind, mut files) in by_kind {
-        // Sort descending by mtime — oldest tail will be deleted.
+        // Sort descending by mtime — oldest tail will be evicted.
         files.sort_by_key(|file| std::cmp::Reverse(file.1));
-        let (to_keep, to_delete) = if files.len() > keep {
+        let (to_keep, to_evict) = if files.len() > keep {
             files.split_at(keep)
         } else {
             (&files[..], &[][..])
@@ -263,19 +333,67 @@ pub fn rotate_storage_backups(
             kept: to_keep.len(),
             ..Default::default()
         };
-        for (path, _mtime, size) in to_delete {
-            match fs::remove_file(path) {
+        for (path, _mtime, size) in to_evict {
+            if delete_opted_in {
+                // Legacy hard-delete behavior — only behind the explicit
+                // `AM_BACKUP_ROTATION_DELETE` opt-in.
+                match fs::remove_file(path) {
+                    Ok(()) => {
+                        debug!(kind = kind.label(), path = %path.display(), size, "deleted rotated backup (explicit opt-in)");
+                        summary.deleted += 1;
+                        summary.bytes_deleted = summary.bytes_deleted.saturating_add(*size);
+                    }
+                    Err(err) => {
+                        warn!(
+                            kind = kind.label(),
+                            path = %path.display(),
+                            %err,
+                            "failed to delete rotated backup; keeping in place"
+                        );
+                        summary.kept += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Default: quarantine instead of delete (RULE 1). Move the file
+            // into `doctor/reclaimable/rotation-<ts>/` so an operator (or a
+            // later explicit reclaim) decides when disk is actually freed.
+            if !quarantine_ready {
+                if let Err(err) = fs::create_dir_all(&quarantine_dir) {
+                    warn!(
+                        dir = %quarantine_dir.display(),
+                        %err,
+                        "failed to create rotation quarantine dir; leaving evicted backups in place"
+                    );
+                    summary.kept += 1;
+                    continue;
+                }
+                quarantine_ready = true;
+            }
+            let file_name = path.file_name().map_or_else(
+                || std::ffi::OsString::from("unnamed-backup"),
+                std::ffi::OsStr::to_os_string,
+            );
+            let dest = quarantine_dir.join(file_name);
+            match fs::rename(path, &dest) {
                 Ok(()) => {
-                    debug!(kind = kind.label(), path = %path.display(), size, "rotated backup");
-                    summary.removed += 1;
-                    summary.bytes_reclaimed = summary.bytes_reclaimed.saturating_add(*size);
+                    debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
+                    summary.staged += 1;
+                    summary.bytes_staged = summary.bytes_staged.saturating_add(*size);
                 }
                 Err(err) => {
+                    // A cross-device rename can't succeed; a copy+remove
+                    // fallback would still be a delete, so it stays behind
+                    // the same explicit opt-in (which hard-deletes above
+                    // anyway). Without the opt-in, leave the file in place
+                    // and say so.
                     warn!(
                         kind = kind.label(),
                         path = %path.display(),
+                        dest = %dest.display(),
                         %err,
-                        "failed to delete rotated backup; keeping in place"
+                        "failed to stage rotated backup into quarantine; keeping in place"
                     );
                     summary.kept += 1;
                 }
@@ -283,18 +401,20 @@ pub fn rotate_storage_backups(
         }
 
         report.kept = report.kept.saturating_add(summary.kept);
-        report.removed = report.removed.saturating_add(summary.removed);
-        report.bytes_reclaimed = report
-            .bytes_reclaimed
-            .saturating_add(summary.bytes_reclaimed);
+        report.staged = report.staged.saturating_add(summary.staged);
+        report.deleted = report.deleted.saturating_add(summary.deleted);
+        report.bytes_staged = report.bytes_staged.saturating_add(summary.bytes_staged);
+        report.bytes_deleted = report.bytes_deleted.saturating_add(summary.bytes_deleted);
         report.per_kind.insert(kind.label(), summary);
     }
 
-    if report.removed > 0 {
+    if report.evicted() > 0 {
         info!(
-            removed = report.removed,
+            staged = report.staged,
+            deleted = report.deleted,
             kept = report.kept,
-            bytes_reclaimed = report.bytes_reclaimed,
+            bytes_staged = report.bytes_staged,
+            bytes_deleted = report.bytes_deleted,
             "rotated storage backups"
         );
     }
@@ -315,6 +435,16 @@ mod tests {
         if size > 0 {
             f.write_all(&vec![0u8; size]).unwrap();
         }
+    }
+
+    /// Rotate with the delete knob pinned off (the default). The env
+    /// override map is process-global, so tests asserting quarantine
+    /// behavior pin it explicitly rather than racing the opt-in test.
+    fn rotate_with_delete_off(root: &Path, keep: usize) -> RotateReport {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || rotate_storage_backups(root, keep).expect("rotate"),
+        )
     }
 
     #[test]
@@ -457,11 +587,13 @@ mod tests {
         // An unrelated file that must be left alone.
         touch(&tmp.path().join("do-not-touch.txt"), 7);
 
-        let report = rotate_storage_backups(tmp.path(), 3).expect("rotate");
+        let report = rotate_with_delete_off(tmp.path(), 3);
 
-        assert_eq!(report.removed, 2, "expected 2 oldest corrupts removed");
+        assert_eq!(report.staged, 2, "expected 2 oldest corrupts staged");
+        assert_eq!(report.deleted, 0, "nothing hard-deleted without opt-in");
         assert_eq!(report.kept, 3 + 2, "3 corrupts + 2 reconstructs kept");
-        assert!(report.bytes_reclaimed > 0);
+        assert!(report.bytes_staged > 0);
+        assert_eq!(report.bytes_deleted, 0);
 
         // Unrelated file intact.
         assert!(tmp.path().join("do-not-touch.txt").exists());
@@ -486,7 +618,7 @@ mod tests {
         touch(&tmp.path().join("storage.codex.sqlite3"), 4096);
 
         let report = rotate_storage_backups(tmp.path(), 3).expect("rotate");
-        assert_eq!(report.removed, 0);
+        assert_eq!(report.evicted(), 0);
         assert!(tmp.path().join("storage.sqlite3").exists());
         assert!(tmp.path().join("storage.sqlite3-wal").exists());
         assert!(tmp.path().join("storage.sqlite3-shm").exists());
@@ -498,7 +630,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let report = rotate_storage_backups(&missing, 3).expect("rotate");
-        assert_eq!(report.removed, 0);
+        assert_eq!(report.evicted(), 0);
         assert_eq!(report.kept, 0);
     }
 
@@ -514,9 +646,160 @@ mod tests {
             sleep(Duration::from_millis(5));
         }
         // keep=0 should be clamped to MIN_KEEP_PER_KIND (=1)
-        let report = rotate_storage_backups(tmp.path(), 0).expect("rotate");
+        let report = rotate_with_delete_off(tmp.path(), 0);
         assert_eq!(report.kept, 1);
-        assert_eq!(report.removed, 4);
+        assert_eq!(report.staged, 4);
+        assert_eq!(report.deleted, 0);
+    }
+
+    /// Collect the file names inside the (single) `rotation-*` quarantine
+    /// directory, or an empty vec when no quarantine dir exists yet.
+    fn quarantined_names(storage_root: &Path) -> Vec<String> {
+        let reclaimable = storage_root.join("doctor").join("reclaimable");
+        let Ok(entries) = fs::read_dir(&reclaimable) else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        for entry in entries.flatten() {
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                dir_name.starts_with("rotation-"),
+                "unexpected entry in doctor/reclaimable: {dir_name}"
+            );
+            for file in fs::read_dir(entry.path()).unwrap().flatten() {
+                names.push(file.file_name().to_string_lossy().into_owned());
+            }
+        }
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn rotate_storage_backups_stages_instead_of_deleting() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..5 {
+            touch(
+                &tmp.path()
+                    .join(format!("storage.sqlite3.corrupt-20260419_12000{i}_000")),
+                100,
+            );
+            sleep(Duration::from_millis(5));
+        }
+
+        let report = rotate_with_delete_off(tmp.path(), 3);
+        assert_eq!(report.staged, 2);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.bytes_staged, 200);
+        assert_eq!(report.bytes_deleted, 0);
+
+        // The two oldest were moved out of the storage root, not deleted:
+        // originals gone at the top level, contents intact in quarantine.
+        assert!(
+            !tmp.path()
+                .join("storage.sqlite3.corrupt-20260419_120000_000")
+                .exists()
+        );
+        assert!(
+            !tmp.path()
+                .join("storage.sqlite3.corrupt-20260419_120001_000")
+                .exists()
+        );
+        let staged = quarantined_names(tmp.path());
+        assert_eq!(
+            staged,
+            vec![
+                "storage.sqlite3.corrupt-20260419_120000_000".to_string(),
+                "storage.sqlite3.corrupt-20260419_120001_000".to_string(),
+            ]
+        );
+        for name in &staged {
+            let bytes = fs::metadata(
+                tmp.path()
+                    .join("doctor")
+                    .join("reclaimable")
+                    .join(quarantine_dir_name(tmp.path()))
+                    .join(name),
+            )
+            .unwrap()
+            .len();
+            assert_eq!(bytes, 100, "staged file body must survive the move");
+        }
+    }
+
+    /// Name of the single `rotation-*` quarantine dir under
+    /// `doctor/reclaimable/` (panics if there isn't exactly one).
+    fn quarantine_dir_name(storage_root: &Path) -> String {
+        let mut dirs: Vec<String> = fs::read_dir(storage_root.join("doctor").join("reclaimable"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            dirs.len(),
+            1,
+            "expected exactly one rotation quarantine dir"
+        );
+        dirs.pop().unwrap()
+    }
+
+    #[test]
+    fn rotation_delete_requires_explicit_optin() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..3 {
+            touch(
+                &tmp.path()
+                    .join(format!("storage.sqlite3.corrupt-20260419_12000{i}_000")),
+                10,
+            );
+            sleep(Duration::from_millis(5));
+        }
+
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "1")],
+            || rotate_storage_backups(tmp.path(), 1).expect("rotate"),
+        );
+
+        assert_eq!(report.deleted, 2, "opt-in restores hard-delete");
+        assert_eq!(report.staged, 0);
+        assert_eq!(report.bytes_deleted, 20);
+        // Hard-delete removes the files outright — no quarantine dir appears.
+        assert!(!tmp.path().join("doctor").exists());
+        assert!(
+            !tmp.path()
+                .join("storage.sqlite3.corrupt-20260419_120000_000")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn rotation_skips_archive_reconcile_backups() {
+        let tmp = TempDir::new().unwrap();
+        // Well past keep=1, but archive-reconcile snapshots are owned by the
+        // recovery-retention reclaim planner — rotation must not touch them.
+        for i in 0..4 {
+            touch(
+                &tmp.path().join(format!(
+                    "storage.sqlite3.archive-reconcile-20260419_12000{i}_000"
+                )),
+                25,
+            );
+            sleep(Duration::from_millis(5));
+        }
+
+        let report = rotate_storage_backups(tmp.path(), 1).expect("rotate");
+        assert_eq!(report.evicted(), 0);
+        assert!(!report.per_kind.contains_key("archive_reconcile"));
+        for i in 0..4 {
+            assert!(
+                tmp.path()
+                    .join(format!(
+                        "storage.sqlite3.archive-reconcile-20260419_12000{i}_000"
+                    ))
+                    .exists(),
+                "archive-reconcile snapshot {i} must be left in place"
+            );
+        }
+        assert!(!tmp.path().join("doctor").exists());
     }
 
     #[test]

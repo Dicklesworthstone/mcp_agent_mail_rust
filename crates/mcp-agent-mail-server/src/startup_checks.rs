@@ -3035,12 +3035,14 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 fn rotate_backups_best_effort(config: &Config) {
     let keep = crate::backup_rotation::resolved_keep_per_kind();
     match crate::backup_rotation::rotate_storage_backups(&config.storage_root, keep) {
-        Ok(report) if report.removed > 0 => {
+        Ok(report) if report.evicted() > 0 => {
             tracing::info!(
-                removed = report.removed,
+                staged = report.staged,
+                deleted = report.deleted,
                 kept = report.kept,
-                bytes_reclaimed = report.bytes_reclaimed,
-                "backup rotation reclaimed disk in storage_root"
+                bytes_staged = report.bytes_staged,
+                bytes_deleted = report.bytes_deleted,
+                "backup rotation staged old backups in storage_root"
             );
         }
         Ok(_) => {}

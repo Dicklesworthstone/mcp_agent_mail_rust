@@ -14,6 +14,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -35,6 +37,18 @@ const MAX_MAINTENANCE_LOCK_EVIDENCE_BYTES: u64 = 16 * 1024;
 const MAINTENANCE_LOCK_EVIDENCE_PREFIX: &str = "maintenance.lock.agent-mail-stale-";
 const MAINTENANCE_ACTIVE_EVIDENCE_PREFIX: &str = "maintenance.lock.agent-mail-active-";
 const MAINTENANCE_COMPLETED_EVIDENCE_PREFIX: &str = "maintenance.lock.agent-mail-completed-";
+/// Directory (inside the archive `.git` dir, so renames stay on one
+/// filesystem) where new maintenance evidence records are written. Older
+/// releases wrote them directly into `objects/`; readers scan both (GH#234).
+const MAINTENANCE_EVIDENCE_DIR_NAME: &str = "agent-mail-maintenance";
+const MAINTENANCE_EVIDENCE_ARCHIVE_DIR_NAME: &str = "archive";
+const COMPLETED_EVIDENCE_KEEP_COUNT: usize = 20;
+const COMPLETED_EVIDENCE_KEEP_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Mirrors the `Config` default for `archive_maintenance_interval_secs`; the
+/// unowned-lock reap threshold must be derivable without a `Config` because
+/// `run_maintenance` is also invoked from the CLI with only a git dir.
+const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 1800;
+const UNOWNED_LOCK_REAP_ENV: &str = "AM_ARCHIVE_MAINTENANCE_REAP_UNOWNED_LOCK";
 const PLAN_TOP_LIMIT: usize = 8;
 const LOOSE_OBJECTS_WATCH_AT: u64 = 1_000;
 const LOOSE_OBJECTS_CRITICAL_AT: u64 = 10_000;
@@ -58,6 +72,9 @@ pub struct MaintenanceReport {
     pub lock_evidence: Option<String>,
     pub success: bool,
     pub error: Option<String>,
+    /// Non-fatal observations from this cycle (e.g. unreadable pack dir,
+    /// evidence write failure under disk pressure).
+    pub notes: Vec<String>,
 }
 
 /// What the maintenance run measurably accomplished.
@@ -85,6 +102,38 @@ enum RecordedProcessLiveness {
 struct MaintenanceLockFingerprint {
     bytes: u64,
     modified_unix_nanos: u64,
+    /// Device/inode identity, captured from the same `stat` as `bytes` and
+    /// `modified_unix_nanos` (GH#234 TOCTOU). A `(len, mtime)` pair can be
+    /// forged by re-creating a file; dev/ino makes cross-recreation of the
+    /// lock path detectable before a reap rename. Zero in evidence records
+    /// written by agent-mail <= 0.3.x, hence `serde(default)` and the tolerant
+    /// comparison in [`MaintenanceLockFingerprint::matches_recorded`].
+    #[cfg(unix)]
+    #[serde(default)]
+    device: u64,
+    #[cfg(unix)]
+    #[serde(default)]
+    inode: u64,
+}
+
+impl MaintenanceLockFingerprint {
+    /// Compare a freshly probed fingerprint (`self`) against one stored in an
+    /// evidence record. Legacy records carry no dev/ino (deserialized as 0/0);
+    /// for those only `(len, mtime)` can be compared. Records written by this
+    /// release always carry dev/ino and must match exactly.
+    fn matches_recorded(&self, recorded: &Self) -> bool {
+        if self.bytes != recorded.bytes || self.modified_unix_nanos != recorded.modified_unix_nanos
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        if (recorded.device != 0 || recorded.inode != 0)
+            && (recorded.device != self.device || recorded.inode != self.inode)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 /// Durable evidence that this process terminated a Git maintenance child while
@@ -443,27 +492,61 @@ fn maintenance_lock_fingerprint(path: &Path) -> Option<MaintenanceLockFingerprin
     Some(MaintenanceLockFingerprint {
         bytes: metadata.len(),
         modified_unix_nanos,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
     })
 }
 
+/// Age of the lock file in whole seconds, derived from the fingerprint mtime.
+/// `None` when the mtime lies in the future (clock skew): such a lock is
+/// never treated as old.
+fn maintenance_lock_age_secs(fingerprint: MaintenanceLockFingerprint) -> Option<u64> {
+    let now_nanos: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .try_into()
+        .ok()?;
+    now_nanos
+        .checked_sub(fingerprint.modified_unix_nanos)
+        .map(|nanos| nanos / 1_000_000_000)
+}
+
+fn maintenance_evidence_dir(git_dir: &Path) -> PathBuf {
+    git_dir.join(MAINTENANCE_EVIDENCE_DIR_NAME)
+}
+
+/// Directory new evidence records are written into. Creates
+/// `<git_dir>/agent-mail-maintenance/` on demand; it lives inside the git dir
+/// so evidence renames (active -> completed, prune -> archive) never cross a
+/// filesystem boundary. `None` when the directory cannot be created (e.g.
+/// disk pressure or a read-only git dir).
+fn writable_maintenance_evidence_dir(git_dir: &Path) -> Option<PathBuf> {
+    let dir = maintenance_evidence_dir(git_dir);
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 fn maintenance_lock_evidence_path(
-    objects_dir: &Path,
+    evidence_dir: &Path,
     pid: u32,
     observed_at_micros: u64,
 ) -> PathBuf {
     let nonce = MAINTENANCE_LOCK_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    objects_dir.join(format!(
+    evidence_dir.join(format!(
         "{MAINTENANCE_LOCK_EVIDENCE_PREFIX}{observed_at_micros}-pid-{pid}-{nonce:06}.json"
     ))
 }
 
 fn active_maintenance_evidence_path(
-    objects_dir: &Path,
+    evidence_dir: &Path,
     pid: u32,
     observed_at_micros: u64,
 ) -> PathBuf {
     let nonce = MAINTENANCE_LOCK_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    objects_dir.join(format!(
+    evidence_dir.join(format!(
         "{MAINTENANCE_ACTIVE_EVIDENCE_PREFIX}{observed_at_micros}-pid-{pid}-{nonce:06}.json"
     ))
 }
@@ -586,63 +669,128 @@ fn related_git_maintenance_process_running(git_dir: &Path) -> Option<bool> {
     }
 }
 
+/// Enumerate evidence files carrying `prefix` in both the legacy location
+/// (`objects/`, written by agent-mail <= 0.3.24) and the current evidence
+/// directory. Only regular `.json` files within the size cap are returned.
+fn maintenance_evidence_files(git_dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dir in [git_dir.join("objects"), maintenance_evidence_dir(git_dir)] {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(prefix)
+                || path.extension().is_none_or(|extension| extension != "json")
+            {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file()
+                || metadata.len() > MAX_MAINTENANCE_LOCK_EVIDENCE_BYTES
+            {
+                continue;
+            }
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn read_maintenance_evidence_record(path: &Path) -> Option<TerminatedMaintenanceLockEvidence> {
+    serde_json::from_str::<TerminatedMaintenanceLockEvidence>(&fs::read_to_string(path).ok()?).ok()
+}
+
 fn read_matching_maintenance_lock_evidence(
     git_dir: &Path,
     fingerprint: MaintenanceLockFingerprint,
 ) -> Option<TerminatedMaintenanceLockEvidence> {
-    let objects_dir = git_dir.join("objects");
-    fs::read_dir(objects_dir)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_string_lossy();
-            if !name.starts_with(MAINTENANCE_LOCK_EVIDENCE_PREFIX)
-                || path.extension().is_none_or(|extension| extension != "json")
-            {
-                return None;
-            }
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            if !metadata.file_type().is_file()
-                || metadata.len() > MAX_MAINTENANCE_LOCK_EVIDENCE_BYTES
-            {
-                return None;
-            }
-            let evidence = serde_json::from_str::<TerminatedMaintenanceLockEvidence>(
-                &fs::read_to_string(path).ok()?,
-            )
-            .ok()?;
-            (evidence.lock_fingerprint == Some(fingerprint)).then_some(evidence)
+    maintenance_evidence_files(git_dir, MAINTENANCE_LOCK_EVIDENCE_PREFIX)
+        .iter()
+        .filter_map(|path| {
+            let evidence = read_maintenance_evidence_record(path)?;
+            evidence
+                .lock_fingerprint
+                .is_some_and(|recorded| fingerprint.matches_recorded(&recorded))
+                .then_some(evidence)
         })
         .max_by_key(|evidence| evidence.observed_at_unix_micros)
 }
 
 fn read_active_maintenance_evidence(git_dir: &Path) -> Option<TerminatedMaintenanceLockEvidence> {
-    let objects_dir = git_dir.join("objects");
-    fs::read_dir(objects_dir)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_string_lossy();
-            if !name.starts_with(MAINTENANCE_ACTIVE_EVIDENCE_PREFIX)
-                || path.extension().is_none_or(|extension| extension != "json")
-            {
-                return None;
-            }
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            if !metadata.file_type().is_file()
-                || metadata.len() > MAX_MAINTENANCE_LOCK_EVIDENCE_BYTES
-            {
-                return None;
-            }
-            let evidence = serde_json::from_str::<TerminatedMaintenanceLockEvidence>(
-                &fs::read_to_string(path).ok()?,
-            )
-            .ok()?;
+    maintenance_evidence_files(git_dir, MAINTENANCE_ACTIVE_EVIDENCE_PREFIX)
+        .iter()
+        .filter_map(|path| {
+            let evidence = read_maintenance_evidence_record(path)?;
             evidence.lock_fingerprint.is_none().then_some(evidence)
         })
         .max_by_key(|evidence| evidence.observed_at_unix_micros)
+}
+
+/// Prune completed-maintenance evidence records so `objects/` and the
+/// evidence directory do not grow without bound (~48 records/day, GH#234).
+/// Keeps the newest [`COMPLETED_EVIDENCE_KEEP_COUNT`] records plus anything
+/// younger than [`COMPLETED_EVIDENCE_KEEP_MAX_AGE_SECS`]; older records are
+/// MOVED (never deleted) into `<git_dir>/agent-mail-maintenance/archive/`.
+fn prune_maintenance_evidence(git_dir: &Path) {
+    let now = SystemTime::now();
+    let mut records: Vec<(PathBuf, SystemTime)> =
+        maintenance_evidence_files(git_dir, MAINTENANCE_COMPLETED_EVIDENCE_PREFIX)
+            .into_iter()
+            .filter_map(|path| {
+                let modified = fs::symlink_metadata(&path).ok()?.modified().ok()?;
+                Some((path, modified))
+            })
+            .collect();
+    records.sort_by_key(|record| std::cmp::Reverse(record.1));
+
+    let archive_dir = maintenance_evidence_dir(git_dir).join(MAINTENANCE_EVIDENCE_ARCHIVE_DIR_NAME);
+    let mut archive_dir_ready = false;
+    let mut archived = 0u64;
+    for (path, modified) in records.iter().skip(COMPLETED_EVIDENCE_KEEP_COUNT) {
+        let age_secs = now
+            .duration_since(*modified)
+            .map(|age| age.as_secs())
+            .unwrap_or(0);
+        if age_secs < COMPLETED_EVIDENCE_KEEP_MAX_AGE_SECS {
+            continue;
+        }
+        if !archive_dir_ready {
+            if fs::create_dir_all(&archive_dir).is_err() {
+                return;
+            }
+            archive_dir_ready = true;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // Non-overwriting move: allocate a fresh name if the plain one is
+        // already taken (e.g. the same record archived from both locations).
+        let mut target = archive_dir.join(name);
+        if fs::symlink_metadata(&target).is_ok() {
+            let nonce = MAINTENANCE_LOCK_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            target = archive_dir.join(format!("{name}.dup-{nonce:06}"));
+            if fs::symlink_metadata(&target).is_ok() {
+                continue;
+            }
+        }
+        if fs::rename(path, &target).is_ok() {
+            archived += 1;
+        }
+    }
+    if archived > 0 {
+        debug!(
+            git_dir = %git_dir.display(),
+            archived,
+            archive_dir = %archive_dir.display(),
+            "archived old completed-maintenance evidence records"
+        );
+    }
 }
 
 fn write_maintenance_lock_evidence(
@@ -667,7 +815,7 @@ fn record_active_maintenance_evidence(
     git_pid: u32,
     git_process_start_ticks: Option<u64>,
 ) -> Option<ActiveMaintenanceEvidence> {
-    let objects_dir = git_dir.join("objects");
+    let evidence_dir = writable_maintenance_evidence_dir(git_dir)?;
     let observed_at_unix_micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -682,7 +830,7 @@ fn record_active_maintenance_evidence(
         observed_at_unix_micros,
         lock_fingerprint: None,
     };
-    let path = active_maintenance_evidence_path(&objects_dir, git_pid, observed_at_unix_micros);
+    let path = active_maintenance_evidence_path(&evidence_dir, git_pid, observed_at_unix_micros);
     write_maintenance_lock_evidence(&path, &evidence).then_some(ActiveMaintenanceEvidence { path })
 }
 
@@ -724,7 +872,7 @@ fn record_terminated_maintenance_lock(
 ) -> Option<String> {
     let lock_path = maintenance_lock_path(git_dir);
     let fingerprint = maintenance_lock_fingerprint(&lock_path)?;
-    let objects_dir = lock_path.parent()?;
+    let evidence_dir = writable_maintenance_evidence_dir(git_dir)?;
     let observed_at_unix_micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -740,12 +888,148 @@ fn record_terminated_maintenance_lock(
         lock_fingerprint: Some(fingerprint),
     };
     let evidence_path =
-        maintenance_lock_evidence_path(objects_dir, git_pid, observed_at_unix_micros);
+        maintenance_lock_evidence_path(&evidence_dir, git_pid, observed_at_unix_micros);
     write_maintenance_lock_evidence(&evidence_path, &evidence).then_some(())?;
     Some(format!(
         "recorded stale maintenance lock evidence at {} for git pid {git_pid}",
         evidence_path.display()
     ))
+}
+
+/// Whether the age-based reap of a maintenance.lock with no agent-mail PID
+/// evidence is enabled. Defaults ON; only an explicit falsy value
+/// (`0`/`false`/`f`/`no`/`n`, matching core's `parse_bool`) disables it.
+fn unowned_lock_reap_enabled() -> bool {
+    !std::env::var(UNOWNED_LOCK_REAP_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_lowercase().as_str(),
+            "0" | "false" | "f" | "no" | "n"
+        )
+    })
+}
+
+/// Age beyond which a lock with no PID evidence is considered abandoned: one
+/// full maintenance interval plus the command timeout. Any legitimately held
+/// lock from a live run must have been refreshed or released within that
+/// window. Reads `AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS` directly because this
+/// path (via the CLI) may run without a `Config`.
+fn unowned_lock_reap_threshold_secs() -> u64 {
+    let interval = std::env::var("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_SECS)
+        .max(MIN_INTERVAL_SECS);
+    interval.saturating_add(MAINTENANCE_COMMAND_TIMEOUT_SECS)
+}
+
+#[derive(Debug)]
+enum LockQuarantineError {
+    Open(std::io::Error),
+    ChangedOrBusy,
+    NoQuarantinePath,
+    ChangedBeforeRename,
+    RenameFailed,
+}
+
+/// Quarantine `lock_path` by a non-overwriting rename, guarding against the
+/// lock being replaced between the caller's decision and the rename (GH#234
+/// TOCTOU): the file is held under an advisory exclusive lock and the path is
+/// re-stat'ed — dev/ino/len/mtime — both after taking the advisory lock and
+/// again immediately before the rename. Any mismatch aborts the reap.
+///
+/// Residual race, documented honestly: `fs::rename` operates by pathname, so
+/// a writer that recreates `maintenance.lock` in the sub-microsecond window
+/// between the final stat and the rename syscall would still have its fresh
+/// lock quarantined. POSIX offers no stat-and-rename primitive keyed on
+/// inode; the dev/ino recheck narrows the window to that syscall gap and the
+/// quarantined file is retained, so even that worst case is recoverable.
+fn quarantine_maintenance_lock(
+    lock_path: &Path,
+    expected: MaintenanceLockFingerprint,
+) -> Result<PathBuf, LockQuarantineError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(LockQuarantineError::Open)?;
+    if fs2::FileExt::try_lock_exclusive(&file).is_err()
+        || maintenance_lock_fingerprint(lock_path) != Some(expected)
+    {
+        let _ = fs2::FileExt::unlock(&file);
+        return Err(LockQuarantineError::ChangedOrBusy);
+    }
+    let Some(quarantine_path) = maintenance_lock_quarantine_path(lock_path) else {
+        let _ = fs2::FileExt::unlock(&file);
+        return Err(LockQuarantineError::NoQuarantinePath);
+    };
+    // Final recheck right before the rename: quarantine-path allocation above
+    // may have probed up to 1024 candidate names, leaving time for the lock
+    // to be swapped out underneath us.
+    if maintenance_lock_fingerprint(lock_path) != Some(expected) {
+        let _ = fs2::FileExt::unlock(&file);
+        warn!(
+            lock_path = %lock_path.display(),
+            "maintenance.lock changed identity immediately before quarantine rename; aborting reap"
+        );
+        return Err(LockQuarantineError::ChangedBeforeRename);
+    }
+    let renamed = fs::rename(lock_path, &quarantine_path);
+    let _ = fs2::FileExt::unlock(&file);
+    renamed
+        .map(|()| quarantine_path)
+        .map_err(|_| LockQuarantineError::RenameFailed)
+}
+
+/// GH#234 self-heal: a stale `objects/maintenance.lock` written by agent-mail
+/// <= 0.3.24 or by a foreign process carries no PID evidence, and without
+/// this path every future cycle errors out forever. Reap it only when ALL of:
+/// the gate env is on, the lock is older than a full interval + command
+/// timeout, and process inspection positively reports no related Git
+/// maintenance process (`Some(false)`; `None` — inspection unavailable —
+/// never reaps).
+fn try_reap_unowned_stale_lock(
+    git_dir: &Path,
+    lock_path: &Path,
+    fingerprint: MaintenanceLockFingerprint,
+) -> Option<MaintenanceLockPreflight> {
+    if !unowned_lock_reap_enabled() {
+        return None;
+    }
+    let age_secs = maintenance_lock_age_secs(fingerprint)?;
+    let threshold_secs = unowned_lock_reap_threshold_secs();
+    if age_secs <= threshold_secs {
+        return None;
+    }
+    if related_git_maintenance_process_running(git_dir) != Some(false) {
+        return None;
+    }
+    quarantine_maintenance_lock(lock_path, fingerprint).map_or_else(
+        |error| {
+            warn!(
+                lock_path = %lock_path.display(),
+                error = ?error,
+                "unowned stale maintenance.lock could not be quarantined; leaving it in place"
+            );
+            None
+        },
+        |quarantine_path| {
+            warn!(
+                lock_path = %lock_path.display(),
+                quarantine_path = %quarantine_path.display(),
+                age_secs,
+                threshold_secs,
+                "unowned stale maintenance.lock quarantined; no agent-mail PID evidence and no related git maintenance process"
+            );
+            Some(MaintenanceLockPreflight {
+                reaped: true,
+                evidence: Some(format!(
+                    "unowned stale maintenance.lock (age {age_secs}s) quarantined: {} exceeded the {threshold_secs}s abandonment threshold with no PID evidence and no related git maintenance process; retained lock artifact at {}",
+                    lock_path.display(),
+                    quarantine_path.display()
+                )),
+            })
+        },
+    )
 }
 
 /// Reap only a lock left by a maintenance child that this worker previously
@@ -776,6 +1060,11 @@ fn preflight_maintenance_lock(git_dir: &Path) -> MaintenanceLockPreflight {
         // child was launched; process-tree liveness below is the safety gate.
         (evidence, "active-child")
     } else {
+        // No agent-mail PID evidence at all: written by am <= 0.3.24 or a
+        // foreign process. Age-gated self-heal (GH#234) before refusing.
+        if let Some(reaped) = try_reap_unowned_stale_lock(git_dir, &lock_path, fingerprint) {
+            return reaped;
+        }
         return MaintenanceLockPreflight {
             evidence: Some(format!(
                 "maintenance lock at {} has no terminated-child PID evidence; refusing to run a silently skipped maintenance command",
@@ -823,49 +1112,8 @@ fn preflight_maintenance_lock(git_dir: &Path) -> MaintenanceLockPreflight {
         }
     }
 
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(file) => file,
-        Err(error) => {
-            return MaintenanceLockPreflight {
-                evidence: Some(format!(
-                    "could not open stale maintenance lock {} for an exclusive safety probe: {error}",
-                    lock_path.display()
-                )),
-                ..Default::default()
-            };
-        }
-    };
-    if fs2::FileExt::try_lock_exclusive(&file).is_err()
-        || maintenance_lock_fingerprint(&lock_path) != Some(fingerprint)
-    {
-        let _ = fs2::FileExt::unlock(&file);
-        return MaintenanceLockPreflight {
-            evidence: Some(format!(
-                "maintenance lock at {} changed or is advisory-lock busy during stale-lock verification; not reaping",
-                lock_path.display()
-            )),
-            ..Default::default()
-        };
-    }
-
-    let Some(quarantine_path) = maintenance_lock_quarantine_path(&lock_path) else {
-        let _ = fs2::FileExt::unlock(&file);
-        return MaintenanceLockPreflight {
-            evidence: Some(format!(
-                "could not allocate a non-overwriting quarantine path for stale maintenance lock {}",
-                lock_path.display()
-            )),
-            ..Default::default()
-        };
-    };
-    let reaped = fs::rename(&lock_path, &quarantine_path).is_ok();
-    let _ = fs2::FileExt::unlock(&file);
-    if reaped {
-        MaintenanceLockPreflight {
+    match quarantine_maintenance_lock(&lock_path, fingerprint) {
+        Ok(quarantine_path) => MaintenanceLockPreflight {
             reaped: true,
             evidence: Some(format!(
                 "quarantined stale maintenance lock at {} after {evidence_kind} git pid {} was {liveness:?}; retained lock artifact at {}",
@@ -873,16 +1121,38 @@ fn preflight_maintenance_lock(git_dir: &Path) -> MaintenanceLockPreflight {
                 evidence.git_pid,
                 quarantine_path.display()
             )),
+        },
+        Err(LockQuarantineError::Open(error)) => MaintenanceLockPreflight {
+            evidence: Some(format!(
+                "could not open stale maintenance lock {} for an exclusive safety probe: {error}",
+                lock_path.display()
+            )),
+            ..Default::default()
+        },
+        Err(LockQuarantineError::ChangedOrBusy | LockQuarantineError::ChangedBeforeRename) => {
+            MaintenanceLockPreflight {
+                evidence: Some(format!(
+                    "maintenance lock at {} changed or is advisory-lock busy during stale-lock verification; not reaping",
+                    lock_path.display()
+                )),
+                ..Default::default()
+            }
         }
-    } else {
-        MaintenanceLockPreflight {
+        Err(LockQuarantineError::NoQuarantinePath) => MaintenanceLockPreflight {
+            evidence: Some(format!(
+                "could not allocate a non-overwriting quarantine path for stale maintenance lock {}",
+                lock_path.display()
+            )),
+            ..Default::default()
+        },
+        Err(LockQuarantineError::RenameFailed) => MaintenanceLockPreflight {
             evidence: Some(format!(
                 "failed to quarantine stale maintenance lock at {} after {evidence_kind} git pid {} was {liveness:?}",
                 lock_path.display(),
                 evidence.git_pid
             )),
             ..Default::default()
-        }
+        },
     }
 }
 
@@ -978,8 +1248,21 @@ fn terminate_maintenance_child(
 /// This is the core function used by both the background worker and the CLI.
 pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
     let work_tree = git_dir.parent().unwrap_or(git_dir);
+    let mut notes: Vec<String> = Vec::new();
     let loose_before = count_loose_objects(git_dir);
     let pack_before = count_pack_files(git_dir);
+    if pack_before.is_none() {
+        // GH#233: `None` means objects/pack exists but was unreadable — not
+        // "zero packs". Record it instead of silently treating it as zero.
+        debug!(
+            git_dir = %git_dir.display(),
+            "objects/pack was unreadable; pack count is unknown this cycle"
+        );
+        notes.push(
+            "objects/pack was unreadable; pack count is unknown this cycle (not treated as zero)"
+                .to_string(),
+        );
+    }
     let disk_before = measure_objects_disk_usage(git_dir);
     let lock_preflight = preflight_maintenance_lock(git_dir);
     if lock_preflight.evidence.is_some() && !lock_preflight.reaped {
@@ -992,6 +1275,7 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
             disk_bytes_after: measure_objects_disk_usage(git_dir),
             lock_evidence: lock_preflight.evidence.clone(),
             error: lock_preflight.evidence,
+            notes,
             ..Default::default()
         };
     }
@@ -1015,39 +1299,30 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
                     lock_reaped: lock_preflight.reaped,
                     lock_evidence: lock_preflight.evidence,
                     error: Some(e.to_string()),
+                    notes,
                     ..Default::default()
                 };
             }
         };
-    let Some(active_evidence) =
-        record_active_maintenance_evidence(git_dir, child.id(), process_start_ticks(child.id()))
-    else {
-        let lock_evidence = terminate_maintenance_child(
-            &mut child,
-            git_dir,
-            "maintenance launch could not persist active PID evidence",
+    // GH#234 fail-open under disk pressure: an evidence-write failure most
+    // likely means the disk is full — exactly when maintenance is most
+    // needed. Do NOT kill the freshly spawned git child; let it run and note
+    // that no durable PID evidence exists. Success below still requires the
+    // observed-effect check to pass, so a silently skipped run cannot be
+    // reported as success.
+    let active_evidence =
+        record_active_maintenance_evidence(git_dir, child.id(), process_start_ticks(child.id()));
+    if active_evidence.is_none() {
+        warn!(
+            git_dir = %git_dir.display(),
+            git_pid = child.id(),
+            "could not persist active Git maintenance PID evidence (likely disk pressure); letting the maintenance child run without it"
         );
-        return MaintenanceReport {
-            loose_before,
-            loose_after: count_loose_objects(git_dir),
-            pack_count_before: pack_before,
-            pack_count_after: count_pack_files(git_dir),
-            disk_bytes_before: disk_before,
-            disk_bytes_after: measure_objects_disk_usage(git_dir),
-            lock_reaped: lock_preflight.reaped,
-            lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
-            error: Some(lock_evidence.map_or_else(
-                || {
-                    "could not persist active Git maintenance PID evidence; maintenance child was terminated"
-                        .to_string()
-                },
-                |evidence| format!(
-                    "could not persist active Git maintenance PID evidence; maintenance child was terminated; {evidence}"
-                ),
-            )),
-            ..Default::default()
-        };
-    };
+        notes.push(
+            "no durable active-maintenance PID evidence was persisted (evidence write failed); success gated on the observed-effect check only"
+                .to_string(),
+        );
+    }
 
     // Poll the child process, checking for shutdown signal so we don't
     // block server exit if git maintenance hangs.
@@ -1072,6 +1347,7 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
                             || "interrupted by shutdown".to_string(),
                             |evidence| format!("interrupted by shutdown; {evidence}"),
                         )),
+                        notes,
                         ..Default::default()
                     };
                 }
@@ -1093,6 +1369,7 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
                             || timeout_error.clone(),
                             |evidence| format!("{timeout_error}; {evidence}"),
                         )),
+                        notes,
                         ..Default::default()
                     };
                 }
@@ -1104,7 +1381,10 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
         }
     };
 
-    let evidence_completion_error = mark_maintenance_evidence_completed(&active_evidence).err();
+    let evidence_completion_error = active_evidence
+        .as_ref()
+        .map(mark_maintenance_evidence_completed)
+        .and_then(Result::err);
 
     let loose_after = count_loose_objects(git_dir);
     let pack_after = count_pack_files(git_dir);
@@ -1162,6 +1442,11 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
         Err(e) => (false, Some(e.to_string())),
     };
 
+    if success {
+        // Keep the evidence footprint bounded (GH#234); move-only, never delete.
+        prune_maintenance_evidence(git_dir);
+    }
+
     MaintenanceReport {
         loose_before,
         loose_after,
@@ -1174,6 +1459,7 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
         lock_evidence: lock_preflight.evidence,
         success,
         error,
+        notes,
     }
 }
 
@@ -1198,6 +1484,7 @@ fn log_report(report: &MaintenanceReport, git_dir: &Path) {
             observed_effect = ?report.observed_effect,
             lock_reaped = report.lock_reaped,
             lock_evidence = report.lock_evidence.as_deref().unwrap_or("none"),
+            notes = report.notes.join("; "),
             "archive maintenance completed"
         );
     } else {
@@ -1207,6 +1494,7 @@ fn log_report(report: &MaintenanceReport, git_dir: &Path) {
             observed_effect = ?report.observed_effect,
             lock_reaped = report.lock_reaped,
             lock_evidence = report.lock_evidence.as_deref().unwrap_or("none"),
+            notes = report.notes.join("; "),
             "archive maintenance failed"
         );
     }
@@ -1888,5 +2176,264 @@ mod tests {
         assert!(plan.oldest_pack_age_secs.is_some());
         assert!(plan.newest_pack_age_secs.is_some());
         assert_eq!(count_loose_objects(&git_dir), loose_before);
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}: {output:?}",
+            dir.display()
+        );
+    }
+
+    /// Set a file's mtime far into the past via POSIX `touch -t` (portable
+    /// across GNU and BSD touch). Stamp format: `YYYYMMDDhhmm`.
+    #[cfg(unix)]
+    fn set_mtime_old(path: &Path, stamp: &str) {
+        let status = Command::new("touch")
+            .args(["-t", stamp, &path.display().to_string()])
+            .status()
+            .expect("spawn touch");
+        assert!(status.success(), "touch -t failed for {}", path.display());
+    }
+
+    #[test]
+    fn first_cycle_on_fresh_repo_with_loose_objects_succeeds_and_packs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_root = tmp.path().join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        run_git(&archive_root, &["init", "--quiet"]);
+        fs::write(archive_root.join("note.txt"), b"maintenance fixture").unwrap();
+        run_git(&archive_root, &["add", "note.txt"]);
+        run_git(
+            &archive_root,
+            &[
+                "-c",
+                "user.email=maintenance@test.invalid",
+                "-c",
+                "user.name=Maintenance Test",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ],
+        );
+        let git_dir = archive_root.join(".git");
+
+        assert_eq!(
+            count_pack_files(&git_dir),
+            Some(0),
+            "a fresh repo must start with zero packs"
+        );
+        assert!(
+            count_loose_objects(&git_dir).unwrap_or(0) > 0,
+            "committing must create loose objects"
+        );
+
+        SHUTDOWN.store(false, Ordering::Release);
+        let report = run_maintenance(&git_dir);
+        assert_eq!(report.pack_count_before, Some(0));
+        assert!(
+            report.success,
+            "first cycle on a fresh repo with loose objects must succeed: {report:?}"
+        );
+
+        // The loose-objects task packs loose objects, so the second cycle
+        // must escalate to incremental-repack.
+        let packs_after = count_pack_files(&git_dir).unwrap_or(0);
+        assert!(
+            packs_after > 0,
+            "the loose-objects task must have created a pack: {report:?}"
+        );
+        let second = build_git_maintenance_command(&git_dir, &archive_root, packs_after > 0);
+        let argv: Vec<String> =
+            std::iter::once(second.get_program().to_string_lossy().into_owned())
+                .chain(
+                    second
+                        .get_args()
+                        .map(|argument| argument.to_string_lossy().into_owned()),
+                )
+                .collect();
+        assert!(
+            argv.iter().any(|a| a == "--task=incremental-repack"),
+            "the second cycle must include incremental-repack: {argv:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unowned_stale_lock_is_quarantined_after_age_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let lock_path = maintenance_lock_path(&git_dir);
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, b"foreign maintenance lock, no PID evidence").unwrap();
+        // Age the lock far past interval + command timeout (GH#234).
+        set_mtime_old(&lock_path, "202001010000");
+
+        let preflight = preflight_maintenance_lock(&git_dir);
+        assert!(
+            preflight.reaped,
+            "an unowned lock past the abandonment threshold must be reaped: {preflight:?}"
+        );
+        assert!(!lock_path.exists(), "the stale lock must be moved aside");
+        assert!(
+            preflight.evidence.as_deref().is_some_and(|evidence| {
+                evidence.contains("unowned stale maintenance.lock (age")
+                    && evidence.contains("quarantined")
+            }),
+            "the reap must disclose the unowned-stale reason: {preflight:?}"
+        );
+        let retained = fs::read_dir(lock_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("maintenance.lock.agent-mail-quarantine-")
+            });
+        assert!(
+            retained,
+            "quarantine must be a rename, retaining the lock artifact"
+        );
+    }
+
+    #[test]
+    fn unowned_young_lock_is_not_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let lock_path = maintenance_lock_path(&git_dir);
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, b"fresh foreign maintenance lock").unwrap();
+
+        let preflight = preflight_maintenance_lock(&git_dir);
+        assert!(
+            !preflight.reaped,
+            "a young unowned lock must never be reaped: {preflight:?}"
+        );
+        assert!(lock_path.exists(), "the young lock must remain in place");
+        assert!(
+            preflight
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("no terminated-child PID evidence")),
+            "the refusal must keep the no-evidence diagnostic: {preflight:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_files_are_pruned_move_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let objects_dir = git_dir.join("objects");
+        fs::create_dir_all(&objects_dir).unwrap();
+
+        // 22 fresh completed records (legacy objects/ location) and 4 far
+        // older than 7 days: the newest 20 stay by count, the 2 fresh ones
+        // beyond the count stay by age, the 4 old ones get archived.
+        for idx in 0..22u32 {
+            let path = objects_dir.join(format!(
+                "{MAINTENANCE_COMPLETED_EVIDENCE_PREFIX}fresh-{idx:03}-pid-1-000000.json"
+            ));
+            fs::write(&path, b"{}").unwrap();
+        }
+        for idx in 0..4u32 {
+            let path = objects_dir.join(format!(
+                "{MAINTENANCE_COMPLETED_EVIDENCE_PREFIX}old-{idx:03}-pid-1-000000.json"
+            ));
+            fs::write(&path, b"{}").unwrap();
+            set_mtime_old(&path, &format!("2020010100{idx:02}"));
+        }
+
+        prune_maintenance_evidence(&git_dir);
+
+        let archive_dir =
+            maintenance_evidence_dir(&git_dir).join(MAINTENANCE_EVIDENCE_ARCHIVE_DIR_NAME);
+        let archived: Vec<_> = fs::read_dir(&archive_dir)
+            .expect("archive dir must exist after pruning")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            archived.len(),
+            4,
+            "exactly the 4 over-count, over-age records must be archived: {archived:?}"
+        );
+        assert!(
+            archived.iter().all(|name| name.contains("-old-")),
+            "only old records may be archived: {archived:?}"
+        );
+
+        let remaining = fs::read_dir(&objects_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(MAINTENANCE_COMPLETED_EVIDENCE_PREFIX)
+            })
+            .count();
+        assert_eq!(
+            remaining, 22,
+            "all fresh records must remain in place (kept by count or by age)"
+        );
+        assert_eq!(
+            remaining + archived.len(),
+            26,
+            "pruning must be move-only: every record still exists somewhere"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_write_failure_does_not_abort_maintenance() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_root = tmp.path().join("archive");
+        fs::create_dir_all(&archive_root).unwrap();
+        run_git(&archive_root, &["init", "--quiet"]);
+        let git_dir = archive_root.join(".git");
+
+        // A read-only evidence directory makes the create_new evidence write
+        // fail with EACCES — the test analogue of ENOSPC disk pressure.
+        let evidence_dir = maintenance_evidence_dir(&git_dir);
+        fs::create_dir_all(&evidence_dir).unwrap();
+        fs::set_permissions(&evidence_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Running as root ignores mode bits; the simulation cannot work there.
+        let probe = evidence_dir.join("write-probe.tmp");
+        if fs::write(&probe, b"probe").is_ok() {
+            eprintln!("skipping: evidence dir writable despite 0o555 (running as root?)");
+            let _ = fs::set_permissions(&evidence_dir, fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        SHUTDOWN.store(false, Ordering::Release);
+        let report = run_maintenance(&git_dir);
+
+        // Restore permissions so the tempdir can clean up.
+        let _ = fs::set_permissions(&evidence_dir, fs::Permissions::from_mode(0o755));
+
+        assert!(
+            report.success,
+            "an evidence-write failure must not abort a maintenance cycle: {report:?}"
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("PID evidence")),
+            "the report must disclose that no durable PID evidence exists: {report:?}"
+        );
     }
 }
