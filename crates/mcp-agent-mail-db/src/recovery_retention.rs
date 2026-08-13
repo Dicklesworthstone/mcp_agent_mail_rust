@@ -243,11 +243,11 @@ pub fn reclaimable_staging_bytes(storage_root: &Path) -> u64 {
     let Ok(metadata) = std::fs::symlink_metadata(&root) else {
         return 0;
     };
-    metadata
-        .file_type()
-        .is_dir()
-        .then(|| dir_size_bytes(&root))
-        .unwrap_or(0)
+    if metadata.file_type().is_dir() {
+        dir_size_bytes(&root)
+    } else {
+        0
+    }
 }
 
 /// Enumerate forensic bundle directories under `<storage_root>/doctor/forensics/`.

@@ -7471,6 +7471,121 @@ pub async fn fetch_inbox_delivery_events(
     }
 }
 
+/// Record that an exact message-recipient signal write completed.
+///
+/// The signal file itself is a mutable, debounced latest-state hint. This
+/// append-only row is the durable fact used by message-ID receipt lookup.
+pub async fn append_message_delivery_signal_receipt(
+    cx: &Cx,
+    pool: &DbPool,
+    message_id: i64,
+    agent_id: i64,
+    delivery_route: &str,
+    signal_path_digest: &str,
+    observed_ts: i64,
+) -> Outcome<(), DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let delivery_route = delivery_route.to_string();
+    let signal_path_digest = signal_path_digest.to_string();
+
+    run_with_mvcc_retry(cx, "append_message_delivery_signal_receipt", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let insert_params = [
+            Value::BigInt(message_id),
+            Value::BigInt(agent_id),
+            Value::Text(delivery_route.clone()),
+            Value::Text(signal_path_digest.clone()),
+            Value::BigInt(observed_ts),
+            Value::BigInt(message_id),
+            Value::BigInt(agent_id),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "INSERT OR IGNORE INTO message_delivery_signal_receipts \
+                         (message_id, agent_id, delivery_route, signal_path_digest, observed_ts) \
+                     SELECT ?, ?, ?, ?, ? \
+                     WHERE EXISTS (\
+                         SELECT 1 FROM message_recipients \
+                         WHERE message_id = ? AND agent_id = ?\
+                     )",
+                    &insert_params,
+                )
+                .await
+            )
+        );
+
+        let receipt_rows = match map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT 1 FROM message_delivery_signal_receipts \
+                 WHERE message_id = ? AND agent_id = ? AND delivery_route = ? LIMIT 1",
+                &[
+                    Value::BigInt(message_id),
+                    Value::BigInt(agent_id),
+                    Value::Text(delivery_route.clone()),
+                ],
+            )
+            .await,
+        ) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+            Outcome::Cancelled(reason) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(reason);
+            }
+            Outcome::Panicked(payload) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(payload);
+            }
+        };
+        if receipt_rows.is_empty() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "MessageRecipient",
+                format!("{message_id}:{agent_id}"),
+            ));
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(())
+    })
+    .await
+}
+
+/// Look up persisted, signaled, and acknowledged facts for one exact message.
+pub async fn get_message_delivery_receipt(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    message_id: i64,
+) -> Outcome<crate::sync::MessageDeliveryReceipt, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match crate::sync::message_delivery_receipt_from_conn(&conn, project_id, message_id) {
+        Ok(receipt) => Outcome::Ok(receipt),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn fetch_inbox(
     cx: &Cx,
@@ -16171,7 +16286,7 @@ mod tests {
                             5_000 + offset,
                             6_000 + offset,
                             ExperienceState::Resolved,
-                            1_700_000_000_000_000 + (offset as i64 * 10_000),
+                            1_700_000_000_000_000 + (i64::try_from(offset).unwrap_or(0) * 10_000),
                         );
                         append_atc_experience(&cx, &pool, &row)
                             .await

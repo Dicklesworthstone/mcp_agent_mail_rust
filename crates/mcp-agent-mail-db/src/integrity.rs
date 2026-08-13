@@ -238,11 +238,13 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
         })
 }
 
-/// br-mdfpz: names of damaged indexes when EVERY integrity-check detail row is
-/// index-level-only damage that a plain `REINDEX` can rebuild from the intact
-/// table b-trees — the class behind the 2026-08-12 csd incident, where two
-/// corrupt `file_reservations` indexes routed startup into a nine-day archive
-/// reconstruction crash loop that a seconds-long `REINDEX` would have healed.
+/// br-mdfpz: names of damaged indexes when EVERY integrity-check detail row
+/// is index-level-only damage that a plain `REINDEX` can rebuild.
+///
+/// This is the class behind the 2026-08-12 csd incident, where two corrupt
+/// `file_reservations` indexes routed startup into a nine-day archive
+/// reconstruction crash loop that a seconds-long `REINDEX` would have healed
+/// (the table b-trees were intact throughout).
 ///
 /// Returns `Some(index_names)` only when at least one row is index-class
 /// damage (`wrong # of entries in index <name>` or `row <N> missing from

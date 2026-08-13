@@ -37,6 +37,34 @@ pub struct InboxDeliveryEventPage {
     pub tail_cursor: i64,
 }
 
+/// One immutable observation that a message-specific recipient signal was
+/// written to a delivery route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDeliverySignalReceipt {
+    pub delivery_route: String,
+    pub signal_path_digest: String,
+    pub observed_ts: i64,
+}
+
+/// Per-recipient delivery facts for one persisted message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDeliveryRecipientReceipt {
+    pub recipient: String,
+    pub kind: String,
+    pub acknowledged_ts: Option<i64>,
+    pub signal_receipts: Vec<MessageDeliverySignalReceipt>,
+}
+
+/// A message-ID-bound view of durable persistence, signal observations, and
+/// acknowledgement state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageDeliveryReceipt {
+    pub message_id: i64,
+    pub project_id: i64,
+    pub persisted_ts: i64,
+    pub recipients: Vec<MessageDeliveryRecipientReceipt>,
+}
+
 /// A cursor condition is explicit so monitor clients never confuse retention
 /// loss or an invalid future position with a valid empty page.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +75,151 @@ pub enum InboxDeliveryEventError {
     CursorAhead { after: i64, tail: i64 },
     #[error("inbox delivery event query failed: {0}")]
     Database(#[from] DbError),
+}
+
+/// Append one successful signal observation for an exact message-recipient
+/// pair.
+///
+/// `INSERT OR IGNORE` makes a retry idempotent without overwriting the
+/// first durable observation or creating a second receipt.
+pub fn append_message_delivery_signal_receipt(
+    conn: &DbConn,
+    message_id: i64,
+    agent_id: i64,
+    delivery_route: &str,
+    signal_path_digest: &str,
+    observed_ts: i64,
+) -> Result<(), DbError> {
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO message_delivery_signal_receipts \
+             (message_id, agent_id, delivery_route, signal_path_digest, observed_ts) \
+         SELECT ?, ?, ?, ?, ? \
+         WHERE EXISTS (\
+             SELECT 1 FROM message_recipients \
+             WHERE message_id = ? AND agent_id = ?\
+         )",
+        &[
+            Value::BigInt(message_id),
+            Value::BigInt(agent_id),
+            Value::Text(delivery_route.to_string()),
+            Value::Text(signal_path_digest.to_string()),
+            Value::BigInt(observed_ts),
+            Value::BigInt(message_id),
+            Value::BigInt(agent_id),
+        ],
+    )
+    .map_err(|error| DbError::Sqlite(error.to_string()))?;
+
+    let rows = conn
+        .query_sync(
+            "SELECT 1 FROM message_delivery_signal_receipts \
+             WHERE message_id = ? AND agent_id = ? AND delivery_route = ? LIMIT 1",
+            &[
+                Value::BigInt(message_id),
+                Value::BigInt(agent_id),
+                Value::Text(delivery_route.to_string()),
+            ],
+        )
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    if rows.is_empty() {
+        return Err(DbError::not_found(
+            "MessageRecipient",
+            format!("{message_id}:{agent_id}"),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Read persisted, signaled, and acknowledged facts for one exact message.
+///
+/// The mutable recipient `.signal` file is intentionally not read here: it is
+/// a debounced latest-state hint that can point at another message. Only the
+/// append-only receipt ledger establishes the `signaled` fact.
+pub fn message_delivery_receipt_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    message_id: i64,
+) -> Result<MessageDeliveryReceipt, DbError> {
+    let message_rows = conn
+        .query_sync(
+            "SELECT id, project_id, created_ts FROM messages WHERE id = ? AND project_id = ? LIMIT 1",
+            &[Value::BigInt(message_id), Value::BigInt(project_id)],
+        )
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    let message = message_rows
+        .first()
+        .ok_or_else(|| DbError::not_found("Message", message_id.to_string()))?;
+    let persisted_ts = message
+        .get_named("created_ts")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+
+    let rows = conn
+        .query_sync(
+            "SELECT agent.name AS recipient, recipient.kind AS kind, recipient.ack_ts AS ack_ts, \
+                    signal.delivery_route AS delivery_route, \
+                    signal.signal_path_digest AS signal_path_digest, \
+                    signal.observed_ts AS observed_ts \
+             FROM message_recipients AS recipient \
+             JOIN agents AS agent ON agent.id = recipient.agent_id \
+             LEFT JOIN message_delivery_signal_receipts AS signal \
+               ON signal.message_id = recipient.message_id AND signal.agent_id = recipient.agent_id \
+             WHERE recipient.message_id = ? \
+             ORDER BY recipient.agent_id ASC, signal.delivery_route ASC",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+
+    let mut recipients: Vec<MessageDeliveryRecipientReceipt> = Vec::new();
+    for row in rows {
+        let recipient: String = row
+            .get_named("recipient")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let kind: String = row
+            .get_named("kind")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        if recipients
+            .last()
+            .is_none_or(|previous| previous.recipient != recipient || previous.kind != kind)
+        {
+            let acknowledged_ts = row
+                .get_named("ack_ts")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            recipients.push(MessageDeliveryRecipientReceipt {
+                recipient: recipient.clone(),
+                kind: kind.clone(),
+                acknowledged_ts,
+                signal_receipts: Vec::new(),
+            });
+        }
+
+        let delivery_route: Option<String> = row
+            .get_named("delivery_route")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let signal_path_digest: Option<String> = row
+            .get_named("signal_path_digest")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let observed_ts: Option<i64> = row
+            .get_named("observed_ts")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        if let (Some(delivery_route), Some(signal_path_digest), Some(observed_ts)) =
+            (delivery_route, signal_path_digest, observed_ts)
+            && let Some(current) = recipients.last_mut()
+        {
+            current.signal_receipts.push(MessageDeliverySignalReceipt {
+                delivery_route,
+                signal_path_digest,
+                observed_ts,
+            });
+        }
+    }
+
+    Ok(MessageDeliveryReceipt {
+        message_id,
+        project_id,
+        persisted_ts,
+        recipients,
+    })
 }
 
 /// Synchronously update the thread ID of a message.
@@ -1241,6 +1414,92 @@ mod tests {
             expired,
             InboxDeliveryEventError::CursorExpired { .. }
         ));
+    }
+
+    #[test]
+    fn message_delivery_signal_receipts_are_message_bound_and_ack_separate() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "Sender");
+        let recipient_id = insert_agent(&conn, project_id, "Recipient");
+        let first_message_id = insert_message(&conn, project_id, sender_id, "first-thread");
+        let second_message_id = insert_message(&conn, project_id, sender_id, "second-thread");
+        for message_id in [first_message_id, second_message_id] {
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+                &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+            )
+            .expect("persist recipient");
+        }
+
+        let persisted_only =
+            message_delivery_receipt_from_conn(&conn, project_id, first_message_id)
+                .expect("read persisted receipt");
+        assert_eq!(persisted_only.recipients.len(), 1);
+        assert!(persisted_only.recipients[0].signal_receipts.is_empty());
+        assert_eq!(persisted_only.recipients[0].acknowledged_ts, None);
+
+        append_message_delivery_signal_receipt(
+            &conn,
+            first_message_id,
+            recipient_id,
+            "filesystem_signal",
+            "first-path-digest",
+            1_700_000_000_000_000,
+        )
+        .expect("append first message signal receipt");
+        // A retry must not overwrite the first observation or append a second
+        // receipt for the same (message, recipient, route).
+        append_message_delivery_signal_receipt(
+            &conn,
+            first_message_id,
+            recipient_id,
+            "filesystem_signal",
+            "retry-path-digest",
+            1_700_000_000_000_001,
+        )
+        .expect("idempotent receipt retry");
+
+        let first = message_delivery_receipt_from_conn(&conn, project_id, first_message_id)
+            .expect("read signaled first message");
+        assert_eq!(first.recipients[0].signal_receipts.len(), 1);
+        assert_eq!(
+            first.recipients[0].signal_receipts[0].signal_path_digest,
+            "first-path-digest"
+        );
+
+        let second = message_delivery_receipt_from_conn(&conn, project_id, second_message_id)
+            .expect("read un-signaled second message");
+        assert!(
+            second.recipients[0].signal_receipts.is_empty(),
+            "a recipient's latest signal must not be attributed to another message"
+        );
+
+        conn.execute_sync(
+            "UPDATE message_recipients SET ack_ts = ?1 WHERE message_id = ?2 AND agent_id = ?3",
+            &[
+                Value::BigInt(1_700_000_000_000_100),
+                Value::BigInt(first_message_id),
+                Value::BigInt(recipient_id),
+            ],
+        )
+        .expect("acknowledge first message");
+        let acknowledgement_rows = conn
+            .query_sync(
+                "SELECT ack_ts FROM message_recipients WHERE message_id = ?1 AND agent_id = ?2",
+                &[Value::BigInt(first_message_id), Value::BigInt(recipient_id)],
+            )
+            .expect("read raw acknowledgement");
+        let raw_acknowledged_ts: Option<i64> = acknowledgement_rows[0]
+            .get_named("ack_ts")
+            .expect("decode raw acknowledgement");
+        assert_eq!(raw_acknowledged_ts, Some(1_700_000_000_000_100));
+        let acknowledged = message_delivery_receipt_from_conn(&conn, project_id, first_message_id)
+            .expect("read acknowledged receipt");
+        assert_eq!(
+            acknowledged.recipients[0].acknowledged_ts,
+            Some(1_700_000_000_000_100)
+        );
     }
 
     // ── update_message_thread_id tests ───────────────────────────────

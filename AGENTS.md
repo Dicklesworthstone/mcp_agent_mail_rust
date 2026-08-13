@@ -255,7 +255,7 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 | `mcp-agent-mail-db` | SQL queries, pool, cache coherency, FTS sanitization, stress tests (concurrent ops, pool exhaustion) |
 | `mcp-agent-mail-storage` | Git archive, commit coalescer, notification signals |
 | `mcp-agent-mail-guard` | Pre-commit reservation enforcement, symmetric fnmatch, archive reading, rename handling |
-| `mcp-agent-mail-tools` | 39 MCP tool implementations via conformance fixtures |
+| `mcp-agent-mail-tools` | 38 MCP tool implementations via conformance fixtures |
 | `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
 | `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
 | `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
@@ -477,7 +477,7 @@ reflection surface:
 
 ## MCP Agent Mail — This Project
 
-**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 39 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
+**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 38 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
 
 ### What It Does
 
@@ -523,7 +523,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 39 MCP tool implementations
+│   ├── mcp-agent-mail-tools/               # 38 MCP tool implementations
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am)
@@ -550,19 +550,19 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
 | `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
-| `mcp-agent-mail-tools` | `src/` | 39 MCP tool implementations across 9 clusters |
+| `mcp-agent-mail-tools` | `src/` | 38 MCP tool implementations across 9 clusters |
 | `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
 | `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (16 screens) |
 | `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
 | `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
-### 39 MCP Tools (9 Clusters)
+### 38 MCP Tools (9 Clusters)
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
 | Infrastructure | 4 | health_check, ensure_project, install_precommit_guard, uninstall_precommit_guard |
 | Identity | 6 | register_agent, create_agent_identity, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
-| Messaging | 6 | send_message, reply_message, fetch_inbox, fetch_inbox_events, acknowledge_message, mark_message_read |
+| Messaging | 5 | send_message, reply_message, fetch_inbox, acknowledge_message, mark_message_read |
 | Contacts | 4 | request_contact, respond_contact, list_contacts, set_contact_policy |
 | File Reservations | 5 | check_file_reservation_conflicts, file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |
 | Search | 2 | search_messages, summarize_thread |

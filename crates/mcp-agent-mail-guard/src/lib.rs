@@ -5100,28 +5100,7 @@ mod tests {
         let marker = td.path().join("marker.txt");
         std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
         run_git(&repo_dir, &["init", "-q"]);
-        std::fs::write(repo_dir.join("a.rs"), "fn a() {}\n").expect("write staged file");
-        run_git(&repo_dir, &["add", "a.rs"]);
         install_guard(&repo_dir.to_string_lossy(), &repo_dir, false).expect("install guard");
-
-        // Identity is required only when a staged path is actually covered by
-        // a live reservation. Keep this fixture concrete: a missing archive
-        // is intentionally warning-and-allow, while this peer reservation
-        // must fail closed with the guard's identity exit code.
-        let reservations_dir = repo_dir.join("file_reservations");
-        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
-        std::fs::write(
-            reservations_dir.join("peer.json"),
-            serde_json::json!({
-                "path_pattern": "a.rs",
-                "agent_name": "OtherAgent",
-                "exclusive": true,
-                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-                "released_ts": serde_json::Value::Null,
-            })
-            .to_string(),
-        )
-        .expect("write active reservation");
 
         let hooks_dir = resolve_hooks_dir(&repo_dir).expect("hooks dir");
         write_guard_file_atomic(

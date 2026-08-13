@@ -2233,6 +2233,36 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v26: message-bound signal delivery receipts (GH#218) ────────────
+    //
+    // A recipient's `.signal` file is a debounced latest-state indicator and
+    // cannot prove which of several concurrent messages it represents. Keep
+    // the durable, append-only observation separate from that mutable file so
+    // callers can distinguish a persisted message from one whose signal write
+    // actually completed for this exact recipient and route.
+    migrations.push(Migration::new(
+        "v26_create_message_delivery_signal_receipts".to_string(),
+        "GH#218: create message-bound signal delivery receipt ledger".to_string(),
+        "CREATE TABLE IF NOT EXISTS message_delivery_signal_receipts (\
+            message_id INTEGER NOT NULL REFERENCES messages(id),\
+            agent_id INTEGER NOT NULL REFERENCES agents(id),\
+            delivery_route TEXT NOT NULL,\
+            signal_path_digest TEXT NOT NULL,\
+            observed_ts INTEGER NOT NULL,\
+            PRIMARY KEY(message_id, agent_id, delivery_route)\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v26_idx_message_delivery_signal_receipts_message".to_string(),
+        "GH#218: index signal delivery receipts by message and recipient".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_message_delivery_signal_receipts_message \
+         ON message_delivery_signal_receipts(message_id, agent_id)"
+            .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -2864,6 +2894,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "messages",
         "message_recipients",
         "inbox_delivery_events",
+        "message_delivery_signal_receipts",
         "file_reservations",
         "file_reservation_releases",
         "agent_links",
@@ -2875,6 +2906,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "idx_messages_ack_required_id",
         "idx_mr_ack_message",
         "idx_inbox_delivery_events_agent_seq",
+        "idx_message_delivery_signal_receipts_message",
         "idx_file_reservations_released_expires_id",
         "idx_file_reservation_releases_ts",
     ];
@@ -2942,6 +2974,16 @@ pub async fn validate_startup_schema_gate<C: Connection>(
                 "message_id",
                 "kind",
                 "delivered_ts",
+            ],
+        ),
+        (
+            "message_delivery_signal_receipts",
+            &[
+                "message_id",
+                "agent_id",
+                "delivery_route",
+                "signal_path_digest",
+                "observed_ts",
             ],
         ),
         (

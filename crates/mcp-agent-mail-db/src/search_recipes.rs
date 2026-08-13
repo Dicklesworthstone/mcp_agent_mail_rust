@@ -565,11 +565,10 @@ pub fn prune_recipes(conn: &DbConn, keep: usize) -> Result<u64, String> {
         }
         let id_list = keep_ids
             .iter()
-            .map(|id| id.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        let sql =
-            format!("DELETE FROM search_recipes WHERE pinned = 0 AND id NOT IN ({id_list})");
+        let sql = format!("DELETE FROM search_recipes WHERE pinned = 0 AND id NOT IN ({id_list})");
         conn.execute_sync(&sql, &[]).map_err(|e| e.to_string())
     })
 }

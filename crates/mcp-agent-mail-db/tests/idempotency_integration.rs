@@ -448,7 +448,11 @@ fn retention_window_replays_in_window_but_prunes_after_expiry() {
     // Exactly one key remains (expired pruned, fresh inserted), and it is a NEW
     // record — a strictly newer created_ts proves the prune-then-record path ran
     // rather than a stale replay.
-    assert_eq!(key_count(), 1, "pruning must leave exactly the one fresh key");
+    assert_eq!(
+        key_count(),
+        1,
+        "pruning must leave exactly the one fresh key"
+    );
     assert!(
         key_created_ts() > ts_original,
         "the pruned key was re-recorded fresh (newer created_ts)"
