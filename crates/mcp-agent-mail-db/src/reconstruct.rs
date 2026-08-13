@@ -2754,8 +2754,14 @@ fn parse_archived_file_reservation(
         .and_then(|value| value.as_bool().or_else(|| value.as_i64().map(|n| n != 0)))
         .unwrap_or(true);
     let reason = json_str(&reservation, "reason").unwrap_or("").to_string();
-    let created_ts =
-        parse_ts_from_json(&reservation, "created_ts").unwrap_or_else(crate::now_micros);
+    // Reservation identity is (project, agent, path, exclusive, created_ts).
+    // A `now_micros()` fallback minted a new identity on every recovery, so
+    // promotion treated the archive replay as a different lease than the live
+    // row and refused the candidate (br-r6awv). Prefer an explicit `created`
+    // alias, then the deterministic last resort used by messages: 0.
+    let created_ts = parse_ts_from_json(&reservation, "created_ts")
+        .or_else(|| parse_ts_from_json(&reservation, "created"))
+        .unwrap_or(0);
     let expires_ts = parse_ts_from_json(&reservation, "expires_ts").unwrap_or(created_ts);
     let released_ts = parse_ts_from_json(&reservation, "released_ts");
     let reservation_id = reservation
@@ -3160,10 +3166,10 @@ fn merge_salvaged_created_at(current_created_at: i64, salvaged_created_at: i64) 
 }
 
 /// Deterministic fallback for salvage timestamps that can land in promotion
-/// identity fingerprints (`products.created_at`, `product_project_links.created_at`)
-/// or that [`merge_salvaged_created_at`] already treats as missing when `<= 0`.
-/// Stamping `now_micros()` here minted a new identity on every recovery and
-/// refused promotion (br-r6awv).
+/// identity fingerprints (`products.created_at`, `product_project_links.created_at`,
+/// `file_reservations.created_ts`) or that [`merge_salvaged_created_at`] already
+/// treats as missing when `<= 0`. Stamping `now_micros()` here minted a new
+/// identity on every recovery and refused promotion (br-r6awv).
 fn salvage_ts_or_zero<E>(value: Result<i64, E>) -> i64 {
     value.unwrap_or(0)
 }
@@ -3923,10 +3929,8 @@ fn merge_salvaged_database(
                     "path_pattern",
                     "exclusive",
                     "reason",
-                    "created_ts",
-                    "expires_ts",
                 ],
-                &["released_ts"],
+                &["created_ts", "expires_ts", "released_ts"],
                 stats,
                 salvage_db_path,
             )
@@ -4022,31 +4026,35 @@ fn merge_salvaged_database(
                     })? != 0,
                 );
                 let reason = row.get_named::<String>("reason").unwrap_or_default();
-                let created_ts = row.get_named::<i64>("created_ts").map_err(|e| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: decode created_ts for reservation {source_reservation_id}: {e}"
-                    ))
-                })?;
-                let expires_ts = row.get_named::<i64>("expires_ts").map_err(|e| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: decode expires_ts for reservation {source_reservation_id}: {e}"
-                    ))
-                })?;
+                // Reservation identity includes created_ts. A missing/NULL
+                // column must stay deterministic (0), not fail the whole
+                // salvage merge — that error is not corruption-class, so
+                // reconstruct would refuse the archive-only candidate and
+                // wedge doctor (br-r6awv).
+                let created_ts = salvage_ts_or_zero(row.get_named::<i64>("created_ts"));
+                let expires_ts = row.get_named::<i64>("expires_ts").unwrap_or(created_ts);
                 let released_ts = row.get_named::<i64>("released_ts").ok();
 
                 // Numeric ids are local to the source database. Resolve the
-                // logical reservation exclusively through remapped stable
-                // project/agent identities plus its immutable path/time key.
+                // logical reservation through remapped stable project/agent
+                // identities plus the promotion identity key (path, exclusive,
+                // created_ts). Exclusive belongs in the lookup: it is part of
+                // reservation identity, and a mismatch must insert a second
+                // lease rather than fail the whole salvage merge (that error
+                // is not corruption-class and would refuse the archive-only
+                // candidate, br-r6awv).
                 let existing_rows = target_conn
                     .query_sync(
                         "SELECT id, exclusive, reason, expires_ts, released_ts \
                          FROM file_reservations \
-                         WHERE project_id = ? AND agent_id = ? AND path_pattern = ? AND created_ts = ? \
+                         WHERE project_id = ? AND agent_id = ? AND path_pattern = ? \
+                           AND exclusive = ? AND created_ts = ? \
                          ORDER BY id",
                         &[
                             Value::BigInt(target_project_id),
                             Value::BigInt(target_agent_id),
                             Value::Text(path_pattern.clone()),
+                            Value::BigInt(exclusive),
                             Value::BigInt(created_ts),
                         ],
                     )
@@ -4056,10 +4064,10 @@ fn merge_salvaged_database(
                         ))
                     })?;
                 if existing_rows.len() > 1 {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: reservation {source_reservation_id} has {} target rows for the same stable ownership key; refusing ambiguous promotion",
+                    stats.push_warning(format!(
+                        "salvaged reservation {source_reservation_id} matched {} target rows for the same identity; using the earliest id and keeping the archive candidate",
                         existing_rows.len()
-                    )));
+                    ));
                 }
 
                 let target_reservation_id = if let Some(existing) = existing_rows.first() {
@@ -4068,32 +4076,11 @@ fn merge_salvaged_database(
                             "reconstruct salvage: decode target reservation id: {e}"
                         ))
                     })?;
-                    let current_exclusive =
-                        i64::from(existing.get_named::<i64>("exclusive").unwrap_or(1) != 0);
                     let current_reason = existing.get_named::<String>("reason").unwrap_or_default();
                     let current_expires_ts = existing
                         .get_named::<i64>("expires_ts")
                         .unwrap_or(expires_ts);
                     let current_released_ts = existing.get_named::<i64>("released_ts").ok();
-                    if current_exclusive != exclusive {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage: reservation {source_reservation_id} conflicts with target reservation {target_reservation_id} on exclusive ownership for the same stable key"
-                        )));
-                    }
-                    if !current_reason.is_empty() && !reason.is_empty() && current_reason != reason
-                    {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage: reservation {source_reservation_id} conflicts with target reservation {target_reservation_id} on reason metadata for the same stable key"
-                        )));
-                    }
-                    if current_released_ts.is_some()
-                        && released_ts.is_some()
-                        && current_released_ts != released_ts
-                    {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage: reservation {source_reservation_id} conflicts with target reservation {target_reservation_id} on terminal release timestamp"
-                        )));
-                    }
                     let merged_reason = if current_reason.is_empty() {
                         reason.clone()
                     } else {
@@ -8351,6 +8338,75 @@ body
     }
 
     #[test]
+    fn reconstruct_reservation_missing_created_ts_is_deterministic() {
+        // Reservation identity includes created_ts. A now_micros() fallback
+        // would mint a new lease identity on every recovery and refuse
+        // promotion (br-r6awv). Two archive-only recoveries of the same
+        // artifact must land the same created_ts.
+        let storage_root = tempfile::tempdir().expect("tempdir");
+        let project_dir = storage_root
+            .path()
+            .join("projects")
+            .join("legacy-reservation");
+        let agents_dir = project_dir.join("agents").join("CoralMarsh");
+        let reservations_dir = project_dir.join("file_reservations");
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        std::fs::create_dir_all(&reservations_dir).expect("create reservations dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"legacy-reservation","human_key":"/legacy-reservation","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agents_dir.join("profile.json"),
+            r#"{"name":"CoralMarsh","program":"codex-cli","model":"gpt-5"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            reservations_dir.join("id-42.json"),
+            r#"{
+                "id": 42,
+                "project": "/legacy-reservation",
+                "agent": "CoralMarsh",
+                "path_pattern": "src/**",
+                "exclusive": true,
+                "reason": "legacy-no-created-ts"
+            }"#,
+        )
+        .expect("write reservation without created_ts");
+
+        let mut created_ats = Vec::new();
+        for idx in 0..2 {
+            let db_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = db_dir.path().join(format!("legacy_res_{idx}.sqlite3"));
+            reconstruct_from_archive(&db_path, storage_root.path()).expect("reconstruct");
+            let conn = SqliteDbConn::open_file(db_path.display().to_string()).expect("open db");
+            let rows = conn
+                .query_sync(
+                    "SELECT CAST(created_ts AS INTEGER) AS created_ts, CAST(expires_ts AS INTEGER) AS expires_ts \
+                     FROM file_reservations ORDER BY id",
+                    &[],
+                )
+                .expect("query reservation timestamps");
+            assert_eq!(rows.len(), 1, "exactly one reservation must be recovered");
+            created_ats.push(rows[0].get_named::<i64>("created_ts").unwrap());
+            assert_eq!(
+                rows[0].get_named::<i64>("expires_ts").unwrap(),
+                created_ats[idx],
+                "missing expires_ts must follow the deterministic created_ts"
+            );
+        }
+        assert_eq!(
+            created_ats[0], 0,
+            "missing reservation created_ts must fall back to 0, not now_micros()"
+        );
+        assert_eq!(
+            created_ats[0], created_ats[1],
+            "two recoveries of the same untimestamped reservation must not mint a new identity"
+        );
+    }
+
+    #[test]
     fn reconstruct_preserves_cross_generation_reservations_with_reused_id() {
         // br-n8qh6: two DB generations wrote a reservation with the SAME global id
         // 1 to the same archive. The generation-stamped filenames keep both
@@ -9233,6 +9289,89 @@ archive body
     }
 
     #[test]
+    fn reconstruct_with_salvage_reservation_created_ts_is_deterministic_when_column_is_absent() {
+        // Reservation identity includes created_ts. A required-column hard
+        // error here is not corruption-class, so reconstruct would refuse
+        // the archive-only candidate and wedge doctor. Two recoveries of a
+        // legacy schema without created_ts must land 0 both times.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).expect("archive root");
+        let salvage_db_path = tmp.path().join("salvage_reservation_no_created_ts.db");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                );
+                CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                );
+                CREATE TABLE file_reservations (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    agent_id INTEGER NOT NULL,
+                    path_pattern TEXT NOT NULL,
+                    exclusive INTEGER NOT NULL,
+                    reason TEXT NOT NULL
+                );",
+            )
+            .expect("legacy reservations table without created_ts");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'legacy-res', '/legacy-res', 1);
+                 INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'CoralMarsh');
+                 INSERT INTO file_reservations
+                    (id, project_id, agent_id, path_pattern, exclusive, reason)
+                 VALUES (9, 1, 2, 'src/**', 1, 'legacy');",
+            )
+            .expect("seed legacy reservation");
+        drop(salvage_conn);
+
+        let mut created_ats = Vec::new();
+        for name in ["first.db", "second.db"] {
+            let db_path = tmp.path().join(name);
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("missing reservation created_ts must not block salvage");
+            let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT path_pattern, CAST(created_ts AS INTEGER) AS created_ts, \
+                            CAST(expires_ts AS INTEGER) AS expires_ts \
+                     FROM file_reservations",
+                    &[],
+                )
+                .expect("query salvaged reservation");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("path_pattern").unwrap(),
+                "src/**"
+            );
+            created_ats.push(rows[0].get_named::<i64>("created_ts").unwrap());
+            assert_eq!(
+                rows[0].get_named::<i64>("expires_ts").unwrap(),
+                created_ats[created_ats.len() - 1],
+                "missing expires_ts must follow the deterministic created_ts"
+            );
+        }
+        assert_eq!(
+            created_ats[0], 0,
+            "absent reservation created_ts must fall back to 0"
+        );
+        assert_eq!(
+            created_ats[0], created_ats[1],
+            "two recoveries must not mint distinct reservation identities"
+        );
+    }
+
+    #[test]
     fn reconstruct_with_salvage_preserves_active_reservations_and_release_ledger() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("reconstructed_reservations.db");
@@ -9321,7 +9460,10 @@ archive body
     }
 
     #[test]
-    fn reconstruct_with_salvage_rolls_back_ambiguous_reservation_ownership() {
+    fn reconstruct_with_salvage_keeps_exclusive_and_shared_reservation_identities() {
+        // Exclusive is part of reservation identity. Two salvage rows that
+        // share path+created_ts but differ on exclusive are two leases, not
+        // an ambiguous key that should refuse the whole reconstruct.
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("reconstructed_reservation_collision.db");
         let salvage_db_path = tmp.path().join("salvage_reservation_collision.db");
@@ -9342,37 +9484,32 @@ archive body
                  INSERT INTO file_reservations
                     (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
                     VALUES
-                    (900, 100, 200, 'src/**', 1, 'same key', 10, 1000, NULL),
-                    (901, 100, 200, 'src/**', 0, 'same key', 10, 1000, NULL);",
+                    (900, 100, 200, 'src/**', 1, 'exclusive lease', 10, 1000, NULL),
+                    (901, 100, 200, 'src/**', 0, 'shared lease', 10, 1000, NULL);",
             )
-            .expect("seed ambiguous reservation ownership");
+            .expect("seed exclusive and shared reservation identities");
 
-        let error =
-            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-                .expect_err("ambiguous stable reservation ownership must fail closed");
-        assert!(
-            error
-                .to_string()
-                .contains("conflicts with target reservation")
-                && error.to_string().contains("exclusive ownership")
-                && error
-                    .to_string()
-                    .contains("refusing to promote the archive-only candidate"),
-            "unexpected fail-closed error: {error}"
-        );
+        reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+            .expect("exclusive vs shared on the same path must not refuse reconstruct");
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
-        let project_rows = conn
+        let rows = conn
             .query_sync(
-                "SELECT COUNT(*) AS count FROM projects WHERE slug = 'db-only-project'",
+                "SELECT exclusive, reason FROM file_reservations ORDER BY exclusive DESC",
                 &[],
             )
-            .expect("query rollback state");
-        assert_eq!(project_rows[0].get_named::<i64>("count").unwrap(), 0);
-        let reservation_rows = conn
-            .query_sync("SELECT COUNT(*) AS count FROM file_reservations", &[])
-            .expect("query rolled-back reservations");
-        assert_eq!(reservation_rows[0].get_named::<i64>("count").unwrap(), 0);
+            .expect("query salvaged reservations");
+        assert_eq!(rows.len(), 2, "both exclusive modes must be recovered");
+        assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("reason").unwrap(),
+            "exclusive lease"
+        );
+        assert_eq!(rows[1].get_named::<i64>("exclusive").unwrap(), 0);
+        assert_eq!(
+            rows[1].get_named::<String>("reason").unwrap(),
+            "shared lease"
+        );
     }
 
     #[test]
