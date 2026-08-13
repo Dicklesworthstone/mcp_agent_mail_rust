@@ -2918,9 +2918,6 @@ fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
     }
 }
 
-/// Return the `project_id` of a message row with the given canonical id, or
-/// `None` if no such row exists. Used during reconstruction to distinguish
-/// same-project duplicates from cross-project canonical-id collisions.
 /// Deterministic timestamp fallback for canonical archive files whose
 /// frontmatter carries no parseable `created`/`created_ts`: the filename's
 /// leading `%Y-%m-%dT%H-%M-%SZ` stamp (e.g.
@@ -2937,31 +2934,6 @@ fn canonical_filename_created_ts(file_path: &Path) -> Option<i64> {
 /// identity, not just id: an id can be legitimately reused by a *different*
 /// message across DB generations or across separately-produced project
 /// archives (br-r6awv).
-fn message_identity_already_present(
-    conn: &DbConn,
-    project_id: i64,
-    created_ts: i64,
-    subject: &str,
-) -> DbResult<bool> {
-    let rows = conn
-        .query_sync(
-            "SELECT 1 AS present FROM messages \
-             WHERE project_id = ? AND CAST(created_ts AS INTEGER) = ? AND subject = ? \
-             LIMIT 1",
-            &[
-                Value::BigInt(project_id),
-                Value::BigInt(created_ts),
-                Value::Text(subject.to_string()),
-            ],
-        )
-        .map_err(|e| {
-            DbError::Sqlite(format!(
-                "check existing message identity in project {project_id}: {e}"
-            ))
-        })?;
-    Ok(!rows.is_empty())
-}
-
 fn message_row_identity(conn: &DbConn, message_id: i64) -> DbResult<Option<(i64, i64, String)>> {
     let rows = conn
         .query_sync(
@@ -3010,6 +2982,15 @@ fn message_identity_existing_id(
     row.get_named::<i64>("id")
         .map(Some)
         .map_err(|e| DbError::Sqlite(format!("decode message identity id: {e}")))
+}
+
+fn message_identity_already_present(
+    conn: &DbConn,
+    project_id: i64,
+    created_ts: i64,
+    subject: &str,
+) -> DbResult<bool> {
+    Ok(message_identity_existing_id(conn, project_id, created_ts, subject)?.is_some())
 }
 
 fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
@@ -4916,9 +4897,10 @@ fn merge_salvaged_database(
                     // silently discards the salvaged message (br-r6awv);
                     // identity mismatches fall through to the remap path.
                     let source_subject = row.get_named::<String>("subject").unwrap_or_default();
-                    let source_created_ts = row
-                        .get_named::<i64>("created_ts")
-                        .unwrap_or_else(|_| crate::now_micros());
+                    // Must be deterministic: `now_micros()` here would give the
+                    // same salvage row a new identity on every recovery and
+                    // prevent matching the archive copy (br-r6awv).
+                    let source_created_ts = row.get_named::<i64>("created_ts").unwrap_or(0);
                     if let Some((existing_pid, existing_created_ts, existing_subject)) =
                         message_row_identity(&target_conn, source_message_id)?
                         && existing_pid == target_project_id
@@ -7758,6 +7740,72 @@ loser body
     }
 
     #[test]
+    fn canonical_filename_created_ts_parses_leading_utc_stamp() {
+        let path = Path::new("/archive/2026-02-22T12-00-00Z__hello__1.md");
+        assert_eq!(
+            super::canonical_filename_created_ts(path),
+            Some(1_771_761_600_000_000)
+        );
+        assert_eq!(
+            super::canonical_filename_created_ts(Path::new("no-stamp.md")),
+            None
+        );
+        assert_eq!(
+            super::canonical_filename_created_ts(Path::new("hello__7.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn reconstruct_uses_filename_stamp_when_frontmatter_has_no_created_ts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("stamp-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"stamp-project","human_key":"/stamp-project","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-02-22T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__no-ts__3.md"),
+            r#"---json
+{
+  "id": 3,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "No ts"
+}
+---
+
+body
+"#,
+        )
+        .unwrap();
+
+        reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT created_ts FROM messages WHERE id = 3", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<i64>("created_ts").expect("created_ts"),
+            1_771_761_600_000_000,
+            "missing frontmatter created_ts must fall back to the filename stamp, not now_micros()"
+        );
+    }
+
+    #[test]
     fn reconstruct_preserves_cross_project_canonical_id_collision_under_generated_db_id() {
         // Two separate project archives both contain a message with frontmatter
         // id 7. Prior behavior dropped the second as a duplicate. Expected
@@ -9038,6 +9086,83 @@ archive body
             rows[1].get_named::<String>("subject").unwrap(),
             "DB-only different message"
         );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_maps_same_identity_under_a_different_numeric_id() {
+        // Archive carried the message as canonical id 7; the salvage source
+        // still has the same identity under id 99 (row-id reuse). Re-inserting
+        // it trips the promotion duplicate-inflation guard (br-r6awv).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_identity_remap.db");
+        let salvage_db_path = tmp.path().join("salvage_identity_remap.db");
+        let storage_root = tmp.path().join("storage");
+
+        let archive_project = storage_root.join("projects").join("solo");
+        let archive_messages = archive_project.join("messages").join("2026").join("07");
+        std::fs::create_dir_all(&archive_messages).expect("create archive messages");
+        std::fs::write(
+            archive_project.join("project.json"),
+            r#"{"slug":"solo","human_key":"/solo","created_at":1}"#,
+        )
+        .expect("write archive project");
+        std::fs::write(
+            archive_messages.join("2026-07-17T12-00-00Z__archive__7.md"),
+            r#"---json
+{"id":7,"from":"Alice","to":[],"subject":"Archive message","importance":"normal","created_ts":1784289600000000,"attachments":[]}
+---
+
+archive body
+"#,
+        )
+        .expect("write archive message");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init salvage schema");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+                    (500, 'solo', '/solo', 1);
+                 INSERT INTO agents
+                    (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                    VALUES
+                    (600, 500, 'Alice', 'coder', 'test', '', 1, 2, 'auto', 'auto');
+                 INSERT INTO messages
+                    (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments)
+                    VALUES
+                    (99, 500, 600, 'Archive message', 'archive body', 'normal', 0, 1784289600000000,
+                     '{\"to\":[],\"cc\":[],\"bcc\":[]}', '[]'),
+                    (100, 500, 600, 'DB-only', 'db body', 'normal', 0, 2,
+                     '{\"to\":[],\"cc\":[],\"bcc\":[]}', '[]');",
+            )
+            .expect("seed same-identity different-id salvage rows");
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("same-identity salvage row must map, not re-insert");
+        assert_eq!(
+            stats.salvaged_messages, 1,
+            "only the true DB-only row is new; warnings: {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT id, subject FROM messages ORDER BY id", &[])
+            .expect("query messages");
+        assert_eq!(
+            rows.len(),
+            2,
+            "must not replay the archive copy as a second row"
+        );
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 7);
+        assert_eq!(
+            rows[0].get_named::<String>("subject").unwrap(),
+            "Archive message"
+        );
+        assert_eq!(rows[1].get_named::<String>("subject").unwrap(), "DB-only");
     }
 
     #[test]
