@@ -9030,6 +9030,17 @@ where
     ensure_recovery_disk_headroom(primary_path, backup_bytes, "sqlite backup restore")?;
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    // Detach the corrupt primary's stale journal/WAL sidecars BEFORE the
+    // promotion receipt snapshots the source: a stale rollback journal makes
+    // the primary engine's read-only open demand a write (hot-journal
+    // rollback), which turned the receipt snapshot into a hard
+    // "attempt to write a readonly database" failure and blocked restoring
+    // from a perfectly healthy backup. The sidecars are quarantined by
+    // rename (never deleted) under the same `.corrupt-<ts>` names the
+    // promotion path uses.
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        quarantine_sidecar(primary_path, suffix, &timestamp)?;
+    }
     let restore_candidate = stage_backup_restore_candidate(backup_path, primary_path, &timestamp)?;
     if !sqlite_recovery_candidate_is_healthy(&restore_candidate)? {
         cleanup_sqlite_candidate_artifact(&restore_candidate);

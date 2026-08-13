@@ -3159,6 +3159,15 @@ fn merge_salvaged_created_at(current_created_at: i64, salvaged_created_at: i64) 
     }
 }
 
+/// Deterministic fallback for salvage timestamps that can land in promotion
+/// identity fingerprints (`products.created_at`, `product_project_links.created_at`)
+/// or that [`merge_salvaged_created_at`] already treats as missing when `<= 0`.
+/// Stamping `now_micros()` here minted a new identity on every recovery and
+/// refused promotion (br-r6awv).
+fn salvage_ts_or_zero<E>(value: Result<i64, E>) -> i64 {
+    value.unwrap_or(0)
+}
+
 fn merge_salvaged_inception_ts(current_inception_ts: i64, salvaged_inception_ts: i64) -> i64 {
     if salvaged_inception_ts <= 0 {
         current_inception_ts
@@ -3637,9 +3646,7 @@ fn merge_salvaged_database(
                 let human_key = row
                     .get_named::<String>("human_key")
                     .unwrap_or_else(|_| synthetic_project_placeholder_human_key(&slug));
-                let created_at = row
-                    .get_named::<i64>("created_at")
-                    .unwrap_or_else(|_| crate::now_micros());
+                let created_at = salvage_ts_or_zero(row.get_named::<i64>("created_at"));
 
                 if let Ok(target_project_id) =
                     query_last_insert_or_existing_id(&target_conn, "projects", "slug", &slug)
@@ -3781,12 +3788,10 @@ fn merge_salvaged_database(
                 let salvaged_task_description = row
                     .get_named::<String>("task_description")
                     .unwrap_or_default();
-                let salvaged_inception_ts = row
-                    .get_named::<i64>("inception_ts")
-                    .unwrap_or_else(|_| crate::now_micros());
-                let salvaged_last_active_ts = row
-                    .get_named::<i64>("last_active_ts")
-                    .unwrap_or_else(|_| crate::now_micros());
+                let salvaged_inception_ts =
+                    salvage_ts_or_zero(row.get_named::<i64>("inception_ts"));
+                let salvaged_last_active_ts =
+                    salvage_ts_or_zero(row.get_named::<i64>("last_active_ts"));
                 let salvaged_attachments_policy_raw =
                     row.get_named::<String>("attachments_policy").ok();
                 let salvaged_contact_policy_raw = row.get_named::<String>("contact_policy").ok();
@@ -4365,12 +4370,15 @@ fn merge_salvaged_database(
                     .get_named::<String>("status")
                     .unwrap_or_else(|_| "pending".to_string());
                 let reason = row.get_named::<String>("reason").unwrap_or_default();
-                let created_ts = row
-                    .get_named::<i64>("created_ts")
-                    .unwrap_or_else(|_| crate::now_micros());
+                // created_ts is optional on legacy agent_links. A missing
+                // column must stay deterministic (0), not `now_micros()`, but
+                // must not trip the "invalid timestamp" skip that is meant
+                // for present-and-broken values.
+                let decoded_created_ts = row.get_named::<i64>("created_ts").ok();
+                let created_ts = decoded_created_ts.unwrap_or(0);
                 let updated_ts = row.get_named::<i64>("updated_ts").unwrap_or(created_ts);
                 let expires_ts = row.get_named::<i64>("expires_ts").ok();
-                if created_ts <= 0 || updated_ts < created_ts {
+                if decoded_created_ts.is_some_and(|ts| ts <= 0) || updated_ts < created_ts {
                     stats.push_warning(format!(
                         "skipped salvaged agent_link {link_label}: invalid timestamp ordering ({created_ts}, {updated_ts})"
                     ));
@@ -4574,10 +4582,9 @@ fn merge_salvaged_database(
                             &[
                                 Value::Text(product_uid.clone()),
                                 Value::Text(name.clone()),
-                                Value::BigInt(
-                                    row.get_named::<i64>("created_at")
-                                        .unwrap_or_else(|_| crate::now_micros()),
-                                ),
+                                Value::BigInt(salvage_ts_or_zero(
+                                    row.get_named::<i64>("created_at"),
+                                )),
                             ],
                         )
                         .map_err(|e| {
@@ -4667,10 +4674,9 @@ fn merge_salvaged_database(
                             &[
                                 Value::BigInt(target_product_id),
                                 Value::BigInt(target_project_id),
-                                Value::BigInt(
-                                    row.get_named::<i64>("created_at")
-                                        .unwrap_or_else(|_| crate::now_micros()),
-                                ),
+                                Value::BigInt(salvage_ts_or_zero(
+                                    row.get_named::<i64>("created_at"),
+                                )),
                             ],
                         )
                         .map_err(|e| {
@@ -7757,6 +7763,12 @@ loser body
     }
 
     #[test]
+    fn salvage_ts_or_zero_keeps_decoded_values_and_falls_back_to_zero() {
+        assert_eq!(super::salvage_ts_or_zero::<()>(Ok(42)), 42);
+        assert_eq!(super::salvage_ts_or_zero::<&str>(Err("missing")), 0);
+    }
+
+    #[test]
     fn reconstruct_uses_filename_stamp_when_frontmatter_has_no_created_ts() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("test.db");
@@ -9163,6 +9175,61 @@ archive body
             "Archive message"
         );
         assert_eq!(rows[1].get_named::<String>("subject").unwrap(), "DB-only");
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_product_created_at_is_deterministic_when_column_is_absent() {
+        // products.created_at is part of the unique promotion fingerprint.
+        // A now_micros() fallback would mint a new identity on every recovery
+        // and refuse promotion as a phantom loss (br-r6awv).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).expect("archive root");
+        let salvage_db_path = tmp.path().join("salvage_product_no_created_at.db");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE products (
+                    id INTEGER PRIMARY KEY,
+                    product_uid TEXT NOT NULL,
+                    name TEXT NOT NULL
+                );",
+            )
+            .expect("products table without created_at");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO products (id, product_uid, name) VALUES (1, 'uid-widget', 'Widget');",
+            )
+            .expect("seed product");
+        drop(salvage_conn);
+
+        let mut created_ats = Vec::new();
+        for name in ["first.db", "second.db"] {
+            let db_path = tmp.path().join(name);
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("missing product created_at must not block salvage");
+            let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT product_uid, name, CAST(created_at AS INTEGER) AS created_at \
+                     FROM products",
+                    &[],
+                )
+                .expect("query salvaged product");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("product_uid").unwrap(),
+                "uid-widget"
+            );
+            assert_eq!(rows[0].get_named::<String>("name").unwrap(), "Widget");
+            created_ats.push(rows[0].get_named::<i64>("created_at").unwrap());
+        }
+        assert_eq!(created_ats[0], 0, "absent created_at must fall back to 0");
+        assert_eq!(
+            created_ats[0], created_ats[1],
+            "two recoveries must not mint distinct product identities"
+        );
     }
 
     #[test]

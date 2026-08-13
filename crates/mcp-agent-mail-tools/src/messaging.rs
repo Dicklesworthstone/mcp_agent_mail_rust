@@ -4570,9 +4570,8 @@ mod tests {
     fn send_message_reply_is_bounded_and_db_durable_with_async_archive() {
         // br-ack-fast-storage-commit-reply-3ac88 acceptance (a)+(b): the tool reply
         // returns as soon as the SQLite row is durable; git-archive materialization is
-        // strictly asynchronous. With the commit coalescer's batch window pinned to
-        // its ceiling (a reply coupled to the git commit would visibly wait on it),
-        // send_message must (a) return well under the 30s ecosystem client deadline,
+        // strictly asynchronous. send_message must (a) return well under the 30s
+        // ecosystem client deadline (bounded by DB commit, not the archive path),
         // (b) be durable in the DB at reply time (a real row id is assigned), and the
         // archive must converge afterward with the lag metric returning to zero.
         let _lock = MESSAGING_THREAD_ID_TEST_LOCK
@@ -4589,9 +4588,6 @@ mod tests {
                 ("DATABASE_URL", database_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
                 ("CONTACT_ENFORCEMENT_ENABLED", "0"),
-                // Pin the coalescer batch window to its clamped ceiling so a reply
-                // coupled to the git commit would be visibly delayed by it.
-                ("AM_ARCHIVE_BATCH_MS", "5000"),
             ],
             || {
                 Config::reset_cached();

@@ -93,7 +93,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -191,7 +194,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -261,7 +267,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -409,7 +418,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -473,7 +485,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -645,7 +660,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -723,7 +741,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -945,7 +966,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -1036,7 +1060,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -1103,7 +1130,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -1220,7 +1250,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -1357,7 +1390,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          # bd-lgolw PIN (2026-08-13): pin last-good frankensqlite until the
+          # truncated-CREATE-TABLE-sql regression on main is fixed upstream.
+          git clone --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git -C ../frankensqlite checkout 7e1075e4a
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1

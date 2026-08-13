@@ -2205,6 +2205,7 @@ dependencies = [
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
+ "futures-lite",
  "tracing",
 ]
 

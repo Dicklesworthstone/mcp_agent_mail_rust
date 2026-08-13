@@ -21,10 +21,15 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 --sparse https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --sparse --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           (
             cd ../frankensqlite
             git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
+            # bd-lgolw PIN (2026-08-13): frankensqlite main after 7e1075e4a stores
+            # truncated multi-line CREATE TABLE sql in sqlite_master via the am
+            # init path (canonical sqlite3: "malformed database schema"). Pin the
+            # last-good commit until the upstream P0 is fixed, then remove.
+            git checkout 7e1075e4a
           )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
@@ -61,10 +66,15 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 --sparse https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --sparse --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           (
             cd ../frankensqlite
             git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
+            # bd-lgolw PIN (2026-08-13): frankensqlite main after 7e1075e4a stores
+            # truncated multi-line CREATE TABLE sql in sqlite_master via the am
+            # init path (canonical sqlite3: "malformed database schema"). Pin the
+            # last-good commit until the upstream P0 is fixed, then remove.
+            git checkout 7e1075e4a
           )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
@@ -127,10 +137,15 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 --sparse https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --sparse --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           (
             cd ../frankensqlite
             git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
+            # bd-lgolw PIN (2026-08-13): frankensqlite main after 7e1075e4a stores
+            # truncated multi-line CREATE TABLE sql in sqlite_master via the am
+            # init path (canonical sqlite3: "malformed database schema"). Pin the
+            # last-good commit until the upstream P0 is fixed, then remove.
+            git checkout 7e1075e4a
           )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
