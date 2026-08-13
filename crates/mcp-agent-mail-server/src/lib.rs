@@ -1325,9 +1325,12 @@ impl MailboxActivityLockMetadata {
 }
 
 fn mailbox_activity_lock_age(acquired_at_micros: i64) -> String {
-    let elapsed_micros = mcp_agent_mail_core::timestamps::now_micros()
-        .saturating_sub(acquired_at_micros)
-        .max(0) as u64;
+    let elapsed_micros = u64::try_from(
+        mcp_agent_mail_core::timestamps::now_micros()
+            .saturating_sub(acquired_at_micros)
+            .max(0),
+    )
+    .unwrap_or(0);
     let elapsed_seconds = elapsed_micros / 1_000_000;
     if elapsed_seconds < 60 {
         return format!("{elapsed_seconds}s");
