@@ -2004,6 +2004,54 @@ mod tests {
             crate::pool::open_atc_sidecar_conn(pool.sqlite_path()).is_none(),
             "0-byte sidecar must read as absent"
         );
+
+        // A valid SQLite sidecar can also be non-empty yet still lack the ATC
+        // schema. The readiness probe, rather than the length check alone,
+        // must keep the maintenance paths quiet in that state too.
+        let schema_less_conn =
+            crate::CanonicalDbConn::open_file(atc_path.as_str()).expect("open schema-less sidecar");
+        schema_less_conn
+            .execute_raw("CREATE TABLE unrelated_sidecar_marker(value INTEGER NOT NULL)")
+            .expect("create unrelated schema-less sidecar table");
+        crate::queries::close_canonical_db_conn(
+            schema_less_conn,
+            "schema-less ATC sidecar fixture connection",
+        );
+        assert!(
+            std::fs::metadata(&atc_path)
+                .expect("schema-less sidecar metadata")
+                .len()
+                > 0,
+            "fixture must be a non-empty SQLite sidecar"
+        );
+
+        let summary = runtime
+            .block_on(refresh_rollups(&cx, &pool, crate::now_micros(), 1_000_000))
+            .into_result()
+            .expect("refresh_rollups must no-op on a schema-less sidecar");
+        assert_eq!(summary.rows_scanned, 0);
+        assert_eq!(
+            enforce_experience_row_ceiling(&pool, 100)
+                .expect("ceiling must no-op on a schema-less sidecar"),
+            0
+        );
+        let schema_probe = crate::CanonicalDbConn::open_file(atc_path.as_str())
+            .expect("open schema-less sidecar for verification");
+        let atc_tables = schema_probe
+            .query_sync(
+                "SELECT 1 AS present FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'atc_experiences' LIMIT 1",
+                &[],
+            )
+            .expect("probe schema-less ATC sidecar");
+        crate::queries::close_canonical_db_conn(
+            schema_probe,
+            "schema-less ATC sidecar verification connection",
+        );
+        assert!(
+            atc_tables.is_empty(),
+            "idle maintenance must not initialize an unrelated sidecar"
+        );
     }
 
     fn encode_outcome(spec: &TestExperienceSpec) -> Option<String> {
