@@ -430,6 +430,20 @@ fn pid_hint_max_age_secs() -> u64 {
 /// another process.
 #[must_use]
 pub fn check_port_status(host: &str, port: u16) -> PortStatus {
+    check_port_status_at_mcp_path(host, port, "/mcp/")
+}
+
+/// Check a port using the MCP route configured for the server that would own
+/// it.
+///
+/// This is the ownership-sensitive counterpart to [`check_port_status`]. A
+/// green liveness route does not prove that an MCP client can use its configured
+/// endpoint: in particular, a trailing-slash or custom-path regression can
+/// return 405 from MCP while `/healthz` is still 200. Callers deciding whether
+/// to stop, replace, or defer to a peer must use this function with
+/// [`Config::http_path`].
+#[must_use]
+pub fn check_port_status_at_mcp_path(host: &str, port: u16, mcp_path: &str) -> PortStatus {
     let addr = format!("{host}:{port}");
     let bind_host = normalize_bind_host_for_socket(host);
 
@@ -455,15 +469,20 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
         }
     }
 
-    // Step 2: Port is in use - try to identify if it's Agent Mail via health check
-    let health_probe_status = agent_mail_health_probe(host, port);
+    // Step 2: Port is in use - prove that its configured MCP route works.
+    let health_probe_status = agent_mail_mcp_probe(host, port, mcp_path);
     if matches!(health_probe_status, HealthProbeStatus::AgentMailServer) {
         return PortStatus::AgentMailServer;
     }
 
-    // Step 3: Health check failed (timeout, server busy, etc.) — fall back to
-    // process-level identification via listener PID lookup + /proc/{pid}/cmdline.
-    if is_agent_mail_by_pid(host, port) {
+    // Step 3: An unavailable probe can fall back to process-level
+    // identification via listener PID lookup + /proc/{pid}/cmdline. Do not
+    // let that fallback turn a reachable but broken MCP route (for example a
+    // signed 405) into a healthy peer: lifecycle decisions must see the route
+    // failure and leave the listener alone.
+    if matches!(health_probe_status, HealthProbeStatus::NoResponse)
+        && is_agent_mail_by_pid(host, port)
+    {
         return PortStatus::AgentMailServer;
     }
 
@@ -581,10 +600,10 @@ fn normalize_connect_host_for_health_check(host: &str) -> std::borrow::Cow<'_, s
 /// the MCP transport it actually serves.
 ///
 /// A liveness endpoint alone cannot detect a broken mounted MCP route. Send a
-/// small JSON-RPC POST to the canonical MCP path instead. A signed 401 still
+/// small JSON-RPC POST to the configured MCP path instead. A signed 401 still
 /// proves the request reached Agent Mail's bearer-auth gate without requiring
 /// this ownership probe to know the secret.
-fn agent_mail_health_probe(host: &str, port: u16) -> HealthProbeStatus {
+fn agent_mail_mcp_probe(host: &str, port: u16, mcp_path: &str) -> HealthProbeStatus {
     let connect_host = normalize_connect_host_for_health_check(host);
     let host_for_resolution = connect_host
         .strip_prefix('[')
@@ -593,29 +612,45 @@ fn agent_mail_health_probe(host: &str, port: u16) -> HealthProbeStatus {
     let Ok(addrs) = (host_for_resolution, port).to_socket_addrs() else {
         return HealthProbeStatus::NoResponse;
     };
-    agent_mail_health_probe_addrs(connect_host.as_ref(), port, addrs)
+    agent_mail_mcp_probe_addrs(connect_host.as_ref(), port, mcp_path, addrs)
 }
 
-#[cfg(test)]
-fn is_agent_mail_health_check_addrs(
-    connect_host: &str,
-    port: u16,
-    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
-) -> bool {
+/// Probe the configured MCP endpoint synchronously for a peer that is safe to
+/// treat as the current Agent Mail owner.
+///
+/// Unlike the generic liveness endpoint, this POST exercises the route clients
+/// will actually call. It is deliberately token-free: a signed 401 establishes
+/// ownership while still keeping the bearer token out of this probe.
+#[must_use]
+pub fn probe_agent_mail_mcp_blocking(config: &Config) -> bool {
     matches!(
-        agent_mail_health_probe_addrs(connect_host, port, addrs),
+        agent_mail_mcp_probe(&config.http_host, config.http_port, &config.http_path),
         HealthProbeStatus::AgentMailServer
     )
 }
 
-fn agent_mail_health_probe_addrs(
+#[cfg(test)]
+fn is_agent_mail_mcp_check_addrs(
     connect_host: &str,
     port: u16,
+    mcp_path: &str,
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> bool {
+    matches!(
+        agent_mail_mcp_probe_addrs(connect_host, port, mcp_path, addrs),
+        HealthProbeStatus::AgentMailServer
+    )
+}
+
+fn agent_mail_mcp_probe_addrs(
+    connect_host: &str,
+    port: u16,
+    mcp_path: &str,
     addrs: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> HealthProbeStatus {
     let mut saw_listener = false;
     for addr in addrs {
-        match probe_agent_mail_health_addr(connect_host, port, addr) {
+        match probe_agent_mail_mcp_addr(connect_host, port, mcp_path, addr) {
             HealthProbeStatus::AgentMailServer => return HealthProbeStatus::AgentMailServer,
             HealthProbeStatus::OtherListener => saw_listener = true,
             HealthProbeStatus::NoResponse => {}
@@ -628,9 +663,10 @@ fn agent_mail_health_probe_addrs(
     }
 }
 
-fn probe_agent_mail_health_addr(
+fn probe_agent_mail_mcp_addr(
     connect_host: &str,
     port: u16,
+    mcp_path: &str,
     addr: std::net::SocketAddr,
 ) -> HealthProbeStatus {
     // Try to connect with a short timeout
@@ -646,7 +682,7 @@ fn probe_agent_mail_health_addr(
     // Exercise the actual MCP POST route so trailing-slash regressions are not
     // hidden behind a green liveness endpoint.
     let request = format!(
-        "POST /mcp/ HTTP/1.1\r\n\
+        "POST {} HTTP/1.1\r\n\
          Host: {connect_host}:{port}\r\n\
          Connection: close\r\n\
          User-Agent: mcp-agent-mail-startup-check\r\n\
@@ -654,6 +690,7 @@ fn probe_agent_mail_health_addr(
          Content-Length: {}\r\n\
          \r\n\
          {body}",
+        normalize_mcp_probe_path(mcp_path),
         body.len(),
     );
 
@@ -723,6 +760,22 @@ fn probe_agent_mail_health_addr(
     } else {
         HealthProbeStatus::OtherListener
     }
+}
+
+fn normalize_mcp_probe_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return "/".to_string();
+    }
+
+    let mut normalized = trimmed.to_string();
+    if !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
 }
 
 #[allow(dead_code)]
@@ -1956,12 +2009,12 @@ fn probe_http_path(config: &Config) -> ProbeResult {
 
 /// Check that the configured port is available for binding.
 ///
-/// Uses cross-platform port detection via `check_port_status()`:
+/// Uses cross-platform port detection via the configured MCP endpoint:
 /// - If the port is free, the probe passes.
 /// - If an Agent Mail server is already running, the probe fails with reuse guidance.
 /// - If another process is using the port, the probe fails with guidance.
 fn probe_port(config: &Config) -> ProbeResult {
-    match check_port_status(&config.http_host, config.http_port) {
+    match check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path) {
         PortStatus::Free => ProbeResult::Ok { name: "port" },
 
         PortStatus::AgentMailServer => ProbeResult::Fail(ProbeFailure {
@@ -3015,7 +3068,7 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
 #[must_use]
 pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
     let existing_agent_mail_server = matches!(
-        check_port_status(&config.http_host, config.http_port),
+        check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path),
         PortStatus::AgentMailServer
     );
 
@@ -3862,7 +3915,7 @@ mod tests {
     }
 
     #[test]
-    fn health_check_tries_all_resolved_addresses() {
+    fn mcp_probe_tries_all_resolved_addresses() {
         let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind dead listener");
         let dead_port = dead_listener
             .local_addr()
@@ -3911,9 +3964,10 @@ mod tests {
             stream.flush().expect("flush health response");
         });
 
-        assert!(is_agent_mail_health_check_addrs(
+        assert!(is_agent_mail_mcp_check_addrs(
             "127.0.0.1",
             live_port,
+            "/mcp/",
             [dead_addr, live_addr]
         ));
 
@@ -3948,6 +4002,80 @@ mod tests {
             check_port_status("127.0.0.1", port),
             PortStatus::OtherProcess { .. }
         ));
+        server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn check_port_status_uses_normalized_configured_mcp_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept MCP probe");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            assert_eq!(request_line, "POST /custom/mcp/ HTTP/1.1\r\n");
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read request line");
+                if bytes == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+
+            let response = "HTTP/1.1 401 Unauthorized\r\n\
+                X-Agent-Mail-Health: 1\r\n\
+                Content-Length: 0\r\n\
+                Connection: close\r\n\
+                \r\n";
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        assert!(matches!(
+            check_port_status_at_mcp_path("127.0.0.1", port, "custom/mcp"),
+            PortStatus::AgentMailServer
+        ));
+        server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn blocking_mcp_owner_probe_honors_configured_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept MCP probe");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            assert_eq!(request_line, "POST /custom/owner/ HTTP/1.1\r\n");
+
+            let response = "HTTP/1.1 401 Unauthorized\r\n\
+                X-Agent-Mail-Health: 1\r\n\
+                Content-Length: 0\r\n\
+                Connection: close\r\n\
+                \r\n";
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        let config = Config {
+            http_host: "127.0.0.1".to_string(),
+            http_port: port,
+            http_path: "custom/owner".to_string(),
+            ..Config::default()
+        };
+        assert!(probe_agent_mail_mcp_blocking(&config));
         server_thread.join().expect("join test server");
     }
 

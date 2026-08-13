@@ -806,37 +806,47 @@ fn merge_toml_section(
             let mut merged = Vec::new();
             let mut in_target_section = false;
             let mut saw_target_section = false;
+            let mut preserved_target_lines = Vec::new();
+            let mut preserved_target_keys = HashSet::new();
 
             for raw_line in text.lines() {
                 if let Some(section) = parse_toml_section_header(raw_line) {
-                    if in_target_section {
-                        merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
-                    }
-
                     in_target_section = toml_section_matches_target(section, section_header);
                     saw_target_section |= in_target_section;
-                    if in_target_section {
-                        merged.push(section_header.to_string());
-                    } else {
+                    if !in_target_section {
                         merged.push(raw_line.to_string());
                     }
                     continue;
                 }
 
-                if in_target_section
-                    && raw_line
-                        .split_once('=')
-                        .is_some_and(|(lhs, _)| target_keys.contains(lhs.trim()))
-                {
+                if !in_target_section {
+                    merged.push(raw_line.to_string());
                     continue;
                 }
 
-                merged.push(raw_line.to_string());
+                // Coalesce every matching spelling of the target table into
+                // one canonical section. Keeping the aliases in place would
+                // emit duplicate TOML table headers when both spellings were
+                // present. Preserve non-managed settings at most once so a
+                // pre-existing alias pair remains parseable after setup.
+                let Some((lhs, _)) = raw_line.split_once('=') else {
+                    preserved_target_lines.push(raw_line.to_string());
+                    continue;
+                };
+                let key = lhs.trim();
+                if !target_keys.contains(key) && preserved_target_keys.insert(key.to_string()) {
+                    preserved_target_lines.push(raw_line.to_string());
+                }
             }
 
-            if in_target_section {
+            if saw_target_section {
+                if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
+                    merged.push(String::new());
+                }
+                merged.push(section_header.to_string());
+                merged.extend(preserved_target_lines);
                 merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
-            } else if !saw_target_section {
+            } else {
                 if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
                     merged.push(String::new());
                 }
@@ -4368,6 +4378,50 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(!merged.contains("mcp-agent-mail"));
         assert!(merged.contains("url = \"http://127.0.0.1:8765/mcp/\""));
         assert!(merged.contains("startup_timeout_sec = 15"));
+    }
+
+    #[test]
+    fn setup_coalesces_both_toml_server_name_aliases_without_duplicate_table_headers() {
+        let merged = merge_toml_section(
+            Some(
+                "[mcp_servers.mcp_agent_mail]\n\
+                 url = \"http://127.0.0.1:8765/old/\"\n\
+                 custom_setting = \"keep-first\"\n\
+                 \n\
+                 [mcp_servers.\"mcp-agent-mail\"]\n\
+                 url = \"http://127.0.0.1:8765/stale/\"\n\
+                 custom_setting = \"drop-duplicate\"\n\
+                 \n\
+                 [other]\n\
+                 enabled = true\n",
+            ),
+            "[mcp_servers.mcp_agent_mail]",
+            &[
+                (
+                    "url".to_string(),
+                    "\"http://127.0.0.1:8765/mcp/\"".to_string(),
+                ),
+                ("startup_timeout_sec".to_string(), "15".to_string()),
+            ],
+        );
+
+        // TOML rejects a table header when the same table was already
+        // declared. One canonical header proves setup did not emit the invalid
+        // duplicate-table form that prompted this regression.
+        assert_eq!(
+            merged.matches("[mcp_servers.mcp_agent_mail]").count(),
+            1,
+            "only the canonical table header may remain"
+        );
+        assert!(!merged.contains("[mcp_servers.\"mcp-agent-mail\"]"));
+        let sections = collect_toml_server_sections(&merged);
+        assert_eq!(sections.len(), 1, "setup status must find one server entry");
+        let canonical = &sections[0];
+        assert_eq!(canonical.url.as_deref(), Some("http://127.0.0.1:8765/mcp/"));
+        assert_eq!(canonical.startup_timeout, Some(15));
+        assert!(merged.contains("custom_setting = \"keep-first\""));
+        assert!(!merged.contains("custom_setting = \"drop-duplicate\""));
+        assert!(merged.contains("[other]\nenabled = true"));
     }
 
     #[test]

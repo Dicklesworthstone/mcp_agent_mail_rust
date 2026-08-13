@@ -378,7 +378,7 @@ pub enum Commands {
         /// Forcibly take over the storage root from an already-running server.
         ///
         /// By default, if another Agent Mail server is LIVE and answering
-        /// `/healthz` on this host:port, startup REFUSES (exit 1) rather than
+        /// its configured MCP endpoint on this host:port, startup REFUSES (exit 1) rather than
         /// killing the responsive peer. Pass --takeover to SIGTERM/SIGKILL the
         /// existing holder and seize the storage root anyway.
         #[arg(long)]
@@ -4768,19 +4768,23 @@ const fn should_attach_read_only_tui(
 /// read-only: a healthy service keeps serving MCP/API while the terminal uses
 /// its `/mail/ws-state` snapshot.
 fn should_attach_read_only_tui_to_live_service(
-    host: &str,
-    port: u16,
+    config: &Config,
     interactive_tui: bool,
     takeover: bool,
 ) -> bool {
-    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status_at_mcp_path};
 
-    let peer_is_serving = matches!(check_port_status(host, port), PortStatus::AgentMailServer);
+    let peer_is_serving = matches!(
+        check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path),
+        PortStatus::AgentMailServer
+    );
     if !should_attach_read_only_tui(interactive_tui, peer_is_serving, takeover) {
         return false;
     }
 
-    if let Some((kind, binding)) = active_conflicting_managed_service(host, port) {
+    if let Some((kind, binding)) =
+        active_conflicting_managed_service(&config.http_host, config.http_port)
+    {
         let service_name = managed_service_display_name(kind);
         eprintln!(
             "[info] Attached read-only to {service_name} on {}:{}; the running service will not be stopped or restarted",
@@ -4788,7 +4792,8 @@ fn should_attach_read_only_tui_to_live_service(
         );
     } else {
         eprintln!(
-            "[info] Attached read-only to the Agent Mail server on {host}:{port}; the running service will not be stopped or restarted"
+            "[info] Attached read-only to the Agent Mail server on {}:{}; the running service will not be stopped or restarted",
+            config.http_host, config.http_port
         );
     }
     true
@@ -4906,10 +4911,10 @@ fn resolve_auto_clear_db_blockers_sqlite_path(config: &Config) -> Option<PathBuf
 /// binary signature, with no liveness check, so the old unconditional
 /// SIGTERM→SIGKILL would happily murder a healthy running server.
 ///
-/// When `takeover` is `false` (the default), if ANY holder answers `/healthz`
-/// on the configured `http_host:http_port`, startup REFUSES with a clear error
-/// (non-zero exit) instead of killing it. Only a provably non-responsive holder
-/// is eligible for the kill path. Pass `takeover = true` (via
+/// When `takeover` is `false` (the default), if ANY holder serves the configured
+/// MCP endpoint on the configured `http_host:http_port`, startup REFUSES with a
+/// clear error (non-zero exit) instead of killing it. Only a provably
+/// non-responsive holder is eligible for the kill path. Pass `takeover = true` (via
 /// `am serve-http --takeover`) to opt back into the legacy seize-the-port
 /// behavior and kill the live holder anyway.
 fn auto_clear_db_blockers_with_takeover(config: &Config, takeover: bool) -> CliResult<()> {
@@ -4936,20 +4941,49 @@ fn auto_clear_db_blockers_with_takeover(config: &Config, takeover: bool) -> CliR
     }
 
     // A peer is holding the storage DB. Unless the operator explicitly opted
-    // into a takeover, probe whether that peer is a LIVE, responsive server. If
-    // it answers /healthz, refuse to start rather than kill a working server.
-    if !takeover && mcp_agent_mail_server::probe_http_healthz_blocking(config) {
-        return Err(CliError::Other(format!(
-            "another Agent Mail server is already serving this storage root \
-             ({}): it is LIVE and answering /healthz on {}:{}. Refusing to kill \
-             a responsive peer. Use a different --port/STORAGE_ROOT, stop the \
-             other server first, or pass `am serve-http --takeover` to forcibly \
-             seize it. Holder PID(s): {:?}",
-            db_path.display(),
-            config.http_host,
-            config.http_port,
-            am_pids,
-        )));
+    // into a takeover, prove that the peer's configured MCP route is serving.
+    // A green `/healthz` alone is insufficient: it can hide a 405 on the path
+    // clients actually use. Conversely, a reachable listener with a broken
+    // MCP route is still not safe to kill: it might be this same Agent Mail
+    // server after a route regression. Only a free port proves that the DB
+    // holder is non-serving and eligible for the stale-holder path below.
+    if !takeover {
+        use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status_at_mcp_path};
+
+        match check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path)
+        {
+            PortStatus::Free => {}
+            PortStatus::AgentMailServer => {
+                return Err(CliError::Other(format!(
+                    "another Agent Mail server is already serving this storage root \
+                     ({}): its configured MCP endpoint ({}) is responding on {}:{}. Refusing to kill \
+                     a responsive peer. Use a different --port/STORAGE_ROOT, stop the \
+                     other server first, or pass `am serve-http --takeover` to forcibly \
+                     seize it. Holder PID(s): {:?}",
+                    db_path.display(),
+                    config.http_path,
+                    config.http_host,
+                    config.http_port,
+                    am_pids,
+                )));
+            }
+            PortStatus::OtherProcess { description } => {
+                return Err(CliError::Other(format!(
+                    "a listener is active on {}:{} but its configured MCP endpoint ({}) did not prove healthy ({description}). \
+                     Refusing to kill Agent Mail DB holder PID(s) {:?}; inspect or repair the listener, \
+                     or pass `am serve-http --takeover` to explicitly seize it.",
+                    config.http_host, config.http_port, config.http_path, am_pids,
+                )));
+            }
+            PortStatus::Error { message, .. } => {
+                return Err(CliError::Other(format!(
+                    "could not safely probe {}:{} before clearing Agent Mail DB holder PID(s) {:?}: {message}. \
+                     Refusing to kill an unverified holder; resolve the probe failure or pass \
+                     `am serve-http --takeover` to explicitly seize it.",
+                    config.http_host, config.http_port, am_pids,
+                )));
+            }
+        }
     }
 
     eprintln!(
@@ -5402,8 +5436,12 @@ fn should_reuse_unresolved_live_server(
 /// Refuses to terminate non-Agent-Mail processes. A verified listener without
 /// a trustworthy PID is returned explicitly so a managed duplicate can exit
 /// successfully rather than crash-looping while a healthy peer serves traffic.
-fn auto_clear_port(host: &str, port: u16) -> Result<AutoClearPortOutcome, CliError> {
-    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+fn auto_clear_port(
+    host: &str,
+    port: u16,
+    mcp_path: &str,
+) -> Result<AutoClearPortOutcome, CliError> {
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status_at_mcp_path};
 
     match bind_tcp_listener(host, port) {
         Ok(_listener) => return Ok(AutoClearPortOutcome::Cleared),
@@ -6299,7 +6337,8 @@ fn emit_pre_tui_startup_banner(config: &Config) {
 /// How long a non-takeover `am serve-http` will wait for the restart-coordination
 /// lock before refusing to start (the holder is provably alive but not serving
 /// yet — see [`RestartDecision::ContendedAliveHolder`]). While waiting it
-/// re-probes `/healthz`, so a peer that binds during the wait short-circuits this.
+/// re-probes the configured MCP endpoint, so a peer that binds during the wait
+/// short-circuits this.
 const RESTART_COORD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const RESTART_COORD_BACKOFF_BASE_MILLIS: u64 = 40;
 const RESTART_COORD_BACKOFF_CAP_MILLIS: u64 = 640;
@@ -6320,8 +6359,8 @@ enum RestartDecision {
     /// We hold the restart lock; proceed with takeover + bind, holding it for the
     /// server's lifetime.
     Proceed,
-    /// A peer already won the restart and is answering `/healthz`; this
-    /// invocation is redundant and should exit without fighting.
+    /// A peer already won the restart and is serving its configured MCP route;
+    /// this invocation is redundant and should exit without fighting.
     PeerAlreadyServing,
     /// Couldn't coordinate because the lock INFRASTRUCTURE failed (lock file
     /// could not be created/opened), or `--takeover` was requested against a
@@ -6329,7 +6368,7 @@ enum RestartDecision {
     /// pre-coordination behavior.
     ProceedUnlocked,
     /// The restart lock is flock-held by another live process that never
-    /// answered `/healthz` within the wait. A held flock is kernel-released on
+    /// served MCP within the wait. A held flock is kernel-released on
     /// process death, so the holder is provably ALIVE — most likely a peer
     /// mid-boot (reconstruct/salvage/migration can run for minutes before the
     /// HTTP listener binds). Killing or racing it is exactly the
@@ -6346,7 +6385,7 @@ enum RestartDecision {
 /// without a real lock, peer, or port.
 const fn decide_restart_coordination(
     acquired: bool,
-    peer_healthz_live: bool,
+    peer_mcp_live: bool,
     takeover: bool,
 ) -> RestartDecision {
     if acquired {
@@ -6355,12 +6394,22 @@ const fn decide_restart_coordination(
         // We were told to seize the port — don't wait on the current holder; the
         // kill path will free its lock.
         RestartDecision::ProceedUnlocked
-    } else if peer_healthz_live {
+    } else if peer_mcp_live {
         // A peer is up and we weren't asked to seize it: do not fight.
         RestartDecision::PeerAlreadyServing
     } else {
         RestartDecision::KeepWaiting
     }
+}
+
+/// A managed supervisor must consider a verified same-mailbox peer a successful
+/// outcome. Returning an error here makes `Restart=on-failure` retry forever
+/// before the port-clearing path can see that no listener PID is available.
+const fn should_reuse_peer_after_restart_coordination(
+    decision: RestartDecision,
+    managed_service: bool,
+) -> bool {
+    managed_service && matches!(decision, RestartDecision::PeerAlreadyServing)
 }
 
 fn restart_lock_path(storage_root: &Path) -> PathBuf {
@@ -6422,8 +6471,9 @@ fn coordinate_server_restart(
                 Some(RestartCoordinationLock { _file: file }),
             );
         }
-        let peer_live = mcp_agent_mail_server::probe_http_healthz_blocking(config);
-        match decide_restart_coordination(false, peer_live, takeover) {
+        let peer_mcp_live =
+            mcp_agent_mail_server::startup_checks::probe_agent_mail_mcp_blocking(config);
+        match decide_restart_coordination(false, peer_mcp_live, takeover) {
             RestartDecision::PeerAlreadyServing => {
                 return (RestartDecision::PeerAlreadyServing, None);
             }
@@ -6432,7 +6482,7 @@ fn coordinate_server_restart(
                 let now = Instant::now();
                 if now >= deadline {
                     // The flock is still held by a live process that is not
-                    // answering /healthz — a peer mid-boot (reconstruct or
+                    // serving MCP — a peer mid-boot (reconstruct or
                     // salvage can run far longer than this wait). Proceeding
                     // unlocked here used to funnel straight into the
                     // auto-clear kill path, which killed the booting holder
@@ -6463,7 +6513,7 @@ mod restart_coordination_tests {
         Config {
             storage_root: storage_root.to_path_buf(),
             http_host: "127.0.0.1".to_string(),
-            // A port nothing is listening on, so the /healthz probe is a fast
+            // A port nothing is listening on, so the MCP probe is a fast
             // `false` and the test never depends on an ambient server.
             http_port: 59_321,
             ..Config::default()
@@ -6488,6 +6538,22 @@ mod restart_coordination_tests {
             decide_restart_coordination(false, true, false),
             RestartDecision::PeerAlreadyServing
         );
+    }
+
+    #[test]
+    fn managed_same_mailbox_peer_is_idempotent_before_port_clear() {
+        assert!(should_reuse_peer_after_restart_coordination(
+            RestartDecision::PeerAlreadyServing,
+            true,
+        ));
+        assert!(!should_reuse_peer_after_restart_coordination(
+            RestartDecision::PeerAlreadyServing,
+            false,
+        ));
+        assert!(!should_reuse_peer_after_restart_coordination(
+            RestartDecision::ContendedAliveHolder,
+            true,
+        ));
     }
 
     #[test]
@@ -6572,8 +6638,8 @@ mod restart_coordination_tests {
         let config = test_config_with_unused_port(dir.path());
         let (first, _held) = coordinate_server_restart(&config, false, Duration::from_millis(100));
         assert_eq!(first, RestartDecision::Proceed);
-        // The lock is flock-held by a live process (us) that is NOT answering
-        // /healthz — exactly what a peer mid-reconstruct looks like. A
+        // The lock is flock-held by a live process (us) that is NOT serving
+        // MCP — exactly what a peer mid-reconstruct looks like. A
         // non-takeover contender must FAIL CLOSED (refuse to start) rather
         // than proceed unlocked into the kill path: proceeding here is what
         // lost committed rows in the 2026-08-01 outage (mcp_agent_mail#253).
@@ -6615,12 +6681,7 @@ fn handle_serve_http(
     // A healthy service remains the mailbox owner. Attaching avoids disrupting
     // active agents and avoids manufacturing a restart-fighting window merely
     // so an interactive terminal can display the TUI.
-    if should_attach_read_only_tui_to_live_service(
-        &config.http_host,
-        config.http_port,
-        config.tui_enabled,
-        takeover,
-    ) {
+    if should_attach_read_only_tui_to_live_service(&config, config.tui_enabled, takeover) {
         return run_read_only_tui_attachment();
     }
 
@@ -6642,12 +6703,25 @@ fn handle_serve_http(
 
     let (restart_decision, _restart_lock) =
         coordinate_server_restart(&config, takeover, RESTART_COORD_WAIT);
+    if should_reuse_peer_after_restart_coordination(
+        restart_decision,
+        running_under_managed_service(),
+    ) {
+        tracing::warn!(
+            host = %config.http_host,
+            port = config.http_port,
+            path = %config.http_path,
+            "verified Agent Mail MCP peer already owns this storage root; managed duplicate exits successfully"
+        );
+        return Ok(());
+    }
     if restart_decision == RestartDecision::PeerAlreadyServing {
         return Err(CliError::Other(format!(
             "another Agent Mail server is already serving this storage root ({}) and is \
-             answering /healthz on {}:{}; not restarting (avoiding restart-fighting). Connect \
+             serving its configured MCP endpoint ({}) on {}:{}; not restarting (avoiding restart-fighting). Connect \
              to it, or pass `am serve-http --takeover` to forcibly seize the port.",
             config.storage_root.display(),
+            config.http_path,
             config.http_host,
             config.http_port,
         )));
@@ -6655,7 +6729,7 @@ fn handle_serve_http(
     if restart_decision == RestartDecision::ContendedAliveHolder {
         return Err(CliError::Other(format!(
             "another Agent Mail process is holding the restart-coordination lock for this \
-             storage root ({}) but is not answering /healthz on {}:{} yet — it is most \
+             storage root ({}) but is not serving its configured MCP endpoint ({}) on {}:{} yet — it is most \
              likely still booting (startup reconstruction/salvage can take minutes). \
              Refusing to start rather than kill a live peer mid-write (see \
              mcp_agent_mail#253: that race loses committed rows and wedges the mailbox). \
@@ -6663,6 +6737,7 @@ fn handle_serve_http(
              `am doctor locks`, or pass `am serve-http --takeover` to forcibly seize the \
              storage root.",
             config.storage_root.display(),
+            config.http_path,
             config.http_host,
             config.http_port,
         )));
@@ -6671,7 +6746,7 @@ fn handle_serve_http(
     // Kill any existing Agent Mail server on the port FIRST — on macOS
     // we can't find processes by DB file handle (no /proc), but we CAN
     // find them by port.  This also handles Codex-spawned `am serve-http`.
-    match auto_clear_port(&config.http_host, config.http_port)? {
+    match auto_clear_port(&config.http_host, config.http_port, &config.http_path)? {
         AutoClearPortOutcome::Cleared => {}
         outcome
             if should_reuse_unresolved_live_server(outcome, running_under_managed_service()) =>
