@@ -2626,7 +2626,48 @@ fn collect_recovery_receipt_evidence(
                              archive identity"
                         );
                     }
-                    (sets, None)
+                    // A successful snapshot is not enough. Index/btree damage
+                    // can still invent identities that the archive candidate
+                    // correctly lacks; using those sets as authority is what
+                    // crash-looped reconstruct on the live 951-message wedge
+                    // (br-r6awv). Full integrity_check is the promotion gate.
+                    match crate::pool::sqlite_file_passes_full_integrity_check(path) {
+                        Ok(true) => (sets, None),
+                        Ok(false) => {
+                            tracing::warn!(
+                                source = %path.display(),
+                                "recovery receipt: source failed full integrity_check; \
+                                 not using its continuity sets as promotion authority"
+                            );
+                            (
+                                RecoveryContinuitySets::default(),
+                                Some(recovery_sha256(
+                                    format!(
+                                        "source failed full integrity_check: {}",
+                                        path.display()
+                                    )
+                                    .as_bytes(),
+                                )),
+                            )
+                        }
+                        Err(health_error) => {
+                            let message = health_error.to_string();
+                            if crate::pool::is_corruption_error_message(&message) {
+                                (
+                                    RecoveryContinuitySets::default(),
+                                    Some(recovery_sha256(message.as_bytes())),
+                                )
+                            } else {
+                                return Err(recovery_receipt_error(
+                                    "source generation health classification",
+                                    path,
+                                    format!(
+                                        "semantic snapshot succeeded but full integrity_check failed ({health_error})"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                 }
                 Err(snapshot_error) => match crate::pool::sqlite_file_is_healthy(path) {
                     Ok(false) => (
@@ -4551,6 +4592,61 @@ mod tests {
         assert!(error_text.contains("proof_gate_consumed_nonces=1"));
         verify_recovery_receipt_state(&storage_root, &primary)
             .expect("loss rejection must not leave a pending intent");
+    }
+
+    /// br-r6awv: a corrupt live DB can still answer NOT INDEXED scans with
+    /// extra identities. Full integrity_check must strip that source of
+    /// promotion authority so archive+salvage can actually heal.
+    #[test]
+    fn recovery_receipt_promotes_when_source_fails_full_integrity_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let marker = "AM_R6AWV_SOURCE_INTEGRITY_MARKER_0123456789AB";
+        let replacement = "AM_R6AWV_SOURCE_INTEGRITY_MARKER_BA9876543210";
+        assert_eq!(marker.len(), replacement.len());
+
+        let conn = crate::CanonicalDbConn::open_file(source.to_string_lossy().as_ref())
+            .expect("open source to plant extra identity + index");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("stable image for byte flip");
+        conn.execute_raw(&format!(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+             VALUES (99, 17, 41, 'phantom-thread', '{marker}', 'db-only body', 'low', 0, 999001, '{{}}', '[]')"
+        ))
+        .expect("plant extra source-only message");
+        conn.execute_raw("CREATE INDEX idx_messages_subject ON messages(subject)")
+            .expect("index to diverge");
+        drop(conn);
+
+        let mut bytes = std::fs::read(&source).expect("read source bytes");
+        let offsets = bytes
+            .windows(marker.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == marker.as_bytes()).then_some(offset))
+            .collect::<Vec<_>>();
+        assert!(
+            offsets.len() >= 2,
+            "marker must appear in table and index, found {}",
+            offsets.len()
+        );
+        let target = offsets[offsets.len() - 1];
+        bytes[target..target + marker.len()].copy_from_slice(replacement.as_bytes());
+        std::fs::write(&source, bytes).expect("write integrity-failed source");
+
+        assert!(
+            !crate::pool::sqlite_file_passes_full_integrity_check(&source)
+                .expect("full integrity probe"),
+            "planted index/table divergence must fail full integrity_check"
+        );
+
+        prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("corrupt source must not block promotion of a healthy archive candidate");
     }
 
     /// The identity/volatile split (GH#208): lifecycle state that archive

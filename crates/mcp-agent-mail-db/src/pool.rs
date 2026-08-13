@@ -7732,6 +7732,19 @@ fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Re
     std::fs::set_permissions(destination, permissions)
 }
 
+/// Full `PRAGMA integrity_check` via canonical SQLite.
+///
+/// Recovery promotion must not treat a source that fails this as
+/// authoritative: a corrupt btree can still answer `SELECT … NOT INDEXED`
+/// with phantom or extra identities, which then looks like 951-message
+/// "loss" and wedges reconstruct forever (br-r6awv).
+pub(crate) fn sqlite_file_passes_full_integrity_check(path: &Path) -> Result<bool, SqlError> {
+    if !is_real_file(path) {
+        return Ok(false);
+    }
+    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
+}
+
 fn sqlite_file_is_backup_safe(path: &Path) -> Result<bool, SqlError> {
     if !sqlite_file_is_healthy(path)? {
         return Ok(false);

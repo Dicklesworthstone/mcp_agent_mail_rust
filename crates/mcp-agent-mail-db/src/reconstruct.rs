@@ -393,6 +393,12 @@ pub struct ReconstructStats {
     /// project. These are preserved (not skipped) to avoid cross-project
     /// data loss.
     pub cross_project_canonical_collisions: usize,
+    /// Number of messages re-inserted under a generated DB id because their
+    /// canonical frontmatter id was already held by a *different* message
+    /// (distinct created_ts/subject) in the *same* project — row-id reuse
+    /// across DB generations. These are preserved (not skipped): only an
+    /// identity-identical artifact is a true duplicate (br-r6awv).
+    pub same_project_canonical_identity_collisions: usize,
     /// Number of projects recovered only from a salvaged database.
     pub salvaged_projects: usize,
     /// Number of agents recovered only from a salvaged database.
@@ -568,6 +574,26 @@ impl ReconstructStats {
         }
     }
 
+    fn record_same_project_canonical_identity_collision(
+        &mut self,
+        message_id: i64,
+        project_id: i64,
+        file_path: &Path,
+    ) {
+        self.same_project_canonical_identity_collisions += 1;
+        if self.same_project_canonical_identity_collisions
+            <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT
+        {
+            self.warnings.push(format!(
+                "Canonical message id {message_id} in {} is already held by a different \
+                 message (distinct created_ts/subject) in the same project_id {project_id} \
+                 (row-id reuse across DB generations); inserting under a generated DB id \
+                 to avoid data loss",
+                file_path.display()
+            ));
+        }
+    }
+
     fn finalize_duplicate_warnings(&mut self) {
         if self.duplicate_canonical_message_files <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT {
             return;
@@ -619,6 +645,13 @@ impl std::fmt::Display for ReconstructStats {
                 f,
                 "; preserved {} cross-project canonical id collision(s) under generated DB ids",
                 self.cross_project_canonical_collisions
+            )?;
+        }
+        if self.same_project_canonical_identity_collisions > 0 {
+            write!(
+                f,
+                "; preserved {} same-project canonical id reuse collision(s) under generated DB ids",
+                self.same_project_canonical_identity_collisions
             )?;
         }
         if self.suppressed_warnings > 0 {
@@ -1620,6 +1653,10 @@ fn reconstruct_from_archive_impl(
         // Maps for deduplication: ((project_id, name) → agent_id)
         let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
 
+        // Canonical-id collision losers, GLOBAL across all projects: inserted
+        // only after every project's canonical ids are settled (br-r6awv).
+        let mut deferred_messages: Vec<DeferredCollisionMessage> = Vec::new();
+
         // Reservation dedup state, GLOBAL across all projects (br-n8qh6): reservation
         // ids are a global AUTOINCREMENT, so an id reused across DB generations (or
         // across projects in a pre-generation archive) must not silently overwrite an
@@ -1674,7 +1711,44 @@ fn reconstruct_from_archive_impl(
             // Phase 3: Discover messages for this project
             let messages_dir = project_path.join("messages");
             if is_real_directory(&messages_dir) {
-                discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats)?;
+                discover_messages(
+                    &conn,
+                    &messages_dir,
+                    pid,
+                    slug,
+                    &mut agent_ids,
+                    &mut stats,
+                    &mut deferred_messages,
+                )?;
+            }
+        }
+
+        // Phase 3b: insert canonical-id collision losers under generated DB
+        // ids. Running this only after the full walk guarantees a generated
+        // id can never occupy a later file's canonical id — the failure that
+        // previously dropped real messages as same-project "duplicates"
+        // (br-r6awv).
+        for item in &deferred_messages {
+            match parse_and_insert_message(
+                &conn,
+                &item.file_path,
+                item.project_id,
+                "",
+                &mut agent_ids,
+                &mut stats,
+                None,
+            ) {
+                Ok(()) => {}
+                Err(e) => {
+                    if conn.execute_raw("SELECT 1").is_err() {
+                        return Err(e);
+                    }
+                    stats.parse_errors += 1;
+                    stats.push_warning(format!(
+                        "Failed to reconstruct deferred collision message from {}: {e}",
+                        item.file_path.display()
+                    ));
+                }
             }
         }
 
@@ -1730,18 +1804,40 @@ pub fn reconstruct_from_archive_with_salvage(
     storage_root: &Path,
     salvage_db_path: Option<&Path>,
 ) -> DbResult<ReconstructStats> {
+    // Salvage is mandatory when the source is a *readable* SQLite file:
+    // missing/symlink/lock failures still refuse so we cannot silently drop
+    // DB-only coordination state. A source that is present but not a
+    // readable SQLite image (the unhealthy live mailbox on the doctor
+    // path) must not block the archive rebuild — that is what left `am`
+    // dead after a refused reconstruct (br-r6awv / br-eudur).
+    let mut salvage_for_merge: Option<&Path> = None;
+    let mut unreadable_salvage: Option<String> = None;
     if let Some(salvage_db_path) = salvage_db_path {
-        probe_salvage_database_for_merge(salvage_db_path).map_err(|error| {
-            DbError::Sqlite(format!(
-                "reconstruct salvage source {} failed validation; refusing an archive-only candidate because DB-only coordination state could be lost: {error}",
-                salvage_db_path.display()
-            ))
-        })?;
+        match probe_salvage_database_for_merge(salvage_db_path) {
+            Ok(()) => salvage_for_merge = Some(salvage_db_path),
+            Err(error) => {
+                let message = error.to_string();
+                if crate::pool::is_corruption_error_message(&message) {
+                    unreadable_salvage = Some(message);
+                } else {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage source {} failed validation; refusing an archive-only candidate because DB-only coordination state could be lost: {error}",
+                        salvage_db_path.display()
+                    )));
+                }
+            }
+        }
     }
 
     let mut stats =
         reconstruct_from_archive_impl(db_path, storage_root, salvage_db_path.is_some())?;
-    if let Some(salvage_db_path) = salvage_db_path {
+    if let Some(message) = unreadable_salvage {
+        stats.push_warning(format!(
+            "salvage source was unreadable as SQLite ({message}); \
+             rebuilt archive-only candidate so doctor can promote a heal"
+        ));
+    }
+    if let Some(salvage_db_path) = salvage_for_merge {
         merge_salvaged_database(db_path, salvage_db_path, &mut stats).map_err(|error| {
             DbError::Sqlite(format!(
                 "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
@@ -1941,6 +2037,7 @@ fn discover_messages(
     project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
+    deferred: &mut Vec<DeferredCollisionMessage>,
 ) -> DbResult<()> {
     // Walk year directories
     let Ok(years) = std::fs::read_dir(messages_dir) else {
@@ -1992,8 +2089,15 @@ fn discover_messages(
     message_files.sort();
 
     for file_path in &message_files {
-        match parse_and_insert_message(conn, file_path, project_id, project_slug, agent_ids, stats)
-        {
+        match parse_and_insert_message(
+            conn,
+            file_path,
+            project_id,
+            project_slug,
+            agent_ids,
+            stats,
+            Some(deferred),
+        ) {
             Ok(()) => {}
             Err(e) => {
                 // Distinguish parse errors (skip file) from DB errors (abort).
@@ -2012,7 +2116,24 @@ fn discover_messages(
     Ok(())
 }
 
+/// A canonical archive file whose frontmatter `id` was already occupied by a
+/// *different* message when it was first visited. Insertion is deferred until
+/// every canonical id across the whole archive is settled, so the generated
+/// DB id it eventually receives can never occupy a later file's canonical id
+/// (which would silently drop that file as a "duplicate", br-r6awv).
+struct DeferredCollisionMessage {
+    file_path: PathBuf,
+    project_id: i64,
+}
+
 /// Parse a single archive `.md` file and insert the message into the database.
+///
+/// `deferred` carries the two insertion modes:
+/// - `Some(queue)`: canonical pass. A frontmatter id whose DB slot is held by
+///   a different message is queued instead of inserted, after recording the
+///   collision in `stats`.
+/// - `None`: deferred pass. The frontmatter id is ignored and the message is
+///   inserted under a generated DB id.
 #[allow(clippy::too_many_lines)]
 fn parse_and_insert_message(
     conn: &DbConn,
@@ -2021,6 +2142,7 @@ fn parse_and_insert_message(
     _project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
+    deferred: Option<&mut Vec<DeferredCollisionMessage>>,
 ) -> DbResult<()> {
     let content = read_archive_text_capped(file_path)
         .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
@@ -2077,38 +2199,58 @@ fn parse_and_insert_message(
 
     // Canonical-id collision handling:
     //
-    //   Same-project collision:  almost certainly a duplicate archive artifact
-    //                            (two files for the same logical message).
-    //                            Keep the first, skip the second.
+    //   True duplicate:          the id is held by a message in the same
+    //                            project with the same identity (created_ts +
+    //                            subject) — two archive artifacts for one
+    //                            logical message. Keep the first, skip this.
     //
-    //   Cross-project collision: two *different* messages in two separate
-    //                            project archives happen to share the same
-    //                            frontmatter `id` (e.g. because the archives
-    //                            were originally produced by separate storage
-    //                            roots). Both are real messages; skipping one
-    //                            would drop legitimate data. Insert the
-    //                            second under an auto-generated DB id and
-    //                            record a warning so operators can audit.
+    //   Identity collision:      the id is held by a *different* message —
+    //                            either from another project archive (#104)
+    //                            or from row-id reuse across DB generations
+    //                            within the same project. Both are real
+    //                            messages; skipping one would drop legitimate
+    //                            data. Defer this file to a second pass that
+    //                            runs after every canonical id is settled, so
+    //                            its generated DB id can never occupy a later
+    //                            file's canonical id and cause that file to be
+    //                            silently dropped as a "duplicate" (br-r6awv).
     //
     // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/104
-    let canonical_id = if let Some(cid) = canonical_id {
-        if let Some(existing_project_id) = message_project_id(conn, cid)? {
-            if existing_project_id == project_id {
-                stats.record_duplicate_canonical_message(cid, file_path);
+    let canonical_id = match (canonical_id, deferred) {
+        (Some(cid), Some(deferred)) => {
+            if let Some((existing_project_id, existing_created_ts, existing_subject)) =
+                message_row_identity(conn, cid)?
+            {
+                if existing_project_id == project_id
+                    && existing_created_ts == created_ts
+                    && existing_subject == subject
+                {
+                    stats.record_duplicate_canonical_message(cid, file_path);
+                    return Ok(());
+                }
+                if existing_project_id == project_id {
+                    stats.record_same_project_canonical_identity_collision(
+                        cid, project_id, file_path,
+                    );
+                } else {
+                    stats.record_cross_project_canonical_collision(
+                        cid,
+                        existing_project_id,
+                        project_id,
+                        file_path,
+                    );
+                }
+                deferred.push(DeferredCollisionMessage {
+                    file_path: file_path.to_path_buf(),
+                    project_id,
+                });
                 return Ok(());
             }
-            stats.record_cross_project_canonical_collision(
-                cid,
-                existing_project_id,
-                project_id,
-                file_path,
-            );
-            None
-        } else {
             Some(cid)
         }
-    } else {
-        None
+        // Deferred pass: the canonical id lost its slot to a different
+        // message; insert under a generated DB id.
+        (Some(_) | None, _) => None,
     };
 
     let thread_id = raw_thread_id.and_then(|raw| {
@@ -2127,8 +2269,12 @@ fn parse_and_insert_message(
         .map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
 
     let message_id = if let Some(cid) = canonical_id {
+        // Plain INSERT: the id was verified free above. A conflict here means
+        // the free-slot check was violated; failing loudly is strictly better
+        // than REPLACE silently destroying an earlier message and its
+        // recipient rows.
         conn.execute_sync(
-            "INSERT OR REPLACE INTO messages \
+            "INSERT INTO messages \
              (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
@@ -2724,6 +2870,32 @@ fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
 /// Return the `project_id` of a message row with the given canonical id, or
 /// `None` if no such row exists. Used during reconstruction to distinguish
 /// same-project duplicates from cross-project canonical-id collisions.
+/// Owning project plus the stable identity fields (`created_ts`, `subject`)
+/// of the message currently holding a DB id. Collision handling must compare
+/// identity, not just id: an id can be legitimately reused by a *different*
+/// message across DB generations or across separately-produced project
+/// archives (br-r6awv).
+fn message_row_identity(conn: &DbConn, message_id: i64) -> DbResult<Option<(i64, i64, String)>> {
+    let rows = conn
+        .query_sync(
+            "SELECT project_id, CAST(created_ts AS INTEGER) AS created_ts, subject \
+             FROM messages WHERE id = ? LIMIT 1",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| DbError::Sqlite(format!("check message {message_id} identity: {e}")))?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let pid = row
+        .get_named::<i64>("project_id")
+        .map_err(|e| DbError::Sqlite(format!("decode project_id for message {message_id}: {e}")))?;
+    let created_ts = row
+        .get_named::<i64>("created_ts")
+        .map_err(|e| DbError::Sqlite(format!("decode created_ts for message {message_id}: {e}")))?;
+    let subject = row.get_named::<String>("subject").unwrap_or_default();
+    Ok(Some((pid, created_ts, subject)))
+}
+
 fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
     let rows = conn
         .query_sync(
@@ -4619,8 +4791,23 @@ fn merge_salvaged_database(
                     // back by a `continue`, and an unreferenced
                     // `unknown-agent-N` row would survive into the recovered
                     // database while the substitution counter overcounted.
-                    if message_project_id(&target_conn, source_message_id)?
-                        == Some(target_project_id)
+                    //
+                    // "Already carries" must be decided on identity
+                    // (project + created_ts + subject), not numeric id alone:
+                    // the candidate slot can hold a *different* message in the
+                    // same project (canonical-id collision handling, row-id
+                    // reuse across generations). Treating that as "carried"
+                    // silently discards the salvaged message (br-r6awv);
+                    // identity mismatches fall through to the remap path.
+                    let source_subject = row.get_named::<String>("subject").unwrap_or_default();
+                    let source_created_ts = row
+                        .get_named::<i64>("created_ts")
+                        .unwrap_or_else(|_| crate::now_micros());
+                    if let Some((existing_pid, existing_created_ts, existing_subject)) =
+                        message_row_identity(&target_conn, source_message_id)?
+                        && existing_pid == target_project_id
+                        && existing_created_ts == source_created_ts
+                        && existing_subject == source_subject
                     {
                         message_id_map.insert(source_message_id, source_message_id);
                         continue;
@@ -4682,7 +4869,7 @@ fn merge_salvaged_database(
                         Value::BigInt(target_project_id),
                         Value::BigInt(target_sender_id),
                         thread_value,
-                        Value::Text(row.get_named::<String>("subject").unwrap_or_default()),
+                        Value::Text(source_subject),
                         Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
                         Value::Text(
                             row.get_named::<String>("importance")
@@ -4691,10 +4878,7 @@ fn merge_salvaged_database(
                         Value::BigInt(i64::from(
                             row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
                         )),
-                        Value::BigInt(
-                            row.get_named::<i64>("created_ts")
-                                .unwrap_or_else(|_| crate::now_micros()),
-                        ),
+                        Value::BigInt(source_created_ts),
                         Value::Text(recipients_json),
                         Value::Text(attachments),
                     ];
@@ -5816,6 +6000,7 @@ mod tests {
             duplicate_canonical_message_files: 0,
             duplicate_canonical_message_ids: 0,
             cross_project_canonical_collisions: 0,
+            same_project_canonical_identity_collisions: 0,
             salvaged_projects: 0,
             salvaged_agents: 0,
             salvaged_messages: 0,
@@ -7442,6 +7627,174 @@ body for {slug}
     }
 
     #[test]
+    fn reconstruct_collision_generated_id_never_displaces_later_canonical_id() {
+        // br-r6awv reproduction: project "a-junk" (walked first) claims
+        // canonical id 1. Project "b-real" holds a *different* message with
+        // canonical id 1 plus a later message with canonical id 2. Prior
+        // behavior inserted the displaced id-1 message immediately under the
+        // next generated rowid — which was 2 — so the real canonical __2.md
+        // file was then misclassified as a same-project duplicate and
+        // silently dropped. Expected: all three messages survive.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let write_project = |slug: &str| {
+            let project_dir = storage_root.join("projects").join(slug);
+            std::fs::create_dir_all(project_dir.join("messages").join("2026").join("02")).unwrap();
+            std::fs::write(
+                project_dir.join("project.json"),
+                format!(r#"{{"slug":"{slug}","human_key":"/{slug}","created_at":0}}"#),
+            )
+            .unwrap();
+            project_dir
+        };
+        let junk_dir = write_project("a-junk");
+        let real_dir = write_project("b-real");
+        let write_message = |dir: &std::path::Path,
+                             name: &str,
+                             id: i64,
+                             subject: &str,
+                             created: &str| {
+            std::fs::write(
+                    dir.join("messages").join("2026").join("02").join(name),
+                    format!(
+                        "---json\n{{\"id\":{id},\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"{subject}\",\"importance\":\"normal\",\"created_ts\":\"{created}\"}}\n---\n\nbody\n"
+                    ),
+                )
+                .unwrap();
+        };
+        write_message(
+            &junk_dir,
+            "2026-02-01T00-00-00Z__junk__1.md",
+            1,
+            "Junk one",
+            "2026-02-01T00:00:00Z",
+        );
+        write_message(
+            &real_dir,
+            "2026-02-10T00-00-00Z__real-one__1.md",
+            1,
+            "Real one",
+            "2026-02-10T00:00:00Z",
+        );
+        write_message(
+            &real_dir,
+            "2026-02-10T00-00-05Z__real-two__2.md",
+            2,
+            "Real two",
+            "2026-02-10T00:00:05Z",
+        );
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(
+            stats.messages, 3,
+            "all three messages must survive; warnings: {:?}",
+            stats.warnings
+        );
+        assert_eq!(stats.cross_project_canonical_collisions, 1);
+        assert_eq!(
+            stats.duplicate_canonical_message_files, 0,
+            "no real message may be dropped as a duplicate"
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT id, subject FROM messages ORDER BY id", &[])
+            .unwrap();
+        let pairs: Vec<(i64, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get_named::<i64>("id").unwrap(),
+                    r.get_named::<String>("subject").unwrap(),
+                )
+            })
+            .collect();
+        // Canonical ids 1 and 2 hold the first-visited claimants; the
+        // displaced message lands on a generated id ABOVE every canonical id.
+        assert_eq!(pairs[0], (1, "Junk one".to_string()));
+        assert_eq!(pairs[1], (2, "Real two".to_string()));
+        assert_eq!(pairs[2].1, "Real one");
+        assert!(
+            pairs[2].0 > 2,
+            "displaced message must get a generated id above all canonical ids, got {}",
+            pairs[2].0
+        );
+    }
+
+    #[test]
+    fn reconstruct_preserves_same_project_canonical_id_reuse_with_distinct_identity() {
+        // One project, three artifacts claiming canonical id 5:
+        //   - fileA: identity X (kept, canonical id 5)
+        //   - fileB: identity X again (true duplicate artifact — skipped)
+        //   - fileC: identity Y (row-id reuse across DB generations —
+        //     preserved under a generated id, NOT dropped)
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("solo");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"solo","human_key":"/solo","created_at":0}"#,
+        )
+        .unwrap();
+        let write_message = |name: &str, subject: &str, created: &str| {
+            std::fs::write(
+                messages_dir.join(name),
+                format!(
+                    "---json\n{{\"id\":5,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"{subject}\",\"importance\":\"normal\",\"created_ts\":\"{created}\"}}\n---\n\nbody\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_message(
+            "2026-03-01T00-00-00Z__gen-one__5.md",
+            "Gen one",
+            "2026-03-01T00:00:00Z",
+        );
+        write_message(
+            "2026-03-01T00-00-00Z__gen-one-copy__5.md",
+            "Gen one",
+            "2026-03-01T00:00:00Z",
+        );
+        write_message(
+            "2026-03-09T00-00-00Z__gen-two__5.md",
+            "Gen two",
+            "2026-03-09T00:00:00Z",
+        );
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(
+            stats.messages, 2,
+            "distinct identities must both survive; warnings: {:?}",
+            stats.warnings
+        );
+        assert_eq!(stats.duplicate_canonical_message_files, 1);
+        assert_eq!(stats.same_project_canonical_identity_collisions, 1);
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("row-id reuse across DB generations")),
+            "expected same-project reuse warning, got {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT id, subject FROM messages ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 5);
+        assert_eq!(rows[0].get_named::<String>("subject").unwrap(), "Gen one");
+        assert!(rows[1].get_named::<i64>("id").unwrap() > 5);
+        assert_eq!(rows[1].get_named::<String>("subject").unwrap(), "Gen two");
+    }
+
+    #[test]
     fn finalize_cross_project_canonical_collision_warnings_emits_summary_above_sample_limit() {
         // Below or at the sample limit: no summary line — the per-collision
         // warnings already itemize everything.
@@ -8373,6 +8726,84 @@ archive body
     }
 
     #[test]
+    fn reconstruct_with_salvage_remaps_same_project_identity_mismatch() {
+        // br-r6awv: the candidate's slot for id 7 holds a *different* message
+        // in the SAME project (canonical-id collision handling / row-id reuse
+        // across generations). Salvage dedup must compare identity, not just
+        // (id, project) — otherwise the DB-only message is silently dropped
+        // as "already carried".
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_identity_mismatch.db");
+        let salvage_db_path = tmp.path().join("salvage_identity_mismatch.db");
+        let storage_root = tmp.path().join("storage");
+
+        let archive_project = storage_root.join("projects").join("solo");
+        let archive_messages = archive_project.join("messages").join("2026").join("07");
+        std::fs::create_dir_all(&archive_messages).expect("create archive messages");
+        std::fs::write(
+            archive_project.join("project.json"),
+            r#"{"slug":"solo","human_key":"/solo","created_at":1}"#,
+        )
+        .expect("write archive project");
+        std::fs::write(
+            archive_messages.join("2026-07-17T12-00-00Z__archive__7.md"),
+            r#"---json
+{"id":7,"from":"Alice","to":[],"subject":"Archive message","importance":"normal","created_ts":"2026-07-17T12:00:00Z","attachments":[]}
+---
+
+archive body
+"#,
+        )
+        .expect("write archive message");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init salvage schema");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+                    (500, 'solo', '/solo', 1);
+                 INSERT INTO agents
+                    (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                    VALUES
+                    (600, 500, 'Bob', 'coder', 'test', '', 1, 2, 'auto', 'auto');
+                 INSERT INTO messages
+                    (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments)
+                    VALUES
+                    (7, 500, 600, 'DB-only different message', 'db body', 'normal', 0, 99,
+                     '{\"to\":[],\"cc\":[],\"bcc\":[]}', '[]');",
+            )
+            .expect("seed same-project identity-mismatch message");
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("same-project identity mismatch must remap, not drop");
+        assert_eq!(
+            stats.salvaged_messages, 1,
+            "DB-only message must survive; warnings: {:?}",
+            stats.warnings
+        );
+        assert_eq!(stats.salvaged_message_id_remaps, 1);
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT id, subject FROM messages ORDER BY id", &[])
+            .expect("query messages");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 7);
+        assert_eq!(
+            rows[0].get_named::<String>("subject").unwrap(),
+            "Archive message"
+        );
+        assert!(rows[1].get_named::<i64>("id").unwrap() > 7);
+        assert_eq!(
+            rows[1].get_named::<String>("subject").unwrap(),
+            "DB-only different message"
+        );
+    }
+
+    #[test]
     fn reconstruct_with_salvage_preserves_active_reservations_and_release_ledger() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("reconstructed_reservations.db");
@@ -8808,6 +9239,31 @@ archive body
         assert!(
             !db_path.exists(),
             "a failed salvage probe must not create a promotable candidate"
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_degrades_to_archive_when_source_is_not_sqlite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_unreadable_salvage.db");
+        let salvage_db_path = tmp.path().join("not-a-database.db");
+        let storage_root = tmp.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("archive root");
+        std::fs::write(&salvage_db_path, b"not-a-database").expect("plant unreadable salvage");
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("unreadable salvage must not block archive rebuild");
+        assert!(
+            db_path.exists(),
+            "archive-only candidate must exist so doctor can promote a heal"
+        );
+        assert!(
+            stats.warnings.iter().any(|warning| {
+                warning.contains("unreadable as SQLite") || warning.contains("not a database")
+            }),
+            "stats must attest the salvage degrade, got {:?}",
+            stats.warnings
         );
     }
 
