@@ -3162,7 +3162,6 @@ mod tests {
         seed_healthy_live_mailbox(&db_path);
 
         let storage_root_s = storage_root.path().display().to_string();
-        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", &db_url),
@@ -3193,6 +3192,7 @@ mod tests {
         seed_healthy_live_mailbox(&db_path);
 
         let storage_root_s = storage_root.path().display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", &db_url),
