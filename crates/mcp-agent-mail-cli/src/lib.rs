@@ -12289,7 +12289,7 @@ fn recover_sqlite_file_with_storage_root(
     // archive rebuild. The restore re-verifies the snapshot before trusting it.
     match mcp_agent_mail_db::snapshot::restore_from_verified_snapshot(path, &storage_root) {
         Ok(Some(meta)) => {
-            reconcile_sqlite_file_with_archive(path, &storage_root)?;
+            reconcile_sqlite_file_with_archive_after_restore(path, &storage_root)?;
             let salvage_after = count_salvage_rows(path);
             let suspect_rows = detect_salvage_suspect_typed_rows(path);
             ftui_runtime::ftui_println!(
@@ -12346,7 +12346,7 @@ fn recover_sqlite_file_with_storage_root(
                 ))
             },
         )?;
-        reconcile_sqlite_file_with_archive(path, &storage_root)?;
+        reconcile_sqlite_file_with_archive_after_restore(path, &storage_root)?;
         emit_salvage_loss_report(
             "backup-restore",
             &salvage_before,
@@ -12431,7 +12431,7 @@ fn recover_sqlite_file_with_storage_root(
                             path.display()
                         ))
                     })?;
-                    reconcile_sqlite_file_with_archive(path, &storage_root)?;
+                    reconcile_sqlite_file_with_archive_after_restore(path, &storage_root)?;
                     emit_salvage_loss_report(
                         "archive-reconstruct",
                         &salvage_before,
@@ -12467,6 +12467,30 @@ fn reconcile_sqlite_file_with_archive(path: &Path, storage_root: &Path) -> CliRe
             path.display()
         ))
     })
+}
+
+/// Reconcile archive drift as the *second phase of an in-progress recovery*
+/// (verified-snapshot or backup restore), not a standalone drift reconcile.
+///
+/// br-vlsf2/br-r6awv: our own restore (`promote_recovery_candidate` /
+/// `restore_from_verified_snapshot`) records a fresh promotion recency. The
+/// archive-ahead reconcile that follows is this recovery's own catch-up, but
+/// `reconcile_archive_state_before_init` can only tell it apart from a
+/// thrash-prone standalone drift reconcile by whether the promotion barrier is
+/// held (the db-native recovery path holds it across restore+reconcile). Because
+/// the CLI performs the restore itself and then calls the reconcile separately,
+/// we must re-assert the barrier here — otherwise the just-recorded promotion
+/// trips the post-promotion cooldown and the reconcile defers, silently dropping
+/// archive-ahead rows (e.g. a message added after the backup was taken).
+fn reconcile_sqlite_file_with_archive_after_restore(
+    path: &Path,
+    storage_root: &Path,
+) -> CliResult<()> {
+    let (_recovery_barrier, _drain) =
+        mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
+            mcp_agent_mail_db::write_barrier::writer_drain_timeout(),
+        );
+    reconcile_sqlite_file_with_archive(path, storage_root)
 }
 
 fn ensure_sqlite_parent_dir(path: &Path) -> CliResult<()> {
