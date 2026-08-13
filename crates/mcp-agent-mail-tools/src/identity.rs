@@ -550,7 +550,7 @@ fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
     }
 }
 
-/// Decompose the bundled health signals into the six independent verdicts
+/// Decompose the bundled health signals into independent verdicts
 /// (br-bvq1x.3.1 / C1). The strict roll-up over the critical verdicts is what
 /// prevents a green top-level result from coexisting with a broken write or
 /// transport path.
