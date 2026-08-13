@@ -280,9 +280,31 @@ fn acquire_legacy_import_mailbox_locks(plan: &ImportPlan) -> CliResult<LegacyImp
     Ok(LegacyImportMailboxLocks { _guards: guards })
 }
 
+/// Current receipt schema version.
+///
+/// - v1: success-only receipts (no `outcome`/`failure_reason` fields).
+/// - v2: adds `outcome` ("succeeded"/"failed") and `failure_reason` so failed
+///   imports leave an auditable trail for `am legacy status`. The reader
+///   tolerates v1 receipts by defaulting `outcome` to "succeeded".
+const LEGACY_IMPORT_RECEIPT_VERSION: u32 = 2;
+
+const LEGACY_IMPORT_OUTCOME_SUCCEEDED: &str = "succeeded";
+const LEGACY_IMPORT_OUTCOME_FAILED: &str = "failed";
+
+fn default_receipt_outcome() -> String {
+    LEGACY_IMPORT_OUTCOME_SUCCEEDED.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyImportReceipt {
     receipt_version: u32,
+    /// "succeeded" or "failed". v1 receipts lack this field; default preserves
+    /// their (success-only) semantics on read.
+    #[serde(default = "default_receipt_outcome")]
+    outcome: String,
+    /// Present only on failure receipts: the error that aborted the import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
     created_at: String,
     mode: ImportMode,
     search_root: String,
@@ -544,6 +566,10 @@ fn handle_legacy_status(
         ftui_runtime::ftui_println!("- Receipt count: {}", report.receipt_count);
         if let Some(latest) = &report.latest_receipt {
             ftui_runtime::ftui_println!("- Latest: {}", latest.created_at);
+            ftui_runtime::ftui_println!("- Outcome: {}", latest.outcome);
+            if let Some(reason) = &latest.failure_reason {
+                ftui_runtime::ftui_println!("- Failure reason: {reason}");
+            }
             ftui_runtime::ftui_println!("- Mode: {:?}", latest.mode);
             ftui_runtime::ftui_println!("- Target DB: {}", latest.target_db);
             ftui_runtime::ftui_println!(
@@ -753,7 +779,9 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         source_storage.display()
     ));
     operations.push(
-        "verify source DB through canonical SQLite read-only access before copying".to_string(),
+        "verify source DB through canonical SQLite read-only immutable access before copying \
+         (never creates/touches source -wal/-shm sidecars)"
+            .to_string(),
     );
     operations.push(format!(
         "copy source DB to target DB with a canonical SQLite online backup: {}",
@@ -786,18 +814,32 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
     let _mailbox_locks = acquire_legacy_import_mailbox_locks(&plan)?;
     let now = Utc::now();
     let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+
+    // Preflight before any target artifact exists: failures here return the
+    // error unchanged (there is nothing to stage aside and no target storage
+    // root that this run owns to hold a failure receipt).
+    verify_source_canonical_sqlite_readable(&plan.source_db)?;
+    ensure_target_storage_root_usable(&plan.target_storage_root)?;
+
+    match execute_import_body(&plan, should_refresh_setup, &now) {
+        Ok(receipt) => {
+            write_receipt(&plan.target_storage_root, &receipt, &timestamp)?;
+            Ok(receipt)
+        }
+        Err(err) => Err(handle_failed_import(&plan, &err, &now, &timestamp)),
+    }
+}
+
+/// Import steps that create/modify target artifacts. Any `Err` from here means
+/// a partially created target may exist; `execute_import` stages it aside and
+/// records a failure receipt so the run is auditable and retryable.
+fn execute_import_body(
+    plan: &ImportPlan,
+    should_refresh_setup: bool,
+    now: &chrono::DateTime<Utc>,
+) -> CliResult<LegacyImportReceipt> {
     let mut warnings = Vec::new();
 
-    verify_canonical_sqlite_readable(&plan.source_db, "source DB")?;
-    if plan.target_storage_root.exists() {
-        let mut iter = fs::read_dir(&plan.target_storage_root)?;
-        if iter.next().is_some() {
-            return Err(CliError::InvalidArgument(format!(
-                "target storage root {} already exists and is not empty; choose a different path",
-                plan.target_storage_root.display()
-            )));
-        }
-    }
     copy_db_via_sqlite_backup(&plan.source_db, &plan.target_db)?;
     copy_dir_recursive(&plan.source_storage_root, &plan.target_storage_root)?;
 
@@ -810,7 +852,7 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
         )));
     }
     let core_counts = query_core_table_counts(&plan.target_db)?;
-    verify_canonical_sqlite_readable(&plan.source_db, "source DB")?;
+    verify_source_canonical_sqlite_readable(&plan.source_db)?;
     verify_canonical_sqlite_readable(&plan.target_db, "target DB")?;
     verify_runtime_sqlite_readable(&plan.target_db, "target DB")?;
 
@@ -826,8 +868,10 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
         true
     };
 
-    let receipt = LegacyImportReceipt {
-        receipt_version: 1,
+    Ok(LegacyImportReceipt {
+        receipt_version: LEGACY_IMPORT_RECEIPT_VERSION,
+        outcome: LEGACY_IMPORT_OUTCOME_SUCCEEDED.to_string(),
+        failure_reason: None,
         created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         mode: plan.mode,
         search_root: plan.search_root.display().to_string(),
@@ -840,9 +884,135 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
         core_table_counts: core_counts,
         setup_refresh_ok: setup_ok,
         warnings,
+    })
+}
+
+/// A target storage root is usable when it does not exist, or contains at most
+/// the `legacy_import_receipts` directory (left behind by a previous failed
+/// attempt whose partial artifacts were staged aside). Anything else is
+/// refused so an unrelated directory is never merged into.
+fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()> {
+    if !target_storage_root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(target_storage_root)? {
+        let entry = entry?;
+        if entry.file_name() == "legacy_import_receipts" {
+            continue;
+        }
+        return Err(CliError::InvalidArgument(format!(
+            "target storage root {} already exists and is not empty; choose a different path",
+            target_storage_root.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Failure path for `execute_import`: stage the partially created target DB
+/// (plus `-wal`/`-shm` sidecars) aside as `<target>.failed-<UTC ts>` siblings
+/// so the original target path is free for a retry, write a failure receipt so
+/// `am legacy status` can report the attempt, and return the original error
+/// annotated with the staged and receipt paths.
+///
+/// Staging uses rename (never deletion), and only touches the target DB this
+/// same run just created — source paths are never moved or modified.
+fn handle_failed_import(
+    plan: &ImportPlan,
+    original: &CliError,
+    now: &chrono::DateTime<Utc>,
+    timestamp: &str,
+) -> CliError {
+    let failure_reason = original.to_string();
+    let mut warnings = Vec::new();
+    let staged = stage_failed_target_db_aside(&plan.target_db, timestamp, &mut warnings);
+
+    let staged_note = if staged.is_empty() {
+        "no partial target DB was created".to_string()
+    } else {
+        format!(
+            "partial target DB staged aside at {}",
+            staged
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
-    write_receipt(&plan.target_storage_root, &receipt, &timestamp)?;
-    Ok(receipt)
+
+    let receipt = LegacyImportReceipt {
+        receipt_version: LEGACY_IMPORT_RECEIPT_VERSION,
+        outcome: LEGACY_IMPORT_OUTCOME_FAILED.to_string(),
+        failure_reason: Some(failure_reason.clone()),
+        created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        mode: plan.mode,
+        search_root: plan.search_root.display().to_string(),
+        source_db: plan.source_db.display().to_string(),
+        source_storage_root: plan.source_storage_root.display().to_string(),
+        target_db: plan.target_db.display().to_string(),
+        target_storage_root: plan.target_storage_root.display().to_string(),
+        migrated_migration_ids: Vec::new(),
+        integrity_check_ok: false,
+        core_table_counts: BTreeMap::new(),
+        setup_refresh_ok: false,
+        warnings: {
+            let mut all = warnings;
+            if !staged.is_empty() {
+                all.push(format!("{staged_note} (rename, not deletion)"));
+            }
+            all
+        },
+    };
+    let receipt_note = match write_receipt(&plan.target_storage_root, &receipt, timestamp) {
+        Ok(path) => format!("failure receipt written to {}", path.display()),
+        Err(receipt_err) => format!("failure receipt could not be written: {receipt_err}"),
+    };
+
+    CliError::Other(format!(
+        "legacy import failed: {failure_reason}; {staged_note}; {receipt_note}; \
+         the original target paths are free again, so the same command can be retried \
+         once the cause is fixed"
+    ))
+}
+
+/// Rename the partially created target DB and its SQLite sidecars aside as
+/// `<target>.failed-<ts>` (sidecars become `<target>.failed-<ts>-wal` /
+/// `<target>.failed-<ts>-shm`, keeping them associated with the staged DB).
+/// Missing files are skipped; rename errors are reported as warnings rather
+/// than masking the original import error.
+fn stage_failed_target_db_aside(
+    target_db: &Path,
+    timestamp: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    let base = format!("{}.failed-{timestamp}", target_db.display());
+    let mut staged = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = if suffix.is_empty() {
+            target_db.to_path_buf()
+        } else {
+            PathBuf::from(format!("{}{suffix}", target_db.display()))
+        };
+        if fs::symlink_metadata(&candidate).is_err() {
+            continue;
+        }
+        let mut dest = PathBuf::from(format!("{base}{suffix}"));
+        let mut counter = 1_u32;
+        while fs::symlink_metadata(&dest).is_ok() {
+            dest = PathBuf::from(format!("{base}-{counter}{suffix}"));
+            counter = counter.saturating_add(1);
+            if counter > 1000 {
+                break;
+            }
+        }
+        match fs::rename(&candidate, &dest) {
+            Ok(()) => staged.push(dest),
+            Err(err) => warnings.push(format!(
+                "failed to stage partial target artifact {} aside: {err}",
+                candidate.display()
+            )),
+        }
+    }
+    staged
 }
 
 fn run_setup_refresh_once(project_dir: Option<PathBuf>) -> CliResult<()> {
@@ -975,7 +1145,7 @@ fn write_receipt(
     target_storage_root: &Path,
     receipt: &LegacyImportReceipt,
     timestamp: &str,
-) -> CliResult<()> {
+) -> CliResult<PathBuf> {
     let dir = target_storage_root.join("legacy_import_receipts");
     fs::create_dir_all(&dir)?;
     let mut path = dir.join(format!("legacy_import_{timestamp}.json"));
@@ -994,8 +1164,8 @@ fn write_receipt(
     }
     let content = serde_json::to_string_pretty(receipt)
         .map_err(|e| CliError::Other(format!("failed to serialize receipt: {e}")))?;
-    fs::write(path, format!("{content}\n"))?;
-    Ok(())
+    fs::write(&path, format!("{content}\n"))?;
+    Ok(path)
 }
 
 fn build_detect_report(
@@ -1308,8 +1478,9 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
     }
     // Detection is part of the source-import path. Do not let the writable
     // runtime engine establish namespace metadata or attempt schema repair on
-    // a legacy source simply to identify it.
-    let conn = match open_canonical_read_only(path) {
+    // a legacy source simply to identify it. The immutable open also keeps a
+    // WAL-mode source's -wal/-shm sidecars untouched (no reader-side creation).
+    let conn = match open_source_canonical_read_only_immutable(path) {
         Ok(v) => v,
         Err(_) => {
             return Some(LegacyDbSignature {
@@ -1700,8 +1871,54 @@ fn open_canonical_read_only(path: &Path) -> CliResult<CanonicalDbConn> {
     })
 }
 
-fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
-    let conn = open_canonical_read_only(path)?;
+/// Encode a filesystem path for use inside a SQLite URI filename.
+///
+/// SQLite URI filenames treat `?` as the query separator and `#` as a fragment
+/// marker, and `%` introduces percent-escapes, so those three characters must
+/// be percent-encoded when they appear in the path itself.
+fn sqlite_uri_encode_path(path: &Path) -> String {
+    let mut encoded = String::new();
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            '%' => encoded.push_str("%25"),
+            '?' => encoded.push_str("%3F"),
+            '#' => encoded.push_str("%23"),
+            other => encoded.push(other),
+        }
+    }
+    encoded
+}
+
+/// Open a SOURCE database read-only in SQLite immutable mode.
+///
+/// A plain read-only open of a WAL-mode database still creates/touches the
+/// `-wal`/`-shm` sidecars (readers need the wal-index). When the legacy Python
+/// server is still live next to the source, that is a write side effect on a
+/// path this command promises never to modify. `immutable=1` (via a URI
+/// filename, which `OpenFlags::uri` enables) makes SQLite treat the file as
+/// unchangeable: no locks, no journal/WAL access, no sidecar creation.
+///
+/// Trade-off: an immutable connection ignores any `-wal` content entirely, so
+/// this open is only used for inspection/verification. The backup path in
+/// [`copy_db_via_sqlite_backup`] detects a non-empty source `-wal` and copies
+/// through a private staging copy instead, so WAL-resident rows are never lost.
+fn open_source_canonical_read_only_immutable(path: &Path) -> CliResult<CanonicalDbConn> {
+    let uri = format!("file:{}?immutable=1", sqlite_uri_encode_path(path));
+    let flags = {
+        let mut flags = mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_only();
+        flags.uri = true;
+        flags
+    };
+    let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(uri).flags(flags);
+    CanonicalDbConn::open(&config).map_err(|error| {
+        CliError::Other(format!(
+            "cannot open SQLite DB read-only (immutable) {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn verify_canonical_quick_check(conn: &CanonicalDbConn, path: &Path, label: &str) -> CliResult<()> {
     let rows = conn
         .query_sync("PRAGMA quick_check", &[])
         .map_err(|error| {
@@ -1721,6 +1938,21 @@ fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Verify a TARGET database (a fresh artifact this run created) is readable.
+/// Uses a plain read-only open; side effects on our own target are harmless
+/// and a non-immutable open sees any WAL content the migration left behind.
+fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
+    let conn = open_canonical_read_only(path)?;
+    verify_canonical_quick_check(&conn, path, label)
+}
+
+/// Verify the SOURCE database is readable without any filesystem side effects
+/// (immutable open — see [`open_source_canonical_read_only_immutable`]).
+fn verify_source_canonical_sqlite_readable(path: &Path) -> CliResult<()> {
+    let conn = open_source_canonical_read_only_immutable(path)?;
+    verify_canonical_quick_check(&conn, path, "source DB")
 }
 
 fn verify_runtime_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
@@ -1758,7 +1990,52 @@ fn copy_db_via_sqlite_backup(source_db: &Path, target_db: &Path) -> CliResult<()
     if let Some(parent) = target_db.parent() {
         fs::create_dir_all(parent)?;
     }
-    let source = open_canonical_read_only(source_db)?;
+
+    // Source opens are immutable so a WAL-mode source next to a live legacy
+    // server never has its -wal/-shm sidecars created or touched by us. An
+    // immutable connection cannot see WAL-resident rows, though, so when the
+    // source has a non-empty -wal we back up from a private byte-level staging
+    // copy (main DB + wal): SQLite then performs WAL recovery on OUR staging
+    // copy, never on the source. The -shm file is deliberately not copied —
+    // it is a transient wal-index that SQLite rebuilds.
+    let source_wal = PathBuf::from(format!("{}-wal", source_db.display()));
+    let wal_len = fs::metadata(&source_wal).map(|m| m.len()).unwrap_or(0);
+
+    if wal_len > 0 {
+        let staging_dir = tempfile::Builder::new()
+            .prefix("am-legacy-import-staging-")
+            .tempdir()
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "cannot create staging directory for WAL-mode source copy: {error}"
+                ))
+            })?;
+        let staging_db = staging_dir.path().join("staging.sqlite3");
+        let staging_wal = staging_dir.path().join("staging.sqlite3-wal");
+        fs::copy(source_db, &staging_db)?;
+        fs::copy(&source_wal, &staging_wal)?;
+
+        let staging =
+            CanonicalDbConn::open_file(staging_db.display().to_string()).map_err(|error| {
+                CliError::Other(format!(
+                    "cannot open staging copy of WAL-mode source {}: {error}",
+                    source_db.display()
+                ))
+            })?;
+        staging
+            .backup_to_path(target_db.to_string_lossy().as_ref())
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "canonical SQLite backup from staged WAL-mode copy of {} to {} failed: {error}",
+                    source_db.display(),
+                    target_db.display()
+                ))
+            })?;
+        // staging_dir (our own temp artifact) is removed on drop.
+        return Ok(());
+    }
+
+    let source = open_source_canonical_read_only_immutable(source_db)?;
     source
         .backup_to_path(target_db.to_string_lossy().as_ref())
         .map_err(|error| {
@@ -1841,7 +2118,9 @@ mod tests {
         let mut counts = BTreeMap::new();
         counts.insert("messages".to_string(), 1);
         LegacyImportReceipt {
-            receipt_version: 1,
+            receipt_version: LEGACY_IMPORT_RECEIPT_VERSION,
+            outcome: LEGACY_IMPORT_OUTCOME_SUCCEEDED.to_string(),
+            failure_reason: None,
             created_at: created_at.to_string(),
             mode: ImportMode::Copy,
             search_root: "/tmp/project".to_string(),
@@ -2283,9 +2562,46 @@ mod tests {
         assert!(receipt_path.exists());
         let parsed: LegacyImportReceipt =
             serde_json::from_str(&fs::read_to_string(receipt_path).unwrap()).unwrap();
-        assert_eq!(parsed.receipt_version, 1);
+        assert_eq!(parsed.receipt_version, LEGACY_IMPORT_RECEIPT_VERSION);
+        assert_eq!(parsed.outcome, LEGACY_IMPORT_OUTCOME_SUCCEEDED);
+        assert!(parsed.failure_reason.is_none());
         assert_eq!(parsed.mode, ImportMode::Copy);
         assert_eq!(parsed.source_db, "/tmp/storage.sqlite3");
+    }
+
+    #[test]
+    fn status_reader_tolerates_v1_receipts_without_outcome_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receipts_dir = tmp.path().join("legacy_import_receipts");
+        fs::create_dir_all(&receipts_dir).unwrap();
+        // A verbatim v1 receipt: no `outcome`, no `failure_reason`.
+        let v1_json = r#"{
+            "receipt_version": 1,
+            "created_at": "2026-02-17T00:00:00Z",
+            "mode": "copy",
+            "search_root": "/tmp/project",
+            "source_db": "/tmp/storage.sqlite3",
+            "source_storage_root": "/tmp/storage-root",
+            "target_db": "/tmp/target.sqlite3",
+            "target_storage_root": "/tmp/target-root",
+            "migrated_migration_ids": [],
+            "integrity_check_ok": true,
+            "core_table_counts": {},
+            "setup_refresh_ok": true,
+            "warnings": []
+        }"#;
+        fs::write(
+            receipts_dir.join("legacy_import_20260217T000000Z.json"),
+            v1_json,
+        )
+        .unwrap();
+
+        let report = collect_status_report(tmp.path()).unwrap();
+        assert_eq!(report.receipt_count, 1);
+        let latest = report.latest_receipt.expect("v1 receipt should parse");
+        assert_eq!(latest.receipt_version, 1);
+        assert_eq!(latest.outcome, LEGACY_IMPORT_OUTCOME_SUCCEEDED);
+        assert!(latest.failure_reason.is_none());
     }
 
     #[test]
@@ -2550,6 +2866,229 @@ mod tests {
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_import_writes_failure_receipt_and_stages_partial_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_db = tmp.path().join("legacy.sqlite3");
+        let source_storage = tmp.path().join("legacy-storage");
+        let target_db = tmp.path().join("rust-copy.sqlite3");
+        let target_storage = tmp.path().join("rust-storage");
+
+        // Valid SQLite source so the preflight quick_check passes and the
+        // target DB copy is created; the storage copy then fails on a broken
+        // symlink (existing validation), which is the cleanest failure
+        // injection AFTER the partial target DB exists.
+        let conn = CanonicalDbConn::open_file(source_db.display().to_string())
+            .expect("create source fixture DB");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create fixture table");
+        drop(conn);
+        fs::create_dir_all(&source_storage).expect("create source storage");
+        symlink("/does/not/exist", source_storage.join("broken-link"))
+            .expect("seed broken symlink");
+
+        let opts = ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(source_db.clone()),
+            storage_root: Some(source_storage.clone()),
+            target_db: Some(target_db.clone()),
+            target_storage_root: Some(target_storage.clone()),
+            dry_run: false,
+            yes: true,
+        };
+        let plan = build_import_plan(&opts).expect("build import plan");
+        let err = execute_import(plan, false).expect_err("import must fail on broken symlink");
+        let message = err.to_string();
+        assert!(
+            message.contains("legacy import failed"),
+            "error should be annotated: {message}"
+        );
+        assert!(
+            message.contains("broken symlink"),
+            "original failure must be preserved: {message}"
+        );
+        assert!(
+            message.contains(".failed-"),
+            "error should name the staged partial target: {message}"
+        );
+        assert!(
+            message.contains("failure receipt written to"),
+            "error should name the failure receipt: {message}"
+        );
+
+        // The partial target DB was renamed aside (never deleted), freeing the
+        // original target path for retry.
+        assert!(
+            !target_db.exists(),
+            "original target DB path must be free again"
+        );
+        let staged: Vec<PathBuf> = fs::read_dir(tmp.path())
+            .expect("list tempdir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("rust-copy.sqlite3.failed-"))
+            })
+            .collect();
+        assert_eq!(
+            staged.len(),
+            1,
+            "exactly one staged partial target DB expected, got {staged:?}"
+        );
+
+        // A failure receipt is discoverable via the status reader.
+        let report = collect_status_report(&target_storage).expect("status report");
+        assert_eq!(report.receipt_count, 1);
+        let latest = report.latest_receipt.expect("failure receipt present");
+        assert_eq!(latest.receipt_version, LEGACY_IMPORT_RECEIPT_VERSION);
+        assert_eq!(latest.outcome, LEGACY_IMPORT_OUTCOME_FAILED);
+        assert!(
+            latest
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("broken symlink")),
+            "failure_reason should carry the original error: {:?}",
+            latest.failure_reason
+        );
+        assert!(!latest.integrity_check_ok);
+        assert!(latest.migrated_migration_ids.is_empty());
+
+        // Retryability: the same options build a plan again (target DB path is
+        // free; target storage root holds only the receipts directory).
+        build_import_plan(&opts).expect("retry plan must build after failed import");
+    }
+
+    #[test]
+    fn wal_mode_source_sidecars_untouched_by_detect_and_import() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_db = tmp.path().join("legacy-wal.sqlite3");
+        let source_storage = tmp.path().join("legacy-storage");
+        let target_db = tmp.path().join("rust-copy.sqlite3");
+        let target_storage = tmp.path().join("rust-storage");
+        fs::create_dir_all(&source_storage).expect("create source storage");
+        fs::write(source_storage.join("message.json"), "legacy archive")
+            .expect("seed source storage");
+        seed_v20_agents_fixture(&source_db);
+
+        // Simulate a live legacy server: an open writer connection holding the
+        // source in WAL mode with committed rows that exist only in the -wal.
+        let writer = CanonicalDbConn::open_file(source_db.display().to_string())
+            .expect("open live writer on source");
+        writer
+            .query_sync("PRAGMA journal_mode=WAL", &[])
+            .expect("switch source to WAL mode");
+        writer
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (2, 'wal-live', '/tmp/wal-live', 1)",
+            )
+            .expect("insert WAL-resident project row");
+
+        let wal_path = PathBuf::from(format!("{}-wal", source_db.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", source_db.display()));
+        assert!(wal_path.exists(), "fixture must have a live -wal sidecar");
+        assert!(shm_path.exists(), "fixture must have a live -shm sidecar");
+        let wal_bytes_before = fs::read(&wal_path).expect("read wal bytes");
+        let shm_bytes_before = fs::read(&shm_path).expect("read shm bytes");
+        let db_bytes_before = fs::read(&source_db).expect("read source db bytes");
+        let wal_mtime_before = fs::metadata(&wal_path)
+            .and_then(|m| m.modified())
+            .expect("wal mtime");
+        let shm_mtime_before = fs::metadata(&shm_path)
+            .and_then(|m| m.modified())
+            .expect("shm mtime");
+        let db_mtime_before = fs::metadata(&source_db)
+            .and_then(|m| m.modified())
+            .expect("db mtime");
+
+        // Detect (source DB signature inspection) must not touch the sidecars.
+        let report = build_detect_report(
+            tmp.path(),
+            Some(source_db.as_path()),
+            Some(source_storage.as_path()),
+        )
+        .expect("detect report");
+        assert!(
+            report.db_signature.as_ref().is_some_and(|sig| sig.open_ok),
+            "immutable read-only open must succeed on a WAL-mode source"
+        );
+
+        // Import (verification + backup + migration of the copy) likewise.
+        let plan = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(source_db.clone()),
+            storage_root: Some(source_storage.clone()),
+            target_db: Some(target_db.clone()),
+            target_storage_root: Some(target_storage.clone()),
+            dry_run: false,
+            yes: true,
+        })
+        .expect("build import plan");
+        let receipt = execute_import(plan, false).expect("import WAL-mode source");
+        assert!(receipt.integrity_check_ok);
+
+        assert_eq!(
+            fs::read(&wal_path).expect("reread wal bytes"),
+            wal_bytes_before,
+            "source -wal bytes must be unchanged by detect+import"
+        );
+        assert_eq!(
+            fs::read(&shm_path).expect("reread shm bytes"),
+            shm_bytes_before,
+            "source -shm bytes must be unchanged by detect+import"
+        );
+        assert_eq!(
+            fs::read(&source_db).expect("reread source db bytes"),
+            db_bytes_before,
+            "source db bytes must be unchanged by detect+import"
+        );
+        assert_eq!(
+            fs::metadata(&wal_path)
+                .and_then(|m| m.modified())
+                .expect("wal mtime after"),
+            wal_mtime_before,
+            "source -wal mtime must be unchanged by detect+import"
+        );
+        assert_eq!(
+            fs::metadata(&shm_path)
+                .and_then(|m| m.modified())
+                .expect("shm mtime after"),
+            shm_mtime_before,
+            "source -shm mtime must be unchanged by detect+import"
+        );
+        assert_eq!(
+            fs::metadata(&source_db)
+                .and_then(|m| m.modified())
+                .expect("db mtime after"),
+            db_mtime_before,
+            "source db mtime must be unchanged by detect+import"
+        );
+
+        // The staged-copy backup path must carry WAL-resident rows into the
+        // target: both the checkpointed project and the wal-only insert.
+        let target = open_canonical_read_only(&target_db).expect("open migrated target");
+        let rows = target
+            .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
+            .expect("count target projects");
+        let count = rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or(0);
+        assert_eq!(
+            count, 2,
+            "WAL-resident row must survive the staged-copy backup"
+        );
+
+        drop(writer);
     }
 
     #[cfg(unix)]

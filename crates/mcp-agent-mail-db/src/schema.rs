@@ -3304,26 +3304,106 @@ fn is_missing_table_error(err: &SqlError) -> bool {
         .contains("no such table")
 }
 
+/// Parse `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> (...)`,
+/// returning `(table, index_name)`.
+#[must_use]
+fn parse_create_index(sql: &str) -> Option<(String, String)> {
+    // Split '(' off tokens so "agents(registration_token)" yields "agents".
+    let normalized = sql.replace('(', " (");
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if !tokens.first()?.eq_ignore_ascii_case("create") {
+        return None;
+    }
+    let mut idx = 1;
+    if tokens
+        .get(idx)
+        .is_some_and(|token| token.eq_ignore_ascii_case("unique"))
+    {
+        idx += 1;
+    }
+    if !tokens.get(idx)?.eq_ignore_ascii_case("index") {
+        return None;
+    }
+    idx += 1;
+    if tokens
+        .get(idx)
+        .is_some_and(|token| token.eq_ignore_ascii_case("if"))
+        && tokens
+            .get(idx + 1)
+            .is_some_and(|token| token.eq_ignore_ascii_case("not"))
+        && tokens
+            .get(idx + 2)
+            .is_some_and(|token| token.eq_ignore_ascii_case("exists"))
+    {
+        idx += 3;
+    }
+    let index_name = trim_sql_identifier(tokens.get(idx)?);
+    if index_name.is_empty() {
+        return None;
+    }
+    idx += 1;
+    if !tokens.get(idx)?.eq_ignore_ascii_case("on") {
+        return None;
+    }
+    idx += 1;
+    let table = trim_sql_identifier(tokens.get(idx)?);
+    if table.is_empty() {
+        return None;
+    }
+    Some((table.to_string(), index_name.to_string()))
+}
+
+/// Cheap structural pre-probe: decide whether a migration's DDL is already
+/// satisfied by the live schema WITHOUT executing the DDL statement.
+///
+/// This matters beyond plain idempotency. Even a no-op `ALTER TABLE ... ADD
+/// COLUMN` (failing with "duplicate column") or `CREATE INDEX IF NOT EXISTS`
+/// (succeeding as a no-op) still routes through the engine's schema-change
+/// path and can trigger a full schema reload — which the bespoke engine has
+/// historically mishandled on legacy-shaped stores (e.g. the v20 pair on
+/// Python-imported databases with implicit UNIQUE autoindexes, GH#236). The
+/// probes below use PRAGMA table_info / PRAGMA index_list, which read schema
+/// metadata without any schema mutation or reload.
+///
+/// Migrations whose shape is not recognized fall back to `false`, i.e. the
+/// generic execute-then-inspect-error path in the caller.
 async fn migration_preflight_already_satisfied<C: Connection>(
     cx: &Cx,
     conn: &C,
     migration: &Migration,
 ) -> Outcome<bool, SqlError> {
-    let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
-        return Outcome::Ok(false);
-    };
-
-    let sql = format!("PRAGMA table_info({table})");
-    match conn.query(cx, &sql, &[]).await {
-        Outcome::Ok(rows) => Outcome::Ok(
-            rows.into_iter()
-                .filter_map(|row| row.get_named::<String>("name").ok())
-                .any(|name| name == column),
-        ),
-        Outcome::Err(query_err) => Outcome::Err(query_err),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    if let Some((table, column)) = parse_alter_table_add_column(&migration.up) {
+        let sql = format!("PRAGMA table_info({table})");
+        return match conn.query(cx, &sql, &[]).await {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .filter_map(|row| row.get_named::<String>("name").ok())
+                    .any(|name| name == column),
+            ),
+            Outcome::Err(query_err) => Outcome::Err(query_err),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        };
     }
+
+    if let Some((table, index_name)) = parse_create_index(&migration.up) {
+        // PRAGMA index_list on a missing table yields no rows (or an error on
+        // stricter engines); either way the migration is not "already
+        // satisfied" and the generic path runs.
+        let sql = format!("PRAGMA index_list({table})");
+        return match conn.query(cx, &sql, &[]).await {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .filter_map(|row| row.get_named::<String>("name").ok())
+                    .any(|name| name == index_name),
+            ),
+            Outcome::Err(_) => Outcome::Ok(false),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        };
+    }
+
+    Outcome::Ok(false)
 }
 
 async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
@@ -4640,6 +4720,117 @@ mod tests {
                 .expect("last_message_ts value"),
             200
         );
+    }
+
+    #[test]
+    fn v20_already_satisfied_is_detected_without_schema_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v20_preflight_short_circuit.sqlite3");
+        let path = db_path.to_string_lossy().to_string();
+        let conn = DbConn::open_file(&path).expect("open sqlite connection");
+
+        // Bootstrap the full latest schema: agents already has
+        // registration_token and idx_agents_registration_token exists.
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("initial base migration");
+            }
+        });
+
+        // Forget the v20 ledger rows so the runner must re-evaluate them
+        // against a schema that already satisfies them.
+        conn.execute_sync(
+            &format!(
+                "DELETE FROM {MIGRATIONS_TABLE_NAME} WHERE id IN \
+                 ('v20_agents_registration_token', 'v20_idx_agents_registration_token')"
+            ),
+            &[],
+        )
+        .expect("delete v20 ledger rows");
+
+        let migrations: Vec<Migration> = schema_migrations_base()
+            .into_iter()
+            .filter(|migration| {
+                matches!(
+                    migration.id.as_str(),
+                    "v20_agents_registration_token" | "v20_idx_agents_registration_token"
+                )
+            })
+            .collect();
+        assert_eq!(migrations.len(), 2, "both v20 migrations must exist");
+
+        // The CREATE INDEX shape must be recognized by the structural parser.
+        let index_migration = migrations
+            .iter()
+            .find(|m| m.id == "v20_idx_agents_registration_token")
+            .expect("v20 index migration");
+        assert_eq!(
+            parse_create_index(&index_migration.up),
+            Some((
+                "agents".to_string(),
+                "idx_agents_registration_token".to_string()
+            ))
+        );
+
+        // Structural pre-probes (PRAGMA table_info / PRAGMA index_list) must
+        // report both migrations as already satisfied. This is the branch that
+        // records the migration WITHOUT executing its DDL, so no ALTER TABLE /
+        // CREATE INDEX statement — and therefore no engine schema reload — is
+        // issued for the already-present column and index.
+        for migration in &migrations {
+            let satisfied = block_on({
+                let conn = &conn;
+                move |cx| async move {
+                    migration_preflight_already_satisfied(&cx, conn, migration)
+                        .await
+                        .into_result()
+                        .expect("preflight probe")
+                }
+            });
+            assert!(
+                satisfied,
+                "preflight must detect {} as already satisfied structurally",
+                migration.id
+            );
+        }
+
+        // The full runner path completes and re-records both ids.
+        let applied = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("re-run base migration with satisfied v20 schema")
+            }
+        });
+        assert!(
+            applied
+                .iter()
+                .any(|id| id == "v20_agents_registration_token"),
+            "v20 column migration should be recorded on re-run: {applied:?}"
+        );
+        assert!(
+            applied
+                .iter()
+                .any(|id| id == "v20_idx_agents_registration_token"),
+            "v20 index migration should be recorded on re-run: {applied:?}"
+        );
+
+        let rows = conn
+            .query_sync(
+                &format!(
+                    "SELECT id FROM {MIGRATIONS_TABLE_NAME} WHERE id IN \
+                     ('v20_agents_registration_token', 'v20_idx_agents_registration_token')"
+                ),
+                &[],
+            )
+            .expect("query ledger");
+        assert_eq!(rows.len(), 2, "both v20 ledger rows must be re-recorded");
     }
 
     #[test]
