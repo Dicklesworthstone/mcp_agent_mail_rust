@@ -1019,11 +1019,9 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
                 };
             }
         };
-    let Some(active_evidence) = record_active_maintenance_evidence(
-        git_dir,
-        child.id(),
-        process_start_ticks(child.id()),
-    ) else {
+    let Some(active_evidence) =
+        record_active_maintenance_evidence(git_dir, child.id(), process_start_ticks(child.id()))
+    else {
         let lock_evidence = terminate_maintenance_child(
             &mut child,
             git_dir,
