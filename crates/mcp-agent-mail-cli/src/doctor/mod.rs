@@ -85,6 +85,14 @@ pub fn handle_robot_docs() -> CliResult<()> {
 /// filtering is available once the detector registry is wired; today the
 /// `quick_mode_eligible` attribute lives on the capabilities side.
 pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
+    let envelope = triage_envelope(target, quick)?;
+    let output = serde_json::to_string_pretty(&envelope)
+        .map_err(|e| CliError::Other(format!("serializing triage envelope: {e}")))?;
+    println!("{output}");
+    Ok(())
+}
+
+fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_json::Value> {
     let root = runs::doctor_root(target);
     let report_path = latest_doctor_report_path_for_root(&root);
 
@@ -282,10 +290,7 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
         "robot_docs_url": "am doctor robot-docs",
     });
 
-    let s = serde_json::to_string_pretty(&envelope)
-        .map_err(|e| CliError::Other(format!("serializing triage envelope: {e}")))?;
-    println!("{s}");
-    Ok(())
+    Ok(envelope)
 }
 
 /// A small archive-only parity discrepancy is operational debt, not evidence
@@ -3157,6 +3162,7 @@ mod tests {
         seed_healthy_live_mailbox(&db_path);
 
         let storage_root_s = storage_root.path().display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", &db_url),
@@ -3187,7 +3193,6 @@ mod tests {
         seed_healthy_live_mailbox(&db_path);
 
         let storage_root_s = storage_root.path().display().to_string();
-        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", &db_url),
@@ -3411,23 +3416,20 @@ mod tests {
             .unwrap();
 
         let storage_root_s = storage_root.path().display().to_string();
-        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", &db_url),
                 ("STORAGE_ROOT", &storage_root_s),
                 ("HTTP_PORT", "47351"),
             ],
-            || handle_triage(target.path(), false),
+            || triage_envelope(target.path(), false),
         );
-        let output = capture.drain_to_string();
-        drop(capture);
 
         assert!(
             result.is_ok(),
             "truncated report must not crash triage: {result:?}"
         );
-        let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let report = result.expect("triage envelope after successful result");
         assert_eq!(report["report_available"], true);
         assert!(
             report["report_warning"]

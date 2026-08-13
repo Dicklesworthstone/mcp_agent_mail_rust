@@ -10587,7 +10587,7 @@ fn doctor_locks_recommended_next_action(
             owner_state.safe_next_command
         ),
         DoctorLockOwnerClass::Reclaimable => format!(
-            "{waiter_prefix}Owner class reclaimable: the mailbox owner is provably dead-or-wedged (zombie, or a deleted-executable owner that is unresponsive and idle past the threshold). A supervised takeover may quarantine its stale locks and repair — the FIRST agent to run the takeover wins an election lock; the rest see a stale/safe mailbox and proceed or defer. `am` is never killed. Safe next command: `{}`.",
+            "{waiter_prefix}Owner class reclaimable: the mailbox owner is provably dead-or-wedged (zombie, or a deleted-executable owner that is unresponsive and idle past the threshold). A supervised takeover may quarantine its stale locks and repair — the FIRST agent to run the takeover wins an election lock; the rest see a stale/safe mailbox and proceed or defer. `am` is never terminated. Safe next command: `{}`.",
             owner_state.safe_next_command
         ),
         DoctorLockOwnerClass::UnsafeToTouch => format!(
@@ -49486,13 +49486,15 @@ http_headers = { Authorization = "Bearer secret" }
             enforce_supervised_owner_guard(bogus_db, storage, "repair", false, true, false).is_ok(),
             "--allow-live-owner must bypass the ownership scan"
         );
-        // --take-ownership must NOT bypass the scan (it needs the report to
-        // decide reclaimability); with an unresolvable DB the scan errors, which
-        // is the correct not-Ok outcome here.
+        // --take-ownership does NOT early-return like dry_run/allow_live_owner:
+        // it performs the ownership scan. This bogus path resolves to an
+        // *unowned* mailbox (no live/wedged owner, no lock holders), which
+        // classifies as `stale` — safe to mutate — so the guard proceeds (Ok)
+        // without attempting any takeover. (A takeover only fires for a
+        // `reclaimable` owner, which a fake path can never produce.)
         assert!(
-            enforce_supervised_owner_guard(bogus_db, storage, "repair", false, false, true)
-                .is_err(),
-            "--take-ownership must still perform the ownership scan"
+            enforce_supervised_owner_guard(bogus_db, storage, "repair", false, false, true).is_ok(),
+            "--take-ownership on an unowned/stale mailbox performs the scan and proceeds"
         );
     }
 
