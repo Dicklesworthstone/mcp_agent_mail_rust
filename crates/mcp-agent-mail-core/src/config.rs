@@ -2834,7 +2834,7 @@ impl Config {
             return true;
         }
 
-        let (profile_clusters, profile_tools) = match profile {
+        let (profile_clusters, profile_tools, profile_excluded_tools) = match profile {
             "core" => (
                 &[
                     "identity",
@@ -2843,6 +2843,11 @@ impl Config {
                     "workflow_macros",
                 ][..],
                 &["health_check", "ensure_project"][..],
+                // The core profile is the compact interactive mailbox surface.
+                // Restart-safe monitor polling remains available through the
+                // messaging/full/custom profiles, but is deliberately omitted
+                // here to preserve the established core profile contract.
+                &["fetch_inbox_events"][..],
             ),
             "minimal" => (
                 &[][..],
@@ -2854,13 +2859,19 @@ impl Config {
                     "fetch_inbox",
                     "acknowledge_message",
                 ][..],
+                &[][..],
             ),
             "messaging" => (
                 &["identity", "messaging", "contact"][..],
                 &["health_check", "ensure_project", "search_messages"][..],
+                &[][..],
             ),
-            _ => (&[][..], &[][..]),
+            _ => (&[][..], &[][..], &[][..]),
         };
+
+        if profile_excluded_tools.contains(&tool_name) {
+            return false;
+        }
 
         let in_cluster = profile_clusters.contains(&cluster);
         let in_tools = profile_tools.contains(&tool_name);
@@ -4499,6 +4510,10 @@ mod tests {
         let config = make_filter(true, "core");
         assert!(!config.should_expose_tool("search_messages", "search"));
         assert!(!config.should_expose_tool("summarize_thread", "search"));
+        assert!(
+            !config.should_expose_tool("fetch_inbox_events", "messaging"),
+            "restart-safe monitor polling belongs to the messaging profile, not compact core"
+        );
     }
 
     #[test]
