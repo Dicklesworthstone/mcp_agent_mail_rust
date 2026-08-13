@@ -1096,6 +1096,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "fetch_inbox_events".to_string(),
+                    summary: "Read body-free, oldest-first recipient delivery events with a restart-safe cursor.".to_string(),
+                    use_when: "Resuming an inbox monitor without replaying or missing prior delivery events.".to_string(),
+                    related: vec!["fetch_inbox".to_string(), "acknowledge_message".to_string()],
+                    expected_frequency: "Frequent polling by restart-safe monitor loops.".to_string(),
+                    required_capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Resume monitor".to_string(), sample: "fetch_inbox_events(project_key='backend', agent_name='BlueLake', after=41, limit=100)".to_string() }],
+                    capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "mark_message_read".to_string(),
                     summary: "Record read_ts for FYI messages without sending acknowledgements.".to_string(),
                     use_when: "Clearing inbox notifications once reviewed.".to_string(),
