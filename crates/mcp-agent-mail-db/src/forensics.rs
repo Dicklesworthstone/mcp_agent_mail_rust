@@ -1984,10 +1984,17 @@ fn attach_identity_delta(
     }
     for (key, source_count) in source {
         let candidate_count = candidate.get(key).copied().unwrap_or(0);
-        lost.extend(std::iter::repeat_n(
-            key.clone(),
-            source_count.saturating_sub(candidate_count),
-        ));
+        // Identity LOSS means the identity is absent from the candidate.
+        // Reduced multiplicity of a surviving identity is DEDUPLICATION:
+        // rows sharing the full identity key (e.g. same project + sender +
+        // subject + µs created_ts) are duplicate-replay artifacts that prior
+        // recovery bugs injected (br-r6awv), and a candidate that collapses
+        // them must be promotable — otherwise a duplicate-polluted source
+        // wedges every future recovery. Real inflation stays blocked by the
+        // separate duplicate-inflation guard.
+        if candidate_count == 0 {
+            lost.extend(std::iter::repeat_n(key.clone(), *source_count));
+        }
     }
     category.identity_added_count = Some(added.len());
     category.identity_lost_count = Some(lost.len());
@@ -4170,6 +4177,41 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    /// br-r6awv: reduced multiplicity of a SURVIVING identity is
+    /// deduplication of replayed rows and must not count as identity loss —
+    /// only a fully absent identity does. Without this, a duplicate-polluted
+    /// source wedges every future recovery behind the loss guard.
+    #[test]
+    fn identity_delta_treats_deduplication_as_survival_not_loss() {
+        let mut category = super::recovery_delta_category(
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("empty payload delta");
+
+        let mut source = std::collections::BTreeMap::new();
+        source.insert("dup-identity".to_string(), 2_usize);
+        source.insert("gone-identity".to_string(), 3_usize);
+        let mut candidate = std::collections::BTreeMap::new();
+        candidate.insert("dup-identity".to_string(), 1_usize);
+
+        super::attach_identity_delta(&mut category, &source, &candidate);
+        assert_eq!(
+            category.identity_lost_count,
+            Some(3),
+            "only the fully absent identity counts as loss (at its multiplicity)"
+        );
+        assert!(
+            category
+                .identity_lost
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|key| key == "gone-identity"),
+            "the deduplicated surviving identity must not be reported as lost"
+        );
+    }
 
     fn seed_recovery_receipt_db(path: &std::path::Path, include_coordination: bool) {
         let conn = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())

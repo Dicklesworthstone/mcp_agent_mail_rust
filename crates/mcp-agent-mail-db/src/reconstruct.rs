@@ -2206,9 +2206,16 @@ fn parse_and_insert_message(
         .get("ack_required")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // The fallback for a file without any parseable timestamp MUST be
+    // deterministic across reconstruct runs: stamping `now_micros()` gave the
+    // same artifact a new identity on every rebuild, so each recovery bred a
+    // fresh row (and identity-based promotion accounting could never
+    // converge, br-r6awv). The canonical filename's leading UTC timestamp is
+    // stable; a constant 0 is the last resort.
     let created_ts = parse_ts_from_json(&msg, "created_ts")
         .or_else(|| parse_ts_from_json(&msg, "created"))
-        .unwrap_or_else(crate::now_micros);
+        .or_else(|| canonical_filename_created_ts(file_path))
+        .unwrap_or(0);
     let attachments = normalize_archive_attachments_json(
         msg.get("attachments"),
         &file_path.display().to_string(),
@@ -2914,6 +2921,17 @@ fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
 /// Return the `project_id` of a message row with the given canonical id, or
 /// `None` if no such row exists. Used during reconstruction to distinguish
 /// same-project duplicates from cross-project canonical-id collisions.
+/// Deterministic timestamp fallback for canonical archive files whose
+/// frontmatter carries no parseable `created`/`created_ts`: the filename's
+/// leading `%Y-%m-%dT%H-%M-%SZ` stamp (e.g.
+/// `2026-04-01T13-00-00Z__subject__7.md`), in microseconds.
+fn canonical_filename_created_ts(file_path: &Path) -> Option<i64> {
+    let name = file_path.file_name()?.to_str()?;
+    let (stamp, _) = name.split_once("__")?;
+    let parsed = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H-%M-%SZ").ok()?;
+    Some(parsed.and_utc().timestamp_micros())
+}
+
 /// Owning project plus the stable identity fields (`created_ts`, `subject`)
 /// of the message currently holding a DB id. Collision handling must compare
 /// identity, not just id: an id can be legitimately reused by a *different*
@@ -2963,6 +2981,35 @@ fn message_row_identity(conn: &DbConn, message_id: i64) -> DbResult<Option<(i64,
         .map_err(|e| DbError::Sqlite(format!("decode created_ts for message {message_id}: {e}")))?;
     let subject = row.get_named::<String>("subject").unwrap_or_default();
     Ok(Some((pid, created_ts, subject)))
+}
+
+/// Find a message in `project_id` matching the stable identity fields
+/// (`created_ts`, `subject`), regardless of its numeric id. Used by salvage
+/// to recognize content the candidate already carries under a different id
+/// (row-id reuse across DB generations, br-r6awv).
+fn message_identity_existing_id(
+    conn: &DbConn,
+    project_id: i64,
+    created_ts: i64,
+    subject: &str,
+) -> DbResult<Option<i64>> {
+    let rows = conn
+        .query_sync(
+            "SELECT id FROM messages \
+             WHERE project_id = ? AND CAST(created_ts AS INTEGER) = ? AND subject = ? LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(created_ts),
+                Value::Text(subject.to_string()),
+            ],
+        )
+        .map_err(|e| DbError::Sqlite(format!("lookup message identity in project: {e}")))?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    row.get_named::<i64>("id")
+        .map(Some)
+        .map_err(|e| DbError::Sqlite(format!("decode message identity id: {e}")))
 }
 
 fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
@@ -4879,6 +4926,21 @@ fn merge_salvaged_database(
                         && existing_subject == source_subject
                     {
                         message_id_map.insert(source_message_id, source_message_id);
+                        continue;
+                    }
+                    // The same message can already be in the candidate under a
+                    // DIFFERENT id: row-id reuse across DB generations means
+                    // the archive's canonical file for this content carries
+                    // another numeric id. Re-inserting it here would replay a
+                    // duplicate, which the promotion guard rightly refuses
+                    // (br-r6awv). Map to the existing row instead.
+                    if let Some(existing_id) = message_identity_existing_id(
+                        &target_conn,
+                        target_project_id,
+                        source_created_ts,
+                        &source_subject,
+                    )? {
+                        message_id_map.insert(source_message_id, existing_id);
                         continue;
                     }
 
