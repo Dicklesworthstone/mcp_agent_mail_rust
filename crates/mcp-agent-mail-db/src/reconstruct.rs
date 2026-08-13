@@ -1793,12 +1793,15 @@ fn reconstruct_from_archive_impl(
 /// additional rows that never made it into the Git archive, including DB-only
 /// contact/product-bus metadata.
 ///
-/// When a salvage path is supplied, probing and merging it are mandatory.
-/// Returning an apparently successful archive-only result when the path is
-/// missing, invalid, or unreadable — or when the merge fails — would silently
-/// discard coordination state and allow callers to promote an incomplete
-/// candidate. Callers that explicitly want archive-only recovery must pass
-/// `None`.
+/// When a salvage path is supplied:
+/// - missing, symlink, lock, and other non-corruption probe failures still
+///   refuse so we cannot silently drop DB-only coordination state
+/// - a present file that is not readable SQLite, or that fails full
+///   `integrity_check`, degrades to archive-only (warned, still promotable)
+/// - a merge that fails with a corruption-class error also degrades; the
+///   merge transaction is rolled back first
+///
+/// Callers that explicitly want archive-only recovery must pass `None`.
 pub fn reconstruct_from_archive_with_salvage(
     db_path: &Path,
     storage_root: &Path,
@@ -1853,28 +1856,28 @@ pub fn reconstruct_from_archive_with_salvage(
         reconstruct_from_archive_impl(db_path, storage_root, salvage_db_path.is_some())?;
     if let Some(message) = unreadable_salvage {
         stats.push_warning(format!(
-            "salvage source was unreadable as SQLite ({message}); \
+            "salvage source skipped ({message}); \
              rebuilt archive-only candidate so doctor can promote a heal"
         ));
     }
-    if let Some(salvage_db_path) = salvage_for_merge {
-        if let Err(error) = merge_salvaged_database(db_path, salvage_db_path, &mut stats) {
-            let message = error.to_string();
-            if crate::pool::is_corruption_error_message(&message) {
-                // Merge rolled back. Keep the archive-only candidate so
-                // `am doctor reconstruct` can promote a heal instead of
-                // leaving the mailbox wedged on a corrupt-but-openable source.
-                stats.push_warning(format!(
-                    "salvage merge from {} failed with corruption ({message}); \
-                     keeping archive-only candidate so doctor can promote a heal",
-                    salvage_db_path.display()
-                ));
-            } else {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
-                    salvage_db_path.display()
-                )));
-            }
+    if let Some(salvage_db_path) = salvage_for_merge
+        && let Err(error) = merge_salvaged_database(db_path, salvage_db_path, &mut stats)
+    {
+        let message = error.to_string();
+        if crate::pool::is_corruption_error_message(&message) {
+            // Merge rolled back. Keep the archive-only candidate so
+            // `am doctor reconstruct` can promote a heal instead of
+            // leaving the mailbox wedged on a corrupt-but-openable source.
+            stats.push_warning(format!(
+                "salvage merge from {} failed with corruption ({message}); \
+                 keeping archive-only candidate so doctor can promote a heal",
+                salvage_db_path.display()
+            ));
+        } else {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
+                salvage_db_path.display()
+            )));
         }
     }
     Ok(stats)
@@ -2281,8 +2284,17 @@ fn parse_and_insert_message(
             Some(cid)
         }
         // Deferred pass: the canonical id lost its slot to a different
-        // message; insert under a generated DB id.
-        (Some(_) | None, _) => None,
+        // message. Insert under a generated DB id, but still skip a true
+        // duplicate of a message already inserted — two losers can share
+        // an identity after colliding with a third occupant of the same id.
+        (Some(cid), None) => {
+            if message_identity_already_present(conn, project_id, created_ts, subject)? {
+                stats.record_duplicate_canonical_message(cid, file_path);
+                return Ok(());
+            }
+            None
+        }
+        (None, _) => None,
     };
 
     let thread_id = raw_thread_id.and_then(|raw| {
@@ -2907,6 +2919,31 @@ fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
 /// identity, not just id: an id can be legitimately reused by a *different*
 /// message across DB generations or across separately-produced project
 /// archives (br-r6awv).
+fn message_identity_already_present(
+    conn: &DbConn,
+    project_id: i64,
+    created_ts: i64,
+    subject: &str,
+) -> DbResult<bool> {
+    let rows = conn
+        .query_sync(
+            "SELECT 1 AS present FROM messages \
+             WHERE project_id = ? AND CAST(created_ts AS INTEGER) = ? AND subject = ? \
+             LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(created_ts),
+                Value::Text(subject.to_string()),
+            ],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "check existing message identity in project {project_id}: {e}"
+            ))
+        })?;
+    Ok(!rows.is_empty())
+}
+
 fn message_row_identity(conn: &DbConn, message_id: i64) -> DbResult<Option<(i64, i64, String)>> {
     let rows = conn
         .query_sync(
@@ -7491,6 +7528,12 @@ first body
 "#,
         )
         .unwrap();
+        // A drifted duplicate ARTIFACT of the same logical message: identical
+        // identity (created_ts + subject), divergent volatile payload
+        // (recipients/importance/body). Only identity-identical artifacts are
+        // duplicates — a same-id file with a different identity is row-id
+        // reuse and is preserved instead (br-r6awv, covered separately by
+        // `reconstruct_preserves_same_project_canonical_id_reuse_with_distinct_identity`).
         std::fs::write(
             messages_dir.join("2026-02-22T12-01-00Z__second__7.md"),
             r#"---json
@@ -7498,9 +7541,9 @@ first body
   "id": 7,
   "from": "Alice",
   "to": ["Carol"],
-  "subject": "Second copy",
+  "subject": "First copy",
   "importance": "urgent",
-  "created_ts": "2026-02-22T12:01:00Z"
+  "created_ts": "2026-02-22T12:00:00Z"
 }
 ---
 
@@ -7554,6 +7597,101 @@ second body
                 .get_named::<String>("name")
                 .expect("recipient name"),
             "Bob"
+        );
+    }
+
+    #[test]
+    fn reconstruct_skips_deferred_collision_losers_that_share_an_identity() {
+        // Three artifacts share canonical id 7: the winner (identity X) plus
+        // two losers that are copies of identity Y. Pass 1 keeps X and queues
+        // both Y files. Pass 2 must insert Y once, not twice.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("dup-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"dup-project","human_key":"/dup-project","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-02-22T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__winner__7.md"),
+            r#"---json
+{
+  "id": 7,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Winner",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+winner body
+"#,
+        )
+        .unwrap();
+        for name in [
+            "2026-02-22T12-01-00Z__loser-a__7.md",
+            "2026-02-22T12-02-00Z__loser-b__7.md",
+        ] {
+            std::fs::write(
+                messages_dir.join(name),
+                r#"---json
+{
+  "id": 7,
+  "from": "Alice",
+  "to": ["Carol"],
+  "subject": "Loser",
+  "created_ts": "2026-02-22T12:01:00Z"
+}
+---
+
+loser body
+"#,
+            )
+            .unwrap();
+        }
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.messages, 2, "winner plus one deferred loser");
+        assert_eq!(stats.duplicate_canonical_message_files, 1);
+        assert!(
+            stats.same_project_canonical_identity_collisions >= 1,
+            "both losers must be recognized as id-7 identity collisions, got {}",
+            stats.same_project_canonical_identity_collisions
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let subject_rows = conn
+            .query_sync(
+                "SELECT subject, COUNT(*) AS cnt FROM messages GROUP BY subject ORDER BY subject",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(subject_rows.len(), 2);
+        let counts: Vec<(String, i64)> = subject_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<String>("subject").expect("subject"),
+                    row.get_named::<i64>("cnt").expect("cnt"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            vec![("Loser".to_string(), 1), ("Winner".to_string(), 1)]
         );
     }
 
@@ -8247,9 +8385,14 @@ archive body
             .unwrap();
         salvage_conn
             .query_sync(
+                // The archive copy of a message carries the DB's exact
+                // created_ts (µs), so a salvage row for an already-carried
+                // message matches the candidate's identity precisely; a
+                // same-id row whose identity differs is row-id reuse and gets
+                // remapped instead of dropped (br-r6awv).
                 "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
                  VALUES
-                    (1, 100, 10, 'Archive copy', 'archive body', 1),
+                    (1, 100, 10, 'Archive copy', 'archive body', 1771761600000000),
                     (2, 100, 10, 'DB-only', 'db body', 2)",
                 &[],
             )
@@ -9292,7 +9435,8 @@ archive body
         );
         assert!(
             stats.warnings.iter().any(|warning| {
-                warning.contains("unreadable as SQLite") || warning.contains("not a database")
+                warning.contains("salvage source skipped")
+                    && (warning.contains("not a database") || warning.contains("unreadable"))
             }),
             "stats must attest the salvage degrade, got {:?}",
             stats.warnings
@@ -9364,8 +9508,8 @@ archive body
         );
         assert!(
             stats.warnings.iter().any(|warning| {
-                warning.contains("failed full integrity_check")
-                    || warning.contains("unreadable as SQLite")
+                warning.contains("salvage source skipped")
+                    && warning.contains("failed full integrity_check")
             }),
             "stats must attest the integrity degrade, got {:?}",
             stats.warnings
