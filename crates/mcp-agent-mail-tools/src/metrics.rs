@@ -239,6 +239,15 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         },
     ),
     (
+        // Message-ID-bound delivery receipt lookup (GH#218): a read-only
+        // facts surface over the v26 signal-receipt ledger.
+        "get_message_delivery_receipt",
+        ToolMeta {
+            capabilities: &["messaging", "read"],
+            complexity: "low",
+        },
+    ),
+    (
         "mark_message_read",
         ToolMeta {
             capabilities: &["messaging", "read"],

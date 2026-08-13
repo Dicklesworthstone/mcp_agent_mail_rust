@@ -1441,6 +1441,7 @@ impl Default for Config {
                 "summarize_thread".to_string(),
                 "list_contacts".to_string(),
                 "fetch_inbox_events".to_string(),
+                "get_message_delivery_receipt".to_string(),
                 "fetch_inbox_product".to_string(),
                 "search_messages_product".to_string(),
                 "summarize_thread_product".to_string(),
@@ -2844,10 +2845,11 @@ impl Config {
                 ][..],
                 &["health_check", "ensure_project"][..],
                 // The core profile is the compact interactive mailbox surface.
-                // Restart-safe monitor polling remains available through the
-                // messaging/full/custom profiles, but is deliberately omitted
-                // here to preserve the established core profile contract.
-                &["fetch_inbox_events"][..],
+                // Restart-safe monitor polling and delivery-receipt forensics
+                // remain available through the messaging/full/custom profiles,
+                // but are deliberately omitted here to preserve the
+                // established core profile contract.
+                &["fetch_inbox_events", "get_message_delivery_receipt"][..],
             ),
             "minimal" => (
                 &[][..],
@@ -4463,6 +4465,13 @@ mod tests {
                 .any(|tool| tool == "fetch_inbox_product"),
             "fetch_inbox_product is non-mutating and should remain reader-accessible"
         );
+        assert!(
+            config
+                .http_rbac_readonly_tools
+                .iter()
+                .any(|tool| tool == "get_message_delivery_receipt"),
+            "get_message_delivery_receipt is non-mutating and should remain reader-accessible"
+        );
     }
 
     #[test]
@@ -4513,6 +4522,10 @@ mod tests {
         assert!(
             !config.should_expose_tool("fetch_inbox_events", "messaging"),
             "restart-safe monitor polling belongs to the messaging profile, not compact core"
+        );
+        assert!(
+            !config.should_expose_tool("get_message_delivery_receipt", "messaging"),
+            "delivery-receipt forensics belong to the messaging profile, not compact core"
         );
     }
 

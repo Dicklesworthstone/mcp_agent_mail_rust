@@ -1,0 +1,17 @@
+{
+  "message_id": 1,
+  "project_id": 1,
+  "persisted": true,
+  "persisted_at": null,
+  "recipients": [
+    {
+      "recipient": "GreenPeak",
+      "kind": "to",
+      "persisted": true,
+      "signaled": false,
+      "signal_receipts": [],
+      "acknowledged": false,
+      "acknowledged_at": null
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "version": "rust-native@2026-08-13",
+  "generated_at": "2026-08-13T00:00:00Z",
+  "tool": "get_message_delivery_receipt",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "persisted_recipient_reports_delivery_facts",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/delivery-receipt-basic",
+        "message_id": 1
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/delivery-receipt-basic"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/delivery-receipt-basic",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "BlueLake"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/delivery-receipt-basic",
+              "program": "claude-code",
+              "model": "opus-4.1",
+              "name": "GreenPeak"
+            }
+          },
+          {
+            "name": "set_contact_policy",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/delivery-receipt-basic",
+              "agent_name": "GreenPeak",
+              "policy": "open"
+            }
+          },
+          {
+            "name": "send_message",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/delivery-receipt-basic",
+              "sender_name": "BlueLake",
+              "to": ["GreenPeak"],
+              "subject": "Delivery receipt fixture",
+              "body_md": "Receipt body"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/get_message_delivery_receipt/persisted_recipient_reports_delivery_facts.output.json"
+      },
+      "normalize": {
+        "ignore_json_pointers": [
+          "/persisted_at",
+          "/recipients/0/signaled",
+          "/recipients/0/signal_receipts"
+        ]
+      }
+    },
+    {
+      "name": "unknown_message_is_not_found",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/delivery-receipt-missing",
+        "message_id": 999999
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/delivery-receipt-missing"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "err": {
+          "error_type": "NOT_FOUND",
+          "message_contains": "Message"
+        }
+      }
+    }
+  ]
+}

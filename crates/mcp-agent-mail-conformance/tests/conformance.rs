@@ -2273,6 +2273,7 @@ fn rust_native_fixture_coverage_matches_classification() {
         "check_file_reservation_conflicts",
         "cleanup_pane_identities",
         "fetch_inbox_events",
+        "get_message_delivery_receipt",
         "list_agents",
         "resolve_pane_identity",
     ]
