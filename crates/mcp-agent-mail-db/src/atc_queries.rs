@@ -786,6 +786,21 @@ pub async fn refresh_rollups(
     lookback_micros: i64,
 ) -> Outcome<RollupSummary, DbError> {
     if pool.sqlite_path() != ":memory:" {
+        // An absent or schema-less sidecar is the normal "ATC never wrote"
+        // state: report an empty refresh instead of warning `no such table:
+        // atc_experiences` on every operator tick of an idle mailbox (GH#232).
+        match crate::queries::atc_sidecar_schema_ready(pool) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Outcome::Ok(RollupSummary {
+                    lookback_micros,
+                    rows_scanned: 0,
+                    rows_applied: 0,
+                    strata_updated: 0,
+                });
+            }
+            Err(error) => return Outcome::Err(error),
+        }
         return match crate::queries::open_canonical_atc_conn(pool, "refresh_rollups") {
             Ok(conn) => {
                 let result = refresh_rollups_with_conn(&conn, now_micros, lookback_micros);
@@ -1614,6 +1629,12 @@ pub fn enforce_experience_row_ceiling(pool: &DbPool, max_rows: i64) -> Result<us
     if max_rows <= 0 || pool.sqlite_path() == ":memory:" {
         return Ok(0);
     }
+    // An absent or schema-less sidecar has no rows to bound; sweeping it only
+    // produces `no such table: atc_experiences` warns on idle mailboxes and
+    // leaves a 0-byte sidecar behind from the bare open (GH#232).
+    if !crate::queries::atc_sidecar_schema_ready(pool)? {
+        return Ok(0);
+    }
     let conn = crate::queries::open_canonical_atc_conn(pool, "experience_ceiling")?;
     let result = enforce_experience_row_ceiling_with_conn(&conn, max_rows);
     crate::queries::close_canonical_db_conn(conn, "experience_ceiling connection");
@@ -1888,6 +1909,101 @@ mod tests {
             .into_result()
             .expect("initialize ATC sidecar schema for test pool");
         pool
+    }
+
+    /// File-backed pool whose ATC sidecar was never initialized — the normal
+    /// state of a fresh mailbox that has produced no ATC experience (GH#232).
+    fn test_pool_without_sidecar() -> DbPool {
+        let pool_id = TEST_POOL_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!("atc_no_sidecar_test_{pool_id}.db"));
+        let init_conn = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open canonical ATC test db");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply ATC test pragmas");
+        init_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("apply ATC test base schema");
+        crate::queries::close_canonical_db_conn(init_conn, "ATC no-sidecar test init connection");
+        crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .inspect(|_pool| {
+            TEST_POOL_DIRS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .expect("lock test tempdir registry")
+                .push(dir);
+        })
+        .expect("create file-backed ATC test pool without sidecar")
+    }
+
+    #[test]
+    fn idle_mailbox_ticks_no_op_quietly_without_atc_sidecar_schema() {
+        // GH#232: an absent sidecar — and a 0-byte sidecar left behind by a
+        // bare open — are the normal "ATC never wrote" state. The operator
+        // tick (refresh_rollups) and the experience-ceiling sweep must no-op
+        // instead of failing with `no such table: atc_experiences`, and they
+        // must not create the sidecar file as a side effect.
+        let pool = test_pool_without_sidecar();
+        let atc_path = pool.atc_sqlite_path().expect("file-backed sidecar path");
+        assert!(
+            !std::path::Path::new(&atc_path).exists(),
+            "fresh pool must not have a sidecar yet"
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+
+        // Absent sidecar: both ticks no-op, and neither creates the file.
+        let summary = runtime
+            .block_on(refresh_rollups(&cx, &pool, crate::now_micros(), 1_000_000))
+            .into_result()
+            .expect("refresh_rollups must no-op without a sidecar");
+        assert_eq!(summary.rows_scanned, 0);
+        assert_eq!(summary.strata_updated, 0);
+        assert_eq!(
+            enforce_experience_row_ceiling(&pool, 100).expect("ceiling must no-op"),
+            0
+        );
+        assert!(
+            !std::path::Path::new(&atc_path).exists(),
+            "ticks must not create the sidecar as a side effect"
+        );
+
+        // 0-byte sidecar (created by a bare open elsewhere): same behavior,
+        // and the file must stay schema-less and empty.
+        std::fs::write(&atc_path, b"").expect("touch 0-byte sidecar");
+        let summary = runtime
+            .block_on(refresh_rollups(&cx, &pool, crate::now_micros(), 1_000_000))
+            .into_result()
+            .expect("refresh_rollups must no-op on a 0-byte sidecar");
+        assert_eq!(summary.rows_scanned, 0);
+        assert_eq!(
+            enforce_experience_row_ceiling(&pool, 100).expect("ceiling must no-op"),
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&atc_path)
+                .expect("sidecar metadata")
+                .len(),
+            0,
+            "ticks must not initialize schema on a 0-byte sidecar"
+        );
+
+        // And the read-only sidecar opener treats 0-byte as absent.
+        assert!(
+            crate::pool::open_atc_sidecar_conn(pool.sqlite_path()).is_none(),
+            "0-byte sidecar must read as absent"
+        );
     }
 
     fn encode_outcome(spec: &TestExperienceSpec) -> Option<String> {

@@ -2193,6 +2193,40 @@ pub(crate) fn open_canonical_atc_conn(
     Ok(conn)
 }
 
+/// True when the ATC sidecar exists with a non-empty on-disk image AND already
+/// carries the `atc_experiences` table.
+///
+/// A missing sidecar — or a 0-byte one left behind by a mere open that never
+/// committed (SQLite creates the file on open and writes no header until the
+/// first transaction) — is the normal "ATC never wrote" state, not a fault.
+/// Read/maintenance ticks gate on this instead of bare file existence so an
+/// idle mailbox never logs `no such table: atc_experiences` (GH#232). The
+/// probe never creates the sidecar file.
+pub(crate) fn atc_sidecar_schema_ready(pool: &DbPool) -> std::result::Result<bool, DbError> {
+    let Some(atc_path) = pool.atc_sqlite_path() else {
+        return Ok(false);
+    };
+    match std::fs::metadata(&atc_path) {
+        Ok(meta) if meta.len() > 0 => {}
+        Ok(_) => return Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(DbError::Sqlite(format!(
+                "atc sidecar readiness probe: {err}"
+            )));
+        }
+    }
+    let conn = open_canonical_atc_conn(pool, "atc sidecar readiness probe")?;
+    let probe = canonical_query_atc_rows(
+        &conn,
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'atc_experiences' LIMIT 1",
+        &[],
+        "atc sidecar readiness probe",
+    );
+    close_canonical_db_conn(conn, "atc sidecar readiness probe connection");
+    Ok(!probe?.is_empty())
+}
+
 pub(crate) fn begin_canonical_atc_write_tx(
     conn: &crate::CanonicalDbConn,
 ) -> std::result::Result<(), DbError> {

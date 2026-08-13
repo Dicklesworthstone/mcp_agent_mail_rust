@@ -5735,8 +5735,13 @@ pub fn open_atc_sidecar_conn(primary_sqlite_path: &str) -> Option<crate::Canonic
         return None;
     }
     let atc_path = atc_sidecar_sqlite_path(primary_sqlite_path);
-    if !Path::new(&atc_path).exists() {
-        return None;
+    // A 0-byte sidecar is indistinguishable from an absent one: SQLite creates
+    // the file on open and writes no header until the first commit, so a mere
+    // open (e.g. a maintenance probe) can leave an empty file with no ATC
+    // schema behind. Treat it as the normal "ATC never wrote" state (GH#232).
+    match std::fs::metadata(&atc_path) {
+        Ok(meta) if meta.len() > 0 => {}
+        _ => return None,
     }
     let conn = crate::CanonicalDbConn::open_file(atc_path.as_str()).ok()?;
     let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
