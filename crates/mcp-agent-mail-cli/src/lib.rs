@@ -6819,11 +6819,27 @@ where
             output::info(&format!(
                 "Startup detected mailbox database issues; reconstructing from archive ({detail})"
             ));
-            run_startup_doctor_subcommand_quietly(|| run_reconstruct(&reconstruct_db_path))?;
-            cleanup_stale_db_artifacts(&reconstruct_db_path)?;
-            output::info("Automatic mailbox reconstruction completed; continuing startup");
-            auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
-            Ok(())
+            match run_startup_doctor_subcommand_quietly(|| run_reconstruct(&reconstruct_db_path)) {
+                Ok(()) => {
+                    cleanup_stale_db_artifacts(&reconstruct_db_path)?;
+                    output::info("Automatic mailbox reconstruction completed; continuing startup");
+                    auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
+                    Ok(())
+                }
+                Err(err) if is_reconstruct_promotion_refusal(&err) => {
+                    // br-r6awv: a refused promotion means the live DB still
+                    // holds coordination keys the archive candidate would
+                    // drop. Crashing startup here is what crash-looped
+                    // systemd for days. Keep the live file and boot.
+                    output::warn(&format!(
+                        "Automatic mailbox reconstruction refused promotion \
+                         (live database kept): {err}"
+                    ));
+                    cleanup_stale_db_artifacts(&reconstruct_db_path)?;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
         }
     }
 }
@@ -27853,6 +27869,31 @@ fn doctor_archive_db_drift_is_data_loss_class(
         || archive.latest_message_id.unwrap_or(0) > db.max_message_id
 }
 
+/// Reconstruct only when archive drift is the data-loss class (GH#217 / br-r6awv).
+/// Extra junk/tmp project directories in a shared mailbox archive are hygiene
+/// debt: reconstructing over them remaps canonical message ids, the promotion
+/// guard then refuses the lossy candidate, and `am` crash-loops.
+fn doctor_reconstruct_strategy_for_archive_drift(
+    archive: &DoctorArchiveInventory,
+    db: &DoctorDbInventory,
+    archive_root: &Path,
+) -> Option<DoctorDatabaseFixStrategy> {
+    let detail = doctor_archive_db_drift_detail(archive, db)?;
+    if !doctor_archive_db_drift_is_data_loss_class(archive, db) {
+        return None;
+    }
+    Some(DoctorDatabaseFixStrategy::Reconstruct(format!(
+        "{detail}; reconstruct from archive {}",
+        archive_root.display()
+    )))
+}
+
+fn is_reconstruct_promotion_refusal(err: &CliError) -> bool {
+    let text = err.to_string();
+    text.contains("reconstruction succeeded but final database promotion failed")
+        || text.contains("would lose stable coordination keys")
+}
+
 fn doctor_archive_inventory_suffix(archive: &DoctorArchiveInventory) -> String {
     let mut extras = Vec::new();
     if archive.canonical_message_files > archive.messages {
@@ -28471,12 +28512,10 @@ fn doctor_database_fix_strategy_read_only_probes(
             Path::new(&opened.opened_path),
             storage_root,
             storage_root_is_explicit,
-        ) && let Some(detail) = doctor_archive_db_drift_detail(&archive, &db)
+        ) && let Some(strategy) =
+            doctor_reconstruct_strategy_for_archive_drift(&archive, &db, archive_root)
         {
-            return Ok(DoctorDatabaseFixStrategy::Reconstruct(format!(
-                "{detail}; reconstruct from archive {}",
-                archive_root.display()
-            )));
+            return Ok(strategy);
         }
     }
 
@@ -28800,12 +28839,10 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             resolved,
             storage_root,
             storage_root_is_explicit,
-        ) && let Some(detail) = doctor_archive_db_drift_detail(&archive, &db)
+        ) && let Some(strategy) =
+            doctor_reconstruct_strategy_for_archive_drift(&archive, &db, &archive_root)
         {
-            return Ok(DoctorDatabaseFixStrategy::Reconstruct(format!(
-                "{detail}; reconstruct from archive {}",
-                archive_root.display()
-            )));
+            return Ok(strategy);
         }
     }
 
@@ -51438,6 +51475,86 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_database_fix_strategy_ignores_hygiene_only_missing_archive_projects() {
+        // br-r6awv / GH#217: extra junk project dirs in a shared mailbox
+        // archive (ahead-project, /tmp test roots) must not force reconstruct
+        // when message counts already match. That path remaps ids, the
+        // promotion guard refuses, and `am` crash-loops.
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path().join("storage");
+        let project_root = storage_root.join("projects").join("proj-alpha");
+        std::fs::create_dir_all(project_root.join("agents").join("BlueLake")).unwrap();
+        std::fs::create_dir_all(project_root.join("messages").join("2026").join("03")).unwrap();
+        std::fs::write(
+            project_root
+                .join("agents")
+                .join("BlueLake")
+                .join("profile.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            project_root
+                .join("messages")
+                .join("2026")
+                .join("03")
+                .join("2026-03-12T12-00-00Z__hello__1.md"),
+            "---json\n{\"id\": 1, \"subject\": \"hello\"}\n---\nbody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(storage_root.join("projects").join("ahead-project")).unwrap();
+        std::fs::create_dir_all(
+            storage_root
+                .join("projects")
+                .join("data-tmp-tmp0xnsez-project-root"),
+        )
+        .unwrap();
+
+        let db_path = dir.path().join("hygiene_only.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open sqlite db");
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, model TEXT, inception_ts INTEGER, last_active_ts INTEGER)",
+        )
+        .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, subject TEXT, body_md TEXT, thread_id TEXT, created_ts INTEGER)",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT)",
+        )
+        .expect("create message_recipients");
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj-alpha', '/tmp/proj-alpha', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 'BlueLake', 'codex-cli', 'gpt-5', 0, 0)",
+        )
+        .expect("insert agent");
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, thread_id, created_ts) \
+             VALUES (1, 1, 1, 'hello', 'body', NULL, 0)",
+        )
+        .expect("insert matching message");
+        drop(conn);
+
+        let strategy =
+            doctor_database_fix_strategy(&db_url, &storage_root).expect("repair strategy");
+        assert!(
+            !matches!(strategy, DoctorDatabaseFixStrategy::Reconstruct(_)),
+            "hygiene-only extra archive projects must not reconstruct: {strategy:?}"
+        );
+    }
+
+    #[test]
     fn doctor_database_fix_strategy_ignores_unrelated_default_archive_overlap() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("custom.sqlite3");
@@ -51535,6 +51652,36 @@ startup_timeout_sec = 42
         assert!(
             reconstruct_called.get(),
             "reconstruct runner should be used for missing archive-backed DB"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_keeps_live_db_when_reconstruct_promotion_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_archive_mailbox_project(dir.path());
+        let db_path = dir.path().join("missing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let reconstruct_called = std::cell::Cell::new(false);
+
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || panic!("promotion-refusal fixture should not repair"),
+            |_| {
+                reconstruct_called.set(true);
+                Err(CliError::Other(
+                    "reconstruction succeeded but final database promotion failed: \
+                     recovery candidate would lose stable coordination keys from \
+                     live.sqlite3 (messages=951, message_recipients=3776); refusing promotion"
+                        .to_string(),
+                ))
+            },
+        )
+        .expect("promotion refusal must keep the live DB and continue startup");
+
+        assert!(
+            reconstruct_called.get(),
+            "reconstruct runner should still be attempted"
         );
     }
 
