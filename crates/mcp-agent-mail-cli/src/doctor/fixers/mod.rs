@@ -392,6 +392,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::missing_or_malformed_project_json",
         },
         FixerSpec {
+            id: reservation_artifact_normalize::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "Op::WriteFile + Op::Rename",
+            auto_fixable: true,
+            one_line_description: "Legacy id-N.json file-reservation archive artifacts are migrated to generation-stamped id-N-g<generation>.json keys only after live DB (project,id) verification; foreign-generation artifacts and redundant legacy duplicates are quarantined through mutate(), preserving bytes for am doctor undo.",
+            source_module: "doctor::fixers::reservation_artifact_normalize",
+        },
+        FixerSpec {
             id: stale_archive_lock::FM_ID,
             severity: "P1",
             subsystem: "archive_state_files",
@@ -489,15 +498,6 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "automatic recovery is circuit-broken after repeated same-content failures; operator intervention required",
             source_module: "doctor::fixers::recovery_breaker_tripped",
-        },
-        FixerSpec {
-            id: reservation_artifact_normalize::FM_ID,
-            severity: "P1",
-            subsystem: "archive_state_files",
-            op_pattern: "Op::WriteFile + Op::Rename",
-            auto_fixable: true,
-            one_line_description: "Legacy id-N.json file-reservation archive artifacts are migrated to generation-stamped id-N-g<generation>.json keys only after live DB (project,id) verification; foreign-generation artifacts and redundant legacy duplicates are quarantined through mutate(), preserving bytes for am doctor undo.",
-            source_module: "doctor::fixers::reservation_artifact_normalize",
         },
         FixerSpec {
             id: reservation_db_archive_parity::FM_ID,
