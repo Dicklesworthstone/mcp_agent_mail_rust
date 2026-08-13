@@ -461,10 +461,90 @@ pub fn sample_and_record(config: &Config) -> DiskSample {
     sample
 }
 
+/// Recognize the fixed macOS firmlinks that symlink guards must accept.
+///
+/// These are `/var`, `/tmp`, and `/etc` -> `/private/<name>`, which
+/// path-traversal guards must treat as platform-canonical rather than as a
+/// symlink-escape (GH#230; macOS TMPDIRs live under `/var/folders/...`, so
+/// refusing `/var` broke every operator-supplied output path on macOS).
+///
+/// Conservative on purpose: ONLY a top-level `/<name>` symlink whose canonical
+/// target is exactly `/private/<name>` (for the small fixed set of Apple
+/// firmlink roots) qualifies, so an attacker-planted symlink anywhere else is
+/// still refused. A no-op on Linux, where those paths are real directories
+/// (the `is_symlink()` branches that call this are never taken).
+///
+/// `link` is the symlinked path component as encountered during traversal;
+/// `resolved` is its canonical target (e.g. from `std::fs::canonicalize`).
+#[must_use]
+pub fn is_platform_temp_firmlink(link: &Path, resolved: &Path) -> bool {
+    let Some(name) = link.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !matches!(name, "var" | "tmp" | "etc") {
+        return false;
+    }
+    // Must be a top-level entry directly under `/` — `/var`, not `/foo/var`.
+    if link.parent() != Some(Path::new("/")) {
+        return false;
+    }
+    resolved == Path::new("/private").join(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn platform_temp_firmlink_accepts_apple_firmlink_roots() {
+        assert!(is_platform_temp_firmlink(
+            Path::new("/var"),
+            Path::new("/private/var")
+        ));
+        assert!(is_platform_temp_firmlink(
+            Path::new("/tmp"),
+            Path::new("/private/tmp")
+        ));
+        assert!(is_platform_temp_firmlink(
+            Path::new("/etc"),
+            Path::new("/private/etc")
+        ));
+    }
+
+    #[test]
+    fn platform_temp_firmlink_rejects_non_firmlinks() {
+        // Nested (not directly under `/`) -> not a firmlink.
+        assert!(!is_platform_temp_firmlink(
+            Path::new("/foo/var"),
+            Path::new("/private/var")
+        ));
+        // Wrong canonical target -> not a firmlink (an escape attempt).
+        assert!(!is_platform_temp_firmlink(
+            Path::new("/var"),
+            Path::new("/other")
+        ));
+        // A symlink pointing at a sensitive file is NOT a firmlink.
+        assert!(!is_platform_temp_firmlink(
+            Path::new("/tmp"),
+            Path::new("/etc/passwd")
+        ));
+        // Not one of the recognized temp roots.
+        assert!(!is_platform_temp_firmlink(
+            Path::new("/usr"),
+            Path::new("/private/usr")
+        ));
+        // Canonical target must be exactly /private/<name>, not deeper.
+        assert!(!is_platform_temp_firmlink(
+            Path::new("/var"),
+            Path::new("/private/var/tmp")
+        ));
+        // Relative link paths never qualify.
+        assert!(!is_platform_temp_firmlink(
+            Path::new("var"),
+            Path::new("/private/var")
+        ));
+    }
 
     #[test]
     fn sqlite_url_parsing_variants() {

@@ -222,7 +222,14 @@ pub fn resolve_project_path(human_key: &str) -> PathBuf {
             return cached;
         }
         if let Ok(canonical) = std::fs::canonicalize(&path) {
-            let canonical = recover_stored_path_spelling(&canonical);
+            // GH#216: `std::fs::canonicalize` yields the extended-length
+            // (`\\?\C:\...`) form on Windows. This value becomes the persisted
+            // project `human_key` AND (via dir_mode_slug_source) the slug, so
+            // the verbatim prefix must be stripped here — not just at the
+            // storage entrypoints — or every Windows project identity keeps
+            // the `\\?\` spelling and any later normalization re-keys it.
+            let canonical =
+                recover_stored_path_spelling(&crate::disk::simplify_verbatim_path(&canonical));
             resolve_path_cache_insert(&path, &canonical);
             return canonical;
         }
@@ -240,7 +247,7 @@ pub fn resolve_project_path(human_key: &str) -> PathBuf {
                     .join(path)
             }
         },
-        |canonical| recover_stored_path_spelling(&canonical),
+        |canonical| recover_stored_path_spelling(&crate::disk::simplify_verbatim_path(&canonical)),
     )
 }
 
@@ -805,6 +812,20 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GH#216: the persisted project identity (`human_key`, and the slug
+    /// derived from it) must never carry the Windows extended-length
+    /// (`\\?\C:\...`) spelling that `std::fs::canonicalize` produces.
+    #[test]
+    fn resolve_project_path_never_returns_a_verbatim_spelling() {
+        let dir = std::env::temp_dir();
+        let resolved = resolve_project_path(&dir.to_string_lossy());
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "resolved project path kept the verbatim prefix: {}",
+            resolved.display()
+        );
+    }
 
     // -----------------------------------------------------------------------
     // slugify

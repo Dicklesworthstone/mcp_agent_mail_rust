@@ -2661,52 +2661,31 @@ fn validate_real_directory_if_present(path: &Path) -> ShareResult<()> {
 }
 
 fn ensure_real_directory(path: &Path) -> ShareResult<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        use std::path::Component;
-
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(ShareError::Validation {
-                    message: format!(
-                        "refusing to create deployment directory with parent traversal: {}",
-                        path.display()
-                    ),
-                });
-            }
-            Component::Normal(segment) => {
-                current.push(segment);
-                match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) => {
-                        if metadata.file_type().is_symlink() {
-                            return Err(ShareError::Validation {
-                                message: format!(
-                                    "refusing to traverse symlinked deployment directory {}",
-                                    current.display()
-                                ),
-                            });
-                        }
-                        if !metadata.file_type().is_dir() {
-                            return Err(ShareError::Validation {
-                                message: format!(
-                                    "expected deployment directory but found non-directory {}",
-                                    current.display()
-                                ),
-                            });
-                        }
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        std::fs::create_dir(&current).map_err(ShareError::Io)?;
-                    }
-                    Err(err) => return Err(ShareError::Io(err)),
-                }
-            }
-        }
+    use crate::snapshot::{RealDirError, create_real_directory_all};
+    // GH#230: shared guarded traversal (macOS firmlinks allowed, every other
+    // symlink refused); only the error wording/variants are deploy-specific.
+    match create_real_directory_all(path) {
+        Ok(()) => Ok(()),
+        Err(RealDirError::ParentTraversal) => Err(ShareError::Validation {
+            message: format!(
+                "refusing to create deployment directory with parent traversal: {}",
+                path.display()
+            ),
+        }),
+        Err(RealDirError::Symlink(current)) => Err(ShareError::Validation {
+            message: format!(
+                "refusing to traverse symlinked deployment directory {}",
+                current.display()
+            ),
+        }),
+        Err(RealDirError::NotDirectory(current)) => Err(ShareError::Validation {
+            message: format!(
+                "expected deployment directory but found non-directory {}",
+                current.display()
+            ),
+        }),
+        Err(RealDirError::Io(err)) => Err(ShareError::Io(err)),
     }
-    Ok(())
 }
 
 /// Load deployment history from the bundle directory.

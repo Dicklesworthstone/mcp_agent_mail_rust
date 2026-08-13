@@ -839,17 +839,14 @@ fn merge_toml_section(
                 }
             }
 
+            if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
+                merged.push(String::new());
+            }
             if saw_target_section {
-                if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
-                    merged.push(String::new());
-                }
                 merged.push(section_header.to_string());
                 merged.extend(preserved_target_lines);
                 merged.extend(key_values.iter().map(|(k, v)| format!("{k} = {v}")));
             } else {
-                if !merged.is_empty() && !merged.last().is_some_and(String::is_empty) {
-                    merged.push(String::new());
-                }
                 merged.extend(section_lines);
             }
 

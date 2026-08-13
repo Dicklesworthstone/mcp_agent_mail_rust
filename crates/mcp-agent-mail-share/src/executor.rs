@@ -504,46 +504,25 @@ fn workflow_repo_root(workflow_path: &Path, execution_root: &Path) -> Result<Pat
 }
 
 fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        use std::path::Component;
-
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(std::io::Error::other(format!(
-                    "refusing to create directory with parent traversal: {}",
-                    path.display()
-                )));
-            }
-            Component::Normal(segment) => {
-                current.push(segment);
-                match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) => {
-                        if metadata.file_type().is_symlink() {
-                            return Err(std::io::Error::other(format!(
-                                "refusing to traverse symlinked directory {}",
-                                current.display()
-                            )));
-                        }
-                        if !metadata.file_type().is_dir() {
-                            return Err(std::io::Error::other(format!(
-                                "expected directory but found non-directory {}",
-                                current.display()
-                            )));
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        std::fs::create_dir(&current)?;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
+    use crate::snapshot::{RealDirError, create_real_directory_all};
+    // GH#230: shared guarded traversal (macOS firmlinks allowed, every other
+    // symlink refused).
+    match create_real_directory_all(path) {
+        Ok(()) => Ok(()),
+        Err(RealDirError::ParentTraversal) => Err(std::io::Error::other(format!(
+            "refusing to create directory with parent traversal: {}",
+            path.display()
+        ))),
+        Err(RealDirError::Symlink(current)) => Err(std::io::Error::other(format!(
+            "refusing to traverse symlinked directory {}",
+            current.display()
+        ))),
+        Err(RealDirError::NotDirectory(current)) => Err(std::io::Error::other(format!(
+            "expected directory but found non-directory {}",
+            current.display()
+        ))),
+        Err(RealDirError::Io(error)) => Err(error),
     }
-    Ok(())
 }
 
 fn write_generated_file(path: &Path, content: &str) -> std::io::Result<()> {

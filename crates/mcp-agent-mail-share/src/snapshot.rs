@@ -426,7 +426,37 @@ fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
     Ok(false)
 }
 
-fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+/// How the guarded directory traversal in [`create_real_directory_all`]
+/// failed. Callers map these onto their own error type/wording so the
+/// share-crate guards can share one traversal (GH#230).
+#[derive(Debug)]
+pub(crate) enum RealDirError {
+    /// The requested path contains a `..` component.
+    ParentTraversal,
+    /// An existing component is a symlink (and not a recognized macOS
+    /// firmlink); the offending component path is attached.
+    Symlink(PathBuf),
+    /// An existing component is neither a directory nor a symlink; the
+    /// offending component path is attached.
+    NotDirectory(PathBuf),
+    /// Filesystem inspection/creation failed.
+    Io(std::io::Error),
+}
+
+/// Shared symlink-refusing `create_dir_all` used by every share-crate output
+/// path guard (snapshot, bundle, static render, deploy, executor).
+///
+/// Walks `path` component by component, creating missing directories and
+/// refusing `..` components, symlinks, and non-directory components.
+///
+/// GH#230: macOS firmlinks (`/var` -> `/private/var`, `/tmp` ->
+/// `/private/tmp`, `/etc` -> `/private/etc`) are platform-canonical, not a
+/// symlink-escape — rejecting them broke every operator-supplied output path
+/// on macOS (TMPDIRs live under `/var/folders/...`). A component recognized
+/// by [`mcp_agent_mail_core::disk::is_platform_temp_firmlink`] is resolved
+/// and traversal continues against its canonical location; every OTHER
+/// symlink stays a hard refusal.
+pub(crate) fn create_real_directory_all(path: &Path) -> Result<(), RealDirError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         use std::path::Component;
@@ -435,41 +465,54 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
             Component::Prefix(prefix) => current.push(prefix.as_os_str()),
             Component::RootDir => current.push(component.as_os_str()),
             Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(std::io::Error::other(format!(
-                    "refusing to create snapshot directory with parent traversal: {}",
-                    path.display()
-                )));
-            }
-            Component::Normal(part) => current.push(part),
-        }
-
-        if current.as_os_str().is_empty() {
-            continue;
-        }
-
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(std::io::Error::other(format!(
-                        "refusing to traverse symlinked snapshot directory {}",
-                        current.display()
-                    )));
-                }
-                if !metadata.file_type().is_dir() {
-                    return Err(std::io::Error::other(format!(
-                        "snapshot parent component is not a directory: {}",
-                        current.display()
-                    )));
+            Component::ParentDir => return Err(RealDirError::ParentTraversal),
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            if let Ok(resolved) = std::fs::canonicalize(&current)
+                                && mcp_agent_mail_core::disk::is_platform_temp_firmlink(
+                                    &current, &resolved,
+                                )
+                            {
+                                current = resolved;
+                                continue;
+                            }
+                            return Err(RealDirError::Symlink(current));
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(RealDirError::NotDirectory(current));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current).map_err(RealDirError::Io)?;
+                    }
+                    Err(error) => return Err(RealDirError::Io(error)),
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current)?
-            }
-            Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    match create_real_directory_all(path) {
+        Ok(()) => Ok(()),
+        Err(RealDirError::ParentTraversal) => Err(std::io::Error::other(format!(
+            "refusing to create snapshot directory with parent traversal: {}",
+            path.display()
+        ))),
+        Err(RealDirError::Symlink(current)) => Err(std::io::Error::other(format!(
+            "refusing to traverse symlinked snapshot directory {}",
+            current.display()
+        ))),
+        Err(RealDirError::NotDirectory(current)) => Err(std::io::Error::other(format!(
+            "snapshot parent component is not a directory: {}",
+            current.display()
+        ))),
+        Err(RealDirError::Io(error)) => Err(error),
+    }
 }
 
 trait SnapshotSource {
@@ -739,6 +782,68 @@ pub struct SnapshotContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // GH#230: the firmlink allowance itself is a pure predicate over
+    // synthetic paths (real firmlinks cannot be fabricated at `/` inside a
+    // test sandbox); acceptance lives in
+    // `mcp_agent_mail_core::disk::is_platform_temp_firmlink` tests. Here we
+    // pin down the share-side traversal: a fixture-local `var ->
+    // private/var` symlink is NOT a firmlink (its canonical target is not
+    // exactly `/private/var`), so it must stay refused.
+    #[cfg(unix)]
+    #[test]
+    fn create_real_directory_all_rejects_fixture_var_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let private_var = dir.path().join("private").join("var");
+        std::fs::create_dir_all(&private_var).unwrap();
+        let linked_var = dir.path().join("var");
+        symlink(&private_var, &linked_var).unwrap();
+
+        let err = create_real_directory_all(&linked_var.join("out"))
+            .expect_err("fixture var symlink is not a platform firmlink");
+        match err {
+            RealDirError::Symlink(component) => assert_eq!(component, linked_var),
+            _ => panic!("expected symlink refusal"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_real_directory_all_rejects_plain_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let linked = dir.path().join("linked");
+        symlink(&target, &linked).unwrap();
+
+        assert!(matches!(
+            create_real_directory_all(&linked.join("child")),
+            Err(RealDirError::Symlink(_))
+        ));
+    }
+
+    #[test]
+    fn create_real_directory_all_accepts_and_creates_real_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        create_real_directory_all(&nested).expect("plain real dirs are accepted");
+        assert!(nested.is_dir());
+        // Idempotent on existing real directories.
+        create_real_directory_all(&nested).expect("existing real dirs stay accepted");
+    }
+
+    #[test]
+    fn create_real_directory_all_rejects_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            create_real_directory_all(&dir.path().join("..").join("escape")),
+            Err(RealDirError::ParentTraversal)
+        ));
+    }
 
     #[test]
     fn snapshot_source_not_found() {
