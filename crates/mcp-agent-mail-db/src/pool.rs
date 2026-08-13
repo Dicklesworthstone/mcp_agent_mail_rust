@@ -11349,6 +11349,17 @@ mod tests {
         rows.first()?.get_named::<String>("value").ok()
     }
 
+    fn canonical_sqlite_marker_value(path: &Path) -> Option<String> {
+        let path_str = path.to_string_lossy();
+        let conn = crate::CanonicalDbConn::open_file(path_str.as_ref()).ok()?;
+        conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT NOT NULL)")
+            .ok()?;
+        let rows = conn
+            .query_sync("SELECT value FROM marker ORDER BY rowid DESC LIMIT 1", &[])
+            .ok()?;
+        rows.first()?.get_named::<String>("value").ok()
+    }
+
     fn checkpoint_and_remove_sqlite_sidecars(path: &Path) {
         wal_checkpoint_truncate_path(path).expect("checkpoint test sqlite db");
         for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
@@ -11739,7 +11750,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fsqlite 0.3.0 checkpoint+reopen visibility regression; upstream frankensqlite bd-a5zj5 (css); un-ignore on fsqlite bump"]
     fn recovery_promotion_rejects_hard_link_alias_of_live_database() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -11753,9 +11763,22 @@ mod tests {
             error.to_string().contains("aliases the live database"),
             "unexpected error: {error}"
         );
+        // FrankenSQLite deliberately refuses to reopen a path with multiple
+        // hard links: aliases do not form an isolated authority namespace for
+        // its path-derived coordination sidecars. The rejected candidate stays
+        // inspectable, so assert the live bytes through the canonical SQLite
+        // reader rather than converting this intentional fail-closed boundary
+        // into a false data-loss report.
+        // `expect_err` needs Debug on the Ok type, which FrankenConnection
+        // deliberately does not implement; assert the shape instead.
+        assert!(
+            DbConn::open_file(primary.to_string_lossy().as_ref()).is_err(),
+            "FrankenSQLite must fail closed while a hard-link alias exists"
+        );
         assert_eq!(
-            sqlite_marker_value(&primary).as_deref(),
-            Some("live-generation")
+            canonical_sqlite_marker_value(&primary).as_deref(),
+            Some("live-generation"),
+            "rejecting a hard-link candidate must not alter the live generation"
         );
         assert!(
             candidate.exists(),
