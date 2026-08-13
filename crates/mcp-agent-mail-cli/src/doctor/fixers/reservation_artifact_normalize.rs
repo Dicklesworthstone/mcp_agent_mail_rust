@@ -31,7 +31,6 @@ use crate::doctor::mutate::{Op, mutate};
 use mcp_agent_mail_core::reservation_artifact::{
     parse_reservation_artifact_filename, reservation_artifact_filename,
 };
-use mcp_agent_mail_db::sqlmodel_core::Connection;
 use serde::Serialize;
 use serde_json::Value;
 use sqlmodel_sqlite::SqliteConnection;
