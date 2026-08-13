@@ -544,15 +544,16 @@ pub fn inbox_delivery_events_from_conn(
 
     let range_rows = conn
         .query_sync(
-            "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor \
+            "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor, \
+                    (SELECT MIN(seq) FROM inbox_delivery_events) AS global_oldest \
              FROM inbox_delivery_events WHERE project_id = ? AND agent_id = ?",
             &[Value::BigInt(project_id), Value::BigInt(agent_id)],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
-    let (oldest_available_cursor, tail_cursor) = range_rows
+    let (oldest_available_cursor, tail_cursor, global_oldest_cursor) = range_rows
         .first()
         .map(
-            |row| -> Result<(Option<i64>, i64), InboxDeliveryEventError> {
+            |row| -> Result<(Option<i64>, i64, Option<i64>), InboxDeliveryEventError> {
                 let oldest = row
                     .get_named::<Option<i64>>("oldest_cursor")
                     .map_err(|error| {
@@ -564,14 +565,29 @@ pub fn inbox_delivery_events_from_conn(
                         InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
                     })?
                     .unwrap_or(0);
-                Ok((oldest, tail))
+                let global_oldest =
+                    row.get_named::<Option<i64>>("global_oldest")
+                        .map_err(|error| {
+                            InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                        })?;
+                Ok((oldest, tail, global_oldest))
             },
         )
         .transpose()?
-        .unwrap_or((None, 0));
+        .unwrap_or((None, 0, None));
 
     if let Some(after) = after {
+        // `seq` is a GLOBAL AUTOINCREMENT shared by every recipient, so a gap
+        // between `after` and this recipient's oldest event normally consists
+        // of other recipients' deliveries — NOT lost history. A monitor that
+        // called `--position-now` on an empty inbox (cursor 0) must still
+        // receive its first delivery even when that lands at a high global
+        // seq (GH#238). A cursor is only genuinely expired when retention has
+        // actually removed rows, which is observable while global seq 1 is
+        // gone from the ledger.
+        let retention_has_pruned = global_oldest_cursor.is_some_and(|global| global > 1);
         if let Some(oldest) = oldest_available_cursor
+            && retention_has_pruned
             && after < oldest.saturating_sub(1)
         {
             return Err(InboxDeliveryEventError::CursorExpired {
@@ -1414,6 +1430,52 @@ mod tests {
             expired,
             InboxDeliveryEventError::CursorExpired { .. }
         ));
+    }
+
+    #[test]
+    fn bootstrap_cursor_survives_unrelated_recipients_advancing_global_seq() {
+        // GH#238: `seq` is a global AUTOINCREMENT. A monitor that positioned
+        // itself on an empty inbox (cursor 0) must receive its first delivery
+        // even when unrelated recipients have advanced the global sequence in
+        // the meantime — the gap below its own oldest event is other
+        // recipients' traffic, not lost history, and must never read as
+        // CURSOR_EXPIRED while nothing has been pruned.
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "Sender");
+        let other_id = insert_agent(&conn, project_id, "Other");
+        let late_id = insert_agent(&conn, project_id, "Latecomer");
+
+        // Position-now on an empty inbox: tail 0, no events.
+        let empty = inbox_delivery_events_from_conn(&conn, project_id, late_id, None, 5)
+            .expect("empty inbox page");
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.tail_cursor, 0);
+
+        // Unrelated traffic advances the global sequence well past 0.
+        for _ in 0..5 {
+            let noise_id = insert_message(&conn, project_id, sender_id, "noise-thread");
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+                &[Value::BigInt(noise_id), Value::BigInt(other_id)],
+            )
+            .expect("persist unrelated recipient");
+        }
+
+        // The latecomer's FIRST delivery lands at a high global seq.
+        let handoff_id = insert_message(&conn, project_id, sender_id, "handoff-thread");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+            &[Value::BigInt(handoff_id), Value::BigInt(late_id)],
+        )
+        .expect("persist latecomer recipient");
+
+        // Resuming from the persisted cursor 0 must deliver it.
+        let page = inbox_delivery_events_from_conn(&conn, project_id, late_id, Some(0), 5)
+            .expect("bootstrap cursor must not expire while nothing was pruned (GH#238)");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].message_id, handoff_id);
+        assert!(page.oldest_available_cursor.expect("own oldest") > 1);
     }
 
     #[test]

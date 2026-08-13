@@ -23330,22 +23330,46 @@ mod tests {
             assert!(agent.id.is_some(), "acknowledged write must have an id");
         }
 
-        // External-style parity probes on a fresh connection.
+        // External-style parity probes on a fresh connection. Probe shapes
+        // matter (GH#213 reporter, 2026-08-06): a bare `count(*)` is served
+        // from a covering INDEX under the count optimization, and an
+        // `INDEXED BY` hint without any restriction is resolved then
+        // discarded — both forms read the same btree and can never detect an
+        // index/table desync. Force the table scan with NOT INDEXED and give
+        // every index probe a WHERE clause so the hinted plan is actually
+        // used, and enumerate the indexes from sqlite_master so future
+        // migrations (and sqlite_autoindex_*) are covered automatically.
         let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open probe");
         let empty: [crate::sqlmodel_core::Value; 0] = [];
         let table_count: i64 = conn
-            .query_sync("SELECT count(*) AS c FROM agents", &empty)
+            .query_sync("SELECT count(*) AS c FROM agents NOT INDEXED", &empty)
             .expect("table count")[0]
             .get_named("c")
             .expect("decode");
         assert_eq!(table_count, 7, "acknowledged rows must all be present");
 
-        for index in [
-            "idx_agents_project_name",
-            "idx_agents_last_active_id_desc",
-            "idx_agents_project_name_nocase",
-        ] {
-            let sql = format!("SELECT count(*) AS c FROM agents INDEXED BY {index}");
+        let index_names: Vec<String> = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agents' ORDER BY name",
+                &empty,
+            )
+            .expect("list agents indexes")
+            .iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect();
+        assert!(
+            index_names.len() >= 3,
+            "expected several agents indexes, got {index_names:?}"
+        );
+
+        for index in &index_names {
+            if index.starts_with("sqlite_autoindex_") {
+                // INDEXED BY cannot name an implicit autoindex; its UNIQUE
+                // constraint is instead exercised per-row below via the
+                // (project_id, name) lookups that integrity_check also walks.
+                continue;
+            }
+            let sql = format!("SELECT count(*) AS c FROM agents INDEXED BY \"{index}\" WHERE 1");
             match conn.query_sync(&sql, &empty) {
                 Ok(rows) => {
                     let index_count: i64 = rows[0].get_named("c").expect("decode");
@@ -23356,6 +23380,26 @@ mod tests {
                 }
                 Err(error) => panic!("forced-index count via {index} failed: {error}"),
             }
+        }
+
+        // Per-row point lookups walk the UNIQUE autoindex the INDEXED BY loop
+        // cannot name: every acknowledged registration must be findable by
+        // its constraint key.
+        for name in names {
+            let rows = conn
+                .query_sync(
+                    "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                    &[
+                        crate::sqlmodel_core::Value::BigInt(project_id),
+                        crate::sqlmodel_core::Value::Text(name.to_string()),
+                    ],
+                )
+                .expect("autoindex point lookup");
+            assert_eq!(
+                rows.len(),
+                1,
+                "agent {name} must be findable via the UNIQUE (project_id, name) autoindex"
+            );
         }
 
         let integrity = conn

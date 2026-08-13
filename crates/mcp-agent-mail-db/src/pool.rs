@@ -4757,18 +4757,12 @@ pub(crate) fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<()
 /// firmlink roots) qualifies, so an attacker-planted symlink anywhere else is
 /// still refused. A no-op on Linux, where those paths are real directories (the
 /// `is_symlink()` branch that calls this is never taken).
+///
+/// GH#230: thin wrapper over the shared
+/// [`mcp_agent_mail_core::disk::is_platform_temp_firmlink`] helper so every
+/// snapshot/export path guard shares one strict definition.
 fn is_macos_temp_firmlink(link: &Path, resolved: &Path) -> bool {
-    let Some(name) = link.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    if !matches!(name, "var" | "tmp" | "etc") {
-        return false;
-    }
-    // Must be a top-level entry directly under `/` — `/var`, not `/foo/var`.
-    if link.parent() != Some(Path::new("/")) {
-        return false;
-    }
-    resolved == Path::new("/private").join(name)
+    mcp_agent_mail_core::disk::is_platform_temp_firmlink(link, resolved)
 }
 
 pub struct CanonicalSnapshotTempDir {
@@ -5280,12 +5274,24 @@ fn sqlite_primary_check_is_ok_with_canonical_fallback(
                      healthy (not corruption — safe to ignore)"
                 );
             } else {
-                tracing::warn!(
+                // GH#214: do NOT fail open here. The primary engine has a
+                // documented history of producing real btree damage that
+                // canonical SQLite's checker under-reports (self-consistent
+                // row loss, GH#213), so "canonical disagrees" is only proof
+                // for the whitelisted false-positive classes above. Keep the
+                // primary probe's verdict for everything else.
+                tracing::error!(
                     path = %path.display(),
                     check = %kind,
                     primary_error = primary_error_msg.as_deref(),
-                    "primary sqlite integrity probe did not accept the file but canonical SQLite did; treating as healthy"
+                    "primary sqlite integrity probe did not accept the file; canonical SQLite \
+                     disagreed but the complaint is not a known false-positive class — keeping \
+                     the primary verdict"
                 );
+                return match primary_result {
+                    Ok(ok) => Ok(ok),
+                    Err(primary_error) => Err(primary_error),
+                };
             }
             Ok(true)
         }

@@ -231,10 +231,10 @@ pub use idempotency::{
     IdempotencyConflict, IdempotentOutcome, idempotency_retention_secs,
 };
 pub use integrity::{
-    CheckKind, IntegrityCheckResult, IntegrityMetrics, MailboxIntegrityStatus,
-    MailboxIntegrityVerdict, attempt_vacuum_recovery, full_check, incremental_check,
-    inspect_mailbox_integrity, integrity_details_are_suspect, integrity_metrics, is_full_check_due,
-    quick_check,
+    CheckKind, IntegrityCheckOutcome, IntegrityCheckResult, IntegrityMetrics,
+    MailboxIntegrityStatus, MailboxIntegrityVerdict, attempt_vacuum_recovery, full_check,
+    incremental_check, inspect_mailbox_integrity, integrity_details_are_suspect, integrity_metrics,
+    is_full_check_due, quick_check,
 };
 pub use invariants::{
     SCHEMA_INVARIANT_REPLAY_COMMAND, SCHEMA_INVARIANT_SCOPES, SchemaInvariantFinding,
