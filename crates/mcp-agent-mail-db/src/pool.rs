@@ -5244,6 +5244,74 @@ fn is_known_nocase_index_order_false_positive(message: &str) -> bool {
     lower.contains("entries are out of order") && lower.contains("nocase")
 }
 
+/// Tables whose rows represent durable mailbox state rather than schema or
+/// runtime bookkeeping. A freshly initialized mailbox has its schema and
+/// `db_identity` generation row, but none of these tables contain a row.
+const DURABLE_MAILBOX_STATE_TABLES: &[&str] = &[
+    "projects",
+    "products",
+    "product_project_links",
+    "agents",
+    "messages",
+    "message_recipients",
+    "file_reservations",
+    "file_reservation_releases",
+    "agent_links",
+    "project_sibling_suggestions",
+    "proof_gate_consumed_nonces",
+    "idempotency_keys",
+    "inbox_delivery_events",
+    "message_delivery_signal_receipts",
+    "inbox_stats",
+    "tool_metrics_snapshots",
+    "atc_experiences",
+    "atc_experience_rollups",
+    "atc_leader_lease",
+    "atc_rollup_snapshots",
+];
+
+/// True only when canonical SQLite can read every *present* durable mailbox
+/// table and each is empty. A partially bootstrapped fresh file may not yet
+/// have the newest tables; an absent table cannot contain recoverable rows.
+/// Failure to inspect a present table remains fail-closed.
+#[allow(clippy::result_large_err)]
+fn canonical_mailbox_has_no_durable_rows(path: &Path) -> Result<bool, SqlError> {
+    let path_str = path.to_string_lossy();
+    let conn = crate::CanonicalDbConn::open_file(path_str.as_ref())?;
+
+    for table in DURABLE_MAILBOX_STATE_TABLES {
+        // `table` comes from the static list above, never user input. A
+        // missing post-bootstrap table is acceptable only because it cannot
+        // contain state; every table that does exist must be readable.
+        let table_exists = format!(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{table}' LIMIT 1"
+        );
+        if conn.query_sync(&table_exists, &[])?.is_empty() {
+            continue;
+        }
+
+        let rows = conn.query_sync(&format!("SELECT 1 FROM \"{table}\" LIMIT 1"), &[])?;
+        if !rows.is_empty() {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+/// Canonical SQLite can overrule a primary integrity rejection for the known
+/// `NOCASE` false positive, or for a schema-only mailbox. The latter has no
+/// durable content to recover and is the fsqlite-0.3.0 fresh-file probe shape;
+/// once any mailbox row exists, unknown disagreement stays fail-closed.
+#[must_use]
+fn primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
+    primary_error_message: Option<&str>,
+    canonical_mailbox_has_no_durable_rows: bool,
+) -> bool {
+    primary_error_message.is_some_and(is_known_nocase_index_order_false_positive)
+        || canonical_mailbox_has_no_durable_rows
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_primary_check_is_ok_with_canonical_fallback(
     path: &Path,
@@ -5258,20 +5326,29 @@ fn sqlite_primary_check_is_ok_with_canonical_fallback(
     match sqlite_canonical_file_check_is_ok(path, kind) {
         Ok(true) => {
             let primary_error_msg = primary_result.as_ref().err().map(ToString::to_string);
-            // GH#185: demote the known COLLATE NOCASE index-order false
-            // positive to INFO once canonical SQLite has verified the file
-            // (see `is_known_nocase_index_order_false_positive`).
-            if primary_error_msg
-                .as_deref()
-                .is_some_and(is_known_nocase_index_order_false_positive)
-            {
+            let schema_only_mailbox = match canonical_mailbox_has_no_durable_rows(path) {
+                Ok(is_empty) => is_empty,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        check = %kind,
+                        error = %error,
+                        "canonical SQLite verified integrity, but durable mailbox rows could not be inspected; keeping the primary verdict"
+                    );
+                    false
+                }
+            };
+
+            if primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
+                primary_error_msg.as_deref(),
+                schema_only_mailbox,
+            ) {
                 tracing::info!(
                     path = %path.display(),
                     check = %kind,
                     primary_error = primary_error_msg.as_deref(),
-                    "primary sqlite integrity probe raised the known COLLATE NOCASE \
-                     index-order false positive; canonical SQLite verified the file \
-                     healthy (not corruption — safe to ignore)"
+                    schema_only_mailbox,
+                    "canonical SQLite verified an accepted primary integrity-probe disagreement"
                 );
             } else {
                 // GH#214: do NOT fail open here. The primary engine has a
@@ -12319,6 +12396,35 @@ mod tests {
     // surface as a corruption verdict the canonical engine disproves.
 
     #[test]
+    fn primary_canonical_disagreement_accepts_only_nocase_or_schema_only_mailbox() {
+        let unknown_primary_rejection = Some("unexpected primary integrity rejection");
+        assert!(
+            primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
+                unknown_primary_rejection,
+                true,
+            ),
+            "a canonical-verified schema-only mailbox has no durable content to recover"
+        );
+        assert!(
+            !primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
+                unknown_primary_rejection,
+                false,
+            ),
+            "unknown primary/canonical disagreement with durable rows must remain fail-closed"
+        );
+        assert!(
+            primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
+                Some(
+                    "entries are out of order for index idx_agents_project_name_nocase \
+                     under NOCASE",
+                ),
+                false,
+            ),
+            "the established NOCASE false-positive class remains accepted"
+        );
+    }
+
+    #[test]
     fn reconcile_canonical_passes_through_healthy_primary_without_probing() {
         let probe_called = std::cell::Cell::new(false);
         let primary = Ok(integrity::IntegrityCheckResult {
@@ -16864,6 +16970,26 @@ mod tests {
             sqlite_file_is_healthy(&db_path).expect("health check after fresh bootstrap"),
             "fresh bootstrap should leave a healthy sqlite file"
         );
+        assert!(
+            canonical_mailbox_has_no_durable_rows(&db_path)
+                .expect("inspect durable rows after fresh bootstrap"),
+            "fresh bootstrap should qualify as a schema-only mailbox"
+        );
+
+        let canonical = crate::CanonicalDbConn::open_file(db_path_str)
+            .expect("open fresh bootstrap with canonical SQLite");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('fresh-bootstrap-proof', 'fresh-bootstrap-proof', 0)",
+            )
+            .expect("insert durable mailbox state");
+        assert!(
+            !canonical_mailbox_has_no_durable_rows(&db_path)
+                .expect("inspect durable rows after project insert"),
+            "a project row must prevent the fresh-mailbox exception"
+        );
+        drop(canonical);
 
         let conn = open_sqlite_file_with_recovery(db_path_str)
             .expect("runtime sqlite should open after fresh bootstrap");
