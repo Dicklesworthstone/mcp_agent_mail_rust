@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Row, Value};
 use std::path::Path;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 /// Result of an integrity check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,12 +48,66 @@ pub enum CheckKind {
     Full,
 }
 
+impl CheckKind {
+    const fn as_storage_u8(self) -> u8 {
+        match self {
+            Self::Quick => 1,
+            Self::Incremental => 2,
+            Self::Full => 3,
+        }
+    }
+
+    const fn from_storage_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Quick),
+            2 => Some(Self::Incremental),
+            3 => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for CheckKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Quick => write!(f, "quick_check"),
             Self::Incremental => write!(f, "integrity_check(1)"),
             Self::Full => write!(f, "integrity_check"),
+        }
+    }
+}
+
+/// Outcome of an integrity check retained for the current process lifetime.
+///
+/// A passing `quick_check` is weaker evidence than a complete
+/// `integrity_check`; callers that need a durable health verdict must inspect
+/// [`IntegrityMetrics::last_full_check_outcome`] separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityCheckOutcome {
+    /// No check of this class has completed in this process.
+    #[default]
+    Unknown,
+    /// The check completed without reporting corruption.
+    Passed,
+    /// The check reported corruption or returned no usable result rows.
+    Failed,
+}
+
+impl IntegrityCheckOutcome {
+    const fn as_storage_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Passed => 1,
+            Self::Failed => 2,
+        }
+    }
+
+    const fn from_storage_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Passed,
+            2 => Self::Failed,
+            _ => Self::Unknown,
         }
     }
 }
@@ -69,6 +123,16 @@ struct IntegrityCheckState {
     last_check_ts: AtomicI64,
     /// Timestamp (microseconds since epoch) of the last completed full check.
     last_full_check_ts: AtomicI64,
+    /// Kind of the latest check. Zero denotes that no check has completed.
+    last_check_kind: AtomicU8,
+    /// Outcome of the latest check, independent of historical counters.
+    last_check_outcome: AtomicU8,
+    /// Outcome of the latest full `PRAGMA integrity_check`.
+    ///
+    /// This deliberately is not cleared by a later `quick_check` success: a
+    /// weaker probe cannot attest that corruption found by the complete scan
+    /// has been repaired.
+    last_full_check_outcome: AtomicU8,
     /// Total number of checks run.
     checks_total: AtomicU64,
     /// Total number of failures detected.
@@ -87,6 +151,9 @@ impl IntegrityCheckState {
             last_ok_ts: AtomicI64::new(0),
             last_check_ts: AtomicI64::new(0),
             last_full_check_ts: AtomicI64::new(0),
+            last_check_kind: AtomicU8::new(0),
+            last_check_outcome: AtomicU8::new(IntegrityCheckOutcome::Unknown.as_storage_u8()),
+            last_full_check_outcome: AtomicU8::new(IntegrityCheckOutcome::Unknown.as_storage_u8()),
             checks_total: AtomicU64::new(0),
             failures_total: AtomicU64::new(0),
             failures_since_last_ok: AtomicU64::new(0),
@@ -103,6 +170,21 @@ fn state() -> &'static IntegrityCheckState {
 pub struct IntegrityMetrics {
     pub last_ok_ts: i64,
     pub last_check_ts: i64,
+    /// Timestamp of the most recent complete `PRAGMA integrity_check`.
+    #[serde(default)]
+    pub last_full_check_ts: i64,
+    /// The probe that produced `last_check_outcome`, if a probe has run.
+    #[serde(default)]
+    pub last_check_kind: Option<CheckKind>,
+    /// Result of the most recently completed check of any kind.
+    #[serde(default)]
+    pub last_check_outcome: IntegrityCheckOutcome,
+    /// Result of the most recently completed full `PRAGMA integrity_check`.
+    ///
+    /// This remains `failed` until another full check succeeds; a passing
+    /// quick or incremental check cannot overwrite it.
+    #[serde(default)]
+    pub last_full_check_outcome: IntegrityCheckOutcome,
     pub checks_total: u64,
     /// Monotonic lifetime tally of failed checks since this process started.
     /// This NEVER decreases, so it does not reflect the *current* integrity
@@ -143,6 +225,14 @@ pub fn integrity_metrics() -> IntegrityMetrics {
     IntegrityMetrics {
         last_ok_ts: s.last_ok_ts.load(Ordering::Relaxed),
         last_check_ts: s.last_check_ts.load(Ordering::Relaxed),
+        last_full_check_ts: s.last_full_check_ts.load(Ordering::Relaxed),
+        last_check_kind: CheckKind::from_storage_u8(s.last_check_kind.load(Ordering::Relaxed)),
+        last_check_outcome: IntegrityCheckOutcome::from_storage_u8(
+            s.last_check_outcome.load(Ordering::Relaxed),
+        ),
+        last_full_check_outcome: IntegrityCheckOutcome::from_storage_u8(
+            s.last_full_check_outcome.load(Ordering::Relaxed),
+        ),
         checks_total: s.checks_total.load(Ordering::Relaxed),
         failures_total: s
             .failures_total
@@ -448,8 +538,19 @@ pub fn evaluate_check_rows(
     let s = state();
     let now = crate::now_micros();
     s.last_check_ts.store(now, Ordering::Relaxed);
+    s.last_check_kind
+        .store(kind.as_storage_u8(), Ordering::Relaxed);
+    let outcome = if ok {
+        IntegrityCheckOutcome::Passed
+    } else {
+        IntegrityCheckOutcome::Failed
+    };
+    s.last_check_outcome
+        .store(outcome.as_storage_u8(), Ordering::Relaxed);
     if kind == CheckKind::Full {
         s.last_full_check_ts.store(now, Ordering::Relaxed);
+        s.last_full_check_outcome
+            .store(outcome.as_storage_u8(), Ordering::Relaxed);
     }
     s.checks_total.fetch_add(1, Ordering::Relaxed);
     if ok {
@@ -601,6 +702,15 @@ mod tests {
         s.last_check_ts.store(last_check_ts, Ordering::Relaxed);
         s.last_full_check_ts
             .store(last_full_check_ts, Ordering::Relaxed);
+        s.last_check_kind.store(0, Ordering::Relaxed);
+        s.last_check_outcome.store(
+            IntegrityCheckOutcome::Unknown.as_storage_u8(),
+            Ordering::Relaxed,
+        );
+        s.last_full_check_outcome.store(
+            IntegrityCheckOutcome::Unknown.as_storage_u8(),
+            Ordering::Relaxed,
+        );
         s.checks_total.store(checks_total, Ordering::Relaxed);
         s.failures_total.store(failures_total, Ordering::Relaxed);
         s.failures_since_last_ok
@@ -647,6 +757,41 @@ mod tests {
             "a failed check must increment failures_since_last_ok"
         );
         assert!(m.failures_total >= 1);
+    }
+
+    #[test]
+    fn quick_check_cannot_clear_a_failed_full_check_outcome() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        set_state_for_tests(0, 0, 0, 0, 0);
+
+        let _ = evaluate_check_rows(&[], CheckKind::Full, 0)
+            .expect_err("empty full-check rows must record a failed full outcome");
+        let failed = integrity_metrics();
+        assert_eq!(
+            failed.last_full_check_outcome,
+            IntegrityCheckOutcome::Failed
+        );
+
+        let conn = open_test_db();
+        quick_check(&conn).expect("healthy quick_check should pass");
+        let after_quick = integrity_metrics();
+        assert_eq!(after_quick.last_check_kind, Some(CheckKind::Quick));
+        assert_eq!(
+            after_quick.last_check_outcome,
+            IntegrityCheckOutcome::Passed
+        );
+        assert_eq!(
+            after_quick.last_full_check_outcome,
+            IntegrityCheckOutcome::Failed,
+            "a weaker quick_check must not clear failed full-check evidence"
+        );
+
+        full_check(&conn).expect("healthy full check should pass");
+        assert_eq!(
+            integrity_metrics().last_full_check_outcome,
+            IntegrityCheckOutcome::Passed,
+            "only a succeeding full check clears failed full-check evidence"
+        );
     }
 
     #[test]
@@ -715,6 +860,10 @@ mod tests {
         let json = serde_json::to_value(&m).expect("serialize IntegrityMetrics");
         assert!(json.get("last_ok_ts").is_some());
         assert!(json.get("last_check_ts").is_some());
+        assert!(json.get("last_full_check_ts").is_some());
+        assert!(json.get("last_check_kind").is_some());
+        assert!(json.get("last_check_outcome").is_some());
+        assert!(json.get("last_full_check_outcome").is_some());
         assert!(json.get("checks_total").is_some());
         assert!(json.get("failures_total").is_some());
     }
@@ -992,12 +1141,16 @@ mod tests {
         let obj = json.as_object().expect("should be object");
         assert_eq!(
             obj.len(),
-            5,
-            "IntegrityMetrics should have exactly 5 fields"
+            9,
+            "IntegrityMetrics should have exactly 9 fields"
         );
         for key in &[
             "last_ok_ts",
             "last_check_ts",
+            "last_full_check_ts",
+            "last_check_kind",
+            "last_check_outcome",
+            "last_full_check_outcome",
             "checks_total",
             "failures_total",
             "failures_since_last_ok",

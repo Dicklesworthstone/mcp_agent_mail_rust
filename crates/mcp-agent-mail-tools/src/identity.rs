@@ -422,10 +422,12 @@ pub struct HealthVerdicts {
     pub archive_db_parity: HealthVerdict,
     /// The doctor surface can operate (storage root writable).
     pub doctor_readiness: HealthVerdict,
+    /// The latest full `PRAGMA integrity_check` is usable evidence.
+    pub integrity_check: HealthVerdict,
 }
 
 impl HealthVerdicts {
-    const fn all(&self) -> [&HealthVerdict; 6] {
+    const fn all(&self) -> [&HealthVerdict; 7] {
         [
             &self.transport_health,
             &self.db_health,
@@ -433,6 +435,7 @@ impl HealthVerdicts {
             &self.semantic_readiness,
             &self.archive_db_parity,
             &self.doctor_readiness,
+            &self.integrity_check,
         ]
     }
 
@@ -440,13 +443,14 @@ impl HealthVerdicts {
     /// can point at the failing subsystem.
     fn failing_names(&self) -> Vec<String> {
         let mut named: Vec<(&str, mcp_agent_mail_core::HealthLevel)> = Vec::new();
-        let labelled: [(&str, &HealthVerdict); 6] = [
+        let labelled: [(&str, &HealthVerdict); 7] = [
             ("transport_health", &self.transport_health),
             ("db_health", &self.db_health),
             ("write_health", &self.write_health),
             ("semantic_readiness", &self.semantic_readiness),
             ("archive_db_parity", &self.archive_db_parity),
             ("doctor_readiness", &self.doctor_readiness),
+            ("integrity_check", &self.integrity_check),
         ];
         for (name, verdict) in labelled {
             if verdict.level() != mcp_agent_mail_core::HealthLevel::Green {
@@ -554,6 +558,7 @@ fn compute_health_verdicts(
     config: &Config,
     pool_present: bool,
     semantic: &SemanticReadinessResponse,
+    integrity: &mcp_agent_mail_db::IntegrityMetrics,
 ) -> HealthVerdicts {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     let kind = classify_semantic_failure(&semantic.status, &semantic.detail);
@@ -617,6 +622,8 @@ fn compute_health_verdicts(
         Err(detail) => HealthVerdict::new(Yellow, false, detail),
     };
 
+    let integrity_check = integrity_health_verdict(integrity);
+
     HealthVerdicts {
         transport_health,
         db_health,
@@ -624,6 +631,61 @@ fn compute_health_verdicts(
         semantic_readiness,
         archive_db_parity,
         doctor_readiness,
+        integrity_check,
+    }
+}
+
+/// Convert the process-local integrity evidence into a strict health verdict.
+///
+/// A clean quick/incremental check cannot clear a failed full check: the full
+/// outcome remains red until another complete `PRAGMA integrity_check` passes.
+/// Conversely, before a full check has completed, health is deliberately
+/// yellow rather than falsely green about evidence it does not have.
+fn integrity_health_verdict(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
+    use mcp_agent_mail_db::IntegrityCheckOutcome::{Failed, Passed, Unknown};
+
+    match metrics.last_full_check_outcome {
+        Failed => HealthVerdict::new(
+            Red,
+            true,
+            format!(
+                "latest full integrity_check failed at {}; a later quick check cannot clear it",
+                metrics.last_full_check_ts
+            ),
+        ),
+        Unknown => HealthVerdict::new(
+            Yellow,
+            true,
+            "no full PRAGMA integrity_check has completed in this process",
+        ),
+        Passed if metrics.last_check_outcome == Failed => HealthVerdict::new(
+            Red,
+            true,
+            format!(
+                "latest {} failed at {} after the last successful full integrity_check",
+                metrics
+                    .last_check_kind
+                    .map_or_else(|| "integrity probe".to_string(), |kind| kind.to_string()),
+                metrics.last_check_ts
+            ),
+        ),
+        Passed if metrics.last_check_outcome == Unknown => HealthVerdict::new(
+            Yellow,
+            true,
+            "full integrity_check evidence changed while the current probe outcome was unavailable",
+        ),
+        Passed => HealthVerdict::new(
+            Green,
+            true,
+            format!(
+                "full integrity_check passed at {}; latest {} also passed",
+                metrics.last_full_check_ts,
+                metrics
+                    .last_check_kind
+                    .map_or_else(|| "integrity probe".to_string(), |kind| kind.to_string())
+            ),
+        ),
     }
 }
 
@@ -1030,6 +1092,11 @@ pub struct RecoveryStatusResponse {
 pub struct IntegrityHealthResponse {
     pub last_ok_ts: i64,
     pub last_check_ts: i64,
+    pub last_full_check_ts: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_check_kind: Option<mcp_agent_mail_db::CheckKind>,
+    pub last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome,
+    pub last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome,
     pub checks_total: u64,
     pub failures_total: u64,
 }
@@ -1123,6 +1190,10 @@ pub struct ArchiveLagHealthResponse {
     pub backlog_drained_total: u64,
     /// Ops dropped because the retry backlog was full (DB stays authoritative).
     pub backlog_dropped_total: u64,
+    /// Ops enqueued WITHOUT a durable journal (local-disk journal write failed):
+    /// not crash-safe until drained. Nonzero sets this subsystem's `warning`
+    /// flag so a disk that cannot journal is never silently green (br-ack-fast).
+    pub backlog_ephemeral_total: u64,
     /// Configured warn/critical bounds (ms) for the oldest-unmaterialized age.
     pub warn_threshold_ms: u64,
     pub critical_threshold_ms: u64,
@@ -1305,7 +1376,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // strictly, so a green top-level can never coexist with a broken critical
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
-    let verdicts = compute_health_verdicts(config, pool.is_some(), &semantic_readiness);
+    let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
+    let verdicts = compute_health_verdicts(
+        config,
+        pool.is_some(),
+        &semantic_readiness,
+        &integrity_metrics,
+    );
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
     // verdict (or the live pressure level).
@@ -1428,9 +1505,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     backlog_enqueued_total: archive_lag.enqueued_total,
                     backlog_drained_total: archive_lag.drained_total,
                     backlog_dropped_total: archive_lag.dropped_total,
+                    backlog_ephemeral_total: archive_lag.ephemeral_total,
                     warn_threshold_ms: archive_lag_warn_us.div_ceil(1_000),
                     critical_threshold_ms: archive_lag_critical_us.div_ceil(1_000),
-                    warning: archive_lag_oldest_us >= archive_lag_warn_us,
+                    // br-ack-fast: a lagging archive OR any op that could not be
+                    // durably journaled (ephemeral) warrants operator attention.
+                    warning: archive_lag_oldest_us >= archive_lag_warn_us
+                        || archive_lag.ephemeral_total > 0,
                 },
             }
         }),
@@ -1452,19 +1533,16 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             fatal_threshold_mb: config.disk_space_fatal_mb,
             errors: s.errors.clone(),
         }),
-        integrity: {
-            let im = mcp_agent_mail_db::integrity_metrics();
-            if im.checks_total > 0 {
-                Some(IntegrityHealthResponse {
-                    last_ok_ts: im.last_ok_ts,
-                    last_check_ts: im.last_check_ts,
-                    checks_total: im.checks_total,
-                    failures_total: im.failures_total,
-                })
-            } else {
-                None
-            }
-        },
+        integrity: Some(IntegrityHealthResponse {
+            last_ok_ts: integrity_metrics.last_ok_ts,
+            last_check_ts: integrity_metrics.last_check_ts,
+            last_full_check_ts: integrity_metrics.last_full_check_ts,
+            last_check_kind: integrity_metrics.last_check_kind,
+            last_check_outcome: integrity_metrics.last_check_outcome,
+            last_full_check_outcome: integrity_metrics.last_full_check_outcome,
+            checks_total: integrity_metrics.checks_total,
+            failures_total: integrity_metrics.failures_total,
+        }),
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
         recovery,
@@ -2509,6 +2587,21 @@ mod tests {
             semantic_readiness: g(false),
             archive_db_parity: g(true),
             doctor_readiness: g(false),
+            integrity_check: g(true),
+        }
+    }
+
+    fn healthy_integrity_metrics() -> mcp_agent_mail_db::IntegrityMetrics {
+        mcp_agent_mail_db::IntegrityMetrics {
+            last_ok_ts: 1,
+            last_check_ts: 1,
+            last_full_check_ts: 1,
+            last_check_kind: Some(mcp_agent_mail_db::CheckKind::Full),
+            last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            checks_total: 1,
+            failures_total: 0,
+            failures_since_last_ok: 0,
         }
     }
 
@@ -2588,6 +2681,40 @@ mod tests {
     }
 
     #[test]
+    fn failed_full_integrity_evidence_stays_red_after_a_quick_pass() {
+        let mut metrics = healthy_integrity_metrics();
+        metrics.last_full_check_ts = 100;
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        metrics.last_check_ts = 200;
+        metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
+
+        let verdict = integrity_health_verdict(&metrics);
+        assert_eq!(verdict.status, "red");
+        assert!(verdict.critical);
+        assert!(verdict.detail.contains("later quick check cannot clear it"));
+
+        metrics.last_full_check_ts = 300;
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
+        metrics.last_check_ts = 300;
+        metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Full);
+        let repaired = integrity_health_verdict(&metrics);
+        assert_eq!(repaired.status, "green");
+    }
+
+    #[test]
+    fn missing_full_integrity_evidence_is_critical_yellow() {
+        let mut metrics = healthy_integrity_metrics();
+        metrics.last_full_check_ts = 0;
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
+
+        let verdict = integrity_health_verdict(&metrics);
+        assert_eq!(verdict.status, "yellow");
+        assert!(verdict.critical);
+    }
+
+    #[test]
     fn missing_tables_makes_write_health_red_and_names_it() {
         let config = Config::from_env();
         let verdicts = compute_health_verdicts(
@@ -2597,6 +2724,7 @@ mod tests {
                 "fail",
                 "sqlite schema missing required health_check tables: agents, messages",
             ),
+            &healthy_integrity_metrics(),
         );
         assert_eq!(verdicts.write_health.status, "red");
         assert!(verdicts.write_health.critical);
@@ -2621,6 +2749,7 @@ mod tests {
                 "fail",
                 "sqlite connectivity probe failed during health_check: file is not a database",
             ),
+            &healthy_integrity_metrics(),
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -2639,6 +2768,7 @@ mod tests {
                 "fail",
                 "archive inventory is ahead of the sqlite index (archive projects=2 ...)",
             ),
+            &healthy_integrity_metrics(),
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
         assert_eq!(
@@ -2654,6 +2784,7 @@ mod tests {
             &config,
             false,
             &semantic("fail", "database pool bootstrap failed"),
+            &healthy_integrity_metrics(),
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -2665,7 +2796,12 @@ mod tests {
     #[test]
     fn all_healthy_rolls_up_green() {
         let config = Config::from_env();
-        let verdicts = compute_health_verdicts(&config, true, &semantic("ok", "aligned"));
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("ok", "aligned"),
+            &healthy_integrity_metrics(),
+        );
         assert_eq!(verdicts.db_health.status, "green");
         assert_eq!(verdicts.write_health.status, "green");
         assert_eq!(verdicts.transport_health.status, "green");
@@ -2689,7 +2825,12 @@ mod tests {
         let config = Config::from_env();
         let drift_detail = "archive projects=13, agents=332, messages=1496, \
              db projects=13, agents=338, messages=1498";
-        let verdicts = compute_health_verdicts(&config, true, &semantic("ok", drift_detail));
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("ok", drift_detail),
+            &healthy_integrity_metrics(),
+        );
         assert_eq!(verdicts.archive_db_parity.status, "green");
         assert!(
             verdicts.archive_db_parity.detail.contains("agents=338")

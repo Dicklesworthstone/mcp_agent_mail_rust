@@ -7131,8 +7131,17 @@ fn search_message_ids_by_recipient_kind(
 fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (HealthProbe, bool) {
     let has_checks = metrics.checks_total > 0;
     let last_check_failed = has_checks && metrics.last_ok_ts < metrics.last_check_ts;
+    let full_check_failed = matches!(
+        metrics.last_full_check_outcome,
+        mcp_agent_mail_db::IntegrityCheckOutcome::Failed
+    );
     let runtime_failures_without_checks = !has_checks && metrics.failures_total > 0;
-    let detail = if !has_checks && metrics.failures_total == 0 {
+    let detail = if full_check_failed {
+        format!(
+            "latest full integrity_check failed at {}; a later quick check cannot clear it",
+            metrics.last_full_check_ts
+        )
+    } else if !has_checks && metrics.failures_total == 0 {
         "No checks run yet".to_string()
     } else if runtime_failures_without_checks {
         format!(
@@ -7160,7 +7169,7 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
     (
         HealthProbe {
             name: "integrity".into(),
-            status: if last_check_failed || runtime_failures_without_checks {
+            status: if full_check_failed || last_check_failed || runtime_failures_without_checks {
                 "warn"
             } else {
                 "ok"
@@ -7169,7 +7178,7 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
             latency_ms: 0.0,
             detail,
         },
-        !(last_check_failed || runtime_failures_without_checks),
+        !(full_check_failed || last_check_failed || runtime_failures_without_checks),
     )
 }
 
@@ -17938,6 +17947,10 @@ mod tests {
         let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
             last_ok_ts: 1_000,
             last_check_ts: 2_000,
+            last_full_check_ts: 0,
+            last_check_kind: Some(mcp_agent_mail_db::CheckKind::Quick),
+            last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+            last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Unknown,
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 1,
@@ -17949,6 +17962,10 @@ mod tests {
         let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
             last_ok_ts: 2_000,
             last_check_ts: 2_000,
+            last_full_check_ts: 0,
+            last_check_kind: Some(mcp_agent_mail_db::CheckKind::Quick),
+            last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Unknown,
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 0,
@@ -17963,6 +17980,10 @@ mod tests {
         let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
             last_ok_ts: 0,
             last_check_ts: 0,
+            last_full_check_ts: 0,
+            last_check_kind: None,
+            last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Unknown,
+            last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Unknown,
             checks_total: 0,
             failures_total: 1,
             failures_since_last_ok: 1,
@@ -17970,6 +17991,24 @@ mod tests {
         assert!(!ok);
         assert_eq!(probe.status, "warn");
         assert!(probe.detail.contains("runtime corruption failures"));
+
+        let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
+            last_ok_ts: 3_000,
+            last_check_ts: 3_000,
+            last_full_check_ts: 2_000,
+            last_check_kind: Some(mcp_agent_mail_db::CheckKind::Quick),
+            last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+            checks_total: 5,
+            failures_total: 2,
+            failures_since_last_ok: 0,
+        });
+        assert!(
+            !ok,
+            "failed full evidence must remain unhealthy after a quick pass"
+        );
+        assert_eq!(probe.status, "warn");
+        assert!(probe.detail.contains("later quick check cannot clear it"));
     }
 
     #[test]
