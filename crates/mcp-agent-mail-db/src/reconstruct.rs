@@ -1804,17 +1804,37 @@ pub fn reconstruct_from_archive_with_salvage(
     storage_root: &Path,
     salvage_db_path: Option<&Path>,
 ) -> DbResult<ReconstructStats> {
-    // Salvage is mandatory when the source is a *readable* SQLite file:
-    // missing/symlink/lock failures still refuse so we cannot silently drop
-    // DB-only coordination state. A source that is present but not a
-    // readable SQLite image (the unhealthy live mailbox on the doctor
-    // path) must not block the archive rebuild — that is what left `am`
-    // dead after a refused reconstruct (br-r6awv / br-eudur).
+    // Salvage is mandatory when the source is a *healthy* readable SQLite
+    // file: missing/symlink/lock failures still refuse so we cannot silently
+    // drop DB-only coordination state. A source that is present but not a
+    // readable SQLite image — or that fails full integrity_check — must not
+    // block the archive rebuild. Merging a btree-desynced live mailbox is
+    // how reconstruct injected phantom identities and then refused
+    // promotion (br-r6awv / br-eudur).
     let mut salvage_for_merge: Option<&Path> = None;
     let mut unreadable_salvage: Option<String> = None;
     if let Some(salvage_db_path) = salvage_db_path {
         match probe_salvage_database_for_merge(salvage_db_path) {
-            Ok(()) => salvage_for_merge = Some(salvage_db_path),
+            Ok(()) => match crate::pool::sqlite_file_passes_full_integrity_check(salvage_db_path) {
+                Ok(true) => salvage_for_merge = Some(salvage_db_path),
+                Ok(false) => {
+                    unreadable_salvage = Some(format!(
+                        "salvage source {} failed full integrity_check",
+                        salvage_db_path.display()
+                    ));
+                }
+                Err(health_error) => {
+                    let message = health_error.to_string();
+                    if crate::pool::is_corruption_error_message(&message) {
+                        unreadable_salvage = Some(message);
+                    } else {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage source {} failed validation; refusing an archive-only candidate because DB-only coordination state could be lost: {health_error}",
+                            salvage_db_path.display()
+                        )));
+                    }
+                }
+            },
             Err(error) => {
                 let message = error.to_string();
                 if crate::pool::is_corruption_error_message(&message) {
@@ -1838,12 +1858,24 @@ pub fn reconstruct_from_archive_with_salvage(
         ));
     }
     if let Some(salvage_db_path) = salvage_for_merge {
-        merge_salvaged_database(db_path, salvage_db_path, &mut stats).map_err(|error| {
-            DbError::Sqlite(format!(
-                "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
-                salvage_db_path.display()
-            ))
-        })?;
+        if let Err(error) = merge_salvaged_database(db_path, salvage_db_path, &mut stats) {
+            let message = error.to_string();
+            if crate::pool::is_corruption_error_message(&message) {
+                // Merge rolled back. Keep the archive-only candidate so
+                // `am doctor reconstruct` can promote a heal instead of
+                // leaving the mailbox wedged on a corrupt-but-openable source.
+                stats.push_warning(format!(
+                    "salvage merge from {} failed with corruption ({message}); \
+                     keeping archive-only candidate so doctor can promote a heal",
+                    salvage_db_path.display()
+                ));
+            } else {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
+                    salvage_db_path.display()
+                )));
+            }
+        }
     }
     Ok(stats)
 }
@@ -9126,7 +9158,7 @@ archive body
     }
 
     #[test]
-    fn reconstruct_with_salvage_fails_closed_when_message_query_is_corrupt() {
+    fn reconstruct_with_salvage_degrades_to_archive_when_message_query_is_corrupt() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("reconstructed_corrupt_salvage.db");
         let salvage_db_path = tmp.path().join("salvage_corrupt_message_scan.db");
@@ -9190,21 +9222,21 @@ archive body
             .unwrap();
 
         FAIL_SALVAGE_QUERY_MESSAGES.with(|hook| hook.set(true));
-        let error =
+        let stats =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-                .expect_err("corrupt salvage source must block candidate promotion");
+                .expect("corrupt salvage merge must not block an archive-only heal");
 
         assert!(
-            error.to_string().contains(
-                "reconstruct salvage: query messages: Query error: database disk image is malformed"
-            ),
-            "error should include corrupt message query failure: {error}"
+            db_path.exists(),
+            "archive-only candidate must exist so doctor can promote a heal"
         );
         assert!(
-            error
-                .to_string()
-                .contains("refusing to promote the archive-only candidate"),
-            "error should explain the fail-closed continuity invariant: {error}"
+            stats.warnings.iter().any(|warning| {
+                warning.contains("failed with corruption")
+                    && warning.contains("database disk image is malformed")
+            }),
+            "stats must attest the salvage-merge degrade, got {:?}",
+            stats.warnings
         );
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
@@ -9263,6 +9295,79 @@ archive body
                 warning.contains("unreadable as SQLite") || warning.contains("not a database")
             }),
             "stats must attest the salvage degrade, got {:?}",
+            stats.warnings
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_degrades_to_archive_when_source_fails_integrity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_integrity_failed_salvage.db");
+        let salvage_db_path = tmp.path().join("salvage_integrity_failed.db");
+        let storage_root = tmp.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("archive root");
+
+        let marker = "AM_R6AWV_SALVAGE_INTEGRITY_MARKER_0123456789AB";
+        let replacement = "AM_R6AWV_SALVAGE_INTEGRITY_MARKER_BA9876543210";
+        assert_eq!(marker.len(), replacement.len());
+
+        let salvage_conn =
+            SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).expect("open salvage");
+        salvage_conn
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("stable image for byte flip");
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    subject TEXT
+                )",
+            )
+            .expect("create messages");
+        salvage_conn
+            .execute_raw(&format!(
+                "INSERT INTO messages (id, subject) VALUES (1, '{marker}')"
+            ))
+            .expect("plant indexed subject");
+        salvage_conn
+            .execute_raw("CREATE INDEX idx_messages_subject ON messages(subject)")
+            .expect("index to diverge");
+        drop(salvage_conn);
+
+        let mut bytes = std::fs::read(&salvage_db_path).expect("read salvage bytes");
+        let offsets = bytes
+            .windows(marker.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == marker.as_bytes()).then_some(offset))
+            .collect::<Vec<_>>();
+        assert!(
+            offsets.len() >= 2,
+            "marker must appear in table and index, found {}",
+            offsets.len()
+        );
+        let target = offsets[offsets.len() - 1];
+        bytes[target..target + marker.len()].copy_from_slice(replacement.as_bytes());
+        std::fs::write(&salvage_db_path, bytes).expect("write integrity-failed salvage");
+
+        assert!(
+            !crate::pool::sqlite_file_passes_full_integrity_check(&salvage_db_path)
+                .expect("full integrity probe"),
+            "planted index/table divergence must fail full integrity_check"
+        );
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("integrity-failed salvage must not block archive rebuild");
+        assert!(
+            db_path.exists(),
+            "archive-only candidate must exist so doctor can promote a heal"
+        );
+        assert!(
+            stats.warnings.iter().any(|warning| {
+                warning.contains("failed full integrity_check")
+                    || warning.contains("unreadable as SQLite")
+            }),
+            "stats must attest the integrity degrade, got {:?}",
             stats.warnings
         );
     }

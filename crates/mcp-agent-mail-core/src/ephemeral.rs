@@ -442,9 +442,19 @@ pub fn classify_ephemeral(
     signals.path_var_folders =
         normalized == "/var/folders" || normalized.starts_with("/var/folders/");
 
-    // Also check std::env::temp_dir() at runtime
+    // Also check std::env::temp_dir() at runtime. Use the resolved path so a
+    // `/data/tmp/...` project is isolated when TMPDIR is `/data/tmp` even if
+    // the caller passed a symlink or a not-yet-canonical human_key. The raw
+    // `project_root` check stays so a not-yet-created temp path still matches.
     let temp_dir = std::env::temp_dir();
-    if project_root.starts_with(&temp_dir) && !signals.path_tmp && !signals.path_var_tmp {
+    if (project_root.starts_with(&temp_dir) || resolved.starts_with(&temp_dir))
+        && !signals.path_tmp
+        && !signals.path_var_tmp
+        && !signals.path_dev_shm
+        && !signals.path_private_tmp
+        && !signals.path_var_folders
+        && temp_dir.components().count() > 1
+    {
         signals.path_tmpdir = true;
     }
 
@@ -774,6 +784,27 @@ mod tests {
             classify_ephemeral(Path::new("/var/folders/ab/cd1234/T/test"), &empty_env);
         assert_eq!(class, EphemeralClass::Ephemeral);
         assert!(signals.path_var_folders);
+    }
+
+    #[test]
+    fn classify_runtime_temp_dir_as_ephemeral() {
+        let temp_dir = std::env::temp_dir();
+        if temp_dir.components().count() <= 1 {
+            return;
+        }
+        let under_temp = temp_dir.join("am-fleet-temp-project");
+        let (class, signals) = classify_ephemeral(&under_temp, &empty_env);
+        assert_eq!(class, EphemeralClass::Ephemeral);
+        assert!(
+            signals.path_tmpdir
+                || signals.path_tmp
+                || signals.path_var_tmp
+                || signals.path_dev_shm
+                || signals.path_private_tmp
+                || signals.path_var_folders,
+            "a project under std::env::temp_dir() ({}) must be isolated from the default mailbox, got {signals:?}",
+            temp_dir.display()
+        );
     }
 
     // ---- Tier 2: Test/repro ----
