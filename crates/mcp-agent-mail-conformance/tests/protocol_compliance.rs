@@ -64,6 +64,17 @@ struct TransportExecution {
     http_headers: Vec<HashMap<String, String>>,
 }
 
+/// Agent Mail's locked HTTP MCP path (`HTTP_PATH` default `/mcp/`).
+/// FastMCP 0.3 defaulted `HttpHandlerConfig::base_path` to `/mcp/v1`; tests
+/// that use the raw FastMCP HTTP transport must pin Agent Mail's trailing-slash
+/// contract instead of inheriting that default (br-w9v59.1).
+fn agent_mail_http_config() -> HttpHandlerConfig {
+    HttpHandlerConfig {
+        base_path: "/mcp/".to_string(),
+        ..HttpHandlerConfig::default()
+    }
+}
+
 fn initialize_request<T: Into<Value>>(id: T) -> JsonRpcRequest {
     let params = Some(json!({
         "protocolVersion": "2024-11-05",
@@ -134,7 +145,8 @@ fn execute_transport(transport: TransportKind, payloads: Vec<Payload>) -> Transp
                 input.extend_from_slice(&build_raw_http_request(&body));
             }
 
-            let transport = HttpTransport::new(Cursor::new(input), writer);
+            let transport =
+                HttpTransport::with_config(Cursor::new(input), writer, agent_mail_http_config());
             let handle = std::thread::spawn(move || {
                 let cx = Cx::for_testing();
                 if let Err(error) = server.run_transport_returning_with_cx(&cx, transport) {
@@ -380,7 +392,7 @@ fn transport_framing_and_utf8_round_trip_are_stable() {
         "stdio must preserve UTF-8 payloads"
     );
 
-    let handler = HttpRequestHandler::new();
+    let handler = HttpRequestHandler::with_config(agent_mail_http_config());
     let http_request = HttpRequest::new(HttpMethod::Post, "/mcp/")
         .with_header("Content-Type", "application/json")
         .with_body(encoded.clone().into_bytes());
@@ -511,7 +523,7 @@ fn large_payloads_are_explicitly_accepted_or_rejected() {
 
     let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
         max_body_size: 1024,
-        ..HttpHandlerConfig::default()
+        ..agent_mail_http_config()
     });
     let oversized_body = vec![b'x'; 2048];
     let request = HttpRequest::new(HttpMethod::Post, "/mcp/")

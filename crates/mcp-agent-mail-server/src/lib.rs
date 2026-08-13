@@ -252,8 +252,13 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         let _ = mcp_agent_mail_core::refresh_health_level();
         // Backpressure gate: reject shedable tools under Red (when enabled)
         if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
+            // ToolExecutionError (-32000) is a tool-level refusal, not an
+            // opaque framework InternalError. FastMCP's router redacts
+            // InternalError to "Internal server error" and treats it as
+            // terminal; shedding must keep the overloaded envelope so
+            // callers can retry the named tool (br-w9v59.1).
             return Err(McpError::new(
-                McpErrorCode::InternalError,
+                McpErrorCode::ToolExecutionError,
                 format!(
                     "Server overloaded (health_level=red). Tool '{}' temporarily unavailable. Retry after load subsides.",
                     self.tool_name,
@@ -353,7 +358,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
             return Box::pin(std::future::ready(fastmcp_core::Outcome::Err(
                 McpError::new(
-                    McpErrorCode::InternalError,
+                    McpErrorCode::ToolExecutionError,
                     format!(
                         "Server overloaded (health_level=red). Tool '{}' temporarily unavailable. Retry after load subsides.",
                         self.tool_name,
