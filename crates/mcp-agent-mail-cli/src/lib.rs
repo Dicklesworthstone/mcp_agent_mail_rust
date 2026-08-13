@@ -10835,8 +10835,8 @@ fn quarantine_reclaimable_owner_locks(
             .file_name()
             .map(|n| n.to_os_string())
             .unwrap_or_else(|| std::ffi::OsString::from(lock.name));
-        let to = quarantine_dir.join(&file_name);
-        std::fs::rename(&from, &to)?;
+        let to = quarantine_dir.join(file_name);
+        std::fs::rename(from, &to)?;
         moved.push(SupervisedTakeoverMovedLock {
             name: lock.name,
             from: lock.path.clone(),
@@ -10859,7 +10859,7 @@ fn quarantine_reclaimable_owner_locks(
         witness_path: witness_path.display().to_string(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&outcome) {
-        let _ = std::fs::write(&witness_path, json);
+        let _ = std::fs::write(witness_path, json);
     }
     Ok(outcome)
 }
@@ -10888,7 +10888,7 @@ fn emit_takeover_success(outcome: &SupervisedTakeoverOutcome) {
 }
 
 fn emit_takeover_not_reclaimable_refusal(op_label: &str, report: &DoctorLocksReport) {
-    let lines = vec![
+    let lines = [
         format!(
             "Error: refusing `am doctor {op_label} --take-ownership` — the mailbox owner is not reclaimable."
         ),
@@ -10908,7 +10908,7 @@ fn emit_takeover_not_reclaimable_refusal(op_label: &str, report: &DoctorLocksRep
 }
 
 fn emit_takeover_election_busy_refusal(op_label: &str, report: &DoctorLocksReport) {
-    let lines = vec![
+    let lines = [
         format!(
             "Notice: another agent is already performing a supervised takeover of this mailbox; `am doctor {op_label} --take-ownership` is deferring."
         ),
@@ -10923,7 +10923,7 @@ fn emit_takeover_election_busy_refusal(op_label: &str, report: &DoctorLocksRepor
 }
 
 fn emit_takeover_reverify_changed_refusal(op_label: &str, report: &DoctorLocksReport) {
-    let lines = vec![
+    let lines = [
         format!(
             "Error: refusing `am doctor {op_label} --take-ownership` — the owner is no longer reclaimable on re-verify."
         ),
@@ -10942,7 +10942,7 @@ fn emit_takeover_holder_not_reclaimable_refusal(
     lock: &DoctorLockPathReport,
     reclaimable_pids: &BTreeSet<u32>,
 ) {
-    let lines = vec![
+    let lines = [
         format!(
             "Error: refusing `am doctor {op_label} --take-ownership` — {} activity lock is held by a PID not judged reclaimable.",
             lock.name
@@ -23767,6 +23767,34 @@ fn doctor_is_preserved_missing_agent_fk_violation(
         && preserved_missing_agent_recipient_rowids.contains(&violation.rowid)
 }
 
+/// A `file_reservations` row whose `agents`/`projects` parent no longer exists is
+/// a preserved-by-design orphan, NOT a repairable violation (br-d75xt).
+///
+/// The app intentionally keeps orphaned-holder reservations visible (rendered as
+/// `[unknown-agent-<id>]`) and every reservation carries an `expires_ts`, so the
+/// leases lapse on their own — there is nothing durable to "repair". Counting
+/// them as repairable routes the strategy to Repair, but the repair path only
+/// prunes orphaned `message_recipients`; the reservation rows survive and every
+/// startup re-repairs the same rows forever (the endless self-heal loop the
+/// macOS field report captured). Excluding them here (mirroring the missing-agent
+/// `message_recipients` preservation) lets the strategy attest them as
+/// preserved-by-design and return `None`, breaking the loop idempotently.
+fn doctor_is_preserved_orphaned_file_reservation_fk_violation(
+    violation: &DoctorForeignKeyViolation,
+) -> bool {
+    violation.table == "file_reservations"
+        && (violation.parent == "agents" || violation.parent == "projects")
+}
+
+fn doctor_preserved_orphaned_file_reservation_count(
+    violations: &[DoctorForeignKeyViolation],
+) -> usize {
+    violations
+        .iter()
+        .filter(|violation| doctor_is_preserved_orphaned_file_reservation_fk_violation(violation))
+        .count()
+}
+
 fn doctor_repairable_foreign_key_violation_count(
     violations: &[DoctorForeignKeyViolation],
     preserved_missing_agent_recipient_rowids: &std::collections::BTreeSet<i64>,
@@ -23777,7 +23805,7 @@ fn doctor_repairable_foreign_key_violation_count(
             !doctor_is_preserved_missing_agent_fk_violation(
                 violation,
                 preserved_missing_agent_recipient_rowids,
-            )
+            ) && !doctor_is_preserved_orphaned_file_reservation_fk_violation(violation)
         })
         .count()
 }
