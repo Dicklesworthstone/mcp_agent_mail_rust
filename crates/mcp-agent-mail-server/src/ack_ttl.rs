@@ -467,6 +467,16 @@ mod tests {
         assert_eq!(mode_upper.to_lowercase(), "file_reservation");
     }
 
+    /// `Config` for these tests: escalation writes reservation artifacts to
+    /// the archive under `config.storage_root`, so it MUST point inside the
+    /// test sandbox. `Config::from_env()` alone resolves to the operator's
+    /// real mailbox archive and leaks junk projects into it (br-r6awv).
+    fn test_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = Config::from_env();
+        config.storage_root = tmp.path().join("storage");
+        config
+    }
+
     fn make_test_pool(tmp: &tempfile::TempDir) -> DbPool {
         // Use the standard pool setup to mirror production initialization
         // semantics under FrankenSQLite.
@@ -568,7 +578,7 @@ mod tests {
     fn ack_ttl_cycle_marks_overdue_when_ttl_zero() {
         let (_tmp, pool, _cx, _unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_ttl_seconds = 0;
         config.ack_escalation_enabled = false;
 
@@ -581,7 +591,7 @@ mod tests {
     fn ack_ttl_cycle_respects_ttl_when_large() {
         let (_tmp, pool, _cx, _unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_ttl_seconds = 10_000;
         config.ack_escalation_enabled = false;
 
@@ -594,7 +604,7 @@ mod tests {
     fn ack_ttl_stateful_cycle_escalates_newly_overdue_only_once() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_ttl_seconds = 0;
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
@@ -628,7 +638,7 @@ mod tests {
     fn ack_ttl_escalation_is_idempotent_across_worker_restarts() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_ttl_seconds = 0;
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
@@ -656,7 +666,7 @@ mod tests {
     fn escalation_reacquires_after_prior_matching_claim_was_released() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
         config.ack_escalation_claim_exclusive = true;
@@ -723,7 +733,7 @@ mod tests {
     fn escalation_creates_file_reservation_for_recipient_inbox() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
         config.ack_escalation_claim_exclusive = true;
@@ -756,7 +766,7 @@ mod tests {
     fn escalation_mode_log_is_noop() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "log".to_string();
 
@@ -775,7 +785,7 @@ mod tests {
     fn escalation_mode_unknown_is_noop() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "unknown".to_string();
 
@@ -795,7 +805,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pool = make_test_pool(&tmp);
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&tmp);
         config.ack_ttl_seconds = 0;
         config.ack_escalation_enabled = false;
 
@@ -815,7 +825,7 @@ mod tests {
             other => panic!("acknowledge_message failed: {other:?}"),
         }
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_ttl_seconds = 0;
         config.ack_escalation_enabled = false;
 
@@ -828,7 +838,7 @@ mod tests {
     fn escalation_with_custom_holder_uses_system_agent() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
         config.ack_escalation_claim_holder_name = "OpsEscalation".to_string();
@@ -875,7 +885,7 @@ mod tests {
     fn escalation_mode_is_case_insensitive() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "FILE_RESERVATION".to_string();
         config.ack_escalation_claim_holder_name.clear();
@@ -1022,7 +1032,7 @@ mod tests {
             other => panic!("create_message 2 failed: {other:?}"),
         }
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&tmp);
         config.ack_ttl_seconds = 0; // All messages immediately overdue
         config.ack_escalation_enabled = false;
 
@@ -1035,7 +1045,7 @@ mod tests {
     fn escalation_non_exclusive_reservation() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
         config.ack_escalation_claim_exclusive = false; // non-exclusive
@@ -1060,7 +1070,7 @@ mod tests {
     fn escalation_applies_configured_ttl_seconds() {
         let (_tmp, pool, cx, unacked) = seed_unacked_message();
 
-        let mut config = Config::from_env();
+        let mut config = test_config(&_tmp);
         config.ack_escalation_enabled = true;
         config.ack_escalation_mode = "file_reservation".to_string();
         config.ack_escalation_claim_ttl_seconds = 120;
