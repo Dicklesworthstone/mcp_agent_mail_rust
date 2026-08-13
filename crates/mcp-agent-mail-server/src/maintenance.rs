@@ -496,7 +496,7 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
         let tail = stat.get(close_paren + 2..)?;
         // Fields after `comm` start with field 3. Process start time is field
         // 22, therefore position 19 in this tail segment.
-        return tail.split_whitespace().nth(19)?.parse().ok();
+        tail.split_whitespace().nth(19)?.parse().ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -525,7 +525,7 @@ fn recorded_process_liveness(
         {
             return RecordedProcessLiveness::Reused;
         }
-        return RecordedProcessLiveness::Alive;
+        RecordedProcessLiveness::Alive
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -568,7 +568,7 @@ fn related_git_maintenance_process_running(git_dir: &Path) -> Option<bool> {
                 return Some(true);
             }
         }
-        return Some(false);
+        Some(false)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1019,39 +1019,36 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
                 };
             }
         };
-    let active_evidence = match record_active_maintenance_evidence(
+    let Some(active_evidence) = record_active_maintenance_evidence(
         git_dir,
         child.id(),
         process_start_ticks(child.id()),
-    ) {
-        Some(evidence) => evidence,
-        None => {
-            let lock_evidence = terminate_maintenance_child(
-                &mut child,
-                git_dir,
-                "maintenance launch could not persist active PID evidence",
-            );
-            return MaintenanceReport {
-                loose_before,
-                loose_after: count_loose_objects(git_dir),
-                pack_count_before: pack_before,
-                pack_count_after: count_pack_files(git_dir),
-                disk_bytes_before: disk_before,
-                disk_bytes_after: measure_objects_disk_usage(git_dir),
-                lock_reaped: lock_preflight.reaped,
-                lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
-                error: Some(lock_evidence.map_or_else(
-                    || {
-                        "could not persist active Git maintenance PID evidence; maintenance child was terminated"
-                            .to_string()
-                    },
-                    |evidence| format!(
-                        "could not persist active Git maintenance PID evidence; maintenance child was terminated; {evidence}"
-                    ),
-                )),
-                ..Default::default()
-            };
-        }
+    ) else {
+        let lock_evidence = terminate_maintenance_child(
+            &mut child,
+            git_dir,
+            "maintenance launch could not persist active PID evidence",
+        );
+        return MaintenanceReport {
+            loose_before,
+            loose_after: count_loose_objects(git_dir),
+            pack_count_before: pack_before,
+            pack_count_after: count_pack_files(git_dir),
+            disk_bytes_before: disk_before,
+            disk_bytes_after: measure_objects_disk_usage(git_dir),
+            lock_reaped: lock_preflight.reaped,
+            lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
+            error: Some(lock_evidence.map_or_else(
+                || {
+                    "could not persist active Git maintenance PID evidence; maintenance child was terminated"
+                        .to_string()
+                },
+                |evidence| format!(
+                    "could not persist active Git maintenance PID evidence; maintenance child was terminated; {evidence}"
+                ),
+            )),
+            ..Default::default()
+        };
     };
 
     // Poll the child process, checking for shutdown signal so we don't
