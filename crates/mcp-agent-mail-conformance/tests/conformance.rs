@@ -1417,7 +1417,6 @@ fn run_fixtures_against_rust_server_router() {
     mcp_agent_mail_tools::reset_tool_metrics();
 
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
     let mut req_id: u64 = 1;
 
     for (tool_name, tool_fixture) in &fixtures.tools {
@@ -2218,7 +2217,6 @@ fn tool_filter_profiles_match_fixtures() {
         let router = mcp_agent_mail_server::build_server(&config).into_router();
 
         let cx = Cx::for_testing();
-        let budget = Budget::INFINITE;
 
         // tools/list
         let tools_result = router
@@ -2524,7 +2522,6 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
 
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
     let mut req_id: u64 = 1;
 
     // Save and restore global metric state because backpressure cache/metrics are process-wide.
@@ -2641,7 +2638,6 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
     let mut req_id: u64 = 1;
 
     let mut call_tool_json = |name: &str, arguments: Value| -> Value {
@@ -3268,7 +3264,6 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
     let mut req_id: u64 = 1;
 
     // Seed multiple projects so filtering/limits are observable.
@@ -3375,7 +3370,6 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
 
     let invalid_cases = [
         ("resource://projects?limit=NaN", "Invalid limit"),
@@ -3447,7 +3441,6 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
 
     let cases: [(&str, &[&str]); 4] = [
         (
@@ -3552,7 +3545,6 @@ fn toon_format_resolution_json_fallback() {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
 
     // Call health_check - should work regardless of TOON config.
     let params = CallToolParams {
@@ -3611,7 +3603,6 @@ fn llm_mode_parameter_accepted_by_tools() {
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
-    let budget = Budget::INFINITE;
     let mut req_id: u64 = 1;
     let project_key = tmp
         .path()

@@ -109,7 +109,9 @@ fn execute_transport(transport: TransportKind, payloads: Vec<Payload>) -> Transp
             let transport = StdioTransport::new(Cursor::new(input), writer);
             let handle = std::thread::spawn(move || {
                 let cx = Cx::for_testing();
-                server.run_transport_returning_with_cx(&cx, transport);
+                if let Err(error) = server.run_transport_returning_with_cx(&cx, transport) {
+                    eprintln!("stdio transport stopped with an error: {error}");
+                }
             });
             handle.join().expect("stdio server thread");
 
@@ -135,7 +137,9 @@ fn execute_transport(transport: TransportKind, payloads: Vec<Payload>) -> Transp
             let transport = HttpTransport::new(Cursor::new(input), writer);
             let handle = std::thread::spawn(move || {
                 let cx = Cx::for_testing();
-                server.run_transport_returning_with_cx(&cx, transport);
+                if let Err(error) = server.run_transport_returning_with_cx(&cx, transport) {
+                    eprintln!("HTTP transport stopped with an error: {error}");
+                }
             });
             handle.join().expect("http server thread");
 
