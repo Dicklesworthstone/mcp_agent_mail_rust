@@ -1,7 +1,7 @@
 //! Integration tests for client-supplied idempotency keys on mutating DB entry
 //! points (br-idempotency-keys-mutating-tools-h0x9k).
 //!
-//! Exercises the real DB layer (no mocks) against a temp FrankenSQLite file to
+//! Exercises the real DB layer (no mocks) against a temp `FrankenSQLite` file to
 //! prove the acceptance criteria at the transactional core that the tool layer
 //! calls into:
 //!   (a) POSITIVE  — a retry with the same key + byte-identical payload replays

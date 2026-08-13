@@ -326,7 +326,7 @@ fn scan_artifacts(
             if artifact_generation.is_some_and(|generation| generation != current_generation) {
                 quarantines.push(QuarantineArtifact {
                     source: path,
-                    project,
+                    project: project.clone(),
                     reason: QuarantineReason::ForeignGeneration,
                 });
                 continue;
