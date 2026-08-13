@@ -4703,31 +4703,6 @@ pub(crate) fn gather_process_owner_model(
 }
 
 #[cfg(target_os = "macos")]
-fn stop_launchd_service() -> CliResult<()> {
-    let uid = current_uid()?;
-    let Some(plist_path) = launchd_plist_path() else {
-        return Err(CliError::Other(
-            "failed to resolve LaunchAgent plist path".to_string(),
-        ));
-    };
-    run_cmd(
-        "launchctl",
-        &[
-            "bootout",
-            &format!("gui/{uid}"),
-            &plist_path.display().to_string(),
-        ],
-    )
-}
-
-#[cfg(not(target_os = "macos"))]
-fn stop_launchd_service() -> CliResult<()> {
-    Err(CliError::Other(
-        "launchd service control is unavailable on this platform".to_string(),
-    ))
-}
-
-#[cfg(target_os = "macos")]
 fn start_launchd_service() -> CliResult<()> {
     let uid = current_uid()?;
     let Some(plist_path) = launchd_plist_path() else {
@@ -4837,13 +4812,6 @@ fn run_read_only_tui_attachment() -> CliResult<()> {
             command: robot::RobotSubcommand::TuiDump,
         })?;
         std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-}
-
-fn stop_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
-    match kind {
-        ManagedServiceKind::Systemd => run_systemctl_user(&["stop", SYSTEMD_UNIT_NAME]),
-        ManagedServiceKind::Launchd => stop_launchd_service(),
     }
 }
 
@@ -13169,7 +13137,7 @@ fn canonical_snapshot_tempdir_in(
     prefix: &str,
     context: &str,
 ) -> CliResult<tempfile::TempDir> {
-    let canonical_temp_dir = std::fs::canonicalize(&temp_dir).map_err(|e| {
+    let canonical_temp_dir = std::fs::canonicalize(temp_dir).map_err(|e| {
         CliError::Other(format!(
             "{context} snapshot tempdir {} is unusable: {e}",
             temp_dir.display()
