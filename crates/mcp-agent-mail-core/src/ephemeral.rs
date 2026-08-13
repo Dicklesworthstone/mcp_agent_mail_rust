@@ -442,18 +442,16 @@ pub fn classify_ephemeral(
     signals.path_var_folders =
         normalized == "/var/folders" || normalized.starts_with("/var/folders/");
 
-    // Also check std::env::temp_dir() at runtime. Use the resolved path so a
-    // `/data/tmp/...` project is isolated when TMPDIR is `/data/tmp` even if
-    // the caller passed a symlink or a not-yet-canonical human_key. The raw
-    // `project_root` check stays so a not-yet-created temp path still matches.
-    let temp_dir = std::env::temp_dir();
-    if (project_root.starts_with(&temp_dir) || resolved.starts_with(&temp_dir))
+    // Also check std::env::temp_dir() at runtime (and its canonical target).
+    // On this fleet TMPDIR is often `/data/tmp`, or `/tmp` is a symlink to
+    // `/data/tmp`; comparing only the raw prefix misses one of those shapes
+    // and leaks test projects into the default mailbox.
+    if path_is_under_runtime_temp(project_root, &resolved)
         && !signals.path_tmp
         && !signals.path_var_tmp
         && !signals.path_dev_shm
         && !signals.path_private_tmp
         && !signals.path_var_folders
-        && temp_dir.components().count() > 1
     {
         signals.path_tmpdir = true;
     }
@@ -502,13 +500,47 @@ pub fn path_has_ephemeral_root(path: &Path) -> bool {
     // Resolve symlinks so `/data/projects/foo` → `/tmp/test/` is detected.
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-    let temp_root = std::env::temp_dir();
-    if resolved.starts_with(&temp_root) {
+    if path_is_under_runtime_temp(path, &resolved) {
         return true;
     }
 
     let normalized = resolved.to_string_lossy().replace('\\', "/");
     starts_with_system_temp(&normalized)
+}
+
+fn temp_dir_is_usable_prefix(path: &Path) -> bool {
+    let mut has_normal = false;
+    let mut count = 0;
+    for component in path.components() {
+        count += 1;
+        if matches!(component, std::path::Component::Normal(_)) {
+            has_normal = true;
+        }
+    }
+    // Reject `/` and `C:\` so a broken TMPDIR cannot mark the whole volume
+    // ephemeral. Require a named directory (`/tmp`, `/data/tmp`, …).
+    has_normal && count > 1
+}
+
+fn runtime_temp_dir_prefixes() -> Vec<std::path::PathBuf> {
+    let raw = std::env::temp_dir();
+    let mut prefixes = Vec::new();
+    let mut push_if_usable = |path: std::path::PathBuf| {
+        if temp_dir_is_usable_prefix(&path) && !prefixes.contains(&path) {
+            prefixes.push(path);
+        }
+    };
+    push_if_usable(raw.clone());
+    if let Ok(canon) = std::fs::canonicalize(&raw) {
+        push_if_usable(canon);
+    }
+    prefixes
+}
+
+fn path_is_under_runtime_temp(project_root: &Path, resolved: &Path) -> bool {
+    runtime_temp_dir_prefixes()
+        .iter()
+        .any(|temp| project_root.starts_with(temp) || resolved.starts_with(temp))
 }
 
 /// Resolve the effective ephemeral class for a project, considering
@@ -789,7 +821,7 @@ mod tests {
     #[test]
     fn classify_runtime_temp_dir_as_ephemeral() {
         let temp_dir = std::env::temp_dir();
-        if temp_dir.components().count() <= 1 {
+        if !temp_dir_is_usable_prefix(&temp_dir) {
             return;
         }
         let under_temp = temp_dir.join("am-fleet-temp-project");
@@ -1010,6 +1042,20 @@ mod tests {
     fn path_has_ephemeral_root_rejects_normal_paths() {
         assert!(!path_has_ephemeral_root(Path::new("/data/projects/x")));
         assert!(!path_has_ephemeral_root(Path::new("/home/ubuntu/x")));
+    }
+
+    #[test]
+    fn path_has_ephemeral_root_detects_runtime_temp_dir() {
+        let temp_dir = std::env::temp_dir();
+        if !temp_dir_is_usable_prefix(&temp_dir) {
+            return;
+        }
+        let under_temp = temp_dir.join("am-fleet-temp-project");
+        assert!(
+            path_has_ephemeral_root(&under_temp),
+            "doctor/anomaly scanners must treat std::env::temp_dir() ({}) as ephemeral, same as classify_ephemeral",
+            temp_dir.display()
+        );
     }
 
     // ---- Edge cases ----
