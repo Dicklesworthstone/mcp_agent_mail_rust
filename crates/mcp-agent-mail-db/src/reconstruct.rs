@@ -3420,9 +3420,13 @@ fn enrich_existing_agent_from_salvage(
         )
         && current != salvaged
     {
-        return Err(DbError::Sqlite(format!(
-            "reconstruct salvage: agent {name} has conflicting non-null registration tokens; refusing to bind credentials across ambiguous identities"
-        )));
+        // Tokens are credential payload on a stable (project, name)
+        // identity. Re-registration after a mailbox wipe is common; failing
+        // the merge here refuses the archive-only candidate and wedges
+        // doctor (br-r6awv). Keep the archive token and continue.
+        stats.push_warning(format!(
+            "salvaged agent {name} has a conflicting registration token; keeping the archive candidate credential"
+        ));
     }
     let existing_source = format!("existing agent row {agent_id} ({name})");
     let current_program = normalize_reconstructed_required_agent_field(
@@ -3497,10 +3501,10 @@ fn enrich_existing_agent_from_salvage(
             current_contact_policy.clone()
         };
     let next_reaper_exempt = salvaged_reaper_exempt.unwrap_or(current_reaper_exempt);
-    let next_registration_token = if salvage_has_registration_token {
-        salvaged_registration_token.map(str::to_string)
-    } else {
-        current_registration_token.clone()
+    let next_registration_token = match current_registration_token.as_deref() {
+        Some(_) => current_registration_token.clone(),
+        None if salvage_has_registration_token => salvaged_registration_token.map(str::to_string),
+        None => current_registration_token.clone(),
     };
 
     if next_program != current_program
@@ -3922,15 +3926,14 @@ fn merge_salvaged_database(
             let reservation_select = build_salvage_select(
                 "file_reservations",
                 &reservation_columns,
+                &["id", "project_id", "agent_id", "path_pattern"],
                 &[
-                    "id",
-                    "project_id",
-                    "agent_id",
-                    "path_pattern",
                     "exclusive",
                     "reason",
+                    "created_ts",
+                    "expires_ts",
+                    "released_ts",
                 ],
-                &["created_ts", "expires_ts", "released_ts"],
                 stats,
                 salvage_db_path,
             )
@@ -4014,17 +4017,20 @@ fn merge_salvaged_database(
                     .trim()
                     .to_string();
                 if path_pattern.is_empty() {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: reservation {source_reservation_id} has an empty path_pattern"
-                    )));
+                    // Empty path is a junk row, not corruption. Failing the
+                    // whole merge here refuses the archive-only candidate
+                    // and wedges doctor (br-r6awv).
+                    stats.push_warning(format!(
+                        "skipped salvaged reservation {source_reservation_id}: empty path_pattern"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
                 }
-                let exclusive = i64::from(
-                    row.get_named::<i64>("exclusive").map_err(|e| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: decode exclusive for reservation {source_reservation_id}: {e}"
-                        ))
-                    })? != 0,
-                );
+                // Exclusive is identity but historically optional on some
+                // salvage schemas. Default 1 matches archive parse
+                // (`unwrap_or(true)`); a hard error here is not
+                // corruption-class and would refuse reconstruct.
+                let exclusive = i64::from(row.get_named::<i64>("exclusive").unwrap_or(1) != 0);
                 let reason = row.get_named::<String>("reason").unwrap_or_default();
                 // Reservation identity includes created_ts. A missing/NULL
                 // column must stay deterministic (0), not fail the whole
@@ -4139,13 +4145,14 @@ fn merge_salvaged_database(
             }
         }
 
-        if has_file_reservation_releases {
-            if !has_file_reservations {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct salvage: {} has file_reservation_releases without file_reservations",
-                    salvage_db_path.display()
-                )));
-            }
+        if has_file_reservation_releases && !has_file_reservations {
+            // A leftover ledger table is not corruption-class. Failing here
+            // refuses the archive-only candidate and wedges doctor (br-r6awv).
+            stats.push_warning(format!(
+                "skipped salvaged file_reservation_releases in {}: file_reservations table is absent",
+                salvage_db_path.display()
+            ));
+        } else if has_file_reservation_releases {
             let release_columns = table_columns(&salvage_conn, "file_reservation_releases")?;
             let release_select = build_salvage_select(
                 "file_reservation_releases",
@@ -4214,9 +4221,13 @@ fn merge_salvaged_database(
                         ))
                     })?;
                     if current_released_ts != released_ts {
-                        return Err(DbError::Sqlite(format!(
-                            "reconstruct salvage: reservation {source_reservation_id} has conflicting terminal release ledger timestamps ({released_ts} versus {current_released_ts})"
-                        )));
+                        // released_ts is volatile lifecycle state (GH#208).
+                        // A ledger mismatch is not corruption-class: keep
+                        // the archive candidate's timestamp and continue so
+                        // reconstruct cannot refuse the whole mailbox.
+                        stats.push_warning(format!(
+                            "salvaged reservation {source_reservation_id} has a conflicting terminal release ledger timestamp ({released_ts} versus candidate {current_released_ts}); keeping the archive candidate"
+                        ));
                     }
                     continue;
                 }
@@ -4235,9 +4246,10 @@ fn merge_salvaged_database(
                     .and_then(|existing| existing.get_named::<i64>("released_ts").ok())
                     && legacy_release != released_ts
                 {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: reservation {source_reservation_id} has conflicting row/ledger release timestamps ({legacy_release} versus {released_ts})"
-                    )));
+                    stats.push_warning(format!(
+                        "salvaged reservation {source_reservation_id} has a conflicting row/ledger release timestamp ({legacy_release} versus {released_ts}); keeping the archive candidate"
+                    ));
+                    continue;
                 }
                 target_conn
                     .execute_sync(
@@ -4377,7 +4389,8 @@ fn merge_salvaged_database(
                     .query_sync(
                         "SELECT id FROM agent_links \
                          WHERE a_project_id = ? AND a_agent_id = ? \
-                           AND b_project_id = ? AND b_agent_id = ? LIMIT 2",
+                           AND b_project_id = ? AND b_agent_id = ? \
+                         ORDER BY id LIMIT 2",
                         &[
                             Value::BigInt(target_origin_project_id),
                             Value::BigInt(target_origin_agent_id),
@@ -4391,10 +4404,13 @@ fn merge_salvaged_database(
                         ))
                     })?;
                 if existing_links.len() > 1 {
-                    return Err(DbError::Sqlite(
-                        "reconstruct salvage: multiple target agent_links share the same stable endpoint quartet"
+                    // Duplicate endpoint quartets are data dups, not
+                    // corruption. Failing the merge here refuses the
+                    // archive-only candidate and wedges doctor (br-r6awv).
+                    stats.push_warning(
+                        "salvaged agent_link matched multiple target rows for the same endpoint quartet; using the earliest id and keeping the archive candidate"
                             .to_string(),
-                    ));
+                    );
                 }
                 let state_values = [
                     Value::Text(link_status),
@@ -9372,6 +9388,85 @@ archive body
     }
 
     #[test]
+    fn reconstruct_with_salvage_reservation_missing_exclusive_defaults_deterministically() {
+        // Exclusive is part of reservation identity. A required-column hard
+        // error here is not corruption-class, so reconstruct would refuse
+        // the archive-only candidate and wedge doctor. Two recoveries of a
+        // legacy schema without exclusive must land the archive default (1).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).expect("archive root");
+        let salvage_db_path = tmp.path().join("salvage_reservation_no_exclusive.db");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                );
+                CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                );
+                CREATE TABLE file_reservations (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    agent_id INTEGER NOT NULL,
+                    path_pattern TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL
+                );",
+            )
+            .expect("legacy reservations table without exclusive");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'legacy-excl', '/legacy-excl', 1);
+                 INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'CoralMarsh');
+                 INSERT INTO file_reservations
+                    (id, project_id, agent_id, path_pattern, reason, created_ts)
+                 VALUES (9, 1, 2, 'src/**', 'legacy', 10);",
+            )
+            .expect("seed legacy reservation");
+        drop(salvage_conn);
+
+        let mut exclusives = Vec::new();
+        for name in ["first.db", "second.db"] {
+            let db_path = tmp.path().join(name);
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("missing reservation exclusive must not block salvage");
+            let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT path_pattern, CAST(exclusive AS INTEGER) AS exclusive, \
+                            CAST(created_ts AS INTEGER) AS created_ts \
+                     FROM file_reservations",
+                    &[],
+                )
+                .expect("query salvaged reservation");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("path_pattern").unwrap(),
+                "src/**"
+            );
+            assert_eq!(rows[0].get_named::<i64>("created_ts").unwrap(), 10);
+            exclusives.push(rows[0].get_named::<i64>("exclusive").unwrap());
+        }
+        assert_eq!(
+            exclusives[0], 1,
+            "absent exclusive must fall back to the archive default (true/1)"
+        );
+        assert_eq!(
+            exclusives[0], exclusives[1],
+            "two recoveries must not mint distinct exclusive identities"
+        );
+    }
+
+    #[test]
     fn reconstruct_with_salvage_preserves_active_reservations_and_release_ledger() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("reconstructed_reservations.db");
@@ -9509,6 +9604,100 @@ archive body
         assert_eq!(
             rows[1].get_named::<String>("reason").unwrap(),
             "shared lease"
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_keeps_going_when_release_ledger_timestamps_conflict() {
+        // released_ts is volatile (GH#208). A ledger/row mismatch used to
+        // fail the whole salvage merge, which then refused the archive-only
+        // candidate and wedged doctor (br-r6awv).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_release_conflict.db");
+        let salvage_db_path = tmp.path().join("salvage_release_conflict.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("release-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let reservations_dir = project_dir.join("file_reservations");
+        std::fs::create_dir_all(&agent_dir).expect("create archive agent");
+        std::fs::create_dir_all(&reservations_dir).expect("create reservations dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"release-project","human_key":"/release-project","created_at":1}"#,
+        )
+        .expect("write archive project");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":1,"last_active_ts":2}"#,
+        )
+        .expect("write archive agent");
+        std::fs::write(
+            reservations_dir.join("id-900.json"),
+            r#"{
+                "id": 900,
+                "project": "/release-project",
+                "agent": "Alice",
+                "path_pattern": "src/**",
+                "exclusive": true,
+                "reason": "archive lease",
+                "created_ts": 10,
+                "expires_ts": 1000,
+                "released_ts": 100
+            }"#,
+        )
+        .expect("write archive reservation with released_ts");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init salvage schema");
+        salvage_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                    VALUES (100, 'release-project', '/release-project', 1);
+                 INSERT INTO agents
+                    (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                    VALUES (200, 100, 'Alice', 'coder', 'test', '', 1, 2, 'auto', 'auto');
+                 INSERT INTO file_reservations
+                    (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+                    VALUES (900, 100, 200, 'src/**', 1, 'archive lease', 10, 1000, 100);
+                 INSERT INTO file_reservation_releases (reservation_id, released_ts)
+                    VALUES (900, 200);",
+            )
+            .expect("seed conflicting release ledger");
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("volatile release-ledger mismatch must not refuse reconstruct");
+        assert!(
+            stats.warnings.iter().any(|warning| {
+                warning.contains("conflicting row/ledger release timestamp")
+                    || warning.contains("conflicting terminal release ledger timestamp")
+            }),
+            "mismatch should be recorded as a warning, not a hard error: {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT CAST(fr.released_ts AS INTEGER) AS row_released_ts, \
+                        rr.released_ts AS ledger_released_ts \
+                 FROM file_reservations fr \
+                 LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id",
+                &[],
+            )
+            .expect("query recovered reservation");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<i64>("row_released_ts").unwrap(),
+            100,
+            "archive candidate released_ts must be kept"
+        );
+        assert!(
+            rows[0].get_named::<i64>("ledger_released_ts").is_err(),
+            "conflicting salvage ledger must not overwrite the archive candidate"
         );
     }
 
