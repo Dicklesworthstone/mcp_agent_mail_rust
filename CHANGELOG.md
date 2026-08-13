@@ -12,7 +12,7 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
-## v0.3.26 — 2026-08-13 (pending release)
+## v0.3.26 — 2026-08-13 **[Release]**
 
 Recovery-convergence and field-report release. v0.3.24 (the last published
 build) is ~290 commits stale and is the version implicated in most open field

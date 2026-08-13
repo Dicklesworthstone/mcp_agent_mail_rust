@@ -4579,7 +4579,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "asupersync",
  "clap",
@@ -4607,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4655,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4680,7 +4680,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "chrono",
  "criterion",
@@ -4709,7 +4709,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4752,7 +4752,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "chrono",
  "git2",
@@ -4768,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "chrono",
  "criterion",
@@ -4797,7 +4797,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4843,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -4864,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "asupersync",
  "base64 0.23.1",
@@ -4892,7 +4892,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "git2",
  "tempfile",
@@ -4901,7 +4901,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.3.25"
+version = "0.3.26"
 dependencies = [
  "arbitrary",
  "asupersync",
