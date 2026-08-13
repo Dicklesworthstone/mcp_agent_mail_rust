@@ -3513,14 +3513,26 @@ mod tests {
             verdicts: green_test_verdicts(),
             failing_verdicts: vec![],
         };
-        let json_str = serde_json::to_string(&r).unwrap();
-        assert!(!json_str.contains("pool_utilization"));
-        assert!(!json_str.contains("queues"));
-        assert!(!json_str.contains("disk"));
-        assert!(!json_str.contains("integrity"));
-        assert!(!json_str.contains("semantic_indexing"));
-        assert!(!json_str.contains("two_tier_indexing"));
-        assert!(!json_str.contains("recovery"));
+        // Assert on the top-level KEYS, not substrings: verdict labels in the
+        // always-present `verdicts` array legitimately mention these words
+        // (e.g. the integrity verdict), which a substring check would
+        // misread as the optional block being serialized.
+        let value: serde_json::Value = serde_json::to_value(&r).unwrap();
+        let object = value.as_object().expect("health response object");
+        for key in [
+            "pool_utilization",
+            "queues",
+            "disk",
+            "integrity",
+            "semantic_indexing",
+            "two_tier_indexing",
+            "recovery",
+        ] {
+            assert!(
+                !object.contains_key(key),
+                "optional null field {key} must be omitted"
+            );
+        }
     }
 
     #[test]
