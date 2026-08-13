@@ -1107,6 +1107,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "get_message_delivery_receipt".to_string(),
+                    summary: "Return message-ID-bound delivery facts: persisted, signaled, and acknowledged per recipient.".to_string(),
+                    use_when: "Verifying whether a specific message actually reached each recipient (GH#218) without reading message content.".to_string(),
+                    related: vec!["send_message".to_string(), "fetch_inbox_events".to_string()],
+                    expected_frequency: "Occasional, when delivery needs proof.".to_string(),
+                    required_capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Verify delivery".to_string(), sample: "get_message_delivery_receipt(project_key='backend', message_id=1482)".to_string() }],
+                    capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "mark_message_read".to_string(),
                     summary: "Record read_ts for FYI messages without sending acknowledgements.".to_string(),
                     use_when: "Clearing inbox notifications once reviewed.".to_string(),
@@ -5820,6 +5831,7 @@ mod resource_shape_tests {
                         None,
                         None, // auto_contact_if_blocked
                         None, // sender_token
+                        None, // idempotency_key
                     )
                     .await
                     .expect("send_message"),
@@ -5889,6 +5901,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None, // sender_token
+                        None, // idempotency_key
                     )
                     .await
                     .expect("reply_message"),

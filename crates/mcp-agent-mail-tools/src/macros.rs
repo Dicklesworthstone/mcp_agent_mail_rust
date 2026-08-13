@@ -747,6 +747,7 @@ pub async fn macro_contact_handshake(
                 None,
                 None, // auto_contact_if_blocked
                 None, // sender_token
+                None, // idempotency_key
             )
             .await?;
             Some(parse_json(welcome_json, "welcome_message")?)

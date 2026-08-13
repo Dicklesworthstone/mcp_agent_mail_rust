@@ -30,6 +30,14 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    run_serial_async_with_env(&[], f)
+}
+
+fn run_serial_async_with_env<F, Fut, T>(extra_env: &[(&str, &str)], f: F) -> T
+where
+    F: FnOnce(Cx) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -37,20 +45,22 @@ where
     let db_path = format!("/tmp/messaging-error-parity-{env_suffix}.sqlite3");
     let database_url = format!("sqlite://{db_path}");
     let storage_root = format!("/tmp/messaging-error-storage-{env_suffix}");
-    with_process_env_overrides_for_test(
-        &[
-            ("DATABASE_URL", database_url.as_str()),
-            ("STORAGE_ROOT", storage_root.as_str()),
-        ],
-        || {
-            Config::reset_cached();
-            let cx = Cx::for_testing();
-            let rt = RuntimeBuilder::current_thread()
-                .build()
-                .expect("build runtime");
-            rt.block_on(f(cx))
-        },
-    )
+    let mut env: Vec<(&str, &str)> = vec![
+        ("DATABASE_URL", database_url.as_str()),
+        ("STORAGE_ROOT", storage_root.as_str()),
+    ];
+    env.extend_from_slice(extra_env);
+    with_process_env_overrides_for_test(&env, || {
+        Config::reset_cached();
+        let cx = Cx::for_testing();
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let out = rt.block_on(f(cx));
+        // Do not leak a profile-altered cached Config into later tests.
+        Config::reset_cached();
+        out
+    })
 }
 
 fn error_object(err: &fastmcp::McpError) -> serde_json::Map<String, Value> {
@@ -192,6 +202,7 @@ fn test_send_message_empty_to_error() {
             None, // broadcast
             None, // auto_contact_if_blocked
             None, // sender_token
+            None, // idempotency_key
         )
         .await
         .expect_err("empty to should fail");
@@ -242,6 +253,7 @@ fn test_invalid_importance_error() {
             None,                              // broadcast
             None,                              // auto_contact_if_blocked
             None,                              // sender_token
+            None,                              // idempotency_key
         )
         .await
         .expect_err("invalid importance should fail");
@@ -288,6 +300,7 @@ fn test_reply_message_not_found() {
             None, // attachment_paths
             None, // convert_images
             None, // sender_token
+            None, // idempotency_key
         )
         .await
         .expect_err("reply to nonexistent message should fail");
@@ -356,6 +369,7 @@ fn test_reply_message_cross_project_reports_owning_project() {
             None, // broadcast
             None, // auto_contact_if_blocked
             None, // sender_token
+            None, // idempotency_key
         )
         .await
         .expect("send_message should succeed");
@@ -381,6 +395,7 @@ fn test_reply_message_cross_project_reports_owning_project() {
             None, // attachment_paths
             None, // convert_images
             None, // sender_token
+            None, // idempotency_key
         )
         .await
         .expect_err("cross-project reply must be refused");
@@ -461,6 +476,7 @@ fn test_reply_message_subject_prefix() {
             None, // broadcast
             None, // auto_contact_if_blocked
             None, // sender_token
+            None, // idempotency_key
         )
         .await
         .expect("send_message should succeed");
@@ -486,6 +502,7 @@ fn test_reply_message_subject_prefix() {
             None, // attachment_paths
             None, // convert_images
             None, // sender_token
+            None, // idempotency_key
         )
         .await
         .expect("reply should succeed");
@@ -518,6 +535,7 @@ fn test_reply_message_subject_prefix() {
             None, // attachment_paths
             None, // convert_images
             None, // sender_token
+            None, // idempotency_key
         )
         .await
         .expect("second reply should succeed");
@@ -563,6 +581,7 @@ fn test_broadcast_with_explicit_to_error() {
             Some(true), // broadcast
             None,       // auto_contact_if_blocked
             None,       // sender_token
+            None,       // idempotency_key
         )
         .await
         .expect_err("broadcast + explicit to should fail");
@@ -662,5 +681,136 @@ fn test_contact_required_error_format() {
     assert!(
         msg.contains("Contact approval required"),
         "should mention contact approval: {msg}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// GH#237: reply_message must honor the fail-closed send profile — it is a
+// message-creation path and must not be the token-free way to speak as
+// another agent.
+// -----------------------------------------------------------------------
+
+async fn register_agent_with_token(ctx: &McpContext, project_key: &str, agent: &str) -> String {
+    let response = register_agent(
+        ctx,
+        project_key.to_string(),
+        "codex-cli".to_string(),
+        "gpt-5".to_string(),
+        Some(agent.to_string()),
+        Some("fail-closed reply test".to_string()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("register_agent");
+    let parsed: Value = serde_json::from_str(&response).expect("register_agent JSON");
+    let token = parsed
+        .get("registration_token")
+        .and_then(Value::as_str)
+        .expect("registration_token in register_agent response")
+        .to_string();
+    mcp_agent_mail_tools::contacts::set_contact_policy(
+        ctx,
+        project_key.to_string(),
+        agent.to_string(),
+        "open".to_string(),
+    )
+    .await
+    .expect("set_contact_policy");
+    token
+}
+
+#[test]
+fn fail_closed_profile_gates_reply_message_sender_verification() {
+    run_serial_async_with_env(
+        &[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "1")],
+        |cx| async move {
+            let project_key = format!("/tmp/msg_reply_fc-{}", unique_suffix());
+            let ctx = McpContext::new(cx.clone(), 1);
+            ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure_project");
+            let blue_token = register_agent_with_token(&ctx, &project_key, "BlueLake").await;
+            let red_token = register_agent_with_token(&ctx, &project_key, "RedPeak").await;
+
+            let send_response = send_message(
+                &ctx,
+                project_key.clone(),
+                "BlueLake".to_string(),
+                vec!["RedPeak".to_string()],
+                "Fail-closed reply gating".to_string(),
+                "Original body".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(blue_token),
+                None, // idempotency_key
+            )
+            .await
+            .expect("verified send under the fail-closed profile");
+            let send_json: Value = serde_json::from_str(&send_response).expect("send_message JSON");
+            let message_id = send_json
+                .get("message_id")
+                .or_else(|| send_json.get("id"))
+                .and_then(Value::as_i64)
+                .expect("message id in send response");
+
+            // Token-free reply must be refused BEFORE any write.
+            let err = reply_message(
+                &ctx,
+                project_key.clone(),
+                message_id,
+                "RedPeak".to_string(),
+                "Unverified reply".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // idempotency_key
+            )
+            .await
+            .expect_err("token-free reply must be refused under the fail-closed profile");
+            let payload = error_object(&err);
+            assert_eq!(
+                payload.get("type").and_then(Value::as_str),
+                Some("SENDER_TOKEN_REQUIRED"),
+                "reply must route through verify_sender_identity: {payload:?}"
+            );
+
+            // A verified reply succeeds.
+            reply_message(
+                &ctx,
+                project_key.clone(),
+                message_id,
+                "RedPeak".to_string(),
+                "Verified reply".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(red_token),
+                None, // idempotency_key
+            )
+            .await
+            .expect("verified reply under the fail-closed profile");
+        },
     );
 }

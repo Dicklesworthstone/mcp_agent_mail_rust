@@ -586,6 +586,7 @@ fn enabled_gate_blocks_send_message_and_request_contact_auto_register() {
                 None,
                 None,
                 None,
+                None, // idempotency_key
             )
             .await
             .expect_err("send_message to unknown recipient must fail closed");
@@ -656,6 +657,7 @@ fn enabled_gate_blocks_send_message_and_request_contact_auto_register() {
                 None,
                 Some(true), // auto_contact_if_blocked
                 None,
+                None, // idempotency_key
             )
             .await
             .expect("send_message between existing identities should still work");
@@ -708,6 +710,7 @@ fn disabled_gate_auto_registers_via_send_message_and_request_contact() {
             None,
             None,
             None,
+            None, // idempotency_key
         )
         .await
         .expect("send_message should auto-register recipient when gate disabled");

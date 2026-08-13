@@ -62,6 +62,19 @@ pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, co
                         "{context}; WBQ unavailable, queued for durable background archive retry"
                     );
                 }
+                mcp_agent_mail_storage::ArchiveBacklogPush::QueuedEphemeral => {
+                    // br-ack-fast: the op is enqueued in memory but its durable
+                    // journal could not be written, so a crash before drain would
+                    // lose the archive materialization. The DB row is still
+                    // authoritative; this is surfaced (and counted) via the
+                    // archive-lag health metric rather than silently treated as
+                    // durable.
+                    tracing::warn!(
+                        "{context}; WBQ unavailable and archive journal write failed; archive op \
+                         enqueued WITHOUT a durable journal (not crash-safe; DB authoritative; \
+                         surfaced via archive-lag health metric)"
+                    );
+                }
                 mcp_agent_mail_storage::ArchiveBacklogPush::Dropped => {
                     tracing::warn!(
                         "{context}; WBQ unavailable and retry backlog full; archive op dropped \
@@ -1662,12 +1675,47 @@ pub async fn send_message(
     broadcast: Option<bool>,
     auto_contact_if_blocked: Option<bool>,
     sender_token: Option<String>,
+    idempotency_key: Option<String>,
 ) -> McpResult<String> {
     // Normalize names
     let sender_name = normalize_agent_name_or_original(sender_name);
     let to = normalize_agent_names_or_original(to);
     let cc = normalize_optional_agent_names(cc);
     let bcc = normalize_optional_agent_names(bcc);
+    let idempotency_key =
+        crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
+    // Fingerprint the normalized request payload (only when a key was supplied)
+    // so a retry with the same key must carry the same logical arguments; any
+    // change is a typed conflict. Computed early from raw inputs, before body/
+    // attachment processing, so it is stable across retries.
+    let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
+        let sorted = |v: &[String]| {
+            let mut x = v.to_vec();
+            x.sort();
+            x.join("\u{1f}")
+        };
+        let mut atts = attachment_paths.clone().unwrap_or_default();
+        atts.sort();
+        crate::idempotency::compute_fingerprint(
+            "send_message",
+            &[
+                ("sender", sender_name.clone()),
+                ("to", sorted(&to)),
+                ("cc", sorted(cc.as_deref().unwrap_or(&[]))),
+                ("bcc", sorted(bcc.as_deref().unwrap_or(&[]))),
+                ("subject", subject.clone()),
+                ("body_md", body_md.clone()),
+                ("importance", importance.clone().unwrap_or_default()),
+                ("ack_required", ack_required.unwrap_or(false).to_string()),
+                ("thread_id", thread_id.clone().unwrap_or_default()),
+                ("attachments", atts.join("\u{1f}")),
+                (
+                    "convert_images",
+                    convert_images.map(|b| b.to_string()).unwrap_or_default(),
+                ),
+            ],
+        )
+    });
     let explicitly_targeted = !to.is_empty()
         || cc.as_ref().is_some_and(|v| !v.is_empty())
         || bcc.as_ref().is_some_and(|v| !v.is_empty());
@@ -2290,131 +2338,177 @@ effective_free_bytes={free}"
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
-    let message = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message_with_recipients(
-            ctx.cx(),
-            &pool,
+    // Idempotency (br-idempotency-keys-mutating-tools-h0x9k): when the client
+    // supplied a key, route through the idempotent DB entry point. A matching
+    // prior key replays the original message — the index/notification/archive
+    // side effects below are then skipped (at-most-once) — while a differing
+    // payload under the same key is a typed conflict.
+    let (message, idempotent_replay) = if let Some(fingerprint) = idempotency_fingerprint.as_deref()
+    {
+        let key = idempotency_key.as_deref().unwrap_or_default();
+        let claim = mcp_agent_mail_db::IdempotencyClaim {
             project_id,
-            sender_id,
-            &subject,
-            &final_body,
-            thread_id.as_deref(),
-            &importance_val,
-            ack_required.unwrap_or(false),
-            &attachments_json,
-            &recipient_refs,
-        )
-        .await,
-    )?;
-
-    let message_id = message.id.unwrap_or(0);
-    enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
-    enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-        id: message_id,
-        project_id,
-        project_slug: project.slug.clone(),
-        sender_name: sender.name.clone(),
-        subject: message.subject.clone(),
-        body_md: message.body_md.clone(),
-        thread_id: message.thread_id.clone(),
-        importance: message.importance.clone(),
-        created_ts: message.created_ts,
-    });
-
-    // Emit notification signals for to/cc recipients only (never bcc).
-    //
-    // IMPORTANT: These must be synchronous so that the `.signal` file exists
-    // immediately when `send_message` returns (conformance parity with legacy
-    // Python implementation + fixture tests).
-    let notification_meta = mcp_agent_mail_storage::NotificationMessage {
-        id: Some(message_id),
-        from: Some(sender.name.clone()),
-        subject: Some(message.subject.clone()),
-        importance: Some(message.importance.clone()),
-    };
-    let mut notified = HashSet::new();
-    for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
-        if notified.insert(name.clone()) {
-            match mcp_agent_mail_storage::emit_notification_signal(
-                config,
-                &project.slug,
-                name,
-                Some(&notification_meta),
-            ) {
-                mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
-                    if let Some(recipient_id) = recipient_map
-                        .get(&name.to_lowercase())
-                        .and_then(|agent| agent.id)
-                    {
-                        append_signal_delivery_receipt_after_emit(
-                            ctx,
-                            &pool,
-                            config,
-                            &project.slug,
-                            message_id,
-                            recipient_id,
-                            name,
-                        )
-                        .await;
-                    } else {
-                        tracing::warn!(
-                            project = %project.slug,
-                            message_id,
-                            recipient = %name,
-                            "signal emitted for recipient without a resolvable delivery receipt identity"
-                        );
-                    }
-                }
-                mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
-                    project = %project.slug,
-                    recipient = %name,
-                    "failed to emit notification signal during send_message"
-                ),
-                mcp_agent_mail_storage::SignalEmitOutcome::InvalidTarget => tracing::warn!(
-                    project = %project.slug,
-                    recipient = %name,
-                    "resolved recipient produced invalid notification target during send_message"
-                ),
-                _ => {}
+            tool: "send_message",
+            key,
+            fingerprint,
+        };
+        match db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &subject,
+                &final_body,
+                thread_id.as_deref(),
+                &importance_val,
+                ack_required.unwrap_or(false),
+                &attachments_json,
+                &recipient_refs,
+                claim,
+            )
+            .await,
+        )? {
+            mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
+            mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
+            mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
+                return Err(crate::idempotency::idempotency_conflict_error(&info));
             }
         }
-    }
+    } else {
+        let row = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::create_message_with_recipients(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &subject,
+                &final_body,
+                thread_id.as_deref(),
+                &importance_val,
+                ack_required.unwrap_or(false),
+                &attachments_json,
+                &recipient_refs,
+            )
+            .await,
+        )?;
+        (row, false)
+    };
 
-    // Write message bundle to git archive (best-effort)
-    {
-        let mut all_recipient_names: SmallVec<[String; 12]> = SmallVec::new();
-        all_recipient_names.extend(resolved_to.iter().cloned());
-        all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
-        all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
+    let message_id = message.id.unwrap_or(0);
 
-        // Deduplicate recipient names for archive write (avoid duplicate inbox writes)
-        all_recipient_names.sort_unstable();
-        all_recipient_names.dedup();
-
-        let msg_json = serde_json::json!({
-            "id": message_id,
-            "from": &sender.name,
-            "to": &resolved_to,
-            "cc": &resolved_cc_recipients,
-            "bcc": &resolved_bcc_recipients,
-            "subject": &message.subject,
-            "created": micros_to_iso(message.created_ts),
-            "thread_id": &message.thread_id,
-            "project": &project.human_key,
-            "project_slug": &project.slug,
-            "importance": &message.importance,
-            "ack_required": message.ack_required != 0,
-            "attachments": &all_attachment_meta,
+    // On an idempotent replay, skip all one-time side effects (search indexing,
+    // notification signals, git archive) — the original send already performed
+    // them exactly once. This is the at-most-once archive-dispatch guarantee.
+    if !idempotent_replay {
+        enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
+        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
+            id: message_id,
+            project_id,
+            project_slug: project.slug.clone(),
+            sender_name: sender.name.clone(),
+            subject: message.subject.clone(),
+            body_md: message.body_md.clone(),
+            thread_id: message.thread_id.clone(),
+            importance: message.importance.clone(),
+            created_ts: message.created_ts,
         });
-        try_write_message_archive(
-            config,
-            &project.slug,
-            &msg_json,
-            &message.body_md,
-            &sender.name,
-            &all_recipient_names,
-            &all_attachment_rel_paths,
-        );
+
+        // Emit notification signals for to/cc recipients only (never bcc).
+        //
+        // IMPORTANT: These must be synchronous so that the `.signal` file exists
+        // immediately when `send_message` returns (conformance parity with legacy
+        // Python implementation + fixture tests).
+        let notification_meta = mcp_agent_mail_storage::NotificationMessage {
+            id: Some(message_id),
+            from: Some(sender.name.clone()),
+            subject: Some(message.subject.clone()),
+            importance: Some(message.importance.clone()),
+        };
+        let mut notified = HashSet::new();
+        for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
+            if notified.insert(name.clone()) {
+                match mcp_agent_mail_storage::emit_notification_signal(
+                    config,
+                    &project.slug,
+                    name,
+                    Some(&notification_meta),
+                ) {
+                    mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
+                        if let Some(recipient_id) = recipient_map
+                            .get(&name.to_lowercase())
+                            .and_then(|agent| agent.id)
+                        {
+                            append_signal_delivery_receipt_after_emit(
+                                ctx,
+                                &pool,
+                                config,
+                                &project.slug,
+                                message_id,
+                                recipient_id,
+                                name,
+                            )
+                            .await;
+                        } else {
+                            tracing::warn!(
+                                project = %project.slug,
+                                message_id,
+                                recipient = %name,
+                                "signal emitted for recipient without a resolvable delivery receipt identity"
+                            );
+                        }
+                    }
+                    mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
+                        project = %project.slug,
+                        recipient = %name,
+                        "failed to emit notification signal during send_message"
+                    ),
+                    mcp_agent_mail_storage::SignalEmitOutcome::InvalidTarget => tracing::warn!(
+                        project = %project.slug,
+                        recipient = %name,
+                        "resolved recipient produced invalid notification target during send_message"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+
+        // Write message bundle to git archive (best-effort)
+        {
+            let mut all_recipient_names: SmallVec<[String; 12]> = SmallVec::new();
+            all_recipient_names.extend(resolved_to.iter().cloned());
+            all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
+            all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
+
+            // Deduplicate recipient names for archive write (avoid duplicate inbox writes)
+            all_recipient_names.sort_unstable();
+            all_recipient_names.dedup();
+
+            let msg_json = serde_json::json!({
+                "id": message_id,
+                "from": &sender.name,
+                "to": &resolved_to,
+                "cc": &resolved_cc_recipients,
+                "bcc": &resolved_bcc_recipients,
+                "subject": &message.subject,
+                "created": micros_to_iso(message.created_ts),
+                "thread_id": &message.thread_id,
+                "project": &project.human_key,
+                "project_slug": &project.slug,
+                "importance": &message.importance,
+                "ack_required": message.ack_required != 0,
+                "attachments": &all_attachment_meta,
+            });
+            try_write_message_archive(
+                config,
+                &project.slug,
+                &msg_json,
+                &message.body_md,
+                &sender.name,
+                &all_recipient_names,
+                &all_attachment_rel_paths,
+            );
+        }
     }
 
     let response = if config.messaging_fail_closed_send_profile {
@@ -2473,7 +2567,9 @@ effective_free_bytes={free}"
         project_key
     );
 
-    response.map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+    response
+        .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
 /// Reply to an existing message, preserving or establishing a thread.
@@ -2514,12 +2610,44 @@ pub async fn reply_message(
     attachment_paths: Option<Vec<String>>,
     convert_images: Option<bool>,
     sender_token: Option<String>,
+    idempotency_key: Option<String>,
 ) -> McpResult<String> {
     // Normalize names
     let sender_name = normalize_agent_name_or_original(sender_name);
     let to = normalize_optional_agent_names(to);
     let cc = normalize_optional_agent_names(cc);
     let bcc = normalize_optional_agent_names(bcc);
+    let idempotency_key =
+        crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
+    // Fingerprint the normalized reply payload (only when a key was supplied).
+    let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
+        let sorted = |v: Option<&Vec<String>>| {
+            let mut x = v.cloned().unwrap_or_default();
+            x.sort();
+            x.join("\u{1f}")
+        };
+        let mut atts = attachment_paths.clone().unwrap_or_default();
+        atts.sort();
+        crate::idempotency::compute_fingerprint(
+            "reply_message",
+            &[
+                ("parent", message_id.to_string()),
+                ("sender", sender_name.clone()),
+                ("body_md", body_md.clone()),
+                ("to", sorted(to.as_ref())),
+                ("cc", sorted(cc.as_ref())),
+                ("bcc", sorted(bcc.as_ref())),
+                ("subject_prefix", subject_prefix.clone().unwrap_or_default()),
+                ("importance", importance.clone().unwrap_or_default()),
+                ("ack_required", ack_required.unwrap_or(false).to_string()),
+                ("attachments", atts.join("\u{1f}")),
+                (
+                    "convert_images",
+                    convert_images.map(|b| b.to_string()).unwrap_or_default(),
+                ),
+            ],
+        )
+    });
 
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
     let config = &Config::get();
@@ -2700,33 +2828,17 @@ effective_free_bytes={free}"
     .await?;
     let sender_id = sender.id.unwrap_or(0);
 
-    // ── Sender identity verification (issue #42) ──────────────────────
-    let verified_sender = match sender_token.as_deref() {
-        Some(token) => {
-            if let Some(ref stored_token) = sender.registration_token {
-                if mcp_agent_mail_core::setup::constant_time_str_eq(token, stored_token) {
-                    true
-                } else {
-                    return Err(legacy_tool_error(
-                        "SENDER_TOKEN_MISMATCH",
-                        format!(
-                            "sender_token does not match the registered token for agent '{sender_name}'. \
-                             Only the agent's owner (the session that called register_agent) can send \
-                             messages as this agent. Use the registration_token returned by register_agent."
-                        ),
-                        false,
-                        serde_json::json!({
-                            "sender_name": sender_name,
-                            "hint": "Use the registration_token returned by register_agent as sender_token",
-                        }),
-                    ));
-                }
-            } else {
-                false
-            }
-        }
-        None => false,
-    };
+    // ── Sender identity verification (issue #42; GH#237 fail-closed) ──
+    // Same contract as send_message: under the fail-closed send profile a
+    // missing/unverifiable token REFUSES before any thread resolution or
+    // write. Reply is a message-creation path — it must not be the token-free
+    // way to speak as another agent.
+    let verified_sender = verify_sender_identity(
+        &sender_name,
+        sender_token.as_deref(),
+        sender.registration_token.as_deref(),
+        config.messaging_fail_closed_send_profile,
+    )?;
 
     // Resolve original sender name for default recipient
     let original_sender = db_outcome_to_mcp_result(
@@ -3182,129 +3294,173 @@ effective_free_bytes={free}"
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
-    let reply = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message_with_recipients(
-            ctx.cx(),
-            &pool,
+    // Idempotency (br-idempotency-keys-mutating-tools-h0x9k): route through the
+    // idempotent DB entry point when a key was supplied. A matching prior key
+    // replays the original reply (skipping the index/notification/archive side
+    // effects below, at-most-once); a differing payload is a typed conflict.
+    let (reply, idempotent_replay) = if let Some(fingerprint) = idempotency_fingerprint.as_deref() {
+        let key = idempotency_key.as_deref().unwrap_or_default();
+        let claim = mcp_agent_mail_db::IdempotencyClaim {
             project_id,
-            sender_id,
-            &subject,
-            &final_body,
-            Some(&thread_id),
-            &importance_val,
-            ack_required.unwrap_or(original.ack_required != 0),
-            &attachments_json,
-            &recipient_refs,
-        )
-        .await,
-    )?;
-
-    let reply_id = reply.id.unwrap_or(0);
-    enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
-    enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
-        id: reply_id,
-        project_id,
-        project_slug: project.slug.clone(),
-        sender_name: sender.name.clone(),
-        subject: reply.subject.clone(),
-        body_md: reply.body_md.clone(),
-        thread_id: Some(thread_id.clone()),
-        importance: reply.importance.clone(),
-        created_ts: reply.created_ts,
-    });
-
-    // Emit notification signals for to/cc recipients only (never bcc).
-    // Mirrors the send_message notification logic for parity with Python.
-    let notification_meta = mcp_agent_mail_storage::NotificationMessage {
-        id: Some(reply_id),
-        from: Some(sender.name.clone()),
-        subject: Some(reply.subject.clone()),
-        importance: Some(reply.importance.clone()),
-    };
-    let mut notified = HashSet::new();
-    for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
-        if notified.insert(name.clone()) {
-            match mcp_agent_mail_storage::emit_notification_signal(
-                config,
-                &project.slug,
-                name,
-                Some(&notification_meta),
-            ) {
-                mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
-                    if let Some(recipient_id) = recipient_map
-                        .get(&name.to_lowercase())
-                        .and_then(|agent| agent.id)
-                    {
-                        append_signal_delivery_receipt_after_emit(
-                            ctx,
-                            &pool,
-                            config,
-                            &project.slug,
-                            reply_id,
-                            recipient_id,
-                            name,
-                        )
-                        .await;
-                    } else {
-                        tracing::warn!(
-                            project = %project.slug,
-                            message_id = reply_id,
-                            recipient = %name,
-                            "signal emitted for recipient without a resolvable delivery receipt identity"
-                        );
-                    }
-                }
-                mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
-                    project = %project.slug,
-                    recipient = %name,
-                    "failed to emit notification signal during reply_message"
-                ),
-                mcp_agent_mail_storage::SignalEmitOutcome::InvalidTarget => tracing::warn!(
-                    project = %project.slug,
-                    recipient = %name,
-                    "resolved recipient produced invalid notification target during reply_message"
-                ),
-                _ => {}
+            tool: "reply_message",
+            key,
+            fingerprint,
+        };
+        match db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &subject,
+                &final_body,
+                Some(&thread_id),
+                &importance_val,
+                ack_required.unwrap_or(original.ack_required != 0),
+                &attachments_json,
+                &recipient_refs,
+                claim,
+            )
+            .await,
+        )? {
+            mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
+            mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
+            mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
+                return Err(crate::idempotency::idempotency_conflict_error(&info));
             }
         }
-    }
+    } else {
+        let row = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::create_message_with_recipients(
+                ctx.cx(),
+                &pool,
+                project_id,
+                sender_id,
+                &subject,
+                &final_body,
+                Some(&thread_id),
+                &importance_val,
+                ack_required.unwrap_or(original.ack_required != 0),
+                &attachments_json,
+                &recipient_refs,
+            )
+            .await,
+        )?;
+        (row, false)
+    };
 
-    // Write reply message bundle to git archive (best-effort)
-    {
-        let mut all_recipient_names: SmallVec<[String; 12]> = SmallVec::new();
-        all_recipient_names.extend(resolved_to.iter().cloned());
-        all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
-        all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
+    let reply_id = reply.id.unwrap_or(0);
 
-        // Deduplicate recipient names for archive write (avoid duplicate inbox writes)
-        all_recipient_names.sort_unstable();
-        all_recipient_names.dedup();
-
-        let msg_json = serde_json::json!({
-            "id": reply_id,
-            "from": &sender.name,
-            "to": &resolved_to,
-            "cc": &resolved_cc_recipients,
-            "bcc": &resolved_bcc_recipients,
-            "subject": &reply.subject,
-            "created": micros_to_iso(reply.created_ts),
-            "thread_id": &thread_id,
-            "project": &project.human_key,
-            "project_slug": &project.slug,
-            "importance": &reply.importance,
-            "ack_required": reply.ack_required != 0,
-            "attachments": &all_attachment_meta,
-            "reply_to": message_id,
+    // On an idempotent replay, skip all one-time side effects (search indexing,
+    // notification signals, git archive) — the original reply performed them
+    // exactly once (at-most-once archive dispatch).
+    if !idempotent_replay {
+        enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
+        enqueue_message_lexical_index(&mcp_agent_mail_db::search_v3::IndexableMessage {
+            id: reply_id,
+            project_id,
+            project_slug: project.slug.clone(),
+            sender_name: sender.name.clone(),
+            subject: reply.subject.clone(),
+            body_md: reply.body_md.clone(),
+            thread_id: Some(thread_id.clone()),
+            importance: reply.importance.clone(),
+            created_ts: reply.created_ts,
         });
-        try_write_message_archive(
-            config,
-            &project.slug,
-            &msg_json,
-            &reply.body_md,
-            &sender.name,
-            &all_recipient_names,
-            &all_attachment_rel_paths,
-        );
+
+        // Emit notification signals for to/cc recipients only (never bcc).
+        // Mirrors the send_message notification logic for parity with Python.
+        let notification_meta = mcp_agent_mail_storage::NotificationMessage {
+            id: Some(reply_id),
+            from: Some(sender.name.clone()),
+            subject: Some(reply.subject.clone()),
+            importance: Some(reply.importance.clone()),
+        };
+        let mut notified = HashSet::new();
+        for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
+            if notified.insert(name.clone()) {
+                match mcp_agent_mail_storage::emit_notification_signal(
+                    config,
+                    &project.slug,
+                    name,
+                    Some(&notification_meta),
+                ) {
+                    mcp_agent_mail_storage::SignalEmitOutcome::Emitted => {
+                        if let Some(recipient_id) = recipient_map
+                            .get(&name.to_lowercase())
+                            .and_then(|agent| agent.id)
+                        {
+                            append_signal_delivery_receipt_after_emit(
+                                ctx,
+                                &pool,
+                                config,
+                                &project.slug,
+                                reply_id,
+                                recipient_id,
+                                name,
+                            )
+                            .await;
+                        } else {
+                            tracing::warn!(
+                                project = %project.slug,
+                                message_id = reply_id,
+                                recipient = %name,
+                                "signal emitted for recipient without a resolvable delivery receipt identity"
+                            );
+                        }
+                    }
+                    mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
+                        project = %project.slug,
+                        recipient = %name,
+                        "failed to emit notification signal during reply_message"
+                    ),
+                    mcp_agent_mail_storage::SignalEmitOutcome::InvalidTarget => tracing::warn!(
+                        project = %project.slug,
+                        recipient = %name,
+                        "resolved recipient produced invalid notification target during reply_message"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+
+        // Write reply message bundle to git archive (best-effort)
+        {
+            let mut all_recipient_names: SmallVec<[String; 12]> = SmallVec::new();
+            all_recipient_names.extend(resolved_to.iter().cloned());
+            all_recipient_names.extend(resolved_cc_recipients.iter().cloned());
+            all_recipient_names.extend(resolved_bcc_recipients.iter().cloned());
+
+            // Deduplicate recipient names for archive write (avoid duplicate inbox writes)
+            all_recipient_names.sort_unstable();
+            all_recipient_names.dedup();
+
+            let msg_json = serde_json::json!({
+                "id": reply_id,
+                "from": &sender.name,
+                "to": &resolved_to,
+                "cc": &resolved_cc_recipients,
+                "bcc": &resolved_bcc_recipients,
+                "subject": &reply.subject,
+                "created": micros_to_iso(reply.created_ts),
+                "thread_id": &thread_id,
+                "project": &project.human_key,
+                "project_slug": &project.slug,
+                "importance": &reply.importance,
+                "ack_required": reply.ack_required != 0,
+                "attachments": &all_attachment_meta,
+                "reply_to": message_id,
+            });
+            try_write_message_archive(
+                config,
+                &project.slug,
+                &msg_json,
+                &reply.body_md,
+                &sender.name,
+                &all_recipient_names,
+                &all_attachment_rel_paths,
+            );
+        }
     }
 
     let payload = MessagePayload {
@@ -3357,6 +3513,7 @@ effective_free_bytes={free}"
     );
 
     serde_json::to_string(&response)
+        .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -4181,9 +4338,24 @@ pub async fn acknowledge_message(
     project_key: String,
     agent_name: String,
     message_id: i64,
+    idempotency_key: Option<String>,
 ) -> McpResult<String> {
     let agent_name = normalize_agent_name_or_original(agent_name);
     let config = Config::get();
+    let idempotency_key =
+        crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
+    // Fingerprint the normalized ack payload (only when a key was supplied). The
+    // raw ack is already COALESCE-idempotent; the key layer adds verbatim result
+    // replay + typed conflict detection (same key, different agent/message).
+    let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
+        crate::idempotency::compute_fingerprint(
+            "acknowledge_message",
+            &[
+                ("agent", agent_name.clone()),
+                ("message_id", message_id.to_string()),
+            ],
+        )
+    });
 
     // Each step that can hit a corrupt/busy/unavailable DB queues a durable
     // ack intent (fail-soft) rather than dropping a closeout acknowledgement.
@@ -4243,27 +4415,75 @@ pub async fn acknowledge_message(
 
     // Authorization note: agent_id is globally unique (auto-increment), so
     // the DB query implicitly scopes to the correct project. See mark_message_read.
-    let (read_ts, ack_ts) = match mcp_agent_mail_db::queries::acknowledge_message(
-        ctx.cx(),
-        &pool,
-        agent_id,
-        message_id,
-    )
-    .await
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(error) if db_error_supports_ack_intent(&error) => {
-            return queued_ack_intent_response(
-                &config,
-                &project_key,
-                &agent_name,
+    // Idempotency (br-idempotency-keys-mutating-tools-h0x9k): route through the
+    // idempotent DB entry point when a key was supplied. A matching prior key
+    // replays the stored (read_ts, ack_ts); a differing payload (same key, other
+    // agent/message) is a typed conflict. Ack has no archive/notification side
+    // effects, so a replay only marks the response.
+    let (read_ts, ack_ts, idempotent_replay) =
+        if let Some(fingerprint) = idempotency_fingerprint.as_deref() {
+            let claim = mcp_agent_mail_db::IdempotencyClaim {
+                project_id,
+                tool: "acknowledge_message",
+                key: idempotency_key.as_deref().unwrap_or_default(),
+                fingerprint,
+            };
+            let idem_outcome = mcp_agent_mail_db::queries::acknowledge_message_idempotent(
+                ctx.cx(),
+                &pool,
+                agent_id,
                 message_id,
-                "acknowledge_message",
-                &error.to_string(),
-            );
-        }
-        other => db_outcome_to_mcp_result(other)?,
-    };
+                claim,
+            )
+            .await;
+            // Same fail-soft ack-intent queuing as the plain path on a supported error.
+            if let Outcome::Err(error) = &idem_outcome
+                && db_error_supports_ack_intent(error)
+            {
+                return queued_ack_intent_response(
+                    &config,
+                    &project_key,
+                    &agent_name,
+                    message_id,
+                    "acknowledge_message",
+                    &error.to_string(),
+                );
+            }
+            match db_outcome_to_mcp_result(idem_outcome)? {
+                mcp_agent_mail_db::IdempotentOutcome::Fresh((read_ts, ack_ts)) => {
+                    (read_ts, ack_ts, false)
+                }
+                mcp_agent_mail_db::IdempotentOutcome::Replayed((read_ts, ack_ts)) => {
+                    (read_ts, ack_ts, true)
+                }
+                mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
+                    return Err(crate::idempotency::idempotency_conflict_error(&info));
+                }
+            }
+        } else {
+            let (read_ts, ack_ts) = match mcp_agent_mail_db::queries::acknowledge_message(
+                ctx.cx(),
+                &pool,
+                agent_id,
+                message_id,
+            )
+            .await
+            {
+                Outcome::Ok(value) => value,
+                Outcome::Err(error) if db_error_supports_ack_intent(&error) => {
+                    return queued_ack_intent_response(
+                        &config,
+                        &project_key,
+                        &agent_name,
+                        message_id,
+                        "acknowledge_message",
+                        &error.to_string(),
+                    );
+                }
+                other => db_outcome_to_mcp_result(other)?,
+            };
+            (read_ts, ack_ts, false)
+        };
 
     // The DB is reachable: opportunistically replay any previously-queued ack
     // intents so degraded-mode acknowledgements land once the mailbox recovers.
@@ -4284,6 +4504,7 @@ pub async fn acknowledge_message(
     );
 
     serde_json::to_string(&response)
+        .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -4635,6 +4856,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None, // idempotency_key
                     )
                     .await
                     .expect("multi-recipient send after replacement");
@@ -4901,6 +5123,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // idempotency_key
             )
             .await
             .expect_err("reply should fail when original sender metadata is missing");

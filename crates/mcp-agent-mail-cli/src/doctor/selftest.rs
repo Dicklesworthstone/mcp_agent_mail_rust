@@ -616,6 +616,7 @@ fn run_selftest_sequence_in_process(project_key: &str) -> WriteSelftestReport {
             None,
             None,
             None,
+            None, // idempotency_key
         )
         .await
         {
@@ -646,6 +647,7 @@ fn run_selftest_sequence_in_process(project_key: &str) -> WriteSelftestReport {
             project_key.clone(),
             RECIPIENT.to_string(),
             message_id,
+            None, // idempotency_key
         )
         .await
         {

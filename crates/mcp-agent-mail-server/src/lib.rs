@@ -165,21 +165,21 @@ use mcp_agent_mail_tools::{
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
     CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxEvents,
     FetchInboxProduct, FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation,
-    HealthCheck, IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents,
-    ListContacts, MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread,
-    MacroStartSession, MailboxResource, MailboxWithCommitsResource, MarkMessageRead,
-    MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
-    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
-    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
-    RequestContact, ResolvePaneIdentity, RespondContact, SearchMessages, SearchMessagesProduct,
-    SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource,
-    ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource,
-    ToolingDirectoryQueryResource, ToolingDirectoryResource, ToolingLocksQueryResource,
-    ToolingLocksResource, ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource,
-    ToolingMetricsQueryResource, ToolingMetricsResource, ToolingRecentResource,
-    ToolingSchemasQueryResource, ToolingSchemasResource, UninstallPrecommitGuard,
-    ViewsAckOverdueResource, ViewsAckRequiredResource, ViewsAcksStaleResource,
-    ViewsUrgentUnreadResource, Whois, clusters,
+    GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource, InboxResource,
+    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
+    MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
+    MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
+    ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
+    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
+    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
+    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
+    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
+    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
+    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
+    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
+    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -671,6 +671,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "acknowledge_message",
         clusters::MESSAGING,
         AcknowledgeMessage,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "get_message_delivery_receipt",
+        clusters::MESSAGING,
+        GetMessageDeliveryReceipt,
     );
     let server = add_tool(
         server,
@@ -2839,12 +2846,34 @@ fn validate_snapshot_temp_dir(candidate: &Path, source: &str) -> std::io::Result
 
 #[cfg(target_os = "macos")]
 fn trusted_platform_snapshot_temp_alias(candidate: &Path) -> std::io::Result<Option<PathBuf>> {
+    // GH#230: firmlink recognition is shared with the db/share path guards
+    // (`mcp_agent_mail_core::disk::is_platform_temp_firmlink`); this wrapper
+    // keeps the server-specific whitelist of temp subtrees (`/var/folders`,
+    // `/tmp`, `/var/tmp`) whose canonical `/private` twins are acceptable
+    // snapshot temp dirs.
+    const TRUSTED_SUBTREES: &[(&str, &str)] = &[
+        ("/var/folders", "/private/var/folders"),
+        ("/tmp", "/private/tmp"),
+        ("/var/tmp", "/private/var/tmp"),
+    ];
+    let Some((alias_prefix, canonical_prefix)) = TRUSTED_SUBTREES
+        .iter()
+        .copied()
+        .find(|(alias, _)| candidate.starts_with(alias))
+    else {
+        return Ok(None);
+    };
+    // The alias is only trusted when its top-level component (`/var` or
+    // `/tmp`) is a genuine Apple firmlink: a top-level symlink resolving to
+    // exactly `/private/<name>`. Anything else stays refused.
+    let firmlink_root: PathBuf = Path::new(alias_prefix).components().take(2).collect();
+    match std::fs::canonicalize(&firmlink_root) {
+        Ok(resolved)
+            if mcp_agent_mail_core::disk::is_platform_temp_firmlink(&firmlink_root, &resolved) => {}
+        _ => return Ok(None),
+    }
     let canonical = std::fs::canonicalize(candidate)?;
-    let trusted = (candidate.starts_with("/var/folders")
-        && canonical.starts_with("/private/var/folders"))
-        || (candidate.starts_with("/tmp") && canonical.starts_with("/private/tmp"))
-        || (candidate.starts_with("/var/tmp") && canonical.starts_with("/private/var/tmp"));
-    if !trusted {
+    if !canonical.starts_with(canonical_prefix) {
         return Ok(None);
     }
     if path_existing_prefix_has_symlink(&canonical)? {
@@ -7271,6 +7300,7 @@ fn execute_atc_advisory_effect(
                 Some(false),
                 Some(false),
                 None,
+                None, // idempotency_key
             )
             .await
         })
@@ -7307,6 +7337,7 @@ fn execute_atc_probe_effect(
                 Some(false),
                 Some(true),
                 None,
+                None, // idempotency_key
             )
             .await
         })

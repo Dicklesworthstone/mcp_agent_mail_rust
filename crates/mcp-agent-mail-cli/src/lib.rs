@@ -5457,7 +5457,7 @@ fn auto_clear_port(
         }
     }
 
-    let status = check_port_status(host, port);
+    let status = check_port_status_at_mcp_path(host, port, mcp_path);
     match status {
         PortStatus::Free => Ok(AutoClearPortOutcome::Cleared),
         PortStatus::AgentMailServer => {
@@ -5813,6 +5813,66 @@ mod port_kill_tests {
     }
 }
 
+/// GH#230: canonicalize the longest existing prefix of an operator-supplied
+/// output path so macOS firmlinks (`/var` -> `/private/var`, `/tmp` ->
+/// `/private/tmp`, `/etc` -> `/private/etc`) are resolved before the
+/// symlink-refusing export/deploy directory guards walk the path. The
+/// not-yet-existing suffix is re-appended untouched, so the guards still vet
+/// every component they go on to create.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return path.to_path_buf(),
+        }
+    };
+    let mut prefix = absolute.as_path();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(prefix) {
+            let Ok(suffix) = absolute.strip_prefix(prefix) else {
+                return absolute;
+            };
+            return canonical.join(suffix);
+        }
+        match prefix.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => prefix = parent,
+            _ => return absolute,
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_existing_prefix_tests {
+    use super::canonicalize_existing_prefix;
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_existing_symlinked_prefix_and_keeps_missing_suffix() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("create real dir");
+        let linked = dir.path().join("linked");
+        symlink(&real, &linked).expect("symlink");
+
+        let resolved = canonicalize_existing_prefix(&linked.join("missing").join("out"));
+        let canonical_real = std::fs::canonicalize(&real).expect("canonicalize real");
+        assert_eq!(resolved, canonical_real.join("missing").join("out"));
+    }
+
+    #[test]
+    fn anchors_relative_paths_and_preserves_missing_components() {
+        let resolved = canonicalize_existing_prefix(std::path::Path::new(
+            "definitely-missing-gh230/child/out",
+        ));
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("definitely-missing-gh230/child/out"));
+    }
+}
+
 fn handle_share(action: ShareCommand) -> CliResult<()> {
     match action {
         ShareCommand::Export(args) => {
@@ -5863,7 +5923,9 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 );
             }
             run_share_export(ShareExportParams {
-                output: args.output,
+                // GH#230: resolve macOS firmlinks in the operator-supplied
+                // output path before the symlink-refusing guards walk it.
+                output: canonicalize_existing_prefix(&args.output),
                 projects,
                 inline_threshold: inline,
                 detach_threshold: detach_adjusted,
@@ -5986,7 +6048,9 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
         ShareCommand::StaticExport(args) => {
             let output_display = args.output.display().to_string();
             let config = mcp_agent_mail_server::static_export::ExportConfig {
-                output_dir: args.output,
+                // GH#230: resolve macOS firmlinks in the operator-supplied
+                // output path before the symlink-refusing guards walk it.
+                output_dir: canonicalize_existing_prefix(&args.output),
                 projects: args.projects,
                 include_archive: args.include_archive,
                 include_search_index: args.include_search_index,
@@ -6092,8 +6156,11 @@ fn handle_deploy(action: DeployCommand) -> CliResult<()> {
         }
         DeployCommand::Tooling(args) => {
             ensure_dir(&args.bundle)?;
-            let repo_root = resolve_deploy_tooling_repo_root(&args.bundle)?;
-            let written = share::deploy::write_deploy_tooling(&repo_root, &args.bundle)?;
+            // GH#230: resolve macOS firmlinks in the operator-supplied bundle
+            // path before the symlink-refusing deploy guards walk it.
+            let bundle = canonicalize_existing_prefix(&args.bundle);
+            let repo_root = resolve_deploy_tooling_repo_root(&bundle)?;
+            let written = share::deploy::write_deploy_tooling(&repo_root, &bundle)?;
             ftui_runtime::ftui_println!("Wrote {} deployment files:", written.len());
             for file in &written {
                 ftui_runtime::ftui_println!("  {file}");
@@ -77147,6 +77214,7 @@ async fn call_send_message_tool_locally(
         None,
         None,
         sender_token.filter(|t| !t.is_empty()).map(str::to_string),
+        None, // idempotency_key
     )
     .await
     .map_err(mcp_error_to_cli_error)?;
@@ -77176,6 +77244,7 @@ async fn call_reply_message_tool_locally(
         None,
         None,
         None, // sender_token
+        None, // idempotency_key
     )
     .await
     .map_err(mcp_error_to_cli_error)?;

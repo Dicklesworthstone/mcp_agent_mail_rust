@@ -1655,6 +1655,7 @@ impl MessageBrowserScreen {
             None,
             None,
             None,
+            None, // idempotency_key
         ));
 
         match result {
@@ -1756,6 +1757,7 @@ impl MessageBrowserScreen {
             None,
             None,
             None, // sender_token
+            None, // idempotency_key
         ));
 
         match result {
