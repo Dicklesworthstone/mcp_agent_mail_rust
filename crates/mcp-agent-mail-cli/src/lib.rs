@@ -58512,6 +58512,9 @@ startup_timeout_sec = 42
         storage
             .create_issue(&in_progress_issue, "test")
             .expect("insert in-progress issue");
+        // `open_storage` owns the Beads write lock; release the fixture
+        // writer before asking the CLI's separate `br` process to query it.
+        drop(storage);
 
         let (ready, open, in_progress) =
             beads_issue_awareness_counts_from(Some(dir.path())).expect("counts");
@@ -58874,8 +58877,9 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
 
         // Initialize a fresh beads storage (creates the DB)
-        let _storage =
+        let storage =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+        drop(storage);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_beads_status(Some(dir.path().to_path_buf()), None, true);
@@ -58904,8 +58908,9 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
         std::fs::create_dir_all(&nested).expect("create nested dir");
 
-        let _storage =
+        let storage =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+        drop(storage);
 
         let _cwd = CwdGuard::chdir(&nested);
         let capture = ftui_runtime::StdioCapture::install().unwrap();
@@ -58955,6 +58960,7 @@ startup_timeout_sec = 42
                 "test",
             )
             .expect("insert custom issue");
+        drop(storage);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_beads_status(Some(dir.path().to_path_buf()), None, true);
@@ -58978,8 +58984,9 @@ startup_timeout_sec = 42
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
 
-        let _storage =
+        let storage =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
+        drop(storage);
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
         let result = handle_beads_ready(Some(dir.path().to_path_buf()), 20, None, true);
