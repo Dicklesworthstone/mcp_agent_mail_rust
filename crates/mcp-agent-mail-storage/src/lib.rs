@@ -1127,8 +1127,17 @@ pub fn archive_lag_critical_threshold_us() -> u64 {
 /// Outcome of pushing an op onto the archive retry backlog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveBacklogPush {
-    /// The op was durably queued for background retry.
+    /// The op was **durably** journaled to local disk (fsync + atomic rename)
+    /// AND enqueued for background retry. It survives a crash: `archive_backlog_recover`
+    /// replays it on the next boot.
     Queued,
+    /// The op was enqueued in memory for best-effort background retry, but its
+    /// durable journal could NOT be written (local-disk error). It is drained if
+    /// the process survives, but a crash before materialization loses the archive
+    /// write — the DB row stays authoritative and the archive-lag health metric
+    /// counts it. Callers MUST NOT report this as a durable acknowledgment
+    /// (br-ack-fast: "do not report queued/durable unless the journal persisted").
+    QueuedEphemeral,
     /// The backlog was at capacity; the op was dropped. The DB row remains
     /// authoritative (parity tooling reports the drift as DB-ahead).
     Dropped,
@@ -1295,9 +1304,18 @@ struct ArchiveRetryBacklog {
     drain_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     lifecycle: Mutex<()>,
     depth: AtomicU64,
+    /// Slots reserved by in-flight pushers between the capacity check and the
+    /// enqueue. Mutated ONLY while holding the `queue` lock, so the capacity
+    /// check `queue.len() + reserved` is race-free (br-ack-fast: concurrent
+    /// pushers can no longer exceed `cap`).
+    reserved: AtomicU64,
     enqueued_total: AtomicU64,
     drained_total: AtomicU64,
     dropped_total: AtomicU64,
+    /// Ops enqueued in memory whose durable journal could not be written
+    /// (returned [`ArchiveBacklogPush::QueuedEphemeral`]). Surfaced through the
+    /// archive-lag health metric so a disk that cannot journal is never green.
+    ephemeral_total: AtomicU64,
 }
 
 static ARCHIVE_BACKLOG: LazyLock<ArchiveRetryBacklog> = LazyLock::new(ArchiveRetryBacklog::new);
@@ -1317,9 +1335,11 @@ impl ArchiveRetryBacklog {
             drain_handle: Mutex::new(None),
             lifecycle: Mutex::new(()),
             depth: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
             enqueued_total: AtomicU64::new(0),
             drained_total: AtomicU64::new(0),
             dropped_total: AtomicU64::new(0),
+            ephemeral_total: AtomicU64::new(0),
         }
     }
 
@@ -1333,10 +1353,21 @@ impl ArchiveRetryBacklog {
     /// Durably journal and enqueue an op. `cap` bounds the in-memory queue; on
     /// overflow the op is dropped (DB stays authoritative). Non-blocking apart
     /// from the single local-disk journal fsync.
+    ///
+    /// Capacity is *reserved* under the queue lock before the (unlocked) journal
+    /// fsync and released when the entry is enqueued, so concurrent pushers can
+    /// never exceed `cap` (br-ack-fast: fixed a check-then-enqueue TOCTOU race).
+    /// The return value reflects **actual durability**: [`ArchiveBacklogPush::Queued`]
+    /// only when the journal persisted, else [`ArchiveBacklogPush::QueuedEphemeral`].
     fn push(&self, op: WriteOp, cap: u64) -> ArchiveBacklogPush {
+        // Reserve a slot under the lock: count both live entries and in-flight
+        // reservations against `cap` so parallel pushers serialize on the bound.
         {
             let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-            if u64::try_from(queue.len()).unwrap_or(u64::MAX) >= cap {
+            let occupied = u64::try_from(queue.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(self.reserved.load(Ordering::Relaxed));
+            if occupied >= cap {
                 drop(queue);
                 self.dropped_total.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
@@ -1346,20 +1377,40 @@ impl ArchiveRetryBacklog {
                 );
                 return ArchiveBacklogPush::Dropped;
             }
+            // Reserve while still holding the lock so the slot is visible to the
+            // next pusher's capacity check.
+            self.reserved.fetch_add(1, Ordering::Relaxed);
         }
         // Journal outside the queue lock: the fsync must not stall other pushers.
         let journal_path = archive_backlog_journal_write(&op);
-        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        queue.push_back(ArchiveBacklogEntry {
-            op,
-            journal_path,
-            first_enqueued_at: Instant::now(),
-            attempts: 0,
-        });
-        self.store_depth(&queue);
-        drop(queue);
+        let durable = journal_path.is_some();
+        {
+            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            // Release the reservation and enqueue the real entry atomically.
+            self.reserved.fetch_sub(1, Ordering::Relaxed);
+            queue.push_back(ArchiveBacklogEntry {
+                op,
+                journal_path,
+                first_enqueued_at: Instant::now(),
+                attempts: 0,
+            });
+            self.store_depth(&queue);
+        }
         self.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        ArchiveBacklogPush::Queued
+        if durable {
+            ArchiveBacklogPush::Queued
+        } else {
+            // The op is in memory only; a crash before the drain thread
+            // materializes it loses the archive write. Surface it — never claim
+            // durability the disk did not provide.
+            self.ephemeral_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                "archive retry backlog: op enqueued WITHOUT a durable journal \
+                 (local-disk journal write failed); a crash before drain loses the \
+                 archive materialization (DB authoritative; surfaced via archive-lag metric)"
+            );
+            ArchiveBacklogPush::QueuedEphemeral
+        }
     }
 
     /// Enqueue an op recovered from its on-disk journal (already durable).
@@ -1409,7 +1460,9 @@ impl ArchiveRetryBacklog {
                 drop(queue);
                 self.drained_total.fetch_add(1, Ordering::Relaxed);
                 if let Some(path) = journal_path {
-                    archive_backlog_journal_remove(&path);
+                    // Op is now durable in the archive: retire the journal
+                    // entry non-destructively (RULE 1) so recovery won't replay it.
+                    archive_backlog_journal_resolve(&path);
                 }
                 ArchiveBacklogDrainStep::Materialized
             }
@@ -1485,27 +1538,62 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
     let tmp_path = final_path.with_extension("json.tmp");
     if let Err(error) = archive_backlog_write_tmp(&tmp_path, &bytes) {
         tracing::warn!(error = %error, "archive backlog: journal write failed; in-memory only");
-        let _ = fs::remove_file(&tmp_path);
+        archive_backlog_quarantine_file(&tmp_path, "failed");
         return None;
     }
     if let Err(error) = fs::rename(&tmp_path, &final_path) {
         tracing::warn!(error = %error, "archive backlog: journal rename failed; in-memory only");
-        let _ = fs::remove_file(&tmp_path);
+        archive_backlog_quarantine_file(&tmp_path, "failed");
         return None;
     }
     Some(final_path)
 }
 
-fn archive_backlog_journal_remove(path: &Path) {
-    if let Err(error) = fs::remove_file(path) {
+/// RULE 1: the ack-fast backlog NEVER deletes journal files. Instead of removing
+/// `path`, move it into a `<journal-dir>/<subdir>/` sibling (created on demand),
+/// preserving the record for forensics/operator reclaim. Best-effort: a missing
+/// source is a no-op; a failed move leaves the file in place (recovery re-materializes
+/// idempotently, so a stray journal is never a correctness problem, only tidiness).
+///
+/// The `resolved/`/`failed/` subdirs are NOT re-scanned by [`archive_backlog_recover`]
+/// (it reads only top-level `*.json`), so quarantined entries are never replayed.
+/// In practice these dirs stay small because the backlog is used only on the
+/// degraded WBQ-unavailable fallback path; operators reclaim them like other
+/// `.doctor`/recovery debris.
+fn archive_backlog_quarantine_file(path: &Path, subdir: &str) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let quarantine_dir = parent.join(subdir);
+    if let Err(error) = fs::create_dir_all(&quarantine_dir) {
+        tracing::debug!(
+            error = %error,
+            dir = %quarantine_dir.display(),
+            "archive backlog: cannot create {subdir} quarantine dir; leaving journal in place"
+        );
+        return;
+    }
+    let Some(name) = path.file_name() else {
+        return;
+    };
+    let dest = quarantine_dir.join(name);
+    if let Err(error) = fs::rename(path, &dest) {
         if error.kind() != std::io::ErrorKind::NotFound {
             tracing::debug!(
                 error = %error,
-                path = %path.display(),
-                "archive backlog: journal remove failed (cleaned on next recover)"
+                from = %path.display(),
+                to = %dest.display(),
+                "archive backlog: quarantine move failed (recovery replays idempotently)"
             );
         }
     }
+}
+
+/// Retire a durably-materialized journal entry non-destructively (RULE 1): its
+/// op is now durable in the git archive, so the entry is moved into `resolved/`
+/// rather than deleted, and recovery no longer replays it.
+fn archive_backlog_journal_resolve(path: &Path) {
+    archive_backlog_quarantine_file(path, "resolved");
 }
 
 fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
@@ -1567,7 +1655,12 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
 pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
     let backlog = &*ARCHIVE_BACKLOG;
     let outcome = backlog.push(op, archive_backlog_cap());
-    if outcome == ArchiveBacklogPush::Queued {
+    // Both durable and ephemeral enqueues sit in the in-memory queue and need the
+    // drain thread; only a `Dropped` op was never enqueued.
+    if matches!(
+        outcome,
+        ArchiveBacklogPush::Queued | ArchiveBacklogPush::QueuedEphemeral
+    ) {
         archive_backlog_ensure_drain(backlog);
     }
     outcome
@@ -1687,6 +1780,10 @@ pub struct ArchiveLagSnapshot {
     pub drained_total: u64,
     /// Lifetime count of ops dropped because the retry backlog was full.
     pub dropped_total: u64,
+    /// Lifetime count of ops enqueued WITHOUT a durable journal (local-disk
+    /// journal write failed). Nonzero means the archive is not crash-safe for
+    /// those ops until they drain; the DB stays authoritative (br-ack-fast).
+    pub ephemeral_total: u64,
 }
 
 /// Snapshot the live archive-materialization lag for `health_check`.
@@ -1706,6 +1803,7 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         enqueued_total: backlog.enqueued_total.load(Ordering::Relaxed),
         drained_total: backlog.drained_total.load(Ordering::Relaxed),
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
+        ephemeral_total: backlog.ephemeral_total.load(Ordering::Relaxed),
     }
 }
 
@@ -16768,8 +16866,18 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let parsed: PersistedWriteOp = serde_json::from_slice(&bytes).unwrap();
         assert!(matches!(parsed, PersistedWriteOp::MessageBundle { .. }));
-        archive_backlog_journal_remove(&path);
-        assert!(!path.exists());
+        // RULE 1: resolve moves the journal into `resolved/` rather than deleting.
+        archive_backlog_journal_resolve(&path);
+        assert!(!path.exists(), "original journal path no longer present");
+        let resolved = path
+            .parent()
+            .unwrap()
+            .join("resolved")
+            .join(path.file_name().unwrap());
+        assert!(
+            resolved.exists(),
+            "journal preserved under resolved/ (not deleted)"
+        );
     }
 
     #[test]
@@ -16811,7 +16919,14 @@ mod tests {
         assert_eq!(
             journal_count(&journal_dir),
             0,
-            "journal removed only after durable materialization"
+            "top-level journal retired only after durable materialization"
+        );
+        // RULE 1: the journal is retired non-destructively into resolved/, not
+        // deleted, and recovery no longer replays it.
+        assert_eq!(
+            journal_count(&journal_dir.join("resolved")),
+            1,
+            "materialized journal preserved under resolved/"
         );
         // The message is now durably in the git archive.
         let archive = ensure_archive(&config, "local-drain").unwrap();
@@ -16820,17 +16935,26 @@ mod tests {
 
     #[test]
     fn archive_backlog_reports_lag_while_op_is_stuck() {
-        // storage_root points AT A FILE, so `write_op_sync` (ensure_archive) fails
-        // deterministically and the op stays in the backlog — letting us assert the
-        // lag metric reports nonzero while the archive has not converged (b).
+        // The op is DURABLY journaled and queued, but its archive materialization
+        // is wedged, so it stays in the backlog — letting us assert the lag metric
+        // reports nonzero while the archive has not converged (b). We block ONLY the
+        // project archive path (a FILE where its git repo dir must go, so
+        // `ensure_archive` fails during drain) while leaving `storage_root` — and
+        // thus the `.archive_backlog` journal dir — writable, so push is durable.
         let tmp = TempDir::new().unwrap();
-        let bad_root = tmp.path().join("not_a_dir");
-        std::fs::write(&bad_root, b"x").unwrap();
-        let config = test_config(&bad_root);
+        let config = test_config(tmp.path());
+        let projects_dir = config.storage_root.join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        std::fs::write(projects_dir.join("stuck-proj"), b"x").unwrap();
         let op = backlog_test_message_op(&config, "stuck-proj", 1);
 
         let backlog = ArchiveRetryBacklog::new();
         assert_eq!(backlog.push(op, 8_192), ArchiveBacklogPush::Queued);
+        assert_eq!(
+            backlog.ephemeral_total.load(Ordering::Relaxed),
+            0,
+            "op journaled durably (only the archive materialization is stuck)"
+        );
         assert_eq!(backlog.backlog_state().0, 1);
 
         assert!(matches!(
@@ -16882,6 +17006,155 @@ mod tests {
             !get_recent_commits(&archive, 8, None).unwrap().is_empty(),
             "recovered message materialized into the git archive"
         );
+    }
+
+    #[test]
+    fn archive_backlog_push_without_durable_journal_reports_ephemeral() {
+        // br-ack-fast durability gap: when the journal cannot be written, push
+        // must report QueuedEphemeral (NOT Queued) so callers never treat a
+        // non-crash-safe enqueue as durable. Force journal failure by planting a
+        // FILE where the `.archive_backlog` journal dir would go, so create_dir_all
+        // fails deterministically.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        std::fs::create_dir_all(&config.storage_root).unwrap();
+        std::fs::write(config.storage_root.join(".archive_backlog"), b"blocker").unwrap();
+
+        let backlog = ArchiveRetryBacklog::new();
+        let op = backlog_test_message_op(&config, "ephemeral-proj", 7);
+        assert_eq!(
+            backlog.push(op, 8_192),
+            ArchiveBacklogPush::QueuedEphemeral,
+            "journal write failed => ephemeral, not durable Queued"
+        );
+        // Still enqueued in memory for best-effort drain, and counted.
+        assert_eq!(backlog.backlog_state().0, 1, "op enqueued in memory");
+        assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn archive_backlog_push_bounds_at_capacity() {
+        // br-ack-fast overflow: the queue never exceeds `cap`; excess ops are
+        // Dropped (DB authoritative) and counted.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let backlog = ArchiveRetryBacklog::new();
+        let cap = 3u64;
+
+        for id in 0i64..3 {
+            assert_eq!(
+                backlog.push(backlog_test_message_op(&config, "cap-proj", id), cap),
+                ArchiveBacklogPush::Queued
+            );
+        }
+        // Now full: the next push is dropped, depth stays at cap.
+        assert_eq!(
+            backlog.push(backlog_test_message_op(&config, "cap-proj", 99), cap),
+            ArchiveBacklogPush::Dropped
+        );
+        assert_eq!(backlog.backlog_state().0, cap, "queue bounded at cap");
+        assert_eq!(backlog.dropped_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backlog.reserved.load(Ordering::Relaxed),
+            0,
+            "no reservation leaked"
+        );
+    }
+
+    #[test]
+    fn archive_backlog_capacity_bound_holds_under_concurrent_pushers() {
+        // br-ack-fast race fix: reserving capacity under the queue lock means N
+        // concurrent pushers can never enqueue more than `cap` (the old
+        // check-then-journal-then-enqueue TOCTOU could exceed it).
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let backlog = Arc::new(ArchiveRetryBacklog::new());
+        let cap = 8u64;
+        let pushers = 48u64;
+
+        let handles: Vec<_> = (0i64..48)
+            .map(|id| {
+                let backlog = Arc::clone(&backlog);
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    backlog.push(backlog_test_message_op(&config, "race-proj", id), cap)
+                })
+            })
+            .collect();
+        let mut queued = 0u64;
+        let mut dropped = 0u64;
+        for h in handles {
+            match h.join().unwrap() {
+                ArchiveBacklogPush::Queued | ArchiveBacklogPush::QueuedEphemeral => queued += 1,
+                ArchiveBacklogPush::Dropped => dropped += 1,
+            }
+        }
+        assert_eq!(queued + dropped, pushers, "every push accounted for");
+        assert!(
+            queued <= cap,
+            "never enqueued more than cap: {queued} > {cap}"
+        );
+        assert_eq!(
+            backlog.backlog_state().0,
+            queued,
+            "depth matches queued count"
+        );
+        assert!(
+            backlog.backlog_state().0 <= cap,
+            "queue depth bounded at cap under concurrency"
+        );
+        assert_eq!(
+            backlog.reserved.load(Ordering::Relaxed),
+            0,
+            "all reservations released"
+        );
+    }
+
+    #[test]
+    fn archive_backlog_resolved_journal_is_not_replayed_by_recover() {
+        // RULE 1 + idempotency: a journal retired into resolved/ (op already
+        // durable) is NOT re-materialized by a subsequent recover — recover reads
+        // only top-level *.json, never the resolved/ subdir.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let op = backlog_test_message_op(&config, "resolved-proj", 11);
+        let journal_path = archive_backlog_journal_write(&op).expect("journal write");
+
+        archive_backlog_journal_resolve(&journal_path);
+        assert!(
+            !journal_path.exists(),
+            "moved out of the top-level journal dir"
+        );
+        let journal_dir = config.storage_root.join(".archive_backlog");
+        let resolved = journal_dir
+            .join("resolved")
+            .join(journal_path.file_name().unwrap());
+        assert!(
+            resolved.exists(),
+            "preserved under resolved/ (RULE 1: never deleted)"
+        );
+
+        // Recover reads only top-level *.json; it must neither re-scan resolved/
+        // nor move the resolved entry back into the active journal dir. (Assert on
+        // the per-config filesystem, not the shared global backlog depth, so the
+        // test is robust under parallel execution.)
+        archive_backlog_recover(&config);
+        let top_level_json = std::fs::read_dir(&journal_dir).map_or(0, |rd| {
+            rd.filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.path().extension().map(|x| x == "json"))
+                    .unwrap_or(false)
+            })
+            .count()
+        });
+        assert_eq!(
+            top_level_json, 0,
+            "recover did not resurrect the resolved journal into the active dir"
+        );
+        assert!(resolved.exists(), "resolved entry untouched by recover");
     }
 
     #[test]
