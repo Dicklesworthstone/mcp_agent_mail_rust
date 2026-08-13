@@ -4346,6 +4346,154 @@ mod tests {
     }
 
     #[test]
+    fn send_message_reply_is_bounded_and_db_durable_with_async_archive() {
+        // br-ack-fast-storage-commit-reply-3ac88 acceptance (a)+(b): the tool reply
+        // returns as soon as the SQLite row is durable; git-archive materialization is
+        // strictly asynchronous. With the commit coalescer's batch window pinned to
+        // its ceiling (a reply coupled to the git commit would visibly wait on it),
+        // send_message must (a) return well under the 30s ecosystem client deadline,
+        // (b) be durable in the DB at reply time (a real row id is assigned), and the
+        // archive must converge afterward with the lag metric returning to zero.
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("ack-fast tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                // Pin the coalescer batch window to its clamped ceiling so a reply
+                // coupled to the git commit would be visibly delayed by it.
+                ("AM_ARCHIVE_BATCH_MS", "5000"),
+            ],
+            || {
+                Config::reset_cached();
+                let cx = Cx::for_testing();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let project_key = format!(
+                        "/data/projects/ack-fast-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    crate::ensure_project(&ctx, project_key.clone(), None)
+                        .await
+                        .expect("ensure project");
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("BlueLake".to_string()),
+                        Some("sender".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register sender");
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some("GreenStone".to_string()),
+                        Some("recipient".to_string()),
+                        Some("auto".to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register recipient");
+
+                    // ~6 KB markdown body, matching the br-hpv61 field workload shape.
+                    let body = "x".repeat(6 * 1024);
+                    let started = std::time::Instant::now();
+                    let response = crate::send_message(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        vec!["GreenStone".to_string()],
+                        "ack-fast latency probe".to_string(),
+                        body,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("send_message should return at the storage commit");
+                    let elapsed = started.elapsed();
+
+                    // (a) reply-at-commit: bounded under the 30s ecosystem deadline with
+                    // margin, i.e. NOT gated on the archive coalescer tail.
+                    assert!(
+                        elapsed < std::time::Duration::from_secs(25),
+                        "send_message reply must be bounded by DB commit and stay under the 30s \
+                         deadline, not track the archive coalescer; took {elapsed:?}"
+                    );
+                    eprintln!(
+                        "[ack-fast acceptance a] send_message reply latency (archive async, \
+                         coalescer window pinned to 5s): {elapsed:?}"
+                    );
+
+                    // Durable in the DB at reply time: the response carries a real row id
+                    // (assigned by the committed INSERT), before any git commit runs.
+                    let response_json: serde_json::Value =
+                        serde_json::from_str(&response).expect("parse send response");
+                    assert_eq!(
+                        response_json["count"].as_i64(),
+                        Some(1),
+                        "exactly one delivery expected: {response_json}"
+                    );
+                    let message_id = response_json["deliveries"][0]["payload"]["id"]
+                        .as_i64()
+                        .expect("message id in response");
+                    assert!(
+                        message_id > 0,
+                        "message must be durable (assigned a DB row id) at reply time"
+                    );
+
+                    // (b) the archive converges once materialization runs, and the lag
+                    // metric returns to zero backlog.
+                    assert!(
+                        mcp_agent_mail_storage::archive_backlog_flush_blocking(
+                            std::time::Duration::from_secs(15)
+                        ),
+                        "archive retry backlog drains"
+                    );
+                    mcp_agent_mail_storage::wbq_flush();
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let lag = mcp_agent_mail_storage::archive_lag_snapshot();
+                    assert_eq!(
+                        lag.backlog_depth, 0,
+                        "archive retry backlog must converge to empty after flush: {lag:?}"
+                    );
+                    eprintln!("[ack-fast acceptance b] archive lag after convergence: {lag:?}");
+                });
+            },
+        );
+    }
+
+    #[test]
     fn send_message_delivers_all_recipients_after_recipient_row_replacement() {
         let _lock = MESSAGING_THREAD_ID_TEST_LOCK
             .lock()
