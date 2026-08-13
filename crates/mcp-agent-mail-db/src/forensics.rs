@@ -2605,6 +2605,40 @@ fn archive_canonical_project_identities(storage_root: &Path) -> BTreeMap<String,
         .collect()
 }
 
+/// Why a live source must not be promotion authority, if it must not.
+///
+/// `Ok(None)` means full `integrity_check` passed — the snapshot (or its
+/// failure) can be trusted as a continuity verdict.
+/// `Ok(Some(reason))` means the file is present but not a trustworthy SQLite
+/// generation; callers empty the source sets so a healthy archive candidate
+/// can still be promoted (br-r6awv).
+/// `Err` is reserved for probes that failed without proving corruption
+/// (lock/busy, I/O) — those must not look like a successful heal.
+fn source_full_integrity_refusal(path: &Path) -> Result<Option<String>, SqlError> {
+    match crate::pool::sqlite_file_passes_full_integrity_check(path) {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(format!(
+            "source failed full integrity_check: {}",
+            path.display()
+        ))),
+        Err(health_error) => {
+            let message = health_error.to_string();
+            if crate::pool::is_corruption_error_message(&message) {
+                Ok(Some(message))
+            } else {
+                Err(health_error)
+            }
+        }
+    }
+}
+
+fn unverified_source_sets(reason: &str) -> (RecoveryContinuitySets, Option<String>) {
+    (
+        RecoveryContinuitySets::default(),
+        Some(recovery_sha256(reason.as_bytes())),
+    )
+}
+
 fn collect_recovery_receipt_evidence(
     receipts_dir: &Path,
     source_path: Option<&Path>,
@@ -2631,56 +2665,52 @@ fn collect_recovery_receipt_evidence(
                     // correctly lacks; using those sets as authority is what
                     // crash-looped reconstruct on the live 951-message wedge
                     // (br-r6awv). Full integrity_check is the promotion gate.
-                    match crate::pool::sqlite_file_passes_full_integrity_check(path) {
-                        Ok(true) => (sets, None),
-                        Ok(false) => {
+                    match source_full_integrity_refusal(path) {
+                        Ok(None) => (sets, None),
+                        Ok(Some(reason)) => {
                             tracing::warn!(
                                 source = %path.display(),
+                                reason = %reason,
                                 "recovery receipt: source failed full integrity_check; \
                                  not using its continuity sets as promotion authority"
                             );
-                            (
-                                RecoveryContinuitySets::default(),
-                                Some(recovery_sha256(
-                                    format!(
-                                        "source failed full integrity_check: {}",
-                                        path.display()
-                                    )
-                                    .as_bytes(),
-                                )),
-                            )
+                            unverified_source_sets(&reason)
                         }
                         Err(health_error) => {
-                            let message = health_error.to_string();
-                            if crate::pool::is_corruption_error_message(&message) {
-                                (
-                                    RecoveryContinuitySets::default(),
-                                    Some(recovery_sha256(message.as_bytes())),
-                                )
-                            } else {
-                                return Err(recovery_receipt_error(
-                                    "source generation health classification",
-                                    path,
-                                    format!(
-                                        "semantic snapshot succeeded but full integrity_check failed ({health_error})"
-                                    ),
-                                ));
-                            }
+                            return Err(recovery_receipt_error(
+                                "source generation health classification",
+                                path,
+                                format!(
+                                    "semantic snapshot succeeded but full integrity_check failed ({health_error})"
+                                ),
+                            ));
                         }
                     }
                 }
-                Err(snapshot_error) => match crate::pool::sqlite_file_is_healthy(path) {
-                    Ok(false) => (
-                        RecoveryContinuitySets::default(),
-                        Some(recovery_sha256(snapshot_error.to_string().as_bytes())),
-                    ),
-                    Ok(true) => return Err(snapshot_error),
+                // Snapshot failed. The weaker quick_check/incremental health
+                // probe can still pass on a file that full integrity_check
+                // rejects; treating that as "healthy, inventory is the bug"
+                // refused promotion and crash-looped startup (br-r6awv).
+                // Only a source that *passes* full integrity is allowed to
+                // block the archive candidate.
+                Err(snapshot_error) => match source_full_integrity_refusal(path) {
+                    Ok(None) => return Err(snapshot_error),
+                    Ok(Some(reason)) => {
+                        tracing::warn!(
+                            source = %path.display(),
+                            snapshot_error = %snapshot_error,
+                            reason = %reason,
+                            "recovery receipt: source snapshot failed and the file is not \
+                             a trustworthy SQLite generation; not using it as promotion authority"
+                        );
+                        unverified_source_sets(&format!("{snapshot_error}; {reason}"))
+                    }
                     Err(health_error) => {
                         return Err(recovery_receipt_error(
                             "source generation health classification",
                             path,
                             format!(
-                                "semantic snapshot failed ({snapshot_error}); health classification also failed ({health_error})"
+                                "semantic snapshot failed ({snapshot_error}); full integrity_check also failed ({health_error})"
                             ),
                         ));
                     }
@@ -4647,6 +4677,33 @@ mod tests {
 
         prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
             .expect("corrupt source must not block promotion of a healthy archive candidate");
+    }
+
+    /// Snapshot fails immediately on a non-SQLite file. Promotion must still
+    /// treat that source as unverified — the weaker `sqlite_file_is_healthy`
+    /// path used to be the only snapshot-error gate, and a mismatch vs full
+    /// integrity_check is how a refused candidate crash-looped startup.
+    #[test]
+    fn recovery_receipt_promotes_when_source_is_not_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        std::fs::write(&source, b"not-a-database").expect("plant non-sqlite source");
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("a non-sqlite source must not block promotion of a healthy archive candidate");
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&prepared.pending_path).expect("read pending receipt"),
+        )
+        .expect("decode pending receipt");
+        assert!(
+            document.body.source_snapshot_failure_sha256.is_some(),
+            "receipt must attest that the garbage source was not used as authority"
+        );
+        assert_eq!(document.body.source.projects.count, 0);
     }
 
     /// The identity/volatile split (GH#208): lifecycle state that archive

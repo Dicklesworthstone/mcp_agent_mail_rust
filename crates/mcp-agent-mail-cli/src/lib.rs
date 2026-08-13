@@ -6826,16 +6826,21 @@ where
                     auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
                     Ok(())
                 }
-                Err(err) if is_reconstruct_promotion_refusal(&err) => {
+                Err(err)
+                    if is_reconstruct_promotion_refusal(&err) && reconstruct_db_path.is_file() =>
+                {
                     // br-r6awv: a refused promotion means the live DB still
                     // holds coordination keys the archive candidate would
                     // drop. Crashing startup here is what crash-looped
-                    // systemd for days. Keep the live file and boot.
+                    // systemd for days. Keep the live file and boot — but
+                    // only when that file is still present. A refusal with
+                    // no live DB is not a heal.
                     output::warn(&format!(
                         "Automatic mailbox reconstruction refused promotion \
                          (live database kept): {err}"
                     ));
                     cleanup_stale_db_artifacts(&reconstruct_db_path)?;
+                    auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
                     Ok(())
                 }
                 Err(err) => Err(err),
@@ -51685,7 +51690,9 @@ startup_timeout_sec = 42
     fn startup_database_self_heal_keeps_live_db_when_reconstruct_promotion_refuses() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_archive_mailbox_project(dir.path());
-        let db_path = dir.path().join("missing.sqlite3");
+        let db_path = dir.path().join("live.sqlite3");
+        std::fs::write(&db_path, b"not-a-database")
+            .expect("plant the live DB that promotion refusal must keep");
         let db_url = format!("sqlite:///{}", db_path.display());
         let reconstruct_called = std::cell::Cell::new(false);
 
@@ -51704,10 +51711,46 @@ startup_timeout_sec = 42
             },
         )
         .expect("promotion refusal must keep the live DB and continue startup");
+        assert!(
+            db_path.is_file(),
+            "fail-open must not remove the live database it claimed to keep"
+        );
 
         assert!(
             reconstruct_called.get(),
             "reconstruct runner should still be attempted"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_does_not_fail_open_when_live_db_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_archive_mailbox_project(dir.path());
+        let db_path = dir.path().join("missing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let error = run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || panic!("missing-db fixture should not repair"),
+            |_| {
+                Err(CliError::Other(
+                    "reconstruction succeeded but final database promotion failed: \
+                     recovery candidate would lose stable coordination keys"
+                        .to_string(),
+                ))
+            },
+        )
+        .expect_err("promotion refusal with no live DB is not a heal");
+        assert!(
+            error
+                .to_string()
+                .contains("would lose stable coordination keys"),
+            "missing-db refusal must surface the promotion error, got {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "fail-open must not invent a live database that was never there"
         );
     }
 
