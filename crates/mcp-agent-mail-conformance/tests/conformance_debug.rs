@@ -260,7 +260,7 @@ fn audit_doc_matches_live_inventory() {
         .collect();
     assert_eq!(
         runtime_tools.len(),
-        39,
+        40,
         "tool count drifted from audit baseline"
     );
 
