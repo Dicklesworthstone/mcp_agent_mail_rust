@@ -1046,9 +1046,47 @@ pub fn is_running_under_cargo_test_harness() -> bool {
         // insta snapshot runner marker.
         "INSTA_WORKSPACE_ROOT",
     ];
-    markers
+    if markers
         .iter()
         .any(|k| process_env_value(k).is_some_and(|v| !v.trim().is_empty()))
+    {
+        return true;
+    }
+    // Fallback for UNIT tests run via plain `cargo test --lib` (br-3jkqw): none of
+    // the markers above are set for `src/` unit tests (`CARGO_TARGET_TMPDIR` is
+    // integration-test-only), so a unit test (e.g. the ack_ttl escalation cases)
+    // that resolved `Config::from_env` to the default archive slipped past this
+    // guard and leaked junk projects into the real user archive. Cargo compiles
+    // every test/bench binary into `<target>/<profile>/deps/`, whereas the shipped
+    // `am` / `mcp-agent-mail` binaries live one level up in `<target>/<profile>/`
+    // (or an install dir like `~/.local/bin`), so a `current_exe` whose immediate
+    // parent directory is `deps` is a cargo test/bench binary — never production.
+    current_exe_is_in_cargo_deps_dir()
+}
+
+/// True when the running executable is a cargo-compiled test/bench binary
+/// (`<target>/<profile>/deps/<name>-<hash>`).
+///
+/// Marker-independent fallback for [`is_running_under_cargo_test_harness`] so
+/// `cargo test --lib` unit tests — which set none of the harness env markers —
+/// are still guarded against writing to the default user archive (br-3jkqw).
+/// Robust to a renamed `CARGO_TARGET_DIR` (only the fixed `deps` leaf matters)
+/// and false-positive safe: production binaries never live directly under a
+/// `deps` directory.
+///
+/// `AM_ASSUME_PRODUCTION_EXE` is a test-only escape hatch that forces `false` so
+/// the production-path guard test can be exercised from within a (necessarily
+/// `deps`-hosted) test binary. It must never be set outside tests.
+fn current_exe_is_in_cargo_deps_dir() -> bool {
+    if env_truthy("AM_ASSUME_PRODUCTION_EXE") {
+        return false;
+    }
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "deps")
 }
 
 /// When this process is running under a test harness and `storage_root`
@@ -5324,15 +5362,42 @@ mod tests {
             &[
                 ("HOME", home.to_string_lossy().as_ref()),
                 ("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref()),
-                // Clear all harness markers via override.
+                // Clear all harness markers via override, and force the exe-in-deps
+                // fallback off (br-3jkqw) so this test can exercise the true
+                // production path from within a (necessarily deps-hosted) test binary.
                 ("CARGO_TARGET_TMPDIR", ""),
                 ("NEXTEST_RUN_ID", ""),
                 ("INSTA_WORKSPACE_ROOT", ""),
+                ("AM_ASSUME_PRODUCTION_EXE", "1"),
             ],
             || {
                 let default_path = default_storage_root_path();
                 // Must not panic when no harness marker is set.
                 guard_against_default_storage_root_in_test_mode(&default_path);
+            },
+        );
+    }
+
+    #[test]
+    fn exe_in_cargo_deps_dir_flags_unit_test_binary_without_markers() {
+        // br-3jkqw: a plain `cargo test --lib` unit-test binary sets none of the
+        // harness env markers, yet it is compiled into `<target>/<profile>/deps/`.
+        // The exe-in-deps fallback must flag it so `Config::from_env` still guards
+        // against writing to the default user archive. This test binary is itself
+        // such a binary, so the detector must report `true` with markers cleared
+        // and the production escape hatch unset.
+        with_process_env_overrides_for_test(
+            &[
+                ("CARGO_TARGET_TMPDIR", ""),
+                ("NEXTEST_RUN_ID", ""),
+                ("INSTA_WORKSPACE_ROOT", ""),
+                ("AM_ASSUME_PRODUCTION_EXE", ""),
+            ],
+            || {
+                assert!(
+                    is_running_under_cargo_test_harness(),
+                    "exe-in-deps fallback must flag this unit-test binary even with all env markers cleared"
+                );
             },
         );
     }
