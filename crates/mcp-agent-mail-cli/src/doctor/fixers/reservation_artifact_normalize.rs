@@ -351,7 +351,7 @@ fn scan_artifacts(
                 ) {
                     quarantines.push(QuarantineArtifact {
                         source: path,
-                        project,
+                        project: project.clone(),
                         reason: QuarantineReason::LegacyDuplicateOfStampedArtifact,
                     });
                 }
@@ -372,7 +372,7 @@ fn scan_artifacts(
             migrations.push(LegacyMigration {
                 source: path,
                 destination,
-                project,
+                project: project.clone(),
                 reservation_id: parsed.id,
                 content,
                 mode: file_mode(&entry.path()),
