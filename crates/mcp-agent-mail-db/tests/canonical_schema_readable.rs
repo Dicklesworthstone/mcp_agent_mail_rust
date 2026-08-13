@@ -29,7 +29,9 @@ fn make_schema_db() -> (tempfile::TempDir, String) {
         .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
         .expect("apply init PRAGMAs");
     let cx = Cx::for_testing();
-    match common::spin_poll(mcp_agent_mail_db::schema::migrate_to_latest_base(&cx, &init_conn)) {
+    match common::spin_poll(mcp_agent_mail_db::schema::migrate_to_latest_base(
+        &cx, &init_conn,
+    )) {
         Outcome::Ok(_) => {}
         other => panic!("schema migration failed: {other:?}"),
     }
@@ -67,7 +69,8 @@ fn canonical_sqlite_reads_comment_prefixed_schema() {
         let sql = row.get_named::<String>("sql").unwrap_or_default();
         let head = sql.trim_start();
         assert!(
-            head.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("create")),
+            head.get(..6)
+                .is_some_and(|p| p.eq_ignore_ascii_case("create")),
             "sqlite_master.sql for table `{name}` must start at CREATE, not a comment; got: {:?}",
             &head.chars().take(48).collect::<String>()
         );
@@ -75,7 +78,12 @@ fn canonical_sqlite_reads_comment_prefixed_schema() {
 
     // Force canonical SQLite to actually USE the parsed schema for a couple of
     // representative tables (a bare open can lazily defer the schema parse).
-    for table in ["projects", "messages", "file_reservations", "idempotency_keys"] {
+    for table in [
+        "projects",
+        "messages",
+        "file_reservations",
+        "idempotency_keys",
+    ] {
         canon
             .query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
             .unwrap_or_else(|e| {

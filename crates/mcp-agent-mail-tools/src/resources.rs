@@ -326,6 +326,23 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))?;
     let resolved_path = PathBuf::from(&resolved.canonical_path);
     if !resolved_path.exists() {
+        // A live DB that never existed AND an archive with no durable state
+        // is an EMPTY mailbox, not a database failure: serve lookups from an
+        // empty in-memory schema so each resource reports its own natural
+        // not-found (e.g. "Project not found") instead of a generic
+        // DATABASE_ERROR. Resource reads must never create the live file.
+        if resource_live_database_missing_without_archive_state() {
+            let empty = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: "sqlite:///:memory:".to_string(),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))?;
+            return Ok(ResourceReadPool::live(empty));
+        }
         return Err(resource_sync_db_error_to_mcp_error(format!(
             "resource read-only sqlite source not found: {}",
             resolved_path.display()
@@ -350,7 +367,6 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
 }
 
-#[allow(dead_code)]
 fn resource_live_database_missing_without_archive_state() -> bool {
     let config = Config::from_env();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {

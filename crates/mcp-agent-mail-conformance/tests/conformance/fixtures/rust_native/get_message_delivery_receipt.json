@@ -61,6 +61,7 @@
       },
       "normalize": {
         "ignore_json_pointers": [
+          "/project_id",
           "/persisted_at",
           "/recipients/0/signaled",
           "/recipients/0/signal_receipts"
