@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool,
-    get_db_pool, legacy_tool_error, parse_attachment_metadata_json,
-    parse_recipients_lists, resolve_agent, resolve_existing_project, resolve_project,
+    get_db_pool, legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists,
+    resolve_agent, resolve_existing_project, resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
