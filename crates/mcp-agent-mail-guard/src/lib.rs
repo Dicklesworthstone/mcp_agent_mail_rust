@@ -882,25 +882,61 @@ def project_metadata_matches(
     canonical_human_key = canonical_text(human_key)
     return bool(canonical_human_key and canonical_human_key in {canonical_project, canonical_repo})
 
+def probe_real_directory(path):
+    """(is_dir, error) -- inspection errors are distinct from a missing path.
+
+    `os.path.isdir` coerces permission errors into False, which upstream made
+    indistinguishable from "no matching project" and therefore fail-OPEN
+    (GH#228). Absent paths return (False, None); paths that cannot even be
+    inspected return (False, "<detail>") so the caller can route the errored
+    outcome through fail_closed.
+    """
+    try:
+        if os.path.islink(path):
+            return False, None
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False, None
+    except OSError as exc:
+        return False, "%s: %s" % (path, exc)
+    try:
+        return os.path.isdir(path), None
+    except OSError as exc:
+        return False, "%s: %s" % (path, exc)
+
 def resolve_archive_root():
     """Locate this project's archive root.
 
-    Returns (archive_root, suspicious_entry):
-    - (path, None) when a matching archive is found;
-    - (None, name) when an archive whose directory name collides with this
-      project's slug exists but provably belongs to a different project
+    Returns (archive_root, suspicious_entry, errors):
+    - (path, None, [...]) when a matching archive is found;
+    - (None, name, [...]) when an archive whose directory name collides with
+      this project's slug exists but provably belongs to a different project
       (slug collision -- the guard must stay fail-closed, GH#224 note);
-    - (None, None) when nothing in the storage root relates to this repo at
-      all (nothing to guard -- callers may fail open).
+    - (None, None, []) when nothing in the storage root relates to this repo
+      at all (nothing to guard -- callers may fail open);
+    - (None, *, [error, ...]) when resolution hit inspection errors
+      (permissions, IO) that make "no match" unprovable -- callers must route
+      this through fail_closed rather than allowing (GH#228).
     """
+    errors = []
     repo_root = get_repo_root()
-    if repo_root and is_real_directory(os.path.join(repo_root, "file_reservations")):
-        return repo_root, None
+    if repo_root:
+        local_reservations, err = probe_real_directory(
+            os.path.join(repo_root, "file_reservations")
+        )
+        if local_reservations:
+            return repo_root, None, errors
+        if err:
+            errors.append(err)
 
     storage_root = default_storage_root()
     projects_dir = os.path.join(storage_root, "projects")
-    if not is_real_directory(projects_dir):
-        return None, None
+    projects_dir_ok, err = probe_real_directory(projects_dir)
+    if err:
+        errors.append(err)
+        return None, None, errors
+    if not projects_dir_ok:
+        return None, None, errors
 
     project_value = PROJECT.strip()
     project_slug = slugify(project_value) if project_value else ""
@@ -925,15 +961,21 @@ def resolve_archive_root():
 
     for name in explicit_names:
         candidate = os.path.join(projects_dir, name)
-        if is_real_directory(os.path.join(candidate, "file_reservations")):
-            return candidate, None
+        reservations_ok, err = probe_real_directory(
+            os.path.join(candidate, "file_reservations")
+        )
+        if reservations_ok:
+            return candidate, None, errors
+        if err:
+            errors.append(err)
 
     canonical_project = canonical_text(project_value)
     canonical_repo = canonical_text(repo_root)
     try:
         entries = sorted(os.scandir(projects_dir), key=lambda entry: entry.name)
-    except OSError:
-        return None, None
+    except OSError as exc:
+        errors.append("%s: %s" % (projects_dir, exc))
+        return None, None, errors
 
     slug_candidates = set(explicit_names)
     if project_slug:
@@ -946,14 +988,21 @@ def resolve_archive_root():
         try:
             if not entry.is_dir(follow_symlinks=False):
                 continue
-        except OSError:
+        except OSError as exc:
+            errors.append("%s: %s" % (entry.path, exc))
             continue
 
         candidate = entry.path
-        if not is_real_directory(os.path.join(candidate, "file_reservations")):
+        reservations_ok, err = probe_real_directory(
+            os.path.join(candidate, "file_reservations")
+        )
+        if err:
+            errors.append(err)
+            continue
+        if not reservations_ok:
             continue
         if entry.name in explicit_names:
-            return candidate, None
+            return candidate, None, errors
 
         metadata_path = os.path.join(candidate, "project.json")
         if not is_real_file(metadata_path):
@@ -963,6 +1012,11 @@ def resolve_archive_root():
         try:
             with open(metadata_path, "r", encoding="utf-8") as handle:
                 metadata = json.load(handle)
+        except OSError as exc:
+            # Cannot rule this candidate out as ours: unreadable metadata is
+            # an errored outcome, not proof of no-match (GH#228).
+            errors.append("%s: %s" % (metadata_path, exc))
+            continue
         except Exception:
             if suspicious is None and entry.name in slug_candidates:
                 suspicious = entry.name
@@ -976,11 +1030,11 @@ def resolve_archive_root():
             canonical_project,
             canonical_repo,
         ):
-            return candidate, None
+            return candidate, None, errors
         if suspicious is None and entry.name in slug_candidates:
             suspicious = entry.name
 
-    return None, suspicious
+    return None, suspicious, errors
 
 def released_ts_marks_released(value):
     if value is None:
@@ -1025,8 +1079,18 @@ def is_expired(value, now):
 
 def get_active_reservations():
     """Read active file reservations directly from the archive."""
-    archive_root, suspicious = resolve_archive_root()
+    archive_root, suspicious, errors = resolve_archive_root()
     if not archive_root:
+        if errors:
+            # Resolution ERRORED -- "no matching project" is unprovable
+            # (permissions, IO). Coercing this into the no-match allow path
+            # turned a chmod-000 storage root into a silent bypass of an
+            # active exclusive reservation (GH#228). fail_closed honors
+            # AGENT_MAIL_GUARD_MODE=warn and advertises AGENT_MAIL_BYPASS=1.
+            fail_closed(
+                "mcp-agent-mail: guard could not resolve the archive for project "
+                "%r; resolution errors: %s" % (PROJECT, "; ".join(errors[:5]))
+            )
         if suspicious:
             # An archive directory named like this project's slug exists but
             # provably belongs to a different project (slug collision).
@@ -4186,6 +4250,127 @@ mod tests {
         );
     }
 
+    /// GH#228: an archive-resolution ERROR (permissions) must not be coerced
+    /// into the "no project matches → allow" path. chmod 000 on
+    /// `storage/projects` previously turned a must-block commit into a silent
+    /// allow; it must now fail closed (and honor AGENT_MAIL_GUARD_MODE=warn).
+    #[cfg(unix)]
+    #[test]
+    fn guard_plugin_archive_resolution_error_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(python) = python_executable() else {
+            return;
+        };
+        // chmod 000 does not restrict root; the scenario is unprovable there.
+        let euid = Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+        if euid.as_deref() == Some("0") {
+            return;
+        }
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        let staged = repo_dir.join("src").join("main.rs");
+        std::fs::create_dir_all(staged.parent().expect("src dir")).expect("mkdir src");
+        std::fs::write(&staged, "fn main() {}\n").expect("write staged file");
+        run_git(&repo_dir, &["add", "src/main.rs"]);
+
+        let repo_identity =
+            mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy());
+        let archive_root = storage_root.join("projects").join(&repo_identity.slug);
+        let reservations_dir = archive_root.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        std::fs::write(
+            archive_root.join("project.json"),
+            serde_json::json!({
+                "slug": repo_identity.slug,
+                "human_key": repo_dir.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+        std::fs::write(
+            reservations_dir.join("conflict.json"),
+            serde_json::json!({
+                "path_pattern": "src/main.rs",
+                "agent_name": "OtherAgent",
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+
+        // Make the projects dir uninspectable — resolution now ERRORS rather
+        // than proving "no match".
+        let projects_dir = storage_root.join("projects");
+        let saved_mode = std::fs::metadata(&projects_dir)
+            .expect("projects metadata")
+            .permissions();
+        std::fs::set_permissions(&projects_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 projects");
+
+        let run = |mode: Option<&str>| {
+            let mut cmd = Command::new(&python);
+            cmd.current_dir(&repo_dir)
+                .env("AGENT_NAME", "PinkStone")
+                .env("STORAGE_ROOT", &storage_root)
+                .arg(&script_path);
+            if let Some(mode) = mode {
+                cmd.env("AGENT_MAIL_GUARD_MODE", mode);
+            }
+            cmd.output().expect("run guard script")
+        };
+
+        let blocked = run(None);
+        let warned = run(Some("warn"));
+
+        // Restore permissions BEFORE asserting so tempdir cleanup always works.
+        std::fs::set_permissions(&projects_dir, saved_mode).expect("restore projects perms");
+
+        assert_eq!(
+            blocked.status.code(),
+            Some(2),
+            "resolution errors must fail closed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&blocked.stdout),
+            String::from_utf8_lossy(&blocked.stderr),
+        );
+        let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+        assert!(
+            blocked_stderr.contains("could not resolve the archive")
+                && blocked_stderr.contains("AGENT_MAIL_BYPASS=1"),
+            "errored outcome must explain itself and advertise the escape hatch: {blocked_stderr}",
+        );
+
+        assert_eq!(
+            warned.status.code(),
+            Some(0),
+            "AGENT_MAIL_GUARD_MODE=warn must allow with a warning: stdout={}, stderr={}",
+            String::from_utf8_lossy(&warned.stdout),
+            String::from_utf8_lossy(&warned.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&warned.stderr).contains("WARNING"),
+            "warn mode must still surface the degraded protection",
+        );
+    }
+
     #[test]
     fn guard_plugin_pre_commit_fails_closed_when_git_is_unavailable() {
         let Some(python) = python_executable() else {
@@ -4929,8 +5114,8 @@ mod tests {
 
     /// Regression: `resolve_archive_root`'s explicit-name fast path (a
     /// slug-style PROJECT whose `projects/<slug>/file_reservations` archive
-    /// exists) must return the `(archive_root, suspicious)` tuple like every
-    /// other return site. It previously returned the bare path, so the
+    /// exists) must return the `(archive_root, suspicious, errors)` tuple like
+    /// every other return site. It previously returned the bare path, so the
     /// caller's tuple unpack raised `ValueError` — an unhandled traceback
     /// (exit 1) that blocked every commit on the *healthy* happy path, and
     /// that `AGENT_MAIL_GUARD_MODE=warn` could not soften.
