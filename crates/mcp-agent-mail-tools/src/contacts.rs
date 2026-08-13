@@ -277,11 +277,11 @@ pub async fn request_contact(
     // write pool. In particular, a fresh database can legitimately have no
     // archive repository yet; that must not turn a missing project into an
     // unrelated archive-open DATABASE_ERROR.
-    let existing_source_project = if !register_if_missing {
+    let existing_source_project = if register_if_missing {
+        None
+    } else {
         let read_pool = get_coalescer_bypass_read_db_pool()?;
         Some(resolve_existing_project(ctx, &read_pool, &project_key).await?)
-    } else {
-        None
     };
 
     let pool = get_db_pool()?;

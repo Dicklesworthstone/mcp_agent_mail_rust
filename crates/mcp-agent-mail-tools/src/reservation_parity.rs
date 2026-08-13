@@ -3,6 +3,7 @@
 use mcp_agent_mail_db::sqlmodel_core::{Row, Value};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 pub const RESERVATION_PARITY_SCHEMA_VERSION: &str = "reservation_db_archive_parity.v1";
@@ -99,16 +100,18 @@ impl ReservationParityReport {
             // are reported only as informational suffixes when non-zero.
             let mut suffix = String::new();
             if self.drift.pruned_released_archived > 0 {
-                suffix.push_str(&format!(
+                let _ = write!(
+                    suffix,
                     " pruned_released_archived={}",
                     self.drift.pruned_released_archived
-                ));
+                );
             }
             if self.drift.foreign_generation_artifacts > 0 {
-                suffix.push_str(&format!(
+                let _ = write!(
+                    suffix,
                     " foreign_generation_artifacts={}",
                     self.drift.foreign_generation_artifacts
-                ));
+                );
             }
             return format!(
                 "reservation_parity: ok db={} archive={} drift=0{suffix}",

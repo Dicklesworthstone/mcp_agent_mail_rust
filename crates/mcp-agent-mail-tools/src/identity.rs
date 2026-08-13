@@ -1100,10 +1100,11 @@ pub struct QueuesHealthResponse {
     pub archive_lag: ArchiveLagHealthResponse,
 }
 
-/// Live archive-materialization lag surfaced through `health_check`. The tool
-/// reply is decoupled from git-archive materialization (ack-fast), so this
-/// metric is how operators observe the eventual-consistency window: the age of
-/// the oldest write that is durable in the DB but not yet in the archive, plus
+/// Live archive-materialization lag surfaced through `health_check`.
+///
+/// The tool reply is decoupled from git-archive materialization (ack-fast), so
+/// this metric is how operators observe the eventual-consistency window: the age
+/// of the oldest write that is durable in the DB but not yet in the archive, plus
 /// the depth of the durable retry backlog and commit coalescer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveLagHealthResponse {

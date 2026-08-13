@@ -1318,9 +1318,10 @@ pub mod tool_util {
     }
 
     /// Resolve a project that must already exist without allowing a read
-    /// request to create it.  This is the companion to the query-only read
-    /// lane: absolute project keys are looked up by `human_key` rather than
-    /// flowing through `ensure_project`.
+    /// request to create it.
+    ///
+    /// This is the companion to the query-only read lane: absolute project keys
+    /// are looked up by `human_key` rather than flowing through `ensure_project`.
     pub async fn resolve_existing_project(
         ctx: &McpContext,
         pool: &DbPool,

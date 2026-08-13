@@ -127,6 +127,8 @@ pub fn idempotency_conflict_error(conflict: &IdempotencyConflict) -> McpError {
     )
 }
 
+/// Mark a serialized tool response as an idempotent replay when `replayed`.
+///
 /// If `replayed`, inject `"idempotent_replay": true` into the top-level object of
 /// a serialized tool response so a client can distinguish a replay from a fresh
 /// apply. A fresh (or keyless) response is returned unchanged, keeping default
