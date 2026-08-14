@@ -817,9 +817,21 @@ pub mod tool_util {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ReadArchiveSignatureState {
+        /// Persisted cross-process epoch protocol (GH#235): O(1) in the
+        /// archive tree size. Any mutation window — in this process or any
+        /// other — rewrites the on-disk token, changing the stamp.
+        Epoch(mcp_agent_mail_storage::ArchiveEpochReadStamp),
+        /// Legacy gate for archives without an epoch token (mixed versions):
+        /// `HEAD` with a fully clean `projects/` tree, established by a full
+        /// `statuses()` walk.
+        CleanCommit { head: git2::Oid },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct ReadArchiveSignature {
         storage_root: PathBuf,
-        head: git2::Oid,
+        state: ReadArchiveSignatureState,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -848,16 +860,38 @@ pub mod tool_util {
             .map(|commit| commit.id())
     }
 
-    /// Return a cacheable archive signature only when `projects/` is fully
-    /// represented by one stable commit. Any worktree, index, ignored, or
-    /// untracked state bypasses the cache because archive writes are durable in
-    /// the worktree before the asynchronous Git coalescer advances `HEAD`.
+    /// Return a cacheable archive signature.
+    ///
+    /// When the storage crate's persisted per-repo epoch token (GH#235) is
+    /// present, the signature is the O(1) epoch stamp — `HEAD`, Git index
+    /// stamp, and the on-disk token every mutation window (in any process)
+    /// rewrites on both edges — and NO working-tree walk happens. When the
+    /// token file is missing or unparsable (an archive last written by an
+    /// older version), fall back to the legacy gate: cacheable only when
+    /// `projects/` is fully represented by one stable commit, established by a
+    /// full `statuses()` walk, because archive writes are durable in the
+    /// worktree before the asynchronous Git coalescer advances `HEAD`.
     fn clean_read_archive_signature(storage_root: &Path) -> Option<ReadArchiveSignature> {
         let canonical_root = storage_root.canonicalize().ok()?;
         let repo = git2::Repository::open(&canonical_root).ok()?;
         let canonical_workdir = repo.workdir()?.canonicalize().ok()?;
         if canonical_workdir != canonical_root {
             return None;
+        }
+
+        match mcp_agent_mail_storage::archive_epoch_read_stamp(&canonical_root) {
+            Ok(Some(stamp)) => {
+                return Some(ReadArchiveSignature {
+                    storage_root: canonical_root,
+                    state: ReadArchiveSignatureState::Epoch(stamp),
+                });
+            }
+            // No epoch token on disk: mixed-version archive — use the legacy
+            // full-scan gate below.
+            Ok(None) => {}
+            // Contention (active mutation window, index.lock, token rewritten
+            // mid-sample): scan without caching.
+            Err(_) => return None,
         }
 
         let head_before = read_archive_head(&repo)?;
@@ -881,7 +915,7 @@ pub mod tool_util {
 
         Some(ReadArchiveSignature {
             storage_root: canonical_root,
-            head: head_after,
+            state: ReadArchiveSignatureState::CleanCommit { head: head_after },
         })
     }
 
@@ -1830,6 +1864,120 @@ body
                 read_archive_inventory_scan_count(),
                 5,
                 "modifying a tracked archive artifact must bypass the cached HEAD"
+            );
+
+            reset_read_archive_inventory_cache();
+        }
+
+        /// Seed the persisted per-repo mutation epoch token (GH#235) exactly
+        /// as a storage-crate mutation window would leave it on disk.
+        fn seed_epoch_token(storage_root: &Path, token_hex: &str) {
+            std::fs::write(
+                storage_root
+                    .join(".git")
+                    .join(mcp_agent_mail_storage::ARCHIVE_EPOCH_FILE_NAME),
+                format!("1{token_hex}"),
+            )
+            .expect("write epoch token");
+        }
+
+        #[test]
+        fn read_archive_inventory_epoch_token_rewrite_invalidates_cache() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "add first message");
+            seed_epoch_token(&storage_root, &"aa".repeat(16));
+
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(read_archive_inventory_scan_count(), 1);
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                1,
+                "a stable epoch token must reuse the cached inventory"
+            );
+
+            // Simulate a writer in ANOTHER process: only the token file
+            // changes (no in-process mutation epoch bump). Two signature
+            // samples straddling the rewrite must disagree, so the inventory
+            // is never served from cache.
+            let signature_before = clean_read_archive_signature(&storage_root)
+                .expect("epoch-token signature must be available");
+            seed_epoch_token(&storage_root, &"bb".repeat(16));
+            let signature_after = clean_read_archive_signature(&storage_root)
+                .expect("epoch-token signature must be available");
+            assert_ne!(
+                signature_before, signature_after,
+                "an externally rewritten token must change the read signature"
+            );
+
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                2,
+                "a cross-process token rewrite must invalidate the cached inventory"
+            );
+
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn read_archive_inventory_epoch_token_replaces_statuses_walk_for_uncommitted_writes() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "add first message");
+            seed_epoch_token(&storage_root, &"cc".repeat(16));
+
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(read_archive_inventory_scan_count(), 1);
+
+            // A cross-process uncommitted archive write: durable in the
+            // worktree, invisible to HEAD/index, signaled ONLY through the
+            // token file — exactly what the statuses() walk used to catch.
+            write_inventory_message(&storage_root, 2, 2);
+            seed_epoch_token(&storage_root, &"dd".repeat(16));
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                2,
+                "the token rewrite alone must surface the uncommitted write"
+            );
+
+            // With the token stable, even a dirty worktree is cacheable: the
+            // token — not a working-tree walk — is the mutation authority.
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                2,
+                "a dirty worktree with a stable token must reuse the cache"
             );
 
             reset_read_archive_inventory_cache();

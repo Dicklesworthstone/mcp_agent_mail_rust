@@ -489,12 +489,152 @@ thread_local! {
     static ARCHIVE_MUTATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// File name of the persisted per-repo mutation epoch token, stored inside the
+/// archive's Git directory so it is never visible to `git status` and never
+/// tracked. Content: one format-version byte (`'1'`) followed by a random
+/// hex-encoded token; every physical archive mutation window rewrites it on
+/// both edges, letting readers in OTHER processes detect mutation windows
+/// without walking the archive working tree (GH#235).
+pub const ARCHIVE_EPOCH_FILE_NAME: &str = "agent-mail-archive-epoch";
+
+const ARCHIVE_EPOCH_FORMAT_VERSION: u8 = b'1';
+const ARCHIVE_EPOCH_GIT_DIR_CACHE_CAP: usize = 64;
+
+static ARCHIVE_EPOCH_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+static ARCHIVE_EPOCH_GIT_DIR_CACHE: LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Return the Git directory owning `dir`, if `dir` itself is (or directly
+/// contains) one. Handles both a `.git` directory and a `.git` gitlink file
+/// (linked worktrees / submodules).
+fn git_dir_for_ancestor(dir: &Path) -> Option<PathBuf> {
+    if dir.file_name().is_some_and(|name| name == ".git") && dir.is_dir() {
+        return Some(dir.to_path_buf());
+    }
+    let candidate = dir.join(".git");
+    let meta = fs::symlink_metadata(&candidate).ok()?;
+    if meta.is_dir() {
+        return Some(candidate);
+    }
+    if meta.is_file() {
+        let contents = fs::read_to_string(&candidate).ok()?;
+        let target = contents.strip_prefix("gitdir:")?.trim();
+        let target_path = Path::new(target);
+        let resolved = if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            dir.join(target_path)
+        };
+        return resolved.is_dir().then_some(resolved);
+    }
+    None
+}
+
+/// Resolve the Git directory of the repository enclosing `path` by walking
+/// ancestors, with a small process-global cache keyed by canonicalized
+/// ancestor directory. Returns `None` for paths outside any Git repository.
+fn resolve_archive_epoch_git_dir(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        let key = ancestor
+            .canonicalize()
+            .unwrap_or_else(|_| ancestor.to_path_buf());
+        {
+            let mut cache = ARCHIVE_EPOCH_GIT_DIR_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(git_dir) = cache.get(&key) {
+                if git_dir.is_dir() {
+                    return Some(git_dir.clone());
+                }
+                cache.remove(&key);
+            }
+        }
+        if let Some(git_dir) = git_dir_for_ancestor(&key) {
+            let mut cache = ARCHIVE_EPOCH_GIT_DIR_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.len() >= ARCHIVE_EPOCH_GIT_DIR_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(key, git_dir.clone());
+            return Some(git_dir);
+        }
+    }
+    None
+}
+
+/// Rewrite the persisted mutation-epoch token inside `git_dir` with fresh
+/// randomness, via temp-file-in-git-dir + atomic rename. Best-effort: any
+/// failure is logged and swallowed — the in-process
+/// `ARCHIVE_MUTATION_EPOCH` still bumps, so same-process readers stay exact.
+fn rewrite_archive_epoch_file(git_dir: &Path) {
+    let token = match mcp_agent_mail_core::setup::generate_token() {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!("archive epoch token generation failed: {error}");
+            return;
+        }
+    };
+    // 16 random bytes hex-encoded (generate_token yields 32 bytes / 64 chars).
+    let mut content = String::with_capacity(33);
+    content.push(char::from(ARCHIVE_EPOCH_FORMAT_VERSION));
+    content.push_str(&token[..32]);
+    let seq = ARCHIVE_EPOCH_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = git_dir.join(format!(
+        "{ARCHIVE_EPOCH_FILE_NAME}.tmp-{}-{seq}",
+        std::process::id()
+    ));
+    let result = fs::write(&tmp, content.as_bytes())
+        .and_then(|()| fs::rename(&tmp, git_dir.join(ARCHIVE_EPOCH_FILE_NAME)));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&tmp);
+        tracing::warn!(
+            "archive epoch token rewrite failed at {}: {error}",
+            git_dir.display()
+        );
+    }
+}
+
+/// Read and validate the persisted mutation-epoch token from `git_dir`.
+/// Returns `None` when the file is missing or does not parse (unknown format
+/// version, empty/non-hex token), which readers treat as "no epoch protocol"
+/// and fall back to their conservative full-scan gate.
+fn read_archive_epoch_token(git_dir: &Path) -> Option<String> {
+    let bytes = fs::read(git_dir.join(ARCHIVE_EPOCH_FILE_NAME)).ok()?;
+    let (&version, token) = bytes.split_first()?;
+    if version != ARCHIVE_EPOCH_FORMAT_VERSION
+        || token.is_empty()
+        || token.len() > 128
+        || !token.iter().all(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
+    String::from_utf8(token.to_vec()).ok()
+}
+
 struct ArchiveMutationGuard {
     fence: Option<std::sync::MutexGuard<'static, ()>>,
+    /// Mutated path anchoring the persisted epoch rewrite; `Some` only for the
+    /// outermost guard of a window that was opened with `begin_at`. The
+    /// enclosing repo is re-resolved on each edge so a window that CREATES the
+    /// repo (`ensure_repo`) still stamps its exit edge.
+    epoch_anchor: Option<PathBuf>,
 }
 
 impl ArchiveMutationGuard {
     fn begin() -> Self {
+        Self::begin_inner(None)
+    }
+
+    /// Begin a physical archive mutation window anchored at `path` (any path
+    /// at or beneath the mutated archive). In addition to the in-process
+    /// epoch/fence, the outermost guard rewrites the persisted per-repo epoch
+    /// token on both edges so readers in other processes observe the window.
+    fn begin_at(path: &Path) -> Self {
+        Self::begin_inner(Some(path))
+    }
+
+    fn begin_inner(anchor: Option<&Path>) -> Self {
         let outermost = ARCHIVE_MUTATION_DEPTH.with(|depth| {
             let outermost = depth.get() == 0;
             depth.set(depth.get().saturating_add(1));
@@ -505,14 +645,32 @@ impl ArchiveMutationGuard {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
+        let epoch_anchor = if outermost {
+            anchor.map(Path::to_path_buf)
+        } else {
+            None
+        };
         ARCHIVE_MUTATIONS_ACTIVE.fetch_add(1, Ordering::AcqRel);
         ARCHIVE_MUTATION_EPOCH.fetch_add(1, Ordering::AcqRel);
-        Self { fence }
+        if let Some(anchor) = epoch_anchor.as_deref()
+            && let Some(git_dir) = resolve_archive_epoch_git_dir(anchor)
+        {
+            rewrite_archive_epoch_file(&git_dir);
+        }
+        Self {
+            fence,
+            epoch_anchor,
+        }
     }
 }
 
 impl Drop for ArchiveMutationGuard {
     fn drop(&mut self) {
+        if let Some(anchor) = self.epoch_anchor.take()
+            && let Some(git_dir) = resolve_archive_epoch_git_dir(&anchor)
+        {
+            rewrite_archive_epoch_file(&git_dir);
+        }
         ARCHIVE_MUTATION_EPOCH.fetch_add(1, Ordering::AcqRel);
         ARCHIVE_MUTATIONS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
         ARCHIVE_MUTATION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
@@ -725,6 +883,50 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
         index: index_after,
         mutation_epoch,
     })
+}
+
+/// Persisted cross-process archive read stamp: the O(1) generation marker
+/// (`HEAD` + Git index stamp + in-process mutation epoch) combined with the
+/// per-repo epoch token every physical mutation window rewrites on disk.
+///
+/// Two equal stamps sampled around an archive read guarantee no mutation
+/// window — in this process or any other — touched the archive in between,
+/// without walking the working tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveEpochReadStamp {
+    generation: ArchiveReadGeneration,
+    epoch_token: String,
+}
+
+/// Sample the persisted cross-process epoch stamp for an archive root.
+///
+/// - `Ok(Some(stamp))`: the epoch protocol is active; compare stamps sampled
+///   before/after the read instead of scanning the working tree.
+/// - `Ok(None)`: no repository, or the epoch token file is missing/unparsable
+///   (e.g. an archive last written by an older version). Callers must fall
+///   back to their conservative full-scan gate.
+/// - `Err(..)`: contention (active mutation window, Git `index.lock`, token
+///   rewritten mid-sample). Callers must not cache the read.
+pub fn archive_epoch_read_stamp(storage_root: &Path) -> Result<Option<ArchiveEpochReadStamp>> {
+    let storage_root = mcp_agent_mail_core::disk::simplify_verbatim_path(storage_root);
+    let git_dir = match Repository::open(&storage_root) {
+        Ok(repo) => repo.path().to_path_buf(),
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(token_before) = read_archive_epoch_token(&git_dir) else {
+        return Ok(None);
+    };
+    let generation = archive_read_generation(&storage_root)?;
+    if read_archive_epoch_token(&git_dir).as_deref() != Some(token_before.as_str()) {
+        return Err(StorageError::LockContention {
+            message: "archive epoch token changed while being sampled".to_string(),
+        });
+    }
+    Ok(Some(ArchiveEpochReadStamp {
+        generation,
+        epoch_token: token_before,
+    }))
 }
 
 fn new_write_behind_queue() -> WriteBehindQueue {
@@ -2723,8 +2925,24 @@ fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize 
     end
 }
 
+/// Storage root mutated by a write-behind op, used to anchor the persisted
+/// archive mutation epoch (GH#235).
+fn write_op_storage_root(op: &WriteOp) -> &Path {
+    match op {
+        WriteOp::MessageBundle { config, .. }
+        | WriteOp::AgentProfile { config, .. }
+        | WriteOp::FileReservation { config, .. }
+        | WriteOp::NotificationSignal { config, .. }
+        | WriteOp::ClearSignal { config, .. } => config.storage_root.as_path(),
+    }
+}
+
 fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = envelopes
+        .first()
+        .map_or_else(ArchiveMutationGuard::begin, |envelope| {
+            ArchiveMutationGuard::begin_at(write_op_storage_root(envelope.op.as_ref()))
+        });
     debug_assert!(!envelopes.is_empty());
 
     let mut attempts = 0;
@@ -2790,7 +3008,7 @@ fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result
 }
 
 fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(write_op_storage_root(op));
     let mut attempts = 0;
     loop {
         match wbq_execute_op_inner(op) {
@@ -6100,7 +6318,7 @@ fn commit_paths_lockfree(
     message: &str,
     rel_paths: &[&str],
 ) -> Result<()> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(repo.path());
     if rel_paths.is_empty() {
         return Ok(());
     }
@@ -6645,7 +6863,7 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 
 /// Create a directory (and parents) only if we haven't already created it.
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(dir);
     {
         let cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if cache.contains(dir) {
@@ -6912,7 +7130,7 @@ fn configure_archive_git_defaults(repo: &Repository) {
 ///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(root);
     if repo_cache_contains(root) {
         return Ok(false);
     }
@@ -8162,7 +8380,7 @@ fn update_thread_digest(
     body_md: &str,
     canonical_rel: &str,
 ) -> Result<String> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
     let project_root = archive_project_root_checked(archive)?;
     let digest_dir = project_root.join("messages").join("threads");
     ensure_dir(&digest_dir)?;
@@ -8425,7 +8643,7 @@ pub fn store_attachment(
     file_path: &Path,
     embed_policy: EmbedPolicy,
 ) -> Result<StoredAttachment> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
     use base64::Engine;
     use image::GenericImageView;
 
@@ -8617,7 +8835,7 @@ pub fn store_raw_attachment(
     file_path: &Path,
     max_bytes: usize,
 ) -> Result<StoredAttachment> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
     let effective_limit = if max_bytes > 0 {
         max_bytes.max(FALLBACK_MAX_ATTACHMENT_BYTES)
     } else {
@@ -9184,7 +9402,7 @@ pub fn clear_notification_signal(
     project_slug: &str,
     agent_name: &str,
 ) -> SignalClearOutcome {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(&config.notifications_signals_dir);
     if !config.notifications_enabled {
         return SignalClearOutcome::Disabled;
     }
@@ -10934,7 +11152,7 @@ fn commit_paths(
     message: &str,
     rel_paths: &[&str],
 ) -> Result<()> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(repo.path());
     if rel_paths.is_empty() {
         return Ok(());
     }
@@ -11005,7 +11223,7 @@ fn commit_paths(
 /// Only used as an overload escape hatch for the async commit coalescer when the
 /// spill path set grows too large to track precisely.
 fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(repo.path());
     // Ensure this is a non-bare repo with a workdir.
     let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
 
@@ -11290,7 +11508,7 @@ fn atomic_write_tmp_path(parent: &Path, path: &Path, seq: u64) -> PathBuf {
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     use std::io::Write as _;
 
-    let _mutation = ArchiveMutationGuard::begin();
+    let _mutation = ArchiveMutationGuard::begin_at(path);
 
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
@@ -16615,6 +16833,142 @@ mod tests {
             assert!(archive_mutations_active() >= 1);
         }
         assert!(archive_mutation_epoch() >= before + 4);
+    }
+
+    #[test]
+    fn archive_mutation_guard_rewrites_persisted_epoch_on_both_edges() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive(&config, "epoch-edges").unwrap();
+        let epoch_path = config
+            .storage_root
+            .join(".git")
+            .join(ARCHIVE_EPOCH_FILE_NAME);
+        let token_initial = fs::read(&epoch_path)
+            .expect("archive mutations must persist an epoch token inside .git");
+
+        let outer = ArchiveMutationGuard::begin_at(&config.storage_root);
+        let token_begin = fs::read(&epoch_path).unwrap();
+        assert_ne!(
+            token_initial, token_begin,
+            "outermost begin edge must rewrite the persisted epoch token"
+        );
+        {
+            let _nested = ArchiveMutationGuard::begin_at(&config.storage_root);
+            assert_eq!(
+                token_begin,
+                fs::read(&epoch_path).unwrap(),
+                "nested begin must not rewrite the persisted epoch token"
+            );
+        }
+        assert_eq!(
+            token_begin,
+            fs::read(&epoch_path).unwrap(),
+            "nested drop must not rewrite the persisted epoch token"
+        );
+        drop(outer);
+        let token_end = fs::read(&epoch_path).unwrap();
+        assert_ne!(
+            token_begin, token_end,
+            "outermost drop edge must rewrite the persisted epoch token"
+        );
+    }
+
+    #[test]
+    fn atomic_write_and_commit_paths_rewrite_persisted_epoch_token() {
+        // Doctor/reconstruct route through atomic_write_bytes + commit_paths;
+        // both must advance the cross-process token (GH#235 test f).
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "epoch-doctor").unwrap();
+        let epoch_path = config
+            .storage_root
+            .join(".git")
+            .join(ARCHIVE_EPOCH_FILE_NAME);
+        let before = fs::read(&epoch_path).unwrap();
+
+        let file_path = archive.root.join("agents/TokenAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        atomic_write_bytes(&file_path, br#"{"name":"TokenAgent"}"#, false).unwrap();
+        let after_write = fs::read(&epoch_path).unwrap();
+        assert_ne!(
+            before, after_write,
+            "atomic_write_bytes must rewrite the persisted epoch token"
+        );
+
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        commit_paths(&repo, &config, "epoch token commit", &[rel.as_str()]).unwrap();
+        let after_commit = fs::read(&epoch_path).unwrap();
+        assert_ne!(
+            after_write, after_commit,
+            "commit_paths must rewrite the persisted epoch token"
+        );
+    }
+
+    /// Sample the epoch stamp, retrying briefly around transient contention
+    /// from concurrently running tests' mutation windows.
+    fn sample_epoch_stamp_for_test(storage_root: &Path) -> Option<ArchiveEpochReadStamp> {
+        for _ in 0..200 {
+            match archive_epoch_read_stamp(storage_root) {
+                Ok(stamp) => return stamp,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        panic!("archive epoch stamp remained contended");
+    }
+
+    #[test]
+    fn archive_epoch_read_stamp_tracks_external_token_and_disables_without_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive(&config, "epoch-stamp").unwrap();
+        let epoch_path = config
+            .storage_root
+            .join(".git")
+            .join(ARCHIVE_EPOCH_FILE_NAME);
+
+        let first = sample_epoch_stamp_for_test(&config.storage_root)
+            .expect("epoch protocol must be active after archive writes");
+        let second = sample_epoch_stamp_for_test(&config.storage_root)
+            .expect("epoch protocol must stay active");
+        // Compare the per-repo parts (token/head/index) rather than the whole
+        // stamp: concurrently running tests advance the process-global
+        // mutation epoch without touching this repository.
+        assert_eq!(
+            first.epoch_token, second.epoch_token,
+            "the token must be stable without a writer on this repository"
+        );
+        assert_eq!(first.generation.head, second.generation.head);
+        assert_eq!(first.generation.index, second.generation.index);
+
+        // Simulate ANOTHER process's mutation window: only the on-disk token
+        // changes, without any in-process epoch bump.
+        fs::write(&epoch_path, format!("1{}", "ab".repeat(16))).unwrap();
+        let third = sample_epoch_stamp_for_test(&config.storage_root)
+            .expect("a rewritten token keeps the protocol active");
+        assert_ne!(
+            first.epoch_token, third.epoch_token,
+            "an externally rewritten token must change the stamp"
+        );
+
+        // Missing or unparsable token → protocol inactive → callers fall back
+        // to the conservative full-scan gate (mixed-version safety).
+        fs::remove_file(&epoch_path).unwrap();
+        assert!(
+            sample_epoch_stamp_for_test(&config.storage_root).is_none(),
+            "a missing token file must disable the epoch protocol"
+        );
+        fs::write(&epoch_path, b"2deadbeef").unwrap();
+        assert!(
+            sample_epoch_stamp_for_test(&config.storage_root).is_none(),
+            "an unknown format version must disable the epoch protocol"
+        );
+        fs::write(&epoch_path, b"1not-hex!").unwrap();
+        assert!(
+            sample_epoch_stamp_for_test(&config.storage_root).is_none(),
+            "a non-hex token must disable the epoch protocol"
+        );
     }
 
     #[test]
