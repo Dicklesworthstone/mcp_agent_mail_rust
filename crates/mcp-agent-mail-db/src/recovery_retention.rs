@@ -390,7 +390,13 @@ pub fn is_sidecar_snapshot_name(name: &str) -> bool {
 /// `-wal`/`-shm` sidecars.
 #[must_use]
 pub fn is_stale_artifact_name(name: &str) -> bool {
-    name.ends_with(".stale") || name.contains(".stale-") || name.contains(".stale.")
+    // Deliberately case-sensitive: every producer of `.stale` names in this
+    // codebase (runbook + e2e quarantines) mints lowercase, and a
+    // case-insensitive match would be the only category matcher here that
+    // deviates from the byte-exact conventions above.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    let stale_suffix = name.ends_with(".stale");
+    stale_suffix || name.contains(".stale-") || name.contains(".stale.")
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -564,11 +570,13 @@ pub fn inspect_storage_backups(storage_root: &Path) -> std::io::Result<BackupInv
 // Combined retention resident footprint (GH#210).
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Read-only retention footprint for one mailbox: recovery debris + direct
-/// backups (de-duplicated — archive-reconcile files are visible to both
-/// inventories) + move-only reclaim staging. This is the ONE implementation
-/// behind both `am doctor health`'s `retention_resident` line and the MCP
-/// `health_check` `retention` block.
+/// Read-only retention footprint for one mailbox.
+///
+/// Combines recovery debris + direct backups (de-duplicated —
+/// archive-reconcile files are visible to both inventories) + move-only
+/// reclaim staging. This is the ONE implementation behind both
+/// `am doctor health`'s `retention_resident` line and the MCP `health_check`
+/// `retention` block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionResidentStats {
     pub recovery_debris_artifacts: usize,
@@ -637,8 +645,7 @@ pub fn retention_resident_stats(
     }
 
     let reclaimable_bytes = reclaim_policy.map_or(0, |(policy, now_us)| {
-        select_recovery_debris_to_reclaim(recovery_debris.clone(), policy, now_us)
-            .reclaimable_bytes
+        select_recovery_debris_to_reclaim(recovery_debris.clone(), policy, now_us).reclaimable_bytes
     });
 
     Ok(RetentionResidentStats {
@@ -1111,14 +1118,18 @@ mod tests {
             vec![0_u8; 100],
         )
         .unwrap();
-        std::fs::write(storage_root.join("storage.sqlite3.lock.stale"), vec![0_u8; 10]).unwrap();
+        std::fs::write(
+            storage_root.join("storage.sqlite3.lock.stale"),
+            vec![0_u8; 10],
+        )
+        .unwrap();
 
         let debris = enumerate_recovery_debris(storage_root, &db_path);
-        let stale: Vec<_> = debris
+        let stale = debris
             .iter()
             .filter(|a| a.category == DebrisCategory::StaleArtifact)
-            .collect();
-        assert_eq!(stale.len(), 2, "debris: {debris:?}");
+            .count();
+        assert_eq!(stale, 2, "debris: {debris:?}");
         // Live DB and live WAL are never debris.
         assert!(debris.iter().all(|a| a.path != db_path));
         assert!(
@@ -1206,7 +1217,11 @@ mod tests {
             Some(&30)
         );
         // Zero categories are omitted (compact, null-free block downstream).
-        assert!(!stats.resident_bytes_by_category.contains_key("forensic_bundle"));
+        assert!(
+            !stats
+                .resident_bytes_by_category
+                .contains_key("forensic_bundle")
+        );
         // Zero-retention policy makes all recovery debris reclaimable.
         assert_eq!(stats.reclaimable_bytes, 540);
 
@@ -1220,7 +1235,9 @@ mod tests {
         let stats = retention_resident_stats(storage_root, &db_path, None).unwrap();
         assert_eq!(stats.resident_bytes, 500 + 40 + 60 + 30 + 200);
         assert_eq!(
-            stats.resident_bytes_by_category.get("archive_reconcile_backup"),
+            stats
+                .resident_bytes_by_category
+                .get("archive_reconcile_backup"),
             Some(&200)
         );
         assert_eq!(stats.direct_backup_only_artifacts, 1);

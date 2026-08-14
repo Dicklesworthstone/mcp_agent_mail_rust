@@ -723,6 +723,7 @@ async fn register_agent_with_token(ctx: &McpContext, project_key: &str, agent: &
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn fail_closed_profile_gates_reply_message_sender_verification() {
     run_serial_async_with_env(
         &[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "1")],
@@ -913,7 +914,10 @@ fn reply_message_without_profile_returns_full_payload() {
             reply_json.get("body_md").and_then(Value::as_str),
             Some("Reply body")
         );
-        assert_eq!(reply_json.get("reply_to").and_then(Value::as_i64), Some(message_id));
+        assert_eq!(
+            reply_json.get("reply_to").and_then(Value::as_i64),
+            Some(message_id)
+        );
         assert!(reply_json.get("deliveries").is_some());
         assert!(reply_json.get("subject").is_some());
     });

@@ -299,9 +299,7 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         "capabilities_url": "am doctor capabilities --json",
         "robot_docs_url": "am doctor robot-docs",
     });
-    if !report_available
-        && let Some(map) = envelope.as_object_mut()
-    {
+    if !report_available && let Some(map) = envelope.as_object_mut() {
         map.insert(
             "report_note".to_string(),
             serde_json::Value::String(

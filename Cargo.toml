@@ -37,7 +37,7 @@ fastmcp-protocol = "0.3.1"
 # SQLModel 0.3.2 and sqlmodel-sqlite 0.3.3 are published with an exact
 # Asupersync 0.3.10 dependency, so these SQLModel pins resolve directly
 # from crates.io without a sibling-checkout patch.
-asupersync = { version = "=0.4.3", features = ["tls-webpki-roots"] }
+asupersync = { version = "=0.4.4", features = ["tls-webpki-roots"] }
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
