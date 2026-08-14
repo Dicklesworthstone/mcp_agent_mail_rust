@@ -2954,6 +2954,7 @@ impl DbPool {
                     integrity::CheckKind::Quick,
                 )
             },
+            || canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, phase),
         )
     }
 
@@ -3029,6 +3030,7 @@ impl DbPool {
                     integrity::CheckKind::Full,
                 )
             },
+            || canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, "full-cycle"),
         )
     }
 
@@ -5312,6 +5314,26 @@ fn primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
         || canonical_mailbox_has_no_durable_rows
 }
 
+/// Schema-only-mailbox probe for [`reconcile_with_canonical`] call sites.
+///
+/// Mirrors the file-health probe path: an inspection failure keeps the
+/// primary verdict (returns `false`, i.e. NOT schema-only) so an unreadable
+/// mailbox can never be waved through as "nothing to lose".
+fn canonical_mailbox_is_schema_only_for_reconcile(sqlite_path: &str, phase: &str) -> bool {
+    match canonical_mailbox_has_no_durable_rows(Path::new(sqlite_path)) {
+        Ok(is_empty) => is_empty,
+        Err(error) => {
+            tracing::warn!(
+                phase,
+                path = %sqlite_path,
+                error = %error,
+                "canonical SQLite verified integrity, but durable mailbox rows could not be inspected; keeping the primary verdict"
+            );
+            false
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_primary_check_is_ok_with_canonical_fallback(
     path: &Path,
@@ -5405,15 +5427,27 @@ fn sqlite_canonical_incremental_check_is_ok(
 /// canonical SQLite second opinion — the Track-M "never assert malformed from
 /// a divergent engine" contract (GH#114 / br-bvq1x.13.4).
 ///
-/// If the primary probe reports [`DbError::IntegrityCorruption`] but the
+/// If the primary probe reports [`DbError::IntegrityCorruption`] and the
 /// `canonical_probe` closure proves the file is acceptable to canonical
 /// SQLite, the verdict is reclassified as healthy
-/// (`details = ["ok (canonical fallback)"]`). When canonical *also* rejects
-/// the file, or the canonical probe cannot run, the original corruption
-/// verdict is preserved (fail-closed: we never silence a verdict both engines
-/// agree on, and we never invent health we could not confirm). `Ok` results
-/// and non-corruption errors pass through untouched and never invoke the
-/// canonical probe.
+/// (`details = ["ok (canonical fallback)"]`) — but ONLY for the whitelisted
+/// disagreement classes accepted by
+/// [`primary_canonical_disagreement_is_safe_for_schema_only_mailbox`] (the
+/// known `COLLATE NOCASE` index-order false positive, or a schema-only
+/// mailbox with no durable rows to lose). GH#214: for any OTHER
+/// primary/canonical disagreement the primary corruption verdict is
+/// preserved and logged at ERROR — the primary engine has a documented
+/// history of real btree damage that canonical SQLite's checker
+/// under-reports (self-consistent row loss, GH#213), so "canonical
+/// disagrees" is not proof of health outside the whitelisted classes. This
+/// matches the narrowed v0.3.26 semantics of the file-health probe path
+/// ([`sqlite_primary_check_is_ok_with_canonical_fallback`]).
+///
+/// When canonical *also* rejects the file, or the canonical probe cannot
+/// run, the original corruption verdict is preserved (fail-closed: we never
+/// silence a verdict both engines agree on, and we never invent health we
+/// could not confirm). `Ok` results and non-corruption errors pass through
+/// untouched and never invoke the canonical probe.
 ///
 /// Used by both the quick-cycle ([`DbPool::quick_check_with_canonical_fallback`])
 /// and the periodic full-cycle ([`DbPool::run_full_integrity_check`]) so a
@@ -5422,7 +5456,9 @@ fn sqlite_canonical_incremental_check_is_ok(
 /// disproves (the ts2 `idx_agents_project_name_nocase` false positive).
 ///
 /// The `canonical_probe` is injected so the reconciliation policy is
-/// unit-testable without a real on-disk engine divergence.
+/// unit-testable without a real on-disk engine divergence, and
+/// `canonical_mailbox_is_schema_only` is injected (and only invoked after a
+/// canonical acceptance for a non-NOCASE complaint) for the same reason.
 #[allow(clippy::result_large_err)]
 fn reconcile_with_canonical(
     primary: DbResult<integrity::IntegrityCheckResult>,
@@ -5430,6 +5466,7 @@ fn reconcile_with_canonical(
     phase: &str,
     path_for_log: &str,
     canonical_probe: impl FnOnce() -> Result<bool, SqlError>,
+    canonical_mailbox_is_schema_only: impl FnOnce() -> bool,
 ) -> DbResult<integrity::IntegrityCheckResult> {
     match primary {
         Ok(res) => Ok(res),
@@ -5440,12 +5477,35 @@ fn reconcile_with_canonical(
                 // for their declared key directions") is a KNOWN primary-probe
                 // false positive that reproduces on every startup after a
                 // reconstruct and survives REINDEX — the file is genuinely
-                // healthy (canonical SQLite proves it every time). Logging it
-                // as a WARN that quotes "database disk image is malformed"
-                // pollutes operator logs and erodes trust in the health
-                // signal, so classify it and log at INFO with an explicit
-                // explanation. Any OTHER divergence stays a WARN.
-                if is_known_nocase_index_order_false_positive(&message) {
+                // healthy (canonical SQLite proves it every time). A
+                // schema-only mailbox (no durable rows) is likewise safe to
+                // accept: there is no content to lose.
+                //
+                // GH#214: anything else does NOT fail open. The same narrowed
+                // acceptance the file-health probe path adopted in v0.3.26
+                // applies here: an unknown primary/canonical disagreement on a
+                // mailbox with durable rows keeps the primary corruption
+                // verdict and logs ERROR with both verdicts.
+                let nocase_false_positive = is_known_nocase_index_order_false_positive(&message);
+                let schema_only_mailbox =
+                    !nocase_false_positive && canonical_mailbox_is_schema_only();
+                if !primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
+                    Some(&message),
+                    schema_only_mailbox,
+                ) {
+                    tracing::error!(
+                        phase,
+                        path = %path_for_log,
+                        check = %kind,
+                        primary_error = %message,
+                        canonical_verdict = "ok",
+                        "primary integrity probe rejected the file; canonical SQLite \
+                         disagreed but the complaint is not a known false-positive class — \
+                         keeping the primary corruption verdict (GH#214)"
+                    );
+                    return Err(DbError::IntegrityCorruption { message, details });
+                }
+                if nocase_false_positive {
                     tracing::info!(
                         phase,
                         path = %path_for_log,
@@ -5461,7 +5521,8 @@ fn reconcile_with_canonical(
                         path = %path_for_log,
                         check = %kind,
                         primary_error = %message,
-                        "integrity probe rejected the file but canonical SQLite accepted it; treating as healthy"
+                        schema_only_mailbox,
+                        "integrity probe rejected a schema-only mailbox but canonical SQLite accepted it; treating as healthy"
                     );
                 }
                 Ok(integrity::IntegrityCheckResult {
@@ -12442,6 +12503,7 @@ mod tests {
                 probe_called.set(true);
                 Ok(true)
             },
+            || false,
         )
         .expect("healthy primary passes through");
         assert!(out.ok);
@@ -12473,11 +12535,64 @@ mod tests {
             "full-cycle",
             "/tmp/storage.sqlite3",
             || Ok(true),
+            || false,
         )
         .expect("canonical acceptance reclassifies to healthy");
         assert!(out.ok, "canonical-accepted file must be reported healthy");
         assert_eq!(out.details, vec!["ok (canonical fallback)".to_string()]);
         assert_eq!(out.kind, integrity::CheckKind::Full);
+    }
+
+    #[test]
+    fn reconcile_canonical_keeps_primary_verdict_for_unknown_disagreement_with_durable_rows() {
+        // GH#214 regression: a NON-NOCASE primary corruption complaint with a
+        // canonical-ok second opinion must NOT fail open when the mailbox has
+        // durable rows. The periodic guard used to accept ANY disagreement
+        // as "ok (canonical fallback)" here, while the file-health probe path
+        // was already narrowed in v0.3.26 — this pins the parity.
+        let primary: DbResult<integrity::IntegrityCheckResult> =
+            Err(DbError::IntegrityCorruption {
+                message: "database disk image is malformed: btree page 7 cell overlap".to_string(),
+                details: vec!["*** page 7 cell overlap ***".to_string()],
+            });
+        let err = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Full,
+            "full-cycle",
+            "/tmp/storage.sqlite3",
+            || Ok(true),
+            || false, // durable rows present — NOT a schema-only mailbox
+        )
+        .expect_err("unknown primary/canonical disagreement must keep the primary fail verdict");
+        assert!(matches!(err, DbError::IntegrityCorruption { .. }));
+        assert!(
+            err.to_string().contains("cell overlap"),
+            "original primary complaint must be preserved: {err}"
+        );
+    }
+
+    #[test]
+    fn reconcile_canonical_accepts_unknown_disagreement_only_for_schema_only_mailbox() {
+        // The one non-NOCASE disagreement class the narrowed probe semantics
+        // accept: canonical-ok AND the mailbox is schema-only (no durable
+        // rows to lose). Same parity as
+        // `primary_canonical_disagreement_is_safe_for_schema_only_mailbox`.
+        let primary: DbResult<integrity::IntegrityCheckResult> =
+            Err(DbError::IntegrityCorruption {
+                message: "database disk image is malformed: freelist mismatch".to_string(),
+                details: Vec::new(),
+            });
+        let out = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Quick,
+            "initial",
+            "/tmp/storage.sqlite3",
+            || Ok(true),
+            || true, // schema-only mailbox
+        )
+        .expect("schema-only mailbox disagreement is accepted");
+        assert!(out.ok);
+        assert_eq!(out.details, vec!["ok (canonical fallback)".to_string()]);
     }
 
     #[test]
@@ -12493,6 +12608,7 @@ mod tests {
             "full-cycle",
             "/tmp/storage.sqlite3",
             || Ok(false),
+            || false,
         )
         .expect_err("both engines rejecting must stay a corruption verdict");
         assert!(matches!(err, DbError::IntegrityCorruption { .. }));
@@ -12520,6 +12636,7 @@ mod tests {
             "initial",
             "/tmp/storage.sqlite3",
             || Err(SqlError::Custom("canonical open failed".to_string())),
+            || false,
         )
         .expect_err("unprovable canonical fallback must preserve corruption");
         assert!(matches!(err, DbError::IntegrityCorruption { .. }));
@@ -12555,6 +12672,7 @@ mod tests {
                 "runtime",
                 "/tmp/storage.sqlite3",
                 || Err(SqlError::Custom(canonical_lock_error.to_string())),
+                || false,
             )
             .expect_err("lock-blocked canonical probe must defer");
 
@@ -12596,6 +12714,7 @@ mod tests {
                 probe_called.set(true);
                 Ok(true)
             },
+            || false,
         )
         .expect_err("non-corruption errors pass through unchanged");
         assert!(matches!(err, DbError::Sqlite(_)));
