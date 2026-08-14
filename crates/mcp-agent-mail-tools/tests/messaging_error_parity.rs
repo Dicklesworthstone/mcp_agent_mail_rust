@@ -791,8 +791,9 @@ fn fail_closed_profile_gates_reply_message_sender_verification() {
                 "reply must route through verify_sender_identity: {payload:?}"
             );
 
-            // A verified reply succeeds.
-            reply_message(
+            // A verified reply succeeds — and returns the redacted receipt
+            // shape, mirroring send_message under the profile (GH#237).
+            let reply_response = reply_message(
                 &ctx,
                 project_key.clone(),
                 message_id,
@@ -811,6 +812,201 @@ fn fail_closed_profile_gates_reply_message_sender_verification() {
             )
             .await
             .expect("verified reply under the fail-closed profile");
+            let reply_json: Value =
+                serde_json::from_str(&reply_response).expect("reply_message JSON");
+            assert_eq!(
+                reply_json.get("receipt_mode").and_then(Value::as_str),
+                Some("redacted"),
+                "reply under the fail-closed profile must return a redacted receipt: {reply_json}"
+            );
+            assert_eq!(
+                reply_json.get("reply_to").and_then(Value::as_i64),
+                Some(message_id)
+            );
+            assert_eq!(
+                reply_json.get("verified_sender").and_then(Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                reply_json
+                    .pointer("/target_outcomes/0/recipient")
+                    .and_then(Value::as_str),
+                Some("BlueLake"),
+                "per-target outcomes retained: {reply_json}"
+            );
+            for forbidden in ["subject", "body_md", "attachments", "deliveries"] {
+                assert!(
+                    reply_json.get(forbidden).is_none(),
+                    "redacted reply receipt leaked {forbidden}: {reply_json}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn reply_message_without_profile_returns_full_payload() {
+    // GH#237 control: without the fail-closed profile the reply response is
+    // the unchanged full shape (subject/body/deliveries present).
+    run_serial_async(|cx| async move {
+        let project_key = format!("/tmp/msg_reply_full-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        ensure_project(&ctx, project_key.clone(), None)
+            .await
+            .expect("ensure_project");
+        setup_project_and_agent(&ctx, &project_key, "BlueLake").await;
+        setup_project_and_agent(&ctx, &project_key, "RedPeak").await;
+
+        let send_response = send_message(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            vec!["RedPeak".to_string()],
+            "Full-shape reply control".to_string(),
+            "Original body".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // idempotency_key
+        )
+        .await
+        .expect("send without profile");
+        let send_json: Value = serde_json::from_str(&send_response).expect("send_message JSON");
+        let message_id = send_json
+            .pointer("/deliveries/0/payload/id")
+            .and_then(Value::as_i64)
+            .expect("message id in full send response");
+
+        let reply_response = reply_message(
+            &ctx,
+            project_key.clone(),
+            message_id,
+            "RedPeak".to_string(),
+            "Reply body".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // idempotency_key
+        )
+        .await
+        .expect("reply without profile");
+        let reply_json: Value = serde_json::from_str(&reply_response).expect("reply_message JSON");
+        assert!(
+            reply_json.get("receipt_mode").is_none(),
+            "no redaction without the profile: {reply_json}"
+        );
+        assert_eq!(
+            reply_json.get("body_md").and_then(Value::as_str),
+            Some("Reply body")
+        );
+        assert_eq!(reply_json.get("reply_to").and_then(Value::as_i64), Some(message_id));
+        assert!(reply_json.get("deliveries").is_some());
+        assert!(reply_json.get("subject").is_some());
+    });
+}
+
+// -----------------------------------------------------------------------
+// GH#237: macro_contact_handshake must thread sender_token through to the
+// welcome send_message call — a hardcoded None made the welcome message
+// unconditionally fail closed under MESSAGING_FAIL_CLOSED_SEND_PROFILE.
+// -----------------------------------------------------------------------
+
+#[test]
+fn fail_closed_profile_handshake_welcome_requires_and_accepts_sender_token() {
+    run_serial_async_with_env(
+        &[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "1")],
+        |cx| async move {
+            let project_key = format!("/tmp/msg_handshake_fc-{}", unique_suffix());
+            let ctx = McpContext::new(cx.clone(), 1);
+            ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure_project");
+            let blue_token = register_agent_with_token(&ctx, &project_key, "BlueLake").await;
+            register_agent_with_token(&ctx, &project_key, "RedPeak").await;
+
+            // Token-free handshake with a welcome message fails closed with
+            // the same error class as send_message.
+            let err = mcp_agent_mail_tools::macro_contact_handshake(
+                &ctx,
+                project_key.clone(),
+                Some("BlueLake".to_string()),
+                Some("RedPeak".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(true), // auto_accept
+                None,
+                Some("Welcome".to_string()),
+                Some("Welcome aboard".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // sender_token
+            )
+            .await
+            .expect_err("token-free welcome must fail closed under the profile");
+            let payload = error_object(&err);
+            assert_eq!(
+                payload.get("type").and_then(Value::as_str),
+                Some("SENDER_TOKEN_REQUIRED"),
+                "handshake welcome must fail closed exactly like send_message: {payload:?}"
+            );
+
+            // With a valid requester token the handshake (including the
+            // welcome message) succeeds.
+            let response = mcp_agent_mail_tools::macro_contact_handshake(
+                &ctx,
+                project_key.clone(),
+                Some("BlueLake".to_string()),
+                Some("RedPeak".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(true), // auto_accept
+                None,
+                Some("Welcome".to_string()),
+                Some("Welcome aboard".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(blue_token),
+            )
+            .await
+            .expect("handshake welcome with a valid sender_token succeeds under the profile");
+            let json: Value = serde_json::from_str(&response).expect("handshake JSON");
+            let welcome = json
+                .get("welcome_message")
+                .expect("welcome_message present in handshake response");
+            assert!(!welcome.is_null(), "welcome message must have been sent");
+            assert_eq!(
+                welcome.get("receipt_mode").and_then(Value::as_str),
+                Some("redacted"),
+                "welcome send under the profile is the redacted receipt: {welcome}"
+            );
+            assert_eq!(
+                welcome.get("verified_sender").and_then(Value::as_bool),
+                Some(true)
+            );
         },
     );
 }

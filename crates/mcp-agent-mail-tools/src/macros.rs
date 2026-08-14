@@ -609,6 +609,10 @@ pub async fn macro_file_reservation_cycle(
 /// - `program`: Program for registration
 /// - `model`: Model for registration
 /// - `task_description`: Task for registration
+/// - `sender_token`: Registration token used to verify the requester when the
+///   welcome message is sent (same semantics as `send_message`'s
+///   `sender_token`; mandatory for the welcome under the fail-closed send
+///   profile, GH#237)
 ///
 /// # Conformance
 /// Python-parity.
@@ -634,6 +638,7 @@ pub async fn macro_contact_handshake(
     program: Option<String>,
     model: Option<String>,
     task_description: Option<String>,
+    sender_token: Option<String>,
 ) -> McpResult<String> {
     // Resolve agent names from aliases
     let from_agent = requester.or(agent_name).ok_or_else(|| {
@@ -746,7 +751,11 @@ pub async fn macro_contact_handshake(
                 None,
                 None,
                 None, // auto_contact_if_blocked
-                None, // sender_token
+                // GH#237: forward the caller's sender_token so the handshake
+                // welcome message can satisfy the fail-closed send profile
+                // (a hardcoded None made the welcome unconditionally fail
+                // closed under MESSAGING_FAIL_CLOSED_SEND_PROFILE).
+                sender_token,
                 None, // idempotency_key
             )
             .await?;

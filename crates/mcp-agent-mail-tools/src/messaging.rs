@@ -1474,6 +1474,27 @@ pub struct RedactedSendMessageReceipt {
     pub target_outcomes: Vec<RedactedSendTargetOutcome>,
 }
 
+/// Payload-free response returned by `reply_message` under the fail-closed
+/// send profile (GH#237).
+///
+/// Mirrors [`RedactedSendMessageReceipt`] — no subject, body, attachments, or
+/// nested message payload — plus the reply linkage (`reply_to`, an id, not
+/// content) so a caller can still stitch the thread without the profile
+/// leaking message contents into logs or orchestration state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactedReplyMessageReceipt {
+    pub receipt_mode: String,
+    pub project: String,
+    pub message_id: i64,
+    pub project_id: i64,
+    pub sender_id: i64,
+    pub thread_id: Option<String>,
+    pub created_ts: String,
+    pub reply_to: i64,
+    pub verified_sender: bool,
+    pub target_outcomes: Vec<RedactedSendTargetOutcome>,
+}
+
 fn redacted_send_target_outcomes(
     to: &[String],
     cc: &[String],
@@ -1488,6 +1509,19 @@ fn redacted_send_target_outcomes(
                 .map(|recipient| RedactedSendTargetOutcome {
                     recipient,
                     kind: kind.to_string(),
+                    // "delivered" is a constant here BY CONSTRUCTION, not an
+                    // optimistic echo (GH#237 review): the receipt is built
+                    // only after `create_message_with_recipients` committed
+                    // the message row AND every resolved recipient row in a
+                    // single DB transaction — the authoritative delivery
+                    // record. Any recipient-resolution or write failure
+                    // errors the whole tool call before a receipt exists, so
+                    // there is no per-recipient partial-failure state to
+                    // report at this point. (Notification signals and archive
+                    // materialization are best-effort side channels layered
+                    // on top; their failures are logged, do not undo the
+                    // durable delivery, and are intentionally not folded into
+                    // this outcome.)
                     outcome: "delivered".to_string(),
                 }),
         );
@@ -3463,45 +3497,67 @@ effective_free_bytes={free}"
         }
     }
 
-    let payload = MessagePayload {
-        id: reply_id,
-        project_id,
-        sender_id,
-        thread_id: Some(thread_id.clone()),
-        subject: reply.subject.clone(),
-        body_md: reply.body_md.clone(),
-        importance: reply.importance.clone(),
-        ack_required: reply.ack_required != 0,
-        created_ts: Some(micros_to_iso(reply.created_ts)),
-        attachments: all_attachment_meta.clone(),
-        from: sender.name.clone(),
-        to: resolved_to.to_vec(),
-        cc: resolved_cc_recipients.to_vec(),
-        bcc: resolved_bcc_recipients.to_vec(),
-    };
-
-    let response = ReplyMessageResponse {
-        id: reply_id,
-        project_id,
-        sender_id,
-        thread_id: Some(thread_id),
-        subject: reply.subject,
-        importance: reply.importance,
-        ack_required: reply.ack_required != 0,
-        created_ts: Some(micros_to_iso(reply.created_ts)),
-        attachments: all_attachment_meta,
-        body_md: reply.body_md,
-        from: sender.name.clone(),
-        to: resolved_to.into_vec(),
-        cc: resolved_cc_recipients.into_vec(),
-        bcc: resolved_bcc_recipients.into_vec(),
-        reply_to: message_id,
-        deliveries: vec![DeliveryResult {
+    // GH#237: under the fail-closed send profile the reply returns the same
+    // payload-free redacted receipt shape as send_message — a full
+    // subject/body/attachments echo here was the profile's blind spot.
+    let response = if config.messaging_fail_closed_send_profile {
+        serde_json::to_string(&RedactedReplyMessageReceipt {
+            receipt_mode: "redacted".to_string(),
             project: project.human_key.clone(),
-            payload,
-        }],
-        count: 1,
-        verified_sender,
+            message_id: reply_id,
+            project_id,
+            sender_id,
+            thread_id: Some(thread_id),
+            created_ts: micros_to_iso(reply.created_ts),
+            reply_to: message_id,
+            verified_sender,
+            target_outcomes: redacted_send_target_outcomes(
+                &resolved_to,
+                &resolved_cc_recipients,
+                &resolved_bcc_recipients,
+            ),
+        })
+    } else {
+        let payload = MessagePayload {
+            id: reply_id,
+            project_id,
+            sender_id,
+            thread_id: Some(thread_id.clone()),
+            subject: reply.subject.clone(),
+            body_md: reply.body_md.clone(),
+            importance: reply.importance.clone(),
+            ack_required: reply.ack_required != 0,
+            created_ts: Some(micros_to_iso(reply.created_ts)),
+            attachments: all_attachment_meta.clone(),
+            from: sender.name.clone(),
+            to: resolved_to.to_vec(),
+            cc: resolved_cc_recipients.to_vec(),
+            bcc: resolved_bcc_recipients.to_vec(),
+        };
+
+        serde_json::to_string(&ReplyMessageResponse {
+            id: reply_id,
+            project_id,
+            sender_id,
+            thread_id: Some(thread_id),
+            subject: reply.subject,
+            importance: reply.importance,
+            ack_required: reply.ack_required != 0,
+            created_ts: Some(micros_to_iso(reply.created_ts)),
+            attachments: all_attachment_meta,
+            body_md: reply.body_md,
+            from: sender.name.clone(),
+            to: resolved_to.into_vec(),
+            cc: resolved_cc_recipients.into_vec(),
+            bcc: resolved_bcc_recipients.into_vec(),
+            reply_to: message_id,
+            deliveries: vec![DeliveryResult {
+                project: project.human_key.clone(),
+                payload,
+            }],
+            count: 1,
+            verified_sender,
+        })
     };
 
     tracing::debug!(
@@ -3512,7 +3568,7 @@ effective_free_bytes={free}"
         project_key
     );
 
-    serde_json::to_string(&response)
+    response
         .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
@@ -6157,6 +6213,38 @@ mod tests {
         assert_eq!(json["target_outcomes"][0]["recipient"], "BlueLake");
         assert_eq!(json["target_outcomes"][1]["kind"], "cc");
         for forbidden in ["subject", "body_md", "attachments", "deliveries"] {
+            assert!(json.get(forbidden).is_none(), "receipt leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn redacted_reply_receipt_omits_payload_and_keeps_reply_linkage() {
+        // GH#237: reply_message's fail-closed receipt mirrors send_message's
+        // redacted shape and adds only the reply linkage (ids, not content).
+        let receipt = RedactedReplyMessageReceipt {
+            receipt_mode: "redacted".to_string(),
+            project: "/workspace/example".to_string(),
+            message_id: 42,
+            project_id: 7,
+            sender_id: 11,
+            thread_id: Some("bd-237".to_string()),
+            created_ts: "2026-08-12T19:05:00Z".to_string(),
+            reply_to: 41,
+            verified_sender: true,
+            target_outcomes: redacted_send_target_outcomes(
+                &["BlueLake".to_string()],
+                &[],
+                &["GreenHill".to_string()],
+            ),
+        };
+        let json = serde_json::to_value(&receipt).expect("receipt serializes");
+
+        assert_eq!(json["receipt_mode"], "redacted");
+        assert_eq!(json["message_id"], 42);
+        assert_eq!(json["reply_to"], 41);
+        assert_eq!(json["target_outcomes"][0]["recipient"], "BlueLake");
+        assert_eq!(json["target_outcomes"][1]["kind"], "bcc");
+        for forbidden in ["subject", "body_md", "attachments", "deliveries", "from", "to"] {
             assert!(json.get(forbidden).is_none(), "receipt leaked {forbidden}");
         }
     }
