@@ -4764,14 +4764,49 @@ const fn should_attach_read_only_tui(
     interactive_tui && peer_is_serving && !takeover
 }
 
-/// Check the live endpoint before a local TUI launch. This is intentionally
-/// read-only: a healthy service keeps serving MCP/API while the terminal uses
-/// its `/mail/ws-state` snapshot.
-fn should_attach_read_only_tui_to_live_service(
+/// What an interactive `am` should do when a healthy peer already serves the
+/// configured endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveServiceTuiDecision {
+    /// No healthy peer (or takeover already requested): run the normal path.
+    Proceed,
+    /// Follow the running server's read-only snapshot.
+    AttachReadOnly,
+    /// The operator chose a full local takeover of the mailbox.
+    Takeover,
+    /// The operator chose to leave the running server alone and exit.
+    Quit,
+}
+
+/// Resolve `AM_ATTACH_MODE` (`ask` | `attach` | `takeover`). Unknown values
+/// fall back to `ask` so a typo degrades to the interactive prompt, never to
+/// a silent mode switch.
+fn attach_mode_preference() -> &'static str {
+    match std::env::var("AM_ATTACH_MODE")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "attach" => "attach",
+        "takeover" => "takeover",
+        _ => "ask",
+    }
+}
+
+/// Check the live endpoint before a local TUI launch and decide how to
+/// coexist with it.
+///
+/// The v0.3.26 behavior attached read-only silently, which operators
+/// experienced as "the TUI is broken" (br-mljnz). On a real terminal the
+/// choice is now explicit: attach read-only, take over (through the same
+/// managed-service stop/restore path as `--takeover`, so the service returns
+/// when the session ends), or quit. Non-interactive callers keep the silent
+/// read-only attach so automation never blocks on a prompt.
+fn live_service_tui_decision(
     config: &Config,
     interactive_tui: bool,
     takeover: bool,
-) -> bool {
+) -> LiveServiceTuiDecision {
     use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status_at_mcp_path};
 
     let peer_is_serving = matches!(
@@ -4779,24 +4814,64 @@ fn should_attach_read_only_tui_to_live_service(
         PortStatus::AgentMailServer
     );
     if !should_attach_read_only_tui(interactive_tui, peer_is_serving, takeover) {
-        return false;
+        return LiveServiceTuiDecision::Proceed;
     }
 
-    if let Some((kind, binding)) =
-        active_conflicting_managed_service(&config.http_host, config.http_port)
-    {
-        let service_name = managed_service_display_name(kind);
+    let owner = active_conflicting_managed_service(&config.http_host, config.http_port);
+    let owner_label = owner.map_or_else(
+        || "an already-running Agent Mail server".to_string(),
+        |(kind, _)| managed_service_display_name(kind).to_string(),
+    );
+
+    let preset = attach_mode_preference();
+    let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let decision = match (preset, interactive_stdin) {
+        ("attach", _) | ("ask", false) => LiveServiceTuiDecision::AttachReadOnly,
+        ("takeover", _) => LiveServiceTuiDecision::Takeover,
+        _ => prompt_live_service_choice(&owner_label, &config.http_host, config.http_port),
+    };
+
+    if decision == LiveServiceTuiDecision::AttachReadOnly {
         eprintln!(
-            "[info] Attached read-only to {service_name} on {}:{}; the running service will not be stopped or restarted",
-            binding.host, binding.port
-        );
-    } else {
-        eprintln!(
-            "[info] Attached read-only to the Agent Mail server on {}:{}; the running service will not be stopped or restarted",
+            "[info] Attached read-only to {owner_label} on {}:{}; the running server keeps serving and will not be stopped or restarted.",
             config.http_host, config.http_port
         );
+        eprintln!(
+            "[info] For the full interactive TUI: rerun with --takeover (the managed service is restored when you exit), or set AM_ATTACH_MODE=takeover."
+        );
     }
-    true
+    decision
+}
+
+/// Explicit terminal prompt shown when a healthy server already owns the
+/// endpoint. Reads one line from stdin; empty input (or read failure) keeps
+/// the safe default of a read-only attach.
+fn prompt_live_service_choice(
+    owner_label: &str,
+    host: &str,
+    port: u16,
+) -> LiveServiceTuiDecision {
+    use std::io::Write as _;
+
+    eprintln!("\n{owner_label} already owns {host}:{port} and keeps serving your agents.");
+    eprintln!("Plain `am` will not stop it without asking. Choose:");
+    eprintln!("  [Enter/a] attach read-only  — watch the running server; it keeps serving");
+    eprintln!(
+        "  [t]       take over         — run the full server + interactive TUI here; a managed service is stopped now and restored when you exit"
+    );
+    eprintln!("  [q]       quit");
+    eprint!("> ");
+    let _ = std::io::stderr().flush();
+
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return LiveServiceTuiDecision::AttachReadOnly;
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "t" | "takeover" => LiveServiceTuiDecision::Takeover,
+        "q" | "quit" => LiveServiceTuiDecision::Quit,
+        _ => LiveServiceTuiDecision::AttachReadOnly,
+    }
 }
 
 /// Follow a running service's read-only TUI snapshot. This uses the existing
@@ -4805,7 +4880,9 @@ fn should_attach_read_only_tui_to_live_service(
 fn run_read_only_tui_attachment() -> CliResult<()> {
     use std::io::Write as _;
 
-    eprintln!("[info] Read-only TUI attachment active; press Ctrl-C to detach.");
+    eprintln!(
+        "[info] Read-only TUI attachment active; press Ctrl-C to detach (full TUI: `am --takeover`)."
+    );
     loop {
         print!("\x1b[2J\x1b[H");
         std::io::stdout().flush().map_err(CliError::Io)?;
@@ -4851,15 +4928,21 @@ impl Drop for ManagedServiceRestoreGuard {
     }
 }
 
-/// Legacy compatibility hook for interactive launch setup.
+/// Interactive launch coexistence hook.
 ///
-/// A live service is no longer stopped to make room for a terminal TUI. The
-/// caller attaches read-only before reaching this hook; if it races with a
-/// newly-live peer, this hook remains a safe no-op.
+/// Without takeover, a live service is never stopped to make room for a
+/// terminal TUI (the caller attaches read-only before reaching this hook; if
+/// it races with a newly-live peer, this stays a safe no-op). Under an
+/// explicit takeover, a conflicting MANAGED service is stopped through its
+/// supervisor — never signalled directly — and the returned kind makes the
+/// `ManagedServiceRestoreGuard` restart it when this interactive session
+/// ends. Stopping via the supervisor is what prevents the restart fight: the
+/// unit is administratively down instead of crash-looping against the port.
 fn maybe_stop_conflicting_managed_service(
     host: &str,
     port: u16,
     interactive_tui: bool,
+    takeover: bool,
 ) -> Option<ManagedServiceKind> {
     use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
 
@@ -4874,6 +4957,22 @@ fn maybe_stop_conflicting_managed_service(
 
     if let Some((kind, binding)) = active_conflicting_managed_service(host, port) {
         let service_name = managed_service_display_name(kind);
+        if takeover {
+            eprintln!(
+                "[info] Stopping {service_name} on {}:{} for this interactive session; it will be restarted when the session ends",
+                binding.host, binding.port
+            );
+            match stop_managed_service(kind) {
+                Ok(()) => return Some(kind),
+                Err(e) => {
+                    eprintln!(
+                        "[warn] Failed to stop {service_name}: {e}. Proceeding without service control; \
+                         if startup fights the service, stop it manually and rerun."
+                    );
+                    return None;
+                }
+            }
+        }
         eprintln!(
             "[info] {service_name} is active on {}:{}; preserving it for read-only attachment",
             binding.host, binding.port
@@ -4882,6 +4981,29 @@ fn maybe_stop_conflicting_managed_service(
     }
 
     None
+}
+
+fn stop_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
+    match kind {
+        ManagedServiceKind::Systemd => run_systemctl_user(&["stop", SYSTEMD_UNIT_NAME]),
+        ManagedServiceKind::Launchd => stop_launchd_service(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_launchd_service() -> CliResult<()> {
+    let uid = current_uid()?;
+    run_cmd(
+        "launchctl",
+        &["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stop_launchd_service() -> CliResult<()> {
+    Err(CliError::Other(
+        "launchd service control is unavailable on this platform".to_string(),
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -6745,12 +6867,19 @@ fn handle_serve_http(
     let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
     apply_release_logging_defaults(suppress_runtime_logs_for_tui);
 
-    // A healthy service remains the mailbox owner. Attaching avoids disrupting
-    // active agents and avoids manufacturing a restart-fighting window merely
-    // so an interactive terminal can display the TUI.
-    if should_attach_read_only_tui_to_live_service(&config, config.tui_enabled, takeover) {
-        return run_read_only_tui_attachment();
-    }
+    // A healthy service remains the mailbox owner unless the operator says
+    // otherwise. On a terminal the coexistence choice is explicit (br-mljnz):
+    // attach read-only, take over through the managed-service stop/restore
+    // path, or quit. Automation keeps the silent read-only attach.
+    let takeover = match live_service_tui_decision(&config, config.tui_enabled, takeover) {
+        LiveServiceTuiDecision::AttachReadOnly => return run_read_only_tui_attachment(),
+        LiveServiceTuiDecision::Quit => {
+            eprintln!("[info] Leaving the running server untouched.");
+            return Ok(());
+        }
+        LiveServiceTuiDecision::Takeover => true,
+        LiveServiceTuiDecision::Proceed => takeover,
+    };
 
     // ts2 (br-bvq1x.4.5): serialize concurrent (re)starts for this storage root
     // so racing `am serve-http` invocations don't kill each other's freshly-bound
@@ -6758,13 +6887,16 @@ fn handle_serve_http(
     // lock for this server's lifetime; a late arrival that finds a live peer backs
     // off instead of fighting. `--takeover` seizes immediately; lock-infra failure
     // fails open (proceed unlocked = legacy behavior).
-    // The compatibility hook is now intentionally a no-op around a live peer;
-    // the read-only attachment above is the only interactive coexistence path.
+    // Without takeover the hook stays a no-op around a live peer (the
+    // read-only attachment above is the interactive coexistence path). Under
+    // takeover it stops a conflicting managed service via its supervisor and
+    // the guard restarts it when this session ends (br-mljnz).
     let _managed_service_restore = ManagedServiceRestoreGuard {
         kind: maybe_stop_conflicting_managed_service(
             &config.http_host,
             config.http_port,
             config.tui_enabled,
+            takeover,
         ),
     };
 
