@@ -772,6 +772,88 @@ fn recovery_receipt_error(context: &str, path: &Path, error: impl std::fmt::Disp
     ))
 }
 
+/// Append a canonical SQLite sidecar suffix to a database path.
+fn sqlite_family_sidecar(db_path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    std::path::PathBuf::from(os)
+}
+
+/// Where canonical SQLite evidence reads (continuity snapshot + full
+/// integrity gate) should be pointed for one source database.
+///
+/// Canonical SQLite cannot open a WAL-mode family READ-ONLY while a hot
+/// `-wal` sits beside it without a writable `-shm` ("attempt to write a
+/// readonly database"), and a read-WRITE canonical open CONSUMES hot or
+/// garbage sidecars (journal rollback/unlink, WAL reset) — which both
+/// destroys quarantine evidence and mutates a file the receipt is supposed
+/// to witness. Since the engine stopped checkpointing on connection drop
+/// (bd-daqmp), a hot `-wal` beside a healthy database is the NORMAL resting
+/// state, not an anomaly. Whenever any family sidecar is present, evidence
+/// reads therefore run against a settled private staging copy (db + wal
+/// [+ shm], recovered and checkpointed by canonical SQLite on the COPY);
+/// the source family stays byte-untouched. The staging directory evaporates
+/// on drop.
+enum CanonicalSnapshotSource {
+    Direct(std::path::PathBuf),
+    Staged {
+        _dir: tempfile::TempDir,
+        db_path: std::path::PathBuf,
+    },
+}
+
+impl CanonicalSnapshotSource {
+    fn for_family(db_path: &Path) -> Result<Self, SqlError> {
+        let journal = sqlite_family_sidecar(db_path, "-journal");
+        let wal = sqlite_family_sidecar(db_path, "-wal");
+        let shm = sqlite_family_sidecar(db_path, "-shm");
+        let family_is_hot = journal.symlink_metadata().is_ok()
+            || wal.metadata().map(|m| m.len() > 0).unwrap_or(false)
+            || shm.symlink_metadata().is_ok();
+        if !family_is_hot {
+            return Ok(Self::Direct(db_path.to_path_buf()));
+        }
+
+        let dir = tempfile::TempDir::new()
+            .map_err(|error| recovery_receipt_error("snapshot staging dir", db_path, error))?;
+        let staged_db = dir.path().join("settled-snapshot.sqlite3");
+        std::fs::copy(db_path, &staged_db)
+            .map_err(|error| recovery_receipt_error("snapshot staging copy", db_path, error))?;
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let source_sidecar = sqlite_family_sidecar(db_path, suffix);
+            if source_sidecar.is_file() {
+                std::fs::copy(&source_sidecar, sqlite_family_sidecar(&staged_db, suffix)).map_err(
+                    |error| recovery_receipt_error("snapshot staging sidecar copy", db_path, error),
+                )?;
+            }
+        }
+        // Settle the COPY: canonical SQLite rolls back / recovers whatever the
+        // sidecars held and checkpoints, so the read-only snapshot below sees
+        // every committed row. Garbage sidecars are simply ignored.
+        let settle = crate::CanonicalDbConn::open_file(staged_db.to_string_lossy().as_ref())
+            .map_err(|error| {
+                recovery_receipt_error("snapshot staging settle open", db_path, error)
+            })?;
+        settle
+            .execute_raw("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| {
+                recovery_receipt_error("snapshot staging checkpoint", db_path, error)
+            })?;
+        drop(settle);
+        Ok(Self::Staged {
+            _dir: dir,
+            db_path: staged_db,
+        })
+    }
+
+    fn snapshot_path(&self) -> &Path {
+        match self {
+            Self::Direct(path) => path,
+            Self::Staged { db_path, .. } => db_path,
+        }
+    }
+}
+
 fn receipt_table_names(
     conn: &crate::CanonicalDbConn,
     db_path: &Path,
@@ -931,7 +1013,7 @@ fn require_unique_receipt_keys(
 
 fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuitySets, SqlError> {
     collect_recovery_continuity_sets_with_overrides(db_path, &BTreeMap::new())
-        .map(|(sets, _rewritten)| sets)
+        .map(|(sets, _rewritten, _snapshot)| sets)
 }
 
 /// Substitute the archive's canonical human key for a slug at decode time,
@@ -961,7 +1043,7 @@ fn overridden_project_human_key(
 fn collect_recovery_continuity_sets_with_overrides(
     db_path: &Path,
     identity_overrides: &BTreeMap<String, String>,
-) -> Result<(RecoveryContinuitySets, u64), SqlError> {
+) -> Result<(RecoveryContinuitySets, u64, CanonicalSnapshotSource), SqlError> {
     let mut rewritten = 0u64;
     if !db_path.is_file() {
         return Err(recovery_receipt_error(
@@ -970,7 +1052,9 @@ fn collect_recovery_continuity_sets_with_overrides(
             "source is missing or is not a regular file",
         ));
     }
-    let config = sqlmodel_sqlite::SqliteConfig::file(db_path.to_string_lossy().into_owned())
+    let snapshot_source = CanonicalSnapshotSource::for_family(db_path)?;
+    let snapshot_path = snapshot_source.snapshot_path();
+    let config = sqlmodel_sqlite::SqliteConfig::file(snapshot_path.to_string_lossy().into_owned())
         .flags(sqlmodel_sqlite::OpenFlags::read_only());
     let conn = crate::CanonicalDbConn::open(&config)
         .map_err(|error| recovery_receipt_error("read-only snapshot open", db_path, error))?;
@@ -1812,7 +1896,7 @@ fn collect_recovery_continuity_sets_with_overrides(
         )?;
     }
 
-    Ok((sets, rewritten))
+    Ok((sets, rewritten, snapshot_source))
 }
 
 fn recovery_category(keys: &BTreeSet<String>) -> Result<RecoveryReceiptCategory, SqlError> {
@@ -2657,7 +2741,7 @@ fn collect_recovery_receipt_evidence(
         Some(path) => {
             match collect_recovery_continuity_sets_with_overrides(path, archive_identity_overrides)
             {
-                Ok((sets, rewritten)) => {
+                Ok((sets, rewritten, snapshot_source)) => {
                     if rewritten > 0 {
                         tracing::warn!(
                             source = %path.display(),
@@ -2672,7 +2756,7 @@ fn collect_recovery_receipt_evidence(
                     // correctly lacks; using those sets as authority is what
                     // crash-looped reconstruct on the live 951-message wedge
                     // (br-r6awv). Full integrity_check is the promotion gate.
-                    match source_full_integrity_refusal(path) {
+                    match source_full_integrity_refusal(snapshot_source.snapshot_path()) {
                         Ok(None) => (sets, None),
                         Ok(Some(reason)) => {
                             tracing::warn!(
@@ -2700,7 +2784,10 @@ fn collect_recovery_receipt_evidence(
                 // refused promotion and crash-looped startup (br-r6awv).
                 // Only a source that *passes* full integrity is allowed to
                 // block the archive candidate.
-                Err(snapshot_error) => match source_full_integrity_refusal(path) {
+                Err(snapshot_error) => match CanonicalSnapshotSource::for_family(path).map_or_else(
+                    |_| source_full_integrity_refusal(path),
+                    |snapshot| source_full_integrity_refusal(snapshot.snapshot_path()),
+                ) {
                     Ok(None) => return Err(snapshot_error),
                     Ok(Some(reason)) => {
                         tracing::warn!(
@@ -2896,7 +2983,6 @@ pub(crate) fn prepare_recovery_receipt(
         candidate_path,
         &archive_identity_overrides,
     )?;
-
     // `create_new` on one fixed pathname is the cross-process compare/exchange.
     // Unique per-receipt pending names would let two processes both pass the
     // preceding empty-directory scan and prepare competing promotions.
