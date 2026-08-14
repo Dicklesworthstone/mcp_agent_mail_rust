@@ -10,7 +10,7 @@
 //! bootstrap (the quarantine loop), reconstruct/verification, and the resource
 //! shape suite. Fixed upstream by `strip_leading_sql_comments` (fsqlite
 //! 5015af7f0); this test pins the fix at the CONSUMER boundary so a future
-//! fsqlite pin regression is caught in mcp_agent_mail_rust's own suite.
+//! fsqlite pin regression is caught in `mcp_agent_mail_rust`'s own suite.
 
 mod common;
 
@@ -72,7 +72,7 @@ fn canonical_sqlite_reads_comment_prefixed_schema() {
             head.get(..6)
                 .is_some_and(|p| p.eq_ignore_ascii_case("create")),
             "sqlite_master.sql for table `{name}` must start at CREATE, not a comment; got: {:?}",
-            &head.chars().take(48).collect::<String>()
+            head.chars().take(48).collect::<String>()
         );
     }
 
