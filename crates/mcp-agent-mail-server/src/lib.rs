@@ -20940,6 +20940,37 @@ first body
     }
 
     #[test]
+    fn unauthorized_response_carries_agent_mail_health_signature() {
+        // Regression guard for the fleet incident of 2026-08-14.
+        //
+        // The startup port probe accepts a 401 as proof of ownership ONLY when
+        // the response is *signed* ("a signed 401 establishes ownership"). am
+        // 0.3.24 did not sign it, so a protected peer -- an interactive `am`
+        // holding :8765 -- probed as `Unknown process listening`; a supervised
+        // unit's `--takeover` then refused to terminate what it believed was a
+        // foreign process and restart-looped forever (observed: 545,489
+        // restarts on one host). `handle()` now signs every response, which is
+        // what closes it. This test pins that behaviour to the 401 specifically
+        // so the blanket signer can never regress back to leaving the auth-gate
+        // rejection anonymous.
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Post, "/api/", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        assert_eq!(
+            response_header(&resp, startup_checks::HEALTH_SIGNATURE_HEADER_NAME),
+            Some(startup_checks::HEALTH_SIGNATURE_HEADER_VALUE),
+            "401 from the MCP auth gate must carry the health signature so the \
+             startup probe can identify a protected Agent Mail peer"
+        );
+    }
+
+    #[test]
     fn cors_disabled_emits_no_headers() {
         let config = mcp_agent_mail_core::Config {
             http_cors_enabled: false,

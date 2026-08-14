@@ -2271,6 +2271,11 @@ effective_free_bytes={free}"
                         None,
                         None,
                         None,
+                        // GH#237: forward the caller's sender_token so the
+                        // auto-handshake is verified as this sender. Passing
+                        // None here would reopen the fail-closed welcome hole
+                        // that GH#237 closed.
+                        sender_token.clone(),
                     ))
                     .await
                     .is_ok()
@@ -3267,6 +3272,11 @@ effective_free_bytes={free}"
                     None,
                     None,
                     None,
+                    // GH#237: forward the caller's sender_token so the
+                    // auto-handshake is verified as this sender. Passing None
+                    // here would reopen the fail-closed welcome hole that
+                    // GH#237 closed.
+                    sender_token.clone(),
                 ))
                 .await
                 .is_ok()
