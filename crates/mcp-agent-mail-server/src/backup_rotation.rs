@@ -30,38 +30,14 @@ use tracing::{debug, info, warn};
 const DEFAULT_KEEP_PER_KIND: usize = 3;
 const MIN_KEEP_PER_KIND: usize = 1;
 
-/// Buckets that `classify_backup_file` maps filenames into. Each bucket has
-/// an independent retention count — we don't want a corruption storm to
-/// evict unrelated pre-migration backups, and vice versa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BackupKind {
-    /// `storage.sqlite3.corrupt-*` (plus -wal/-shm siblings)
-    Corrupt,
-    /// `storage.sqlite3.reconstruct-failed-*` and `storage.sqlite3.reconstructing-*`
-    Reconstruct,
-    /// `storage.sqlite3.archive-reconcile-*` (incl. -failed, -restore)
-    ArchiveReconcile,
-    /// `storage.sqlite3.salvage-*`
-    Salvage,
-    /// `storage.sqlite3.manual-backup-*` plus bare `.bak*`
-    ManualBackup,
-    /// `.pre-migrate.*`, `.pre-python-import-*`, `.pre-acfs-import-*`, `.pre-reindex-*`
-    PreMigration,
-}
-
-impl BackupKind {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Corrupt => "corrupt",
-            Self::Reconstruct => "reconstruct",
-            Self::ArchiveReconcile => "archive_reconcile",
-            Self::Salvage => "salvage",
-            Self::ManualBackup => "manual_backup",
-            Self::PreMigration => "pre_migration",
-        }
-    }
-}
+// Lifted to the db crate (GH#210) so the MCP `health_check` retention block
+// (tools crate, which cannot depend on this crate) and `am doctor health`
+// consume the SAME classifier and inventory. Re-exported here so rotation
+// call sites and downstream consumers keep compiling unchanged.
+pub use mcp_agent_mail_db::recovery_retention::{
+    BackupInventory, BackupInventoryArtifact, BackupKind, classify_backup_file,
+    inspect_storage_backups,
+};
 
 /// Report returned by `rotate_storage_backups`. One entry per non-empty kind.
 ///
@@ -99,96 +75,6 @@ pub struct RotateKindSummary {
     pub bytes_deleted: u64,
 }
 
-/// Read-only inventory of backup files eligible for rotation.
-///
-/// This excludes the live DB and its sidecars by way of
-/// [`classify_backup_file`], so consumers such as `am doctor health` can
-/// report retention resident bytes without accidentally treating mailbox state
-/// as disposable backup material.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct BackupInventory {
-    pub artifact_count: usize,
-    pub resident_bytes: u64,
-    /// Individual classified paths, for read-only consumers that need to
-    /// de-duplicate these files from another retention inventory.
-    pub artifacts: Vec<BackupInventoryArtifact>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackupInventoryArtifact {
-    pub path: PathBuf,
-    pub bytes: u64,
-}
-
-/// Classify a `storage_root`-relative filename into a `BackupKind`.
-///
-/// Returns `None` for the live DB, Codex DB, and any file that doesn't
-/// match our known backup patterns. This is the *single* place that
-/// decides whether a file counts as backup material at all; rotation
-/// additionally skips [`BackupKind::ArchiveReconcile`] (owned by the
-/// recovery-retention reclaim planner) even though it classifies here so
-/// inventory consumers still see it.
-#[must_use]
-pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
-    // Explicitly never-delete live state.
-    if matches!(
-        file_name,
-        "storage.sqlite3" | "storage.sqlite3-wal" | "storage.sqlite3-shm" | "mailbox.sqlite3"
-    ) {
-        return None;
-    }
-    // Leave the Codex sidecar DB alone.
-    if file_name.starts_with("storage.codex.sqlite3") {
-        return None;
-    }
-
-    // Only files named like the storage DB (or its WAL/SHM siblings) are
-    // eligible. This is the primary guard against touching unrelated files.
-    let stem_prefixes = [
-        "storage.sqlite3.",
-        "storage.sqlite3-wal.",
-        "storage.sqlite3-shm.",
-    ];
-    let after_stem = stem_prefixes
-        .iter()
-        .find_map(|prefix| file_name.strip_prefix(prefix))?;
-
-    // `archive-reconcile-` covers the bare, `-failed-*`, and `-restore-*`
-    // variants in one check (they all share the prefix).
-    if after_stem.starts_with("archive-reconcile-") {
-        return Some(BackupKind::ArchiveReconcile);
-    }
-    if after_stem.starts_with("reconstruct-") || after_stem.starts_with("reconstructing-") {
-        return Some(BackupKind::Reconstruct);
-    }
-    if after_stem.starts_with("corrupt-") {
-        return Some(BackupKind::Corrupt);
-    }
-    if after_stem.starts_with("salvage-") {
-        return Some(BackupKind::Salvage);
-    }
-    // Manual-backup naming is either `manual-backup-<ts>` or the bare `bak`
-    // / `bak.<ts>` legacy variant. Using a bare `starts_with("bak")` would
-    // false-positive future filenames like `backup-plan.txt` that happen to
-    // share the prefix — match exact variants only.
-    if after_stem.starts_with("manual-backup-")
-        || after_stem == "bak"
-        || after_stem.starts_with("bak.")
-        || after_stem.starts_with("bak-")
-    {
-        return Some(BackupKind::ManualBackup);
-    }
-    if after_stem.starts_with("pre-migrate")
-        || after_stem.starts_with("pre-python-import")
-        || after_stem.starts_with("pre-acfs-import")
-        || after_stem.starts_with("pre-reindex")
-    {
-        return Some(BackupKind::PreMigration);
-    }
-
-    None
-}
-
 /// Resolve the rotation "keep count" — honors `AM_BACKUP_KEEP_COUNT` env
 /// override; falls back to `DEFAULT_KEEP_PER_KIND`. Floor of `MIN_KEEP_PER_KIND`.
 #[must_use]
@@ -214,41 +100,6 @@ pub fn rotation_delete_opted_in() -> bool {
             "1" | "true" | "t" | "yes" | "y"
         )
     })
-}
-
-/// Return the count and bytes of direct backup files eligible for rotation.
-/// Missing storage roots produce an empty inventory, matching rotation's
-/// no-op behavior during first-run bootstrap.
-pub fn inspect_storage_backups(storage_root: &Path) -> std::io::Result<BackupInventory> {
-    let entries = match fs::read_dir(storage_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BackupInventory::default());
-        }
-        Err(error) => return Err(error),
-    };
-    let mut inventory = BackupInventory::default();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if classify_backup_file(&name).is_some() {
-            inventory.artifact_count = inventory.artifact_count.saturating_add(1);
-            inventory.resident_bytes = inventory.resident_bytes.saturating_add(metadata.len());
-            inventory.artifacts.push(BackupInventoryArtifact {
-                path,
-                bytes: metadata.len(),
-            });
-        }
-    }
-    Ok(inventory)
 }
 
 /// Rotate backup files in `storage_root`, staging evictions for reclaim.

@@ -44,6 +44,14 @@ pub enum DebrisCategory {
     /// previously had NO retention at all, so they accumulate without bound
     /// (GH#185 reported 66 of them dating back weeks).
     SidecarSnapshot,
+    /// A `.stale`-marked artifact next to the live database: a lock or
+    /// sidecar renamed aside with a `.stale` suffix/infix (e.g.
+    /// `storage.sqlite3.lock.stale`, `storage.sqlite3-wal.stale-<ts>`), the
+    /// quarantine spelling the operator runbook prescribes for dead-owner
+    /// locks (`mv <lock> <lock>.stale`). GH#210's incident host had 534
+    /// `*.stale*` artifacts (mostly an echo of the GH#202 crash loop) that no
+    /// retention category accounted for.
+    StaleArtifact,
 }
 
 impl DebrisCategory {
@@ -55,6 +63,7 @@ impl DebrisCategory {
             Self::CorruptQuarantine => "corrupt_quarantine",
             Self::ArchiveReconcileBackup => "archive_reconcile_backup",
             Self::SidecarSnapshot => "sidecar_snapshot",
+            Self::StaleArtifact => "stale_artifact",
         }
     }
 }
@@ -222,8 +231,9 @@ pub fn select_recovery_debris_to_reclaim(
 ///
 /// Combines forensic bundles (`doctor/forensics/.../`) with quarantine siblings
 /// (`<db>.corrupt-*`, `<db>.reconstruct-failed-*`), archive-reconcile incident
-/// snapshots (`<db>.archive-reconcile-*`), and startup sidecar snapshots (`<db>-wal.startup-precheckpoint-*`,
-/// `<db>-shm.startup-precheckpoint-*`, `<db>*.startup-quarantine-*`).
+/// snapshots (`<db>.archive-reconcile-*`), startup sidecar snapshots (`<db>-wal.startup-precheckpoint-*`,
+/// `<db>-shm.startup-precheckpoint-*`, `<db>*.startup-quarantine-*`), and
+/// `.stale`-marked artifacts (`<db>*.stale`, `<db>*.stale-*`, `<db>*.stale.*`).
 #[must_use]
 pub fn enumerate_recovery_debris(storage_root: &Path, db_path: &Path) -> Vec<DebrisArtifact> {
     let mut out = enumerate_forensic_bundles(storage_root);
@@ -316,6 +326,8 @@ pub fn enumerate_corrupt_quarantines(db_path: &Path) -> Vec<DebrisArtifact> {
             DebrisCategory::CorruptQuarantine
         } else if is_sidecar_snapshot_name(name) {
             DebrisCategory::SidecarSnapshot
+        } else if is_stale_artifact_name(name) {
+            DebrisCategory::StaleArtifact
         } else {
             continue;
         };
@@ -365,6 +377,283 @@ pub fn is_archive_reconcile_backup_name(name: &str) -> bool {
 #[must_use]
 pub fn is_sidecar_snapshot_name(name: &str) -> bool {
     name.contains(".startup-precheckpoint-") || name.contains(".startup-quarantine-")
+}
+
+/// Whether a filename is a `.stale`-marked artifact (GH#210).
+///
+/// Matches the `.stale` suffix and the `.stale-<ts>` / `.stale.<ext>` infix
+/// spellings this codebase produces or prescribes: the operator runbook's
+/// dead-owner lock quarantine (`mv <lock> <lock>.stale`) and test/e2e
+/// quarantines like `parity.stale-wal.quarantine`. The dot-anchored match
+/// deliberately does NOT trip on words that merely contain "stale"
+/// (`*.staleness`, `stale_report.json`), on the live DB, or on live
+/// `-wal`/`-shm` sidecars.
+#[must_use]
+pub fn is_stale_artifact_name(name: &str) -> bool {
+    name.ends_with(".stale") || name.contains(".stale-") || name.contains(".stale.")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Direct storage-root backup inventory (single implementation; GH#210).
+//
+// This lived in `mcp-agent-mail-server::backup_rotation` and was lifted here
+// so BOTH `am doctor health` (CLI) and the MCP `health_check` retention block
+// (tools crate, which cannot depend on the server crate) consume one
+// classifier. The server re-exports these for its rotation machinery.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Buckets that [`classify_backup_file`] maps filenames into. Each bucket has
+/// an independent retention count — we don't want a corruption storm to
+/// evict unrelated pre-migration backups, and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BackupKind {
+    /// `storage.sqlite3.corrupt-*` (plus -wal/-shm siblings)
+    Corrupt,
+    /// `storage.sqlite3.reconstruct-failed-*` and `storage.sqlite3.reconstructing-*`
+    Reconstruct,
+    /// `storage.sqlite3.archive-reconcile-*` (incl. -failed, -restore)
+    ArchiveReconcile,
+    /// `storage.sqlite3.salvage-*`
+    Salvage,
+    /// `storage.sqlite3.manual-backup-*` plus bare `.bak*`
+    ManualBackup,
+    /// `.pre-migrate.*`, `.pre-python-import-*`, `.pre-acfs-import-*`, `.pre-reindex-*`
+    PreMigration,
+}
+
+impl BackupKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Corrupt => "corrupt",
+            Self::Reconstruct => "reconstruct",
+            Self::ArchiveReconcile => "archive_reconcile",
+            Self::Salvage => "salvage",
+            Self::ManualBackup => "manual_backup",
+            Self::PreMigration => "pre_migration",
+        }
+    }
+}
+
+/// Read-only inventory of backup files eligible for rotation.
+///
+/// This excludes the live DB and its sidecars by way of
+/// [`classify_backup_file`], so consumers such as `am doctor health` can
+/// report retention resident bytes without accidentally treating mailbox state
+/// as disposable backup material.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackupInventory {
+    pub artifact_count: usize,
+    pub resident_bytes: u64,
+    /// Individual classified paths, for read-only consumers that need to
+    /// de-duplicate these files from another retention inventory.
+    pub artifacts: Vec<BackupInventoryArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupInventoryArtifact {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+/// Classify a `storage_root`-relative filename into a [`BackupKind`].
+///
+/// Returns `None` for the live DB, Codex DB, and any file that doesn't
+/// match our known backup patterns. This is the *single* place that
+/// decides whether a file counts as backup material at all; rotation
+/// additionally skips [`BackupKind::ArchiveReconcile`] (owned by the
+/// recovery-retention reclaim planner) even though it classifies here so
+/// inventory consumers still see it.
+#[must_use]
+pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
+    // Explicitly never-delete live state.
+    if matches!(
+        file_name,
+        "storage.sqlite3" | "storage.sqlite3-wal" | "storage.sqlite3-shm" | "mailbox.sqlite3"
+    ) {
+        return None;
+    }
+    // Leave the Codex sidecar DB alone.
+    if file_name.starts_with("storage.codex.sqlite3") {
+        return None;
+    }
+
+    // Only files named like the storage DB (or its WAL/SHM siblings) are
+    // eligible. This is the primary guard against touching unrelated files.
+    let stem_prefixes = [
+        "storage.sqlite3.",
+        "storage.sqlite3-wal.",
+        "storage.sqlite3-shm.",
+    ];
+    let after_stem = stem_prefixes
+        .iter()
+        .find_map(|prefix| file_name.strip_prefix(prefix))?;
+
+    // `archive-reconcile-` covers the bare, `-failed-*`, and `-restore-*`
+    // variants in one check (they all share the prefix).
+    if after_stem.starts_with("archive-reconcile-") {
+        return Some(BackupKind::ArchiveReconcile);
+    }
+    if after_stem.starts_with("reconstruct-") || after_stem.starts_with("reconstructing-") {
+        return Some(BackupKind::Reconstruct);
+    }
+    if after_stem.starts_with("corrupt-") {
+        return Some(BackupKind::Corrupt);
+    }
+    if after_stem.starts_with("salvage-") {
+        return Some(BackupKind::Salvage);
+    }
+    // Manual-backup naming is either `manual-backup-<ts>` or the bare `bak`
+    // / `bak.<ts>` legacy variant. Using a bare `starts_with("bak")` would
+    // false-positive future filenames like `backup-plan.txt` that happen to
+    // share the prefix — match exact variants only.
+    if after_stem.starts_with("manual-backup-")
+        || after_stem == "bak"
+        || after_stem.starts_with("bak.")
+        || after_stem.starts_with("bak-")
+    {
+        return Some(BackupKind::ManualBackup);
+    }
+    if after_stem.starts_with("pre-migrate")
+        || after_stem.starts_with("pre-python-import")
+        || after_stem.starts_with("pre-acfs-import")
+        || after_stem.starts_with("pre-reindex")
+    {
+        return Some(BackupKind::PreMigration);
+    }
+
+    None
+}
+
+/// Return the count and bytes of direct backup files eligible for rotation.
+/// Missing storage roots produce an empty inventory, matching rotation's
+/// no-op behavior during first-run bootstrap.
+pub fn inspect_storage_backups(storage_root: &Path) -> std::io::Result<BackupInventory> {
+    let entries = match std::fs::read_dir(storage_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BackupInventory::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut inventory = BackupInventory::default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if classify_backup_file(&name).is_some() {
+            inventory.artifact_count = inventory.artifact_count.saturating_add(1);
+            inventory.resident_bytes = inventory.resident_bytes.saturating_add(metadata.len());
+            inventory.artifacts.push(BackupInventoryArtifact {
+                path,
+                bytes: metadata.len(),
+            });
+        }
+    }
+    Ok(inventory)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Combined retention resident footprint (GH#210).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Read-only retention footprint for one mailbox: recovery debris + direct
+/// backups (de-duplicated — archive-reconcile files are visible to both
+/// inventories) + move-only reclaim staging. This is the ONE implementation
+/// behind both `am doctor health`'s `retention_resident` line and the MCP
+/// `health_check` `retention` block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionResidentStats {
+    pub recovery_debris_artifacts: usize,
+    pub direct_backup_only_artifacts: usize,
+    pub reclaimable_staging_bytes: u64,
+    /// Total resident bytes: recovery debris + de-duplicated direct backups
+    /// + reclaim staging.
+    pub resident_bytes: u64,
+    pub live_database_bytes: Option<u64>,
+    /// Resident bytes per category label: the [`DebrisCategory::as_str`]
+    /// labels, plus `"direct_backup"` (rotation-eligible files not already
+    /// counted as recovery debris) and `"reclaimable_staging"`. Only nonzero
+    /// categories are present.
+    pub resident_bytes_by_category: BTreeMap<&'static str, u64>,
+    /// Bytes the retention policy would consolidate right now (`0` when the
+    /// caller passed no policy). Compared against the operator alert
+    /// threshold, this is the "reclaimable attention" signal the integrity
+    /// guard's observe-and-alert sweep warns on.
+    pub reclaimable_bytes: u64,
+}
+
+/// Compute the [`RetentionResidentStats`] for `storage_root` / `database_path`.
+///
+/// `reclaim_policy` optionally applies [`select_recovery_debris_to_reclaim`]
+/// (with the supplied `now_us`) to the enumerated recovery debris so the
+/// caller also learns how many bytes are reclaimable under the operator's
+/// configured retention policy.
+pub fn retention_resident_stats(
+    storage_root: &Path,
+    database_path: &Path,
+    reclaim_policy: Option<(RetentionPolicy, i64)>,
+) -> std::io::Result<RetentionResidentStats> {
+    let recovery_debris = enumerate_recovery_debris(storage_root, database_path);
+    let recovery_paths = recovery_debris
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut resident_bytes_by_category: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut recovery_bytes = 0_u64;
+    for artifact in &recovery_debris {
+        recovery_bytes = recovery_bytes.saturating_add(artifact.bytes);
+        let slot = resident_bytes_by_category
+            .entry(artifact.category.as_str())
+            .or_default();
+        *slot = slot.saturating_add(artifact.bytes);
+    }
+
+    let backup_inventory = inspect_storage_backups(storage_root)?;
+    let mut direct_backup_only_artifacts = 0_usize;
+    let mut direct_backup_only_bytes = 0_u64;
+    for artifact in &backup_inventory.artifacts {
+        if recovery_paths.contains(&artifact.path) {
+            continue;
+        }
+        direct_backup_only_artifacts += 1;
+        direct_backup_only_bytes = direct_backup_only_bytes.saturating_add(artifact.bytes);
+    }
+    if direct_backup_only_bytes > 0 {
+        resident_bytes_by_category.insert("direct_backup", direct_backup_only_bytes);
+    }
+
+    let staging_bytes = reclaimable_staging_bytes(storage_root);
+    if staging_bytes > 0 {
+        resident_bytes_by_category.insert("reclaimable_staging", staging_bytes);
+    }
+
+    let reclaimable_bytes = reclaim_policy.map_or(0, |(policy, now_us)| {
+        select_recovery_debris_to_reclaim(recovery_debris.clone(), policy, now_us)
+            .reclaimable_bytes
+    });
+
+    Ok(RetentionResidentStats {
+        recovery_debris_artifacts: recovery_debris.len(),
+        direct_backup_only_artifacts,
+        reclaimable_staging_bytes: staging_bytes,
+        resident_bytes: recovery_bytes
+            .saturating_add(direct_backup_only_bytes)
+            .saturating_add(staging_bytes),
+        live_database_bytes: std::fs::metadata(database_path)
+            .ok()
+            .map(|metadata| metadata.len()),
+        resident_bytes_by_category,
+        reclaimable_bytes,
+    })
 }
 
 /// Outcome of [`consolidate_debris`].
@@ -782,6 +1071,160 @@ mod tests {
         assert!(!is_sidecar_snapshot_name(
             "storage.sqlite3.corrupt-20260618_145230_042"
         ));
+    }
+
+    #[test]
+    fn stale_artifact_name_classification() {
+        // Operator-runbook dead-owner lock quarantine (`mv <lock> <lock>.stale`).
+        assert!(is_stale_artifact_name("storage.sqlite3.lock.stale"));
+        assert!(is_stale_artifact_name("index.lock.stale"));
+        // Suffixed sidecar quarantines with a timestamp / extension tail.
+        assert!(is_stale_artifact_name(
+            "storage.sqlite3-wal.stale-20260621_131955_667"
+        ));
+        assert!(is_stale_artifact_name("storage.sqlite3.stale"));
+        assert!(is_stale_artifact_name("parity.stale-wal.quarantine"));
+        assert!(is_stale_artifact_name("storage.sqlite3.stale.bak"));
+        // Live DB / sidecars / backups and mere "stale" substrings are NOT
+        // stale artifacts.
+        assert!(!is_stale_artifact_name("storage.sqlite3"));
+        assert!(!is_stale_artifact_name("storage.sqlite3-wal"));
+        assert!(!is_stale_artifact_name("storage.sqlite3-shm"));
+        assert!(!is_stale_artifact_name("storage.sqlite3.bak"));
+        assert!(!is_stale_artifact_name("storage.sqlite3.staleness"));
+        assert!(!is_stale_artifact_name("stale_report.json"));
+        // Quarantine / snapshot spellings stay in their own categories.
+        assert!(!is_stale_artifact_name(
+            "storage.sqlite3.corrupt-20260618_145230_042"
+        ));
+    }
+
+    #[test]
+    fn enumerates_stale_artifacts_as_their_own_byte_budget_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path();
+        let db_path = storage_root.join("storage.sqlite3");
+        std::fs::write(&db_path, b"live-db").unwrap();
+        std::fs::write(storage_root.join("storage.sqlite3-wal"), b"live-wal").unwrap();
+        std::fs::write(
+            storage_root.join("storage.sqlite3-wal.stale-20260621_131955_667"),
+            vec![0_u8; 100],
+        )
+        .unwrap();
+        std::fs::write(storage_root.join("storage.sqlite3.lock.stale"), vec![0_u8; 10]).unwrap();
+
+        let debris = enumerate_recovery_debris(storage_root, &db_path);
+        let stale: Vec<_> = debris
+            .iter()
+            .filter(|a| a.category == DebrisCategory::StaleArtifact)
+            .collect();
+        assert_eq!(stale.len(), 2, "debris: {debris:?}");
+        // Live DB and live WAL are never debris.
+        assert!(debris.iter().all(|a| a.path != db_path));
+        assert!(
+            debris
+                .iter()
+                .all(|a| a.path != storage_root.join("storage.sqlite3-wal"))
+        );
+
+        // The byte budget applies per category, so the stale bucket is
+        // reclaimable under a zero-retention policy like every other bucket.
+        let plan = select_recovery_debris_to_reclaim(
+            debris,
+            RetentionPolicy {
+                keep_min: 0,
+                max_age_secs: 0,
+                max_total_bytes_per_category: Some(0),
+            },
+            i64::MAX,
+        );
+        assert_eq!(plan.prune.len(), 2);
+        assert_eq!(plan.reclaimable_bytes, 110);
+    }
+
+    #[test]
+    fn retention_resident_stats_reports_bytes_by_category_and_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path();
+        let db_path = storage_root.join("storage.sqlite3");
+        std::fs::write(&db_path, vec![0_u8; 7]).unwrap();
+        // Recovery debris: one quarantine + one stale artifact.
+        std::fs::write(
+            storage_root.join("storage.sqlite3.corrupt-20260101_000000_000"),
+            vec![0_u8; 500],
+        )
+        .unwrap();
+        std::fs::write(
+            storage_root.join("storage.sqlite3-wal.stale-20260101_000000_000"),
+            vec![0_u8; 40],
+        )
+        .unwrap();
+        // Direct backup only (rotation-eligible, not recovery debris).
+        std::fs::write(
+            storage_root.join("storage.sqlite3.manual-backup-20260101_000000_000"),
+            vec![0_u8; 60],
+        )
+        .unwrap();
+        // Move-only reclaim staging residue.
+        let staging = storage_root.join("doctor").join("reclaimable").join("run");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("old-artifact"), vec![0_u8; 30]).unwrap();
+
+        let stats = retention_resident_stats(
+            storage_root,
+            &db_path,
+            Some((
+                RetentionPolicy {
+                    keep_min: 0,
+                    max_age_secs: 0,
+                    max_total_bytes_per_category: None,
+                },
+                i64::MAX,
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(stats.recovery_debris_artifacts, 2);
+        assert_eq!(stats.direct_backup_only_artifacts, 1);
+        assert_eq!(stats.reclaimable_staging_bytes, 30);
+        assert_eq!(stats.resident_bytes, 500 + 40 + 60 + 30);
+        assert_eq!(stats.live_database_bytes, Some(7));
+        assert_eq!(
+            stats.resident_bytes_by_category.get("corrupt_quarantine"),
+            Some(&500)
+        );
+        assert_eq!(
+            stats.resident_bytes_by_category.get("stale_artifact"),
+            Some(&40)
+        );
+        assert_eq!(
+            stats.resident_bytes_by_category.get("direct_backup"),
+            Some(&60)
+        );
+        assert_eq!(
+            stats.resident_bytes_by_category.get("reclaimable_staging"),
+            Some(&30)
+        );
+        // Zero categories are omitted (compact, null-free block downstream).
+        assert!(!stats.resident_bytes_by_category.contains_key("forensic_bundle"));
+        // Zero-retention policy makes all recovery debris reclaimable.
+        assert_eq!(stats.reclaimable_bytes, 540);
+
+        // Archive-reconcile files are visible to both inventories; they must
+        // be counted once (as recovery debris), never twice.
+        std::fs::write(
+            storage_root.join("storage.sqlite3.archive-reconcile-20260101_000000_000"),
+            vec![0_u8; 200],
+        )
+        .unwrap();
+        let stats = retention_resident_stats(storage_root, &db_path, None).unwrap();
+        assert_eq!(stats.resident_bytes, 500 + 40 + 60 + 30 + 200);
+        assert_eq!(
+            stats.resident_bytes_by_category.get("archive_reconcile_backup"),
+            Some(&200)
+        );
+        assert_eq!(stats.direct_backup_only_artifacts, 1);
+        assert_eq!(stats.reclaimable_bytes, 0, "no policy → no reclaim probe");
     }
 
     #[test]

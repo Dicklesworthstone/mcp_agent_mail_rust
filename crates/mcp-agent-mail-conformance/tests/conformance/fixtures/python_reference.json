@@ -105,7 +105,8 @@
               "/queues/commit_coalescer/over_80_for_s",
               "/queues/commit_coalescer/warning",
               "/queues/archive_lag",
-              "/integrity"
+              "/integrity",
+              "/retention"
             ]
           }
         }

@@ -350,6 +350,54 @@ fn coalescer_latency_health_level(
     }
 }
 
+/// Build the `health_check` retention block (GH#210).
+///
+/// Read-only: enumerates the same recovery-debris / direct-backup / staging
+/// inventories `am doctor health` reports, through the single shared
+/// implementation in the db crate. Returns `None` (block omitted) when the
+/// mailbox path cannot be resolved (e.g. `:memory:`) or the storage root
+/// cannot be inspected — health never fails on accounting.
+fn health_check_retention_block(config: &Config) -> Option<RetentionHealthResponse> {
+    let resolved =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    let database_path = Path::new(&resolved.canonical_path);
+    let live_database_bytes = std::fs::metadata(database_path).map_or(0, |meta| meta.len());
+    // Same policy shape as the integrity guard's observe-and-alert sweep
+    // (br-mudrv): keep_min/max_age plus the live-DB-scaled byte ceiling.
+    let policy = mcp_agent_mail_db::recovery_retention::RetentionPolicy {
+        keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
+        max_age_secs: config.doctor_retention_max_age_secs,
+        max_total_bytes_per_category:
+            mcp_agent_mail_db::recovery_retention::effective_byte_budget_per_category(
+                config.doctor_retention_max_bytes_per_category,
+                live_database_bytes,
+            ),
+    };
+    let now_us = mcp_agent_mail_db::now_micros();
+    let stats = mcp_agent_mail_db::recovery_retention::retention_resident_stats(
+        &config.storage_root,
+        database_path,
+        Some((policy, now_us)),
+    )
+    .ok()?;
+    // The existing operator warn threshold: the integrity guard warns when
+    // the reclaimable debris crosses `doctor_retention_alert_bytes`.
+    let reclaimable_attention = config.doctor_retention_alert_bytes > 0
+        && stats.reclaimable_bytes >= config.doctor_retention_alert_bytes;
+    Some(RetentionHealthResponse {
+        resident_bytes: stats.resident_bytes,
+        resident_bytes_by_category: stats
+            .resident_bytes_by_category
+            .iter()
+            .map(|(category, bytes)| ((*category).to_string(), *bytes))
+            .collect(),
+        reclaimable_staging_bytes: stats.reclaimable_staging_bytes,
+        reclaimable_bytes: stats.reclaimable_bytes,
+        live_database_bytes: stats.live_database_bytes,
+        reclaimable_attention,
+    })
+}
+
 fn percentage_clamped(value: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
@@ -1045,6 +1093,10 @@ pub struct HealthCheckResponse {
     pub queues: Option<QueuesHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<DiskHealthResponse>,
+    /// Retention/reclaim resident footprint (GH#210). Omitted only when the
+    /// mailbox path cannot be resolved or inspected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<IntegrityHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1120,6 +1172,36 @@ pub struct DiskHealthResponse {
     pub fatal_threshold_mb: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+}
+
+/// Retention/reclaim footprint surfaced through `health_check` (GH#210).
+///
+/// A never-delete forensic policy is only safe when somebody is told: the
+/// 22 GB-vs-1.6 MB incident sat invisible for a month because the resident
+/// backup/forensic bytes had no health surface. The accounting is the same
+/// single implementation `am doctor health` uses
+/// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionHealthResponse {
+    /// Total resident bytes: recovery debris + de-duplicated direct backups
+    /// + move-only reclaim staging.
+    pub resident_bytes: u64,
+    /// Resident bytes per category label (only nonzero categories present):
+    /// `forensic_bundle`, `corrupt_quarantine`, `archive_reconcile_backup`,
+    /// `sidecar_snapshot`, `stale_artifact`, `direct_backup`,
+    /// `reclaimable_staging`.
+    pub resident_bytes_by_category: std::collections::BTreeMap<String, u64>,
+    /// Bytes already consolidated into `doctor/reclaimable/` awaiting an
+    /// explicit operator removal.
+    pub reclaimable_staging_bytes: u64,
+    /// Bytes the configured retention policy would consolidate right now.
+    pub reclaimable_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_database_bytes: Option<u64>,
+    /// True when `reclaimable_bytes` crosses the operator alert threshold
+    /// (`doctor_retention_alert_bytes`) — the same threshold the integrity
+    /// guard's observe-and-alert sweep warns on. Next step: `am doctor reclaim`.
+    pub reclaimable_attention: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1533,6 +1615,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             fatal_threshold_mb: config.disk_space_fatal_mb,
             errors: s.errors.clone(),
         }),
+        retention: health_check_retention_block(config),
         integrity: Some(IntegrityHealthResponse {
             last_ok_ts: integrity_metrics.last_ok_ts,
             last_check_ts: integrity_metrics.last_check_ts,
@@ -2982,6 +3065,7 @@ mod tests {
             timeout_diagnostics: test_timeout_diagnostics(),
             queues: None,
             disk: None,
+            retention: None,
             integrity: None,
             semantic_indexing: None,
             two_tier_indexing: None,
@@ -3506,6 +3590,7 @@ mod tests {
             timeout_diagnostics: test_timeout_diagnostics(),
             queues: None,
             disk: None,
+            retention: None,
             integrity: None,
             semantic_indexing: None,
             two_tier_indexing: None,
@@ -3523,6 +3608,7 @@ mod tests {
             "pool_utilization",
             "queues",
             "disk",
+            "retention",
             "integrity",
             "semantic_indexing",
             "two_tier_indexing",
@@ -3533,6 +3619,44 @@ mod tests {
                 "optional null field {key} must be omitted"
             );
         }
+    }
+
+    #[test]
+    fn health_check_retention_block_serializes_null_free() {
+        // GH#210: the retention block is compact and null-free — zero
+        // categories are absent from the map and an unknown live-DB size is
+        // omitted rather than serialized as null.
+        let r = RetentionHealthResponse {
+            resident_bytes: 630,
+            resident_bytes_by_category: [
+                ("corrupt_quarantine".to_string(), 500_u64),
+                ("stale_artifact".to_string(), 40),
+                ("direct_backup".to_string(), 60),
+                ("reclaimable_staging".to_string(), 30),
+            ]
+            .into_iter()
+            .collect(),
+            reclaimable_staging_bytes: 30,
+            reclaimable_bytes: 540,
+            live_database_bytes: None,
+            reclaimable_attention: true,
+        };
+        let value = serde_json::to_value(&r).unwrap();
+        let object = value.as_object().expect("retention object");
+        assert!(!object.contains_key("live_database_bytes"));
+        assert_eq!(value["resident_bytes"], 630);
+        assert_eq!(value["reclaimable_attention"], true);
+        assert_eq!(value["resident_bytes_by_category"]["stale_artifact"], 40);
+        assert!(
+            value["resident_bytes_by_category"]
+                .get("forensic_bundle")
+                .is_none(),
+            "zero categories must be absent, not null"
+        );
+        assert!(
+            !value.to_string().contains("null"),
+            "retention block must be null-free: {value}"
+        );
     }
 
     #[test]

@@ -34,7 +34,6 @@ use mcp_agent_mail_tools::reservation_parity::{
     ReservationParityReport, check_reservation_parity_with_canonical_conn,
 };
 use serde::Serialize;
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -135,10 +134,16 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         .get("findings")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
-    let mut total_findings = summary
-        .get("total_findings")
-        .and_then(|n| n.as_u64())
-        .unwrap_or_else(|| findings.as_array().map(|arr| arr.len() as u64).unwrap_or(0));
+    // GH#214: with NO report on disk there is no evidence either way, so the
+    // count is an explicit unknown (`null`), never a `0` indistinguishable
+    // from a clean scan. A live-probe finding below still materializes a
+    // concrete count.
+    let mut total_findings: Option<u64> = report_path.as_ref().map(|_| {
+        summary
+            .get("total_findings")
+            .and_then(|n| n.as_u64())
+            .unwrap_or_else(|| findings.as_array().map(|arr| arr.len() as u64).unwrap_or(0))
+    });
 
     // GH#185: live read-only mailbox probe (identical to `am doctor health`,
     // safe while a server owns the mailbox). A failing live probe must never
@@ -212,13 +217,13 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         } else {
             findings = serde_json::json!([finding]);
         }
-        total_findings = total_findings.saturating_add(1);
+        total_findings = Some(total_findings.unwrap_or(0).saturating_add(1));
     }
 
     let recommended_command = if let Some(live) = live_recommended {
         // An active live-probe failure outranks any cached-report advice.
         live
-    } else if total_findings == 0 {
+    } else if total_findings.unwrap_or(0) == 0 {
         if report_path.is_none() {
             "am doctor".to_string()
         } else {
@@ -271,13 +276,18 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         })
         .unwrap_or_default();
 
-    let envelope = serde_json::json!({
+    let report_available = report_path.is_some();
+    let mut envelope = serde_json::json!({
         "schema_version": "1.0",
         "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
         "tool": "am",
         "tool_version": env!("CARGO_PKG_VERSION"),
         "quick": quick,
-        "report_available": report_path.is_some(),
+        // GH#214: an explicit report disposition. `"absent"` + a null
+        // `total_findings` means "never scanned", which must never read like
+        // a clean scan's `"present"` + `0`.
+        "report": if report_available { "present" } else { "absent" },
+        "report_available": report_available,
         "report_path": report_path.map(|p| p.to_string_lossy().into_owned()),
         "report_warning": report_warning,
         "live_health": live_health,
@@ -289,6 +299,18 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         "capabilities_url": "am doctor capabilities --json",
         "robot_docs_url": "am doctor robot-docs",
     });
+    if !report_available
+        && let Some(map) = envelope.as_object_mut()
+    {
+        map.insert(
+            "report_note".to_string(),
+            serde_json::Value::String(
+                "No doctor report exists yet for this target — the finding count is unknown, \
+                 not zero. Run `am doctor` (or `am doctor --json`) to produce one."
+                    .to_string(),
+            ),
+        );
+    }
 
     Ok(envelope)
 }
@@ -377,62 +399,23 @@ struct DoctorLiveProbeTarget {
 /// Read-only retention footprint for the same mailbox selected by the health
 /// probe. The resident total de-duplicates archive-reconcile files, which are
 /// visible both to direct backup rotation and recovery-debris reclaim.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DoctorRetentionResidentStats {
-    recovery_debris_artifacts: usize,
-    direct_backup_only_artifacts: usize,
-    reclaimable_staging_bytes: u64,
-    resident_bytes: u64,
-    live_database_bytes: Option<u64>,
-}
-
+///
+/// The computation lives in the db crate
+/// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]) so
+/// the MCP `health_check` `retention` block and this `am doctor health`
+/// surface consume ONE implementation (GH#210).
 fn doctor_retention_resident_stats(
     probe_target: &DoctorLiveProbeTarget,
-) -> Result<DoctorRetentionResidentStats, String> {
+) -> Result<mcp_agent_mail_db::recovery_retention::RetentionResidentStats, String> {
     let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
         .map_err(|error| format!("resolving live database path: {error}"))?;
     let database_path = PathBuf::from(&resolved.canonical_path);
-    let recovery_debris = mcp_agent_mail_db::recovery_retention::enumerate_recovery_debris(
+    mcp_agent_mail_db::recovery_retention::retention_resident_stats(
         &probe_target.storage_root,
         &database_path,
-    );
-    let recovery_paths = recovery_debris
-        .iter()
-        .map(|artifact| artifact.path.clone())
-        .collect::<BTreeSet<_>>();
-    let recovery_bytes = recovery_debris
-        .iter()
-        .map(|artifact| artifact.bytes)
-        .fold(0_u64, u64::saturating_add);
-
-    let backup_inventory =
-        mcp_agent_mail_server::backup_rotation::inspect_storage_backups(&probe_target.storage_root)
-            .map_err(|error| format!("inspecting direct backup retention: {error}"))?;
-    let direct_backup_only = backup_inventory
-        .artifacts
-        .iter()
-        .filter(|artifact| !recovery_paths.contains(&artifact.path))
-        .collect::<Vec<_>>();
-    let direct_backup_only_bytes = direct_backup_only
-        .iter()
-        .map(|artifact| artifact.bytes)
-        .fold(0_u64, u64::saturating_add);
-    let reclaimable_staging_bytes =
-        mcp_agent_mail_db::recovery_retention::reclaimable_staging_bytes(
-            &probe_target.storage_root,
-        );
-
-    Ok(DoctorRetentionResidentStats {
-        recovery_debris_artifacts: recovery_debris.len(),
-        direct_backup_only_artifacts: direct_backup_only.len(),
-        reclaimable_staging_bytes,
-        resident_bytes: recovery_bytes
-            .saturating_add(direct_backup_only_bytes)
-            .saturating_add(reclaimable_staging_bytes),
-        live_database_bytes: fs::metadata(database_path)
-            .ok()
-            .map(|metadata| metadata.len()),
-    })
+        None,
+    )
+    .map_err(|error| format!("inspecting direct backup retention: {error}"))
 }
 
 fn format_resident_to_live_database_ratio(
@@ -3431,6 +3414,7 @@ mod tests {
         );
         let report = result.expect("triage envelope after successful result");
         assert_eq!(report["report_available"], true);
+        assert_eq!(report["report"], "present");
         assert!(
             report["report_warning"]
                 .as_str()
@@ -3438,6 +3422,53 @@ mod tests {
             "missing historical-report warning: {report}"
         );
         assert_eq!(report["live_health"]["status"], "ok");
+        // A present (if unreadable) report keeps a concrete count.
+        assert_eq!(report["total_findings"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_triage_reports_absent_report_as_unknown_not_clean() {
+        // GH#214: with NO report on disk, triage must say "unknown", never a
+        // `total_findings: 0` indistinguishable from a clean scan.
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_healthy_live_mailbox(&db_path);
+
+        let storage_root_s = storage_root.path().display().to_string();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                ("HTTP_PORT", "47351"),
+            ],
+            || triage_envelope(target.path(), false),
+        );
+
+        let report = result.expect("triage envelope without any prior run");
+        assert_eq!(report["report"], "absent");
+        assert_eq!(report["report_available"], false);
+        assert!(
+            report["total_findings"].is_null(),
+            "no report means the finding count is UNKNOWN (null), got: {}",
+            report["total_findings"]
+        );
+        let note = report["report_note"]
+            .as_str()
+            .expect("absent report must carry a human-readable note");
+        assert!(
+            note.contains("No doctor report exists yet") && note.contains("am doctor"),
+            "note must say the report is missing and how to produce one: {note}"
+        );
+        assert_eq!(report["recommended_command"], "am doctor");
+        // The live probe is healthy, so no synthetic finding materializes.
+        assert_eq!(report["live_health"]["status"], "ok");
+        assert_eq!(report["findings"], serde_json::json!([]));
     }
 
     #[cfg(unix)]
