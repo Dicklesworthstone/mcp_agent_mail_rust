@@ -303,6 +303,22 @@ fn run_full_cycle(
     match pool.run_full_integrity_check() {
         Ok(_) => {
             tracing::info!("integrity guard: periodic full integrity check passed");
+            // GH#214: PRAGMA checks can under-report the index/table desync
+            // class (quick_check misses single-row loss; the GH#213 Linux
+            // specimen sat green for a full run). Cross-count the hot tables
+            // through their index btrees on the same full-check cadence.
+            // Runs BEFORE the verified-snapshot capture so a desynced DB is
+            // never recorded as last-known-healthy.
+            if let Some(mismatch) = run_index_table_cross_count(sqlite_path) {
+                handle_integrity_error(
+                    "index_table_cross_count",
+                    &mismatch,
+                    sqlite_path,
+                    storage_root,
+                    last_recovery_attempt,
+                );
+                return false;
+            }
             // Bead K2: a passing full check means the DB is verifiably clean —
             // capture a last-known-healthy verified snapshot (best-effort; the
             // call re-verifies and records metrics, and never fails the cycle).
@@ -328,6 +344,68 @@ fn run_full_cycle(
                 last_recovery_attempt,
             );
             false
+        }
+    }
+}
+
+/// Hot tables the GH#214 cross-count guards: the tables whose acknowledged
+/// writes the field reports lost (agents on both legs; messages and
+/// message_recipients in the 2026-08-12 production follow-up), plus their
+/// join anchors.
+const CROSS_COUNT_TABLES: &[&str] = &[
+    "projects",
+    "agents",
+    "messages",
+    "message_recipients",
+    "file_reservations",
+];
+
+/// Run the GH#214 index-vs-table cross-count against a read-only connection.
+///
+/// Returns the first mismatch rendered as a corruption-classifiable message,
+/// or `None` when every probed table agrees with its indexes (or the probe
+/// itself could not run — probe failures are logged and are NOT corruption
+/// evidence). Honest scope: this catches the desync class only; a mutually
+/// consistent database missing acknowledged rows (the GH#213 Windows silent
+/// class) is invisible to any server-side arithmetic.
+fn run_index_table_cross_count(sqlite_path: &Path) -> Option<String> {
+    let path = sqlite_path.display().to_string();
+    let conn = match mcp_agent_mail_db::DbConn::open_file_read_only(&path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "integrity guard: cross-count read-only open failed; skipping this cycle"
+            );
+            return None;
+        }
+    };
+    let result = mcp_agent_mail_db::integrity::index_table_cross_count(&conn, CROSS_COUNT_TABLES);
+    mcp_agent_mail_db::close_db_conn(conn, "integrity-guard cross-count");
+    match result {
+        Ok(mismatches) => {
+            if mismatches.is_empty() {
+                return None;
+            }
+            for mismatch in &mismatches {
+                tracing::error!(
+                    table = %mismatch.table,
+                    index = %mismatch.index,
+                    table_rows = mismatch.table_rows,
+                    index_rows = mismatch.index_rows,
+                    "integrity guard: index/table cross-count desync (GH#214)"
+                );
+            }
+            mismatches
+                .first()
+                .map(mcp_agent_mail_db::integrity::CrossCountMismatch::as_corruption_message)
+        }
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "integrity guard: cross-count probe failed; skipping this cycle"
+            );
+            None
         }
     }
 }
@@ -609,6 +687,36 @@ fn handle_integrity_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_count_healthy_file_reports_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cross-count.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
+            .expect("open db file");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        conn.execute_raw("CREATE INDEX idx_agents_name ON agents(name)")
+            .expect("create index");
+        conn.execute_raw("INSERT INTO agents (name) VALUES ('BlueLake')")
+            .expect("insert row");
+        mcp_agent_mail_db::close_db_conn(conn, "cross-count test");
+
+        assert!(
+            run_index_table_cross_count(&path).is_none(),
+            "healthy database must not report a cross-count desync"
+        );
+    }
+
+    #[test]
+    fn cross_count_missing_file_reports_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("never-created.sqlite3");
+        assert!(
+            run_index_table_cross_count(&path).is_none(),
+            "an unopenable database is a probe failure, not corruption evidence"
+        );
+    }
 
     #[test]
     fn full_check_interval_disabled_when_zero() {

@@ -676,6 +676,137 @@ pub fn is_full_check_due(interval_hours: u64) -> bool {
     elapsed_hours >= interval_hours
 }
 
+/// One index-vs-table row-count disagreement found by
+/// [`index_table_cross_count`] (GH#214 desync class).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossCountMismatch {
+    pub table: String,
+    pub index: String,
+    /// Rows visible through the table btree (`SELECT count(*) ... NOT INDEXED`).
+    pub table_rows: i64,
+    /// Rows visible through the named index (`... INDEXED BY "<index>" WHERE 1`).
+    pub index_rows: i64,
+}
+
+impl CrossCountMismatch {
+    /// Render the mismatch as a corruption-classifiable message.
+    ///
+    /// The leading `database disk image is malformed` phrase is deliberate: it
+    /// routes the finding through the same corruption classification
+    /// (`error::is_corruption_error`) and recovery flow as a failing
+    /// `PRAGMA integrity_check`, so a desynced-but-PRAGMA-green database
+    /// (the GH#213 Linux presentation) is treated as the corruption it is.
+    #[must_use]
+    pub fn as_corruption_message(&self) -> String {
+        format!(
+            "database disk image is malformed: index \"{}\" returns {} rows but table \"{}\" holds {} rows (GH#214 index/table cross-count desync)",
+            self.index, self.index_rows, self.table, self.table_rows
+        )
+    }
+}
+
+/// Arithmetic tripwire for the index/table desync class that `PRAGMA
+/// quick_check` can miss at the single-row stage (GH#213/GH#214).
+///
+/// For each named table that exists, counts the rows through the table btree
+/// (`NOT INDEXED`) and through every eligible named index (`INDEXED BY
+/// "<index>" WHERE 1` — the `WHERE 1` defeats the count(*) covering-index
+/// optimization, which would otherwise resolve the hint and then discard it,
+/// silently comparing an index to itself; measured by the GH#213 reporter).
+/// Any disagreement is returned as a [`CrossCountMismatch`].
+///
+/// Skipped, by design:
+/// - missing tables (fresh/partial schemas are not findings);
+/// - `sqlite_autoindex_*` (cannot be named in `INDEXED BY`; UNIQUE-constraint
+///   coverage belongs to per-row point lookups);
+/// - partial indexes (`CREATE INDEX ... WHERE ...` legitimately holds fewer
+///   entries than the table);
+/// - indexes whose forced probe errors (engine probe limitations are not
+///   corruption evidence; the error is reported via `tracing` only).
+///
+/// Honest scope note: this catches the loud desync class (index and table
+/// btrees disagree). It cannot see the GH#213 Windows silent-loss class,
+/// where table and indexes are mutually consistent but acknowledged rows are
+/// absent — only a client-side acknowledgement ledger sees that.
+pub fn index_table_cross_count(
+    conn: &DbConn,
+    tables: &[&str],
+) -> DbResult<Vec<CrossCountMismatch>> {
+    let mut mismatches = Vec::new();
+    for table in tables {
+        let exists_rows = conn
+            .query_sync(
+                "SELECT count(*) AS c FROM sqlite_master WHERE type = 'table' AND name = ?",
+                &[Value::Text((*table).to_string())],
+            )
+            .map_err(|error| DbError::Sqlite(format!("cross-count table probe failed: {error}")))?;
+        let exists: i64 = exists_rows
+            .first()
+            .and_then(|row| row.get_named("c").ok())
+            .unwrap_or(0);
+        if exists == 0 {
+            continue;
+        }
+
+        let table_sql = format!("SELECT count(*) AS c FROM \"{table}\" NOT INDEXED");
+        let table_rows: i64 = conn
+            .query_sync(&table_sql, &[])
+            .map_err(|error| {
+                DbError::Sqlite(format!("cross-count NOT INDEXED scan of {table} failed: {error}"))
+            })?
+            .first()
+            .and_then(|row| row.get_named("c").ok())
+            .unwrap_or(0);
+
+        let index_rows = conn
+            .query_sync(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? ORDER BY name",
+                &[Value::Text((*table).to_string())],
+            )
+            .map_err(|error| DbError::Sqlite(format!("cross-count index list failed: {error}")))?;
+        for row in &index_rows {
+            let Ok(index) = row.get_named::<String>("name") else {
+                continue;
+            };
+            if index.starts_with("sqlite_autoindex_") {
+                continue;
+            }
+            // Partial indexes legitimately hold fewer entries than the table.
+            let create_sql = row.get_named::<String>("sql").unwrap_or_default();
+            if create_sql.to_ascii_uppercase().contains("WHERE") {
+                continue;
+            }
+            let forced_sql =
+                format!("SELECT count(*) AS c FROM \"{table}\" INDEXED BY \"{index}\" WHERE 1");
+            match conn.query_sync(&forced_sql, &[]) {
+                Ok(rows) => {
+                    let forced: i64 = rows
+                        .first()
+                        .and_then(|row| row.get_named("c").ok())
+                        .unwrap_or(0);
+                    if forced != table_rows {
+                        mismatches.push(CrossCountMismatch {
+                            table: (*table).to_string(),
+                            index,
+                            table_rows,
+                            index_rows: forced,
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        table,
+                        index,
+                        %error,
+                        "cross-count forced-index probe failed; skipping index (probe limitation, not corruption evidence)"
+                    );
+                }
+            }
+        }
+    }
+    Ok(mismatches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,5 +1455,77 @@ mod tests {
             !dir.path().join("test.db.recovery-shm").exists(),
             "recovery shm should be removed"
         );
+    }
+
+    #[test]
+    fn cross_count_is_clean_on_a_healthy_table() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        conn.execute_raw("CREATE TABLE cc (id INTEGER PRIMARY KEY, name TEXT, other TEXT)")
+            .expect("create table");
+        conn.execute_raw("CREATE INDEX idx_cc_name ON cc(name)")
+            .expect("create index");
+        conn.execute_raw("CREATE INDEX idx_cc_other ON cc(other)")
+            .expect("create second index");
+        for i in 0..3 {
+            conn.execute_raw(&format!("INSERT INTO cc (name, other) VALUES ('n{i}', 'o{i}')"))
+                .expect("insert row");
+        }
+
+        let mismatches = index_table_cross_count(&conn, &["cc"]).expect("cross count");
+        assert!(
+            mismatches.is_empty(),
+            "healthy table must not report desync: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn cross_count_skips_missing_tables() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        let mismatches =
+            index_table_cross_count(&conn, &["does_not_exist"]).expect("cross count");
+        assert!(mismatches.is_empty(), "missing table is not a finding");
+    }
+
+    #[test]
+    fn cross_count_skips_partial_indexes() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        conn.execute_raw("CREATE TABLE ccp (id INTEGER PRIMARY KEY, flag INTEGER)")
+            .expect("create table");
+        // A partial index legitimately holds fewer entries than the table;
+        // it must never be reported as a desync. If this engine build does
+        // not support partial indexes, the skip path is moot — bail out.
+        if conn
+            .execute_raw("CREATE INDEX idx_ccp_flag ON ccp(flag) WHERE flag = 1")
+            .is_err()
+        {
+            return;
+        }
+        conn.execute_raw("INSERT INTO ccp (flag) VALUES (1)")
+            .expect("insert matching row");
+        conn.execute_raw("INSERT INTO ccp (flag) VALUES (0)")
+            .expect("insert non-matching row");
+
+        let mismatches = index_table_cross_count(&conn, &["ccp"]).expect("cross count");
+        assert!(
+            mismatches.is_empty(),
+            "partial index must be skipped, not reported: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn cross_count_mismatch_message_classifies_as_corruption() {
+        let mismatch = CrossCountMismatch {
+            table: "agents".to_string(),
+            index: "idx_agents_last_active_id_desc".to_string(),
+            table_rows: 5,
+            index_rows: 7,
+        };
+        let message = mismatch.as_corruption_message();
+        assert!(
+            crate::error::is_corruption_error(&message),
+            "cross-count message must route through the corruption class: {message}"
+        );
+        assert!(message.contains("idx_agents_last_active_id_desc"));
+        assert!(message.contains("GH#214"));
     }
 }
