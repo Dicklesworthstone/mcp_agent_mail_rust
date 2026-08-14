@@ -4846,11 +4846,7 @@ fn live_service_tui_decision(
 /// Explicit terminal prompt shown when a healthy server already owns the
 /// endpoint. Reads one line from stdin; empty input (or read failure) keeps
 /// the safe default of a read-only attach.
-fn prompt_live_service_choice(
-    owner_label: &str,
-    host: &str,
-    port: u16,
-) -> LiveServiceTuiDecision {
+fn prompt_live_service_choice(owner_label: &str, host: &str, port: u16) -> LiveServiceTuiDecision {
     use std::io::Write as _;
 
     eprintln!("\n{owner_label} already owns {host}:{port} and keeps serving your agents.");
