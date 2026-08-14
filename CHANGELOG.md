@@ -10,6 +10,70 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+## v0.3.27 — 2026-08-14 **[Release]**
+
+Fast-follow to v0.3.26 (next day): the silent read-only attach that made
+upgraded `am` installs look broken is now an explicit choice, the whole
+dependency graph moves to the latest asupersync (0.4.4) and FrankenSQLite
+(v0.3.1 lineage), and the archive-read path drops its biggest per-read cost.
+
+### Fixed — the "my TUI is gone" report
+
+- **Plain `am` under a live server asks instead of silently degrading
+  (br-mljnz).** On a terminal: `[Enter/a]` attach read-only (safe default),
+  `[t]` full takeover, `[q]` quit; automation keeps the silent attach;
+  `AM_ATTACH_MODE=attach|takeover|ask` presets the answer.
+- **`--takeover` (and `[t]`) stops a conflicting managed service through its
+  supervisor** (`systemctl --user stop` / `launchctl bootout`) so systemd
+  cannot restart-fight the interactive session, and restarts it when the
+  session ends. Previously takeover seized the mailbox and then fought the
+  supervisor's restart loop.
+
+### Changed — engine and runtime
+
+- **asupersync 0.4.3 → 0.4.4** across the sibling graph (am, sqlmodel,
+  beads_rust, fastmcp). Audited: no `JoinHandle::abort`/`JoinSet` usage
+  anywhere, so 0.4.4's abort-vs-acknowledged-cancel change has zero exposure.
+- **FrankenSQLite engine advanced to the v0.3.1 lineage** (branch
+  `release-engine-0327`, commit `705ea842b`): the append-gate freelist fix
+  (single-writer DDL batches no longer refused with phantom snapshot
+  conflicts — the bug that blocked adopting the crates.io 0.3.1 tarball),
+  the waiter-livelock fix, CONCURRENT EOF abandonment-pool fixes, and JSONB
+  encoding corrections. Registry fsqlite adoption still waits for a 0.3.2
+  that contains the append-gate fix.
+- **Canonical evidence reads no longer consume the source family's sidecars.**
+  With no checkpoint-on-drop, a hot `-wal` is the engine's normal resting
+  state; receipt snapshots and the full-integrity gate now run against a
+  settled private staging copy, so restores keep their quarantine evidence
+  and the receipt witnesses untouched bytes.
+
+### Fixed — v0.3.26 issue-sweep remainders
+
+- Archive reads no longer walk the entire archive working tree (#235):
+  persisted per-repo mutation epoch replaces two full `git status` walks per
+  post-write read, with automatic fallback for archives written by older
+  binaries.
+- The periodic integrity guard no longer fail-opens on canonical
+  disagreement (#214): `reconcile_with_canonical` accepts the canonical
+  verdict only for the known COLLATE NOCASE class.
+- `health_check` surfaces retention/reclaim state (#210) from the same
+  single inventory behind `am doctor health`; `*.stale*` artifacts gained a
+  retention matcher.
+- The fail-closed send profile has no token-free paths left (#237):
+  `macro_contact_handshake` forwards `sender_token`; `reply_message` returns
+  the same redacted receipt as `send_message` under the profile.
+- `am doctor triage` distinguishes "no report yet" from "clean" (#214).
+
+### Known
+
+- `durability_probe_rejects_pooled_only_retained_autocommit_agent` stays
+  `#[ignore]`d pending frankensqlite bd-wd904 (retained-autocommit rows
+  visible to fresh connections). Production pool connections run
+  `autocommit_retain=OFF`; the guarded shape cannot arise outside the
+  harness.
+
+---
+
 ---
 
 ## v0.3.26 — 2026-08-13 **[Release]**
