@@ -6254,7 +6254,14 @@ mod tests {
         assert_eq!(json["reply_to"], 41);
         assert_eq!(json["target_outcomes"][0]["recipient"], "BlueLake");
         assert_eq!(json["target_outcomes"][1]["kind"], "bcc");
-        for forbidden in ["subject", "body_md", "attachments", "deliveries", "from", "to"] {
+        for forbidden in [
+            "subject",
+            "body_md",
+            "attachments",
+            "deliveries",
+            "from",
+            "to",
+        ] {
             assert!(json.get(forbidden).is_none(), "receipt leaked {forbidden}");
         }
     }
