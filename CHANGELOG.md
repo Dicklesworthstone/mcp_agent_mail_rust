@@ -133,6 +133,19 @@ failure mode this release removes.
 - **`am inbox-events` / `fetch_inbox_events`:** durable, restart-safe
   per-recipient delivery cursors ([#238](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/238)).
 
+### Engine
+
+Release binaries are built against a frozen FrankenSQLite engine (v0.3.0
+lineage, branch `release-engine-0326`, commit `dabbccea6`) carrying two
+verified fixes over the 0.3.0 tag: the verbatim-CREATE comment capture that
+made every am-initialized database unreadable by stock `sqlite3`
+("malformed database schema", bd-lgolw), and the detached drop-time WAL
+checkpoint that rewrote the database family ~50ms after an async
+connection's `drop()` returned, underneath forensic/salvage readers
+(bd-daqmp). Every platform binary was probe-verified (`am migrate` + stock
+`sqlite3` schema read) before packaging; the query-only and salvage
+byte-neutrality keepers are 2/2 green at this engine.
+
 ---
 
 ## v0.3.25 — 2026-07-25 **[Tag only]**
