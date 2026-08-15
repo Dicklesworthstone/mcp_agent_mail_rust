@@ -169,7 +169,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -180,7 +180,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -676,7 +676,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -693,7 +693,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1514,7 +1514,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1675,7 +1675,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2150,7 +2150,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsqlite"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync",
  "fsqlite-core",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "foldhash",
  "fsqlite-error",
@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2228,14 +2228,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2246,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2279,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2322,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "argon2",
  "asupersync",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync",
  "bitflags 2.13.1",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync",
  "blake3",
@@ -3254,7 +3254,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a791e6620676a875f362f3156ed213e73ca099a09bf992c18812abe65cc37b1"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -4177,7 +4177,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4536,7 +4536,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "asupersync",
  "clap",
@@ -4564,7 +4564,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4612,7 +4612,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4637,7 +4637,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "chrono",
  "criterion",
@@ -4666,7 +4666,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4709,7 +4709,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "chrono",
  "git2",
@@ -4725,7 +4725,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "chrono",
  "criterion",
@@ -4754,7 +4754,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4800,7 +4800,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -4821,7 +4821,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "asupersync",
  "base64 0.23.1",
@@ -4849,7 +4849,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "git2",
  "tempfile",
@@ -4858,7 +4858,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "arbitrary",
  "asupersync",
@@ -5098,7 +5098,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5329,7 +5329,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5714,7 +5714,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6103,7 +6103,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6556,7 +6556,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7090,10 +7090,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7867,7 +7867,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
