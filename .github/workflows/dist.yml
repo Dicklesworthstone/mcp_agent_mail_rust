@@ -29,7 +29,7 @@ jobs:
             # truncated multi-line CREATE TABLE sql in sqlite_master via the am
             # init path (canonical sqlite3: "malformed database schema"). Pin the
             # last-good commit until the upstream P0 is fixed, then remove.
-            git checkout dabbccea61a1e6b4ce7239b1fd71ed58f037fd97
+            git checkout 705ea842b743b725aa127e03ba055e3c9337c0a5
           )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
@@ -83,7 +83,7 @@ jobs:
             # truncated multi-line CREATE TABLE sql in sqlite_master via the am
             # init path (canonical sqlite3: "malformed database schema"). Pin the
             # last-good commit until the upstream P0 is fixed, then remove.
-            git checkout dabbccea61a1e6b4ce7239b1fd71ed58f037fd97
+            git checkout 705ea842b743b725aa127e03ba055e3c9337c0a5
           )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
@@ -163,7 +163,7 @@ jobs:
             # truncated multi-line CREATE TABLE sql in sqlite_master via the am
             # init path (canonical sqlite3: "malformed database schema"). Pin the
             # last-good commit until the upstream P0 is fixed, then remove.
-            git checkout dabbccea61a1e6b4ce7239b1fd71ed58f037fd97
+            git checkout 705ea842b743b725aa127e03ba055e3c9337c0a5
           )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2

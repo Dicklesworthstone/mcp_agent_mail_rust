@@ -56,6 +56,9 @@ dependency graph moves to the latest asupersync (0.4.4) and FrankenSQLite
 - The periodic integrity guard no longer fail-opens on canonical
   disagreement (#214): `reconcile_with_canonical` accepts the canonical
   verdict only for the known COLLATE NOCASE class.
+- The integrity guard cross-counts index vs table rows on the full-check
+  cadence (#214), so index/table desync is caught at runtime instead of
+  only by the CI tripwire.
 - `health_check` surfaces retention/reclaim state (#210) from the same
   single inventory behind `am doctor health`; `*.stale*` artifacts gained a
   retention matcher.

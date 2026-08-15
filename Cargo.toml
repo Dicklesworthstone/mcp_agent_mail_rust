@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.26"
+version = "0.3.27"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
