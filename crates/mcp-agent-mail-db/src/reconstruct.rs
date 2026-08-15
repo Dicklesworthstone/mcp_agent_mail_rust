@@ -1668,6 +1668,16 @@ fn reconstruct_from_archive_impl(
         // re-scans, keyed by (project, generation, archived id).
         let mut used_reservation_ids: HashSet<i64> = HashSet::new();
         let mut seen_reservations: HashSet<(i64, String, i64)> = HashSet::new();
+        // Identity-level dedup, GLOBAL: one reservation can surface under BOTH the
+        // legacy `id-<id>.json` name and the generation-stamped `id-<id>-g<gen>.json`
+        // name (plus mirrors). Those pass the (project, generation, id) key as
+        // distinct artifacts, and the id-collision fallback then re-inserts the
+        // second copy under a fresh id — producing byte-identical duplicate rows
+        // that the promotion receipt's stable-key collision check rightly refuses
+        // (observed live 2026-08-15: 14802 rows / 14797 unique keys). Content that
+        // matches an already-imported reservation identity exactly is one
+        // reservation and is imported once.
+        let mut seen_reservation_identities: HashSet<ReservationIdentity> = HashSet::new();
 
         // Phase 1: Replay projects discovered before opening the target DB.
         for (slug, project_path) in &project_dirs {
@@ -1704,6 +1714,7 @@ fn reconstruct_from_archive_impl(
                     &mut agent_ids,
                     &mut used_reservation_ids,
                     &mut seen_reservations,
+                    &mut seen_reservation_identities,
                     &mut stats,
                 )?;
             }
@@ -2800,8 +2811,24 @@ fn insert_archived_file_reservation(
     agent_ids: &mut HashMap<(i64, String), i64>,
     used_reservation_ids: &mut HashSet<i64>,
     seen_reservations: &mut HashSet<(i64, String, i64)>,
+    seen_reservation_identities: &mut HashSet<ReservationIdentity>,
 ) -> DbResult<()> {
     let agent_id = ensure_agent_exists(conn, project_id, &reservation.agent_name, agent_ids)?;
+
+    // One reservation, one row: an identity that already imported (under any
+    // artifact naming generation) is the same lease, not a new one.
+    if !seen_reservation_identities.insert((
+        project_id,
+        agent_id,
+        reservation.path_pattern.clone(),
+        i64::from(reservation.exclusive),
+        reservation.reason.clone(),
+        reservation.created_ts,
+        reservation.expires_ts,
+        reservation.released_ts,
+    )) {
+        return Ok(());
+    }
 
     let columns_no_id = "project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts";
     let values_no_id = [
@@ -2878,6 +2905,13 @@ fn insert_archived_file_reservation(
     }
 }
 
+/// Full identity of one archived file reservation, used to import identical
+/// content once no matter how many artifact namings (legacy `id-<id>.json`,
+/// generation-stamped `id-<id>-g<gen>.json`, sha1 mirrors) carry it:
+/// (project_id, agent_id, path_pattern, exclusive, reason, created_ts,
+/// expires_ts, released_ts).
+type ReservationIdentity = (i64, i64, String, i64, String, i64, i64, Option<i64>);
+
 fn discover_file_reservations(
     conn: &DbConn,
     reservations_dir: &Path,
@@ -2885,6 +2919,7 @@ fn discover_file_reservations(
     agent_ids: &mut HashMap<(i64, String), i64>,
     used_reservation_ids: &mut HashSet<i64>,
     seen_reservations: &mut HashSet<(i64, String, i64)>,
+    seen_reservation_identities: &mut HashSet<ReservationIdentity>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     for file_path in reservation_artifact_paths(reservations_dir) {
@@ -2899,6 +2934,7 @@ fn discover_file_reservations(
             agent_ids,
             used_reservation_ids,
             seen_reservations,
+            seen_reservation_identities,
         )?;
     }
 
@@ -8474,6 +8510,57 @@ body
         assert_eq!(
             rows[1].get_named::<String>("path_pattern").unwrap(),
             "src/second.rs"
+        );
+    }
+
+    #[test]
+    fn reconstruct_dedups_identical_reservation_across_legacy_and_generation_artifacts() {
+        // Observed live 2026-08-15 (br-gotf0): ONE reservation surfaced under both
+        // the legacy `id-<id>.json` name and the generation-stamped
+        // `id-<id>-g<gen>.json` name. The (project, generation, id) dedup treats
+        // those as distinct artifacts and the id-collision fallback re-inserts the
+        // second copy under a fresh id — byte-identical duplicate rows that the
+        // promotion receipt's stable-key collision check rightly refuses
+        // (14802 rows / 14797 unique keys wedged the production repair). Identical
+        // identity = one reservation = one row.
+        let storage_root = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = storage_root.path().join("projects").join("dup-project");
+        let agents_dir = project_dir.join("agents").join("CoralMarsh");
+        let reservations_dir = project_dir.join("file_reservations");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        std::fs::create_dir_all(&reservations_dir).expect("reservations dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"dup-project","human_key":"/dup-project","created_at":0}"#,
+        )
+        .expect("project meta");
+        std::fs::write(
+            agents_dir.join("profile.json"),
+            r#"{"name":"CoralMarsh","program":"codex-cli","model":"gpt-5","task_description":"","inception_ts":"2026-03-13T21:21:02Z","last_active_ts":"2026-03-13T21:21:02Z"}"#,
+        )
+        .expect("agent profile");
+
+        // Same reservation content; only the artifact naming differs (and the
+        // generation-stamped copy carries db_generation).
+        let legacy = r#"{"id":7,"project":"/dup-project","agent":"CoralMarsh","path_pattern":"src/same.rs","exclusive":true,"reason":"same lease","created_ts":"2026-03-13T21:36:47.221175Z","expires_ts":"2026-03-13T23:36:47.221175Z"}"#;
+        let stamped = r#"{"id":7,"db_generation":"cccc3333","project":"/dup-project","agent":"CoralMarsh","path_pattern":"src/same.rs","exclusive":true,"reason":"same lease","created_ts":"2026-03-13T21:36:47.221175Z","expires_ts":"2026-03-13T23:36:47.221175Z"}"#;
+        std::fs::write(reservations_dir.join("id-7.json"), legacy).expect("legacy artifact");
+        std::fs::write(reservations_dir.join("id-7-gcccc3333.json"), stamped)
+            .expect("stamped artifact");
+
+        let db_path = db_dir.path().join("dup.sqlite3");
+        reconstruct_from_archive(&db_path, storage_root.path()).expect("reconstruct");
+
+        let conn = SqliteDbConn::open_file(db_path.display().to_string()).expect("open db");
+        let rows = conn
+            .query_sync("SELECT path_pattern FROM file_reservations", &[])
+            .expect("query reservations");
+        assert_eq!(
+            rows.len(),
+            1,
+            "identical reservation identity across legacy and generation artifacts \
+             must import exactly once (stable-key collision otherwise refuses promotion)"
         );
     }
 
