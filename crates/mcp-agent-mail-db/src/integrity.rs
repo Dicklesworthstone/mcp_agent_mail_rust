@@ -752,7 +752,9 @@ pub fn index_table_cross_count(
         let table_rows: i64 = conn
             .query_sync(&table_sql, &[])
             .map_err(|error| {
-                DbError::Sqlite(format!("cross-count NOT INDEXED scan of {table} failed: {error}"))
+                DbError::Sqlite(format!(
+                    "cross-count NOT INDEXED scan of {table} failed: {error}"
+                ))
             })?
             .first()
             .and_then(|row| row.get_named("c").ok())
@@ -1467,8 +1469,10 @@ mod tests {
         conn.execute_raw("CREATE INDEX idx_cc_other ON cc(other)")
             .expect("create second index");
         for i in 0..3 {
-            conn.execute_raw(&format!("INSERT INTO cc (name, other) VALUES ('n{i}', 'o{i}')"))
-                .expect("insert row");
+            conn.execute_raw(&format!(
+                "INSERT INTO cc (name, other) VALUES ('n{i}', 'o{i}')"
+            ))
+            .expect("insert row");
         }
 
         let mismatches = index_table_cross_count(&conn, &["cc"]).expect("cross count");
@@ -1481,8 +1485,7 @@ mod tests {
     #[test]
     fn cross_count_skips_missing_tables() {
         let conn = DbConn::open_memory().expect("open memory db");
-        let mismatches =
-            index_table_cross_count(&conn, &["does_not_exist"]).expect("cross count");
+        let mismatches = index_table_cross_count(&conn, &["does_not_exist"]).expect("cross count");
         assert!(mismatches.is_empty(), "missing table is not a finding");
     }
 

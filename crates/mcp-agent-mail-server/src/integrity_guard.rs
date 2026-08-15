@@ -692,8 +692,8 @@ mod tests {
     fn cross_count_healthy_file_reports_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cross-count.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
-            .expect("open db file");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(path.display().to_string()).expect("open db file");
         conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
             .expect("create table");
         conn.execute_raw("CREATE INDEX idx_agents_name ON agents(name)")
