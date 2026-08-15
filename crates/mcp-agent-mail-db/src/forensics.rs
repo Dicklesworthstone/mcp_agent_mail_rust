@@ -808,7 +808,7 @@ impl CanonicalSnapshotSource {
         let wal = sqlite_family_sidecar(db_path, "-wal");
         let shm = sqlite_family_sidecar(db_path, "-shm");
         let family_is_hot = journal.symlink_metadata().is_ok()
-            || wal.metadata().map(|m| m.len() > 0).unwrap_or(false)
+            || wal.metadata().is_ok_and(|m| m.len() > 0)
             || shm.symlink_metadata().is_ok();
         if !family_is_hot {
             return Ok(Self::Direct(db_path.to_path_buf()));
