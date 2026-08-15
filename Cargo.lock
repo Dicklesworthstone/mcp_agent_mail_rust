@@ -5996,7 +5996,7 @@ dependencies = [
  "crossterm",
  "fancy-regex 0.18.0",
  "log",
- "lru 0.16.4",
+ "lru 0.18.2",
  "num-rational",
  "once_cell",
  "os_pipe",
