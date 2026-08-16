@@ -3595,7 +3595,88 @@ mod startup_readiness_bind_deadline_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Crash markers (long-uptime forensics)
+// ---------------------------------------------------------------------------
+
+/// Size cap for the crash-marker ledger so a panic loop can never eat the
+/// disk (same policy family as the forensics retention cap, br-vdpyv). At the
+/// cap, new markers are dropped — the earliest crashes are the diagnostic
+/// gold, not the millionth repeat.
+const CRASH_MARKER_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+static CRASH_MARKER_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Install a process-wide panic hook that appends a structured crash marker
+/// to `<storage_root>/doctor/crash_markers.jsonl` before the previous hook
+/// (default stderr printer) runs.
+///
+/// Long-uptime `am` sessions die with their stderr lost to a closed tmux
+/// pane or a discarded redirect; without an on-disk marker a weeks-old crash
+/// is unattributable. The marker records message, location, thread,
+/// backtrace, version, and uptime, and is written for every panic — including
+/// dispatch-thread panics that are otherwise caught and converted to
+/// `McpError`s — so panic-shaped trouble is visible even when it does not
+/// kill the process.
+fn install_crash_marker_panic_hook(storage_root: std::path::PathBuf) {
+    CRASH_MARKER_HOOK.call_once(move || {
+        let started = Instant::now();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            write_crash_marker(&storage_root, info, started.elapsed());
+            previous(info);
+        }));
+    });
+}
+
+/// Best-effort by design: a diagnostics failure must never obscure or
+/// amplify the original panic, so every fallible step silently bails.
+fn write_crash_marker(
+    storage_root: &Path,
+    info: &std::panic::PanicHookInfo<'_>,
+    uptime: Duration,
+) {
+    let dir = storage_root.join("doctor");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("crash_markers.jsonl");
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > CRASH_MARKER_MAX_BYTES
+    {
+        return;
+    }
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    let location = info
+        .location()
+        .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
+    let record = serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime.as_secs(),
+        "thread": std::thread::current().name().unwrap_or("<unnamed>"),
+        "message": message,
+        "location": location,
+        "backtrace": std::backtrace::Backtrace::force_capture().to_string(),
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{record}");
+    }
+}
+
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
@@ -3671,6 +3752,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
         return run_http(config);
@@ -3768,7 +3850,32 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     let startup_watchdog = TuiSpinWatchdog::start(&tui_state);
 
     // ── 6. TUI on main thread ───────────────────────────────────────
-    let tui_result = run_tui_main_thread(&tui_state, config);
+    //
+    // catch_unwind: a panic anywhere in the TUI update/render path used to
+    // unwind straight through main, skipping the entire graceful-shutdown
+    // sequence below (WBQ flush, worker shutdown) and killing the MCP/HTTP
+    // server that other agents were still using — the primary mechanism
+    // behind "am eventually terminates after days/weeks". The crash-marker
+    // panic hook has already recorded the panic to
+    // `<storage_root>/doctor/crash_markers.jsonl` by the time we get the
+    // payload here; converting it into an `Err` routes the process through
+    // the same orderly shutdown as any other TUI failure. `Program`'s
+    // terminal guard restores the TTY during the unwind.
+    let tui_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_tui_main_thread(&tui_state, config)
+    }))
+    .unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        Err(std::io::Error::other(format!(
+            "TUI main thread panicked: {detail}. A crash marker with the full \
+             backtrace was appended to <storage_root>/doctor/crash_markers.jsonl; \
+             the server ran its graceful shutdown instead of aborting mid-frame."
+        )))
+    });
     if let Some(watchdog) = startup_watchdog {
         watchdog.shutdown();
     }
