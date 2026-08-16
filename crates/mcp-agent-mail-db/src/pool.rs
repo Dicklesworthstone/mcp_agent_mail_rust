@@ -1873,13 +1873,27 @@ pub fn evaluate_write_route(
 ///
 /// ## Timeout
 ///
-/// Reduced from legacy 60s to 15s: if a connection isn't available within 15s the
-/// circuit breaker should handle the failure rather than having the caller hang.
+/// The acquire timeout MUST stay strictly below
+/// [`mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS`] (30s). When the
+/// two are equal, a stalled acquire and the caller's dispatch deadline expire in
+/// the same instant and every DB stall is reported as
+/// `blocking_dispatch_unattributed` instead of a pool-acquire timeout — the
+/// specific inner error is structurally masked by the generic outer one (GH#245:
+/// a 16-hour outage was undiagnosable for exactly this reason). 10s leaves the
+/// dispatcher 20s of headroom to surface the attributed failure.
 ///
-/// Override via `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` env vars.
+/// Override via `DATABASE_POOL_TIMEOUT` (ms); sizing via `DATABASE_POOL_SIZE` /
+/// `DATABASE_MAX_OVERFLOW` env vars.
 pub const DEFAULT_POOL_SIZE: usize = 25;
 pub const DEFAULT_MAX_OVERFLOW: usize = 75;
-pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 10_000;
+
+// Compile-time guard for the sub-deadline invariant documented above.
+const _: () = assert!(
+    DEFAULT_POOL_TIMEOUT_MS < mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS,
+    "pool acquire timeout must stay below the ecosystem client deadline so \
+     acquire timeouts surface as attributed errors (GH#245)"
+);
 pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes
 
 /// Auto-detect a reasonable pool size from available CPU parallelism.
@@ -10802,8 +10816,9 @@ mod tests {
         assert_eq!(DEFAULT_POOL_SIZE, 25, "min connections for scale");
         assert_eq!(DEFAULT_MAX_OVERFLOW, 75, "overflow headroom for bursts");
         assert_eq!(
-            DEFAULT_POOL_TIMEOUT_MS, 30_000,
-            "30s timeout (fail fast, let circuit breaker handle)"
+            DEFAULT_POOL_TIMEOUT_MS, 10_000,
+            "acquire timeout must stay below the 30s ecosystem client deadline \
+             so pool stalls surface attributed (GH#245)"
         );
         assert_eq!(
             DEFAULT_POOL_RECYCLE_MS,

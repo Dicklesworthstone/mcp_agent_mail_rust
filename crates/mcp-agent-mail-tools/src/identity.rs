@@ -113,6 +113,215 @@ async fn persist_agent_registration_token_with_retry(
     }
 }
 
+/// Tool-layer retry wrapper for #98: `register_agent` is the entry tool
+/// that every multi-agent swarm calls first, so it sees the tallest
+/// concurrent burst of any tool. The inner `run_with_mvcc_retry` already
+/// widens retries (16 attempts, ~29s budget), but a same-instant burst of
+/// 6+ distinct-`project_key` callers can still exhaust the inner budget
+/// because each write serialises on the WAL. Wrap one more coarse level
+/// outside the DB call so the burst settles inside the server process
+/// instead of surfacing a transient RESOURCE_BUSY to every integrator
+/// (which would then have to reimplement its own per-tool retry policy).
+#[allow(clippy::too_many_arguments)]
+async fn register_agent_db_with_retry(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    agent_name: &str,
+    program: &str,
+    model: &str,
+    task_description: Option<&str>,
+    policy: &str,
+    reaper_exempt: Option<bool>,
+) -> Outcome<mcp_agent_mail_db::AgentRow, mcp_agent_mail_db::DbError> {
+    const REGISTER_AGENT_TOOL_RETRIES: u32 = 4;
+    let mut attempt: u32 = 0;
+    loop {
+        let out = mcp_agent_mail_db::queries::register_agent(
+            ctx.cx(),
+            pool,
+            project_id,
+            agent_name,
+            program,
+            model,
+            task_description,
+            Some(policy),
+            reaper_exempt,
+        )
+        .await;
+
+        let should_retry = matches!(&out, Outcome::Err(err) if is_register_retryable(err));
+        if !should_retry || attempt >= REGISTER_AGENT_TOOL_RETRIES {
+            break out;
+        }
+
+        tracing::warn!(
+            attempt,
+            max = REGISTER_AGENT_TOOL_RETRIES,
+            "register_agent: tool-layer retry on RESOURCE_BUSY"
+        );
+        // 500 / 1000 / 1500 / 2000 ms ladder, ±20% jitter from the low
+        // bits of wall-clock so a same-tick boot batch does not
+        // re-collide in lock-step on every retry.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u64, |d| u64::from(d.subsec_nanos()));
+        let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
+        // Thread sleep, NOT `asupersync::time::sleep` (GH#203 class):
+        // tools run under fastmcp's nested-block_on sync bridge, where
+        // runtime timer wheels are not pumped — an awaited timer sleep
+        // parks forever. The backoff is short and bounded, so blocking
+        // the thread is correct.
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+/// Maximum fresh-name draws for a no-name `register_agent` before giving up.
+///
+/// The adjective+noun namespace has tens of thousands of combinations, so 16
+/// consecutive collisions only happens when a project's registry is heavily
+/// saturated — at that point a clear error beats an unbounded loop.
+pub const AUTO_NAME_MAX_DRAWS: u32 = 16;
+
+/// Claim a FRESH auto-generated agent name (GH#213).
+///
+/// A no-name `register_agent` call must never mutate an existing agent's
+/// identity fields. The historical bug: the auto-generated name was fed into
+/// the same `INSERT .. ON CONFLICT(project_id, name) DO UPDATE` upsert used
+/// for explicit re-registration, so a random draw that collided with an
+/// already-registered agent silently overwrote that agent's `program` and
+/// `task_description` while acking the caller as a fresh registration.
+///
+/// This claims the name through [`mcp_agent_mail_db::queries::create_agent`]
+/// (strict insert-if-absent inside a single immediate transaction, returning
+/// `DbError::Duplicate` both when the pre-check sees the row and when a
+/// concurrent writer wins the unique `(project_id, name)` constraint — a
+/// SELECT-based/constraint-based detection, deliberately not `changes()`,
+/// which reports 0 under FrankenSQLite). On collision it redraws, bounded by
+/// [`AUTO_NAME_MAX_DRAWS`].
+///
+/// The registration proof gate is enforced per candidate name, before any row
+/// is written, preserving the "proof is checked against the final agent name"
+/// invariant. Exposed (doc-hidden) so integration tests can drive a
+/// deterministic name drawer.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_fresh_auto_named_agent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_key: &str,
+    project_id: i64,
+    program: &str,
+    model: &str,
+    task_description: Option<&str>,
+    attachments_policy: &str,
+    registration_proof: Option<&str>,
+    first_candidate: String,
+    mut draw_name: impl FnMut() -> String,
+) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    const CREATE_AGENT_TOOL_RETRIES: u32 = 4;
+    let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut candidate = first_candidate;
+    for _draw in 0..AUTO_NAME_MAX_DRAWS {
+        // Proof gate per candidate: no-op when disabled, fail-closed (before
+        // any DB write) when enabled.
+        crate::proof_gate::enforce(
+            ctx.cx(),
+            pool,
+            &crate::proof_gate::RegistrationRequest {
+                agent_name: &candidate,
+                project_key,
+                program,
+                model,
+                granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+                proof: registration_proof,
+            },
+        )
+        .await?;
+
+        // Same coarse RESOURCE_BUSY ladder as the explicit-name path (#98):
+        // a Duplicate outcome is NOT retryable here — it is the redraw signal.
+        let mut busy_attempt: u32 = 0;
+        let out = loop {
+            let out = mcp_agent_mail_db::queries::create_agent(
+                ctx.cx(),
+                pool,
+                project_id,
+                &candidate,
+                program,
+                model,
+                task_description,
+                Some(attachments_policy),
+            )
+            .await;
+
+            let should_retry = matches!(&out, Outcome::Err(err) if is_register_retryable(err));
+            if !should_retry || busy_attempt >= CREATE_AGENT_TOOL_RETRIES {
+                break out;
+            }
+            tracing::warn!(
+                attempt = busy_attempt,
+                max = CREATE_AGENT_TOOL_RETRIES,
+                agent = %candidate,
+                "register_agent auto-name create: tool-layer retry on RESOURCE_BUSY"
+            );
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0u64, |d| u64::from(d.subsec_nanos()));
+            let sleep_ms = register_agent_retry_sleep_ms(busy_attempt, now_ns);
+            // Thread sleep, NOT `asupersync::time::sleep` (GH#203 class); see
+            // register_agent_db_with_retry.
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            busy_attempt = busy_attempt.saturating_add(1);
+        };
+
+        match out {
+            Outcome::Ok(row) => return Ok(row),
+            Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
+                tracing::info!(
+                    project_id,
+                    candidate = %candidate,
+                    "register_agent: auto-generated name collided with an existing agent; \
+                     redrawing instead of merging (GH#213)"
+                );
+                tried.insert(candidate);
+                // Redraw, skipping names this call already saw collide.
+                let mut next = draw_name();
+                for _ in 0..32 {
+                    if !tried.contains(&next) {
+                        break;
+                    }
+                    next = draw_name();
+                }
+                candidate = next;
+            }
+            Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(p) => {
+                return Err(McpError::internal_error(format!(
+                    "Internal panic: {}",
+                    p.message()
+                )));
+            }
+        }
+    }
+
+    Err(legacy_tool_error(
+        "CONFLICT",
+        format!(
+            "Could not auto-generate an unused agent name after {AUTO_NAME_MAX_DRAWS} draws; \
+             this project's adjective+noun namespace is heavily used. \
+             Retry, or pass an explicit unused `name`."
+        ),
+        true,
+        json!({
+            "project_id": project_id,
+            "attempts": AUTO_NAME_MAX_DRAWS,
+        }),
+    ))
+}
+
 /// Build recovery status for the `health_check` response.
 ///
 /// Returns `Some(RecoveryStatusResponse)` when the mailbox is not fully healthy,
@@ -321,10 +530,12 @@ fn timeout_diagnostics_response(
         coalescer_degraded_p99_bound_ms,
         contended_path: diagnostics.stage.as_str().to_string(),
         stage_exceeded_client_deadline: diagnostics.stage_exceeded_budget,
+        p99_window_secs: diagnostics.p99_window_secs,
         pool_acquire_p99_ms: us_to_ms_ceil(diagnostics.pool_acquire_p99_us),
         database_write_p99_ms: us_to_ms_ceil(diagnostics.database_write_p99_us),
         archive_wbq_p99_ms: us_to_ms_ceil(diagnostics.archive_wbq_p99_us),
-        archive_commit_p99_ms: us_to_ms_ceil(diagnostics.archive_commit_p99_us),
+        archive_commit_queue_p99_ms: us_to_ms_ceil(diagnostics.archive_commit_queue_p99_us),
+        git_commit_p99_ms: us_to_ms_ceil(diagnostics.git_commit_p99_us),
         blocking_dispatch_inflight: dispatch.inflight,
         blocking_dispatch_zombies: dispatch.zombies,
         blocking_dispatch_timeouts_total: dispatch.timeouts_total,
@@ -1230,10 +1441,19 @@ pub struct TimeoutDiagnosticsResponse {
     pub contended_path: String,
     /// True only when the named measured stage reached the client deadline.
     pub stage_exceeded_client_deadline: bool,
+    /// Width of the trailing window the p99 evidence below covers. These are
+    /// recent percentiles, not process-lifetime ones (GH#245).
+    pub p99_window_secs: u64,
     pub pool_acquire_p99_ms: u64,
     pub database_write_p99_ms: u64,
+    /// Off the request path since ack-fast: archive lag cannot time a tool out.
     pub archive_wbq_p99_ms: u64,
-    pub archive_commit_p99_ms: u64,
+    /// Enqueue-to-durable latency of the archive commit QUEUE — not pure git
+    /// work, and off the request path since ack-fast (GH#245).
+    pub archive_commit_queue_p99_ms: u64,
+    /// Pure git commit latency, so queue latency is never mistaken for git
+    /// being slow (GH#245).
+    pub git_commit_p99_ms: u64,
     /// Non-pool occupancy from the blocking dispatch handoff.
     pub blocking_dispatch_inflight: u64,
     pub blocking_dispatch_zombies: u64,
@@ -1789,8 +2009,11 @@ pub async fn register_agent(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    // Validate or generate agent name
-    let agent_name = match name {
+    // Validate the explicit agent name if one was provided. When `name` is
+    // omitted the fresh-name draw happens later (GH#213): the auto path must
+    // NEVER upsert onto an existing agent's row, so it claims a name through
+    // the strict insert-if-absent query with bounded redraws on collision.
+    let explicit_name: Option<String> = match name {
         Some(n) => {
             let n = n.trim();
             if n.is_empty() {
@@ -1802,7 +2025,7 @@ pub async fn register_agent(
                     json!({ "provided": n }),
                 ));
             } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(n) {
-                normalized
+                Some(normalized)
             } else {
                 let (err_type, msg) = detect_agent_name_mistake(n).unwrap_or_else(|| {
                     (
@@ -1820,7 +2043,7 @@ pub async fn register_agent(
                 ));
             }
         }
-        None => generate_agent_name(),
+        None => None,
     };
 
     // Validate and normalize attachments_policy (case-insensitive, trimmed)
@@ -1858,74 +2081,84 @@ Check that all parameters have valid values."
     // with an unknown from_agent) — are separately guarded to FAIL CLOSED when
     // the gate is enabled via `proof_gate::reject_auto_registration_if_enabled`,
     // so the identity namespace has no ungated side door.
-    crate::proof_gate::enforce(
-        ctx.cx(),
-        &pool,
-        &crate::proof_gate::RegistrationRequest {
-            agent_name: &agent_name,
-            project_key: &project_key,
-            program: &program,
-            model: &model,
-            granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
-            proof: registration_proof.as_deref(),
-        },
-    )
-    .await?;
+    //
+    // For the auto-generated-name path the gate is enforced INSIDE
+    // `claim_fresh_auto_named_agent` against each candidate name (still before
+    // any row is written), so the "checked against the final agent name"
+    // invariant holds across redraws.
+    if let Some(agent_name) = explicit_name.as_deref() {
+        crate::proof_gate::enforce(
+            ctx.cx(),
+            &pool,
+            &crate::proof_gate::RegistrationRequest {
+                agent_name,
+                project_key: &project_key,
+                program: &program,
+                model: &model,
+                granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+                proof: registration_proof.as_deref(),
+            },
+        )
+        .await?;
+    }
 
-    // Tool-layer retry wrapper for #98: `register_agent` is the entry tool
-    // that every multi-agent swarm calls first, so it sees the tallest
-    // concurrent burst of any tool. The inner `run_with_mvcc_retry` already
-    // widens retries (16 attempts, ~29s budget), but a same-instant burst of
-    // 6+ distinct-`project_key` callers can still exhaust the inner budget
-    // because each write serialises on the WAL. Wrap one more coarse level
-    // outside the DB call so the burst settles inside the server process
-    // instead of surfacing a transient RESOURCE_BUSY to every integrator
-    // (which would then have to reimplement its own per-tool retry policy).
-    const REGISTER_AGENT_TOOL_RETRIES: u32 = 4;
-    let agent_out = {
-        let mut attempt: u32 = 0;
-        loop {
-            let out = mcp_agent_mail_db::queries::register_agent(
-                ctx.cx(),
+    let mut row = if let Some(agent_name) = explicit_name {
+        // Explicit name: documented upsert/idempotent-re-registration
+        // semantics (refresh program/model/task, bump last_active_ts).
+        db_outcome_to_mcp_result(
+            register_agent_db_with_retry(
+                ctx,
                 &pool,
                 project_id,
                 &agent_name,
                 &program,
                 &model,
                 task_description.as_deref(),
-                Some(&policy),
+                &policy,
                 reaper_exempt,
             )
-            .await;
-
-            let should_retry = matches!(&out, Outcome::Err(err) if is_register_retryable(err));
-            if !should_retry || attempt >= REGISTER_AGENT_TOOL_RETRIES {
-                break out;
-            }
-
-            tracing::warn!(
-                attempt,
-                max = REGISTER_AGENT_TOOL_RETRIES,
-                "register_agent: tool-layer retry on RESOURCE_BUSY"
-            );
-            // 500 / 1000 / 1500 / 2000 ms ladder, ±20% jitter from the low
-            // bits of wall-clock so a same-tick boot batch does not
-            // re-collide in lock-step on every retry.
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0u64, |d| u64::from(d.subsec_nanos()));
-            let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
-            // Thread sleep, NOT `asupersync::time::sleep` (GH#203 class):
-            // tools run under fastmcp's nested-block_on sync bridge, where
-            // runtime timer wheels are not pumped — an awaited timer sleep
-            // parks forever. The backoff is short and bounded, so blocking
-            // the thread is correct.
-            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-            attempt = attempt.saturating_add(1);
+            .await,
+        )?
+    } else {
+        // No name given: draw a FRESH name. A random draw that collides with
+        // an already-registered agent must redraw, never merge onto that
+        // agent's row (GH#213).
+        let row = claim_fresh_auto_named_agent(
+            ctx,
+            &pool,
+            &project_key,
+            project_id,
+            &program,
+            &model,
+            task_description.as_deref(),
+            &policy,
+            registration_proof.as_deref(),
+            generate_agent_name(),
+            generate_agent_name,
+        )
+        .await?;
+        if reaper_exempt == Some(true) {
+            // `create_agent` cannot set reaper_exempt; apply it with the
+            // idempotent explicit-name upsert on the row we just created
+            // (safe: the name is now provably ours in this project).
+            db_outcome_to_mcp_result(
+                register_agent_db_with_retry(
+                    ctx,
+                    &pool,
+                    project_id,
+                    &row.name,
+                    &program,
+                    &model,
+                    task_description.as_deref(),
+                    &policy,
+                    reaper_exempt,
+                )
+                .await,
+            )?
+        } else {
+            row
         }
     };
-
-    let mut row = db_outcome_to_mcp_result(agent_out)?;
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
@@ -2694,10 +2927,12 @@ mod tests {
             coalescer_degraded_p99_bound_ms: 15_000,
             contended_path: "no_monitored_stage_exceeded_budget".into(),
             stage_exceeded_client_deadline: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
             pool_acquire_p99_ms: 0,
             database_write_p99_ms: 0,
             archive_wbq_p99_ms: 0,
-            archive_commit_p99_ms: 0,
+            archive_commit_queue_p99_ms: 0,
+            git_commit_p99_ms: 0,
             blocking_dispatch_inflight: 0,
             blocking_dispatch_zombies: 0,
             blocking_dispatch_timeouts_total: 0,
@@ -3543,10 +3778,12 @@ mod tests {
                 client_deadline_us: 30_000_000,
                 stage: mcp_agent_mail_core::metrics::TimeoutStage::BlockingDispatch,
                 stage_exceeded_budget: false,
+                p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
                 pool_acquire_p99_us: 0,
                 database_write_p99_us: 0,
                 archive_wbq_p99_us: 0,
-                archive_commit_p99_us: 16_778_000,
+                archive_commit_queue_p99_us: 16_778_000,
+                git_commit_p99_us: 450_000,
                 blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                     inflight: 1,
                     zombies: 0,
@@ -3559,7 +3796,12 @@ mod tests {
         assert_eq!(response.contended_path, "blocking_dispatch_unattributed");
         assert_eq!(response.pool_acquire_p99_ms, 0);
         assert_eq!(response.blocking_dispatch_inflight, 1);
-        assert_eq!(response.archive_commit_p99_ms, 16_778);
+        assert_eq!(response.archive_commit_queue_p99_ms, 16_778);
+        assert_eq!(response.git_commit_p99_ms, 450);
+        assert_eq!(
+            response.p99_window_secs,
+            mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS
+        );
     }
 
     #[test]

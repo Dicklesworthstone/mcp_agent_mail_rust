@@ -326,6 +326,84 @@ pub fn simplify_verbatim_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Strip a Windows extended-length ("verbatim") prefix from a path string
+/// unconditionally, for path *comparison* only (GH#216).
+///
+/// Unlike [`simplify_verbatim_path`] this ignores the round-trip safety guards
+/// (`MAX_PATH`, trailing dots/spaces): the stripped spelling is never handed to
+/// the filesystem, it only has to land both sides of a prefix comparison in the
+/// same form. `\\?\UNC\srv\share` becomes `\\srv\share` and `\\?\C:\x` becomes
+/// `C:\x`. Returns `None` when `raw` carries no verbatim prefix.
+///
+/// Pure string manipulation, applied unconditionally on every platform (the
+/// `\\?\` byte sequence never begins a real Unix path), so Linux tests exercise
+/// the logic without `cfg!(windows)` gating — same convention as
+/// [`simplify_verbatim_path`].
+fn strip_verbatim_prefix_str(raw: &str) -> Option<String> {
+    raw.strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_string))
+}
+
+/// String-level core of [`relative_to_normalized`] /
+/// [`path_starts_with_normalized`]: compute `target` relative to `base` after
+/// stripping verbatim prefixes from both sides.
+///
+/// Returns `None` when neither side carries a verbatim prefix (the caller's
+/// plain `Path::strip_prefix` was already authoritative), when `base` is not a
+/// prefix of `target`, or when the match does not fall on a path-component
+/// boundary (`C:\ab` is not inside `C:\a`).
+fn relative_str_after_verbatim_strip(target: &str, base: &str) -> Option<String> {
+    let target_stripped = strip_verbatim_prefix_str(target);
+    let base_stripped = strip_verbatim_prefix_str(base);
+    if target_stripped.is_none() && base_stripped.is_none() {
+        return None;
+    }
+    let target_norm = target_stripped.unwrap_or_else(|| target.to_string());
+    let base_norm = base_stripped.unwrap_or_else(|| base.to_string());
+    let rest = target_norm.strip_prefix(&base_norm)?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    if !(rest.starts_with('\\')
+        || rest.starts_with('/')
+        || base_norm.ends_with('\\')
+        || base_norm.ends_with('/'))
+    {
+        return None;
+    }
+    Some(rest.trim_start_matches(['\\', '/']).to_string())
+}
+
+/// Compute `target` relative to `base`, tolerating mixed plain/verbatim
+/// Windows path spellings (GH#216).
+///
+/// `fs::canonicalize` on Windows returns the extended-length `\\?\C:\...`
+/// spelling while storage roots are kept in the simplified legacy form, so a
+/// plain [`Path::strip_prefix`] fails whenever exactly one side carries the
+/// `\\?\` prefix — which broke every archive write-back on Windows. This
+/// helper first defers to `Path::strip_prefix` (identical behavior for all
+/// same-spelling inputs, including every non-Windows path), then retries at
+/// the string level with the verbatim prefix stripped from both sides.
+#[must_use]
+pub fn relative_to_normalized(target: &Path, base: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = target.strip_prefix(base) {
+        return Some(rel.to_path_buf());
+    }
+    relative_str_after_verbatim_strip(&target.to_string_lossy(), &base.to_string_lossy())
+        .map(PathBuf::from)
+}
+
+/// Prefix containment check tolerant of mixed plain/verbatim Windows path
+/// spellings (GH#216). Equivalent to [`Path::starts_with`] for same-spelling
+/// inputs (and for every non-Windows path).
+#[must_use]
+pub fn path_starts_with_normalized(path: &Path, base: &Path) -> bool {
+    path.starts_with(base)
+        || relative_str_after_verbatim_strip(&path.to_string_lossy(), &base.to_string_lossy())
+            .is_some()
+}
+
 /// Return the sibling `SQLite` sidecar path for a `database` file.
 #[must_use]
 pub fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -885,6 +963,105 @@ mod tests {
             simplify_verbatim_path(Path::new(r"\\?\Volume{guid}\x")),
             PathBuf::from(r"\\?\Volume{guid}\x")
         );
+    }
+
+    /// GH#216: mixed verbatim/plain prefix comparisons must succeed — storage
+    /// roots are kept in the simplified legacy spelling while
+    /// `fs::canonicalize` keeps returning the `\\?\` form for targets.
+    #[test]
+    fn relative_to_normalized_mixed_verbatim_and_plain() {
+        // Verbatim target vs plain base: the archive write-back shape that
+        // failed 507 times in a row on a fresh Windows DB.
+        assert_eq!(
+            relative_to_normalized(
+                Path::new(r"\\?\C:\root\projects\p\messages\m.md"),
+                Path::new(r"C:\root")
+            ),
+            Some(PathBuf::from(r"projects\p\messages\m.md"))
+        );
+        // Plain target vs verbatim base.
+        assert_eq!(
+            relative_to_normalized(Path::new(r"C:\root\a.txt"), Path::new(r"\\?\C:\root")),
+            Some(PathBuf::from("a.txt"))
+        );
+        // Both verbatim.
+        assert_eq!(
+            relative_to_normalized(Path::new(r"\\?\C:\root\a"), Path::new(r"\\?\C:\root")),
+            Some(PathBuf::from("a"))
+        );
+        // Verbatim UNC target vs plain UNC base.
+        assert_eq!(
+            relative_to_normalized(
+                Path::new(r"\\?\UNC\server\share\mail\x"),
+                Path::new(r"\\server\share\mail")
+            ),
+            Some(PathBuf::from("x"))
+        );
+        // Equal paths in different spellings: empty relative path.
+        assert_eq!(
+            relative_to_normalized(Path::new(r"\\?\C:\root"), Path::new(r"C:\root")),
+            Some(PathBuf::new())
+        );
+        // Drive-root base keeps its trailing separator; still matches.
+        assert_eq!(
+            relative_to_normalized(Path::new(r"\\?\C:\a"), Path::new(r"C:\")),
+            Some(PathBuf::from("a"))
+        );
+        // Component boundary: `C:\ab` is not inside `C:\a`.
+        assert_eq!(
+            relative_to_normalized(Path::new(r"\\?\C:\ab"), Path::new(r"C:\a")),
+            None
+        );
+        // Different drive: no relative path.
+        assert_eq!(
+            relative_to_normalized(Path::new(r"\\?\D:\other"), Path::new(r"C:\root")),
+            None
+        );
+        // Unix passthrough: plain `Path::strip_prefix` semantics unchanged.
+        assert_eq!(
+            relative_to_normalized(Path::new("/data/root/a/b"), Path::new("/data/root")),
+            Some(PathBuf::from("a/b"))
+        );
+        assert_eq!(
+            relative_to_normalized(Path::new("/data/rootx"), Path::new("/data/root")),
+            None
+        );
+    }
+
+    /// GH#216: attachment containment checks mix `canonicalize()` output with
+    /// the simplified base spelling; the tolerant check must bridge them.
+    #[test]
+    fn path_starts_with_normalized_mixed_spellings() {
+        assert!(path_starts_with_normalized(
+            Path::new(r"\\?\C:\base\file"),
+            Path::new(r"C:\base")
+        ));
+        assert!(path_starts_with_normalized(
+            Path::new(r"C:\base\file"),
+            Path::new(r"\\?\C:\base")
+        ));
+        assert!(path_starts_with_normalized(
+            Path::new(r"\\?\UNC\srv\share\f"),
+            Path::new(r"\\srv\share")
+        ));
+        // Non-prefix and lookalike-component cases stay rejected.
+        assert!(!path_starts_with_normalized(
+            Path::new(r"\\?\C:\evil\file"),
+            Path::new(r"C:\base")
+        ));
+        assert!(!path_starts_with_normalized(
+            Path::new(r"\\?\C:\baseline"),
+            Path::new(r"C:\base")
+        ));
+        // Unix passthrough.
+        assert!(path_starts_with_normalized(
+            Path::new("/a/b/c"),
+            Path::new("/a/b")
+        ));
+        assert!(!path_starts_with_normalized(
+            Path::new("/a/bc"),
+            Path::new("/a/b")
+        ));
     }
 
     #[test]

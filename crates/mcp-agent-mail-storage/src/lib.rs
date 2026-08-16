@@ -9208,7 +9208,11 @@ pub fn resolve_attachment_source_path_from_canonical_base(
     };
 
     let resolved = match candidate.canonicalize() {
-        Ok(resolved) => resolved,
+        // GH#216: simplify the Windows verbatim (`\\?\`) canonical spelling so
+        // the containment checks below compare like-for-like with the
+        // simplified `canonical_base` and the returned path stays usable by
+        // downstream consumers that mishandle verbatim paths.
+        Ok(resolved) => mcp_agent_mail_core::disk::simplify_verbatim_path(&resolved),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(StorageError::InvalidPath(format!(
                 "Attachment not found: {}",
@@ -9223,15 +9227,19 @@ pub fn resolve_attachment_source_path_from_canonical_base(
         }
     };
 
-    // Relative paths must never escape the project directory.
-    if !input_is_absolute && !resolved.starts_with(canonical_base) {
+    // Relative paths must never escape the project directory. GH#216: the
+    // normalized check tolerates a residual verbatim spelling on either side
+    // (e.g. a base past the classic MAX_PATH limit that could not simplify).
+    let inside_base =
+        mcp_agent_mail_core::disk::path_starts_with_normalized(&resolved, canonical_base);
+    if !input_is_absolute && !inside_base {
         return Err(StorageError::InvalidPath(format!(
             "Attachment path escapes the project directory: {}",
             resolved.display()
         )));
     }
 
-    if resolved.starts_with(canonical_base) {
+    if inside_base {
         return Ok(resolved);
     }
 
@@ -9264,14 +9272,19 @@ fn resolve_source_attachment_path_opt(
     } else {
         canonical_base.join(input)
     };
-    let resolved = candidate.canonicalize().ok()?;
+    // GH#216: simplify the verbatim canonical spelling before the containment
+    // checks (see resolve_attachment_source_path_from_canonical_base).
+    let resolved =
+        mcp_agent_mail_core::disk::simplify_verbatim_path(&candidate.canonicalize().ok()?);
 
     // Relative paths must never escape the project directory.
-    if !input_is_absolute && !resolved.starts_with(canonical_base) {
+    let inside_base =
+        mcp_agent_mail_core::disk::path_starts_with_normalized(&resolved, canonical_base);
+    if !input_is_absolute && !inside_base {
         return None;
     }
 
-    if resolved.starts_with(canonical_base) {
+    if inside_base {
         return Some(resolved);
     }
 
@@ -11311,10 +11324,14 @@ fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
         Err(err) => return Err(StorageError::Io(err)),
     };
 
-    canonical_target
-        .strip_prefix(canonical_base)
+    // GH#216: `fs::canonicalize` returns the extended-length (`\\?\C:\...`)
+    // spelling on Windows while `canonical_base` is kept in the simplified
+    // legacy form, so a plain `strip_prefix` fails whenever exactly one side
+    // carries the verbatim prefix — which broke every archive write-back and
+    // armed the durability latch. Use the mixed-spelling-tolerant helper.
+    mcp_agent_mail_core::disk::relative_to_normalized(&canonical_target, canonical_base)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .map_err(|_| {
+        .ok_or_else(|| {
             StorageError::InvalidPath(format!(
                 "Cannot compute relative path from {} to {}",
                 canonical_base.display(),
@@ -11581,7 +11598,11 @@ fn canonicalize_with_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
     loop {
         match current.canonicalize() {
             Ok(canonical_current) => {
-                let mut resolved = canonical_current;
+                // GH#216: keep the simplified legacy spelling so later prefix
+                // comparisons against simplified bases (storage root, cached
+                // repo roots) never mix plain and `\\?\` verbatim forms.
+                let mut resolved =
+                    mcp_agent_mail_core::disk::simplify_verbatim_path(&canonical_current);
                 for component in missing_suffix.iter().rev() {
                     resolved.push(component);
                 }
@@ -15069,6 +15090,27 @@ mod tests {
             2,
             "same slug in distinct archive roots should not serialize on the in-process lock"
         );
+    }
+
+    /// GH#216 regression: `rel_path_cached` for a target that does not exist
+    /// yet resolves through `canonicalize_with_existing_prefix`, which now
+    /// applies the verbatim-path simplification before the (normalized) strip.
+    /// On Unix this pins the passthrough behavior; the Windows verbatim arm is
+    /// covered by the string-level tests in `mcp_agent_mail_core::disk`.
+    #[test]
+    fn gh216_rel_path_cached_handles_not_yet_existing_targets() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "gh216-relpath").unwrap();
+
+        let existing = archive.root.join("existing.txt");
+        fs::write(&existing, "x").unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &existing).unwrap();
+        assert_eq!(rel, "projects/gh216-relpath/existing.txt");
+
+        let missing = archive.root.join("messages/2026/08/new-message.md");
+        let rel = rel_path_cached(&archive.canonical_repo_root, &missing).unwrap();
+        assert_eq!(rel, "projects/gh216-relpath/messages/2026/08/new-message.md");
     }
 
     // -----------------------------------------------------------------------

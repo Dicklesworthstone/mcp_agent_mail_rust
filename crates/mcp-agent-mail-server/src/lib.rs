@@ -5147,17 +5147,23 @@ fn dispatch_timeout_error_text(
     format!(
         "Request timed out after {dispatch_timeout_secs}s (method={method}). \
          Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
-         client_deadline_ms={}; pool_acquire_p99_ms={}; database_write_p99_ms={}; \
-         archive_wbq_p99_ms={}; archive_commit_p99_ms={}; \
+         client_deadline_ms={}; p99_window_secs={}; pool_acquire_p99_ms={}; \
+         database_write_p99_ms={}; archive_wbq_p99_ms={}; \
+         archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
-         blocking_dispatch_timeouts_total={}.",
+         blocking_dispatch_timeouts_total={}. \
+         (archive stages are off the request path since ack-fast: archive \
+         lag cannot cause a tool timeout; archive_commit_queue is \
+         enqueue-to-durable queue latency, not pure git work.)",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
+        diagnostics.p99_window_secs,
         micros_to_millis_ceil(diagnostics.pool_acquire_p99_us),
         micros_to_millis_ceil(diagnostics.database_write_p99_us),
         micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
-        micros_to_millis_ceil(diagnostics.archive_commit_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_commit_queue_p99_us),
+        micros_to_millis_ceil(diagnostics.git_commit_p99_us),
         dispatch.inflight,
         dispatch.zombies,
         dispatch.timeouts_total,
@@ -17099,10 +17105,12 @@ mod tests {
             client_deadline_us: 30_000_000,
             stage: mcp_agent_mail_core::metrics::TimeoutStage::BlockingDispatch,
             stage_exceeded_budget: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
             pool_acquire_p99_us: 9_000,
             database_write_p99_us: 11_000,
             archive_wbq_p99_us: 2_000,
-            archive_commit_p99_us: 16_778_000,
+            archive_commit_queue_p99_us: 16_778_000,
+            git_commit_p99_us: 450_000,
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -17114,7 +17122,10 @@ mod tests {
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
-        assert!(text.contains("archive_commit_p99_ms=16778"));
+        assert!(text.contains("archive_commit_queue_p99_ms=16778"));
+        assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("p99_window_secs=600"));
+        assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
     }
 
