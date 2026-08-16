@@ -10,6 +10,31 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+### Fixed
+
+- **`reservation_parity` no longer fails health forever on released rows with
+  no archive artifact (#244).** A *released* DB reservation missing its
+  current-generation archive artifact is now informational
+  (`released_missing_archive`), not drift: it is not a lock hazard (br-74sxo —
+  "a missing artifact needs no heal"), the retention prune deletes the row in
+  due course, and after reconstruct-from-archive the artifact typically still
+  exists under the prior generation's stamp. Previously these counted as
+  `missing_archive` hard drift with no fixer, so `am doctor health` returned
+  rc=1 permanently on a healthy mailbox (the mirror of #173/br-5xbua). An
+  *active* row missing its artifact remains drift and still self-heals via
+  reconcile-on-read. Health-line examples now list drift examples before
+  informational ones, so `fields=[missing_archive=…]` is no longer illustrated
+  by unrelated `foreign_generation_artifact` entries.
+- **Pool acquire timeout lowered below the MCP request deadline (10s vs 30s,
+  #245).** `DEFAULT_POOL_TIMEOUT_MS` equaled the 30s dispatch deadline, so a
+  stalled connection acquire and the outer request deadline expired in the
+  same instant and every DB stall was reported as
+  `stage=blocking_dispatch_unattributed` — the pool's specific "acquire
+  timeout" error could never surface. The timeout bounds only the wait for a
+  connection (create/init, including migrations and archive reconstruction,
+  is not cut off), and a regression test now pins the ≥2x margin against
+  `ECOSYSTEM_CLIENT_DEADLINE_MS`.
+
 ## v0.3.27 — 2026-08-14 **[Release]**
 
 Fast-follow to v0.3.26 (next day): the silent read-only attach that made
