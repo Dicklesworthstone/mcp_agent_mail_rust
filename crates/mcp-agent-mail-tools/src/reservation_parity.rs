@@ -19,6 +19,21 @@ pub struct ReservationParityDriftSummary {
     /// independently. Tracked for visibility but deliberately excluded from
     /// `total()` so that routine retention never reports parity drift (br-5xbua).
     pub pruned_released_archived: usize,
+    /// *Released* DB reservation rows with no archive artifact for the live DB
+    /// generation. These are EXPECTED bookkeeping, not drift (GH#244): a
+    /// released row is not a lock hazard (the release healer's own rule,
+    /// br-74sxo, is "a missing artifact needs no heal — there is nothing for
+    /// the guard to honor"), the retention prune will hard-delete the row from
+    /// `SQLite` in due course, and the artifact frequently still exists under a
+    /// *prior* generation stamp (`id-<id>-g<gen>.json`) after
+    /// reconstruct-from-archive imported the row into a freshly-minted
+    /// generation. Counting these as hard drift made `am doctor health` fail
+    /// permanently on a healthy mailbox with no fixer able to clear it (the
+    /// mirror of GH#173's archive-side rule, br-5xbua). Tracked for visibility
+    /// and deliberately excluded from `total()`. Only an *active* row missing
+    /// its artifact remains drift — and that direction self-heals via F1
+    /// reconcile-on-read on the next reservation read.
+    pub released_missing_archive: usize,
     /// Archive `id-<id>.json` artifacts whose reservation id exists in `SQLite` only
     /// under a *different* project.
     ///
@@ -95,15 +110,24 @@ impl ReservationParityReport {
     #[must_use]
     pub fn health_line(&self) -> String {
         if self.ok {
-            // `pruned_released_archived` (retention) and `foreign_generation_artifacts`
-            // (prior-DB-generation debris, br-n8qh6) are expected, not drift, so they
-            // are reported only as informational suffixes when non-zero.
+            // `pruned_released_archived` (retention), `released_missing_archive`
+            // (released rows awaiting retention, GH#244) and
+            // `foreign_generation_artifacts` (prior-DB-generation debris,
+            // br-n8qh6) are expected, not drift, so they are reported only as
+            // informational suffixes when non-zero.
             let mut suffix = String::new();
             if self.drift.pruned_released_archived > 0 {
                 let _ = write!(
                     suffix,
                     " pruned_released_archived={}",
                     self.drift.pruned_released_archived
+                );
+            }
+            if self.drift.released_missing_archive > 0 {
+                let _ = write!(
+                    suffix,
+                    " released_missing_archive={}",
+                    self.drift.released_missing_archive
                 );
             }
             if self.drift.foreign_generation_artifacts > 0 {
@@ -389,6 +413,14 @@ where
         });
     }
 
+    // Informational (non-drift) examples are collected separately and appended
+    // AFTER the drift examples, so the health line's leading examples always
+    // describe the drift being reported. Previously the foreign-generation
+    // examples were pushed first and crowded out the drift examples entirely,
+    // producing health lines like `fields=[missing_archive=101]
+    // examples=[...:foreign_generation_artifact,...]` (GH#244).
+    let mut info_examples = Vec::new();
+
     // Partition scanned artifacts: any stamped with a generation other than the
     // live DB's is prior-generation debris — counted for visibility but excluded
     // from parity comparison (and from `total()`), so a re-created DB writing to
@@ -401,8 +433,8 @@ where
         };
         if is_foreign {
             drift.foreign_generation_artifacts += 1;
-            if examples.len() < 32 {
-                examples.push(ReservationParityExample {
+            if info_examples.len() < 32 {
+                info_examples.push(ReservationParityExample {
                     reservation_id: reservation.reservation_id,
                     project_slug: reservation.project_slug.clone(),
                     field: "foreign_generation_artifact".to_string(),
@@ -464,16 +496,45 @@ where
             (Some(db), Some(archive)) => {
                 compare_reservation_pair(db, archive, &mut drift, &mut examples);
             }
-            (Some(_), None) => {
-                drift.missing_archive_artifacts += 1;
-                examples.push(ReservationParityExample {
-                    reservation_id,
-                    project_slug,
-                    field: "archive_artifact".to_string(),
-                    db_value: "present".to_string(),
-                    archive_value: "missing".to_string(),
-                    detail: format!("reservation_id={reservation_id} missing stable id artifact"),
-                });
+            (Some(db), None) => {
+                if positive_ts(db.effective_released_ts()) {
+                    // A *released* DB row with no current-generation artifact is
+                    // expected bookkeeping, not drift (GH#244): it is not a lock
+                    // hazard (br-74sxo — "a missing artifact needs no heal"),
+                    // the retention prune will delete the row, and after
+                    // reconstruct-from-archive the artifact typically still
+                    // exists under the prior generation's stamp. The mirror of
+                    // the archive-side rule br-5xbua.
+                    drift.released_missing_archive += 1;
+                    if info_examples.len() < 32 {
+                        info_examples.push(ReservationParityExample {
+                            reservation_id,
+                            project_slug,
+                            field: "released_missing_archive".to_string(),
+                            db_value: "released".to_string(),
+                            archive_value: "missing".to_string(),
+                            detail: format!(
+                                "reservation_id={reservation_id} released row has no current-generation archive artifact; not drift — awaiting retention prune"
+                            ),
+                        });
+                    }
+                } else {
+                    // An *active* row missing its artifact is genuine drift: the
+                    // pre-commit guard reads the archive, so the holder is
+                    // invisible to it (under-blocking). Self-heals via F1
+                    // reconcile-on-read on the next reservation read.
+                    drift.missing_archive_artifacts += 1;
+                    examples.push(ReservationParityExample {
+                        reservation_id,
+                        project_slug,
+                        field: "archive_artifact".to_string(),
+                        db_value: "present".to_string(),
+                        archive_value: "missing".to_string(),
+                        detail: format!(
+                            "reservation_id={reservation_id} missing stable id artifact"
+                        ),
+                    });
+                }
             }
             (None, Some(archive)) => {
                 // The archive artifact at (this project, id) has no DB row. If the
@@ -524,6 +585,10 @@ where
             (None, None) => {}
         }
     }
+
+    // Drift examples first, informational examples after — the health line's
+    // leading examples must describe the reported drift (GH#244).
+    examples.append(&mut info_examples);
 
     let ok = drift.total() == 0;
     Ok(ReservationParityReport {
@@ -1057,6 +1122,118 @@ mod tests {
             "both prior-generation artifacts are recognized as foreign debris"
         );
         assert!(report.ok);
+    }
+
+    /// GH#244: a *released* DB row with no current-generation archive artifact
+    /// is bookkeeping awaiting the retention prune, not drift. Pre-fix this
+    /// counted as `missing_archive` and made `am doctor health` return rc=1
+    /// permanently on a healthy mailbox, with no fixer able to clear it.
+    #[test]
+    fn released_row_missing_archive_is_informational_not_drift() {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("aaaa2222");
+        conn.execute_raw("UPDATE file_reservations SET released_ts = 200 WHERE id = 1")
+            .expect("release reservation");
+        // No archive artifact written at all.
+
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(
+            report.drift.missing_archive_artifacts, 0,
+            "released row must not count as missing_archive drift: {:?}",
+            report.examples
+        );
+        assert_eq!(report.drift.released_missing_archive, 1);
+        assert_eq!(report.drift.total(), 0);
+        assert!(report.ok);
+        let line = report.health_line();
+        assert!(line.starts_with("reservation_parity: ok"), "{line}");
+        assert!(line.contains("released_missing_archive=1"), "{line}");
+    }
+
+    /// GH#244 counter-guard: an *active* row missing its artifact stays drift —
+    /// the pre-commit guard reads the archive, so the holder would be invisible
+    /// to it (under-blocking). This direction self-heals via reconcile-on-read.
+    #[test]
+    fn active_row_missing_archive_is_still_drift() {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("aaaa2222");
+        // Active row (released_ts NULL), no artifact.
+
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(report.drift.missing_archive_artifacts, 1);
+        assert_eq!(report.drift.released_missing_archive, 0);
+        assert_eq!(report.drift.total(), 1);
+        assert!(!report.ok);
+    }
+
+    /// GH#244's exact field shape: reconstruct-from-archive imported released
+    /// reservations into a freshly-minted DB generation, so their artifacts
+    /// exist only under the *prior* generation stamp. Parity must report ok
+    /// (informational released_missing_archive + foreign_generation_artifacts),
+    /// not a permanent `missing_archive` drift.
+    #[test]
+    fn reconstructed_released_rows_with_foreign_generation_artifacts_report_ok() {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("aaaa2222");
+        conn.execute_raw("UPDATE file_reservations SET released_ts = 200 WHERE id = 1")
+            .expect("release reservation");
+        // The row's artifact exists, but only stamped with the prior DB
+        // generation (what reconstruct imported it from).
+        write_reservation_artifact(
+            storage.path(),
+            "proj-a",
+            1,
+            Some("bbbb1111"),
+            "BlueLake",
+            "src/**",
+            true,
+        );
+
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(report.drift.total(), 0, "{:?}", report.examples);
+        assert!(report.ok);
+        assert_eq!(report.drift.released_missing_archive, 1);
+        assert_eq!(report.drift.foreign_generation_artifacts, 1);
+        assert_eq!(report.drift.missing_archive_artifacts, 0);
+    }
+
+    /// GH#244 diagnostics: drift examples must precede informational examples,
+    /// so the health line's `examples=[...]` (first 3) describes the drift
+    /// being reported instead of foreign-generation debris.
+    #[test]
+    fn drift_examples_precede_informational_examples() {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("aaaa2222");
+        // Informational: prior-generation debris under an unrelated project/id.
+        write_reservation_artifact(
+            storage.path(),
+            "proj-b",
+            7,
+            Some("bbbb1111"),
+            "OldHolder",
+            "legacy/**",
+            true,
+        );
+        // Drift: the active row (proj-a, id 1) has no artifact.
+
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert!(!report.ok);
+        assert_eq!(report.drift.missing_archive_artifacts, 1);
+        assert_eq!(report.drift.foreign_generation_artifacts, 1);
+        assert_eq!(
+            report.examples.first().map(|e| e.field.as_str()),
+            Some("archive_artifact"),
+            "drift example must come first: {:?}",
+            report.examples
+        );
+        assert_eq!(
+            report.examples.last().map(|e| e.field.as_str()),
+            Some("foreign_generation_artifact"),
+            "informational example must come last: {:?}",
+            report.examples
+        );
+        let line = report.health_line();
+        assert!(line.contains("examples=[proj-a:1:archive_artifact"), "{line}");
     }
 
     #[test]
