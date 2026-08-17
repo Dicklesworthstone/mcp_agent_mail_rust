@@ -316,16 +316,54 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
     }
 }
 
+/// GH#247: how many unused-page rows (`Page N: never used` / `... unused`)
+/// an integrity check may report before the "benign freelist/accounting
+/// slack" classification stops applying.
+///
+/// A handful of unaccounted pages is the known benign residual class (engine
+/// page-accounting slack after crash recovery). But `PRAGMA integrity_check`
+/// reports each orphaned page as its own row, so whole-file page loss looks
+/// like the SAME class at a vastly larger magnitude — fleet incidents showed
+/// 59–72% of all pages orphaned while the bare (100-error-capped) check
+/// reported exactly 100 `never used` rows that this classifier then waved
+/// through as benign. Bounding the class by row count keeps the false-positive
+/// tolerance for genuine slack while refusing to call mass page loss healthy.
+pub const BENIGN_UNUSED_PAGE_ROW_LIMIT: usize = 16;
+
+/// GH#247: explicit error-row ceiling for the full `PRAGMA integrity_check`.
+///
+/// The bare pragma stops after 100 errors by default, which both under-reports
+/// severity and lets magnitude-sensitive classifiers
+/// ([`integrity_details_are_suspect`]) misread whole-file page loss as a
+/// small benign residual. Every full check issued through this module passes
+/// this limit explicitly.
+pub const INTEGRITY_CHECK_MAX_ERROR_ROWS: usize = 1_000_000;
+
 #[must_use]
 pub fn integrity_details_are_suspect(details: &[String]) -> bool {
-    !details.is_empty()
-        && details.iter().all(|detail| {
-            let lower = detail.to_ascii_lowercase();
-            lower == "ok"
-                || lower.contains("never used")
-                || lower.contains("unused")
-                || lower.contains("wal without shm")
-        })
+    if details.is_empty() {
+        return false;
+    }
+    let mut unused_page_rows = 0_usize;
+    for detail in details {
+        let trimmed = detail.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        // Section headers like "*** in database main ***" carry no verdict.
+        if lower == "ok"
+            || lower.contains("wal without shm")
+            || (trimmed.starts_with("***") && trimmed.ends_with("***"))
+        {
+            continue;
+        }
+        if lower.contains("never used") || lower.contains("unused") {
+            unused_page_rows += 1;
+            continue;
+        }
+        return false;
+    }
+    // GH#247: the unused-page class is only benign in small numbers. Beyond
+    // the slack limit it is page loss and must be treated as corruption.
+    unused_page_rows <= BENIGN_UNUSED_PAGE_ROW_LIMIT
 }
 
 /// br-mdfpz: names of damaged indexes when EVERY integrity-check detail row
@@ -370,6 +408,11 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
         None
     }
 
+    fn detail_is_unused_page_row(detail: &str) -> bool {
+        let lower = detail.trim().to_ascii_lowercase();
+        lower.contains("never used") || lower.contains("unused")
+    }
+
     fn detail_is_ignorable(detail: &str) -> bool {
         let trimmed = detail.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -382,6 +425,7 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
     }
 
     let mut names: Vec<String> = Vec::new();
+    let mut unused_page_rows = 0_usize;
     for detail in details {
         if let Some(name) = index_name_from_detail(detail) {
             if name.is_empty() {
@@ -390,7 +434,17 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
             if !names.iter().any(|existing| existing == name) {
                 names.push(name.to_string());
             }
-        } else if !detail_is_ignorable(detail) {
+        } else if detail_is_ignorable(detail) {
+            // GH#247: unused-page rows are only ignorable as small freelist
+            // slack. Mass page loss alongside index damage must escalate to
+            // repair/reconstruct, never the REINDEX fast path.
+            if detail_is_unused_page_row(detail) {
+                unused_page_rows += 1;
+                if unused_page_rows > BENIGN_UNUSED_PAGE_ROW_LIMIT {
+                    return None;
+                }
+            }
+        } else {
             return None;
         }
     }
@@ -423,11 +477,7 @@ pub fn full_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
 
 #[must_use]
 pub const fn preferred_check_sql(kind: CheckKind) -> &'static str {
-    match kind {
-        CheckKind::Quick => "SELECT quick_check FROM pragma_quick_check()",
-        CheckKind::Incremental => "SELECT integrity_check FROM pragma_integrity_check() LIMIT 1",
-        CheckKind::Full => "SELECT integrity_check FROM pragma_integrity_check()",
-    }
+    check_sql_candidates(kind)[0]
 }
 
 #[must_use]
@@ -435,35 +485,120 @@ pub const fn fallback_check_sql(kind: CheckKind) -> &'static str {
     match kind {
         CheckKind::Quick => "PRAGMA quick_check",
         CheckKind::Incremental => "PRAGMA integrity_check(1)",
-        CheckKind::Full => "PRAGMA integrity_check",
+        CheckKind::Full => "PRAGMA integrity_check(1000000)",
     }
 }
 
-/// Run an integrity probe with a best-effort fallback from the table-valued
-/// pragma form to the classic PRAGMA statement form.
+/// Candidate SQL forms for one integrity probe, in preference order.
+///
+/// GH#247: the full check passes an explicit error-row limit
+/// ([`INTEGRITY_CHECK_MAX_ERROR_ROWS`]) because the bare pragma caps at 100
+/// errors, which masked whole-file page loss (100 reported rows vs 59–72% of
+/// all pages actually orphaned) behind the "small benign residual" class. The
+/// bare forms remain as final fallbacks for engines that reject the argument.
+#[must_use]
+pub const fn check_sql_candidates(kind: CheckKind) -> &'static [&'static str] {
+    match kind {
+        CheckKind::Quick => &[
+            "SELECT quick_check FROM pragma_quick_check()",
+            "PRAGMA quick_check",
+        ],
+        CheckKind::Incremental => &[
+            "SELECT integrity_check FROM pragma_integrity_check() LIMIT 1",
+            "PRAGMA integrity_check(1)",
+        ],
+        CheckKind::Full => &[
+            "SELECT integrity_check FROM pragma_integrity_check(1000000)",
+            "PRAGMA integrity_check(1000000)",
+            "SELECT integrity_check FROM pragma_integrity_check()",
+            "PRAGMA integrity_check",
+        ],
+    }
+}
+
+/// Run an integrity probe with a best-effort fallback across the candidate SQL
+/// forms for `kind` (table-valued pragma first, then the classic PRAGMA
+/// statement; for the full check the explicitly-uncapped forms come before the
+/// bare 100-error-capped legacy forms).
 ///
 /// Some SQLite-compatible engines in this workspace still do not implement the
-/// table-valued `pragma_*` functions. Callers should use this helper instead of
-/// hardcoding the preferred SQL so runtime probes, doctor flows, and recovery
-/// all behave consistently.
+/// table-valued `pragma_*` functions or pragma arguments. Callers should use
+/// this helper instead of hardcoding the preferred SQL so runtime probes,
+/// doctor flows, and recovery all behave consistently.
 pub fn probe_check_rows<F>(mut query: F, kind: CheckKind) -> Result<Vec<Row>, String>
 where
     F: FnMut(&str) -> Result<Vec<Row>, String>,
 {
-    let preferred_sql = preferred_check_sql(kind);
-    let fallback_sql = fallback_check_sql(kind);
-
-    match query(preferred_sql) {
-        Ok(rows) if !rows.is_empty() || preferred_sql == fallback_sql => Ok(rows),
-        Ok(_) => query(fallback_sql).map_err(|fallback_error| {
-            format!("preferred probe returned no rows and fallback probe errored: {fallback_error}")
-        }),
-        Err(preferred_error) => query(fallback_sql).map_err(|fallback_error| {
-            format!(
-                "preferred probe error: {preferred_error}; fallback probe error: {fallback_error}"
-            )
-        }),
+    let candidates = check_sql_candidates(kind);
+    let mut errors: Vec<String> = Vec::new();
+    let mut empty_ok = false;
+    for sql in candidates {
+        match query(sql) {
+            Ok(rows) if !rows.is_empty() => return Ok(rows),
+            Ok(_) => {
+                // An empty result is not authoritative (a healthy check always
+                // yields at least the "ok" row); remember it and try the next
+                // form, but treat it as success if nothing better exists.
+                empty_ok = true;
+            }
+            Err(error) => errors.push(format!("`{sql}`: {error}")),
+        }
     }
+    if empty_ok {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "every {kind} probe form failed — {}",
+        errors.join("; ")
+    ))
+}
+
+/// Compact, bounded rendering of integrity-check detail rows for logs and
+/// verdict strings. An uncapped full check (GH#247) can return hundreds of
+/// thousands of rows; joining them verbatim would flood journals and truncate
+/// away the magnitude, which is the most important signal. Shows the first few
+/// rows plus an explicit total and unused-page-row count.
+#[must_use]
+pub fn summarize_check_details(details: &[String]) -> String {
+    /// Repetitive unused-page rows shown before eliding.
+    const SHOWN_UNUSED: usize = 5;
+    /// Distinctive (non-unused-page) rows shown before eliding. Generous so
+    /// class-signature substrings (e.g. the known `NOCASE` index-order false
+    /// positive that [`crate::pool`] greps from the message) survive the
+    /// summary for realistic outputs.
+    const SHOWN_DISTINCTIVE: usize = 50;
+
+    if details.len() <= SHOWN_UNUSED {
+        return details.join("; ");
+    }
+    let mut shown: Vec<&str> = Vec::new();
+    let mut unused_page_rows = 0_usize;
+    let mut distinctive_rows = 0_usize;
+    for detail in details {
+        let lower = detail.to_ascii_lowercase();
+        if lower.contains("never used") || lower.contains("unused") {
+            unused_page_rows += 1;
+            if unused_page_rows <= SHOWN_UNUSED {
+                shown.push(detail);
+            }
+        } else {
+            distinctive_rows += 1;
+            if distinctive_rows <= SHOWN_DISTINCTIVE {
+                shown.push(detail);
+            }
+        }
+    }
+    let elided = details.len() - shown.len();
+    if elided == 0 {
+        return shown.join("; ");
+    }
+    format!(
+        "{}; … {} more row(s) elided ({} unused-page row(s) of {} total)",
+        shown.join("; "),
+        elided,
+        unused_page_rows,
+        details.len()
+    )
 }
 
 #[must_use]
@@ -487,6 +622,22 @@ pub fn extract_check_details(rows: &[Row], kind: CheckKind) -> Vec<String> {
             } else {
                 None
             }
+        })
+        // GH#247: some drivers return the ENTIRE check output as one
+        // newline-joined text value. Before this split, a single row holding
+        // "*** in database main ***\nPage 2: never used\n…\nPage 137: never
+        // used" counted as ONE detail — so magnitude-sensitive classifiers
+        // ([`integrity_details_are_suspect`]) saw one benign-looking row no
+        // matter how many pages were lost, and a multi-line row mixing benign
+        // and corruption text could match a benign substring class. Normalize
+        // to one detail per reported line so every consumer sees the same
+        // per-finding granularity.
+        .flat_map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -590,7 +741,7 @@ pub fn evaluate_check_rows(
         return Err(DbError::IntegrityCorruption {
             message: format!(
                 "{kind} detected corruption ({duration_us}us): {}",
-                result.details.join("; ")
+                summarize_check_details(&result.details)
             ),
             details: result.details,
         });
@@ -1090,6 +1241,142 @@ mod tests {
                 fallback_check_sql(CheckKind::Incremental).to_string()
             ]
         );
+    }
+
+    #[test]
+    fn full_check_candidates_are_explicitly_uncapped_first() {
+        // GH#247: the bare `PRAGMA integrity_check` caps at 100 error rows,
+        // which masked 59–72% whole-file page loss as a small benign residual.
+        // Every preferred full-check form must carry an explicit high limit.
+        let candidates = check_sql_candidates(CheckKind::Full);
+        assert!(candidates[0].contains("pragma_integrity_check(1000000)"));
+        assert!(candidates[1].contains("integrity_check(1000000)"));
+        assert_eq!(preferred_check_sql(CheckKind::Full), candidates[0]);
+        assert_eq!(
+            fallback_check_sql(CheckKind::Full),
+            "PRAGMA integrity_check(1000000)"
+        );
+    }
+
+    #[test]
+    fn probe_check_rows_full_falls_back_to_bare_forms_when_arg_unsupported() {
+        // An engine that rejects the pragma argument must still be probed via
+        // the legacy bare forms rather than erroring out entirely.
+        let mut calls = Vec::new();
+        let rows = probe_check_rows(
+            |sql| {
+                calls.push(sql.to_string());
+                if sql.contains("1000000") {
+                    Err("integrity_check does not accept arguments".to_string())
+                } else {
+                    Ok(vec![Row::new(
+                        vec!["integrity_check".to_string()],
+                        vec![Value::Text("ok".to_string())],
+                    )])
+                }
+            },
+            CheckKind::Full,
+        )
+        .expect("bare-form fallback should succeed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(calls.len(), 3, "two uncapped forms then first bare form");
+    }
+
+    #[test]
+    fn extract_check_details_splits_newline_joined_driver_output() {
+        // GH#247: the canonical driver can return the whole integrity_check
+        // output as ONE multi-line text value. It must be normalized to one
+        // detail per line, or magnitude-sensitive classifiers see a single
+        // "row" no matter how many pages were lost.
+        let joined = "*** in database main ***\nPage 2: never used\nPage 3: never used";
+        let rows = vec![Row::new(
+            vec!["integrity_check".to_string()],
+            vec![Value::Text(joined.to_string())],
+        )];
+        let details = extract_check_details(&rows, CheckKind::Full);
+        assert_eq!(details.len(), 3);
+        assert_eq!(details[0], "*** in database main ***");
+        assert_eq!(details[2], "Page 3: never used");
+    }
+
+    #[test]
+    fn suspect_class_ignores_section_headers() {
+        let details = vec![
+            "*** in database main ***".to_string(),
+            "Page 5: never used".to_string(),
+        ];
+        assert!(
+            integrity_details_are_suspect(&details),
+            "the database-section header carries no verdict of its own"
+        );
+    }
+
+    #[test]
+    fn suspect_class_accepts_small_unused_page_slack() {
+        let details: Vec<String> = (1..=BENIGN_UNUSED_PAGE_ROW_LIMIT)
+            .map(|page| format!("Page {page}: never used"))
+            .collect();
+        assert!(
+            integrity_details_are_suspect(&details),
+            "a small unused-page residual stays the benign/suspect class"
+        );
+    }
+
+    #[test]
+    fn suspect_class_rejects_mass_unused_page_loss() {
+        // GH#247 regression: the capped 100-row output of a 59–72%-orphaned DB
+        // was classified benign, so `am doctor triage` reported ok/0 findings
+        // on a file stock SQLite calls malformed. Magnitude must disqualify
+        // the benign class.
+        let details: Vec<String> = (1..=100)
+            .map(|page| format!("Page {page}: never used"))
+            .collect();
+        assert!(
+            !integrity_details_are_suspect(&details),
+            "mass unused-page loss must be treated as corruption, not slack"
+        );
+    }
+
+    #[test]
+    fn index_only_fast_path_disqualified_by_mass_unused_pages() {
+        let mut details: Vec<String> = (1..=(BENIGN_UNUSED_PAGE_ROW_LIMIT + 1))
+            .map(|page| format!("Page {page}: never used"))
+            .collect();
+        details.push("wrong # of entries in index idx_agents_name".to_string());
+        assert!(
+            index_only_corruption_index_names(&details).is_none(),
+            "mass page loss must escalate to repair/reconstruct, never REINDEX"
+        );
+    }
+
+    #[test]
+    fn summarize_check_details_bounds_output_and_reports_magnitude() {
+        let details: Vec<String> = (1..=250)
+            .map(|page| format!("Page {page}: never used"))
+            .collect();
+        let summary = summarize_check_details(&details);
+        assert!(summary.len() < 400, "summary must stay bounded: {summary}");
+        assert!(summary.contains("245 more row(s) elided"));
+        assert!(summary.contains("250 unused-page row(s) of 250 total"));
+        let short = vec!["ok".to_string()];
+        assert_eq!(summarize_check_details(&short), "ok");
+    }
+
+    #[test]
+    fn summarize_check_details_keeps_distinctive_rows_over_unused_noise() {
+        // A class-signature row (e.g. the NOCASE index-order false positive)
+        // must survive the summary even when buried under unused-page noise,
+        // because `reconcile_with_canonical` classifies from the message.
+        let mut details: Vec<String> = (1..=200)
+            .map(|page| format!("Page {page}: never used"))
+            .collect();
+        details.push(
+            "entries are out of order for their declared key directions \
+             in index idx_agents_project_name_nocase"
+                .to_string(),
+        );
+        let summary = summarize_check_details(&details);
+        assert!(summary.contains("nocase"), "distinctive row elided: {summary}");
     }
 
     #[test]

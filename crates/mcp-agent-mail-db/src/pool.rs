@@ -10214,6 +10214,53 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
+    /// GH#247 regression: a purpose-corrupted fixture whose pages are mass-
+    /// orphaned (every integrity_check row is `Page N is never used`). The
+    /// pre-fix classifier waved ANY number of never-used rows through as
+    /// benign freelist slack, so the guard's canonical acceptance path and
+    /// `am doctor triage` both reported ok on a file stock SQLite calls
+    /// malformed. The orphaning is produced deterministically by deleting a
+    /// populated table's `sqlite_master` row via `writable_schema`, which
+    /// strands its entire b-tree.
+    #[test]
+    fn full_integrity_check_rejects_mass_orphaned_pages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("orphan-pages.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(path.display().to_string())
+                .expect("open canonical db");
+            conn.execute_raw("PRAGMA journal_mode = DELETE")
+                .expect("journal mode");
+            conn.execute_raw("CREATE TABLE filler (id INTEGER PRIMARY KEY, payload BLOB)")
+                .expect("create filler");
+            // Enough pages that the stranded b-tree far exceeds the benign
+            // unused-page slack limit.
+            conn.execute_raw(
+                "INSERT INTO filler (payload) \
+                 SELECT randomblob(1024) FROM generate_series(1, 400)",
+            )
+            .or_else(|_| {
+                // generate_series may be unavailable; fall back to a CTE.
+                conn.execute_raw(
+                    "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 400) \
+                     INSERT INTO filler (payload) SELECT randomblob(1024) FROM seq",
+                )
+            })
+            .expect("populate filler");
+            conn.execute_raw("PRAGMA writable_schema = ON")
+                .expect("writable schema on");
+            conn.execute_raw("DELETE FROM sqlite_master WHERE name = 'filler'")
+                .expect("strand filler b-tree");
+            conn.execute_raw("PRAGMA writable_schema = OFF")
+                .expect("writable schema off");
+        }
+
+        assert!(
+            !sqlite_file_passes_full_integrity_check(&path).expect("integrity probe"),
+            "mass never-used page loss must fail the full canonical integrity check"
+        );
+    }
+
     #[test]
     fn checkout_validation_failure_classifier_matches_pool_error_only() {
         // The exact shape from the br-kjta0 incident.
