@@ -142,13 +142,14 @@ impl GaugeU64 {
 
 const LOG2_BUCKETS: usize = 64;
 
-/// Width of one recent-window epoch. [`Log2Histogram::recent_snapshot`] merges
-/// the current and previous epochs, so "recent" covers the trailing
-/// 10–20 minutes. Chosen so a single historical stall stops dominating
-/// reported percentiles within at most two windows (GH#245: one 25s stall in
-/// 635 commits pinned the lifetime p99 at 8.4s for a 2d8h process lifetime,
-/// and that stale figure was displayed beside live timeout diagnostics as
-/// though current).
+/// Width of one recent-window epoch.
+///
+/// [`Log2Histogram::recent_snapshot`] merges the current and previous
+/// epochs, so "recent" covers the trailing 10–20 minutes. Chosen so a
+/// single historical stall stops dominating reported percentiles within at
+/// most two windows (GH#245: one 25s stall in 635 commits pinned the
+/// lifetime p99 at 8.4s for a 2d8h process lifetime, and that stale figure
+/// was displayed beside live timeout diagnostics as though current).
 pub const RECENT_WINDOW_SECS: u64 = 600;
 
 static PROCESS_EPOCH_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
@@ -177,11 +178,13 @@ pub struct Log2Histogram {
     recent_epoch: AtomicU64,
 }
 
-/// Trailing-window view of a [`Log2Histogram`], covering roughly the last
-/// [`RECENT_WINDOW_SECS`]..=2×[`RECENT_WINDOW_SECS`] seconds. Unlike the
-/// lifetime [`HistogramSnapshot`], percentiles here decay: an old outlier
-/// falls out of the estimate within two windows. `count == 0` means "no
-/// samples completed recently", not "no samples ever".
+/// Trailing-window view of a [`Log2Histogram`].
+///
+/// Covers roughly the last [`RECENT_WINDOW_SECS`]..=2×[`RECENT_WINDOW_SECS`]
+/// seconds. Unlike the lifetime [`HistogramSnapshot`], percentiles here
+/// decay: an old outlier falls out of the estimate within two windows.
+/// `count == 0` means "no samples completed recently", not "no samples
+/// ever".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecentHistogramSnapshot {
     pub window_secs: u64,

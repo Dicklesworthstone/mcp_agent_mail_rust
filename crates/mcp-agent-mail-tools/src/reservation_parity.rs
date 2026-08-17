@@ -467,10 +467,8 @@ where
             _ => false,
         };
         if is_foreign {
-            foreign_artifact_keys.insert((
-                reservation.project_slug.clone(),
-                reservation.reservation_id,
-            ));
+            foreign_artifact_keys
+                .insert((reservation.project_slug.clone(), reservation.reservation_id));
             drift.foreign_generation_artifacts += 1;
             if info_examples.len() < 32 {
                 info_examples.push(ReservationParityExample {
@@ -542,6 +540,13 @@ where
                     // generation while the archive kept its original artifact.
                     // The audit record is intact — lineage, not drift (GH#244).
                     drift.reconstructed_prior_generation_rows += 1;
+                    // A *released* row in this shape is simultaneously a
+                    // "released row with no current-generation artifact" —
+                    // keep both informational counters in agreement so the
+                    // doctor suffixes describe the same mailbox consistently.
+                    if positive_ts(db.effective_released_ts()) {
+                        drift.released_missing_archive += 1;
+                    }
                 } else if positive_ts(db.effective_released_ts()) {
                     // A *released* DB row with no current-generation artifact is
                     // expected bookkeeping, not drift (GH#244): it holds no lock
@@ -1212,7 +1217,7 @@ mod tests {
     /// GH#244's exact field shape: reconstruct-from-archive imported released
     /// reservations into a freshly-minted DB generation, so their artifacts
     /// exist only under the *prior* generation stamp. Parity must report ok
-    /// (informational released_missing_archive + foreign_generation_artifacts),
+    /// (informational `released_missing_archive` + `foreign_generation_artifacts`),
     /// not a permanent `missing_archive` drift.
     #[test]
     fn reconstructed_released_rows_with_foreign_generation_artifacts_report_ok() {
@@ -1276,7 +1281,10 @@ mod tests {
             report.examples
         );
         let line = report.health_line();
-        assert!(line.contains("examples=[proj-a:1:archive_artifact"), "{line}");
+        assert!(
+            line.contains("examples=[proj-a:1:archive_artifact"),
+            "{line}"
+        );
     }
 
     #[test]
