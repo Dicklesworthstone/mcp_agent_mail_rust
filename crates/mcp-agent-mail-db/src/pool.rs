@@ -1888,6 +1888,11 @@ pub fn evaluate_write_route(
 /// a 16-hour outage was undiagnosable for exactly this reason). 10s leaves the
 /// dispatcher 20s of headroom to surface the attributed failure.
 ///
+/// The timeout bounds only the *wait* for a connection: the
+/// connection-create/init path (migrations, archive reconstruction) is not cut
+/// off by it, so a slow first-time init still completes. Waiters on that init
+/// are bounded separately by [`SqliteInitGate`].
+///
 /// Override via `DATABASE_POOL_TIMEOUT` (ms); sizing via `DATABASE_POOL_SIZE` /
 /// `DATABASE_MAX_OVERFLOW` env vars.
 pub const DEFAULT_POOL_SIZE: usize = 25;
@@ -11037,6 +11042,25 @@ mod tests {
         assert_eq!(cfg.min_connections, 25);
         assert_eq!(cfg.max_connections, 100); // 25 + 75
         assert_eq!(cfg.max_lifetime_ms, 1_800_000); // 30 min in ms
+    }
+
+    /// GH#245 regression guard: the default pool acquire timeout must stay
+    /// meaningfully below the MCP request/dispatch deadline. When the two are
+    /// equal, a stalled acquire and the outer deadline expire simultaneously,
+    /// so every DB stall is reported as `stage=blocking_dispatch_unattributed`
+    /// and the pool's typed "acquire timeout" error never surfaces. "Meaningful"
+    /// here means at least a 2x margin, so the acquire error wins the race with
+    /// slack even under scheduling jitter.
+    #[test]
+    fn pool_acquire_timeout_is_meaningfully_below_client_deadline() {
+        assert!(
+            DEFAULT_POOL_TIMEOUT_MS.saturating_mul(2)
+                <= mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS,
+            "DEFAULT_POOL_TIMEOUT_MS ({DEFAULT_POOL_TIMEOUT_MS}ms) must be at most half of \
+             ECOSYSTEM_CLIENT_DEADLINE_MS ({}ms) so a pool-acquire stall surfaces its own \
+             typed error instead of an unattributed dispatch timeout (GH#245)",
+            mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS,
+        );
     }
 
     /// Verify auto-sizing picks reasonable values based on CPU count.
