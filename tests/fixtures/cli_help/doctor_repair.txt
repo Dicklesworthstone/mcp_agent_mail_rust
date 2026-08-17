@@ -26,5 +26,10 @@ Options:
 
           By default `am doctor repair` REFUSES (exit 3) when a live `am` owner, a wedged process, or unreconciled split-brain ownership holds the mailbox — repairing under a live writer can corrupt state. The safe path is to gracefully drain/stop the owner via your supervisor (never `kill -9 am`), confirm with `am doctor drain`, then re-run. Pass this flag only when you have already drained the owner.
 
+      --take-ownership
+          Perform a SUPERVISED TAKEOVER of a provably-dead mailbox owner, then repair (br-z41ij).
+
+          Unlike `--allow-live-owner` (a blunt override for any owner), this only acts when `am doctor locks` classifies the owner as `reclaimable` — a zombie, or a deleted-executable owner that is unresponsive and idle past the threshold. It wins a per-mailbox election lock, RE-VERIFIES the owner is still dead, quarantines its stale activity-lock files (moved, never deleted), then repairs. It NEVER signals or kills `am`. On a live or ambiguous owner it refuses (exit 3) and points you at the supervised drain path — use this to break the multi-day "wedged owner, nobody can repair" deadlock.
+
   -h, --help
           Print help (see a summary with '-h')

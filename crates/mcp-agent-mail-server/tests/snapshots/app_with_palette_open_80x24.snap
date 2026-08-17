@@ -3,7 +3,7 @@ Messages   Ack Pend   Locks      Agents     Contacts   Requests   Avg Lat
 Error %                                                                         
 ╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────╮
 │               ╭────────────── Command Palette ───────────────╮               │
-│  [1:All]  [2:M│>Type to search...                            │               │
+│  [A:All]  [M:M│>Type to search...                            │               │
 │ No events yet.│> [App] Quit  Exit AgentMailTUI (requests shu…│               │
 │ Waiting for HT│  [Diagnostics] Go to ATC  Air Traffic Contro…│               │
 │ Enter opens Ti│  [Appearance] Cycle Theme  Switch to the nex…│.              │

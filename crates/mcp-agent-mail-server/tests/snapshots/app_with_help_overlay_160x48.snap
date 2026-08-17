@@ -1,10 +1,10 @@
- 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health ╎ 9◷ Timeline · 10▣ Projects           >
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health ╎ 9◷ Timeline · 0▣ Projects            >
 ╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────╮╭───────────────╮
 │Messages   ││Ack Pend   ││Locks      ││Agents     ││Contacts   ││Projects   ││Requests   ││Avg Lat    ││Error %    ││Ring Fill  ││Drops      ││Uptime         │
 ╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────╯╰───────────────╯
 ╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │                                                                                                                                                              │
-│  [1:All]  [2:Msg]  [3:Tools]  [4:Resv]                                                                                                                       │
+│  [A:All]  [M:Msg]  [O:Tools]  [R:Resv]                                                                                                                       │
 │ No events yet.                                                                                                                                               │
 │ Waiting for HTTP/tool/message tra╭ Help & Keybindings (j/k to scroll) (F1/Esc close) ─────────────────────────────────────╮                                  │
 │ Enter opens Timeline/Search conte│t when results are available.                                                           │                                  │
@@ -19,17 +19,17 @@
 │                                  │   Related screens: System Health, Timeline, Analytics.                                 │                                  │
 │                                  │     j/k              Scroll event log                                                  │                                  │
 │                                  │     Enter            Search (if query) or timeline event                               │                                  │
-│                                  │     /                Focus live dashboard search                                       │                                  │
+│                                  │     Click            Edit live filter / choose quick filter                            │                                  │
 │                                  │     Esc              Dismiss overlay / quit confirm                                    │                                  │
 │                                  │     f                Toggle auto-follow                                                │                                  │
 │                                  │     v                Cycle verbosity tier                                              │                                  │
 │                                  │     t                Cycle quick filter                                                │                                  │
-│                                  │     1-4              Set filter (All/Msg/Tools/Resv)                                   │                                  │
+│                                  │     A/M/O/R          Set filter (All/Msg/Tools/Resv)                                   │                                  │
 │                                  │     G                Jump to bottom                                                    │                                  │
 │                                  │     g                Jump to top                                                       │                                  │
 │                                  │     p                Toggle trend panel                                                │                                  │
 │                                  │     l                Toggle console log                                                │                                  │
-│                                  │     Mouse            Wheel scroll event log                                            │                                  │
+│                                  │     Mouse            Focus panels, select filter, or scroll event log                  │                                  │
 │                                  │  ────────────────────────────────────────────────────────────────────────────────────  │                                  │
 │                                  │   Global (Default)                                                                     │                                  │
 │                                  │   Shared navigation, overlays, accessibility, and shell controls.                      │                                  │
@@ -45,4 +45,4 @@
 │                                                                                                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
  Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                                                                                                  
- Dashboard mcp up:0m00s                             req:0 ok:0 err:0 avg:0ms ·  j/k  Scroll event log                             LIVE Cyberpunk Aurora [^P] [F1
+ Dashboard mcp up:0m00s                            req:0 ok:0 err:0 avg:0ms ·  j/k  Scroll event log                            LIVE Cyberpunk Aurora [^P] [F1] 

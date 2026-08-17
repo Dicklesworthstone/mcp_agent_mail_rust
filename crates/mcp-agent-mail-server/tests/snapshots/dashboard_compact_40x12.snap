@@ -2,8 +2,8 @@ Msg       Ack       Locks     Req
 0 ─       0 ─       0 ─       0 ─       
 ╭Events (0/0) [FOLLOW] [Verbose] [filte╮
 │                                      │
-│  [1:All]  [2:Msg]  [3:Tools]         │
-│ [4:Resv]                             │
+│  [A:All]  [M:Msg]  [O:Tools]         │
+│  [R:Resv]                            │
 │ No events yet.                       │
 │ Waiting for HTTP/tool/message traffi │
 │ Enter opens Timeline/Search context  │

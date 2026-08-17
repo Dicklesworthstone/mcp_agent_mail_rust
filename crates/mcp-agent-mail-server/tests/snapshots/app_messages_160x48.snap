@@ -1,4 +1,4 @@
- 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health ╎ 9◷ Timeline · 10▣ Projects           >
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health ╎ 9◷ Timeline · 0▣ Projects            >
  Search messages... (/ to focus)                                                                                                                                
  ● ▁▂▃▄▅▆▇█▁▂  Mouse: click/select, wheel preset/scroll, drag split border   Ops: / j k J(toggle tree) K                                                        
  ▁▂▃▄▅▆ req:0 ok:0 err:0 avg:0ms spark:......                                                                                                                   
@@ -45,4 +45,4 @@
                                                                                                                                                                 
                                                                                                                                                                 
                                                                                                                                                                 
- Messages mcp up:0m00s                         req:0 ok:0 err:0 avg:0ms ·  /  Search ·  j/k  Navigate results                         LIVE Cyberpunk Aurora [^P]
+ Messages mcp up:0m00s                       req:0 ok:0 err:0 avg:0ms ·  /  Search ·  j/k  Navigate results                       LIVE Cyberpunk Aurora [^P] F1 

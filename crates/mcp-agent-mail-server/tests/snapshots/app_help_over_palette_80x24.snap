@@ -3,7 +3,7 @@ Messages   Ack Pend   Locks      Agents     Contacts   Requests   Avg Lat
 Error %                                                                         
 ╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────╮
 │          ╭ Help & Keybindings (j/k to scroll) (F1/Esc close) ────╮           │
-│  [1:All] │[2:M│>Type to search...                            │   │           │
+│  [A:All] │[M:M│>Type to search...                            │   │           │
 │ No events│ye Dashboard                                           │           │
 │ Waiting f│r HOverview of projects, agents, and live request cou  │           │
 │ Enter ope│s TUse this screen for first-pass operational triage   │           │
@@ -15,7 +15,7 @@ Error %
 │          │   Related screens: System Health, Timeline, Analytic  │           │
 │          │     j/k      Scroll event log                         │           │
 │          │     Enter    Search (if query) or timeline event      │           │
-│          │     /        Focus live dashboard search              │           │
+│          │     Click    Edit live filter / choose quick filter   │           │
 │          │    ╰──────────────────────────────────────────────╯   │           │
 │          ╰───────────────────────────────────────────────────────╯           │
 │                                                                              │
