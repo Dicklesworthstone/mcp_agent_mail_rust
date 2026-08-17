@@ -1292,18 +1292,34 @@ fn golden_score_monotonicity() {
 }
 
 /// Idempotent corpus: building the same corpus twice should produce identical rankings.
+///
+/// The Search V3 two-tier context is process-global, so each corpus instance
+/// must complete its snapshots before the next instance is BUILT — a later
+/// build re-binds the shared context to the newer database generation, and
+/// the earlier corpus's lexical score lookups then miss (returning 0.0 while
+/// the rank order stays SQL-correct). Snapshot-then-build keeps every capture
+/// scored against its own generation without weakening any assertion.
 #[test]
 fn golden_corpus_idempotent() {
-    let corpus1 = build_corpus();
-    let corpus2 = build_corpus();
-
     let queries = golden_queries();
+    let compared: Vec<_> = queries.iter().take(5).collect();
+
+    let corpus1 = build_corpus();
+    let snaps1: Vec<_> = compared
+        .iter()
+        .map(|q| capture_snapshot(&corpus1, q, None))
+        .collect();
+
+    let corpus2 = build_corpus();
+    let snaps2: Vec<_> = compared
+        .iter()
+        .map(|q| capture_snapshot(&corpus2, q, None))
+        .collect();
+
     let mut assertion_count: usize = 0;
 
     // Compare a subset of queries across two independent corpus instances
-    for q in queries.iter().take(5) {
-        let snap1 = capture_snapshot(&corpus1, q, None);
-        let snap2 = capture_snapshot(&corpus2, q, None);
+    for ((q, snap1), snap2) in compared.iter().zip(snaps1).zip(snaps2) {
 
         // Result counts should match
         assert_eq!(

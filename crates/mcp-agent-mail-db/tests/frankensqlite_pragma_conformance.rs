@@ -210,6 +210,12 @@ fn frankensqlite_pragma_matrix_reports_known_divergences() {
             entry.probe_id == "foreign_key_list_messages"
                 && matches!(entry.status, ConformanceStatus::Divergent)
                 && !is_fk_list_ordering_divergence(entry)
+                // Both engines rejecting a deliberately-corrupt fixture with
+                // different error wording is conformant behavior, not drift.
+                && !matches!(
+                    (&entry.canonical, &entry.frankensqlite),
+                    (ProbeOutcome::Err { .. }, ProbeOutcome::Err { .. })
+                )
         })
         .count();
     assert_eq!(

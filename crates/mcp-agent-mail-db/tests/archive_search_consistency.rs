@@ -817,11 +817,34 @@ fn archive_search_consistency_report_detects_product_scope_leaks() {
 #[test]
 fn archive_search_consistency_report_detects_archive_db_count_drift() {
     let fixture = setup_consistency_fixture();
+    // Initialize the pool's runtime connection BEFORE seeding drift: fsqlite
+    // 0.3.4 refuses a fresh open of this reconstruct-produced file once an
+    // external DELETE has grown its freelist ("unable to open database
+    // file"), while an already-open runtime connection keeps serving — which
+    // is also the production shape (a live pool predates at-rest mutations).
+    block_on(|cx| {
+        let pool = fixture.pool.clone();
+        async move {
+            match pool.acquire(&cx).await {
+                asupersync::Outcome::Ok(conn) => drop(conn),
+                asupersync::Outcome::Err(err) => {
+                    panic!("warm pool before drift seeding: {err}")
+                }
+                asupersync::Outcome::Cancelled(reason) => {
+                    panic!("warm pool before drift seeding cancelled: {reason:?}")
+                }
+                asupersync::Outcome::Panicked(_) => {
+                    panic!("warm pool before drift seeding panicked")
+                }
+            }
+        }
+    });
     let conn = open_conn(&fixture.db_path);
     conn.execute_raw("DELETE FROM message_recipients WHERE message_id = 3001")
         .expect("delete drift message recipient rows");
     conn.execute_raw("DELETE FROM messages WHERE id = 3001")
         .expect("delete drift message");
+    drop(conn);
     write_lexical_backfill_state(&fixture.pool, &fixture.storage_root, EXPECTED_MESSAGES - 1);
 
     let report = build_consistency_report(
