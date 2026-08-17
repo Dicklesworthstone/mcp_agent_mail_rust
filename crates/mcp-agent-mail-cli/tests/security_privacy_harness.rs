@@ -83,20 +83,21 @@ fn tool_call(id: i64, name: &str, arguments: Value) -> Value {
 }
 
 fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
-    // Two transient states are retryable by their own contract:
-    // - "Resource is temporarily busy. Wait a moment and try again." —
-    //   back-to-back sessions against the same mailbox can land inside the
-    //   previous owner's activity-lock reap window;
-    // - "Contact approval required ... Automatic handshake attempts already
-    //   ran" — send_message's auto-handshake swallows transient engine
-    //   contention and its error message explicitly says to retry; a re-run
-    //   finds the persisted handshake (or re-drives it) and succeeds.
-    // Retry the whole session a bounded number of times on either.
+    // Retry the whole session (bounded) on responses that are retryable by
+    // their own contract — i.e. whose error text instructs the caller to try
+    // again. Observed shapes on a contended host: the activity-lock reap
+    // window ("Resource is temporarily busy. Wait a moment and try again."),
+    // the generic transient DB envelope ("This may be a transient issue -
+    // try again."), and an auto-handshake that lost its writes to engine
+    // contention ("Contact approval required ... Automatic handshake
+    // attempts already ran ... retry the suggested calls"). Matching the
+    // self-described retry instruction keeps this aligned with the product's
+    // error contract instead of chasing individual phrasings.
     let mut run = run_stdio_session_once(db_path, requests);
     for _ in 0..3 {
         let transient = run.responses.iter().any(|resp| {
             let text = response_text(resp);
-            text.contains("Resource is temporarily busy")
+            text.contains("try again")
                 || (text.contains("Contact approval required")
                     && text.contains("Automatic handshake attempts already ran"))
         });
