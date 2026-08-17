@@ -7881,7 +7881,7 @@ async fn fetch_inbox_impl(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
-    let result = match (options.body_policy, options.ack_overdue_before) {
+    let run_query = || match (options.body_policy, options.ack_overdue_before) {
         (InboxBodyPolicy::Full, Some(threshold)) => {
             crate::sync::fetch_inbox_ack_overdue_rows_from_conn(
                 &conn,
@@ -7924,6 +7924,27 @@ async fn fetch_inbox_impl(
             since_ts,
             limit,
         ),
+    };
+
+    // The fsqlite 0.3.4 registry engine can answer a bare inbox read with
+    // "database is busy" (or its BusyRecovery variant) while concurrent
+    // writers hold the store — the pre-registry engine never surfaced busy on
+    // WAL reads. Absorb transient contention with the same bounded schedule
+    // the write path uses instead of failing the read to the caller.
+    let mut attempt: u32 = 0;
+    let result = loop {
+        match run_query() {
+            Err(error) if attempt < *MVCC_MAX_RETRIES && is_plain_write_contention_error(&error) => {
+                attempt += 1;
+                tracing::warn!(
+                    attempt,
+                    error = %error,
+                    "inbox read hit transient contention; retrying"
+                );
+                mvcc_backoff(attempt);
+            }
+            other => break other,
+        }
     };
 
     match result {
