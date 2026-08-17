@@ -2553,21 +2553,37 @@ impl DbPool {
     /// retry belongs here rather than surfacing a hard `DbError` to every
     /// tool caller. Cancellation and all other errors propagate unchanged.
     pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
-        const CHECKOUT_VALIDATION_RETRIES: u32 = 2;
+        const CHECKOUT_VALIDATION_RETRIES: u32 = 4;
         let mut attempt = 0;
         loop {
             let out = self.acquire_once(cx).await;
             match &out {
                 Outcome::Err(error)
                     if attempt < CHECKOUT_VALIDATION_RETRIES
-                        && is_checkout_validation_failure(&error.to_string()) =>
+                        && {
+                            let msg = error.to_string();
+                            // "recovery in progress" is fsqlite's BusyRecovery:
+                            // another connection holds the WAL recovery fence.
+                            // It is transient by definition (the fence is
+                            // released when recovery finishes), so a checkout
+                            // that lost the fence race retries like a failed
+                            // validation ping instead of failing the tool call.
+                            is_checkout_validation_failure(&msg)
+                                || msg.contains("recovery in progress")
+                        } =>
                 {
                     attempt += 1;
                     tracing::warn!(
                         attempt,
                         error = %error,
-                        "pool checkout validation failed; retrying with a fresh connection"
+                        "pool checkout hit transient validation/recovery contention; retrying with a fresh connection"
                     );
+                    // Same blocking-backoff pattern as queries::mvcc_backoff —
+                    // give a mid-flight WAL recovery a beat to release the
+                    // fence instead of hammering three checkouts in ~1ms.
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        25u64.saturating_mul(1 << attempt.min(4)),
+                    ));
                 }
                 _ => return out,
             }
