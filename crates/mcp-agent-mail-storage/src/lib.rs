@@ -681,6 +681,20 @@ impl Drop for ArchiveMutationGuard {
 /// Run a non-blocking snapshot publication check while physical archive
 /// mutations are excluded. The callback must not initiate an archive write.
 pub fn with_archive_snapshot_publication_fence<T>(publish: impl FnOnce() -> T) -> T {
+    // Latent self-deadlock guard (concurrency audit F3): the publication fence
+    // is a plain, NON-reentrant `Mutex`. A thread already inside an
+    // `ArchiveMutationGuard` window holds the fence via that outermost guard,
+    // so calling this function from within the window would block forever on
+    // the second `lock()`. Publication checks must run strictly outside archive
+    // mutation windows; catch violations in debug builds before they can wedge
+    // a release process.
+    debug_assert_eq!(
+        ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get),
+        0,
+        "with_archive_snapshot_publication_fence called from inside an \
+         ArchiveMutationGuard window; the fence mutex is non-reentrant and \
+         this self-deadlocks"
+    );
     let _fence = ARCHIVE_PUBLICATION_FENCE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1294,6 +1308,18 @@ const ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS: u64 = 100;
 const ARCHIVE_BACKLOG_IDLE_INTERVAL_MS: u64 = 500;
 /// Upper bound on the drain thread's per-entry retry backoff.
 const ARCHIVE_BACKLOG_MAX_BACKOFF_MS: u64 = 5_000;
+/// Per-entry attempt cap for the drain loop (concurrency audit F3). A head op
+/// that fails this many consecutive materializations is considered permanently
+/// poisoned (deleted project dir, malformed artifact path, unrecoverable git
+/// state, ...) and is moved to the dead-letter ledger so it can no longer block
+/// every entry queued behind it. Without the cap, a poisoned head is retried
+/// forever, the backlog fills to its cap, and all later ops are dropped.
+const ARCHIVE_BACKLOG_MAX_ATTEMPTS: u32 = 8;
+/// Size cap for the dead-letter ledger
+/// (`<storage_root>/doctor/backlog_dead_letter.jsonl`). Beyond this, appends
+/// are skipped (loudly) but the poisoned entry is still advanced past — the cap
+/// protects the disk, never the queue.
+const ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Default warn/critical bounds (milliseconds) for the oldest-unmaterialized
 /// archive write age surfaced through `health_check`.
 const ARCHIVE_LAG_WARN_MS_DEFAULT: u64 = 5_000;
@@ -1514,6 +1540,11 @@ struct ArchiveRetryBacklog {
     enqueued_total: AtomicU64,
     drained_total: AtomicU64,
     dropped_total: AtomicU64,
+    /// Ops abandoned after [`ARCHIVE_BACKLOG_MAX_ATTEMPTS`] failed
+    /// materializations and appended to the dead-letter ledger (F3). Nonzero
+    /// means an operator has archive work to inspect/replay from
+    /// `<storage_root>/doctor/backlog_dead_letter.jsonl`.
+    dead_lettered_total: AtomicU64,
     /// Ops enqueued in memory whose durable journal could not be written
     /// (returned [`ArchiveBacklogPush::QueuedEphemeral`]). Surfaced through the
     /// archive-lag health metric so a disk that cannot journal is never green.
@@ -1528,6 +1559,9 @@ enum ArchiveBacklogDrainStep {
     Empty,
     Materialized,
     RetryLater(u32),
+    /// The front op exhausted [`ARCHIVE_BACKLOG_MAX_ATTEMPTS`] and was moved to
+    /// the dead-letter ledger; the queue advanced to the next entry.
+    DeadLettered,
 }
 
 impl ArchiveRetryBacklog {
@@ -1541,6 +1575,7 @@ impl ArchiveRetryBacklog {
             enqueued_total: AtomicU64::new(0),
             drained_total: AtomicU64::new(0),
             dropped_total: AtomicU64::new(0),
+            dead_lettered_total: AtomicU64::new(0),
             ephemeral_total: AtomicU64::new(0),
         }
     }
@@ -1670,9 +1705,16 @@ impl ArchiveRetryBacklog {
             }
             Err(error) => {
                 let next_attempts = attempts.saturating_add(1);
+                if next_attempts >= ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+                    // F3: a permanently-failing head must not block the queue
+                    // forever. Move it to the dead-letter ledger and advance.
+                    self.dead_letter_front(&op, next_attempts, &error);
+                    return ArchiveBacklogDrainStep::DeadLettered;
+                }
                 tracing::warn!(
                     error = %error,
                     attempts = next_attempts,
+                    max_attempts = ARCHIVE_BACKLOG_MAX_ATTEMPTS,
                     "archive backlog: materialization failed; will retry (journal retained)"
                 );
                 {
@@ -1684,6 +1726,110 @@ impl ArchiveRetryBacklog {
                 ArchiveBacklogDrainStep::RetryLater(next_attempts)
             }
         }
+    }
+
+    /// Move the permanently-failing front entry to the dead-letter ledger and
+    /// advance the queue (concurrency audit F3). Work is never silently thrown
+    /// away: the serialized op plus failure context is appended to
+    /// `<storage_root>/doctor/backlog_dead_letter.jsonl`, and the entry's
+    /// durable journal (if any) is quarantined under `failed/` (RULE 1: moved,
+    /// never deleted) so recovery does not replay a known-poisoned op on every
+    /// restart and an operator can inspect/replay it by hand.
+    ///
+    /// Ordering: ledger append happens BEFORE the queue pop / journal
+    /// quarantine. If the process dies in between, restart replays the journal
+    /// idempotently and, at worst, appends a duplicate ledger line.
+    fn dead_letter_front(&self, op: &WriteOp, attempts: u32, error: &StorageError) {
+        archive_backlog_dead_letter_append(op, attempts, error);
+        let journal_path = {
+            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = queue.pop_front();
+            self.store_depth(&queue);
+            entry.and_then(|entry| entry.journal_path)
+        };
+        self.dead_lettered_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(path) = journal_path {
+            archive_backlog_quarantine_file(&path, "failed");
+        }
+    }
+}
+
+/// Append a dead-lettered op to `<storage_root>/doctor/backlog_dead_letter.jsonl`
+/// (one JSON object per line: timestamp, attempts, failure reason, serialized
+/// op). Size-capped at [`ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES`]: beyond the
+/// cap the append is skipped — loudly — but the caller still advances the
+/// queue, and the entry's quarantined journal under
+/// `.archive_backlog/failed/` preserves the op regardless.
+fn archive_backlog_dead_letter_append(op: &WriteOp, attempts: u32, error: &StorageError) {
+    let config = write_op_config(op);
+    let doctor_dir = archive_storage_root(config).join("doctor");
+    let ledger_path = doctor_dir.join("backlog_dead_letter.jsonl");
+    tracing::error!(
+        ledger = %ledger_path.display(),
+        attempts,
+        error = %error,
+        storage_root = %write_op_storage_root(op).display(),
+        "archive backlog: head op failed permanently; dead-lettering it and \
+         advancing the queue (op NOT applied to the archive; DB remains \
+         authoritative — replay from the ledger or .archive_backlog/failed/)"
+    );
+    if let Err(create_error) = fs::create_dir_all(&doctor_dir) {
+        tracing::error!(
+            error = %create_error,
+            dir = %doctor_dir.display(),
+            "archive backlog: cannot create doctor dir for dead-letter ledger; \
+             op record survives only in .archive_backlog/failed/"
+        );
+        return;
+    }
+    let existing_len = fs::metadata(&ledger_path).map_or(0, |meta| meta.len());
+    if existing_len >= ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES {
+        tracing::error!(
+            ledger = %ledger_path.display(),
+            existing_len,
+            cap = ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES,
+            "archive backlog: dead-letter ledger at size cap; SKIPPING append \
+             (entry still advanced past; op record survives only in \
+             .archive_backlog/failed/ — operator should rotate the ledger)"
+        );
+        return;
+    }
+    // Serialize the op fallibly BEFORE building the record: `json!` would
+    // panic on a serialize error, and the drain thread must never panic here.
+    let op_value = match serde_json::to_value(PersistedWriteOp::from_op(op)) {
+        Ok(value) => value,
+        Err(serialize_error) => {
+            tracing::error!(
+                error = %serialize_error,
+                "archive backlog: dead-letter op serialize failed; op record \
+                 survives only in .archive_backlog/failed/"
+            );
+            return;
+        }
+    };
+    let record = serde_json::json!({
+        "dead_lettered_at_us": now_micros_u64(),
+        "attempts": attempts,
+        "error": error.to_string(),
+        "op": op_value,
+    });
+    let mut bytes = record.to_string().into_bytes();
+    bytes.push(b'\n');
+    let append = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ledger_path)
+        .and_then(|mut file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        });
+    if let Err(io_error) = append {
+        tracing::error!(
+            error = %io_error,
+            ledger = %ledger_path.display(),
+            "archive backlog: dead-letter ledger append failed; op record \
+             survives only in .archive_backlog/failed/"
+        );
     }
 }
 
@@ -1838,7 +1984,9 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
                 std::thread::sleep(Duration::from_millis(ARCHIVE_BACKLOG_IDLE_INTERVAL_MS));
             }
             // Materialized: loop immediately to drain the next entry with no sleep.
-            ArchiveBacklogDrainStep::Materialized => {}
+            // DeadLettered (F3): the poisoned head was ledgered and removed;
+            // likewise continue immediately with the next entry.
+            ArchiveBacklogDrainStep::Materialized | ArchiveBacklogDrainStep::DeadLettered => {}
             ArchiveBacklogDrainStep::RetryLater(attempts) => {
                 let backoff = ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS
                     .saturating_mul(u64::from(attempts.min(50)))
@@ -1982,6 +2130,11 @@ pub struct ArchiveLagSnapshot {
     pub drained_total: u64,
     /// Lifetime count of ops dropped because the retry backlog was full.
     pub dropped_total: u64,
+    /// Lifetime count of ops moved to the dead-letter ledger after exhausting
+    /// their materialization attempts (F3). Nonzero means
+    /// `<storage_root>/doctor/backlog_dead_letter.jsonl` has operator work.
+    #[serde(default)]
+    pub dead_lettered_total: u64,
     /// Lifetime count of ops enqueued WITHOUT a durable journal (local-disk
     /// journal write failed). Nonzero means the archive is not crash-safe for
     /// those ops until they drain; the DB stays authoritative (br-ack-fast).
@@ -2005,6 +2158,7 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         enqueued_total: backlog.enqueued_total.load(Ordering::Relaxed),
         drained_total: backlog.drained_total.load(Ordering::Relaxed),
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
+        dead_lettered_total: backlog.dead_lettered_total.load(Ordering::Relaxed),
         ephemeral_total: backlog.ephemeral_total.load(Ordering::Relaxed),
     }
 }
@@ -3008,6 +3162,20 @@ fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result
 }
 
 fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
+    // SAFETY (lock order, concurrency audit F3): the archive snapshot
+    // publication fence (`ARCHIVE_PUBLICATION_FENCE`, taken by the outermost
+    // `ArchiveMutationGuard` below) must be acquired BEFORE any per-project
+    // archive lock (`.archive.lock`, taken inside the write_* helpers via
+    // `ensure_archive`/commit paths). Taking them in the opposite order on two
+    // threads would deadlock: thread A holds a project lock and waits on the
+    // fence while thread B (a publication check) holds the fence and... the
+    // fence callback never touches project locks, so today the reverse edge
+    // cannot form — all production archive writes enter through this function
+    // (or `wbq_execute_message_bundle_batch`, same shape), which takes the
+    // fence first, and `with_archive_snapshot_publication_fence` callbacks are
+    // documented (and debug-asserted) not to initiate archive writes. Keep it
+    // that way: never acquire the fence from code already holding a
+    // per-project archive lock.
     let _mutation = ArchiveMutationGuard::begin_at(write_op_storage_root(op));
     let mut attempts = 0;
     loop {
@@ -15110,7 +15278,10 @@ mod tests {
 
         let missing = archive.root.join("messages/2026/08/new-message.md");
         let rel = rel_path_cached(&archive.canonical_repo_root, &missing).unwrap();
-        assert_eq!(rel, "projects/gh216-relpath/messages/2026/08/new-message.md");
+        assert_eq!(
+            rel,
+            "projects/gh216-relpath/messages/2026/08/new-message.md"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -17366,6 +17537,127 @@ mod tests {
             "oldest-unmaterialized age is reported while the archive lags"
         );
         assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn archive_backlog_dead_letters_permanently_failing_head_and_advances() {
+        // F3: a poisoned head op must not block the queue forever. Wedge ONLY
+        // the poisoned project's archive path (a FILE where its git repo dir
+        // must go, so `ensure_archive` fails deterministically during drain),
+        // queue a healthy op BEHIND it, then step past the attempt cap and
+        // assert the head is dead-lettered, the queue advances, the healthy op
+        // drains, and no work is deleted (ledger line + journal under failed/).
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let projects_dir = config.storage_root.join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        std::fs::write(projects_dir.join("poison-proj"), b"x").unwrap();
+
+        let backlog = ArchiveRetryBacklog::new();
+        let poisoned = backlog_test_message_op(&config, "poison-proj", 1);
+        assert_eq!(backlog.push(poisoned, 8_192), ArchiveBacklogPush::Queued);
+        let healthy = backlog_test_message_op(&config, "healthy-proj", 2);
+        assert_eq!(backlog.push(healthy, 8_192), ArchiveBacklogPush::Queued);
+        assert_eq!(backlog.backlog_state().0, 2);
+
+        for attempt in 1..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(
+                matches!(
+                    backlog.drain_step(),
+                    ArchiveBacklogDrainStep::RetryLater(a) if a == attempt
+                ),
+                "attempt {attempt} below the cap retries"
+            );
+        }
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backlog.backlog_state().0,
+            1,
+            "queue advanced past the poisoned head"
+        );
+
+        // The healthy op queued behind the poisoned head now drains.
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+
+        // No data thrown away (RULE 1): the ledger records the op...
+        let ledger = config
+            .storage_root
+            .join("doctor")
+            .join("backlog_dead_letter.jsonl");
+        let ledger_text = std::fs::read_to_string(&ledger).unwrap();
+        let lines: Vec<&str> = ledger_text.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one dead-letter record");
+        let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record["attempts"], ARCHIVE_BACKLOG_MAX_ATTEMPTS);
+        assert_eq!(record["op"]["kind"], "MessageBundle");
+        assert_eq!(record["op"]["project_slug"], "poison-proj");
+        assert!(record["error"].as_str().is_some_and(|e| !e.is_empty()));
+        assert!(
+            record["dead_lettered_at_us"]
+                .as_u64()
+                .is_some_and(|t| t > 0)
+        );
+        // ...and the durable journal is quarantined under failed/, not deleted.
+        let failed_dir = config.storage_root.join(".archive_backlog").join("failed");
+        assert_eq!(
+            std::fs::read_dir(&failed_dir).unwrap().count(),
+            1,
+            "poisoned journal preserved under failed/ (never replayed, never deleted)"
+        );
+    }
+
+    #[test]
+    fn archive_backlog_dead_letter_ledger_size_cap_still_advances_queue() {
+        // The 10MB ledger cap protects the disk, never the queue: with the
+        // ledger pre-filled to the cap the append is skipped, but the poisoned
+        // entry is STILL advanced past and its journal is still preserved.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let projects_dir = config.storage_root.join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        std::fs::write(projects_dir.join("poison-proj"), b"x").unwrap();
+        let doctor_dir = config.storage_root.join("doctor");
+        std::fs::create_dir_all(&doctor_dir).unwrap();
+        let ledger = doctor_dir.join("backlog_dead_letter.jsonl");
+        let filler = vec![b'x'; usize::try_from(ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES).unwrap()];
+        std::fs::write(&ledger, &filler).unwrap();
+
+        let backlog = ArchiveRetryBacklog::new();
+        let op = backlog_test_message_op(&config, "poison-proj", 3);
+        assert_eq!(backlog.push(op, 8_192), ArchiveBacklogPush::Queued);
+        for _ in 1..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+        }
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert_eq!(
+            backlog.backlog_state().0,
+            0,
+            "queue advances even when the ledger is at its size cap"
+        );
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            std::fs::metadata(&ledger).unwrap().len(),
+            ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES,
+            "no append beyond the size cap"
+        );
+        // The op record still survives via the quarantined journal.
+        let failed_dir = config.storage_root.join(".archive_backlog").join("failed");
+        assert_eq!(std::fs::read_dir(&failed_dir).unwrap().count(), 1);
     }
 
     #[test]
