@@ -2553,7 +2553,7 @@ impl DbPool {
     /// retry belongs here rather than surfacing a hard `DbError` to every
     /// tool caller. Cancellation and all other errors propagate unchanged.
     pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
-        const CHECKOUT_VALIDATION_RETRIES: u32 = 4;
+        const CHECKOUT_VALIDATION_RETRIES: u32 = 6;
         let mut attempt = 0;
         loop {
             let out = self.acquire_once(cx).await;
