@@ -267,7 +267,7 @@ fn json_rpc_invariants_hold_across_stdio_and_http_round_trips() {
 #[test]
 fn notifications_do_not_emit_responses_across_transports() {
     let notifications = vec![
-        Payload::Json(JsonRpcRequest::notification("initialized", None)),
+        Payload::Json(JsonRpcRequest::initialized_notification()),
         Payload::Json(JsonRpcRequest::notification(
             "notifications/cancelled",
             Some(json!({"requestId": 7, "reason": "operator cancel"})),
@@ -312,7 +312,7 @@ fn error_shape_and_standard_codes_are_stable() {
                 transport,
                 vec![
                     Payload::Json(initialize_request("init-error-shape")),
-                    Payload::Json(JsonRpcRequest::notification("initialized", None)),
+                    Payload::Json(JsonRpcRequest::initialized_notification()),
                     Payload::Json(request.clone()),
                 ],
             );
@@ -444,7 +444,7 @@ fn transport_framing_and_utf8_round_trip_are_stable() {
 fn protocol_lifecycle_initialize_then_initialized_then_tools_list() {
     let payloads = vec![
         Payload::Json(initialize_request(1_i64)),
-        Payload::Json(JsonRpcRequest::notification("initialized", None)),
+        Payload::Json(JsonRpcRequest::initialized_notification()),
         Payload::Json(JsonRpcRequest::new("tools/list", None, 2_i64)),
     ];
 

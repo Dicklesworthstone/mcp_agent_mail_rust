@@ -1194,11 +1194,8 @@ fn run_mcp_session(project_key: &str) -> Result<Vec<Value>, String> {
 
     let requests = vec![
         serde_json::to_vec(&build_initialize_request(1)),
-        serde_json::to_vec(&JsonRpcRequest::notification(
-            "notifications/initialized",
-            None,
-        )),
-        serde_json::to_vec(&JsonRpcRequest::new("tools/list", Some(json!({})), 2_i64)),
+        serde_json::to_vec(&JsonRpcRequest::initialized_notification()),
+        serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 2_i64)),
         serde_json::to_vec(&tools_call_request(
             "ensure_project",
             json!({ "human_key": project_key }),
