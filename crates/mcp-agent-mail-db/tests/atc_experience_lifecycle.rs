@@ -230,10 +230,14 @@ fn full_probe_lifecycle_with_resolution_and_rollup() {
 
         // Verify the resolved experience has the outcome stored in the DB.
         // Re-read the row directly via a sync connection to confirm
-        // state=resolved and outcome_json is populated.
+        // state=resolved and outcome_json is populated. File-backed ATC rows
+        // live in the canonical atc.sqlite3 sidecar (br-bvq1x.11.7), so the
+        // verification read goes there, not to the Franken main DB.
         let db_path = _dir.path().join("atc_lifecycle_full.db");
-        let verify_conn =
-            DbConn::open_file(db_path.display().to_string()).expect("open for verification");
+        let verify_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&db_path.display().to_string()),
+        )
+        .expect("open ATC sidecar for verification");
         let verify_rows = verify_conn.query_sync(
             "SELECT state, outcome_json, resolved_ts FROM atc_experiences WHERE experience_id = ?",
             &[sqlmodel_core::Value::BigInt(exp_id as i64)],

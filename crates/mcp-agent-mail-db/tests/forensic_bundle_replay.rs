@@ -702,6 +702,19 @@ fn replay_salvage_merge_reconstruction() {
             &[],
         )
         .expect("insert salvage agents");
+    // Salvage's own copy of archive message 1 (identity: created_ts +
+    // subject must match the archive artifact) — since br-r6awv the mapper
+    // binds salvage rows to canonical rows by identity, never by trusting
+    // the numeric id, so recipient state can only merge when the salvage
+    // side carries the parent message row. 1_771_761_600_000_000 µs ==
+    // 2026-02-22T12:00:00Z.
+    salvage_conn
+        .query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, recipients_json, created_ts)
+             VALUES (1, 100, 10, 'Archive msg 1', 'First message from archive.', 'normal', '{\"to\":[\"Bob\"],\"cc\":[],\"bcc\":[]}', 1771761600000000)",
+            &[],
+        )
+        .expect("insert salvage copy of archive message 1");
     // DB-only message not in archive
     salvage_conn
         .query_sync(
@@ -1079,19 +1092,30 @@ fn replay_corrupt_salvage_refuses_archive_only_candidate() {
     std::fs::write(&salvage_db_path, b"THIS IS NOT A SQLITE DATABASE")
         .expect("write corrupt salvage");
 
-    let error =
+    // Since br-r6awv (recovery must always converge), a corrupt salvage
+    // source no longer wedges reconstruction: the salvage is skipped with a
+    // loud warning and an archive-only candidate is rebuilt so the doctor's
+    // promotion guard — not reconstruct — decides whether the heal is safe.
+    let stats =
         reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-            .expect_err("corrupt salvage must prevent archive-only promotion");
+            .expect("corrupt salvage must not wedge archive reconstruction");
 
-    assert!(
-        error
-            .to_string()
-            .contains("refusing an archive-only candidate"),
-        "failure should explain that DB-only coordination state is protected: {error}"
+    assert_eq!(stats.messages, 1, "archive content must survive");
+    assert_eq!(
+        stats.salvaged_messages, 0,
+        "nothing may be salvaged from a corrupt source"
     );
     assert!(
-        !db_path.exists(),
-        "a failed salvage probe must not create a promotable candidate"
+        stats
+            .warnings
+            .iter()
+            .any(|w| w.contains("salvage source skipped")),
+        "the skipped salvage source must be surfaced loudly: {:?}",
+        stats.warnings
+    );
+    assert!(
+        db_path.exists(),
+        "the archive-only candidate must exist for the doctor to evaluate"
     );
 }
 
@@ -1263,7 +1287,11 @@ fn replay_duplicate_canonical_messages_are_deduplicated() {
         "opus-4.6",
     );
 
-    // Write the same message ID twice in different files
+    // Write the same message twice in different files. Since the br-r6awv
+    // collision-preservation fix, duplicate detection compares identity
+    // (created_ts + subject) — a same-id file with a DIFFERENT identity is a
+    // collision loser that must survive under a new id, not a duplicate. So
+    // a true duplicate means identical identity in both files.
     write_archive_message(
         &storage_root,
         "proj-alpha",
@@ -1290,11 +1318,11 @@ fn replay_duplicate_canonical_messages_are_deduplicated() {
             "id": 1,
             "from": "Alice",
             "to": ["Alice"],
-            "subject": "Duplicate copy",
+            "subject": "Original copy",
             "importance": "normal",
-            "created_ts": "2026-02-22T12:00:01Z",
+            "created_ts": "2026-02-22T12:00:00Z",
         }),
-        "Duplicate body.",
+        "Original body.",
     );
 
     let stats = reconstruct_from_archive(&db_path, &storage_root)
