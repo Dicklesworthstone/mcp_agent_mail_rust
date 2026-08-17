@@ -204,8 +204,18 @@ fn parse_http_responses(raw: &[u8]) -> (Vec<Value>, Vec<HashMap<String, String>>
         let header_bytes = &remaining[..header_end];
         let header_text = String::from_utf8(header_bytes.to_vec()).expect("http headers utf8");
         let mut lines = header_text.split("\r\n");
-        let _status_line = lines.next().expect("http status line");
+        let status_line = lines.next().expect("http status line");
         let mut headers = HashMap::new();
+        // Synthetic ":status" entry so tests can assert HTTP status codes
+        // (202 notification ACKs, 400 malformed-body rejections).
+        headers.insert(
+            ":status".to_string(),
+            status_line
+                .split_whitespace()
+                .nth(1)
+                .expect("http status code")
+                .to_string(),
+        );
         for line in lines {
             if let Some((name, value)) = line.split_once(':') {
                 headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
@@ -218,12 +228,14 @@ fn parse_http_responses(raw: &[u8]) -> (Vec<Value>, Vec<HashMap<String, String>>
         let body_start = cursor + header_end + 4;
         let body_end = body_start + content_length;
         let body = &raw[body_start..body_end];
-        // MCP Streamable HTTP answers notifications with an accepted status
-        // and an empty body; only non-empty bodies carry JSON-RPC responses.
+        // Streamable HTTP acknowledges notification POSTs with 202 Accepted
+        // and rejects malformed bodies with 400 Bad Request, both without a
+        // JSON body. Only frames that carry a body are JSON-RPC responses.
+        // Always keep headers so tests can assert :status on empty-body ACKs.
         if !body.is_empty() {
             responses.push(serde_json::from_slice(body).expect("http response body must be json"));
-            headers_out.push(headers);
         }
+        headers_out.push(headers);
         cursor = body_end;
     }
 
@@ -282,21 +294,35 @@ fn notifications_do_not_emit_responses_across_transports() {
         let execution = execute_transport(transport, notifications.clone());
         assert!(
             execution.responses.is_empty(),
-            "notifications must not emit responses for {}",
+            "notifications must not emit JSON-RPC responses for {}",
             transport.label()
         );
         match transport {
-            // Stdio notifications produce no bytes at all.
+            // A stdio session whose opening frame is not a valid era
+            // selection is refused by fastmcp 0.3.x era admission, but that
+            // refusal is connection-terminal only: notifications carry no id,
+            // so no JSON-RPC bytes may reach the wire.
             TransportKind::Stdio => assert!(
                 execution.raw_output.is_empty(),
-                "notifications must not write response bytes for {}",
-                transport.label()
+                "notifications must not write response bytes for stdio"
             ),
-            // Streamable HTTP acknowledges each notification with an
-            // accepted status and an EMPTY body; the header bytes are
-            // allowed, but no JSON-RPC response may ride along (already
-            // asserted via `responses.is_empty()` above).
-            TransportKind::Http => {}
+            // Streamable HTTP acknowledges each notification POST at the
+            // HTTP layer with 202 Accepted and an empty body; JSON-RPC
+            // itself still produces no response.
+            TransportKind::Http => {
+                for headers in &execution.http_headers {
+                    assert_eq!(
+                        headers.get(":status").map(String::as_str),
+                        Some("202"),
+                        "http notification frames must be 202 Accepted ACKs"
+                    );
+                    assert_eq!(
+                        headers.get("content-length").map(String::as_str),
+                        Some("0"),
+                        "http notification ACKs must carry no body"
+                    );
+                }
+            }
         }
     }
 }
@@ -316,6 +342,10 @@ fn error_shape_and_standard_codes_are_stable() {
             0, // sentinel: accept either protocol-level rejection code
             "",
         ),
+        // The era-admission adapter reports method-owned params failures
+        // with its frozen taxonomy message ("invalid exact MCP 2024-11-05
+        // parameters"), so assert the params vocabulary rather than the
+        // pre-0.3.x "required" phrasing.
         (
             JsonRpcRequest::new("tools/call", None, 42_i64),
             -32602,
@@ -536,6 +566,17 @@ fn malformed_inputs_do_not_crash_the_server_loop() {
                     poisoned.responses.is_empty(),
                     "malformed http input must not produce a JSON-RPC response"
                 );
+                if let Some(status) = poisoned
+                    .http_headers
+                    .first()
+                    .and_then(|headers| headers.get(":status"))
+                    .map(String::as_str)
+                {
+                    assert_eq!(
+                        status, "400",
+                        "malformed http body must be rejected with 400 Bad Request"
+                    );
+                }
                 let recovered =
                     execute_transport(transport, vec![Payload::Json(initialize_request(5_i64))]);
                 assert_eq!(
