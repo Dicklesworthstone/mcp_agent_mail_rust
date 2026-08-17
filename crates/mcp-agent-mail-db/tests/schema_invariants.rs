@@ -637,82 +637,18 @@ fn schema_invariants_detect_ack_before_read_and_bad_reservation_ttl() {
 
     let conn = fresh_conn(&pool);
     allow_corruption_fixture(&conn);
-    for probe in [
-        "SELECT COUNT(*) AS c FROM messages",
-        "SELECT COUNT(*) AS c FROM message_recipients",
-        "SELECT COUNT(*) AS c FROM file_reservations",
-    ] {
-        let rows = conn.query_sync(probe, &[]).expect("probe");
-        eprintln!("[PROBE] {probe} -> {:?}", rows.first().and_then(|r| r.get(0)));
-    }
-    eprintln!("[PROBE] ids: message_id={message_id} recipient_id={recipient_id} reservation_id={reservation_id}");
-    let rows = conn
-        .query_sync(
-            "SELECT message_id, agent_id, kind, read_ts, ack_ts FROM message_recipients",
-            &[],
-        )
-        .expect("probe recipients");
-    for r in &rows {
-        eprintln!(
-            "[PROBE] recipient row: {:?} {:?} {:?}",
-            r.get(0),
-            r.get(1),
-            r.get(2)
-        );
-    }
-    let literal = conn
-        .execute_sync(
-            "UPDATE message_recipients SET read_ts = 999 WHERE message_id = 1 AND agent_id = 2",
-            &[],
-        )
-        .expect("literal update probe");
-    eprintln!("[PROBE] literal update matched: {literal}");
-    let sel2 = conn
-        .query_sync(
-            "SELECT COUNT(*) AS c FROM message_recipients WHERE message_id = ? AND agent_id = ?",
-            &[Value::BigInt(1), Value::BigInt(2)],
-        )
-        .expect("select 2 params");
-    eprintln!("[PROBE] select 2 bound params -> {:?}", sel2.first().and_then(|r| r.get(0)));
-    let up1 = conn
-        .execute_sync(
-            "UPDATE message_recipients SET read_ts = 998 WHERE message_id = ?",
-            &[Value::BigInt(1)],
-        )
-        .expect("update 1 param");
-    eprintln!("[PROBE] update 1 bound param matched: {up1}");
-    let up2 = conn
-        .execute_sync(
-            "UPDATE message_recipients SET read_ts = 997 WHERE message_id = ? AND agent_id = ?",
-            &[Value::BigInt(1), Value::BigInt(2)],
-        )
-        .expect("update 2 params");
-    eprintln!("[PROBE] update 2 bound params matched: {up2}");
-    let up2s = conn
-        .execute_sync(
-            "UPDATE message_recipients SET read_ts = ?, ack_ts = ? WHERE message_id = 1 AND agent_id = 2",
-            &[Value::BigInt(200), Value::BigInt(100)],
-        )
-        .expect("update set-params literal-where");
-    eprintln!("[PROBE] update set-params literal-where matched: {up2s}");
-    let clean = fresh_conn(&pool);
-    let up2clean = clean
-        .execute_sync(
-            "UPDATE message_recipients SET read_ts = 996 WHERE message_id = ? AND agent_id = ?",
-            &[Value::BigInt(1), Value::BigInt(2)],
-        )
-        .expect("update 2 params clean conn");
-    eprintln!("[PROBE] clean-conn update 2 bound params matched: {up2clean}");
+    // fsqlite 0.3.4 (via sqlmodel-frankensqlite): an UPDATE whose WHERE clause
+    // carries MORE THAN ONE bound parameter matches zero rows on this table,
+    // while the identical literal SQL — and the same two params on a SELECT —
+    // match correctly (br-fsq2p). Seed the drift with literal SQL until the
+    // upstream binding bug is fixed; the assert keeps the seed honest.
     let drift_rows = conn
         .execute_sync(
-            "UPDATE message_recipients SET read_ts = ?, ack_ts = ? \
-             WHERE message_id = ? AND agent_id = ?",
-            &[
-                Value::BigInt(200),
-                Value::BigInt(100),
-                Value::BigInt(message_id),
-                Value::BigInt(recipient_id),
-            ],
+            &format!(
+                "UPDATE message_recipients SET read_ts = 200, ack_ts = 100 \
+                 WHERE message_id = {message_id} AND agent_id = {recipient_id}"
+            ),
+            &[],
         )
         .expect("force ack-before-read drift");
     assert_eq!(
