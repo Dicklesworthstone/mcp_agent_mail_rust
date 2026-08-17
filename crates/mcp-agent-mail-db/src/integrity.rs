@@ -1378,7 +1378,10 @@ mod tests {
                 .to_string(),
         );
         let summary = summarize_check_details(&details);
-        assert!(summary.contains("nocase"), "distinctive row elided: {summary}");
+        assert!(
+            summary.contains("nocase"),
+            "distinctive row elided: {summary}"
+        );
     }
 
     #[test]
