@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash as _, Hasher as _};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -338,31 +338,58 @@ fn run_stdio_session(env: &[(String, String)], requests: &[Value]) -> StdioSessi
     }
 
     let mut child = cmd.spawn().expect("spawn `am serve-stdio`");
-    let mut stdout = child.stdout.take().expect("child stdout");
+    let stdout = child.stdout.take().expect("child stdout");
     let mut stderr = child.stderr.take().expect("child stderr");
+    let stdout_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stdout_sink = std::sync::Arc::clone(&stdout_lines);
     let stdout_thread = thread::spawn(move || {
-        let mut buf = String::new();
-        stdout.read_to_string(&mut buf).expect("read child stdout");
-        buf
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => stdout_sink.lock().expect("stdout lines lock").push(line),
+                Err(_) => break,
+            }
+        }
     });
     let stderr_thread = thread::spawn(move || {
         let mut buf = String::new();
         stderr.read_to_string(&mut buf).expect("read child stderr");
         buf
     });
-    {
-        let mut stdin = child.stdin.take().expect("child stdin");
-        serde_json::to_writer(&mut stdin, &initialize_request()).expect("serialize initialize");
-        stdin.write_all(b"\n").expect("write initialize delimiter");
-        for request in requests {
-            serde_json::to_writer(&mut stdin, request).expect("serialize stdio request");
-            stdin.write_all(b"\n").expect("write request delimiter");
-        }
-        stdin.flush().expect("flush stdio requests");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    serde_json::to_writer(&mut stdin, &initialize_request()).expect("serialize initialize");
+    stdin.write_all(b"\n").expect("write initialize delimiter");
+    // The stdio transport gates operating requests on the standard MCP
+    // lifecycle notification (GH#248).
+    serde_json::to_writer(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .expect("serialize initialized notification");
+    stdin
+        .write_all(b"\n")
+        .expect("write initialized notification delimiter");
+    for request in requests {
+        serde_json::to_writer(&mut stdin, request).expect("serialize stdio request");
+        stdin.write_all(b"\n").expect("write request delimiter");
     }
+    stdin.flush().expect("flush stdio requests");
 
     let started = Instant::now();
     let timeout = Duration::from_secs(60);
+    // Keep stdin open until every expected response arrived: the stdio
+    // transport tears the session down on EOF without draining pending
+    // requests, so an eager close races the responses away.
+    let expected_responses =
+        1 + requests.iter().filter(|r| r.get("id").is_some()).count();
+    while started.elapsed() < timeout {
+        if stdout_lines.lock().expect("stdout lines lock").len() >= expected_responses {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    drop(stdin);
+
     let mut timed_out = false;
     loop {
         match child.try_wait() {
@@ -380,7 +407,15 @@ fn run_stdio_session(env: &[(String, String)], requests: &[Value]) -> StdioSessi
     }
 
     let exit_code = child.wait().expect("wait stdio child").code();
-    let stdout = stdout_thread.join().expect("join stdout thread");
+    stdout_thread.join().expect("join stdout thread");
+    let stdout = {
+        let lines = stdout_lines.lock().expect("stdout lines lock");
+        let mut joined = lines.join("\n");
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined
+    };
     let stderr = stderr_thread.join().expect("join stderr thread");
     let responses = stdout
         .lines()
