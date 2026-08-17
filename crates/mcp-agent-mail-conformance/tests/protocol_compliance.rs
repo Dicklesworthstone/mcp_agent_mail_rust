@@ -329,18 +329,18 @@ fn notifications_do_not_emit_responses_across_transports() {
 
 #[test]
 fn error_shape_and_standard_codes_are_stable() {
-    // Alien (non-MCP-namespace) methods are rejected by fastmcp's era-aware
-    // transport router before Agent Mail dispatch ever sees them. The router
-    // reports the protocol-level verdict as INVALID_REQUEST (-32600); a
-    // recognized-but-unimplemented method would surface METHOD_NOT_FOUND
-    // (-32601) from dispatch instead. Both are stable protocol-level codes;
-    // the contract asserted here is that alien traffic yields a well-formed
-    // JSON-RPC error carrying one of them, echoing the request id.
+    // JSON-RPC 2.0 taxonomy (GH#250 spec ruling): a structurally valid
+    // request naming an unavailable method is METHOD_NOT_FOUND (-32601);
+    // INVALID_REQUEST (-32600) is reserved for envelope-structure failures.
+    // fastmcp < 2a5ee3b reported the alien-method case as -32600 from its
+    // era-aware router; that was fixed upstream (fastmcp_rust 2a5ee3b, the
+    // rev the ../fastmcp-rel-0328 pin now points at), so this suite asserts
+    // the exact spec code.
     let cases = vec![
         (
             JsonRpcRequest::new("totally/unknown/method", None, 41_i64),
-            0, // sentinel: accept either protocol-level rejection code
-            "",
+            -32601,
+            "method",
         ),
         // The era-admission adapter reports method-owned params failures
         // with its frozen taxonomy message ("invalid exact MCP 2024-11-05
@@ -389,22 +389,12 @@ fn error_shape_and_standard_codes_are_stable() {
                 "error.message must be string for {}",
                 transport.label()
             );
-            if *expected_code == 0 {
-                let code = error["code"].as_i64().unwrap_or_default();
-                assert!(
-                    code == -32600 || code == -32601,
-                    "alien method must yield a protocol-level rejection \
-                     (-32600 or -32601) for {}: {error:?}",
-                    transport.label()
-                );
-            } else {
-                assert_eq!(
-                    error["code"],
-                    json!(expected_code),
-                    "unexpected error code for {}",
-                    transport.label()
-                );
-            }
+            assert_eq!(
+                error["code"],
+                json!(expected_code),
+                "unexpected error code for {}",
+                transport.label()
+            );
             let lower = error["message"]
                 .as_str()
                 .unwrap_or_default()
