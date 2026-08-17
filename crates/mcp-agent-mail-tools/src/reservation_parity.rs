@@ -1126,14 +1126,14 @@ mod tests {
         // drift with no fixer, keeping `am doctor health` rc=1 forever on a
         // healthy mailbox.
         let storage = tempfile::tempdir().expect("tempdir");
-        let conn = seed_single_reservation_db("gggg2222");
+        let conn = seed_single_reservation_db("beef2222");
 
         // The only artifact for (proj-a, 1) is stamped with the PRIOR generation.
         write_reservation_artifact(
             storage.path(),
             "proj-a",
             1,
-            Some("gggg1111"),
+            Some("beef1111"),
             "BlueLake",
             "src/**",
             true,
@@ -1162,7 +1162,7 @@ mod tests {
         // holds no lock; flagging it forever trains operators to ignore the
         // parity check.
         let storage = tempfile::tempdir().expect("tempdir");
-        let conn = seed_single_reservation_db("gggg2222");
+        let conn = seed_single_reservation_db("beef2222");
         conn.execute_raw("UPDATE file_reservations SET released_ts = 200 WHERE id = 1")
             .expect("release reservation");
 
@@ -1183,7 +1183,7 @@ mod tests {
         // Guard: the GH#244 reclassification must NOT swallow the genuinely
         // dangerous shape — a live lock the durable ledger cannot vouch for.
         let storage = tempfile::tempdir().expect("tempdir");
-        let conn = seed_single_reservation_db("gggg2222");
+        let conn = seed_single_reservation_db("beef2222");
 
         let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
         assert_eq!(report.drift.missing_archive_artifacts, 1);
