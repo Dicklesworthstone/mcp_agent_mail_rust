@@ -7934,7 +7934,9 @@ async fn fetch_inbox_impl(
     let mut attempt: u32 = 0;
     let result = loop {
         match run_query() {
-            Err(error) if attempt < *MVCC_MAX_RETRIES && is_plain_write_contention_error(&error) => {
+            Err(error)
+                if attempt < *MVCC_MAX_RETRIES && is_plain_write_contention_error(&error) =>
+            {
                 attempt += 1;
                 tracing::warn!(
                     attempt,

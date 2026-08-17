@@ -2559,18 +2559,16 @@ impl DbPool {
             let out = self.acquire_once(cx).await;
             match &out {
                 Outcome::Err(error)
-                    if attempt < CHECKOUT_VALIDATION_RETRIES
-                        && {
-                            let msg = error.to_string();
-                            // "recovery in progress" is fsqlite's BusyRecovery:
-                            // another connection holds the WAL recovery fence.
-                            // It is transient by definition (the fence is
-                            // released when recovery finishes), so a checkout
-                            // that lost the fence race retries like a failed
-                            // validation ping instead of failing the tool call.
-                            is_checkout_validation_failure(&msg)
-                                || msg.contains("recovery in progress")
-                        } =>
+                    if attempt < CHECKOUT_VALIDATION_RETRIES && {
+                        let msg = error.to_string();
+                        // "recovery in progress" is fsqlite's BusyRecovery:
+                        // another connection holds the WAL recovery fence.
+                        // It is transient by definition (the fence is
+                        // released when recovery finishes), so a checkout
+                        // that lost the fence race retries like a failed
+                        // validation ping instead of failing the tool call.
+                        is_checkout_validation_failure(&msg) || msg.contains("recovery in progress")
+                    } =>
                 {
                     attempt += 1;
                     tracing::warn!(

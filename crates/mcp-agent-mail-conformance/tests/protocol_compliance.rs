@@ -283,7 +283,10 @@ fn json_rpc_invariants_hold_across_stdio_and_http_round_trips() {
 #[test]
 fn notifications_do_not_emit_responses_across_transports() {
     let notifications = vec![
-        Payload::Json(JsonRpcRequest::notification("notifications/initialized", None)),
+        Payload::Json(JsonRpcRequest::notification(
+            "notifications/initialized",
+            None,
+        )),
         Payload::Json(JsonRpcRequest::notification(
             "notifications/cancelled",
             Some(json!({"requestId": 7, "reason": "operator cancel"})),
@@ -361,7 +364,10 @@ fn error_shape_and_standard_codes_are_stable() {
                 transport,
                 vec![
                     Payload::Json(initialize_request("init-error-shape")),
-                    Payload::Json(JsonRpcRequest::notification("notifications/initialized", None)),
+                    Payload::Json(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
                     Payload::Json(request.clone()),
                 ],
             );
@@ -493,7 +499,10 @@ fn transport_framing_and_utf8_round_trip_are_stable() {
 fn protocol_lifecycle_initialize_then_initialized_then_tools_list() {
     let payloads = vec![
         Payload::Json(initialize_request(1_i64)),
-        Payload::Json(JsonRpcRequest::notification("notifications/initialized", None)),
+        Payload::Json(JsonRpcRequest::notification(
+            "notifications/initialized",
+            None,
+        )),
         Payload::Json(JsonRpcRequest::new("tools/list", Some(json!({})), 2_i64)),
     ];
 
@@ -545,10 +554,12 @@ fn malformed_inputs_do_not_crash_the_server_loop() {
                     transport.label()
                 );
             }
-            // The HTTP listener fails closed on a malformed body: it emits no
-            // JSON-RPC response and drops the connection rather than echoing
-            // attacker-controlled bytes. Recovery is a fresh connection, which
-            // must serve valid traffic normally (i.e. the process survived).
+            // A malformed HTTP body is declined without ever echoing
+            // attacker-controlled bytes as a JSON-RPC response (since the
+            // GH#250 fastmcp rev the listener answers 400 and keeps the
+            // connection open rather than dropping it — either behavior
+            // satisfies these assertions). A fresh connection must serve
+            // valid traffic normally, i.e. the process survived.
             TransportKind::Http => {
                 let poisoned =
                     execute_transport(transport, vec![Payload::Raw(b"{not-json}".to_vec())]);

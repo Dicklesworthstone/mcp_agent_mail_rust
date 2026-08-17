@@ -380,8 +380,7 @@ fn run_stdio_session(env: &[(String, String)], requests: &[Value]) -> StdioSessi
     // Keep stdin open until every expected response arrived: the stdio
     // transport tears the session down on EOF without draining pending
     // requests, so an eager close races the responses away.
-    let expected_responses =
-        1 + requests.iter().filter(|r| r.get("id").is_some()).count();
+    let expected_responses = 1 + requests.iter().filter(|r| r.get("id").is_some()).count();
     while started.elapsed() < timeout {
         if stdout_lines.lock().expect("stdout lines lock").len() >= expected_responses {
             break;

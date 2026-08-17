@@ -1320,7 +1320,6 @@ fn golden_corpus_idempotent() {
 
     // Compare a subset of queries across two independent corpus instances
     for ((q, snap1), snap2) in compared.iter().zip(snaps1).zip(snaps2) {
-
         // Result counts should match
         assert_eq!(
             snap1.result_count, snap2.result_count,

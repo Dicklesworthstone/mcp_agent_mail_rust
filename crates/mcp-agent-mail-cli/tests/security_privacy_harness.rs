@@ -83,17 +83,24 @@ fn tool_call(id: i64, name: &str, arguments: Value) -> Value {
 }
 
 fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
-    // Back-to-back sessions against the same mailbox can land inside the
-    // previous owner's activity-lock reap window; that state is explicitly
-    // retryable ("Resource is temporarily busy. Wait a moment and try
-    // again."), so retry the whole session a bounded number of times.
+    // Two transient states are retryable by their own contract:
+    // - "Resource is temporarily busy. Wait a moment and try again." —
+    //   back-to-back sessions against the same mailbox can land inside the
+    //   previous owner's activity-lock reap window;
+    // - "Contact approval required ... Automatic handshake attempts already
+    //   ran" — send_message's auto-handshake swallows transient engine
+    //   contention and its error message explicitly says to retry; a re-run
+    //   finds the persisted handshake (or re-drives it) and succeeds.
+    // Retry the whole session a bounded number of times on either.
     let mut run = run_stdio_session_once(db_path, requests);
     for _ in 0..3 {
-        let busy = run
-            .responses
-            .iter()
-            .any(|resp| response_text(resp).contains("Resource is temporarily busy"));
-        if !busy {
+        let transient = run.responses.iter().any(|resp| {
+            let text = response_text(resp);
+            text.contains("Resource is temporarily busy")
+                || (text.contains("Contact approval required")
+                    && text.contains("Automatic handshake attempts already ran"))
+        });
+        if !transient {
             break;
         }
         thread::sleep(Duration::from_secs(2));
