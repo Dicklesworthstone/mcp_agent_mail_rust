@@ -16,7 +16,7 @@ use sqlmodel_core::Value;
 /// DB. Since br-bvq1x.11.7 every file-backed ATC row lives there, not in the
 /// main DB, so tests must seed and verify through this connection.
 fn sidecar_conn(pool: &DbPool) -> CanonicalDbConn {
-    let path = atc_sidecar_sqlite_path(&pool.sqlite_path());
+    let path = atc_sidecar_sqlite_path(pool.sqlite_path());
     CanonicalDbConn::open_file(path).expect("open ATC sidecar")
 }
 
