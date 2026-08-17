@@ -3191,6 +3191,8 @@ repair_launchd_service_env_from_rust_config() {
   http_path=$(read_env_assignment_value "$rust_env" "HTTP_PATH")
   [ -z "$http_path" ] && http_path="${HTTP_PATH:-/mcp/}"
 
+  # GH#243: announce exactly what is about to be touched before touching it.
+  info "About to rewrite LaunchAgent plist ${plist_path} (program: ${DEST}/${BIN_CLI}) and restart it via launchctl bootout/bootstrap"
   if ! write_launchd_service_plist "$plist_path" "$DEST/$BIN_CLI" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path"
   then
     warn "Failed to rewrite LaunchAgent plist with Rust config environment."
@@ -3250,7 +3252,14 @@ ensure_remote_http_client_readiness() {
     return 1
   fi
 
-  info "Installing or restarting the background Agent Mail HTTP service"
+  # GH#243: announce exactly what is about to be touched before touching it.
+  local service_unit_desc
+  case "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" in
+    darwin) service_unit_desc="LaunchAgent com.agent-mail (${HOME}/Library/LaunchAgents/com.agent-mail.plist)" ;;
+    *)      service_unit_desc="systemd user unit agent-mail.service (${HOME}/.config/systemd/user/agent-mail.service)" ;;
+  esac
+  info "About to install/enable/restart ${service_unit_desc}"
+  info "  via: ${DEST}/${BIN_CLI} service install (ExecStart will point at ${DEST}/${BIN_CLI})"
   local service_output=""
   if service_output=$("$DEST/$BIN_CLI" service install --host "$(desired_service_bind_host)" --port "$(desired_service_bind_port)" 2>&1); then
     while IFS= read -r line; do

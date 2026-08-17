@@ -109,7 +109,12 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   `--dest` points outside the default install locations, and a new
   `--no-service` flag forces the same skip anywhere — a scratch/CI
   verification install can no longer point a production unit's ExecStart at
-  a deletable directory.
+  a deletable directory. The service-management step now announces exactly
+  which unit it is about to install/enable/restart (and which plist it is
+  about to rewrite) before touching it, and
+  `tests/e2e/test_install_no_service.sh` pins the gate with a fake-systemctl
+  capture harness (zero systemctl invocations under a scratch `--dest` or
+  `--no-service`; default-location installs still manage the service).
 - **Graceful shutdown can no longer park forever (long-uptime "my TUI died"
   class).** The shutdown control message was a silent-drop `try_send` onto a
   bounded channel, and the main thread then waited on the HTTP supervisor
