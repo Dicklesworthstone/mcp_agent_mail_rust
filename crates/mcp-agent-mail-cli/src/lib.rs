@@ -6558,8 +6558,11 @@ enum RestartDecision {
     /// mid-boot (reconstruct/salvage/migration can run for minutes before the
     /// HTTP listener binds). Killing or racing it is exactly the
     /// committed-row-loss generator from the 2026-08-01 fleet outage
-    /// (mcp_agent_mail#253), so startup REFUSES (non-zero exit; systemd
-    /// retries) instead of proceeding unlocked.
+    /// (mcp_agent_mail#253), so startup never proceeds unlocked here. A
+    /// MANAGED unit stands by resident (same GH#246 standby loop — an
+    /// erroring flock loser would exhaust `StartLimitBurst` while the winner
+    /// is still reconstructing); an unmanaged invocation REFUSES with a
+    /// non-zero exit.
     ContendedAliveHolder,
     /// Lock is contended but no peer is serving yet — keep waiting (loop-internal;
     /// never returned to the caller).
@@ -6594,11 +6597,28 @@ const fn decide_restart_coordination(
 /// outcome either (any exit loops under `Restart=always`, and a pre-`READY=1`
 /// exit is a `Type=notify` protocol failure) — it stands by resident until
 /// the peer departs, then retries startup.
-const fn should_reuse_peer_after_restart_coordination(
+///
+/// `ContendedAliveHolder` gets the SAME resident-standby treatment for
+/// managed units: with two managed standbys behind one incumbent, the
+/// incumbent's death sends both back through coordination, the flock loser
+/// probes a winner that has not bound its listener yet (reconstruct/salvage
+/// can run for minutes), and erroring out here made the loser exit non-zero
+/// every `RestartSec=30` — five such failures exhaust the shipped unit's
+/// `StartLimitBurst=5`/`StartLimitIntervalSec=300` in 150s and permanently
+/// fail the unit whenever the winner's boot exceeds ~2.5 minutes. Standing
+/// by resident instead re-coordinates on the standby cadence until the
+/// winner either serves (normal standby) or dies (lock freed → `Proceed`).
+/// Unmanaged invocations keep the fail-closed error (a human ran them; they
+/// must not silently park).
+const fn should_stand_by_after_restart_coordination(
     decision: RestartDecision,
     managed_service: bool,
 ) -> bool {
-    managed_service && matches!(decision, RestartDecision::PeerAlreadyServing)
+    managed_service
+        && matches!(
+            decision,
+            RestartDecision::PeerAlreadyServing | RestartDecision::ContendedAliveHolder
+        )
 }
 
 fn restart_lock_path(storage_root: &Path) -> PathBuf {
@@ -6731,16 +6751,44 @@ mod restart_coordination_tests {
 
     #[test]
     fn managed_same_mailbox_peer_is_idempotent_before_port_clear() {
-        assert!(should_reuse_peer_after_restart_coordination(
+        assert!(should_stand_by_after_restart_coordination(
             RestartDecision::PeerAlreadyServing,
             true,
         ));
-        assert!(!should_reuse_peer_after_restart_coordination(
+        assert!(!should_stand_by_after_restart_coordination(
             RestartDecision::PeerAlreadyServing,
             false,
         ));
-        assert!(!should_reuse_peer_after_restart_coordination(
+    }
+
+    /// Standby-vs-standby follow-up to GH#246: a managed flock loser that
+    /// finds an alive-but-not-yet-serving holder must STAND BY resident, not
+    /// error out. Erroring exits non-zero every `RestartSec=30`; under the
+    /// shipped `StartLimitBurst=5` / `StartLimitIntervalSec=300` five such
+    /// exits permanently fail the loser unit in 150s whenever the winner's
+    /// boot (reconstruct/salvage) exceeds ~2.5 minutes. Unmanaged (human-run)
+    /// invocations keep the fail-closed refusal.
+    #[test]
+    fn managed_contended_alive_holder_stands_by_instead_of_erroring() {
+        assert!(should_stand_by_after_restart_coordination(
             RestartDecision::ContendedAliveHolder,
+            true,
+        ));
+        assert!(!should_stand_by_after_restart_coordination(
+            RestartDecision::ContendedAliveHolder,
+            false,
+        ));
+        // Non-standby decisions never park a managed unit.
+        assert!(!should_stand_by_after_restart_coordination(
+            RestartDecision::Proceed,
+            true,
+        ));
+        assert!(!should_stand_by_after_restart_coordination(
+            RestartDecision::ProceedUnlocked,
+            true,
+        ));
+        assert!(!should_stand_by_after_restart_coordination(
+            RestartDecision::KeepWaiting,
             true,
         ));
     }
@@ -7008,20 +7056,30 @@ fn handle_serve_http(
     loop {
         let (restart_decision, acquired_lock) =
             coordinate_server_restart(&config, takeover, RESTART_COORD_WAIT);
-        if should_reuse_peer_after_restart_coordination(
+        if should_stand_by_after_restart_coordination(
             restart_decision,
             running_under_managed_service(),
         ) {
+            // GH#246 + the standby-vs-standby follow-up: for a managed unit
+            // both "a verified peer is serving" and "an alive holder owns the
+            // restart lock but is not serving yet (mid-boot)" are standby
+            // outcomes, never exits — an exiting flock loser burns one
+            // `StartLimitBurst` slot per `RestartSec` and permanently fails
+            // the unit while the winner is still reconstructing.
+            let standby_reason = if restart_decision == RestartDecision::ContendedAliveHolder {
+                "another Agent Mail process holds the restart-coordination lock for this \
+                 storage root but is not serving yet (most likely a peer mid-boot)"
+            } else {
+                "a verified Agent Mail MCP peer already owns this storage root"
+            };
             tracing::warn!(
                 host = %config.http_host,
                 port = config.http_port,
                 path = %config.http_path,
-                "verified Agent Mail MCP peer already owns this storage root; managed duplicate stands by until the peer exits (GH#246)"
+                decision = ?restart_decision,
+                "managed duplicate stands by until the peer exits (GH#246): {standby_reason}"
             );
-            wait_in_managed_standby_until_peer_departs(
-                &config,
-                "a verified Agent Mail MCP peer already owns this storage root",
-            );
+            wait_in_managed_standby_until_peer_departs(&config, standby_reason);
             continue;
         }
         if restart_decision == RestartDecision::PeerAlreadyServing {

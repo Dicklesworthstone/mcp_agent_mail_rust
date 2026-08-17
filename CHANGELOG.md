@@ -31,7 +31,15 @@ the #244 reservation-parity fix, the #245 pool-timeout stall fixes, and the
   `active` with a flat restart counter while an outside owner serves, and
   automatically reclaims the port the moment that owner exits. No unit-file
   change is required; both the shipped `Restart=on-failure` template and
-  older `Restart=always` units converge.
+  older `Restart=always` units converge. Follow-up in the same release: a
+  managed flock loser that finds an alive-but-not-yet-serving
+  restart-coordination holder (`ContendedAliveHolder` — e.g. two managed
+  standbys re-coordinating after their incumbent dies, while the winner is
+  still in reconstruct/salvage) now enters the same resident standby loop
+  instead of erroring out; the erroring path burned one `StartLimitBurst=5`
+  slot per `RestartSec=30` and permanently failed the loser unit in 150s
+  whenever the winner's boot exceeded ~2.5 minutes. Unmanaged (human-run)
+  invocations keep the fail-closed refusal.
 - **`am doctor triage` can no longer report `ok / 0 findings` on a database
   stock SQLite calls malformed (#247).** Three compounding defects fixed in
   the shared integrity surfaces (used by the doctor probes, the background
