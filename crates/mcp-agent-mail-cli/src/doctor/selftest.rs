@@ -1194,6 +1194,10 @@ fn run_mcp_session(project_key: &str) -> Result<Vec<Value>, String> {
 
     let requests = vec![
         serde_json::to_vec(&build_initialize_request(1)),
+        // Standard MCP lifecycle method (GH#248): the stdio transport gates
+        // operating requests on `notifications/initialized`; the bare
+        // `initialized` name is not part of the protocol and made this
+        // self-test a false negative.
         serde_json::to_vec(&JsonRpcRequest::notification(
             "notifications/initialized",
             None,

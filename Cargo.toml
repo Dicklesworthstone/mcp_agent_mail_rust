@@ -180,18 +180,18 @@ inherits = "release"     # Benchmarks use same optimizations as release
 # pinning asupersync =0.3.10), so the sqlmodel family remains
 # path-patched. /dp/sqlmodel_rust is BACK ON MAIN (0.3.2 line) — other
 # projects need it there — so the patch points at the dedicated stable
-# clone /data/projects/sqlmodel-rel-0327 (harmonize/vlsf2-fsqlite03 tip
+# clone ../sqlmodel-rel-0327 (harmonize/vlsf2-fsqlite03 tip
 # 021bd17 + local asupersync =0.4.5 bump). Cleanup trigger: sqlmodel
 # 0.4.x on crates.io accepting asupersync 0.4.5 and fsqlite 0.3 — then
 # delete these eight lines and resolve from the registry.
-sqlmodel = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel" }
-sqlmodel-core = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-core" }
-sqlmodel-query = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-frankensqlite" }
-sqlmodel-sqlite = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-sqlite" }
+sqlmodel = { path = "../sqlmodel-rel-0327/crates/sqlmodel" }
+sqlmodel-core = { path = "../sqlmodel-rel-0327/crates/sqlmodel-core" }
+sqlmodel-query = { path = "../sqlmodel-rel-0327/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "../sqlmodel-rel-0327/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "../sqlmodel-rel-0327/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "../sqlmodel-rel-0327/crates/sqlmodel-pool" }
+sqlmodel-frankensqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-frankensqlite" }
+sqlmodel-sqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-sqlite" }
 #
 # fastmcp-rust is temporarily force-patched to the sibling checkout
 # until its own v0.3 release propagates to crates.io. The currently
