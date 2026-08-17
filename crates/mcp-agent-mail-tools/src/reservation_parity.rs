@@ -461,6 +461,16 @@ where
     // prior-generation lineage (post-reconstruct) is not misread as
     // `missing_archive` (GH#244).
     let mut foreign_artifact_keys: BTreeSet<(String, i64)> = BTreeSet::new();
+    // Tracks the index into `archive_reservations` for each (project, id) key
+    // already admitted, so a duplicate on-disk artifact for the same
+    // reservation (a generation-stamped file coexisting with its legacy
+    // `id-<id>.json` predecessor, br-n8qh6) is resolved the same way
+    // `find_reservation_artifact` resolves it — stamped wins over legacy —
+    // instead of silently taking whichever file `read_dir` happened to
+    // return last. Before this fix the loser could be the current, correct
+    // artifact, producing spurious released_ts/active_status drift against
+    // an already-healed row (hfdt-am-parity-checker-stale-artifact-read-mwmv4).
+    let mut archive_index: BTreeMap<(String, i64), usize> = BTreeMap::new();
     for reservation in archive_scan.reservations {
         let is_foreign = match (&current_generation, &reservation.generation) {
             (Some(current), Some(generation)) => generation != current,
@@ -486,7 +496,25 @@ where
                 });
             }
         } else {
-            archive_reservations.push(reservation);
+            let key = (reservation.project_slug.clone(), reservation.reservation_id);
+            match archive_index.get(&key) {
+                Some(&existing_idx) => {
+                    let existing_is_stamped =
+                        archive_reservations[existing_idx].generation.is_some();
+                    let new_is_stamped = reservation.generation.is_some();
+                    if new_is_stamped && !existing_is_stamped {
+                        archive_reservations[existing_idx] = reservation;
+                    }
+                    // else: keep the already-admitted entry — either it is
+                    // already stamped (and a same-generation id can have at
+                    // most one stamped filename), or both copies are legacy
+                    // and the first one seen is kept deterministically.
+                }
+                None => {
+                    archive_index.insert(key, archive_reservations.len());
+                    archive_reservations.push(reservation);
+                }
+            }
         }
     }
 
@@ -1394,6 +1422,90 @@ mod tests {
         let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
         assert_eq!(report.drift.archive_id_collisions, 1);
         assert_eq!(report.drift.foreign_generation_artifacts, 0);
+    }
+
+    #[test]
+    fn stamped_sibling_wins_over_stale_legacy_duplicate_for_same_id() {
+        // hfdt-am-parity-checker-stale-artifact-read-mwmv4: a reservation whose
+        // current-generation, already-correct artifact is the generation-stamped
+        // file, but whose stale legacy `id-<id>.json` predecessor was never
+        // cleaned up (br-n8qh6 migration debris) must NOT report drift just
+        // because both files exist in the same directory. The checker's
+        // resolution must match `find_reservation_artifact`'s `stamped.or(legacy)`
+        // — this reproduces the exact real-world shape found in the archive: the
+        // legacy file omits `released_ts` entirely while the stamped sibling
+        // carries the correct value matching the DB.
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("aaaa2222");
+        conn.execute_raw("UPDATE file_reservations SET released_ts = 555 WHERE id = 1")
+            .expect("release reservation");
+
+        let dir = storage
+            .path()
+            .join("projects")
+            .join("proj-a")
+            .join("file_reservations");
+        std::fs::create_dir_all(&dir).expect("create reservations dir");
+
+        // Stale legacy artifact: no released_ts field at all, predates the
+        // generation-stamping migration.
+        let legacy = serde_json::json!({
+            "id": 1,
+            "project": "/proj-a",
+            "agent": "BlueLake",
+            "path_pattern": "src/**",
+            "exclusive": true,
+            "reason": "br-n8qh6",
+            "created_ts": 100_i64,
+            "expires_ts": 9_999_999_999_999_999_i64,
+        });
+        std::fs::write(
+            dir.join("id-1.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .expect("write legacy artifact");
+
+        // Correct, current-generation sibling: already healed, released_ts
+        // matches the DB exactly.
+        let stamped = serde_json::json!({
+            "id": 1,
+            "project": "/proj-a",
+            "agent": "BlueLake",
+            "path_pattern": "src/**",
+            "exclusive": true,
+            "reason": "br-n8qh6",
+            "created_ts": 100_i64,
+            "expires_ts": 9_999_999_999_999_999_i64,
+            "released_ts": 555_i64,
+            "db_generation": "aaaa2222",
+        });
+        let stamped_name =
+            mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                Some("aaaa2222"),
+                1,
+            );
+        std::fs::write(
+            dir.join(stamped_name),
+            serde_json::to_vec_pretty(&stamped).unwrap(),
+        )
+        .expect("write stamped artifact");
+
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(
+            report.drift.released_ts_mismatches, 0,
+            "must resolve the stamped sibling, not the stale legacy duplicate: {:?}",
+            report.examples
+        );
+        assert_eq!(
+            report.drift.active_status_mismatches, 0,
+            "{:?}",
+            report.examples
+        );
+        assert_eq!(report.drift.total(), 0, "{:?}", report.examples);
+        assert!(report.ok, "{:?}", report.examples);
+        // Exactly one archive reservation should be counted for this id — the
+        // duplicate legacy file must be resolved away, not double-counted.
+        assert_eq!(report.archive_reservations, 1);
     }
 
     fn run_compare(
