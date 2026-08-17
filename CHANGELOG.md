@@ -12,6 +12,39 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ### Fixed
 
+- **Managed duplicates stand by instead of restart-looping forever (#246).**
+  When `agent-mail.service` found a verified Agent Mail peer already owning
+  the storage root (an interactive `am`, or an orphan outside the unit), it
+  logged "managed duplicate exits successfully" and exited 0 — which can
+  never converge: `Restart=always` units relaunch any exit unconditionally
+  (NRestarts=165 observed in the field), and the shipped `Type=notify` unit
+  counts an exit before `READY=1` as a protocol failure, so even
+  `Restart=on-failure` looped. The managed duplicate now stays resident: it
+  notifies `READY=1` plus a descriptive `STATUS=standby: …`, supervises the
+  peer's MCP endpoint, and retries the full startup coordination once three
+  consecutive probes confirm the peer stopped serving. The unit reports
+  `active` with a flat restart counter while an outside owner serves, and
+  automatically reclaims the port the moment that owner exits. No unit-file
+  change is required; both the shipped `Restart=on-failure` template and
+  older `Restart=always` units converge.
+- **`am doctor triage` can no longer report `ok / 0 findings` on a database
+  stock SQLite calls malformed (#247).** Three compounding defects fixed in
+  the shared integrity surfaces (used by the doctor probes, the background
+  integrity guard's canonical acceptance path, and recovery promotion):
+  (1) drivers that return the whole `integrity_check` output as one
+  newline-joined value are now split into one detail per reported line, so a
+  single "row" can no longer hide arbitrary page loss (or smuggle real
+  corruption lines past a benign substring match); (2) the benign
+  "`Page N: never used`" freelist-slack class is now bounded
+  (`BENIGN_UNUSED_PAGE_ROW_LIMIT` = 16 rows) — mass page loss (59–72% of all
+  pages in the field reports) is treated as corruption, and the REINDEX-only
+  fast path is likewise disqualified; (3) every full check now passes an
+  explicit `integrity_check(1000000)` limit instead of the bare pragma's
+  silent 100-error cap, with bare-form fallbacks for engines that reject the
+  argument. Corruption verdict strings are summarized (distinctive rows
+  preserved, repetitive unused-page rows elided with explicit counts) so
+  uncapped output cannot flood journals.
+
 - **`reservation_parity` no longer fails health forever on released rows with
   no archive artifact (#244).** A *released* DB reservation missing its
   current-generation archive artifact is now informational
