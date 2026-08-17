@@ -208,8 +208,15 @@ sqlmodel-sqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-sqlite" }
 # v0.3.28: the live ../fastmcp_rust checkout is under active development
 # (it moved 52 commits in one day, changing MCP lifecycle behavior under
 # our conformance suite), so — same pattern as sqlmodel-rel-0327 — the
-# patch points at the dedicated stable clone ../fastmcp-rel-0328, pinned
-# at 206d583: the rev the 0.3.28 release gate actually verified.
+# patch points at the dedicated stable clone ../fastmcp-rel-0328.
+#
+# Pin history: 206d583 (the rev the 0.3.28 release gate verified) ->
+# 2a5ee3b (GH#250: unknown legacy methods are -32601 Method Not Found per
+# JSON-RPC 2.0, and streamable HTTP completes declined malformed-body
+# exchanges with 400 instead of terminating the connection; the full
+# protocol_compliance suite was re-gated green against this rev). When
+# advancing the pin, update every build host's ../fastmcp-rel-0328 clone
+# to the same rev.
 fastmcp-rust = { path = "../fastmcp-rel-0328/crates/fastmcp" }
 fastmcp-core = { path = "../fastmcp-rel-0328/crates/fastmcp-core" }
 fastmcp-server = { path = "../fastmcp-rel-0328/crates/fastmcp-server" }
