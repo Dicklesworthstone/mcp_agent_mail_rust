@@ -8,7 +8,12 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
-## Unreleased
+## [v0.3.28](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.28) — 2026-08-16 **[Release]**
+
+Rollup of everything since v0.3.27: the #246 standby-resident takeover
+(fleet-critical fix for the restart-loop class), the #247 integrity split,
+the #244 reservation-parity fix, the #245 pool-timeout stall fixes, and the
+#243 installer service-management fail-safe.
 
 ### Fixed
 
