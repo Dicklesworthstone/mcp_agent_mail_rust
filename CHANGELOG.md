@@ -8,6 +8,52 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## Unreleased (v0.3.29)
+
+Post-0.3.28 hardening of the registry-engine adoption. The v0.3.28
+binaries were cut from a snapshot that predates everything below.
+
+### Fixed
+
+- **`am doctor mcp-selftest` runs a valid MCP lifecycle
+  ([#248](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/248)).**
+  The self-test now sends the standard `notifications/initialized`
+  notification and a `tools/list` with an explicit empty params object,
+  so release qualification exercises the lifecycle real clients use.
+  The released v0.3.28 `am` still reports the self-test false negative;
+  the fix is diagnostic-only.
+- **Auto-handshake no longer converts transient store contention into a
+  spurious "Contact approval required" refusal.** `send_message` /
+  `reply_message` checked the handshake result with `.is_ok()` alone;
+  a busy/recovery/validation blip during the handshake's own writes now
+  gets one classified retry, while policy refusals keep their exact
+  semantics.
+- **fsqlite 0.3.4 contention absorbed with bounded retries** in three
+  spots the pre-registry engine never stressed: the pre-transaction
+  message-id floor read, pool checkout (BusyRecovery / validation-ping
+  failures, 6 attempts with backoff), and inbox reads. Under saturated
+  hosts these previously surfaced raw `ResourceBusy` / "connection
+  validation failed" errors to tool callers.
+
+### Changed
+
+- **fastmcp resolves from the dedicated gated clone
+  `../fastmcp-rel-0328`** (pin history: 206d583 → 2a5ee3b, the fastmcp
+  GH#250 rev: unknown legacy methods are `-32601` Method Not Found and
+  streamable HTTP survives malformed POST bodies), and the sqlmodel
+  patch uses the relative `../sqlmodel-rel-0327` path so dsr buildroots
+  resolve it on every host.
+- **Gate suites realigned with shipped architecture** (fsqlite 0.3.4 /
+  era-aware fastmcp): ATC tests seed and verify through the atc.sqlite3
+  sidecar, reconstruct fixtures are identity-strict (br-r6awv
+  semantics), export-FTS tests read back through canonical SQLite, MCP
+  protocol tests speak the gated lifecycle, and stale CLI/TUI goldens
+  were regenerated. Three upstream fsqlite 0.3.4 bugs found during
+  gating are filed in the FrankenSQLite tracker (bd-q3hu3, bd-qgh42,
+  bd-dhhxp).
+
+---
+
 ## [v0.3.28](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.28) — 2026-08-16 **[Release]**
 
 Rollup of everything since v0.3.27: the #246 standby-resident takeover
