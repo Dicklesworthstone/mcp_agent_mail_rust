@@ -467,10 +467,8 @@ where
             _ => false,
         };
         if is_foreign {
-            foreign_artifact_keys.insert((
-                reservation.project_slug.clone(),
-                reservation.reservation_id,
-            ));
+            foreign_artifact_keys
+                .insert((reservation.project_slug.clone(), reservation.reservation_id));
             drift.foreign_generation_artifacts += 1;
             if info_examples.len() < 32 {
                 info_examples.push(ReservationParityExample {
@@ -1219,7 +1217,7 @@ mod tests {
     /// GH#244's exact field shape: reconstruct-from-archive imported released
     /// reservations into a freshly-minted DB generation, so their artifacts
     /// exist only under the *prior* generation stamp. Parity must report ok
-    /// (informational released_missing_archive + foreign_generation_artifacts),
+    /// (informational `released_missing_archive` + `foreign_generation_artifacts`),
     /// not a permanent `missing_archive` drift.
     #[test]
     fn reconstructed_released_rows_with_foreign_generation_artifacts_report_ok() {
@@ -1283,7 +1281,10 @@ mod tests {
             report.examples
         );
         let line = report.health_line();
-        assert!(line.contains("examples=[proj-a:1:archive_artifact"), "{line}");
+        assert!(
+            line.contains("examples=[proj-a:1:archive_artifact"),
+            "{line}"
+        );
     }
 
     #[test]

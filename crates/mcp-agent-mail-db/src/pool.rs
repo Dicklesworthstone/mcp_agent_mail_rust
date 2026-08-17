@@ -1212,7 +1212,12 @@ impl ReplayCompensationLog {
 
     /// Drain all records from the log for persistence or reporting.
     pub fn drain(&self) -> Vec<ReplayCompensationRecord> {
-        std::mem::take(&mut *self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+        std::mem::take(
+            &mut *self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 }
 
@@ -1338,7 +1343,10 @@ impl DeferredWriteQueue {
     /// Call this when the durability state transitions to `Recovering`.
     /// If already active, this is a no-op.
     pub fn activate(&self) {
-        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.active = true;
         inner.sealed = false;
     }
@@ -1346,14 +1354,20 @@ impl DeferredWriteQueue {
     /// Whether the queue is currently active and accepting writes.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.active && !inner.sealed
     }
 
     /// Current number of queued writes.
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.entries.len()
     }
 
@@ -1382,7 +1396,10 @@ impl DeferredWriteQueue {
     ) -> DeferralOutcome {
         let now_us = crate::now_micros();
         let entry_bytes = estimate_deferred_write_bytes(&sql, &params);
-        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if inner.sealed {
             return DeferralOutcome::Sealed;
@@ -1464,7 +1481,10 @@ impl DeferredWriteQueue {
     /// [`enqueue()`]: DeferredWriteQueue::enqueue
     /// [`reset()`]: DeferredWriteQueue::reset
     pub fn seal_and_drain(&self) -> Vec<DeferredWrite> {
-        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.sealed = true;
         inner.active = false;
         inner.estimated_bytes = 0;
@@ -1479,7 +1499,10 @@ impl DeferredWriteQueue {
     ///
     /// Call after replay completes (or after recovery is abandoned).
     pub fn reset(&self) {
-        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.active = false;
         inner.sealed = false;
         inner.next_seq = 0;
@@ -1499,7 +1522,10 @@ impl DeferredWriteQueue {
     /// - `HardStop`: system is refusing writes — operator must intervene.
     #[must_use]
     pub fn pressure(&self) -> BacklogPressure {
-        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pressure = if !inner.active && !inner.sealed {
             BacklogPressure::Normal
         } else if inner.sealed {
@@ -1514,28 +1540,40 @@ impl DeferredWriteQueue {
     /// Age of the oldest deferred entry in seconds, or 0 if the queue is empty.
     #[must_use]
     pub fn oldest_age_secs(&self) -> u64 {
-        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         oldest_entry_age_secs(&inner)
     }
 
     /// Running estimated bytes of all queued entries.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.estimated_bytes
     }
 
     /// Lifetime count of writes shed (rejected) due to overload.
     #[must_use]
     pub fn shed_count(&self) -> u64 {
-        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.shed_count
     }
 
     /// Snapshot for diagnostics.
     #[must_use]
     pub fn status(&self) -> DeferredWriteQueueStatus {
-        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pressure = if !inner.active && !inner.sealed {
             BacklogPressure::Normal
         } else if inner.sealed {
