@@ -5985,15 +5985,25 @@ fn index_created_message_best_effort(
 /// brand-new database) is treated as `0` so it can never block message
 /// creation.
 async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<i64, DbError> {
-    let db_max = match map_sql_outcome(
-        traw_query(
-            cx,
-            tracked,
-            "SELECT COALESCE(MAX(id), 0) AS v FROM messages",
-            &[],
+    // This read runs OUTSIDE the caller's retried write transaction, and the
+    // fsqlite 0.3.4 registry engine can answer a bare read with
+    // "database is busy" while concurrent writers hold the store (the
+    // pre-registry engine never surfaced busy on this path). Give it the same
+    // bounded contention retry the write body gets, so a transient busy here
+    // cannot fail message creation before the transaction even begins.
+    let db_max = match run_with_mvcc_retry(cx, "read_messages_id_floor", || async {
+        map_sql_outcome(
+            traw_query(
+                cx,
+                tracked,
+                "SELECT COALESCE(MAX(id), 0) AS v FROM messages",
+                &[],
+            )
+            .await,
         )
-        .await,
-    ) {
+    })
+    .await
+    {
         Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
