@@ -598,14 +598,19 @@ impl DbPoller {
             };
 
             // Block until the next interval or an explicit stop wakeup.
+            //
+            // Lost-wakeup safety (finding F8): the stop side stores the flag
+            // and then notifies while holding this mutex, and the predicate
+            // below re-checks the flag under the same mutex — so a stop that
+            // lands between our last flag check and the condvar park is
+            // observed immediately instead of costing a full poll interval.
             let (lock, cvar) = &*self.wake;
-            let _ = cvar.wait_timeout(
-                match lock.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                },
-                effective_interval,
-            );
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = cvar.wait_timeout_while(guard, effective_interval, |_: &mut ()| {
+                !self.stop.load(Ordering::Relaxed)
+            });
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -613,26 +618,73 @@ impl DbPoller {
     }
 }
 
-impl DbPollerHandle {
-    /// Signal the poller to stop and wait for the thread to exit.
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.wake.1.notify_all();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+/// Budget for joining the poller thread at shutdown. The poller may be inside
+/// an unbounded synchronous SQLite query (finding F4c); after this budget the
+/// thread is detached instead of wedging shutdown, mirroring `wbq_shutdown`'s
+/// `safe_to_join` fallback in mcp-agent-mail-storage.
+const DB_POLLER_JOIN_BUDGET: Duration = Duration::from_secs(5);
+/// Poll cadence for the bounded join: `std::thread::JoinHandle` has no
+/// `join_timeout`, so we poll `is_finished()` against a deadline.
+const DB_POLLER_JOIN_POLL: Duration = Duration::from_millis(20);
+
+/// Join `handle` if it finishes within `budget`; otherwise drop (detach) it.
+///
+/// Returns `true` when the thread was joined, `false` when it was detached.
+fn join_with_deadline(handle: JoinHandle<()>, budget: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            drop(handle);
+            return false;
         }
+        thread::sleep(poll);
+    }
+    let _ = handle.join();
+    true
+}
+
+impl DbPollerHandle {
+    fn store_stop_and_wake(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Notify while holding the mutex (finding F8): the poller's
+        // `wait_timeout_while` predicate re-checks the stop flag under this
+        // mutex, so notifying under it guarantees a poller thread between its
+        // flag check and the condvar park cannot miss the wakeup.
+        let _guard = self
+            .wake
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.wake.1.notify_all();
+    }
+
+    /// Signal the poller to stop and wait (bounded) for the thread to exit.
+    pub fn stop(&mut self) {
+        self.store_stop_and_wake();
+        self.join();
     }
 
     /// Signal stop without waiting.
     pub fn signal_stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.wake.1.notify_all();
+        self.store_stop_and_wake();
     }
 
-    /// Wait for the thread to exit (call after `signal_stop`).
+    /// Wait (bounded) for the thread to exit (call after `signal_stop`).
+    ///
+    /// The wait is bounded by [`DB_POLLER_JOIN_BUDGET`]: the poller thread can
+    /// be stuck inside an unbounded synchronous SQLite query, and an untimed
+    /// join here would wedge the whole graceful-shutdown sequence (finding
+    /// F4c). On timeout the thread is detached with a warning; it exits on
+    /// its own the next time it observes the stop flag.
     pub fn join(&mut self) {
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        if let Some(join) = self.join.take()
+            && !join_with_deadline(join, DB_POLLER_JOIN_BUDGET, DB_POLLER_JOIN_POLL)
+        {
+            tracing::warn!(
+                budget_secs = DB_POLLER_JOIN_BUDGET.as_secs(),
+                "tui-db-poller did not exit within the join budget (likely wedged in a \
+                 synchronous SQLite query); detaching the thread so shutdown can proceed"
+            );
         }
     }
 }
@@ -640,6 +692,43 @@ impl DbPollerHandle {
 impl Drop for DbPollerHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod join_deadline_tests {
+    use super::join_with_deadline;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn joins_a_prompt_thread_within_budget() {
+        let handle = std::thread::spawn(|| {});
+        assert!(join_with_deadline(
+            handle,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn detaches_a_wedged_thread_after_the_budget() {
+        let release = Arc::new(AtomicBool::new(false));
+        let thread_release = Arc::clone(&release);
+        let handle = std::thread::spawn(move || {
+            while !thread_release.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        assert!(!join_with_deadline(
+            handle,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        release.store(true, Ordering::Relaxed);
     }
 }
 

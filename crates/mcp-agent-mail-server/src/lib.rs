@@ -376,14 +376,20 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         let start = Instant::now();
         let call_arguments = arguments.clone();
         Box::pin(async move {
-            // Emit ToolCallStart with masked params
-            emit_tui_event_async(tui_events::MailEvent::tool_call_start(
+            // Emit ToolCallStart with masked params.
+            //
+            // Sync emit on purpose: `push_event_async` awaits an asupersync
+            // timer on ring contention, and this future runs under
+            // `fastmcp_core::block_on` on a dispatch thread — the exact
+            // timer-hostile topology behind the GH#203 livelock (see the
+            // scrub notes in `tools/archive_read.rs`). The sync path bounds
+            // contention with a short `std::thread::sleep` instead.
+            emit_tui_event(tui_events::MailEvent::tool_call_start(
                 self.tool_name,
                 masked,
                 project.clone(),
                 agent.clone(),
-            ))
-            .await;
+            ));
 
             let out = self.inner.call_async(ctx, arguments).await;
             let is_error = !matches!(out, fastmcp_core::Outcome::Ok(_));
@@ -412,7 +418,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                     project.as_deref(),
                     agent.as_deref(),
                 ) {
-                    emit_tui_event_async(event).await;
+                    emit_tui_event(event);
                 }
                 record_atc_message_observations_from_tool_contents(
                     self.tool_name,
@@ -436,7 +442,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                     agent.as_deref(),
                 );
             }
-            emit_tui_event_async(tui_events::MailEvent::tool_call_end(
+            emit_tui_event(tui_events::MailEvent::tool_call_end(
                 self.tool_name,
                 duration_ms,
                 result_preview,
@@ -445,8 +451,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 per_table,
                 project,
                 agent,
-            ))
-            .await;
+            ));
 
             out
         })
@@ -2344,6 +2349,9 @@ fn run_http_headless_supervisor(config: mcp_agent_mail_core::Config) -> std::io:
     );
     let runtime = build_http_runtime()?;
     let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, None, None)?;
+    // Unbounded by design: with no TUI there is no shutdown flag or control
+    // channel — this park is what keeps the headless process serving until
+    // the supervisor exits on its own (error) or the process is signalled.
     let result = recv_http_supervisor_result(result_rx);
     drop(runtime);
     result
@@ -3595,7 +3603,84 @@ mod startup_readiness_bind_deadline_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Crash markers (long-uptime forensics)
+// ---------------------------------------------------------------------------
+
+/// Size cap for the crash-marker ledger so a panic loop can never eat the
+/// disk (same policy family as the forensics retention cap, br-vdpyv). At the
+/// cap, new markers are dropped — the earliest crashes are the diagnostic
+/// gold, not the millionth repeat.
+const CRASH_MARKER_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+static CRASH_MARKER_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Install a process-wide panic hook that appends a structured crash marker
+/// to `<storage_root>/doctor/crash_markers.jsonl` before the previous hook
+/// (default stderr printer) runs.
+///
+/// Long-uptime `am` sessions die with their stderr lost to a closed tmux
+/// pane or a discarded redirect; without an on-disk marker a weeks-old crash
+/// is unattributable. The marker records message, location, thread,
+/// backtrace, version, and uptime, and is written for every panic — including
+/// dispatch-thread panics that are otherwise caught and converted to
+/// `McpError`s — so panic-shaped trouble is visible even when it does not
+/// kill the process.
+fn install_crash_marker_panic_hook(storage_root: std::path::PathBuf) {
+    CRASH_MARKER_HOOK.call_once(move || {
+        let started = Instant::now();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            write_crash_marker(&storage_root, info, started.elapsed());
+            previous(info);
+        }));
+    });
+}
+
+/// Best-effort by design: a diagnostics failure must never obscure or
+/// amplify the original panic, so every fallible step silently bails.
+fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>, uptime: Duration) {
+    let dir = storage_root.join("doctor");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("crash_markers.jsonl");
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > CRASH_MARKER_MAX_BYTES
+    {
+        return;
+    }
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    let location = info
+        .location()
+        .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
+    let record = serde_json::json!({
+        "ts_utc": chrono::Utc::now().to_rfc3339(),
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime.as_secs(),
+        "thread": std::thread::current().name().unwrap_or("<unnamed>"),
+        "message": message,
+        "location": location,
+        "backtrace": std::backtrace::Backtrace::force_capture().to_string(),
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{record}");
+    }
+}
+
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
@@ -3671,6 +3756,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
         return run_http(config);
@@ -3768,7 +3854,32 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     let startup_watchdog = TuiSpinWatchdog::start(&tui_state);
 
     // ── 6. TUI on main thread ───────────────────────────────────────
-    let tui_result = run_tui_main_thread(&tui_state, config);
+    //
+    // catch_unwind: a panic anywhere in the TUI update/render path used to
+    // unwind straight through main, skipping the entire graceful-shutdown
+    // sequence below (WBQ flush, worker shutdown) and killing the MCP/HTTP
+    // server that other agents were still using — the primary mechanism
+    // behind "am eventually terminates after days/weeks". The crash-marker
+    // panic hook has already recorded the panic to
+    // `<storage_root>/doctor/crash_markers.jsonl` by the time we get the
+    // payload here; converting it into an `Err` routes the process through
+    // the same orderly shutdown as any other TUI failure. `Program`'s
+    // terminal guard restores the TTY during the unwind.
+    let tui_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_tui_main_thread(&tui_state, config)
+    }))
+    .unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        Err(std::io::Error::other(format!(
+            "TUI main thread panicked: {detail}. A crash marker with the full \
+             backtrace was appended to <storage_root>/doctor/crash_markers.jsonl; \
+             the server ran its graceful shutdown instead of aborting mid-frame."
+        )))
+    });
     if let Some(watchdog) = startup_watchdog {
         watchdog.shutdown();
     }
@@ -3784,12 +3895,27 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         deferred_workers.progress.start_non_db_if_needed(config);
         deferred_workers.progress.start_db_if_needed(config);
         deferred_workers.progress.start_advisory_if_needed(config);
+        // Stop the poller BEFORE clearing the detach latch (finding F8).
+        // The latch is the narrow TUI-side release here: while it is set,
+        // `wait_for_db_warmup`-style startup waits short-circuit (see
+        // `wait_for_startup_state`), so the poller thread cannot be parked on
+        // the startup condvar when we join it. We deliberately do NOT call
+        // `tui_state.request_shutdown()` in this path: the HTTP supervisor
+        // polls that flag and stops the HTTP instance when it is set, which
+        // would kill the server this detach is meant to keep running.
+        db_poller.stop();
         let _ = tui_state.take_headless_detach_requested();
         set_tui_state_handle(None);
-        db_poller.stop();
 
         supervisor_fail_fast_active.store(false, Ordering::SeqCst);
-        let supervisor_result = recv_http_supervisor_result(supervisor_result_rx);
+        // Headless steady state: wait indefinitely while the supervisor is
+        // healthy, but escalate to a bounded wait if a shutdown request ever
+        // appears without the supervisor reporting back (finding F4b).
+        let supervisor_result = recv_http_supervisor_result_detached(
+            &supervisor_result_rx,
+            &tui_state,
+            HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
+        );
         drop(http_runtime);
 
         retention::shutdown();
@@ -3808,12 +3934,22 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 
     // ── 7. Graceful shutdown ────────────────────────────────────────
     supervisor_fail_fast_active.store(false, Ordering::SeqCst);
+    // Out-of-band shutdown signal (finding F4a): the supervisor loop in
+    // `run_http_server_supervisor` polls `is_shutdown_requested()` at the top
+    // of every iteration and wakes at least every ~200ms (the timeout on its
+    // control-channel recv / idle sleep), so this flag alone guarantees an
+    // orderly supervisor exit even if the control message below is dropped.
     tui_state.request_shutdown();
-    let _ = server_ctl_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
+    // Belt-and-suspenders: also deliver the explicit Shutdown control message
+    // with a bounded retry instead of a silent-drop `try_send`.
+    send_server_shutdown_control(&server_ctl_tx);
     db_poller.stop();
     deferred_workers.join();
 
-    let supervisor_result = recv_http_supervisor_result(supervisor_result_rx);
+    let supervisor_result = recv_http_supervisor_result_within(
+        &supervisor_result_rx,
+        HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
+    );
     drop(http_runtime);
 
     // Shutdown background workers
@@ -4106,6 +4242,14 @@ where
     }
 }
 
+/// Wait (unbounded) for the HTTP supervisor's exit report.
+///
+/// Only safe where an indefinitely-running supervisor is the healthy steady
+/// state (the pure-headless `run_http_headless_supervisor` path, where this
+/// park IS what keeps the process serving). Paths that have already requested
+/// shutdown must use [`recv_http_supervisor_result_within`] instead so a
+/// wedged supervisor cannot park the main thread forever with the TTY
+/// already restored (deadlock-audit finding F4b).
 fn recv_http_supervisor_result(
     result_rx: std::sync::mpsc::Receiver<std::io::Result<()>>,
 ) -> std::io::Result<()> {
@@ -4114,6 +4258,187 @@ fn recv_http_supervisor_result(
             "HTTP supervisor task exited without reporting",
         ))
     })
+}
+
+/// Total budget for waiting on the HTTP supervisor's exit report once
+/// shutdown has been requested (finding F4b). Generous: connection drain and
+/// listener stop normally finish in well under a second; 60s only trips when
+/// the supervisor is genuinely wedged.
+const HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET: Duration = Duration::from_secs(60);
+/// Escalation-log slice for the bounded supervisor-result wait: a warning is
+/// emitted each time this much of the budget elapses without a report.
+const HTTP_SUPERVISOR_SHUTDOWN_RECV_SLICE: Duration = Duration::from_secs(15);
+
+/// Bounded wait for the HTTP supervisor's exit report (finding F4b).
+///
+/// Mirrors the `rx.recv_timeout(...)` + escalation-logging pattern used by
+/// `run_bounded_startup_readiness`: wait in slices, warn on each slice that
+/// elapses without a report, and on final timeout return an error describing
+/// the wedged supervisor instead of parking the main thread forever.
+fn recv_http_supervisor_result_within(
+    result_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
+    total_budget: Duration,
+) -> std::io::Result<()> {
+    let started = Instant::now();
+    let deadline = started + total_budget;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            let budget_secs = total_budget.as_secs();
+            return Err(std::io::Error::other(format!(
+                "HTTP supervisor did not report shutdown within {budget_secs}s; it is likely \
+                 wedged (e.g. stuck in connection drain or listener stop). Abandoning the wait \
+                 so the process can finish shutting down instead of parking forever."
+            )));
+        }
+        let slice =
+            HTTP_SUPERVISOR_SHUTDOWN_RECV_SLICE.min(deadline.saturating_duration_since(now));
+        match result_rx.recv_timeout(slice) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    waited_secs = started.elapsed().as_secs(),
+                    budget_secs = total_budget.as_secs(),
+                    "HTTP supervisor has not reported shutdown yet; continuing bounded wait"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other(
+                    "HTTP supervisor task exited without reporting",
+                ));
+            }
+        }
+    }
+}
+
+/// Wake period for the headless-detach supervisor wait: how often the parked
+/// main thread re-checks whether a shutdown has been requested.
+const HTTP_SUPERVISOR_DETACHED_RECV_WAKE: Duration = Duration::from_secs(1);
+
+/// Wait for the HTTP supervisor result while running headless-detached.
+///
+/// In detach mode an indefinitely-running supervisor is the healthy steady
+/// state — this park is what keeps the headless server alive — so the wait
+/// must NOT carry an unconditional deadline (a flat 60s budget here would be
+/// a kill switch for detached serving). Instead the thread wakes every
+/// [`HTTP_SUPERVISOR_DETACHED_RECV_WAKE`] and only escalates to the bounded
+/// wait once a shutdown has actually been requested, at which point a
+/// non-reporting supervisor is wedged (finding F4b).
+fn recv_http_supervisor_result_detached(
+    result_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
+    tui_state: &tui_bridge::TuiSharedState,
+    escalation_budget: Duration,
+) -> std::io::Result<()> {
+    loop {
+        if tui_state.is_shutdown_requested() {
+            // The supervisor polls this same flag (~200ms cadence) and exits
+            // its loop when set; if it still fails to report within the
+            // budget it is wedged and we abandon the wait.
+            return recv_http_supervisor_result_within(result_rx, escalation_budget);
+        }
+        match result_rx.recv_timeout(HTTP_SUPERVISOR_DETACHED_RECV_WAKE) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other(
+                    "HTTP supervisor task exited without reporting",
+                ));
+            }
+        }
+    }
+}
+
+/// Budget for delivering the explicit [`tui_bridge::ServerControlMsg::Shutdown`]
+/// control message (finding F4a). Delivery is belt-and-suspenders — the
+/// supervisor loop also polls `is_shutdown_requested()` every iteration — so
+/// a short budget suffices.
+const SERVER_SHUTDOWN_CTL_SEND_BUDGET: Duration = Duration::from_secs(2);
+const SERVER_SHUTDOWN_CTL_SEND_SLEEP: Duration = Duration::from_millis(20);
+
+/// Deliver `ServerControlMsg::Shutdown` with a bounded retry (finding F4a).
+///
+/// A bare `try_send` on the bounded control channel silently dropped the
+/// shutdown message whenever the channel was momentarily full, leaving the
+/// supervisor's message-driven exit path unarmed. Retry until the budget
+/// elapses; on Disconnected/Cancelled the supervisor side is already gone
+/// and the result channel will settle on its own.
+fn send_server_shutdown_control(tx: &mpsc::Sender<tui_bridge::ServerControlMsg>) {
+    let deadline = Instant::now() + SERVER_SHUTDOWN_CTL_SEND_BUDGET;
+    loop {
+        match tx.try_send(tui_bridge::ServerControlMsg::Shutdown) {
+            Ok(()) | Err(mpsc::SendError::Disconnected(_) | mpsc::SendError::Cancelled(_)) => {
+                return;
+            }
+            Err(mpsc::SendError::Full(_)) => {
+                if Instant::now() >= deadline {
+                    tracing::warn!(
+                        budget_secs = SERVER_SHUTDOWN_CTL_SEND_BUDGET.as_secs(),
+                        "server control channel stayed full; relying on the supervisor's \
+                         polled shutdown flag instead of the Shutdown control message"
+                    );
+                    return;
+                }
+                std::thread::sleep(SERVER_SHUTDOWN_CTL_SEND_SLEEP);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod http_supervisor_recv_tests {
+    use super::{
+        recv_http_supervisor_result_detached, recv_http_supervisor_result_within, tui_bridge,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bounded_recv_returns_delivered_result() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
+        tx.send(Ok(())).unwrap();
+        assert!(recv_http_supervisor_result_within(&rx, Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn bounded_recv_maps_disconnect_to_error() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
+        drop(tx);
+        let err = recv_http_supervisor_result_within(&rx, Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("exited without reporting"));
+    }
+
+    #[test]
+    fn bounded_recv_times_out_instead_of_parking() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
+        let started = Instant::now();
+        let err = recv_http_supervisor_result_within(&rx, Duration::from_millis(50)).unwrap_err();
+        assert!(err.to_string().contains("did not report shutdown"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(tx);
+    }
+
+    #[test]
+    fn detached_recv_escalates_to_bounded_wait_after_shutdown_request() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+        state.request_shutdown();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
+        let err = recv_http_supervisor_result_detached(&rx, &state, Duration::from_millis(50))
+            .unwrap_err();
+        assert!(err.to_string().contains("did not report shutdown"));
+        drop(tx);
+    }
+
+    #[test]
+    fn detached_recv_returns_supervisor_result_without_shutdown() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
+        tx.send(Err(std::io::Error::other("listener bind lost")))
+            .unwrap();
+        let err =
+            recv_http_supervisor_result_detached(&rx, &state, Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("listener bind lost"));
+    }
 }
 
 fn record_http_server_started(
@@ -5147,17 +5472,23 @@ fn dispatch_timeout_error_text(
     format!(
         "Request timed out after {dispatch_timeout_secs}s (method={method}). \
          Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
-         client_deadline_ms={}; pool_acquire_p99_ms={}; database_write_p99_ms={}; \
-         archive_wbq_p99_ms={}; archive_commit_p99_ms={}; \
+         client_deadline_ms={}; p99_window_secs={}; pool_acquire_p99_ms={}; \
+         database_write_p99_ms={}; archive_wbq_p99_ms={}; \
+         archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
-         blocking_dispatch_timeouts_total={}.",
+         blocking_dispatch_timeouts_total={}. \
+         (archive stages are off the request path since ack-fast: archive \
+         lag cannot cause a tool timeout; archive_commit_queue is \
+         enqueue-to-durable queue latency, not pure git work.)",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
+        diagnostics.p99_window_secs,
         micros_to_millis_ceil(diagnostics.pool_acquire_p99_us),
         micros_to_millis_ceil(diagnostics.database_write_p99_us),
         micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
-        micros_to_millis_ceil(diagnostics.archive_commit_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_commit_queue_p99_us),
+        micros_to_millis_ceil(diagnostics.git_commit_p99_us),
         dispatch.inflight,
         dispatch.zombies,
         dispatch.timeouts_total,
@@ -8077,15 +8408,6 @@ pub fn note_possible_drop_close_event(event: &tracing::Event<'_>) {
             .db
             .drop_close_total
             .inc();
-    }
-}
-
-/// Asynchronous version of [`emit_tui_event`] that uses non-blocking retry.
-///
-/// No-op when TUI mode is not active.
-async fn emit_tui_event_async(event: tui_events::MailEvent) {
-    if let Some(state) = tui_state_handle() {
-        let _ = state.push_event_async(event).await;
     }
 }
 
@@ -17099,10 +17421,12 @@ mod tests {
             client_deadline_us: 30_000_000,
             stage: mcp_agent_mail_core::metrics::TimeoutStage::BlockingDispatch,
             stage_exceeded_budget: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
             pool_acquire_p99_us: 9_000,
             database_write_p99_us: 11_000,
             archive_wbq_p99_us: 2_000,
-            archive_commit_p99_us: 16_778_000,
+            archive_commit_queue_p99_us: 16_778_000,
+            git_commit_p99_us: 450_000,
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -17114,7 +17438,10 @@ mod tests {
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
-        assert!(text.contains("archive_commit_p99_ms=16778"));
+        assert!(text.contains("archive_commit_queue_p99_ms=16778"));
+        assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("p99_window_secs=600"));
+        assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
     }
 

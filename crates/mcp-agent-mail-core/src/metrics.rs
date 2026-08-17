@@ -142,6 +142,23 @@ impl GaugeU64 {
 
 const LOG2_BUCKETS: usize = 64;
 
+/// Width of one recent-window epoch. [`Log2Histogram::recent_snapshot`] merges
+/// the current and previous epochs, so "recent" covers the trailing
+/// 10–20 minutes. Chosen so a single historical stall stops dominating
+/// reported percentiles within at most two windows (GH#245: one 25s stall in
+/// 635 commits pinned the lifetime p99 at 8.4s for a 2d8h process lifetime,
+/// and that stale figure was displayed beside live timeout diagnostics as
+/// though current).
+pub const RECENT_WINDOW_SECS: u64 = 600;
+
+static PROCESS_EPOCH_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+/// Coarse epoch index for recent-window rotation (process-relative, so it is
+/// immune to wall-clock steps).
+fn recent_epoch_now() -> u64 {
+    PROCESS_EPOCH_START.elapsed().as_secs() / RECENT_WINDOW_SECS
+}
+
 #[derive(Debug)]
 pub struct Log2Histogram {
     buckets: [AtomicU64; LOG2_BUCKETS],
@@ -149,6 +166,30 @@ pub struct Log2Histogram {
     sum: AtomicU64,
     min: AtomicU64,
     max: AtomicU64,
+    /// Two-epoch rotating window backing [`Self::recent_snapshot`]. Slot
+    /// `epoch % 2` is the live epoch; the other slot holds the previous
+    /// epoch. Rotation is lazy (checked on record/snapshot) and clears the
+    /// slot(s) that went stale; a racing record during a clear can lose or
+    /// double-count a sample, which is acceptable for diagnostics.
+    recent_buckets: [[AtomicU64; LOG2_BUCKETS]; 2],
+    recent_count: [AtomicU64; 2],
+    recent_max: [AtomicU64; 2],
+    recent_epoch: AtomicU64,
+}
+
+/// Trailing-window view of a [`Log2Histogram`], covering roughly the last
+/// [`RECENT_WINDOW_SECS`]..=2×[`RECENT_WINDOW_SECS`] seconds. Unlike the
+/// lifetime [`HistogramSnapshot`], percentiles here decay: an old outlier
+/// falls out of the estimate within two windows. `count == 0` means "no
+/// samples completed recently", not "no samples ever".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecentHistogramSnapshot {
+    pub window_secs: u64,
+    pub count: u64,
+    pub max: u64,
+    pub p50: u64,
+    pub p95: u64,
+    pub p99: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,6 +218,10 @@ impl Log2Histogram {
             sum: AtomicU64::new(0),
             min: AtomicU64::new(u64::MAX),
             max: AtomicU64::new(0),
+            recent_buckets: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            recent_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            recent_max: std::array::from_fn(|_| AtomicU64::new(0)),
+            recent_epoch: AtomicU64::new(0),
         }
     }
 
@@ -187,9 +232,76 @@ impl Log2Histogram {
         self.max.fetch_max(value, Ordering::Relaxed);
         let idx = bucket_index(value);
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        let slot = (self.rotate_recent() % 2) as usize;
+        self.recent_buckets[slot][idx].fetch_add(1, Ordering::Relaxed);
+        self.recent_max[slot].fetch_max(value, Ordering::Relaxed);
+        self.recent_count[slot].fetch_add(1, Ordering::Relaxed);
         // count is written LAST with Release so that an Acquire load on count
         // in snapshot() establishes a happens-before edge for all prior writes.
         self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Advance the recent window to the current epoch, clearing whichever
+    /// slot(s) went stale. Returns the current epoch index.
+    fn rotate_recent(&self) -> u64 {
+        let now = recent_epoch_now();
+        let seen = self.recent_epoch.load(Ordering::Acquire);
+        if seen == now {
+            return now;
+        }
+        if self
+            .recent_epoch
+            .compare_exchange(seen, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let cur = (now % 2) as usize;
+            self.clear_recent_slot(cur);
+            if now.saturating_sub(seen) >= 2 {
+                // Skipped at least one full epoch: the other slot is stale too.
+                self.clear_recent_slot(cur ^ 1);
+            }
+        }
+        now
+    }
+
+    fn clear_recent_slot(&self, slot: usize) {
+        for bucket in &self.recent_buckets[slot] {
+            bucket.store(0, Ordering::Relaxed);
+        }
+        self.recent_count[slot].store(0, Ordering::Relaxed);
+        self.recent_max[slot].store(0, Ordering::Relaxed);
+    }
+
+    /// Trailing-window percentiles (current + previous epoch; see
+    /// [`RECENT_WINDOW_SECS`]). Used by timeout diagnostics so a historical
+    /// outlier cannot masquerade as current health (GH#245).
+    #[must_use]
+    pub fn recent_snapshot(&self) -> RecentHistogramSnapshot {
+        self.rotate_recent();
+        let mut buckets = [0u64; LOG2_BUCKETS];
+        let mut count = 0u64;
+        let mut max = 0u64;
+        for slot in 0..2 {
+            for (merged, bucket) in buckets.iter_mut().zip(&self.recent_buckets[slot]) {
+                *merged = merged.saturating_add(bucket.load(Ordering::Relaxed));
+            }
+            count = count.saturating_add(self.recent_count[slot].load(Ordering::Relaxed));
+            max = max.max(self.recent_max[slot].load(Ordering::Relaxed));
+        }
+        if count == 0 {
+            return RecentHistogramSnapshot {
+                window_secs: RECENT_WINDOW_SECS,
+                ..RecentHistogramSnapshot::default()
+            };
+        }
+        RecentHistogramSnapshot {
+            window_secs: RECENT_WINDOW_SECS,
+            count,
+            max,
+            p50: estimate_quantile_from_buckets(&buckets, count, 1, 2, max),
+            p95: estimate_quantile_from_buckets(&buckets, count, 19, 20, max),
+            p99: estimate_quantile_from_buckets(&buckets, count, 99, 100, max),
+        }
     }
 
     /// Reset all counters to their initial state.
@@ -201,6 +313,8 @@ impl Log2Histogram {
         self.sum.store(0, Ordering::Relaxed);
         self.min.store(u64::MAX, Ordering::Relaxed);
         self.max.store(0, Ordering::Relaxed);
+        self.clear_recent_slot(0);
+        self.clear_recent_slot(1);
     }
 
     #[must_use]
@@ -685,10 +799,23 @@ pub struct TimeoutDiagnosticsSnapshot {
     pub client_deadline_us: u64,
     pub stage: TimeoutStage,
     pub stage_exceeded_budget: bool,
+    /// Width of the trailing window the p99 evidence below is drawn from
+    /// (see [`RECENT_WINDOW_SECS`]): these are recent percentiles, not
+    /// process-lifetime ones, so a historical stall cannot masquerade as
+    /// current health (GH#245).
+    pub p99_window_secs: u64,
     pub pool_acquire_p99_us: u64,
     pub database_write_p99_us: u64,
+    /// Archive write-behind queue latency. Off the request path since the
+    /// ack-fast change: archive lag cannot cause a tool timeout.
     pub archive_wbq_p99_us: u64,
-    pub archive_commit_p99_us: u64,
+    /// Enqueue-to-durable latency of the archive commit QUEUE
+    /// (`storage.commit_queue_latency_us`) — not pure git work, and off the
+    /// request path since the ack-fast change.
+    pub archive_commit_queue_p99_us: u64,
+    /// Pure git commit latency (`storage.git_commit_latency_us`), exposed so
+    /// queue latency is never mistaken for git being slow (GH#245).
+    pub git_commit_p99_us: u64,
     pub blocking_dispatch: BlockingDispatchMetricsSnapshot,
 }
 
@@ -703,7 +830,8 @@ pub fn timeout_diagnostics_from_samples(
     pool_acquire_p99_us: u64,
     database_write_p99_us: u64,
     archive_wbq_p99_us: u64,
-    archive_commit_p99_us: u64,
+    archive_commit_queue_p99_us: u64,
+    git_commit_p99_us: u64,
     blocking_dispatch: BlockingDispatchMetricsSnapshot,
 ) -> TimeoutDiagnosticsSnapshot {
     let mut stage = TimeoutStage::NoMonitoredStage;
@@ -713,7 +841,7 @@ pub fn timeout_diagnostics_from_samples(
             (TimeoutStage::PoolAcquire, pool_acquire_p99_us),
             (TimeoutStage::DatabaseWrite, database_write_p99_us),
             (TimeoutStage::ArchiveWbq, archive_wbq_p99_us),
-            (TimeoutStage::ArchiveCommit, archive_commit_p99_us),
+            (TimeoutStage::ArchiveCommit, archive_commit_queue_p99_us),
         ] {
             if p99_us >= client_deadline_us && p99_us > slowest_p99_us {
                 stage = candidate;
@@ -730,10 +858,12 @@ pub fn timeout_diagnostics_from_samples(
         client_deadline_us,
         stage,
         stage_exceeded_budget,
+        p99_window_secs: RECENT_WINDOW_SECS,
         pool_acquire_p99_us,
         database_write_p99_us,
         archive_wbq_p99_us,
-        archive_commit_p99_us,
+        archive_commit_queue_p99_us,
+        git_commit_p99_us,
         blocking_dispatch,
     }
 }
@@ -2248,15 +2378,21 @@ pub fn global_metrics() -> &'static GlobalMetrics {
 }
 
 /// Capture all stage evidence needed to explain a client-side dispatch timeout.
+///
+/// Stage p99 evidence comes from the trailing recent window (see
+/// [`RECENT_WINDOW_SECS`]), not process-lifetime histograms, so one
+/// historical stall cannot pin the reported percentiles for the rest of the
+/// process lifetime (GH#245).
 #[must_use]
 pub fn timeout_diagnostics_snapshot(client_deadline_us: u64) -> TimeoutDiagnosticsSnapshot {
-    let metrics = global_metrics().snapshot();
+    let live = global_metrics();
     timeout_diagnostics_from_samples(
         client_deadline_us,
-        metrics.db.pool_acquire_latency_us.p99,
-        database_write_metrics_snapshot().latency_us.p99,
-        metrics.storage.wbq_queue_latency_us.p99,
-        metrics.storage.commit_queue_latency_us.p99,
+        live.db.pool_acquire_latency_us.recent_snapshot().p99,
+        DATABASE_WRITE_METRICS.latency_us.recent_snapshot().p99,
+        live.storage.wbq_queue_latency_us.recent_snapshot().p99,
+        live.storage.commit_queue_latency_us.recent_snapshot().p99,
+        live.storage.git_commit_latency_us.recent_snapshot().p99,
         blocking_dispatch_metrics().snapshot(),
     )
 }
@@ -2273,6 +2409,7 @@ mod tests {
             0,
             0,
             32_000_000,
+            700,
             BlockingDispatchMetricsSnapshot {
                 inflight: 4,
                 zombies: 0,
@@ -2293,6 +2430,7 @@ mod tests {
             12_000,
             2_000,
             16_000_000,
+            600,
             BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -2333,6 +2471,34 @@ mod tests {
         assert!(snap.hard_limit.is_none());
         assert!(snap.open_fds.is_none());
         assert!(snap.utilization_pct.is_none());
+    }
+
+    #[test]
+    fn recent_snapshot_tracks_current_window_and_decays_when_stale() {
+        let h = Log2Histogram::new();
+        h.record(25_000_000);
+        h.record(1_000);
+
+        let recent = h.recent_snapshot();
+        assert_eq!(recent.count, 2, "fresh samples land in the recent window");
+        assert_eq!(recent.window_secs, RECENT_WINDOW_SECS);
+        assert!(recent.p99 >= 1_000);
+        assert_eq!(h.snapshot().count, 2, "lifetime view sees them too");
+
+        // Simulate epochs elapsing: mark the stored epoch stale so the next
+        // rotation clears the live slot (and, for a >=2-epoch gap, both).
+        // The samples above were recorded into the current slot, so after
+        // rotation the recent view must be empty while lifetime is intact.
+        let now = recent_epoch_now();
+        h.recent_epoch.store(now.wrapping_sub(2), Ordering::Relaxed);
+        let decayed = h.recent_snapshot();
+        assert_eq!(decayed.count, 0, "stale window decays to empty (GH#245)");
+        assert_eq!(decayed.p99, 0);
+        assert_eq!(
+            h.snapshot().count,
+            2,
+            "recent-window decay must never touch lifetime counters"
+        );
     }
 
     #[test]

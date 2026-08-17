@@ -24,6 +24,7 @@
 #   --force            Force reinstall even if already at version
 #   --migrate          Force Python->Rust migration/displacement when Python install detected
 #   --no-migrate       Skip and remember Python->Rust migration/displacement
+#   --no-service       Do not install/modify/restart any background service
 #   --uninstall        Remove installed binaries/configuration helpers
 #   --yes              Non-interactive mode (skip all confirmations)
 #   --purge            With --uninstall, also delete data directories/database
@@ -60,6 +61,7 @@ FORCE_INSTALL=0
 FORCE_MIGRATE=0
 FORCE_NO_MIGRATE=0
 UNINSTALL=0
+NO_SERVICE=0
 ASSUME_YES=0
 PURGE=0
 DRY_RUN=0
@@ -1772,14 +1774,20 @@ EOF
 stop_python_server() {
   # Stop any Python systemd user service for mcp_agent_mail first
   # (cron-launched or systemd-managed Python servers will respawn if not disabled)
-  local py_service_names=("mcp-agent-mail-python" "mcp_agent_mail" "agent-mail-python")
-  for svc in "${py_service_names[@]}"; do
-    if systemctl --user is-active "$svc" &>/dev/null 2>&1; then
-      info "Stopping Python systemd service: $svc"
-      systemctl --user stop "$svc" 2>/dev/null || true
-      systemctl --user disable "$svc" 2>/dev/null || true
-    fi
-  done
+  # GH#243: scratch/non-default installs and --no-service must not touch
+  # systemd units at all, including legacy Python ones.
+  if service_management_allowed; then
+    local py_service_names=("mcp-agent-mail-python" "mcp_agent_mail" "agent-mail-python")
+    for svc in "${py_service_names[@]}"; do
+      if systemctl --user is-active "$svc" &>/dev/null 2>&1; then
+        info "Stopping Python systemd service: $svc"
+        systemctl --user stop "$svc" 2>/dev/null || true
+        systemctl --user disable "$svc" 2>/dev/null || true
+      fi
+    done
+  else
+    info "Skipping Python systemd service stop/disable: ${SERVICE_MANAGEMENT_SKIP_REASON}"
+  fi
 
   # Also remove any crontab entries that start the Python server
   if command -v crontab &>/dev/null; then
@@ -2881,6 +2889,34 @@ platform_supports_user_service_management() {
   esac
 }
 
+# GH#243: a scratch/CI/verification install (`--dest ~/some/scratch/bin`) must
+# never rewrite a production unit's ExecStart to a deletable scratch path and
+# bounce the service. Service management is only allowed when the binaries are
+# going to a default install location (~/.local/bin, or /usr/local/bin via
+# --system) AND --no-service was not passed.
+dest_is_default_install_location() {
+  local dest="${DEST%/}"
+  [ -z "$dest" ] && dest="/"
+  local default="${DEST_DEFAULT%/}"
+  [ "$dest" = "$default" ] && return 0
+  [ "$dest" = "/usr/local/bin" ] && return 0
+  return 1
+}
+
+SERVICE_MANAGEMENT_SKIP_REASON=""
+service_management_allowed() {
+  SERVICE_MANAGEMENT_SKIP_REASON=""
+  if [ "${NO_SERVICE:-0}" -eq 1 ]; then
+    SERVICE_MANAGEMENT_SKIP_REASON="--no-service was requested"
+    return 1
+  fi
+  if ! dest_is_default_install_location; then
+    SERVICE_MANAGEMENT_SKIP_REASON="non-default --dest ${DEST} (defaults: ${DEST_DEFAULT}, /usr/local/bin)"
+    return 1
+  fi
+  return 0
+}
+
 service_setup_unavailable_failure() {
   local output="$1"
   printf '%s\n' "$output" | grep -qiE 'failed to run (systemctl|launchctl)|systemctl: command not found|launchctl: command not found|failed to connect (to )?(user scope )?bus|system has not been booted with systemd|could not find domain for'
@@ -3124,6 +3160,13 @@ EOF
 repair_launchd_service_env_from_rust_config() {
   [ "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" = "darwin" ] || return 0
 
+  # GH#243 defense-in-depth: never rewrite the LaunchAgent plist for a
+  # non-default --dest or when --no-service was passed.
+  if ! service_management_allowed; then
+    verbose "remote_http_readiness:skip_launchd_repair reason=${SERVICE_MANAGEMENT_SKIP_REASON}"
+    return 0
+  fi
+
   local plist_path="$HOME/Library/LaunchAgents/com.agent-mail.plist"
   if [ -L "$plist_path" ]; then
     warn "LaunchAgent plist is a symlink; refusing to rewrite it automatically: $plist_path"
@@ -3184,6 +3227,16 @@ ensure_remote_http_client_readiness() {
 
   warn "Remote MCP endpoint is not healthy at ${desired_url}"
   [ -n "${REMOTE_HTTP_PROBE_DETAIL:-}" ] && warn "  Probe detail: ${REMOTE_HTTP_PROBE_DETAIL}"
+
+  # GH#243: never install/rewrite/restart a background service for a
+  # non-default --dest or when --no-service was passed.
+  if ! service_management_allowed; then
+    warn "Skipping background service management: ${SERVICE_MANAGEMENT_SKIP_REASON}"
+    warn "No service unit was installed, modified, enabled, or restarted."
+    warn "Start a local HTTP server manually with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    verbose "remote_http_readiness:skip_service_management reason=${SERVICE_MANAGEMENT_SKIP_REASON}"
+    return 0
+  fi
 
   if ! platform_supports_user_service_management; then
     warn "Automatic background service setup is not supported in this environment."
@@ -5080,7 +5133,7 @@ usage() {
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
                   [--offline] [--no-gum] [--no-verify] [--force] [--from-source] [--verbose] \\
-                  [--migrate|--no-migrate] [--uninstall] [--yes] [--purge] [--dry-run]
+                  [--migrate|--no-migrate] [--no-service] [--uninstall] [--yes] [--purge] [--dry-run]
 
 Installs mcp-agent-mail and am (CLI) binaries.
 
@@ -5100,6 +5153,9 @@ Options:
   --force            Force reinstall even if same version is installed
   --migrate          Force Python->Rust migration/displacement when Python install is detected
   --no-migrate       Skip and remember Python->Rust migration/displacement
+  --no-service       Do not install/modify/restart any background service
+                     (service management is also skipped automatically when
+                     --dest points outside the default install locations)
   --uninstall        Remove installed binaries/configuration helpers
   --yes              Non-interactive mode (skip all confirmations)
   --purge            With --uninstall, also delete storage/database data
@@ -5168,6 +5224,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE_INSTALL=1; shift;;
     --migrate) FORCE_MIGRATE=1; shift;;
     --no-migrate) FORCE_NO_MIGRATE=1; shift;;
+    --no-service) NO_SERVICE=1; shift;;
     --uninstall) UNINSTALL=1; shift;;
     --yes|-y) ASSUME_YES=1; shift;;
     --purge) PURGE=1; shift;;
@@ -5188,7 +5245,7 @@ if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
   exit 2
 fi
 
-verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
+verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} NO_SERVICE=${NO_SERVICE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
 
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall
@@ -5341,7 +5398,9 @@ print_install_plan() {
     echo -e "\033[${section_color}m[Remote HTTP]\033[0m"
     echo "  Connect URL: $(desired_mcp_http_url)"
     echo "  Will verify the local MCP HTTP endpoint after install"
-    if platform_supports_user_service_management; then
+    if ! service_management_allowed; then
+      echo "  Will skip background service management: ${SERVICE_MANAGEMENT_SKIP_REASON}"
+    elif platform_supports_user_service_management; then
       echo "  If needed, will install/start a background per-user service automatically"
     else
       echo "  Automatic background service management is not supported on this platform"

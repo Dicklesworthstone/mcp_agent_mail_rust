@@ -7,7 +7,6 @@ use crate::error::{DbError, DbResult, is_lock_error};
 use crate::integrity;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::schema;
-use asupersync::sync::OnceCell;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::{
     ConsistencyMessageRef, LockLevel, OrderedRwLock,
@@ -29,7 +28,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone)]
@@ -1182,10 +1181,17 @@ impl ReplayCompensationLog {
     }
 
     /// Record a failed replay attempt.
+    ///
+    /// Poison recovery (`into_inner`) instead of `.expect`: these mutexes are
+    /// shared by every thread touching the write-behind queue, so a single
+    /// panicking holder must degrade to slightly-stale bookkeeping, not
+    /// cascade panics into every other thread — including the unprotected TUI
+    /// main thread — and kill the process (same class as br-3py2's
+    /// `archive_process_lock` fix).
     pub fn record(&self, record: ReplayCompensationRecord) {
         self.entries
             .lock()
-            .expect("ReplayCompensationLog poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(record);
     }
 
@@ -1194,7 +1200,7 @@ impl ReplayCompensationLog {
     pub fn len(&self) -> usize {
         self.entries
             .lock()
-            .expect("ReplayCompensationLog poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
 
@@ -1206,7 +1212,7 @@ impl ReplayCompensationLog {
 
     /// Drain all records from the log for persistence or reporting.
     pub fn drain(&self) -> Vec<ReplayCompensationRecord> {
-        std::mem::take(&mut *self.entries.lock().expect("ReplayCompensationLog poisoned"))
+        std::mem::take(&mut *self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 }
 
@@ -1332,7 +1338,7 @@ impl DeferredWriteQueue {
     /// Call this when the durability state transitions to `Recovering`.
     /// If already active, this is a no-op.
     pub fn activate(&self) {
-        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.active = true;
         inner.sealed = false;
     }
@@ -1340,14 +1346,14 @@ impl DeferredWriteQueue {
     /// Whether the queue is currently active and accepting writes.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.active && !inner.sealed
     }
 
     /// Current number of queued writes.
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.entries.len()
     }
 
@@ -1376,7 +1382,7 @@ impl DeferredWriteQueue {
     ) -> DeferralOutcome {
         let now_us = crate::now_micros();
         let entry_bytes = estimate_deferred_write_bytes(&sql, &params);
-        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if inner.sealed {
             return DeferralOutcome::Sealed;
@@ -1458,7 +1464,7 @@ impl DeferredWriteQueue {
     /// [`enqueue()`]: DeferredWriteQueue::enqueue
     /// [`reset()`]: DeferredWriteQueue::reset
     pub fn seal_and_drain(&self) -> Vec<DeferredWrite> {
-        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.sealed = true;
         inner.active = false;
         inner.estimated_bytes = 0;
@@ -1473,7 +1479,7 @@ impl DeferredWriteQueue {
     ///
     /// Call after replay completes (or after recovery is abandoned).
     pub fn reset(&self) {
-        let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let mut inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.active = false;
         inner.sealed = false;
         inner.next_seq = 0;
@@ -1493,7 +1499,7 @@ impl DeferredWriteQueue {
     /// - `HardStop`: system is refusing writes — operator must intervene.
     #[must_use]
     pub fn pressure(&self) -> BacklogPressure {
-        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let pressure = if !inner.active && !inner.sealed {
             BacklogPressure::Normal
         } else if inner.sealed {
@@ -1508,28 +1514,28 @@ impl DeferredWriteQueue {
     /// Age of the oldest deferred entry in seconds, or 0 if the queue is empty.
     #[must_use]
     pub fn oldest_age_secs(&self) -> u64 {
-        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         oldest_entry_age_secs(&inner)
     }
 
     /// Running estimated bytes of all queued entries.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.estimated_bytes
     }
 
     /// Lifetime count of writes shed (rejected) due to overload.
     #[must_use]
     pub fn shed_count(&self) -> u64 {
-        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.shed_count
     }
 
     /// Snapshot for diagnostics.
     #[must_use]
     pub fn status(&self) -> DeferredWriteQueueStatus {
-        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let inner = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let pressure = if !inner.active && !inner.sealed {
             BacklogPressure::Normal
         } else if inner.sealed {
@@ -1873,23 +1879,32 @@ pub fn evaluate_write_route(
 ///
 /// ## Timeout
 ///
-/// The acquire timeout MUST stay meaningfully below
-/// [`mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS`] (the MCP
-/// request/dispatch deadline). When the two are equal, a stalled connection
-/// acquire and the outer request deadline expire in the same instant, so every
-/// DB stall is reported as an unattributed dispatch timeout
-/// (`stage=blocking_dispatch_unattributed`) and the pool's far more specific
-/// "acquire timeout" error never surfaces (GH#245). A subsystem timeout should
-/// never equal the deadline of the caller that would report it.
+/// The acquire timeout MUST stay strictly below
+/// [`mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS`] (30s). When the
+/// two are equal, a stalled acquire and the caller's dispatch deadline expire in
+/// the same instant and every DB stall is reported as
+/// `blocking_dispatch_unattributed` instead of a pool-acquire timeout — the
+/// specific inner error is structurally masked by the generic outer one (GH#245:
+/// a 16-hour outage was undiagnosable for exactly this reason). 10s leaves the
+/// dispatcher 20s of headroom to surface the attributed failure.
 ///
-/// Note the timeout bounds only the *wait* for a connection: the
+/// The timeout bounds only the *wait* for a connection: the
 /// connection-create/init path (migrations, archive reconstruction) is not cut
-/// off by it, so a slow first-time init still completes.
+/// off by it, so a slow first-time init still completes. Waiters on that init
+/// are bounded separately by [`SqliteInitGate`].
 ///
-/// Override via `DATABASE_POOL_SIZE` / `DATABASE_MAX_OVERFLOW` env vars.
+/// Override via `DATABASE_POOL_TIMEOUT` (ms); sizing via `DATABASE_POOL_SIZE` /
+/// `DATABASE_MAX_OVERFLOW` env vars.
 pub const DEFAULT_POOL_SIZE: usize = 25;
 pub const DEFAULT_MAX_OVERFLOW: usize = 75;
 pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 10_000;
+
+// Compile-time guard for the sub-deadline invariant documented above.
+const _: () = assert!(
+    DEFAULT_POOL_TIMEOUT_MS < mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS,
+    "pool acquire timeout must stay below the ecosystem client deadline so \
+     acquire timeouts surface as attributed errors (GH#245)"
+);
 pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes
 
 /// Auto-detect a reasonable pool size from available CPU parallelism.
@@ -2560,35 +2575,42 @@ impl DbPool {
                         let init_gate = sqlite_init_gate(&sqlite_path, &storage_root);
                         let run_migrations = run_migrations;
 
-                        let gate_out = init_gate
-                            .get_or_try_init(|| {
-                                let cx2 = cx2.clone();
-                                let sqlite_path = sqlite_path.clone();
-                                async move {
-                                    match initialize_sqlite_file_once(
-                                        &cx2,
-                                        &sqlite_path,
-                                        run_migrations,
-                                        &storage_root,
-                                    )
-                                    .await
-                                    {
-                                        Outcome::Ok(()) => Ok(()),
-                                        Outcome::Err(e) => Err(Outcome::Err(e)),
-                                        Outcome::Cancelled(r) => Err(Outcome::Cancelled(r)),
-                                        Outcome::Panicked(p) => Err(Outcome::Panicked(p)),
+                        // GH#245 / F1: only the initializer runs unboundedly;
+                        // every other acquire bounds its wait so a wedged or
+                        // slow initialization surfaces as an attributed,
+                        // retryable error instead of parking this dispatch
+                        // thread forever.
+                        match init_gate.claim_or_wait(SQLITE_INIT_GATE_WAIT_BUDGET) {
+                            SqliteInitGateClaim::Ready => {}
+                            SqliteInitGateClaim::TimedOut => {
+                                return Outcome::Err(SqlError::Custom(format!(
+                                    "database initialization still in progress after {}s; \
+                                     the mailbox is warming up or its archive reconcile is \
+                                     slow — retry shortly (bounded init-gate wait, GH#245)",
+                                    SQLITE_INIT_GATE_WAIT_BUDGET.as_secs()
+                                )));
+                            }
+                            SqliteInitGateClaim::Initialize => {
+                                let mut completion = SqliteInitGateCompletion {
+                                    gate: &init_gate,
+                                    success: false,
+                                };
+                                let init_out = initialize_sqlite_file_once(
+                                    &cx2,
+                                    &sqlite_path,
+                                    run_migrations,
+                                    &storage_root,
+                                )
+                                .await;
+                                match init_out {
+                                    Outcome::Ok(()) => {
+                                        completion.success = true;
+                                        drop(completion);
                                     }
+                                    Outcome::Err(e) => return Outcome::Err(e),
+                                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                                    Outcome::Panicked(p) => return Outcome::Panicked(p),
                                 }
-                            })
-                            .await;
-
-                        match gate_out {
-                            Ok(()) => {}
-                            Err(Outcome::Err(e)) => return Outcome::Err(e),
-                            Err(Outcome::Cancelled(r)) => return Outcome::Cancelled(r),
-                            Err(Outcome::Panicked(p)) => return Outcome::Panicked(p),
-                            Err(Outcome::Ok(())) => {
-                                unreachable!("sqlite init gate returned Err(Outcome::Ok(()))")
                             }
                         }
                     }
@@ -3665,7 +3687,7 @@ impl DbPool {
     }
 }
 
-static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<OnceCell<()>>>>> =
+static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<SqliteInitGate>>>> =
     OnceLock::new();
 static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, Weak<Pool<DbConn>>>>> = OnceLock::new();
 static SQLITE_IDENTITY_PATH_CACHE: OnceLock<Mutex<HashMap<String, SqliteIdentityPathCacheEntry>>> =
@@ -3874,7 +3896,124 @@ fn sqlite_init_gate_key(sqlite_path: &str, storage_root: &Path) -> String {
     )
 }
 
-fn sqlite_init_gate(sqlite_path: &str, storage_root: &Path) -> Arc<OnceCell<()>> {
+/// How long a NON-initializing pool acquire may wait for another task's
+/// one-time DB initialization before failing with a retryable
+/// [`DbError::ResourceBusy`]. Tied to [`DEFAULT_POOL_TIMEOUT_MS`] so the
+/// bound matches the pool's own acquire budget.
+const SQLITE_INIT_GATE_WAIT_BUDGET: Duration = Duration::from_millis(DEFAULT_POOL_TIMEOUT_MS);
+
+/// Outcome of [`SqliteInitGate::claim_or_wait`].
+enum SqliteInitGateClaim {
+    /// The caller won the initializer role and MUST run initialization, then
+    /// call [`SqliteInitGate::complete`] (or rely on
+    /// [`SqliteInitGateCompletion`]'s drop guard).
+    Initialize,
+    /// Initialization already completed successfully.
+    Ready,
+    /// Another task is still initializing and the wait budget elapsed.
+    TimedOut,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqliteInitGateState {
+    NotStarted,
+    Running,
+    Done,
+}
+
+/// One-time DB init gate with BOUNDED waiting (GH#245 stall hunt, finding F1).
+///
+/// The previous shape was an `asupersync` `OnceCell<()>`: cancellation-correct,
+/// but every non-initializing caller awaited it with no deadline. When the
+/// initializer wedged (archive reconcile behind the storage publication fence,
+/// a slow migration, a filesystem stall), every DB-needing tool call parked
+/// forever in that await — dispatch threads in `futex_do_wait`, process idle,
+/// every request reported as an unattributed 30s timeout: the GH#245 outage
+/// shape. Now only the initializer runs unboundedly; waiters bound their wait
+/// with [`SQLITE_INIT_GATE_WAIT_BUDGET`] and surface a retryable, ATTRIBUTED
+/// error instead. std sync primitives on purpose: this path runs under
+/// `block_on` on dedicated dispatch threads and must not depend on async
+/// timers (GH#203).
+struct SqliteInitGate {
+    state: Mutex<SqliteInitGateState>,
+    cv: Condvar,
+}
+
+impl SqliteInitGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SqliteInitGateState::NotStarted),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Claim the initializer role, or wait (bounded) for the current one.
+    ///
+    /// Failure semantics mirror the old `OnceCell::get_or_try_init`: a failed
+    /// or cancelled initialization resets to `NotStarted` (via
+    /// [`Self::complete`]) so a later caller retries it.
+    fn claim_or_wait(&self, budget: Duration) -> SqliteInitGateClaim {
+        let deadline = Instant::now() + budget;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match *state {
+                SqliteInitGateState::Done => return SqliteInitGateClaim::Ready,
+                SqliteInitGateState::NotStarted => {
+                    *state = SqliteInitGateState::Running;
+                    return SqliteInitGateClaim::Initialize;
+                }
+                SqliteInitGateState::Running => {
+                    let now = Instant::now();
+                    let Some(remaining) = deadline.checked_duration_since(now) else {
+                        return SqliteInitGateClaim::TimedOut;
+                    };
+                    if remaining.is_zero() {
+                        return SqliteInitGateClaim::TimedOut;
+                    }
+                    let (guard, _) = self
+                        .cv
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state = guard;
+                }
+            }
+        }
+    }
+
+    /// Publish the initializer's outcome and wake every bounded waiter.
+    fn complete(&self, success: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = if success {
+            SqliteInitGateState::Done
+        } else {
+            SqliteInitGateState::NotStarted
+        };
+        drop(state);
+        self.cv.notify_all();
+    }
+}
+
+/// Drop guard so the gate can never be stranded in `Running` — an initializer
+/// that unwinds (or forgets to report) resets the gate to retryable instead of
+/// condemning every future waiter to bounded timeouts with no retry.
+struct SqliteInitGateCompletion<'a> {
+    gate: &'a SqliteInitGate,
+    success: bool,
+}
+
+impl Drop for SqliteInitGateCompletion<'_> {
+    fn drop(&mut self) {
+        self.gate.complete(self.success);
+    }
+}
+
+fn sqlite_init_gate(sqlite_path: &str, storage_root: &Path) -> Arc<SqliteInitGate> {
     let gate_key = sqlite_init_gate_key(sqlite_path, storage_root);
     let gates = SQLITE_INIT_GATES
         .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
@@ -3893,7 +4032,7 @@ fn sqlite_init_gate(sqlite_path: &str, storage_root: &Path) -> Arc<OnceCell<()>>
     if let Some(gate) = guard.get(&gate_key) {
         return Arc::clone(gate);
     }
-    let gate = Arc::new(OnceCell::new());
+    let gate = Arc::new(SqliteInitGate::new());
     guard.insert(gate_key, Arc::clone(&gate));
     gate
 }
@@ -10813,8 +10952,86 @@ mod tests {
         assert_eq!(DEFAULT_MAX_OVERFLOW, 75, "overflow headroom for bursts");
         assert_eq!(
             DEFAULT_POOL_TIMEOUT_MS, 10_000,
-            "10s acquire timeout (fail fast, below the MCP request deadline)"
+            "acquire timeout must stay below the 30s ecosystem client deadline \
+             so pool stalls surface attributed (GH#245)"
         );
+    }
+
+    /// GH#245 / F1: waiters on one-time DB init are BOUNDED; only the
+    /// initializer runs unboundedly, and failure/unwind resets the gate so
+    /// initialization is retryable.
+    #[test]
+    fn sqlite_init_gate_bounds_waiters_and_resets_on_failure() {
+        let gate = SqliteInitGate::new();
+        assert!(matches!(
+            gate.claim_or_wait(Duration::from_millis(10)),
+            SqliteInitGateClaim::Initialize
+        ));
+
+        // While Running, another caller times out instead of parking forever.
+        let start = Instant::now();
+        assert!(matches!(
+            gate.claim_or_wait(Duration::from_millis(50)),
+            SqliteInitGateClaim::TimedOut
+        ));
+        assert!(start.elapsed() >= Duration::from_millis(45));
+
+        // Failure resets to NotStarted: the next caller retries init.
+        gate.complete(false);
+        assert!(matches!(
+            gate.claim_or_wait(Duration::from_millis(10)),
+            SqliteInitGateClaim::Initialize
+        ));
+
+        // Success publishes Done: everyone proceeds instantly.
+        gate.complete(true);
+        assert!(matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::Ready
+        ));
+    }
+
+    #[test]
+    fn sqlite_init_gate_completion_guard_resets_on_unwind_path() {
+        let gate = SqliteInitGate::new();
+        assert!(matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::Initialize
+        ));
+        // Dropping the guard without marking success (what an unwinding
+        // initializer does) must reset the gate to retryable.
+        drop(SqliteInitGateCompletion {
+            gate: &gate,
+            success: false,
+        });
+        assert!(matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::Initialize
+        ));
+    }
+
+    #[test]
+    fn sqlite_init_gate_wakes_waiters_when_initializer_completes() {
+        let gate = Arc::new(SqliteInitGate::new());
+        assert!(matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::Initialize
+        ));
+        let signaller = Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            signaller.complete(true);
+        });
+        let start = Instant::now();
+        assert!(matches!(
+            gate.claim_or_wait(Duration::from_secs(5)),
+            SqliteInitGateClaim::Ready
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "waiter must wake on completion, not run out its full budget"
+        );
+        handle.join().expect("signaller thread");
         assert_eq!(
             DEFAULT_POOL_RECYCLE_MS,
             30 * 60 * 1000,

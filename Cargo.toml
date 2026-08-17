@@ -34,10 +34,11 @@ fastmcp-transport = "0.3.1"
 fastmcp-protocol = "0.3.1"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
-# SQLModel 0.3.2 and sqlmodel-sqlite 0.3.3 are published with an exact
-# Asupersync 0.3.10 dependency, so these SQLModel pins resolve directly
-# from crates.io without a sibling-checkout patch.
-asupersync = { version = "=0.4.4", features = ["tls-webpki-roots"] }
+# 2026-08-16: asupersync resolves from crates.io (0.4.5 — includes the
+# timer-parked-task cancellation wakeup fix, #61). The next release
+# (0.4.6) will carry the Sleep-registration release-on-cancel/ready leak
+# fixes (737b580f7, 4ef4132f8) — adopt it when published.
+asupersync = { version = "=0.4.5", features = ["tls-webpki-roots"] }
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
@@ -167,38 +168,30 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Keep asupersync unified with the sibling checkouts. FrankenSearch
-# references asupersync via the absolute `/dp/asupersync`
-# path (fleet-wide symlink to the canonical checkout); we MUST use the
-# identical path string here or cargo treats `../asupersync` and
-# `/dp/asupersync` as two distinct packages and refuses the lock
-# ("package collision in the lockfile"). Single path string => single
-# Cx/Outcome universe.
+# 2026-08-16 registry adoption: asupersync resolves from crates.io (=0.4.5)
+# and the fsqlite family resolves from crates.io (0.3.4) — the old
+# /dp/asupersync and /dp/frankensqlite path patches are GONE. Every
+# consumer in the graph accepts one asupersync 0.4.5 universe
+# (fsqlite >=0.4.3,<0.5; frankensearch >=0.4.4,<0.5; sqlmodel-rel-0327,
+# beads_rust, fastmcp siblings bumped to =0.4.5).
 #
-# br-noizk NOTE (2026-08-10): the /dp checkout is now 0.4.3, which no longer
-# matches this workspace's =0.3.10 universe (sqlmodel 0.3.2/0.3.3 on
-# crates.io pin asupersync =0.3.10 exactly; frankensearch caps <0.4). The
-# patch is therefore INERT — cargo records it under [[patch.unused]] and the
-# whole graph resolves one asupersync 0.3.10 from the registry, so the
-# single-universe invariant still holds. Keep the line (same path string)
-# so the patch re-engages automatically when the fleet unifies on 0.4.x
-# (needs: sqlmodel release accepting 0.4, frankensearch ceiling lift,
-# fastmcp bump — inventory on bead br-noizk).
-asupersync = { path = "/dp/asupersync" }
-# br-vlsf2 (2026-08-12): workspace harmonized to the asupersync 0.4.3 line.
-# sqlmodel 0.4.0 accepting asupersync =0.4.3 is not on crates.io yet, so the
-# family is path-patched to the sibling checkout (branch harmonize/vlsf2-fsqlite03,
-# off release/fsqlite-0.2.1 with fsqlite reqs flipped 0.2->0.3). Cleanup trigger:
-# a sqlmodel 0.4.x lockstep release on crates.io accepting asupersync 0.4.3 and
-# fsqlite 0.3 — then delete these eight lines and resolve from the registry.
-sqlmodel = { path = "/dp/sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
-sqlmodel-sqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-sqlite" }
+# br-vlsf2 follow-up: a sqlmodel 0.4.x lockstep release accepting
+# asupersync 0.4.5 + fsqlite 0.3 is still not on crates.io (max 0.3.2,
+# pinning asupersync =0.3.10), so the sqlmodel family remains
+# path-patched. /dp/sqlmodel_rust is BACK ON MAIN (0.3.2 line) — other
+# projects need it there — so the patch points at the dedicated stable
+# clone /data/projects/sqlmodel-rel-0327 (harmonize/vlsf2-fsqlite03 tip
+# 021bd17 + local asupersync =0.4.5 bump). Cleanup trigger: sqlmodel
+# 0.4.x on crates.io accepting asupersync 0.4.5 and fsqlite 0.3 — then
+# delete these eight lines and resolve from the registry.
+sqlmodel = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel" }
+sqlmodel-core = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-core" }
+sqlmodel-query = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-pool" }
+sqlmodel-frankensqlite = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-frankensqlite" }
+sqlmodel-sqlite = { path = "/data/projects/sqlmodel-rel-0327/crates/sqlmodel-sqlite" }
 #
 # fastmcp-rust is temporarily force-patched to the sibling checkout
 # until its own v0.3 release propagates to crates.io. The currently
@@ -232,73 +225,13 @@ ftui-layout = { path = "../frankentui/crates/ftui-layout" }
 ftui-style = { path = "../frankentui/crates/ftui-style" }
 ftui-text = { path = "../frankentui/crates/ftui-text" }
 ftui-backend = { path = "../frankentui/crates/ftui-backend" }
-# FrankenSQLite git-rev pin — see the rationale block above the
-# dependency notes. Every fsqlite crate in the graph is patched to ONE
-# rev so beads_rust and sqlmodel-frankensqlite share a single engine.
-#
-# UNPARKED 2026-08-11 (bead br-noizk): the asupersync deadlock that made
-# re-resolution impossible is fixed — the whole graph now resolves ONE
-# registry asupersync 0.3.10 (fastmcp sibling bumped =0.3.9 -> =0.3.10;
-# the /dp/asupersync 0.4.3 path patch is inert under [[patch.unused]]).
-# The fsqlite rev below requires asupersync ^0.3.9, so the pin is only
-# resolvable on the 0.3.x line — do NOT move the workspace to
-# asupersync 0.4.x while this pin is active.
-fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
-fsqlite-ast = { path = "/dp/frankensqlite/crates/fsqlite-ast" }
-fsqlite-btree = { path = "/dp/frankensqlite/crates/fsqlite-btree" }
-fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
-fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
-fsqlite-ext-fts5 = { path = "/dp/frankensqlite/crates/fsqlite-ext-fts5" }
-fsqlite-ext-icu = { path = "/dp/frankensqlite/crates/fsqlite-ext-icu" }
-fsqlite-ext-json = { path = "/dp/frankensqlite/crates/fsqlite-ext-json" }
-fsqlite-ext-misc = { path = "/dp/frankensqlite/crates/fsqlite-ext-misc" }
-fsqlite-ext-rtree = { path = "/dp/frankensqlite/crates/fsqlite-ext-rtree" }
-fsqlite-func = { path = "/dp/frankensqlite/crates/fsqlite-func" }
-fsqlite-mvcc = { path = "/dp/frankensqlite/crates/fsqlite-mvcc" }
-fsqlite-observability = { path = "/dp/frankensqlite/crates/fsqlite-observability" }
-fsqlite-pager = { path = "/dp/frankensqlite/crates/fsqlite-pager" }
-fsqlite-parser = { path = "/dp/frankensqlite/crates/fsqlite-parser" }
-fsqlite-planner = { path = "/dp/frankensqlite/crates/fsqlite-planner" }
-fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
-fsqlite-vdbe = { path = "/dp/frankensqlite/crates/fsqlite-vdbe" }
-fsqlite-vfs = { path = "/dp/frankensqlite/crates/fsqlite-vfs" }
-fsqlite-wal = { path = "/dp/frankensqlite/crates/fsqlite-wal" }
+# FrankenSQLite resolves from crates.io (0.3.4 line) as of 2026-08-16 —
+# the /dp/frankensqlite path patches are gone. beads_rust (^0.3.1) and
+# sqlmodel-frankensqlite (^0.3.0) both accept the registry 0.3.4 family,
+# so the graph keeps ONE engine without any path pin.
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 tru = { path = "../toon_rust" }
 rich_rust = { path = "../rich_rust" }
-
-# FrankenSQLite: git-rev pinned via [patch.crates-io] (decision 2026-08-10,
-# bead br-hpv61 / fleet stall investigation; supersedes the earlier
-# "intentionally NOT path-patched" ruling whose re-evaluation trigger fired).
-#
-# Why: the crates.io 0.1.x line lacks the 2026-07-21 durability wave
-# (NamespaceOpenIntent::ReadOnlyExisting + ns-lifecycle) that br-29u5s and
-# br-mmnyj need, and that wave is implicated in the fleet-wide tool-call
-# stalls (write p99 17-24s on this very mailbox; see br-hpv61). fsqlite
-# 0.2.0 IS on crates.io (2026-08-03) and contains the wave, but
-# sqlmodel-frankensqlite <= 0.3.2 requires ^0.1.18, so the registry route
-# is closed until a sqlmodel release accepts 0.2.x — and 0.2.0 also lacks
-# the GH#294 open-must-not-mutate fixes (2026-08-09/10, unreleased).
-#
-# The pin below is rev 2351c6c5 — the SAME rev cass
-# (coding_agent_session_search) pins and builds against: the tip of the
-# 0.1.19-semver fts5 line, verified to contain the ReadOnlyExisting wave
-# (ancestor 6a86c071) plus the deferred-FTS5-validation open. Being
-# 0.1.19-semver, it satisfies sqlmodel and beads_rust requirements.
-#
-# Rollback: delete the fsqlite* entries from [patch.crates-io] below.
-# Cleanup trigger: a sqlmodel-frankensqlite release accepting fsqlite
-# 0.2.x AND an fsqlite release containing GH#294 — then drop the patches
-# and resolve from the registry again.
-#
-# 2026-08-11 trigger progress: the fsqlite half is SATISFIED — fsqlite
-# 0.2.1 is on crates.io (ns-lifecycle wave + full FTS5 line + GH#294
-# mutation-free opens). Still waiting on (1) the sqlmodel-* lockstep
-# release accepting fsqlite ^0.2 (migration merged on sqlmodel main at
-# d9a3355 / bd-mk6o; crates.io max is still 0.3.2 requiring ^0.1.19,
-# publish staged upstream awaiting go) and (2) beads_rust lifting its
-# fsqlite ^0.1.18 requirement so the workspace keeps ONE engine.
-# Tracking bead: see the fsqlite-0.2.1 registry adoption bead.
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the
