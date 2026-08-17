@@ -266,6 +266,23 @@ fn contact_blocked_error() -> McpError {
     )
 }
 
+/// Whether a failed auto-handshake attempt looks like transient engine/store
+/// contention (worth one bounded retry) rather than a policy or validation
+/// refusal that retrying cannot change. Under the fsqlite 0.3.4 registry
+/// engine, concurrent writers can surface busy/recovery/validation errors on
+/// the handshake's own writes; swallowing those used to convert a healthy
+/// first-contact send into a spurious "Contact approval required" refusal.
+fn handshake_error_is_transient(error: &McpError) -> bool {
+    let lower = error.message.to_ascii_lowercase();
+    lower.contains("database is busy")
+        || lower.contains("database is locked")
+        || lower.contains("recovery in progress")
+        || lower.contains("connection validation failed")
+        || lower.contains("resource is temporarily busy")
+        || lower.contains("retry budget")
+        || lower.contains("initialization in progress")
+}
+
 fn contact_required_error(
     project_key: &str,
     sender_name: &str,
@@ -2253,34 +2270,50 @@ effective_free_bytes={free}"
                 auto_contact_if_blocked.unwrap_or(config.messaging_auto_handshake_on_block);
             if effective_auto_contact {
                 for (name, _) in &blocked {
-                    if Box::pin(crate::macros::macro_contact_handshake(
-                        ctx,
-                        project.human_key.clone(),
-                        Some(sender.name.clone()),
-                        Some(name.clone()),
-                        None,
-                        None,
-                        None,
-                        Some("auto-handshake by send_message".to_string()),
-                        Some(true),
-                        Some(ttl_seconds),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        // GH#237: forward the caller's sender_token so the
-                        // auto-handshake is verified as this sender. Passing
-                        // None here would reopen the fail-closed welcome hole
-                        // that GH#237 closed.
-                        sender_token.clone(),
-                    ))
-                    .await
-                    .is_ok()
-                    {
-                        attempted.push(name.clone());
+                    // Retry once on transient store contention: the handshake
+                    // failing on a busy/recovery/validation blip must not
+                    // silently become a "Contact approval required" refusal.
+                    for attempt in 0..2_u32 {
+                        match Box::pin(crate::macros::macro_contact_handshake(
+                            ctx,
+                            project.human_key.clone(),
+                            Some(sender.name.clone()),
+                            Some(name.clone()),
+                            None,
+                            None,
+                            None,
+                            Some("auto-handshake by send_message".to_string()),
+                            Some(true),
+                            Some(ttl_seconds),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            // GH#237: forward the caller's sender_token so the
+                            // auto-handshake is verified as this sender. Passing
+                            // None here would reopen the fail-closed welcome hole
+                            // that GH#237 closed.
+                            sender_token.clone(),
+                        ))
+                        .await
+                        {
+                            Ok(_) => {
+                                attempted.push(name.clone());
+                                break;
+                            }
+                            Err(error) if attempt == 0 && handshake_error_is_transient(&error) => {
+                                tracing::warn!(
+                                    recipient = %name,
+                                    error = %error.message,
+                                    "auto-handshake hit transient contention; retrying once"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(150));
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
 
@@ -3254,34 +3287,50 @@ effective_free_bytes={free}"
         let mut attempted: Vec<String> = Vec::new();
         if !blocked.is_empty() && config.messaging_auto_handshake_on_block {
             for name in &blocked {
-                if Box::pin(crate::macros::macro_contact_handshake(
-                    ctx,
-                    project.human_key.clone(),
-                    Some(sender.name.clone()),
-                    Some(name.clone()),
-                    None,
-                    None,
-                    None,
-                    Some("auto-handshake by reply_message".to_string()),
-                    Some(true),
-                    Some(ttl_seconds),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    // GH#237: forward the caller's sender_token so the
-                    // auto-handshake is verified as this sender. Passing None
-                    // here would reopen the fail-closed welcome hole that
-                    // GH#237 closed.
-                    sender_token.clone(),
-                ))
-                .await
-                .is_ok()
-                {
-                    attempted.push(name.clone());
+                // Retry once on transient store contention (mirrors
+                // send_message): a busy/recovery/validation blip during the
+                // handshake must not silently become an approval refusal.
+                for attempt in 0..2_u32 {
+                    match Box::pin(crate::macros::macro_contact_handshake(
+                        ctx,
+                        project.human_key.clone(),
+                        Some(sender.name.clone()),
+                        Some(name.clone()),
+                        None,
+                        None,
+                        None,
+                        Some("auto-handshake by reply_message".to_string()),
+                        Some(true),
+                        Some(ttl_seconds),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        // GH#237: forward the caller's sender_token so the
+                        // auto-handshake is verified as this sender. Passing None
+                        // here would reopen the fail-closed welcome hole that
+                        // GH#237 closed.
+                        sender_token.clone(),
+                    ))
+                    .await
+                    {
+                        Ok(_) => {
+                            attempted.push(name.clone());
+                            break;
+                        }
+                        Err(error) if attempt == 0 && handshake_error_is_transient(&error) => {
+                            tracing::warn!(
+                                recipient = %name,
+                                error = %error.message,
+                                "auto-handshake hit transient contention; retrying once"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
 
