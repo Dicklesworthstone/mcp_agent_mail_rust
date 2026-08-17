@@ -199,18 +199,22 @@ fn frankensqlite_pragma_matrix_reports_known_divergences() {
         "foreign_key_check must not regress to the old false-malformed behavior; report={report_json}"
     );
 
-    let known_fk_list_ordering_divergences = report
+    // fsqlite historically diverged from canonical SQLite on PRAGMA
+    // foreign_key_list row ordering/ids; fsqlite 0.3.4 fixed that upstream.
+    // Guard the remaining contract: any fk_list divergence that is NOT the
+    // known (now-fixed) ordering class is a new regression.
+    let unexplained_fk_list_divergences = report
         .probes
         .iter()
         .filter(|entry| {
             entry.probe_id == "foreign_key_list_messages"
                 && matches!(entry.status, ConformanceStatus::Divergent)
-                && is_fk_list_ordering_divergence(entry)
+                && !is_fk_list_ordering_divergence(entry)
         })
         .count();
-    assert!(
-        known_fk_list_ordering_divergences > 0,
-        "current frankensqlite should expose PRAGMA foreign_key_list ordering/id divergence until upstream fixes it; report={report_json}"
+    assert_eq!(
+        unexplained_fk_list_divergences, 0,
+        "PRAGMA foreign_key_list diverged in an unexplained way; report={report_json}"
     );
 }
 
