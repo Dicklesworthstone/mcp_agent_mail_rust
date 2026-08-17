@@ -542,6 +542,13 @@ where
                     // generation while the archive kept its original artifact.
                     // The audit record is intact — lineage, not drift (GH#244).
                     drift.reconstructed_prior_generation_rows += 1;
+                    // A *released* row in this shape is simultaneously a
+                    // "released row with no current-generation artifact" —
+                    // keep both informational counters in agreement so the
+                    // doctor suffixes describe the same mailbox consistently.
+                    if positive_ts(db.effective_released_ts()) {
+                        drift.released_missing_archive += 1;
+                    }
                 } else if positive_ts(db.effective_released_ts()) {
                     // A *released* DB row with no current-generation artifact is
                     // expected bookkeeping, not drift (GH#244): it holds no lock
