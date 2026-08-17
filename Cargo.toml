@@ -204,11 +204,17 @@ sqlmodel-sqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-sqlite" }
 # 0.3.x versions, so the only cleanup step once fastmcp 0.3 lands on
 # crates.io is to delete this block (plus the five fastmcp-* lines
 # below). cargo will then resolve all five from the registry.
-fastmcp-rust = { path = "../fastmcp_rust/crates/fastmcp" }
-fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
-fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
-fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
-fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+#
+# v0.3.28: the live ../fastmcp_rust checkout is under active development
+# (it moved 52 commits in one day, changing MCP lifecycle behavior under
+# our conformance suite), so — same pattern as sqlmodel-rel-0327 — the
+# patch points at the dedicated stable clone ../fastmcp-rel-0328, pinned
+# at 206d583: the rev the 0.3.28 release gate actually verified.
+fastmcp-rust = { path = "../fastmcp-rel-0328/crates/fastmcp" }
+fastmcp-core = { path = "../fastmcp-rel-0328/crates/fastmcp-core" }
+fastmcp-server = { path = "../fastmcp-rel-0328/crates/fastmcp-server" }
+fastmcp-transport = { path = "../fastmcp-rel-0328/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "../fastmcp-rel-0328/crates/fastmcp-protocol" }
 
 beads_rust = { path = "../beads_rust" }
 franken-agent-detection = { path = "../franken_agent_detection" }

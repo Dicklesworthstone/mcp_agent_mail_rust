@@ -7,9 +7,18 @@
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use mcp_agent_mail_db::pool::atc_sidecar_sqlite_path;
 use mcp_agent_mail_db::queries::{restore_atc_rollups, snapshot_atc_rollups};
-use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig, create_pool};
+use mcp_agent_mail_db::{CanonicalDbConn, DbConn, DbPool, DbPoolConfig, create_pool};
 use sqlmodel_core::Value;
+
+/// Open the canonical ATC sidecar (`atc.sqlite3`) beside the pool's mailbox
+/// DB. Since br-bvq1x.11.7 every file-backed ATC row lives there, not in the
+/// main DB, so tests must seed and verify through this connection.
+fn sidecar_conn(pool: &DbPool) -> CanonicalDbConn {
+    let path = atc_sidecar_sqlite_path(&pool.sqlite_path());
+    CanonicalDbConn::open_file(path).expect("open ATC sidecar")
+}
 
 fn setup_real_db(rt: &asupersync::runtime::Runtime, name: &str) -> (Cx, DbPool, tempfile::TempDir) {
     let cx = Cx::for_testing();
@@ -33,7 +42,15 @@ fn setup_real_db(rt: &asupersync::runtime::Runtime, name: &str) -> (Cx, DbPool, 
             }
             other => panic!("migration unexpected outcome: {other:?}"),
         }
-        match mcp_agent_mail_db::schema::migrate_atc_runtime_canonical_followup(&cx, &init_conn)
+        // ATC tables live in the canonical atc.sqlite3 sidecar
+        // (br-bvq1x.11.7), so the follow-up migrations run there, not on
+        // the Franken main DB.
+        let atc_path = atc_sidecar_sqlite_path(&db_path.display().to_string());
+        let atc_conn = CanonicalDbConn::open_file(atc_path).expect("open ATC sidecar");
+        atc_conn
+            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply sidecar PRAGMAs");
+        match mcp_agent_mail_db::schema::migrate_atc_runtime_canonical_followup(&cx, &atc_conn)
             .await
         {
             asupersync::Outcome::Ok(applied) => {
@@ -63,7 +80,7 @@ fn setup_real_db(rt: &asupersync::runtime::Runtime, name: &str) -> (Cx, DbPool, 
 }
 
 fn insert_rollup(pool: &DbPool, stratum_key: &str, total: i64, correct: i64) {
-    let conn = DbConn::open_file(pool.sqlite_path()).expect("open for insert");
+    let conn = sidecar_conn(pool);
     conn.execute_sync(
         "INSERT INTO atc_experience_rollups \
          (stratum_key, subsystem, effect_kind, risk_tier, \
@@ -131,7 +148,7 @@ fn restore_round_trips_through_snapshot() {
             .expect("snapshot");
 
         // Clear all rollups
-        let conn = DbConn::open_file(pool.sqlite_path()).expect("open");
+        let conn = sidecar_conn(&pool);
         conn.execute_sync("DELETE FROM atc_experience_rollups", &[])
             .expect("clear");
         drop(conn);
@@ -144,7 +161,7 @@ fn restore_round_trips_through_snapshot() {
         assert_eq!(restored, 2);
 
         // Verify data
-        let conn = DbConn::open_file(pool.sqlite_path()).expect("open");
+        let conn = sidecar_conn(&pool);
         let rows = conn
             .query_sync(
                 "SELECT stratum_key, total_count, correct_count \
@@ -178,7 +195,7 @@ fn restore_is_idempotent() {
             .expect("snapshot");
 
         // Clear and restore twice
-        let conn = DbConn::open_file(pool.sqlite_path()).expect("open");
+        let conn = sidecar_conn(&pool);
         conn.execute_sync("DELETE FROM atc_experience_rollups", &[])
             .expect("clear");
         drop(conn);
@@ -195,7 +212,7 @@ fn restore_is_idempotent() {
         assert_eq!(r2, 1);
 
         // Still only 1 row
-        let conn = DbConn::open_file(pool.sqlite_path()).expect("open");
+        let conn = sidecar_conn(&pool);
         let rows = conn
             .query_sync("SELECT stratum_key FROM atc_experience_rollups", &[])
             .expect("query");
@@ -216,7 +233,7 @@ fn snapshot_records_metadata_in_snapshots_table() {
             .into_result()
             .expect("snapshot");
 
-        let conn = DbConn::open_file(pool.sqlite_path()).expect("open");
+        let conn = sidecar_conn(&pool);
         let rows = conn
             .query_sync(
                 "SELECT captured_ts, rollup_rows, payload_sha256 \

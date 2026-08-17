@@ -6,9 +6,10 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,26 @@ fn tool_call(id: i64, name: &str, arguments: Value) -> Value {
 }
 
 fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
+    // Back-to-back sessions against the same mailbox can land inside the
+    // previous owner's activity-lock reap window; that state is explicitly
+    // retryable ("Resource is temporarily busy. Wait a moment and try
+    // again."), so retry the whole session a bounded number of times.
+    let mut run = run_stdio_session_once(db_path, requests);
+    for _ in 0..3 {
+        let busy = run
+            .responses
+            .iter()
+            .any(|resp| response_text(resp).contains("Resource is temporarily busy"));
+        if !busy {
+            break;
+        }
+        thread::sleep(Duration::from_secs(2));
+        run = run_stdio_session_once(db_path, requests);
+    }
+    run
+}
+
+fn run_stdio_session_once(db_path: &Path, requests: &[Value]) -> SessionRun {
     let storage_root = db_path
         .parent()
         .expect("db path should have parent")
@@ -98,32 +119,57 @@ fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
         .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn `am serve-stdio`");
-    let mut stdout = child.stdout.take().expect("child stdout");
+    let stdout = child.stdout.take().expect("child stdout");
     let mut stderr = child.stderr.take().expect("child stderr");
+    let stdout_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stdout_sink = Arc::clone(&stdout_lines);
     let stdout_thread = thread::spawn(move || {
-        let mut buf = String::new();
-        stdout.read_to_string(&mut buf).expect("read child stdout");
-        buf
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => stdout_sink.lock().expect("stdout lines lock").push(line),
+                Err(_) => break,
+            }
+        }
     });
     let stderr_thread = thread::spawn(move || {
         let mut buf = String::new();
         stderr.read_to_string(&mut buf).expect("read child stderr");
         buf
     });
-    {
-        let mut stdin = child.stdin.take().expect("child stdin");
-        let mut send = Vec::with_capacity(requests.len() + 1);
-        send.push(initialize_request());
-        send.extend_from_slice(requests);
-        for req in send {
-            serde_json::to_writer(&mut stdin, &req).expect("serialize request");
-            stdin.write_all(b"\n").expect("write request delimiter");
-        }
-        stdin.flush().expect("flush child stdin");
-    }
 
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut send = Vec::with_capacity(requests.len() + 2);
+    send.push(initialize_request());
+    // The stdio transport gates operating requests on the standard MCP
+    // lifecycle notification (GH#248).
+    send.push(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    }));
+    send.extend_from_slice(requests);
+    let expected_responses = send
+        .iter()
+        .filter(|request| request.get("id").is_some())
+        .count();
+    for req in send {
+        serde_json::to_writer(&mut stdin, &req).expect("serialize request");
+        stdin.write_all(b"\n").expect("write request delimiter");
+    }
+    stdin.flush().expect("flush child stdin");
+
+    // Keep stdin open until every expected response has been written: the
+    // stdio transport tears the session down on EOF without draining
+    // still-pending requests, so an eager close races the responses away.
     let timeout = Duration::from_secs(STDIO_SESSION_TIMEOUT_SECS);
     let started = Instant::now();
+    while started.elapsed() < timeout {
+        if stdout_lines.lock().expect("stdout lines lock").len() >= expected_responses {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    drop(stdin);
+
     let mut timed_out = false;
     loop {
         match child.try_wait() {
@@ -141,7 +187,15 @@ fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
     }
 
     let exit_code = child.wait().expect("wait child").code();
-    let stdout = stdout_thread.join().expect("join stdout thread");
+    stdout_thread.join().expect("join stdout thread");
+    let stdout = {
+        let lines = stdout_lines.lock().expect("stdout lines lock");
+        let mut joined = lines.join("\n");
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined
+    };
     let mut stderr = stderr_thread.join().expect("join stderr thread");
     if timed_out {
         if !stderr.is_empty() {
