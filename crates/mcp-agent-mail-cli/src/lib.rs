@@ -5552,8 +5552,8 @@ fn should_reuse_unresolved_live_server(
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
 ///
 /// Refuses to terminate non-Agent-Mail processes. A verified listener without
-/// a trustworthy PID is returned explicitly so a managed duplicate can exit
-/// successfully rather than crash-looping while a healthy peer serves traffic.
+/// a trustworthy PID is returned explicitly so a managed duplicate can stand
+/// by (GH#246) rather than crash-looping while a healthy peer serves traffic.
 fn auto_clear_port(
     host: &str,
     port: u16,
@@ -6587,9 +6587,13 @@ const fn decide_restart_coordination(
     }
 }
 
-/// A managed supervisor must consider a verified same-mailbox peer a successful
-/// outcome. Returning an error here makes `Restart=on-failure` retry forever
-/// before the port-clearing path can see that no listener PID is available.
+/// A managed supervisor must consider a verified same-mailbox peer a
+/// non-error outcome. Returning an error here makes `Restart=on-failure`
+/// retry forever before the port-clearing path can see that no listener PID
+/// is available. GH#246: the managed duplicate no longer exits on this
+/// outcome either (any exit loops under `Restart=always`, and a pre-`READY=1`
+/// exit is a `Type=notify` protocol failure) — it stands by resident until
+/// the peer departs, then retries startup.
 const fn should_reuse_peer_after_restart_coordination(
     decision: RestartDecision,
     managed_service: bool,
@@ -6847,6 +6851,101 @@ mod restart_coordination_tests {
     }
 }
 
+/// GH#246: poll cadence while a managed duplicate stands by behind a verified
+/// peer that owns the storage root.
+const MANAGED_STANDBY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// GH#246: consecutive not-serving probes required before standby concludes
+/// the peer is gone. The managed unit runs with `--takeover`, so acting on a
+/// single failed probe could seize the port from (and kill) a live peer that
+/// merely missed one health round-trip under load.
+const MANAGED_STANDBY_CONFIRM_PROBES: u32 = 3;
+
+/// Pure standby-streak accumulator (unit-testable): the departure streak
+/// resets whenever the peer answers, and standby ends only once
+/// [`MANAGED_STANDBY_CONFIRM_PROBES`] consecutive probes saw no serving peer.
+const fn next_standby_departure_streak(streak: u32, peer_is_serving: bool) -> u32 {
+    if peer_is_serving {
+        0
+    } else {
+        streak.saturating_add(1)
+    }
+}
+
+const fn standby_confirmed_peer_departure(streak: u32) -> bool {
+    streak >= MANAGED_STANDBY_CONFIRM_PROBES
+}
+
+/// GH#246: managed-duplicate standby. A managed unit that finds a verified
+/// Agent Mail peer already owning this storage root used to log
+/// "managed duplicate exits successfully" and exit 0 — which can never
+/// converge: `Restart=always` units relaunch any exit unconditionally
+/// (NRestarts=165 in the field), and a `Type=notify` unit that exits before
+/// `READY=1` is a protocol failure, so even the shipped `Restart=on-failure`
+/// unit looped. Standing by instead keeps the unit `active` (readiness plus a
+/// descriptive `STATUS=` are notified immediately), stops the restart
+/// counter, and — as a bonus over any exit-status scheme — automatically
+/// reclaims the endpoint when the interactive or orphan owner goes away.
+fn wait_in_managed_standby_until_peer_departs(config: &Config, reason: &str) {
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status_at_mcp_path};
+
+    mcp_agent_mail_server::sd_notify("READY=1");
+    mcp_agent_mail_server::sd_notify(&format!(
+        "STATUS=standby: {reason}; supervising {}:{} and taking over when the peer exits",
+        config.http_host, config.http_port
+    ));
+
+    let mut departure_streak = 0_u32;
+    loop {
+        std::thread::sleep(MANAGED_STANDBY_POLL_INTERVAL);
+        let peer_is_serving = matches!(
+            check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path),
+            PortStatus::AgentMailServer
+        );
+        departure_streak = next_standby_departure_streak(departure_streak, peer_is_serving);
+        if standby_confirmed_peer_departure(departure_streak) {
+            tracing::info!(
+                host = %config.http_host,
+                port = config.http_port,
+                path = %config.http_path,
+                confirm_probes = MANAGED_STANDBY_CONFIRM_PROBES,
+                "standby peer stopped serving; managed duplicate is retrying startup (GH#246)"
+            );
+            mcp_agent_mail_server::sd_notify("STATUS=standby peer exited; taking over");
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_standby_tests {
+    use super::*;
+
+    #[test]
+    fn standby_streak_resets_on_a_serving_peer() {
+        let mut streak = 0_u32;
+        streak = next_standby_departure_streak(streak, false);
+        streak = next_standby_departure_streak(streak, false);
+        assert!(!standby_confirmed_peer_departure(streak));
+        // One healthy probe resets the count — a transient blip must never
+        // let the (takeover-armed) unit seize a live peer's port.
+        streak = next_standby_departure_streak(streak, true);
+        assert_eq!(streak, 0);
+        streak = next_standby_departure_streak(streak, false);
+        assert!(!standby_confirmed_peer_departure(streak));
+    }
+
+    #[test]
+    fn standby_requires_consecutive_missed_probes_before_takeover() {
+        let mut streak = 0_u32;
+        for _ in 0..MANAGED_STANDBY_CONFIRM_PROBES {
+            assert!(!standby_confirmed_peer_departure(streak));
+            streak = next_standby_departure_streak(streak, false);
+        }
+        assert!(standby_confirmed_peer_departure(streak));
+    }
+}
+
 fn handle_serve_http(
     host: Option<String>,
     port: Option<u16>,
@@ -6896,72 +6995,99 @@ fn handle_serve_http(
         ),
     };
 
-    let (restart_decision, _restart_lock) =
-        coordinate_server_restart(&config, takeover, RESTART_COORD_WAIT);
-    if should_reuse_peer_after_restart_coordination(
-        restart_decision,
-        running_under_managed_service(),
-    ) {
-        tracing::warn!(
-            host = %config.http_host,
-            port = config.http_port,
-            path = %config.http_path,
-            "verified Agent Mail MCP peer already owns this storage root; managed duplicate exits successfully"
-        );
-        return Ok(());
-    }
-    if restart_decision == RestartDecision::PeerAlreadyServing {
-        return Err(CliError::Other(format!(
-            "another Agent Mail server is already serving this storage root ({}) and is \
-             serving its configured MCP endpoint ({}) on {}:{}; not restarting (avoiding restart-fighting). Connect \
-             to it, or pass `am serve-http --takeover` to forcibly seize the port.",
-            config.storage_root.display(),
-            config.http_path,
-            config.http_host,
-            config.http_port,
-        )));
-    }
-    if restart_decision == RestartDecision::ContendedAliveHolder {
-        return Err(CliError::Other(format!(
-            "another Agent Mail process is holding the restart-coordination lock for this \
-             storage root ({}) but is not serving its configured MCP endpoint ({}) on {}:{} yet — it is most \
-             likely still booting (startup reconstruction/salvage can take minutes). \
-             Refusing to start rather than kill a live peer mid-write (see \
-             mcp_agent_mail#253: that race loses committed rows and wedges the mailbox). \
-             The supervisor may simply retry; to inspect the holder run \
-             `am doctor locks`, or pass `am serve-http --takeover` to forcibly seize the \
-             storage root.",
-            config.storage_root.display(),
-            config.http_path,
-            config.http_host,
-            config.http_port,
-        )));
-    }
-
-    // Kill any existing Agent Mail server on the port FIRST — on macOS
-    // we can't find processes by DB file handle (no /proc), but we CAN
-    // find them by port.  This also handles Codex-spawned `am serve-http`.
-    match auto_clear_port(&config.http_host, config.http_port, &config.http_path)? {
-        AutoClearPortOutcome::Cleared => {}
-        outcome
-            if should_reuse_unresolved_live_server(outcome, running_under_managed_service()) =>
-        {
-            // Managed units use Restart=on-failure. An exit-success preserves
-            // the verified peer and prevents retry storms on hosts where PID
-            // enumeration is unavailable.
+    // GH#246: a managed duplicate must CONVERGE instead of crash-looping.
+    // Exiting (even successfully) cannot converge under every deployed unit:
+    // `Restart=always` relaunches any exit unconditionally (NRestarts=165 in
+    // the field), and a `Type=notify` unit counts an exit before `READY=1` as
+    // a protocol failure, so even `Restart=on-failure` looped. Instead the
+    // duplicate STAYS RESIDENT: it notifies readiness, supervises the peer,
+    // and retries the whole coordination when the peer verifiably stops
+    // serving — so the unit shows `active`, `NRestarts` stays flat, and the
+    // service reclaims the port the moment an interactive/orphan owner exits.
+    let mut _restart_lock: Option<RestartCoordinationLock> = None;
+    loop {
+        let (restart_decision, acquired_lock) =
+            coordinate_server_restart(&config, takeover, RESTART_COORD_WAIT);
+        if should_reuse_peer_after_restart_coordination(
+            restart_decision,
+            running_under_managed_service(),
+        ) {
             tracing::warn!(
                 host = %config.http_host,
                 port = config.http_port,
-                "verified Agent Mail peer is already serving but no safe listener PID is available; managed duplicate exits successfully"
+                path = %config.http_path,
+                "verified Agent Mail MCP peer already owns this storage root; managed duplicate stands by until the peer exits (GH#246)"
             );
-            return Ok(());
+            wait_in_managed_standby_until_peer_departs(
+                &config,
+                "a verified Agent Mail MCP peer already owns this storage root",
+            );
+            continue;
         }
-        AutoClearPortOutcome::LiveServerWithoutKillablePid => {
+        if restart_decision == RestartDecision::PeerAlreadyServing {
             return Err(CliError::Other(format!(
-                "Agent Mail is already serving on {}:{}, but no trustworthy listener PID is available to stop it safely. Reuse the live server or stop its supervisor before retrying.",
-                config.http_host, config.http_port
+                "another Agent Mail server is already serving this storage root ({}) and is \
+                 serving its configured MCP endpoint ({}) on {}:{}; not restarting (avoiding restart-fighting). Connect \
+                 to it, or pass `am serve-http --takeover` to forcibly seize the port.",
+                config.storage_root.display(),
+                config.http_path,
+                config.http_host,
+                config.http_port,
             )));
         }
+        if restart_decision == RestartDecision::ContendedAliveHolder {
+            return Err(CliError::Other(format!(
+                "another Agent Mail process is holding the restart-coordination lock for this \
+                 storage root ({}) but is not serving its configured MCP endpoint ({}) on {}:{} yet — it is most \
+                 likely still booting (startup reconstruction/salvage can take minutes). \
+                 Refusing to start rather than kill a live peer mid-write (see \
+                 mcp_agent_mail#253: that race loses committed rows and wedges the mailbox). \
+                 The supervisor may simply retry; to inspect the holder run \
+                 `am doctor locks`, or pass `am serve-http --takeover` to forcibly seize the \
+                 storage root.",
+                config.storage_root.display(),
+                config.http_path,
+                config.http_host,
+                config.http_port,
+            )));
+        }
+
+        // Kill any existing Agent Mail server on the port FIRST — on macOS
+        // we can't find processes by DB file handle (no /proc), but we CAN
+        // find them by port.  This also handles Codex-spawned `am serve-http`.
+        match auto_clear_port(&config.http_host, config.http_port, &config.http_path)? {
+            AutoClearPortOutcome::Cleared => {}
+            outcome
+                if should_reuse_unresolved_live_server(
+                    outcome,
+                    running_under_managed_service(),
+                ) =>
+            {
+                // A verified peer is serving but no PID enumeration is
+                // available to stop it safely — same standby treatment
+                // (GH#246): supervise and retry when the peer departs.
+                tracing::warn!(
+                    host = %config.http_host,
+                    port = config.http_port,
+                    "verified Agent Mail peer is already serving but no safe listener PID is available; managed duplicate stands by until the peer exits (GH#246)"
+                );
+                wait_in_managed_standby_until_peer_departs(
+                    &config,
+                    "a verified Agent Mail peer is already serving and no safe listener PID is available",
+                );
+                continue;
+            }
+            AutoClearPortOutcome::LiveServerWithoutKillablePid => {
+                return Err(CliError::Other(format!(
+                    "Agent Mail is already serving on {}:{}, but no trustworthy listener PID is available to stop it safely. Reuse the live server or stop its supervisor before retrying.",
+                    config.http_host, config.http_port
+                )));
+            }
+        }
+        // Keep any acquired restart-coordination lock held for the server's
+        // lifetime (dropped when this function returns).
+        _restart_lock = acquired_lock;
+        break;
     }
     // Clear remaining stale Agent Mail processes holding the database file and
     // clean up stale lock/WAL artifacts, then run doctor-grade startup self-heal
@@ -28376,9 +28502,11 @@ fn doctor_classify_canonical_pragma_check(
                 // `Err` arm below.)
                 CanonicalProbeAuthority::Pass
             } else {
+                // GH#247: summarize — an uncapped full check can return
+                // hundreds of thousands of rows; the magnitude is the signal.
                 CanonicalProbeAuthority::Corruption(format!(
                     "{kind} reported: {}",
-                    details.join("; ")
+                    mcp_agent_mail_db::integrity::summarize_check_details(&details)
                 ))
             }
         }
