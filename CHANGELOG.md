@@ -52,6 +52,21 @@ binaries were cut from a snapshot that predates everything below.
   gating are filed in the FrankenSQLite tracker (bd-q3hu3, bd-qgh42,
   bd-dhhxp).
 
+### Known issue — multi-writer latency regression under fsqlite 0.3.4
+
+Quantified on an idle 64-core host: the 30-agent DB+Git pipeline stays
+fully correct (150/150, 0 errors) but runs at p99 ≈ 47s per message
+against the 10s budget (historical baseline on the pre-registry engine:
+p99 = 6.8s), and three sibling load suites
+(`stress_multi_project_120_agents`, `swarm_load_lab_ci_smoke`,
+known-bad-git `scenario_a_clean_baseline`) no longer finish inside their
+240s watchdogs even serialized. This is engine-bound, not host
+saturation — the bounded retries above convert the engine's
+busy/recovery errors into latency instead of failures. Tracked upstream
+as FrankenSQLite bd-pr6ii (with bd-dhhxp as the suspected root); these
+suites stay red in the full gate until the engine regression is fixed,
+deliberately unmasked.
+
 ---
 
 ## [v0.3.28](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.28) — 2026-08-16 **[Release]**
