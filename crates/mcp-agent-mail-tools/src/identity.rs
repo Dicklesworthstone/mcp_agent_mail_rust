@@ -120,7 +120,7 @@ async fn persist_agent_registration_token_with_retry(
 /// 6+ distinct-`project_key` callers can still exhaust the inner budget
 /// because each write serialises on the WAL. Wrap one more coarse level
 /// outside the DB call so the burst settles inside the server process
-/// instead of surfacing a transient RESOURCE_BUSY to every integrator
+/// instead of surfacing a transient `RESOURCE_BUSY` to every integrator
 /// (which would then have to reimplement its own per-tool retry policy).
 #[allow(clippy::too_many_arguments)]
 async fn register_agent_db_with_retry(

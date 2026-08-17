@@ -93,7 +93,7 @@ async fn register_explicit(
 }
 
 /// (a) Auto-name collision must redraw: the existing agent keeps its id,
-/// program, and task_description; the new registration lands under the
+/// program, and `task_description`; the new registration lands under the
 /// redrawn name.
 #[test]
 fn auto_name_collision_redraws_without_touching_existing_agent() {

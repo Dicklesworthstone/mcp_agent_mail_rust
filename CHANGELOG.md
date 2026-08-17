@@ -66,7 +66,91 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   timeout" error could never surface. The timeout bounds only the wait for a
   connection (create/init, including migrations and archive reconstruction,
   is not cut off), and a regression test now pins the ≥2x margin against
-  `ECOSYSTEM_CLIENT_DEADLINE_MS`.
+  `ECOSYSTEM_CLIENT_DEADLINE_MS`. A compile-time assert keeps the two
+  constants from ever re-aliasing.
+- **Timeout diagnostics report *current* health, name the queue honestly, and
+  expose pure git latency (#245).** The p99 evidence attached to a dispatch
+  timeout now comes from a trailing 10-minute two-epoch window
+  (`p99_window_secs=600`) instead of process-lifetime histograms — one
+  historical 25s stall can no longer pin the displayed p99 for a 2d8h
+  process. `archive_commit_p99` is renamed `archive_commit_queue_p99` (it is
+  enqueue-to-durable queue latency, not git work), `git_commit_p99` is
+  exposed beside it, and both archive stages are annotated off-request-path
+  since ack-fast.
+- **One-time DB initialization can no longer park every tool call forever
+  (#245 stall hunt).** The pool's per-database init gate previously made
+  every non-initializing caller await it with no deadline: a wedged or slow
+  initialization (archive reconcile behind the storage publication fence, a
+  slow migration, a filesystem stall) parked every DB-needing dispatch
+  thread in `futex_do_wait` while the process looked idle. Waiters are now
+  bounded by the pool acquire budget (10s) and fail with an attributed,
+  retryable "initialization in progress" error; only the initializer runs
+  unboundedly, and an unwinding initializer resets the gate for retry.
+- **`register_agent` without a name can no longer overwrite an existing
+  agent (#213).** An auto-generated name that collided with an
+  already-registered agent used to fall into the explicit-name upsert and
+  silently replace that agent's `program`/`task_description` while acking a
+  "fresh" registration. Auto-named registration now claims its name with a
+  strict transactional insert-if-absent, redrawing on collision (bounded at
+  16 draws) and returning a retryable `CONFLICT` on exhaustion. Explicit
+  re-registration keeps its documented upsert semantics.
+- **Windows extended-length (`\\?\`) storage roots: archive write-back works
+  (#216).** Relative-path computation mixed plain and verbatim spellings
+  (bases were normalized, canonicalized targets were not), so every archive
+  artifact write failed on `\\?\` roots — 507 consecutive failures on a
+  fresh DB armed the durability latch and refused the first `send_message`.
+  A spelling-tolerant comparison layer (`relative_to_normalized` /
+  `path_starts_with_normalized`) now backs `rel_path_cached`, the
+  missing-target fallback, and attachment containment checks; plain-path
+  behavior is byte-for-byte unchanged.
+- **`install.sh --dest` no longer rewrites the live `agent-mail.service`
+  (#243).** Service management (unit rewrite, enable, restart, legacy
+  Python-unit stop, macOS LaunchAgent repair) is skipped entirely when
+  `--dest` points outside the default install locations, and a new
+  `--no-service` flag forces the same skip anywhere — a scratch/CI
+  verification install can no longer point a production unit's ExecStart at
+  a deletable directory.
+- **Graceful shutdown can no longer park forever (long-uptime "my TUI died"
+  class).** The shutdown control message was a silent-drop `try_send` onto a
+  bounded channel, and the main thread then waited on the HTTP supervisor
+  with an untimed `recv()` — a wedged supervisor left the process parked
+  forever with the TTY already restored. Shutdown delivery now retries
+  bounded, the supervisor wait uses 15s escalation slices with a 60s budget,
+  and the TUI DB-poller join is bounded (5s) with a detach fallback. The
+  pure-headless park remains unbounded by design (it is the serving state).
+- **A poisoned archive-backlog head op no longer wedges the backlog
+  forever.** Backlog head operations are capped at 8 attempts, then
+  dead-lettered to `<storage_root>/doctor/backlog_dead_letter.jsonl` (10MiB
+  cap) with the durable journal quarantined under
+  `.archive_backlog/failed/` (moved, never deleted) so the queue advances
+  instead of retrying a permanently-failing op every 5s for days while the
+  backlog fills and later writes drop.
+
+### Added — long-uptime crash forensics
+
+- **Every panic now leaves a structured crash marker on disk.** A
+  process-wide panic hook appends message, location, thread, backtrace,
+  version, and uptime to `<storage_root>/doctor/crash_markers.jsonl` (5MB
+  cap) before the default stderr printer runs — a weeks-old crash in a
+  closed tmux pane is no longer unattributable.
+- **A TUI panic no longer kills the MCP server ungracefully.** The TUI main
+  thread is wrapped in `catch_unwind`: a panic in update/render converts to
+  an error routed through the normal graceful-shutdown sequence (WBQ flush,
+  worker shutdown) instead of unwinding past all of it mid-frame.
+- **Write-queue mutexes recover from poisoning.** A panic on any thread
+  holding the deferred-write/replay-compensation mutexes previously
+  cascaded panics into every other thread that touched them; they now
+  recover the guard (`PoisonError::into_inner`) and degrade to
+  slightly-stale bookkeeping instead.
+
+### Changed — dependency graph
+
+- **asupersync 0.4.4 → 0.4.5 and FrankenSQLite 0.3.2 → 0.3.4, both resolved
+  from crates.io.** The `/dp/asupersync` and `/dp/frankensqlite` path
+  patches are gone; asupersync 0.4.5 carries the timer-parked-task
+  cancellation wakeup fix (#61). The sqlmodel family still awaits a 0.4.x
+  crates.io lockstep release and is patched to a dedicated stable clone
+  rather than the moving sibling checkout.
 
 ## v0.3.27 — 2026-08-14 **[Release]**
 
