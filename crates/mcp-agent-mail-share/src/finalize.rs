@@ -1581,7 +1581,9 @@ mod tests {
         let fts_ok = build_search_indexes(&db).unwrap();
         assert!(fts_ok);
 
-        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        // fts_messages is built by (and consumed with) canonical SQLite; read
+        // it back with the consumer's engine, not FrankenSQLite's FTS5 reader.
+        let conn = CanonicalDbConn::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT project_slug FROM fts_messages WHERE message_id = 1",
@@ -1808,7 +1810,9 @@ mod tests {
         let fts_ok = build_search_indexes(&db).unwrap();
         assert!(fts_ok);
 
-        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        // fts_messages is built by (and consumed with) canonical SQLite; read
+        // it back with the consumer's engine, not FrankenSQLite's FTS5 reader.
+        let conn = CanonicalDbConn::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT thread_key FROM fts_messages WHERE message_id = 1",
@@ -1835,7 +1839,9 @@ mod tests {
         let fts_ok = build_search_indexes(&db).unwrap();
         assert!(fts_ok);
 
-        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        // fts_messages is built by (and consumed with) canonical SQLite; read
+        // it back with the consumer's engine, not FrankenSQLite's FTS5 reader.
+        let conn = CanonicalDbConn::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
                 "SELECT project_slug FROM fts_messages WHERE message_id = 1",
