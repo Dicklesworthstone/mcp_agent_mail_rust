@@ -8018,6 +8018,8 @@ fn sqlite_recovery_sidecar_label(suffix: &str) -> &'static str {
         "-journal" => "rollback-journal",
         "-wal" => "WAL",
         "-shm" => "SHM",
+        "-wal-cert" => "WAL-cert",
+        "-wal-cert-head" => "WAL-cert-head",
         _ => "sqlite",
     }
 }
@@ -12251,6 +12253,65 @@ mod tests {
         assert!(
             receipt_text.contains("source_snapshot_failure_sha256"),
             "the second receipt must disclose that source continuity was unreadable"
+        );
+    }
+
+    /// Regression for the GH#364 non-converging heal loop (2026-08-18):
+    /// FrankenSQLite's `-wal-cert` / `-wal-cert-head` sidecars carry
+    /// frame/db_size state for the SPECIFIC database file they were written
+    /// beside. When promotion swapped in a fresh database but left the old
+    /// generation's cert sidecars in place, the engine replayed the stale
+    /// state on the next open and re-extended the fresh file to the OLD
+    /// file's exact page count — orphaning the whole gap as
+    /// "Page N: never used" within seconds and making every heal
+    /// self-defeating. Promotion must rotate the cert sidecars with
+    /// `-wal`/`-shm` (quarantined, never deleted).
+    #[test]
+    fn recovery_promotion_quarantines_stale_fsqlite_wal_cert_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.candidate");
+        write_marker_db(&primary, "old-generation");
+        // Stand in for the old generation's engine cert state; content is
+        // irrelevant — what matters is that promotion must not leave these
+        // beside the freshly promoted file.
+        std::fs::write(
+            sqlite_path_with_suffix(&primary, "-wal-cert"),
+            b"stale-cert",
+        )
+        .expect("write stale wal-cert");
+        std::fs::write(
+            sqlite_path_with_suffix(&primary, "-wal-cert-head"),
+            b"stale-cert-head",
+        )
+        .expect("write stale wal-cert-head");
+        write_canonical_marker_db(&candidate, "new-generation");
+
+        promote_recovery_candidate(&primary, &candidate, dir.path())
+            .expect("promotion with stale cert sidecars present must succeed");
+
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("new-generation")
+        );
+        for suffix in ["-wal-cert", "-wal-cert-head"] {
+            assert!(
+                !sqlite_path_with_suffix(&primary, suffix).exists(),
+                "stale {suffix} sidecar must not survive promotion beside the new database"
+            );
+        }
+        // RULE 1: the certs are quarantined (renamed aside), never deleted.
+        let quarantined_certs = std::fs::read_dir(dir.path())
+            .expect("read promotion dir")
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.contains("-wal-cert") && name != "storage.sqlite3-wal-cert"
+            })
+            .count();
+        assert!(
+            quarantined_certs >= 2,
+            "cert sidecars must be quarantined aside, not deleted"
         );
     }
 
