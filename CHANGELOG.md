@@ -52,20 +52,28 @@ binaries were cut from a snapshot that predates everything below.
   gating are filed in the FrankenSQLite tracker (bd-q3hu3, bd-qgh42,
   bd-dhhxp).
 
-### Known issue — multi-writer latency regression under fsqlite 0.3.4
+### Known issue — stress-suite latency budgets don't hold on current gate hardware (NOT an engine regression)
 
-Quantified on an idle 64-core host: the 30-agent DB+Git pipeline stays
-fully correct (150/150, 0 errors) but runs at p99 ≈ 47s per message
-against the 10s budget (historical baseline on the pre-registry engine:
-p99 = 6.8s), and three sibling load suites
+Settled by a same-host A/B: the v0.3.27 tree (pre-registry engine,
+built from the preserved 0.3.27 release buildroot) and current main,
+run back-to-back on the same idle 64-core host, both deliver the
+30-agent DB+Git pipeline fully correct (150/150, 0 errors) at
+statistically identical latency — v0.3.27 p99 = 39.8s, main p99 =
+38–47s — against the suite's 10s budget and its checked-in 6.8s
+baseline from different-era hardware. The fsqlite 0.3.4 adoption is
+NOT the cause (the initially-filed engine bug was retracted and closed
+as bd-pr6ii after this measurement); the budgets and baselines are
+stale for this host class. The same applies to the three sibling
+suites that exceed their 240s watchdogs
 (`stress_multi_project_120_agents`, `swarm_load_lab_ci_smoke`,
-known-bad-git `scenario_a_clean_baseline`) no longer finish inside their
-240s watchdogs even serialized. This is engine-bound, not host
-saturation — the bounded retries above convert the engine's
-busy/recovery errors into latency instead of failures. Tracked upstream
-as FrankenSQLite bd-pr6ii (with bd-dhhxp as the suspected root); these
-suites stay red in the full gate until the engine regression is fixed,
-deliberately unmasked.
+known-bad-git `scenario_a_clean_baseline`). These four stay red until
+the budgets are recalibrated against measured per-host baselines —
+deliberately unmasked so the recalibration happens consciously. The
+directly-observed fsqlite 0.3.4 error-shape bugs (bd-dhhxp, bd-q3hu3,
+bd-qgh42) are independent of this and remain open upstream; the CLI
+bench catalog also needs care — `mail_threads` references a removed
+verb and the criterion archive bench trips the ephemeral-project guard
+(needs `AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1`).
 
 ---
 
