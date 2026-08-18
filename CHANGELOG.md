@@ -15,6 +15,23 @@ binaries were cut from a snapshot that predates everything below.
 
 ### Fixed
 
+- **Recovery no longer leaves FrankenSQLite WAL-cert sidecars beside a
+  replaced database — ends the non-converging "Page N: never used"
+  heal loop
+  ([frankensqlite#364](https://github.com/Dicklesworthstone/frankensqlite/issues/364)).**
+  The engine's `-wal-cert` / `-wal-cert-head` sidecars carry frame and
+  `db_size` state for the specific database file they were written
+  beside. Repair/reconstruct promotion rotated only `-journal` / `-wal`
+  / `-shm`, so a stale cert survived the file swap and the engine's
+  next open replayed it, re-extending the fresh database to the old
+  file's exact page count and orphaning the entire gap within seconds
+  — which made every heal self-defeating. The cert suffixes now rotate
+  with the classic sidecars through every recovery path
+  (candidate-conflict checks, live-sidecar probes, post-checkpoint
+  quarantine, promotion quarantine, rollback restores), with a
+  promotion regression test and doctor-receipt labels for the new
+  sidecar kinds. An engine-side ask (bind the cert to the db file's
+  identity) is filed upstream as frankensqlite#364.
 - **`am doctor mcp-selftest` runs a valid MCP lifecycle
   ([#248](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/248)).**
   The self-test now sends the standard `notifications/initialized`
