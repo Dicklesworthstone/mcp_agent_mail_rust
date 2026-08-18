@@ -4007,9 +4007,12 @@ pub async fn ensure_project(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
 
-    match find_project_in_inventory(cx, &tracked, |project| {
-        project_matches_human_key_alias(project, human_key, &resolved_human_key)
-    })
+    match find_project_in_inventory(
+        cx,
+        &tracked,
+        is_orphan_placeholder_identifier(human_key),
+        |project| project_matches_human_key_alias(project, human_key, &resolved_human_key),
+    )
     .await
     {
         Outcome::Ok(Some(row)) => {
@@ -4137,9 +4140,12 @@ pub async fn get_project_by_slug(
                     Err(e) => Outcome::Err(e),
                 }
             } else {
-                match find_project_in_inventory(cx, &tracked, |project| {
-                    project.slug.eq_ignore_ascii_case(slug)
-                })
+                match find_project_in_inventory(
+                    cx,
+                    &tracked,
+                    is_orphan_placeholder_identifier(slug),
+                    |project| project.slug.eq_ignore_ascii_case(slug),
+                )
                 .await
                 {
                     Outcome::Ok(Some(row)) => {
@@ -4195,9 +4201,12 @@ pub async fn get_project_by_human_key(
                     Err(e) => Outcome::Err(e),
                 }
             } else {
-                match find_project_in_inventory(cx, &tracked, |project| {
-                    project_matches_human_key_alias(project, human_key, human_key)
-                })
+                match find_project_in_inventory(
+                    cx,
+                    &tracked,
+                    is_orphan_placeholder_identifier(human_key),
+                    |project| project_matches_human_key_alias(project, human_key, human_key),
+                )
                 .await
                 {
                     Outcome::Ok(Some(row)) => {
@@ -4246,7 +4255,7 @@ pub async fn get_project_by_id(
                     Err(e) => Outcome::Err(e),
                 }
             } else {
-                match find_project_in_inventory(cx, &tracked, |project| {
+                match find_project_in_inventory(cx, &tracked, true, |project| {
                     project.id == Some(project_id)
                 })
                 .await
@@ -4270,17 +4279,80 @@ pub async fn get_project_by_id(
     }
 }
 
+/// Whether `identifier` has the shape of an orphaned-project placeholder
+/// (`[unknown-project-<id>]`, as minted by [`orphaned_project_placeholder`]).
+///
+/// Placeholder rows only ever match a lookup identifier that is literally the
+/// placeholder string (the alias check requires exact equality for
+/// non-absolute-path keys, and slug matching is a case-insensitive string
+/// compare), so slug / human-key inventory fallbacks can skip the expensive
+/// orphan-detection scans entirely for any other identifier. Without this
+/// gate, every misspelled or phantom project key paid four full anti-join
+/// table scans plus per-orphan MIN() aggregates just to conclude NOT_FOUND —
+/// ~11s against a large live mailbox on the current engine, which also
+/// outlived the CLI daemon-proxy deadline and surfaced as a raw transport
+/// error instead of the helpful suggestions message.
+fn is_orphan_placeholder_identifier(identifier: &str) -> bool {
+    // Case-insensitive to mirror the slug lookup's `eq_ignore_ascii_case`.
+    let lower = identifier.to_ascii_lowercase();
+    lower
+        .strip_prefix("[unknown-project-")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 async fn find_project_in_inventory<F>(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
+    include_orphan_placeholders: bool,
     mut predicate: F,
 ) -> Outcome<Option<ProjectRow>, DbError>
 where
     F: FnMut(&ProjectRow) -> bool,
 {
-    match list_projects_with_tracked(cx, tracked).await {
-        Outcome::Ok(projects) => {
-            Outcome::Ok(projects.into_iter().find(|project| predicate(project)))
+    // Real project rows first: this is one cheap indexed-table scan and covers
+    // canonical-path aliasing (symlink spellings of an existing project).
+    let rows = match list_project_rows_with_tracked(cx, tracked).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    if let Some(found) = rows.into_iter().find(|project| predicate(project)) {
+        return Outcome::Ok(Some(found));
+    }
+    if !include_orphan_placeholders {
+        return Outcome::Ok(None);
+    }
+    // Orphan placeholders second: this runs the anti-join scans over every
+    // referencing table, so callers only opt in when the identifier could
+    // actually match a placeholder (or when matching by raw project id).
+    match list_orphan_project_placeholders_with_tracked(cx, tracked).await {
+        Outcome::Ok(placeholders) => {
+            Outcome::Ok(placeholders.into_iter().find(|project| predicate(project)))
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// The plain `projects` table listing, without the orphaned-project
+/// placeholder augmentation that [`list_projects_with_tracked`] appends.
+async fn list_project_rows_with_tracked(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+) -> Outcome<Vec<ProjectRow>, DbError> {
+    match map_sql_outcome(traw_query(cx, tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                match decode_project_row(r) {
+                    Ok(row) => out.push(row),
+                    Err(e) => return Outcome::Err(e),
+                }
+            }
+            Outcome::Ok(out)
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -4292,72 +4364,88 @@ async fn list_projects_with_tracked(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
 ) -> Outcome<Vec<ProjectRow>, DbError> {
-    let now_us = now_micros();
-    match map_sql_outcome(traw_query(cx, tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for r in &rows {
-                match decode_project_row(r) {
-                    Ok(row) => out.push(row),
-                    Err(e) => return Outcome::Err(e),
-                }
-            }
+    let mut out = match list_project_rows_with_tracked(cx, tracked).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    match list_orphan_project_placeholders_with_tracked(cx, tracked).await {
+        Outcome::Ok(placeholders) => out.extend(placeholders),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    out.sort_by_key(|project| (project.created_at, project.id.unwrap_or_default()));
+    Outcome::Ok(out)
+}
 
-            let mut orphan_project_ids = std::collections::BTreeSet::new();
-            let orphan_sources: Vec<(String, Vec<Value>)> = vec![
-                (
-                    "SELECT DISTINCT m.project_id AS project_id \
+/// Placeholder rows for project ids that are referenced by messages, agents,
+/// active file reservations, or product links but have no `projects` row.
+///
+/// This is the expensive half of the project inventory: one anti-join scan
+/// per referencing table plus a MIN() aggregate per orphaned id.
+async fn list_orphan_project_placeholders_with_tracked(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+) -> Outcome<Vec<ProjectRow>, DbError> {
+    let now_us = now_micros();
+    let mut out = Vec::new();
+
+    let mut orphan_project_ids = std::collections::BTreeSet::new();
+    let orphan_sources: Vec<(String, Vec<Value>)> = vec![
+        (
+            "SELECT DISTINCT m.project_id AS project_id \
                      FROM messages m \
                      LEFT JOIN projects p ON p.id = m.project_id \
                      WHERE p.id IS NULL"
-                        .to_string(),
-                    vec![],
-                ),
-                (
-                    "SELECT DISTINCT a.project_id AS project_id \
+                .to_string(),
+            vec![],
+        ),
+        (
+            "SELECT DISTINCT a.project_id AS project_id \
                      FROM agents a \
                      LEFT JOIN projects p ON p.id = a.project_id \
                      WHERE p.id IS NULL"
-                        .to_string(),
-                    vec![],
-                ),
-                (
-                    format!(
-                        "SELECT DISTINCT file_reservations.project_id AS project_id \
+                .to_string(),
+            vec![],
+        ),
+        (
+            format!(
+                "SELECT DISTINCT file_reservations.project_id AS project_id \
                          FROM file_reservations \
                          LEFT JOIN projects p ON p.id = file_reservations.project_id \
                          WHERE p.id IS NULL \
                            AND ({ACTIVE_RESERVATION_PREDICATE}) \
                            AND file_reservations.expires_ts > ?"
-                    ),
-                    vec![Value::BigInt(now_us)],
-                ),
-                (
-                    "SELECT DISTINCT ppl.project_id AS project_id \
+            ),
+            vec![Value::BigInt(now_us)],
+        ),
+        (
+            "SELECT DISTINCT ppl.project_id AS project_id \
                      FROM product_project_links ppl \
                      LEFT JOIN projects p ON p.id = ppl.project_id \
                      WHERE p.id IS NULL"
-                        .to_string(),
-                    vec![],
-                ),
-            ];
-            for (sql, params) in &orphan_sources {
-                let orphan_rows = match map_sql_outcome(traw_query(cx, tracked, sql, params).await)
-                {
-                    Outcome::Ok(rows) => rows,
-                    Outcome::Err(e) => return Outcome::Err(e),
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
-                };
-                for row in &orphan_rows {
-                    if let Some(project_id) = row.get(0).and_then(value_as_i64) {
-                        orphan_project_ids.insert(project_id);
-                    }
-                }
+                .to_string(),
+            vec![],
+        ),
+    ];
+    for (sql, params) in &orphan_sources {
+        let orphan_rows = match map_sql_outcome(traw_query(cx, tracked, sql, params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        for row in &orphan_rows {
+            if let Some(project_id) = row.get(0).and_then(value_as_i64) {
+                orphan_project_ids.insert(project_id);
             }
+        }
+    }
 
-            let orphan_created_at_sql = format!(
-                "SELECT COALESCE( \
+    let orphan_created_at_sql = format!(
+        "SELECT COALESCE( \
                      (SELECT MIN(m.created_ts) FROM messages m WHERE m.project_id = ?), \
                      (SELECT MIN(a.inception_ts) FROM agents a WHERE a.project_id = ?), \
                      (SELECT MIN(fr.created_ts) FROM file_reservations fr \
@@ -4367,38 +4455,32 @@ async fn list_projects_with_tracked(
                      (SELECT MIN(ppl.created_at) FROM product_project_links ppl WHERE ppl.project_id = ?), \
                      0 \
                  ) AS created_at",
-                active_reservation_predicate_for("fr")
-            );
+        active_reservation_predicate_for("fr")
+    );
 
-            for project_id in orphan_project_ids {
-                let created_params = [
-                    Value::BigInt(project_id),
-                    Value::BigInt(project_id),
-                    Value::BigInt(project_id),
-                    Value::BigInt(now_us),
-                    Value::BigInt(project_id),
-                ];
-                let created_at_rows = match map_sql_outcome(
-                    traw_query(cx, tracked, &orphan_created_at_sql, &created_params).await,
-                ) {
-                    Outcome::Ok(rows) => rows,
-                    Outcome::Err(e) => return Outcome::Err(e),
-                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => return Outcome::Panicked(p),
-                };
-                let created_at = created_at_rows
-                    .first()
-                    .and_then(|row| row.get(0).and_then(value_as_i64))
-                    .unwrap_or(0);
-                out.push(orphaned_project_placeholder(project_id, created_at));
-            }
-            out.sort_by_key(|project| (project.created_at, project.id.unwrap_or_default()));
-            Outcome::Ok(out)
-        }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+    for project_id in orphan_project_ids {
+        let created_params = [
+            Value::BigInt(project_id),
+            Value::BigInt(project_id),
+            Value::BigInt(project_id),
+            Value::BigInt(now_us),
+            Value::BigInt(project_id),
+        ];
+        let created_at_rows = match map_sql_outcome(
+            traw_query(cx, tracked, &orphan_created_at_sql, &created_params).await,
+        ) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let created_at = created_at_rows
+            .first()
+            .and_then(|row| row.get(0).and_then(value_as_i64))
+            .unwrap_or(0);
+        out.push(orphaned_project_placeholder(project_id, created_at));
     }
+    Outcome::Ok(out)
 }
 
 /// List all projects
@@ -4411,6 +4493,32 @@ pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, D
     };
 
     list_projects_with_tracked(cx, &tracked(&*conn)).await
+}
+
+/// List real project rows only, skipping the orphaned-project placeholder
+/// augmentation ([`list_projects`] includes it).
+///
+/// Use this on latency-sensitive paths that only need actual `projects` rows
+/// — e.g. fuzzy "did you mean" suggestions after a NOT_FOUND, where the
+/// placeholder scan's anti-joins over every referencing table would dominate
+/// the response time and `[unknown-project-N]` names would be useless
+/// suggestions anyway.
+pub async fn list_project_rows(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let mut out = match list_project_rows_with_tracked(cx, &tracked(&*conn)).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    out.sort_by_key(|project| (project.created_at, project.id.unwrap_or_default()));
+    Outcome::Ok(out)
 }
 
 // =============================================================================
@@ -15261,6 +15369,27 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Id, Metadata, Subscriber, span};
+
+    #[test]
+    fn orphan_placeholder_identifier_shape_gates_the_inventory_scan() {
+        // Only the literal placeholder shape can ever match a placeholder row,
+        // so only it may opt the slug/human-key fallback into the expensive
+        // orphan anti-join scans.
+        assert!(is_orphan_placeholder_identifier("[unknown-project-1]"));
+        assert!(is_orphan_placeholder_identifier("[unknown-project-42817]"));
+        // Case-insensitive, mirroring the slug lookup's eq_ignore_ascii_case.
+        assert!(is_orphan_placeholder_identifier("[UNKNOWN-PROJECT-7]"));
+
+        // Everything a real caller passes on the NOT_FOUND hot path must stay
+        // on the cheap real-rows-only probe.
+        assert!(!is_orphan_placeholder_identifier("/data/projects/phantom"));
+        assert!(!is_orphan_placeholder_identifier("my-project"));
+        assert!(!is_orphan_placeholder_identifier("unknown-project-3"));
+        assert!(!is_orphan_placeholder_identifier("[unknown-project-]"));
+        assert!(!is_orphan_placeholder_identifier("[unknown-project-3x]"));
+        assert!(!is_orphan_placeholder_identifier("[unknown-project-3"));
+        assert!(!is_orphan_placeholder_identifier(""));
+    }
 
     #[test]
     fn transaction_write_intent_marks_only_mutating_commits_for_latency() {

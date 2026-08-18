@@ -75842,6 +75842,26 @@ fn read_blocking_http_chunk<R: std::io::Read>(
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                // Deadline exhausted on a transient-class error: this is a
+                // response timeout, not a broken transport. Surfacing the raw
+                // errno here (`Resource temporarily unavailable (os error 11)`)
+                // hid what actually happened whenever a slow server-side code
+                // path outlived the proxy deadline. The wording must keep the
+                // `request to … timed out after …` shape that
+                // `server_tool_error_is_unavailable` recognizes.
+                return Err(CliError::Other(format!(
+                    "request to {server_url} timed out after the response deadline expired \
+                     (the server may still be processing the request; last read: {error})"
+                )));
+            }
             Err(error) => {
                 return Err(CliError::Other(format!(
                     "transport failure calling {server_url}: {error}"
@@ -75886,9 +75906,7 @@ fn write_blocking_http_all<W: std::io::Write>(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(error) => {
-                return Err(CliError::Other(format!(
-                    "transport failure calling {server_url}: {error}"
-                )));
+                return Err(blocking_http_write_deadline_error(server_url, &error));
             }
         }
     }
@@ -75906,11 +75924,30 @@ fn write_blocking_http_all<W: std::io::Write>(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(error) => {
-                return Err(CliError::Other(format!(
-                    "transport failure calling {server_url}: {error}"
-                )));
+                return Err(blocking_http_write_deadline_error(server_url, &error));
             }
         }
+    }
+}
+
+/// Map a fatal blocking-write error to a legible CLI error: a transient-class
+/// errno (`EAGAIN`/`ETIMEDOUT`/`EINTR`) that reaches the fatal arm means the
+/// retry deadline expired, which deserves a timeout message rather than the
+/// raw OS error (see the matching read-side arm in
+/// [`read_blocking_http_chunk`]).
+fn blocking_http_write_deadline_error(server_url: &str, error: &std::io::Error) -> CliError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    ) {
+        CliError::Other(format!(
+            "request to {server_url} timed out after the send deadline expired \
+             (the server did not accept the request in time; last write: {error})"
+        ))
+    } else {
+        CliError::Other(format!("transport failure calling {server_url}: {error}"))
     }
 }
 
@@ -76366,13 +76403,15 @@ mod blocking_http_chunk_tests {
     #[test]
     fn interrupt_past_deadline_is_fatal() {
         // If EINTR keeps firing past the deadline, the call eventually fails
-        // (a genuinely wedged endpoint must not loop forever).
+        // (a genuinely wedged endpoint must not loop forever) — reported as a
+        // response timeout, since the transient-class error itself is noise.
         let mut reader = ScriptedReader::new(vec![Err(ErrorKind::Interrupted); 8]);
         let mut chunk = [0_u8; 16];
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let err = read_blocking_http_chunk(&mut reader, &mut chunk, "http://x/mcp/", past)
             .expect_err("past-deadline interrupt must be fatal");
-        assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
+        assert!(matches!(err, CliError::Other(msg)
+                if msg.starts_with("request to ") && msg.contains(" timed out after ")));
     }
 
     /// A `Write` that replays a scripted sequence of results, one per call.
@@ -76436,12 +76475,45 @@ mod blocking_http_chunk_tests {
     }
 
     #[test]
-    fn transient_write_error_past_deadline_is_fatal() {
+    fn transient_write_error_past_deadline_is_a_legible_timeout() {
         let mut w = ScriptedWriter::new(vec![Err(ErrorKind::WouldBlock); 8]);
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let err = super::write_blocking_http_all(&mut w, b"data", "http://x/mcp/", past)
             .expect_err("past-deadline EAGAIN must be fatal");
-        assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
+        // The deadline expiring is a timeout, and must read as one — not as a
+        // raw `Resource temporarily unavailable (os error 11)` transport
+        // failure. The shape must stay in the `request to … timed out after …`
+        // family that server_tool_error_is_unavailable recognizes.
+        assert!(
+            super::server_tool_error_is_unavailable(&err),
+            "a proxy deadline expiry must still classify as server-unavailable"
+        );
+        assert!(
+            matches!(&err, CliError::Other(msg)
+                if msg.starts_with("request to ") && msg.contains(" timed out after ")),
+            "expected a timeout-shaped message, got: {err}"
+        );
+    }
+
+    /// The read-side twin of the write test above: a server-side code path
+    /// that outlives the response deadline used to surface as a raw
+    /// `os error 11` transport failure (the phantom-project-key case).
+    #[test]
+    fn transient_read_error_past_deadline_is_a_legible_timeout() {
+        let mut reader = ScriptedReader::new(vec![Err(ErrorKind::WouldBlock); 8]);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut chunk = [0_u8; 16];
+        let err = super::read_blocking_http_chunk(&mut reader, &mut chunk, "http://x/mcp/", past)
+            .expect_err("past-deadline EAGAIN must be fatal");
+        assert!(
+            super::server_tool_error_is_unavailable(&err),
+            "a proxy deadline expiry must still classify as server-unavailable"
+        );
+        assert!(
+            matches!(&err, CliError::Other(msg)
+                if msg.starts_with("request to ") && msg.contains(" timed out after ")),
+            "expected a timeout-shaped message, got: {err}"
+        );
     }
 }
 
@@ -77650,9 +77722,20 @@ pub(crate) async fn try_call_server_tool(
     });
     classify_server_tool_call(
         tool_name,
-        post_jsonrpc_request(server_url, bearer, &req, 10).await,
+        post_jsonrpc_request(server_url, bearer, &req, SERVER_TOOL_CALL_TIMEOUT_SECS).await,
     )
 }
+
+/// Response deadline for daemon-proxied tool calls.
+///
+/// This must comfortably exceed the server's slowest legitimate tool
+/// response, not just the typical one: a deadline that lands *inside* the
+/// server's processing window converts a helpful server-side error into a
+/// client-side timeout. The historical 10s value sat just under the ~11s a
+/// NOT_FOUND project resolution took against a large mailbox, so exactly the
+/// callers who misspelled a project key got a raw transport failure instead
+/// of the "did you mean" message. 30s matches the local-fallback send bound.
+const SERVER_TOOL_CALL_TIMEOUT_SECS: u64 = 30;
 
 fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Value> {
     match result {

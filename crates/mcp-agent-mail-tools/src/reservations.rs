@@ -648,16 +648,13 @@ fn released_rows_needing_archive_heal(
         if !ts_is_positive(row.released_ts) {
             continue;
         }
-        let needs_heal = match archive_present.get(&id) {
-            Some(view) => {
-                !ts_is_positive(view.released_ts)
-                    || crate::reservation_parity::is_foreign_generation(
-                        db_generation,
-                        view.generation.as_deref(),
-                    )
-            }
-            None => false,
-        };
+        let needs_heal = archive_present.get(&id).is_some_and(|view| {
+            !ts_is_positive(view.released_ts)
+                || crate::reservation_parity::is_foreign_generation(
+                    db_generation,
+                    view.generation.as_deref(),
+                )
+        });
         if needs_heal {
             heal.push(released_reservation_artifact_json(
                 project_human_key,

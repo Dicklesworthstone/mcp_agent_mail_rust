@@ -32,6 +32,23 @@ binaries were cut from a snapshot that predates everything below.
   promotion regression test and doctor-receipt labels for the new
   sidecar kinds. An engine-side ask (bind the cert to the db file's
   identity) is filed upstream as frankensqlite#364.
+- **A misspelled or phantom `project_key` answers quickly with the
+  "did you mean" message instead of an 11-second stall that the CLI
+  reported as a raw `os error 11`.** Two paired defects: (1) every
+  project-lookup miss ran the orphaned-project inventory augmentation —
+  four anti-join scans over `messages`/`agents`/`file_reservations`/
+  `product_project_links` plus per-orphan MIN() aggregates, twice
+  (lookup fallback, then fuzzy suggestions) — even though those
+  placeholder rows can only ever match the literal
+  `[unknown-project-N]` shape; the scans are now gated on that shape
+  and the suggestion pass reads plain project rows only. (2) The CLI's
+  daemon-proxy tool-call deadline was 10s — just under that server-side
+  worst case — and a deadline expiry surfaced the raw transient errno
+  (`Resource temporarily unavailable (os error 11)`) instead of a
+  timeout message. The deadline is now 30s (matching the local-fallback
+  bound) and an exhausted response/send deadline reports a legible
+  `request to … timed out after …` error with unchanged
+  unavailable-classification semantics.
 - **`am doctor mcp-selftest` runs a valid MCP lifecycle
   ([#248](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/248)).**
   The self-test now sends the standard `notifications/initialized`

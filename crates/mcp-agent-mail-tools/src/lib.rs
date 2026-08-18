@@ -1316,7 +1316,11 @@ pub mod tool_util {
         min_score: f64,
     ) -> Vec<(String, String, f64)> {
         let slug = mcp_agent_mail_core::slugify(identifier);
-        let out = mcp_agent_mail_db::queries::list_projects(ctx.cx(), pool).await;
+        // Real rows only: this runs on the NOT_FOUND path, where the orphan
+        // placeholder augmentation's full anti-join scans would dominate the
+        // error's latency and `[unknown-project-N]` names make no sense as
+        // "did you mean" suggestions.
+        let out = mcp_agent_mail_db::queries::list_project_rows(ctx.cx(), pool).await;
         let asupersync::Outcome::Ok(projects) = out else {
             return Vec::new();
         };

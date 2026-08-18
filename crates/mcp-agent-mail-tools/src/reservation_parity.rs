@@ -311,9 +311,11 @@ fn positive_ts(ts: Option<i64>) -> bool {
 }
 
 /// Is an archive artifact's embedded generation foreign to the live database's
-/// current generation (br-n8qh6)? An artifact with no embedded generation
-/// (legacy naming) is never foreign — it is attributed to whichever generation
-/// is live, matching `find_reservation_artifact`'s own legacy-name handling.
+/// current generation (br-n8qh6)?
+///
+/// An artifact with no embedded generation (legacy naming) is never foreign —
+/// it is attributed to whichever generation is live, matching
+/// `find_reservation_artifact`'s own legacy-name handling.
 /// A missing/unseeded live generation means generations cannot be attributed at
 /// all, so nothing is foreign. Shared by the parity checker's own archive scan
 /// and by reconcile-on-read's heal decisions (`mcp-agent-mail-tools::reservations`)
