@@ -7917,7 +7917,18 @@ fn quarantined_sidecar_path(
     )
 }
 
-const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+// `-wal-cert` / `-wal-cert-head` are FrankenSQLite's WAL-certification
+// sidecars. They carry frame/db_size state for the SPECIFIC database file
+// they were written beside: leaving them in place while repair/reconstruct
+// promotion swaps in a fresh `storage.sqlite3` makes the engine replay the
+// OLD file's db_size on the next open and re-extend the fresh file to the
+// old page count, orphaning the entire gap as "Page N: never used" within
+// seconds of startup (the non-converging heal loop diagnosed 2026-08-18;
+// frankensqlite GH#364). They must rotate with `-wal`/`-shm` everywhere
+// this list is consulted: candidate-conflict checks, live-sidecar probes,
+// post-checkpoint quarantine, and promotion's corrupt-sidecar quarantine.
+const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 5] =
+    ["-journal", "-wal", "-shm", "-wal-cert", "-wal-cert-head"];
 // Legacy builds could leave FrankenSQLite namespace coordination files beside
 // a disposable candidate. They must block reuse of that pathname, but must
 // never be unlinked here: namespace records are persistent by design and only
@@ -14077,9 +14088,11 @@ mod tests {
             .expect("create");
         drop(conn);
 
-        let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-journal"));
-        let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-wal"));
-        let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-shm"));
+        // Clear every suffix the probe consults (including the fsqlite
+        // -wal-cert pair the engine wrote alongside the WAL).
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, suffix));
+        }
 
         assert!(!sqlite_file_has_live_sidecars(&path));
 
