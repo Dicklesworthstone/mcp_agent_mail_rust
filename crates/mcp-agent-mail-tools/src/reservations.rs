@@ -4523,8 +4523,11 @@ mod tests {
             "foreign-generation-only coverage must be re-emitted under the current generation"
         );
         assert_eq!(heal[0]["agent"], "GreenCastle");
+        // Artifacts carry released_ts as an ISO-8601 string
+        // (released_ts_json_value → micros_to_iso), not raw microseconds.
         assert_eq!(
-            heal[0]["released_ts"], 5_000,
+            heal[0]["released_ts"],
+            micros_to_iso(5_000),
             "the re-emitted artifact must carry the DB's authoritative released_ts"
         );
     }
