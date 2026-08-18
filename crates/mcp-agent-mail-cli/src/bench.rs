@@ -346,12 +346,16 @@ const CMD_MAIL_SEARCH: &[&str] = &[
     "--json",
     "bench",
 ];
-const CMD_THREADS_LIST: &[&str] = &[
-    "mail",
-    "threads",
+// The `am mail threads` verb was removed from the CLI; the operational
+// thread-overview surface is now `am robot status` (dashboard synthesis
+// including top threads), so the benchmark case follows it.
+const CMD_ROBOT_STATUS: &[&str] = &[
+    "robot",
+    "status",
     "--project",
     BENCH_PROJECT_HUMAN_KEY,
-    "--json",
+    "--format",
+    "json",
 ];
 const CMD_DOCTOR_CHECK: &[&str] = &["doctor", "check", "--json"];
 const CMD_MESSAGE_COUNT: &[&str] = &[
@@ -927,8 +931,8 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
-        name: "mail_threads",
-        command: CMD_THREADS_LIST,
+        name: "robot_status",
+        command: CMD_ROBOT_STATUS,
         category: BenchCategory::Operational,
         default_runs: DEFAULT_RUNS,
         requires_seeded_db: true,
