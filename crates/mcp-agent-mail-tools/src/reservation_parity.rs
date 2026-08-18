@@ -497,23 +497,19 @@ where
             }
         } else {
             let key = (reservation.project_slug.clone(), reservation.reservation_id);
-            match archive_index.get(&key) {
-                Some(&existing_idx) => {
-                    let existing_is_stamped =
-                        archive_reservations[existing_idx].generation.is_some();
-                    let new_is_stamped = reservation.generation.is_some();
-                    if new_is_stamped && !existing_is_stamped {
-                        archive_reservations[existing_idx] = reservation;
-                    }
-                    // else: keep the already-admitted entry — either it is
-                    // already stamped (and a same-generation id can have at
-                    // most one stamped filename), or both copies are legacy
-                    // and the first one seen is kept deterministically.
+            if let Some(&existing_idx) = archive_index.get(&key) {
+                let existing_is_stamped = archive_reservations[existing_idx].generation.is_some();
+                let new_is_stamped = reservation.generation.is_some();
+                if new_is_stamped && !existing_is_stamped {
+                    archive_reservations[existing_idx] = reservation;
                 }
-                None => {
-                    archive_index.insert(key, archive_reservations.len());
-                    archive_reservations.push(reservation);
-                }
+                // else: keep the already-admitted entry — either it is
+                // already stamped (and a same-generation id can have at
+                // most one stamped filename), or both copies are legacy
+                // and the first one seen is kept deterministically.
+            } else {
+                archive_index.insert(key, archive_reservations.len());
+                archive_reservations.push(reservation);
             }
         }
     }
@@ -1479,11 +1475,10 @@ mod tests {
             "released_ts": 555_i64,
             "db_generation": "aaaa2222",
         });
-        let stamped_name =
-            mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
-                Some("aaaa2222"),
-                1,
-            );
+        let stamped_name = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+            Some("aaaa2222"),
+            1,
+        );
         std::fs::write(
             dir.join(stamped_name),
             serde_json::to_vec_pretty(&stamped).unwrap(),

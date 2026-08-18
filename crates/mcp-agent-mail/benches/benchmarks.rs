@@ -2222,14 +2222,21 @@ fn seed_search_fixture(scenario: SearchScenario) -> SearchFixture {
     std::fs::create_dir_all(&workspace).expect("mkdir workspace");
     let human_key = workspace.to_string_lossy().to_string();
 
-    let project = match block_on(mcp_agent_mail_db::queries::ensure_project(
-        &cx, &pool, &human_key,
-    )) {
-        Outcome::Ok(row) => row,
-        Outcome::Err(e) => panic!("ensure_project failed: {e}"),
-        Outcome::Cancelled(_) => panic!("ensure_project cancelled"),
-        Outcome::Panicked(p) => panic!("ensure_project panicked: {}", p.message()),
-    };
+    // The bench workspace lives in a tempdir, which the ephemeral-project
+    // guard would otherwise refuse to register as a project root; opt in
+    // through the sanctioned process-env override (the bench uses its own
+    // isolated DB, so this never touches a real mailbox).
+    let project = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+        || match block_on(mcp_agent_mail_db::queries::ensure_project(
+            &cx, &pool, &human_key,
+        )) {
+            Outcome::Ok(row) => row,
+            Outcome::Err(e) => panic!("ensure_project failed: {e}"),
+            Outcome::Cancelled(_) => panic!("ensure_project cancelled"),
+            Outcome::Panicked(p) => panic!("ensure_project panicked: {}", p.message()),
+        },
+    );
     let project_id = project.id.unwrap_or(0);
 
     let sender = match block_on(mcp_agent_mail_db::queries::register_agent(
