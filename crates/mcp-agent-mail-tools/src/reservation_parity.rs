@@ -324,7 +324,10 @@ fn positive_ts(ts: Option<i64>) -> bool {
 /// as drift, and nothing ever reconciled the disagreement
 /// (hfdt-am-parity-checker-stale-artifact-read-mwmv4 follow-up).
 #[must_use]
-pub fn is_foreign_generation(current_generation: Option<&str>, artifact_generation: Option<&str>) -> bool {
+pub fn is_foreign_generation(
+    current_generation: Option<&str>,
+    artifact_generation: Option<&str>,
+) -> bool {
     match (current_generation, artifact_generation) {
         (Some(current), Some(generation)) => generation != current,
         _ => false,

@@ -472,8 +472,7 @@ fn active_archive_artifact_diverges(
     agent_name: &str,
     db_generation: Option<&str>,
 ) -> bool {
-    if crate::reservation_parity::is_foreign_generation(db_generation, view.generation.as_deref())
-    {
+    if crate::reservation_parity::is_foreign_generation(db_generation, view.generation.as_deref()) {
         return true;
     }
     if view.agent_name.trim() != agent_name.trim() {
@@ -532,11 +531,9 @@ fn reservation_rows_needing_archive_heal(
         let Some(agent_name) = agent_names.get(&row.agent_id) else {
             continue;
         };
-        let needs_heal = archive_present
-            .get(&id)
-            .is_none_or(|view| {
-                active_archive_artifact_diverges(view, row, agent_name, db_generation)
-            });
+        let needs_heal = archive_present.get(&id).is_none_or(|view| {
+            active_archive_artifact_diverges(view, row, agent_name, db_generation)
+        });
         if needs_heal {
             heal.push(active_reservation_artifact_json(
                 project_human_key,
