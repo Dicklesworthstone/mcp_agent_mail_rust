@@ -310,6 +310,27 @@ fn positive_ts(ts: Option<i64>) -> bool {
     ts.is_some_and(|value| value > 0)
 }
 
+/// Is an archive artifact's embedded generation foreign to the live database's
+/// current generation (br-n8qh6)? An artifact with no embedded generation
+/// (legacy naming) is never foreign — it is attributed to whichever generation
+/// is live, matching `find_reservation_artifact`'s own legacy-name handling.
+/// A missing/unseeded live generation means generations cannot be attributed at
+/// all, so nothing is foreign. Shared by the parity checker's own archive scan
+/// and by reconcile-on-read's heal decisions (`mcp-agent-mail-tools::reservations`)
+/// so the two subsystems agree on what "current" archive coverage means —
+/// before this was unified, a released/active row whose only archive copy was
+/// stamped with a now-superseded generation looked "healthy" to the generation-
+/// blind healer (which never rewrote it) while the checker correctly reported it
+/// as drift, and nothing ever reconciled the disagreement
+/// (hfdt-am-parity-checker-stale-artifact-read-mwmv4 follow-up).
+#[must_use]
+pub fn is_foreign_generation(current_generation: Option<&str>, artifact_generation: Option<&str>) -> bool {
+    match (current_generation, artifact_generation) {
+        (Some(current), Some(generation)) => generation != current,
+        _ => false,
+    }
+}
+
 fn ts_label(ts: Option<i64>) -> String {
     ts.map_or_else(|| "NULL".to_string(), |value| value.to_string())
 }
@@ -472,10 +493,10 @@ where
     // an already-healed row (hfdt-am-parity-checker-stale-artifact-read-mwmv4).
     let mut archive_index: BTreeMap<(String, i64), usize> = BTreeMap::new();
     for reservation in archive_scan.reservations {
-        let is_foreign = match (&current_generation, &reservation.generation) {
-            (Some(current), Some(generation)) => generation != current,
-            _ => false,
-        };
+        let is_foreign = is_foreign_generation(
+            current_generation.as_deref(),
+            reservation.generation.as_deref(),
+        );
         if is_foreign {
             foreign_artifact_keys
                 .insert((reservation.project_slug.clone(), reservation.reservation_id));
@@ -900,6 +921,13 @@ pub struct ArchiveReservationView {
     /// Lets reconcile-on-read heal a stale pre-renew artifact whose only
     /// divergence is the expiry.
     pub expires_ts: Option<i64>,
+    /// The DB generation token embedded in (or attributed to) this artifact —
+    /// `None` for a legacy `id-<id>.json` name that carries no `db_generation`
+    /// field either. Lets a caller detect a resolved artifact that is only
+    /// available under a foreign (superseded) generation via
+    /// `is_foreign_generation`, so reconcile-on-read does not mistake stale
+    /// prior-generation coverage for current coverage.
+    pub generation: Option<String>,
 }
 
 impl From<ArchiveReservationState> for ArchiveReservationView {
@@ -912,6 +940,7 @@ impl From<ArchiveReservationState> for ArchiveReservationView {
             exclusive: state.exclusive,
             released_ts: state.released_ts,
             expires_ts: state.expires_ts,
+            generation: state.generation,
         }
     }
 }

@@ -457,11 +457,25 @@ fn ts_is_positive(ts: Option<i64>) -> bool {
 /// is never treated as divergence (br-xyy95) — only a present-but-different value
 /// is. An active DB row (`released_ts` absent) whose artifact records a release is
 /// divergence (the #112 stuck-`released_ts` class).
+///
+/// A resolved artifact stamped with a *foreign* (superseded) generation is also
+/// divergence, even when every field matches: `find_reservation_artifact` (used
+/// to resolve `view`) is generation-blind, so without this check a row whose only
+/// coverage is a prior-generation artifact looks "healthy" here and never gets
+/// re-emitted under the current generation — while `reservation_parity`'s checker
+/// correctly excludes that same artifact as foreign and reports it as missing.
+/// The two subsystems must agree on what counts as current coverage
+/// (hfdt-am-parity-checker-stale-artifact-read-mwmv4 follow-up).
 fn active_archive_artifact_diverges(
     view: &crate::reservation_parity::ArchiveReservationView,
     row: &mcp_agent_mail_db::FileReservationRow,
     agent_name: &str,
+    db_generation: Option<&str>,
 ) -> bool {
+    if crate::reservation_parity::is_foreign_generation(db_generation, view.generation.as_deref())
+    {
+        return true;
+    }
     if view.agent_name.trim() != agent_name.trim() {
         return true;
     }
@@ -520,7 +534,9 @@ fn reservation_rows_needing_archive_heal(
         };
         let needs_heal = archive_present
             .get(&id)
-            .is_none_or(|view| active_archive_artifact_diverges(view, row, agent_name));
+            .is_none_or(|view| {
+                active_archive_artifact_diverges(view, row, agent_name, db_generation)
+            });
         if needs_heal {
             heal.push(active_reservation_artifact_json(
                 project_human_key,
@@ -604,6 +620,19 @@ fn reconcile_active_reservation_archive(
 /// stale holder until `expires_ts`. A missing artifact needs no heal (there is
 /// nothing for the guard to honor), and a row whose holder name is unknown is
 /// skipped for the same wrong-holder reason as the active healer.
+///
+/// Also heals when the resolved artifact is only available under a *foreign*
+/// (superseded) generation, even though its content — including `released_ts`
+/// — already matches the DB: `read_project_archive_reservation` resolves via
+/// `find_reservation_artifact`, which is generation-blind, so a released row
+/// whose only coverage predates the live database's generation (typically
+/// after `doctor reconstruct` mints a new one) looked fully healthy here and
+/// was never re-emitted under the current generation. Meanwhile
+/// `reservation_parity`'s checker correctly excludes that same foreign-
+/// generation artifact from comparison and reports the row as drift — and
+/// nothing ever reconciled the disagreement, since this was the one code path
+/// that could have written a current-generation copy
+/// (hfdt-am-parity-checker-stale-artifact-read-mwmv4 follow-up).
 fn released_rows_needing_archive_heal(
     project_human_key: &str,
     released_rows: &[mcp_agent_mail_db::FileReservationRow],
@@ -622,10 +651,17 @@ fn released_rows_needing_archive_heal(
         if !ts_is_positive(row.released_ts) {
             continue;
         }
-        let artifact_claims_active = archive_present
-            .get(&id)
-            .is_some_and(|view| !ts_is_positive(view.released_ts));
-        if artifact_claims_active {
+        let needs_heal = match archive_present.get(&id) {
+            Some(view) => {
+                !ts_is_positive(view.released_ts)
+                    || crate::reservation_parity::is_foreign_generation(
+                        db_generation,
+                        view.generation.as_deref(),
+                    )
+            }
+            None => false,
+        };
+        if needs_heal {
             heal.push(released_reservation_artifact_json(
                 project_human_key,
                 agent_name,
@@ -4055,6 +4091,23 @@ mod tests {
             exclusive,
             released_ts,
             expires_ts: None,
+            generation: None,
+        }
+    }
+
+    /// Same as `archive_view`, but stamped with an explicit generation token —
+    /// used to build the foreign-generation-coverage regression shape.
+    fn archive_view_with_generation(
+        id: i64,
+        agent: &str,
+        path_pattern: Option<&str>,
+        exclusive: Option<bool>,
+        released_ts: Option<i64>,
+        generation: &str,
+    ) -> crate::reservation_parity::ArchiveReservationView {
+        crate::reservation_parity::ArchiveReservationView {
+            generation: Some(generation.to_string()),
+            ..archive_view(id, agent, path_pattern, exclusive, released_ts)
         }
     }
 
@@ -4304,6 +4357,69 @@ mod tests {
     }
 
     #[test]
+    fn active_heal_rewrites_foreign_generation_only_coverage() {
+        // Active-row counterpart of `released_heal_rewrites_foreign_generation_only_coverage`:
+        // matching content under a foreign generation must still be treated as
+        // divergence, or an active reservation whose only coverage predates a
+        // `doctor reconstruct` would never get a current-generation artifact,
+        // and the checker would report it as `missing_archive` (a live-lock
+        // visibility risk) with no fixer able to clear it.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view_with_generation(
+                1,
+                "GreenCastle",
+                Some("src/**"),
+                Some(true),
+                None,
+                "prior-generation-token",
+            ),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+            Some("current-generation-token"),
+        );
+        assert_eq!(
+            heal.len(),
+            1,
+            "foreign-generation-only coverage must be re-emitted under the current generation"
+        );
+    }
+
+    #[test]
+    fn active_heal_is_noop_when_current_generation_coverage_already_correct() {
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view_with_generation(
+                1,
+                "GreenCastle",
+                Some("src/**"),
+                Some(true),
+                None,
+                "current-generation-token",
+            ),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+            Some("current-generation-token"),
+        );
+        assert!(
+            heal.is_empty(),
+            "matching current-generation coverage needs no heal: {heal:?}"
+        );
+    }
+
+    #[test]
     fn healed_artifact_json_round_trips_through_archive_scan() {
         // The consistency proof: the artifact the healer authors, written to disk
         // and scanned back, agrees with the DB row — so re-emitting converges
@@ -4333,7 +4449,7 @@ mod tests {
         assert_eq!(view.exclusive, Some(true));
         assert_eq!(view.released_ts, None);
         assert!(
-            !active_archive_artifact_diverges(&view, &row, "GreenCastle"),
+            !active_archive_artifact_diverges(&view, &row, "GreenCastle", None),
             "a freshly healed artifact must read back as consistent with the DB row"
         );
     }
@@ -4366,6 +4482,80 @@ mod tests {
         assert!(
             !heal[0]["released_ts"].is_null(),
             "the healed artifact must be terminal (released_ts set)"
+        );
+    }
+
+    #[test]
+    fn released_heal_rewrites_foreign_generation_only_coverage() {
+        // hfdt-am-parity-checker-stale-artifact-read-mwmv4 follow-up: the exact
+        // live shape found on ids 14724/14785/15048/15049/15054/15055. The
+        // resolved artifact's CONTENT matches the DB exactly, including
+        // released_ts -- but it is stamped with a generation that predates the
+        // live database's current generation (typically left behind by a
+        // `doctor reconstruct`). Before this fix, matching content meant no
+        // heal fired, so a current-generation copy was never written and
+        // `reservation_parity`'s checker (which correctly excludes foreign-
+        // generation artifacts) reported permanent drift with nothing able to
+        // clear it.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view_with_generation(
+                1,
+                "GreenCastle",
+                Some("src/**"),
+                Some(true),
+                Some(5_000),
+                "prior-generation-token",
+            ),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+            Some("current-generation-token"),
+        );
+        assert_eq!(
+            heal.len(),
+            1,
+            "foreign-generation-only coverage must be re-emitted under the current generation"
+        );
+        assert_eq!(heal[0]["agent"], "GreenCastle");
+        assert_eq!(
+            heal[0]["released_ts"], 5_000,
+            "the re-emitted artifact must carry the DB's authoritative released_ts"
+        );
+    }
+
+    #[test]
+    fn released_heal_is_noop_when_current_generation_coverage_already_correct() {
+        // Guard against the fix over-firing: a current-generation artifact that
+        // already matches must not be re-emitted every read.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view_with_generation(
+                1,
+                "GreenCastle",
+                Some("src/**"),
+                Some(true),
+                Some(5_000),
+                "current-generation-token",
+            ),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+            Some("current-generation-token"),
+        );
+        assert!(
+            heal.is_empty(),
+            "matching current-generation coverage needs no heal: {heal:?}"
         );
     }
 
