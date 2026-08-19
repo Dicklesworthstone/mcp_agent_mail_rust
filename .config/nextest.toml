@@ -99,6 +99,17 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 '''
 threads-required = "num-test-threads"
 
+# Two labs need more than the 10-minute leash even in isolation: the
+# 120-agent multi-project pipeline (4x the 30-agent lab's work at ~40s p99
+# per wave), and the TUI transport gate, whose e2e adapter enforces its own
+# 1200s internal timeout — the runner watchdog must sit ABOVE that so the
+# adapter's graceful failure (with artifacts) wins over a SIGKILL.
+# NOTE: nextest applies the FIRST matching override per key, so this
+# specific rule must precede the binary-wide 120s rule below.
+[[profile.default.overrides]]
+filter = 'test(stress_multi_project_120_agents) | test(native_tui_transport_gate)'
+slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
+
 # The pipeline/load labs legitimately run for minutes even on an idle host
 # under the registry fsqlite engine (the 30-agent DB+Git pipeline alone
 # delivers p99 ≈ 40s per message wave). Give them a watchdog sized for the
@@ -112,15 +123,6 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(native_share_archive_transport_gate)
 '''
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "10s" }
-
-# Two labs need more than the 10-minute leash even in isolation: the
-# 120-agent multi-project pipeline (4x the 30-agent lab's work at ~40s p99
-# per wave), and the TUI transport gate, whose e2e adapter enforces its own
-# 1200s internal timeout — the runner watchdog must sit ABOVE that so the
-# adapter's graceful failure (with artifacts) wins over a SIGKILL.
-[[profile.default.overrides]]
-filter = 'test(stress_multi_project_120_agents) | test(native_tui_transport_gate)'
-slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
 
 # CI profile inherits the same protections with a shorter slow-warning cadence
 # and an automatic single retry for flakes, while keeping the same hard kill.
@@ -161,6 +163,11 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 '''
 threads-required = "num-test-threads"
 
+# First-match precedence: specific long-lab rule before the binary-wide rule.
+[[profile.ci.overrides]]
+filter = 'test(stress_multi_project_120_agents) | test(native_tui_transport_gate)'
+slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
+
 [[profile.ci.overrides]]
 filter = '''
 binary_id(mcp-agent-mail-storage::stress_pipeline)
@@ -170,7 +177,3 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(native_share_archive_transport_gate)
 '''
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "10s" }
-
-[[profile.ci.overrides]]
-filter = 'test(stress_multi_project_120_agents) | test(native_tui_transport_gate)'
-slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
