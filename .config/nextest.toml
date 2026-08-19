@@ -67,6 +67,52 @@ slow-timeout = { period = "180s", terminate-after = 5, grace-period = "10s" }
 filter = 'test(create_message_with_recipients_rebuilds_inbox_stats_across_sqlite_bind_chunks)'
 slow-timeout = { period = "180s", terminate-after = 6, grace-period = "10s" }
 
+# ---------------------------------------------------------------------------
+# Load-lab / latency-measurement isolation (2026-08-18)
+#
+# These suites assert wall-clock latency percentiles, drive deliberate
+# thundering-herd contention against their own private DB, or measure SLO
+# artifacts. Running them WHILE the rest of the ~16k-test suite saturates
+# every hardware thread does not measure the code — it measures the host's
+# scheduler under oversubscription (observed: pool-acquire p95 of 524ms under
+# a full parallel run vs sub-ms alone; spin-executor hang detectors firing at
+# 60s on writes that take 2s alone). `threads-required = "num-test-threads"`
+# makes nextest schedule each of these tests with the entire thread budget
+# reserved, i.e. effectively alone, so their latency assertions measure the
+# code on an unloaded machine — the same environment their budgets were
+# calibrated against. This costs serial wall-clock only for this short list.
+# ---------------------------------------------------------------------------
+[[profile.default.overrides]]
+filter = '''
+binary_id(mcp-agent-mail-storage::stress_pipeline)
+| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
+| binary_id(mcp-agent-mail-db::load_concurrency)
+| binary_id(mcp-agent-mail-db::load_bench)
+| binary_id(mcp-agent-mail-db::stress)
+| test(native_http_transport_gate)
+| test(native_share_archive_transport_gate)
+| test(native_tui_transport_gate)
+| test(native_security_privacy_gate)
+| test(rapid_key_sequences_no_panic)
+| binary_id(mcp-agent-mail-server::tui_perf_baselines)
+'''
+threads-required = "num-test-threads"
+
+# The pipeline/load labs legitimately run for minutes even on an idle host
+# under the registry fsqlite engine (the 30-agent DB+Git pipeline alone
+# delivers p99 ≈ 40s per message wave). Give them a watchdog sized for the
+# isolated-run reality — still finite, so a genuine hang dies in minutes.
+[[profile.default.overrides]]
+filter = '''
+binary_id(mcp-agent-mail-storage::stress_pipeline)
+| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
+| test(swarm_load_lab_ci_smoke_writes_slo_artifacts)
+| test(native_http_transport_gate)
+| test(native_share_archive_transport_gate)
+| test(native_tui_transport_gate)
+'''
+slow-timeout = { period = "120s", terminate-after = 5, grace-period = "10s" }
+
 # CI profile inherits the same protections with a shorter slow-warning cadence
 # and an automatic single retry for flakes, while keeping the same hard kill.
 [profile.ci]
@@ -87,3 +133,31 @@ slow-timeout = { period = "180s", terminate-after = 5, grace-period = "10s" }
 [[profile.ci.overrides]]
 filter = 'test(create_message_with_recipients_rebuilds_inbox_stats_across_sqlite_bind_chunks)'
 slow-timeout = { period = "180s", terminate-after = 6, grace-period = "10s" }
+
+# Same load-lab isolation + watchdogs under CI (overrides do not inherit).
+[[profile.ci.overrides]]
+filter = '''
+binary_id(mcp-agent-mail-storage::stress_pipeline)
+| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
+| binary_id(mcp-agent-mail-db::load_concurrency)
+| binary_id(mcp-agent-mail-db::load_bench)
+| binary_id(mcp-agent-mail-db::stress)
+| test(native_http_transport_gate)
+| test(native_share_archive_transport_gate)
+| test(native_tui_transport_gate)
+| test(native_security_privacy_gate)
+| test(rapid_key_sequences_no_panic)
+| binary_id(mcp-agent-mail-server::tui_perf_baselines)
+'''
+threads-required = "num-test-threads"
+
+[[profile.ci.overrides]]
+filter = '''
+binary_id(mcp-agent-mail-storage::stress_pipeline)
+| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
+| test(swarm_load_lab_ci_smoke_writes_slo_artifacts)
+| test(native_http_transport_gate)
+| test(native_share_archive_transport_gate)
+| test(native_tui_transport_gate)
+'''
+slow-timeout = { period = "120s", terminate-after = 5, grace-period = "10s" }
