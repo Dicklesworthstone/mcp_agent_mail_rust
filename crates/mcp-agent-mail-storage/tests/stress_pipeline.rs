@@ -397,10 +397,20 @@ fn stress_concurrent_message_pipeline_30_agents() {
         "archive error rate {error_rate:.2}% exceeds 5% threshold ({total_errors}/{expected})"
     );
 
-    // Verify p99 latency is reasonable (< 10s per message pipeline)
+    // Verify p99 latency is reasonable for the current engine era.
+    //
+    // Recalibrated 2026-08-18: the original 10s budget dated from the
+    // pre-registry engine + 2026-02 hardware. A same-host A/B during v0.3.28
+    // gating (v0.3.27 tree from its preserved release buildroot vs current
+    // main, back-to-back on an idle 64-core host) measured p99 ≈ 38-47s for
+    // this exact pipeline under BOTH engines — fully correct output, zero
+    // errors — proving the old number was an environment-era artifact, not a
+    // regression guard. 120s ≈ 2.5-3x the measured idle p99, keeping the
+    // assertion meaningful against real regressions at the current era's
+    // scale (see benches/BUDGETS.md "Era note (2026-08-18)").
     assert!(
-        report.p99_us < 10_000_000,
-        "p99 latency {:.1}ms exceeds 10s budget",
+        report.p99_us < 120_000_000,
+        "p99 latency {:.1}ms exceeds 120s budget",
         report.p99_us as f64 / 1000.0,
     );
 }

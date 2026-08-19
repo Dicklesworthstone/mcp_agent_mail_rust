@@ -53,9 +53,22 @@ fn tantivy_test_lock() -> &'static Mutex<()> {
 
 #[cfg(feature = "tantivy-engine")]
 fn ensure_tantivy_bridge_initialized() {
-    let index_dir = std::env::temp_dir().join("mcp_agent_mail_search_v3_test_index");
-    std::fs::create_dir_all(&index_dir).expect("create tantivy test index dir");
-    init_or_switch_bridge(&index_dir).expect("initialize Tantivy bridge");
+    // One index dir PER TEST PROCESS, auto-cleaned on process exit. The
+    // previous fixed shared path (`$TMPDIR/mcp_agent_mail_search_v3_test_index`)
+    // was only guarded by the in-process `tantivy_test_lock`, which nextest's
+    // process-per-test model cannot see — concurrent test processes raced on
+    // the same Tantivy writer lock and reader generation, making the whole
+    // `v3_lexical_*` family flaky under a parallel run while passing in
+    // isolation. The bridge is process-global, so a per-process dir gives
+    // every nextest test a fully private index.
+    static INDEX_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let index_dir = INDEX_DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("mcp_agent_mail_search_v3_test_index_")
+            .tempdir()
+            .expect("create tantivy test index dir")
+    });
+    init_or_switch_bridge(index_dir.path()).expect("initialize Tantivy bridge");
 }
 
 #[cfg(feature = "tantivy-engine")]
