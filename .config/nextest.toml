@@ -95,6 +95,7 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(native_security_privacy_gate)
 | test(rapid_key_sequences_no_panic)
 | binary_id(mcp-agent-mail-server::tui_perf_baselines)
+| binary_id(mcp-agent-mail-server::golden_snapshots)
 '''
 threads-required = "num-test-threads"
 
@@ -109,9 +110,17 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(swarm_load_lab_ci_smoke_writes_slo_artifacts)
 | test(native_http_transport_gate)
 | test(native_share_archive_transport_gate)
-| test(native_tui_transport_gate)
 '''
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "10s" }
+
+# Two labs need more than the 10-minute leash even in isolation: the
+# 120-agent multi-project pipeline (4x the 30-agent lab's work at ~40s p99
+# per wave), and the TUI transport gate, whose e2e adapter enforces its own
+# 1200s internal timeout — the runner watchdog must sit ABOVE that so the
+# adapter's graceful failure (with artifacts) wins over a SIGKILL.
+[[profile.default.overrides]]
+filter = 'test(stress_multi_project_120_agents) | test(native_tui_transport_gate)'
+slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
 
 # CI profile inherits the same protections with a shorter slow-warning cadence
 # and an automatic single retry for flakes, while keeping the same hard kill.
@@ -148,6 +157,7 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(native_security_privacy_gate)
 | test(rapid_key_sequences_no_panic)
 | binary_id(mcp-agent-mail-server::tui_perf_baselines)
+| binary_id(mcp-agent-mail-server::golden_snapshots)
 '''
 threads-required = "num-test-threads"
 
@@ -158,6 +168,9 @@ binary_id(mcp-agent-mail-storage::stress_pipeline)
 | test(swarm_load_lab_ci_smoke_writes_slo_artifacts)
 | test(native_http_transport_gate)
 | test(native_share_archive_transport_gate)
-| test(native_tui_transport_gate)
 '''
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "10s" }
+
+[[profile.ci.overrides]]
+filter = 'test(stress_multi_project_120_agents) | test(native_tui_transport_gate)'
+slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
