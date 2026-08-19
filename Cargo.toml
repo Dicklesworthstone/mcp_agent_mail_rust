@@ -244,7 +244,15 @@ ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 # so the graph keeps ONE engine without any path pin.
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 tru = { path = "../toon_rust" }
-rich_rust = { path = "../rich_rust" }
+# Gated clone at the 0.2.2 commit (f4b1573). The live ../rich_rust clone
+# moves under active development (bumped to 0.2.3 on 2026-08-19), while the
+# gated fastmcp-rel-0328 clone's fastmcp-console requires exactly =0.2.2 —
+# a moving live clone silently un-applies this patch and cargo falls back to
+# crates.io rich_rust 0.2.2, whose `time >=0.3.47,<0.3.48` pin is
+# unsatisfiable against fastmcp-console's `time =0.3.55` (default-features
+# builds break; portable builds don't pull fastmcp-console and mask it).
+# Same landmine class the fastmcp/sqlmodel gated clones solve.
+rich_rust = { path = "../rich_rust-rel-0328" }
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the
