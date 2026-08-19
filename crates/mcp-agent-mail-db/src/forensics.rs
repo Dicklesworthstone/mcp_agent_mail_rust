@@ -1582,7 +1582,7 @@ fn collect_recovery_continuity_sets_with_overrides(
                  FROM messages AS m NOT INDEXED \
                  JOIN projects AS p NOT INDEXED ON p.id = m.project_id \
                  JOIN agents AS sender NOT INDEXED \
-                   ON sender.id = m.sender_id AND sender.project_id = m.project_id",
+                   ON sender.id = m.sender_id",
                 &[],
             )
             .map_err(|error| recovery_receipt_error("message snapshot query", db_path, error))?;
@@ -1606,7 +1606,7 @@ fn collect_recovery_continuity_sets_with_overrides(
                 "message ownership join",
                 db_path,
                 format!(
-                    "joined {} of {table_count} message rows; refusing orphaned or cross-project senders",
+                    "joined {} of {table_count} message rows; refusing messages whose sender or project row is missing (GH#251: senders registered in another project are legal — `macros contact-handshake` files its welcome message under the recipient's project)",
                     rows.len()
                 ),
             ));
@@ -1720,7 +1720,7 @@ fn collect_recovery_continuity_sets_with_overrides(
                  JOIN messages AS m NOT INDEXED ON m.id = mr.message_id \
                  JOIN projects AS p NOT INDEXED ON p.id = m.project_id \
                  JOIN agents AS recipient NOT INDEXED \
-                   ON recipient.id = mr.agent_id AND recipient.project_id = m.project_id",
+                   ON recipient.id = mr.agent_id",
                 &[],
             )
             .map_err(|error| {
@@ -1753,7 +1753,7 @@ fn collect_recovery_continuity_sets_with_overrides(
                 "message-recipient ownership join",
                 db_path,
                 format!(
-                    "joined {} of {table_count} recipient rows; refusing orphaned or cross-project recipients",
+                    "joined {} of {table_count} recipient rows; refusing recipients whose agent, message, or project row is missing (GH#251: cross-project recipients are legal on threads created by `macros contact-handshake`)",
                     rows.len()
                 ),
             ));
@@ -5041,21 +5041,29 @@ mod tests {
             .expect("duplicate rejection must not leave a pending intent");
     }
 
+    /// GH#251: `macros contact-handshake --to-project` files its welcome
+    /// message under the recipient's project with a sender registered in a
+    /// different project, and replies on that thread can carry cross-project
+    /// recipients. Those shapes must restore. Only a sender/recipient whose
+    /// agent row is genuinely missing refuses promotion.
     #[test]
-    fn recovery_receipt_refuses_cross_project_message_or_recipient_ownership() {
+    fn recovery_receipt_promotes_cross_project_rows_but_refuses_orphans() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source.sqlite3");
-        let message_candidate = dir.path().join("message-candidate.sqlite3");
-        let recipient_candidate = dir.path().join("recipient-candidate.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let orphan_sender_candidate = dir.path().join("orphan-sender-candidate.sqlite3");
+        let orphan_recipient_candidate = dir.path().join("orphan-recipient-candidate.sqlite3");
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("mail-root");
-        seed_recovery_receipt_db(&source, true);
-        seed_recovery_receipt_db(&message_candidate, true);
-        seed_recovery_receipt_db(&recipient_candidate, true);
-
-        for candidate in [&message_candidate, &recipient_candidate] {
-            let conn = crate::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref())
-                .expect("open candidate for cross-project fixture");
+        for db in [
+            &source,
+            &candidate,
+            &orphan_sender_candidate,
+            &orphan_recipient_candidate,
+        ] {
+            seed_recovery_receipt_db(db, true);
+            let conn = crate::CanonicalDbConn::open_file(db.to_string_lossy().as_ref())
+                .expect("open db for cross-project fixture");
             conn.execute_raw(
                 "INSERT INTO projects (id, slug, human_key) VALUES (18, 'beta', '/srv/beta')",
             )
@@ -5064,31 +5072,59 @@ mod tests {
                 "INSERT INTO agents (id, project_id, name, reaper_exempt, registration_token) VALUES (43, 18, 'GreenField', 0, NULL)",
             )
             .expect("insert second-project agent");
+            // The handshake shape: a message filed under project 18 whose
+            // sender (41) is registered in project 17, delivered to a
+            // same-project recipient and cc'd to a cross-project one.
+            conn.execute_raw(
+                "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES (91, 18, 41, 'handshake-thread', 'Contact request', 'Hello from project 17', 'normal', 0, 346000, '{\"to\":[\"GreenField\"]}', '[]')",
+            )
+            .expect("insert cross-project handshake message");
+            conn.execute_raw(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (91, 43, 'to', NULL, NULL)",
+            )
+            .expect("insert same-project handshake recipient");
+            conn.execute_raw(
+                "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (91, 42, 'cc', NULL, NULL)",
+            )
+            .expect("insert cross-project cc recipient");
             drop(conn);
         }
 
-        let message_conn =
-            crate::CanonicalDbConn::open_file(message_candidate.to_string_lossy().as_ref())
-                .expect("open message candidate");
-        message_conn
-            .execute_raw("UPDATE messages SET project_id = 18 WHERE id = 73")
-            .expect("cross-link message to a project that does not own its sender");
-        drop(message_conn);
-        let message_error =
-            prepare_recovery_receipt(&storage_root, &primary, Some(&source), &message_candidate)
-                .expect_err("cross-project sender ownership must fail closed");
-        assert!(message_error.to_string().contains("message ownership join"));
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("cross-project sender/recipient rows must promote (GH#251)");
+        super::abort_recovery_receipt(&prepared).expect("abort promoted receipt intent");
 
-        let recipient_conn =
-            crate::CanonicalDbConn::open_file(recipient_candidate.to_string_lossy().as_ref())
-                .expect("open recipient candidate");
-        recipient_conn
-            .execute_raw("UPDATE message_recipients SET agent_id = 43 WHERE message_id = 73")
-            .expect("cross-link recipient to another project");
-        drop(recipient_conn);
-        let recipient_error =
-            prepare_recovery_receipt(&storage_root, &primary, Some(&source), &recipient_candidate)
-                .expect_err("cross-project recipient ownership must fail closed");
+        let orphan_sender_conn =
+            crate::CanonicalDbConn::open_file(orphan_sender_candidate.to_string_lossy().as_ref())
+                .expect("open orphan-sender candidate");
+        orphan_sender_conn
+            .execute_raw("UPDATE messages SET sender_id = 999 WHERE id = 91")
+            .expect("point the handshake message at a missing sender row");
+        drop(orphan_sender_conn);
+        let sender_error = prepare_recovery_receipt(
+            &storage_root,
+            &primary,
+            Some(&source),
+            &orphan_sender_candidate,
+        )
+        .expect_err("a genuinely missing sender row must fail closed");
+        assert!(sender_error.to_string().contains("message ownership join"));
+
+        let orphan_recipient_conn = crate::CanonicalDbConn::open_file(
+            orphan_recipient_candidate.to_string_lossy().as_ref(),
+        )
+        .expect("open orphan-recipient candidate");
+        orphan_recipient_conn
+            .execute_raw("UPDATE message_recipients SET agent_id = 999 WHERE message_id = 91 AND kind = 'to'")
+            .expect("point the handshake recipient at a missing agent row");
+        drop(orphan_recipient_conn);
+        let recipient_error = prepare_recovery_receipt(
+            &storage_root,
+            &primary,
+            Some(&source),
+            &orphan_recipient_candidate,
+        )
+        .expect_err("a genuinely missing recipient row must fail closed");
         assert!(
             recipient_error
                 .to_string()

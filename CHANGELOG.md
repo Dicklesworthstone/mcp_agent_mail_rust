@@ -15,6 +15,22 @@ binaries were cut from a snapshot that predates everything below.
 
 ### Fixed
 
+- **`am archive restore` accepts archives containing cross-project
+  messages
+  ([#251](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/251)).**
+  The recovery-receipt ownership joins required a message's sender (and
+  a recipient) to belong to the message's own project, so a snapshot
+  containing the welcome message that `macros contact-handshake
+  --to-project` files under the *recipient's* project could never be
+  promoted — every restore of a mailbox with any cross-project
+  coordination failed with "recovery receipt message ownership join
+  failed" and rolled back. Sender/recipient rows now resolve by agent id
+  alone (genuinely missing rows still refuse promotion, and the refusal
+  message says which class it found), the mislabeled
+  `OrphanMessageSender` schema invariant matches, and a regression test
+  pins the handshake shape restoring while true orphans keep failing
+  closed.
+
 - **Recovery no longer leaves FrankenSQLite WAL-cert sidecars beside a
   replaced database — ends the non-converging "Page N: never used"
   heal loop

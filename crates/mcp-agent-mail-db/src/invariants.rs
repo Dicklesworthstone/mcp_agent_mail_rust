@@ -147,10 +147,13 @@ const INVARIANT_CHECKS: &[CountCheck] = &[
     CountCheck {
         kind: SchemaInvariantKind::OrphanMessageSender,
         table: "messages",
-        detail: "messages.sender_id must reference an agent in the same project",
+        // Sender resolution is by id alone: `macros contact-handshake` files its
+        // welcome message under the recipient's project with a sender registered
+        // elsewhere (GH#251), so a cross-project sender is a legal shape.
+        detail: "messages.sender_id must reference agents.id",
         sql: "SELECT COUNT(*) AS count \
               FROM messages m \
-              LEFT JOIN agents a ON a.id = m.sender_id AND a.project_id = m.project_id \
+              LEFT JOIN agents a ON a.id = m.sender_id \
               WHERE a.id IS NULL",
     },
     CountCheck {
