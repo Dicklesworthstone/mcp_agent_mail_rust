@@ -8,7 +8,7 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
-## Unreleased (v0.3.29)
+## [v0.3.29](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.29) — 2026-08-19 **[Release]**
 
 Post-0.3.28 hardening of the registry-engine adoption. The v0.3.28
 binaries were cut from a snapshot that predates everything below.
