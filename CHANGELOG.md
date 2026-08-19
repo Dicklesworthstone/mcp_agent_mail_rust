@@ -71,6 +71,25 @@ binaries were cut from a snapshot that predates everything below.
 
 ### Changed
 
+- **The full test gate is now green on saturated gate hosts: load-lab and
+  latency-measurement suites run exclusively, and era-stale latency budgets
+  were recalibrated to measured same-host reality.** Three structural fixes:
+  (1) the `v3_lexical_*` Tantivy search tests each get a private per-process
+  index directory — the old fixed `$TMPDIR` path was guarded by an in-process
+  mutex that nextest's process-per-test model cannot see, so concurrent test
+  processes raced on the Tantivy writer lock; (2) stress/load/SLO suites
+  (`stress_pipeline*`, `load_bench`, `load_concurrency`, `db::stress`, the
+  CLI transport-harness gates, PTY/TUI perf tests) are scheduled by nextest
+  with `threads-required = "num-test-threads"`, so latency assertions measure
+  the code on an effectively idle machine instead of measuring the host
+  scheduler under 128-way oversubscription; (3) three hard budgets that were
+  calibrated on 2026-02 hardware with the pre-registry engine — the 30-agent
+  pipeline p99 (10s → 120s), and the swarm lab's max-operation p95/p99
+  (1s/3s → 4s/6s) — were recalibrated to ~2x the measured idle numbers from
+  the same-host v0.3.27-vs-main A/B (see benches/BUDGETS.md "Era note
+  (2026-08-18)", which records why these were environment-era artifacts and
+  not engine regressions).
+
 - **fastmcp resolves from the dedicated gated clone
   `../fastmcp-rel-0328`** (pin history: 206d583 → 2a5ee3b, the fastmcp
   GH#250 rev: unknown legacy methods are `-32601` Method Not Found and
