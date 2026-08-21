@@ -27,18 +27,18 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.3.1", package = "fastmcp-rust" }
-fastmcp-core = "0.3.1"
-fastmcp-server = "0.3.1"
-fastmcp-transport = "0.3.1"
-fastmcp-protocol = "0.3.1"
+fastmcp = { version = "0.6.0", package = "fastmcp-rust" }
+fastmcp-core = "0.6.0"
+fastmcp-server = "0.6.0"
+fastmcp-transport = "0.6.0"
+fastmcp-protocol = "0.6.0"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
-# 2026-08-16: asupersync resolves from crates.io (0.4.5 — includes the
-# timer-parked-task cancellation wakeup fix, #61). The next release
-# (0.4.6) will carry the Sleep-registration release-on-cancel/ready leak
-# fixes (737b580f7, 4ef4132f8) — adopt it when published.
-asupersync = { version = "=0.4.5", features = ["tls-webpki-roots"] }
+# 2026-08-20: =0.4.8, lockstep with fastmcp 0.6.0 (which pins =0.4.8) and
+# the fsqlite 0.3.6 baseline. Includes the Sleep-registration
+# release-on-cancel/ready leak fixes the old comment was waiting on
+# (shipped in 0.4.6) and the 0.4.8 franken-kernel/evidence/decision wave.
+asupersync = { version = "=0.4.8", features = ["tls-webpki-roots"] }
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
@@ -193,37 +193,16 @@ sqlmodel-pool = { path = "../sqlmodel-rel-0327/crates/sqlmodel-pool" }
 sqlmodel-frankensqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-frankensqlite" }
 sqlmodel-sqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-sqlite" }
 #
-# fastmcp-rust is temporarily force-patched to the sibling checkout
-# until its own v0.3 release propagates to crates.io. The currently
-# published fastmcp 0.2.1 on crates.io still depends on asupersync
-# 0.2.9, which would bifurcate the asupersync graph against our own
-# 0.3.x direct dep (producing hundreds of "multiple different versions
-# of crate `asupersync`" Cx/Outcome type mismatches).
-#
-# The [workspace.dependencies] entries above are already set to compatible
-# 0.3.x versions, so the only cleanup step once fastmcp 0.3 lands on
-# crates.io is to delete this block (plus the five fastmcp-* lines
-# below). cargo will then resolve all five from the registry.
-#
-# v0.3.28: the live ../fastmcp_rust checkout is under active development
-# (it moved 52 commits in one day, changing MCP lifecycle behavior under
-# our conformance suite), so — same pattern as sqlmodel-rel-0327 — the
-# patch points at the dedicated stable clone ../fastmcp-rel-0328.
-#
-# Pin history: 206d583 (the rev the 0.3.28 release gate verified) ->
-# 2a5ee3b (GH#250: unknown legacy methods are -32601 Method Not Found per
-# JSON-RPC 2.0, and streamable HTTP completes declined malformed-body
-# exchanges with 400 instead of terminating the connection; the full
-# protocol_compliance suite was re-gated green against this rev). When
-# advancing the pin, update every build host's ../fastmcp-rel-0328 clone
-# to the same rev.
-fastmcp-rust = { path = "../fastmcp-rel-0328/crates/fastmcp" }
-fastmcp-core = { path = "../fastmcp-rel-0328/crates/fastmcp-core" }
-fastmcp-server = { path = "../fastmcp-rel-0328/crates/fastmcp-server" }
-fastmcp-transport = { path = "../fastmcp-rel-0328/crates/fastmcp-transport" }
-fastmcp-protocol = { path = "../fastmcp-rel-0328/crates/fastmcp-protocol" }
+# 2026-08-20: fastmcp GRADUATED TO CRATES.IO (0.6.0, published 2026-08-19,
+# pinning asupersync =0.4.8). The fastmcp-rel-0328 gated-clone patches are
+# gone; the whole family resolves from the registry. The 0.6.0 line is the
+# published continuation of the gated 2a5ee3b rev this repo last gated
+# against (GH#250 lifecycle semantics included).
 
-beads_rust = { path = "../beads_rust" }
+# Gated clone (384e832c + local asupersync =0.4.8 bump). The live
+# ../beads_rust pins asupersync =0.4.5, which is unsatisfiable in the
+# 0.4.8 universe fastmcp 0.6.0 forces; same landmine class as rich_rust.
+beads_rust = { path = "../beads_rust-rel-0329" }
 franken-agent-detection = { path = "../franken_agent_detection" }
 # ftui patches keep the repo on the latest local /dp frankentui APIs.
 ftui = { path = "../frankentui/crates/ftui" }
@@ -244,15 +223,9 @@ ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 # so the graph keeps ONE engine without any path pin.
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 tru = { path = "../toon_rust" }
-# Gated clone at the 0.2.2 commit (f4b1573). The live ../rich_rust clone
-# moves under active development (bumped to 0.2.3 on 2026-08-19), while the
-# gated fastmcp-rel-0328 clone's fastmcp-console requires exactly =0.2.2 —
-# a moving live clone silently un-applies this patch and cargo falls back to
-# crates.io rich_rust 0.2.2, whose `time >=0.3.47,<0.3.48` pin is
-# unsatisfiable against fastmcp-console's `time =0.3.55` (default-features
-# builds break; portable builds don't pull fastmcp-console and mask it).
-# Same landmine class the fastmcp/sqlmodel gated clones solve.
-rich_rust = { path = "../rich_rust-rel-0328" }
+# rich_rust resolves from the registry (0.2.3) as of 2026-08-20 —
+# fastmcp-console 0.6.0 pins =0.2.3 and registry 0.2.3 carries the
+# time ^0.3.54 req, so the 0.2.2 gated-clone patch is gone.
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the

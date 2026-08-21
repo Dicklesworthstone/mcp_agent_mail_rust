@@ -76575,7 +76575,10 @@ async fn post_jsonrpc_request(
         headers.push(("X-Tmux-Pane".to_string(), pane));
     }
 
-    let cx = asupersync::Cx::for_testing();
+    // Production request-scoped Cx, not the test-only `Cx::for_testing()`
+    // constructor — matching every other production call site in this crate
+    // (and the asupersync guidance that `for_testing` is harness material).
+    let cx = asupersync::Cx::for_request();
     let request =
         Box::pin(products_http_client().request(&cx, Method::Post, server_url, headers, body));
     let response = match timeout(wall_now(), Duration::from_secs(timeout_seconds), request).await {
