@@ -10076,30 +10076,43 @@ pub async fn rebuild_all_inbox_stats(cx: &Cx, pool: &DbPool) -> Outcome<(), DbEr
         map_sql_outcome(traw_execute(cx, &tracked, delete_sql, &[]).await)
     );
 
-    let agent_rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(
-            traw_query(
-                cx,
-                &tracked,
-                "SELECT DISTINCT agent_id FROM message_recipients ORDER BY agent_id",
-                &[],
-            )
-            .await
-        )
-    );
-    let mut agent_ids = Vec::with_capacity(agent_rows.len());
-    for row in agent_rows {
-        if let Some(agent_id) = row.get(0).and_then(value_as_i64) {
-            agent_ids.push(agent_id);
+    // Perf: one set-based aggregate over the indexed PK join replaces the old
+    // per-agent recompute loop (FrankenSQLite does not rewrite uncorrelated
+    // `IN (SELECT ...)` subqueries into semi-joins, so each per-agent pass
+    // re-scanned `messages`). Semantics match the per-agent path exactly: the
+    // JOIN keeps the implicit "message still exists" filter, and GROUP BY only
+    // emits agents with at least one surviving recipient row (total_count > 0),
+    // so agents without messages get no row — same as the old skip-on-zero.
+    let insert_sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         SELECT \
+             mr.agent_id, \
+             COUNT(*) AS total_count, \
+             SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+             SUM(CASE WHEN mr.ack_ts IS NULL AND m.ack_required = 1 \
+                 THEN 1 ELSE 0 END) AS ack_pending_count, \
+             MAX(m.created_ts) AS last_message_ts \
+         FROM message_recipients mr \
+         JOIN messages m ON m.id = mr.message_id \
+         GROUP BY mr.agent_id";
+    match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &[]).await) {
+        Outcome::Ok(_) => {}
+        // Same tolerance as the per-agent rebuild path: a schema without the
+        // inbox_stats table (or with a view in its place) is not an error.
+        Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {}
+        Outcome::Err(error) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(error);
+        }
+        Outcome::Cancelled(reason) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(reason);
+        }
+        Outcome::Panicked(panic) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Panicked(panic);
         }
     }
-    try_in_tx!(
-        cx,
-        &tracked,
-        rebuild_agents_inbox_stats_in_tx(cx, &tracked, &agent_ids).await
-    );
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
