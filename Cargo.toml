@@ -168,6 +168,29 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
+# ENGINE-HEAD EXPERIMENT: fsqlite family patched to the local
+# frankensqlite checkout (HEAD, carrying ca8ddd95f re-park fix).
+fsqlite = { path = "/data/projects/frankensqlite/crates/fsqlite" }
+fsqlite-ast = { path = "/data/projects/frankensqlite/crates/fsqlite-ast" }
+fsqlite-btree = { path = "/data/projects/frankensqlite/crates/fsqlite-btree" }
+fsqlite-core = { path = "/data/projects/frankensqlite/crates/fsqlite-core" }
+fsqlite-error = { path = "/data/projects/frankensqlite/crates/fsqlite-error" }
+fsqlite-ext-fts5 = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-fts5" }
+fsqlite-ext-icu = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-icu" }
+fsqlite-ext-json = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-json" }
+fsqlite-ext-misc = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-misc" }
+fsqlite-ext-rtree = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-rtree" }
+fsqlite-func = { path = "/data/projects/frankensqlite/crates/fsqlite-func" }
+fsqlite-mvcc = { path = "/data/projects/frankensqlite/crates/fsqlite-mvcc" }
+fsqlite-observability = { path = "/data/projects/frankensqlite/crates/fsqlite-observability" }
+fsqlite-pager = { path = "/data/projects/frankensqlite/crates/fsqlite-pager" }
+fsqlite-parser = { path = "/data/projects/frankensqlite/crates/fsqlite-parser" }
+fsqlite-planner = { path = "/data/projects/frankensqlite/crates/fsqlite-planner" }
+fsqlite-types = { path = "/data/projects/frankensqlite/crates/fsqlite-types" }
+fsqlite-vdbe = { path = "/data/projects/frankensqlite/crates/fsqlite-vdbe" }
+fsqlite-vfs = { path = "/data/projects/frankensqlite/crates/fsqlite-vfs" }
+fsqlite-wal = { path = "/data/projects/frankensqlite/crates/fsqlite-wal" }
+
 # 2026-08-16 registry adoption: asupersync resolves from crates.io (=0.4.5)
 # and the fsqlite family resolves from crates.io (0.3.4) — the old
 # /dp/asupersync and /dp/frankensqlite path patches are GONE. Every

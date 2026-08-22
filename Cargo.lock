@@ -8517,3 +8517,83 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "fsqlite"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-ast"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-btree"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-core"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-error"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-ext-fts5"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-ext-icu"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-ext-json"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-ext-misc"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-ext-rtree"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-func"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-mvcc"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-observability"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-pager"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-parser"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-planner"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-types"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-vdbe"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-vfs"
+version = "0.3.5"
+
+[[patch.unused]]
+name = "fsqlite-wal"
+version = "0.3.5"
