@@ -84,12 +84,14 @@ if ! command -v flock >/dev/null 2>&1; then
     exec "$git_bin" "$@"
 fi
 
-if ! flock -x -w "$timeout" "$sentinel" "$git_bin" "$@"; then
-    rc=$?
-    if [ "$rc" -eq 1 ]; then
-        # flock returned 1 on timeout (vs. command exit status).
-        echo "am-git-wrapper: flock timeout on $sentinel after ${timeout}s — another git process appears stuck. Run 'am doctor check'." >&2
-        exit 75
-    fi
-    exit "$rc"
+rc=0
+flock -x -w "$timeout" "$sentinel" "$git_bin" "$@" || rc=$?
+if [ "$rc" -eq 1 ]; then
+    # flock returned 1 on timeout (vs. command exit status).
+    echo "am-git-wrapper: flock timeout on $sentinel after ${timeout}s — another git process appears stuck. Run 'am doctor check'." >&2
+    exit 75
 fi
+# Propagate git's own exit status verbatim (`rc=$?` must be captured from
+# the flock pipeline itself — inside an `if !` block `$?` is the negation's
+# status and is always 0, which would mask every git failure as success).
+exit "$rc"
