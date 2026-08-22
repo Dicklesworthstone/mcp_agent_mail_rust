@@ -27,18 +27,18 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.6.0", package = "fastmcp-rust" }
-fastmcp-core = "0.6.0"
-fastmcp-server = "0.6.0"
-fastmcp-transport = "0.6.0"
-fastmcp-protocol = "0.6.0"
+fastmcp = { version = "0.7.0", package = "fastmcp-rust" }
+fastmcp-core = "0.7.0"
+fastmcp-server = "0.7.0"
+fastmcp-transport = "0.7.0"
+fastmcp-protocol = "0.7.0"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
-# 2026-08-20: =0.4.8, lockstep with fastmcp 0.6.0 (which pins =0.4.8) and
-# the fsqlite 0.3.6 baseline. Includes the Sleep-registration
-# release-on-cancel/ready leak fixes the old comment was waiting on
-# (shipped in 0.4.6) and the 0.4.8 franken-kernel/evidence/decision wave.
-asupersync = { version = "=0.4.8", features = ["tls-webpki-roots"] }
+# 2026-08-22: =0.4.9, lockstep with fastmcp 0.7.0 (which pins =0.4.9),
+# sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.8 registry baseline.
+# 0.4.9 is additive on the v0.4.3 public compatibility floor (RuntimeHandle
+# request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
+asupersync = { version = "=0.4.9", features = ["tls-webpki-roots"] }
 
 sqlmodel = "=0.4.0"
 sqlmodel-core = "=0.4.0"
@@ -56,7 +56,7 @@ ftui-widgets = { version = "0.5.0", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.5.0"
 ftui-harness = "0.5.0"
 ftui-render = "0.5.0"
-beads_rust = { version = "0.3.0", default-features = false }
+beads_rust = { version = "0.3.2", default-features = false }
 toon = { version = "0.2.3", package = "tru" }
 # GH#161: global allocator for the long-running serve-http daemon to avoid
 # glibc per-thread arena fragmentation (multi-GB retained RSS under load).
@@ -168,64 +168,21 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# ENGINE-HEAD EXPERIMENT: fsqlite family patched to the local
-# frankensqlite checkout (HEAD, carrying ca8ddd95f re-park fix).
-fsqlite = { path = "/data/projects/frankensqlite/crates/fsqlite" }
-fsqlite-ast = { path = "/data/projects/frankensqlite/crates/fsqlite-ast" }
-fsqlite-btree = { path = "/data/projects/frankensqlite/crates/fsqlite-btree" }
-fsqlite-core = { path = "/data/projects/frankensqlite/crates/fsqlite-core" }
-fsqlite-error = { path = "/data/projects/frankensqlite/crates/fsqlite-error" }
-fsqlite-ext-fts5 = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-fts5" }
-fsqlite-ext-icu = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-icu" }
-fsqlite-ext-json = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-json" }
-fsqlite-ext-misc = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-misc" }
-fsqlite-ext-rtree = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-rtree" }
-fsqlite-func = { path = "/data/projects/frankensqlite/crates/fsqlite-func" }
-fsqlite-mvcc = { path = "/data/projects/frankensqlite/crates/fsqlite-mvcc" }
-fsqlite-observability = { path = "/data/projects/frankensqlite/crates/fsqlite-observability" }
-fsqlite-pager = { path = "/data/projects/frankensqlite/crates/fsqlite-pager" }
-fsqlite-parser = { path = "/data/projects/frankensqlite/crates/fsqlite-parser" }
-fsqlite-planner = { path = "/data/projects/frankensqlite/crates/fsqlite-planner" }
-fsqlite-types = { path = "/data/projects/frankensqlite/crates/fsqlite-types" }
-fsqlite-vdbe = { path = "/data/projects/frankensqlite/crates/fsqlite-vdbe" }
-fsqlite-vfs = { path = "/data/projects/frankensqlite/crates/fsqlite-vfs" }
-fsqlite-wal = { path = "/data/projects/frankensqlite/crates/fsqlite-wal" }
-
-# 2026-08-16 registry adoption: asupersync resolves from crates.io (=0.4.5)
-# and the fsqlite family resolves from crates.io (0.3.4) — the old
-# /dp/asupersync and /dp/frankensqlite path patches are GONE. Every
-# consumer in the graph accepts one asupersync 0.4.5 universe
-# (fsqlite >=0.4.3,<0.5; frankensearch >=0.4.4,<0.5; sqlmodel-rel-0327,
-# beads_rust, fastmcp siblings bumped to =0.4.5).
+# 2026-08-22 registry adoption (asupersync =0.4.9 universe):
+# - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.0 pins =0.4.9).
+# - fsqlite family resolves from crates.io (0.3.8) — the machine-specific
+#   /data/projects/frankensqlite path patches are GONE (they broke source
+#   builds on any host without that mount).
+# - sqlmodel family resolves from crates.io (=0.4.0, published 2026-08-21,
+#   accepting asupersync ^0.4.9 + fsqlite ^0.3.7) — the ../sqlmodel-rel-0327
+#   cleanup trigger fired, so those eight patch lines are gone too.
+# - fastmcp family resolves from crates.io (0.7.0, published 2026-08-20).
 #
-# br-vlsf2 follow-up: a sqlmodel 0.4.x lockstep release accepting
-# asupersync 0.4.5 + fsqlite 0.3 is still not on crates.io (max 0.3.2,
-# pinning asupersync =0.3.10), so the sqlmodel family remains
-# path-patched. /dp/sqlmodel_rust is BACK ON MAIN (0.3.2 line) — other
-# projects need it there — so the patch points at the dedicated stable
-# clone ../sqlmodel-rel-0327 (harmonize/vlsf2-fsqlite03 tip
-# 021bd17 + local asupersync =0.4.5 bump). Cleanup trigger: sqlmodel
-# 0.4.x on crates.io accepting asupersync 0.4.5 and fsqlite 0.3 — then
-# delete these eight lines and resolve from the registry.
-sqlmodel = { path = "../sqlmodel-rel-0327/crates/sqlmodel" }
-sqlmodel-core = { path = "../sqlmodel-rel-0327/crates/sqlmodel-core" }
-sqlmodel-query = { path = "../sqlmodel-rel-0327/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "../sqlmodel-rel-0327/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "../sqlmodel-rel-0327/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "../sqlmodel-rel-0327/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-frankensqlite" }
-sqlmodel-sqlite = { path = "../sqlmodel-rel-0327/crates/sqlmodel-sqlite" }
-#
-# 2026-08-20: fastmcp GRADUATED TO CRATES.IO (0.6.0, published 2026-08-19,
-# pinning asupersync =0.4.8). The fastmcp-rel-0328 gated-clone patches are
-# gone; the whole family resolves from the registry. The 0.6.0 line is the
-# published continuation of the gated 2a5ee3b rev this repo last gated
-# against (GH#250 lifecycle semantics included).
-
-# Gated clone (384e832c + local asupersync =0.4.8 bump). The live
-# ../beads_rust pins asupersync =0.4.5, which is unsatisfiable in the
-# 0.4.8 universe fastmcp 0.6.0 forces; same landmine class as rich_rust.
-beads_rust = { path = "../beads_rust-rel-0329" }
+# beads_rust: registry 0.3.2 still pins asupersync =0.4.4, unsatisfiable in
+# the =0.4.9 universe, so it stays path-patched to the live ../beads_rust
+# checkout (0.3.2) with its asupersync pin bumped =0.4.8 → =0.4.9 locally.
+# Cleanup trigger: a beads_rust release accepting asupersync 0.4.9+.
+beads_rust = { path = "../beads_rust" }
 franken-agent-detection = { path = "../franken_agent_detection" }
 # ftui patches keep the repo on the latest local /dp frankentui APIs.
 ftui = { path = "../frankentui/crates/ftui" }
