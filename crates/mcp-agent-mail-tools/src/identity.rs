@@ -2263,7 +2263,10 @@ Check that all parameters have valid values."
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
-        registration_token: Some(registration_token),
+        // Empty means generation or persistence failed above; serialize null
+        // (the documented Optional) rather than Some("") so clients cannot
+        // store a blank token and get silently downgraded to unverified.
+        registration_token: (!registration_token.is_empty()).then_some(registration_token),
     };
 
     serde_json::to_string(&response)
@@ -2551,7 +2554,8 @@ Choose a different name (or omit the name to auto-generate one)."
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
-        registration_token: Some(registration_token),
+        // Same contract as register_agent: no persisted token → null.
+        registration_token: (!registration_token.is_empty()).then_some(registration_token),
     };
 
     serde_json::to_string(&response)

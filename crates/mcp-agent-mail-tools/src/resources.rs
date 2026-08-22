@@ -3605,10 +3605,13 @@ pub struct StaleAcksResponse {
 pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
     let project_key = query.get("project").cloned().unwrap_or_default();
+    // Documented default: settings.ack_ttl_seconds (Config default 1800s,
+    // env ACK_TTL_SECONDS). The previous hardcoded 3600 silently ignored
+    // the operator's configured ack SLA.
     let ttl_seconds: u64 = query
         .get("ttl_seconds")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
+        .unwrap_or(Config::get().ack_ttl_seconds);
     let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {
