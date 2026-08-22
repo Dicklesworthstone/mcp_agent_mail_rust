@@ -644,11 +644,14 @@ fn schema_invariants_detect_ack_before_read_and_bad_reservation_ttl() {
     // upstream binding bug is fixed; the assert keeps the seed honest.
     let drift_rows = conn
         .execute_sync(
-            &format!(
-                "UPDATE message_recipients SET read_ts = 200, ack_ts = 100 \
-                 WHERE message_id = {message_id} AND agent_id = {recipient_id}"
-            ),
-            &[],
+            "UPDATE message_recipients SET read_ts = ?, ack_ts = ? \
+             WHERE message_id = ? AND agent_id = ?",
+            &[
+                Value::BigInt(200),
+                Value::BigInt(100),
+                Value::BigInt(message_id),
+                Value::BigInt(recipient_id),
+            ],
         )
         .expect("force ack-before-read drift");
     assert_eq!(
