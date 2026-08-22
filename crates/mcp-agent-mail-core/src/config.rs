@@ -2483,17 +2483,17 @@ impl Config {
         };
         let console_u16 = |key: &str, default: u16| -> u16 {
             console_value(key)
-                .and_then(|v| v.parse().ok())
+                .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(default)
         };
         let console_usize = |key: &str, default: usize| -> usize {
             console_value(key)
-                .and_then(|v| v.parse().ok())
+                .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(default)
         };
         let console_u64 = |key: &str, default: u64| -> u64 {
             console_value(key)
-                .and_then(|v| v.parse().ok())
+                .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(default)
         };
 

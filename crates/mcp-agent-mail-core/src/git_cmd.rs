@@ -506,6 +506,31 @@ fn run_child(
     outcome
 }
 
+/// Give stdout/stderr reader threads a short grace period to observe EOF,
+/// then detach any that are still parked.
+///
+/// After kill() a grandchild that inherited our pipe fds (git hooks,
+/// credential helpers, `sh -c` wrappers) can hold the pipes open
+/// indefinitely; an unconditional join here would block the caller forever
+/// and defeat the wall-clock timeout this function exists to enforce. The
+/// Timeout and Error paths never consume the captured bytes, so detaching
+/// only leaks the parked reader thread, which exits once the pipes close.
+fn join_readers_bounded(
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+) {
+    for handle in [stdout, stderr].into_iter().flatten() {
+        let deadline = Instant::now() + READER_EOF_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Grace period for reader threads to observe EOF on the give-up paths
+/// before they are detached.
+const READER_EOF_GRACE: Duration = Duration::from_millis(250);
+
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
     // Spawn reader threads to drain stdout/stderr CONCURRENTLY with our
     // wait loop. Without this, the child's pipe buffers (typically 64KiB
@@ -517,14 +542,14 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
     // output. Concurrent drain eliminates this class of hang.
     use std::io::Read;
 
-    let stdout_handle = child.stdout.take().map(|mut o| {
+    let mut stdout_handle = child.stdout.take().map(|mut o| {
         std::thread::spawn(move || {
             let mut buf = Vec::with_capacity(4096);
             let _ = o.read_to_end(&mut buf);
             buf
         })
     });
-    let stderr_handle = child.stderr.take().map(|mut e| {
+    let mut stderr_handle = child.stderr.take().map(|mut e| {
         std::thread::spawn(move || {
             let mut buf = Vec::with_capacity(4096);
             let _ = e.read_to_end(&mut buf);
@@ -540,10 +565,10 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Still join readers so their thread/resource don't
-                    // leak; buffers may be partial but that's OK.
-                    let _ = stdout_handle.map(std::thread::JoinHandle::join);
-                    let _ = stderr_handle.map(std::thread::JoinHandle::join);
+                    // Give readers a bounded grace period, then detach:
+                    // a grandchild holding the inherited pipes must not
+                    // hang past the wall-clock deadline. Bytes are unused.
+                    join_readers_bounded(stdout_handle.take(), stderr_handle.take());
                     return GitRunOutcome::Timeout { after: timeout };
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -554,8 +579,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
                 // of the server's lifetime.
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = stdout_handle.map(std::thread::JoinHandle::join);
-                let _ = stderr_handle.map(std::thread::JoinHandle::join);
+                join_readers_bounded(stdout_handle.take(), stderr_handle.take());
                 return GitRunOutcome::Error(e);
             }
         }
