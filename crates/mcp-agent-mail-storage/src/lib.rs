@@ -6365,6 +6365,86 @@ pub fn clean_stale_git_index_lock(repo_root: &Path, max_age_seconds: f64) -> boo
     try_clean_stale_git_lock(repo_root, max_age_seconds)
 }
 
+/// On-disk identity of an index.lock file, captured when a staleness decision
+/// is made and re-checked immediately before removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitLockIdentity {
+    len: u64,
+    mtime_nanos: u128,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn git_lock_identity(path: &Path) -> Option<GitLockIdentity> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    Some(GitLockIdentity {
+        len: meta.len(),
+        mtime_nanos,
+        #[cfg(unix)]
+        ino: {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino()
+        },
+    })
+}
+
+/// Remove a decided-stale index.lock pair ONLY if the on-disk state still
+/// matches the snapshot the decision was made on.
+///
+/// The staleness verdict is derived from a read taken at function entry; by
+/// removal time a competing cleaner may already have deleted that pair and a
+/// fresh writer reacquired a LIVE index.lock. Deleting blindly would strip
+/// the live lock and let a second writer into the repo mid-write. Requiring
+/// an identical owner first-line and an unchanged lock identity (size, mtime,
+/// inode) makes us bail whenever anyone else touched the pair in between; the
+/// caller simply reports no cleanup and the next detection pass re-decides
+/// against fresh state.
+fn remove_verified_stale_pair(
+    lock_path: &Path,
+    owner_path: &Path,
+    entry_identity: Option<&GitLockIdentity>,
+    entry_owner_first_line: Option<&str>,
+) -> bool {
+    match (entry_owner_first_line, fs::read_to_string(owner_path)) {
+        // Owner must still carry the exact dead/recycled PID we judged stale.
+        (Some(expected), Ok(content)) => {
+            if content.lines().next().unwrap_or("").trim() != expected {
+                return false;
+            }
+        }
+        // Owner vanished: another cleaner is mid-removal (or finished). Do
+        // not touch the lock — it may already have been reacquired.
+        (Some(_), Err(_)) => return false,
+        // No-owner decision: a parseable owner appearing since entry means a
+        // fresh writer likely owns the lock now.
+        (None, Ok(late)) => {
+            if late
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim().parse::<u32>().is_ok())
+            {
+                return false;
+            }
+        }
+        (None, Err(_)) => {}
+    }
+    // Lock gone or replaced (recreated inode/mtime/len) since entry: the old
+    // stale file is no longer what we decided on.
+    if git_lock_identity(lock_path).as_ref() != entry_identity {
+        return false;
+    }
+    // Keep the owner-before-lock order: a racing cleaner must never be able
+    // to pair stale owner metadata with a freshly acquired lock.
+    let _ = fs::remove_file(owner_path);
+    let _ = fs::remove_file(lock_path);
+    true
+}
+
 /// Try to clean up a stale `.git/index.lock` file with PID-aware safety.
 ///
 /// See [`clean_stale_git_index_lock`] for the supported cleanup semantics.
@@ -6375,6 +6455,11 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     if !path_is_nonsymlink_file(&lock_path) {
         return false;
     }
+
+    // Snapshot the on-disk pair NOW; every removal below must re-verify this
+    // identity immediately before unlinking (TOCTOU guard — see
+    // [`remove_verified_stale_pair`]).
+    let entry_identity = git_lock_identity(&lock_path);
 
     // Check PID-based ownership first
     if path_is_nonsymlink_file(&owner_path)
@@ -6399,8 +6484,14 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     tracing::info!(
                         "[git-lock] index.lock owner PID {pid} reused (start ticks mismatch), removing stale lock"
                     );
-                    let _ = fs::remove_file(&owner_path);
-                    let _ = fs::remove_file(&lock_path);
+                    if !remove_verified_stale_pair(
+                        &lock_path,
+                        &owner_path,
+                        entry_identity.as_ref(),
+                        Some(pid_str.trim()),
+                    ) {
+                        return false;
+                    }
                     return true;
                 }
 
@@ -6418,8 +6509,14 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                             "[git-lock] index.lock held by alive PID {pid} but start ticks unavailable, force clean (age > {:.1}s)",
                             max_age_seconds * 2.0
                         );
-                        let _ = fs::remove_file(&owner_path);
-                        let _ = fs::remove_file(&lock_path);
+                        if !remove_verified_stale_pair(
+                            &lock_path,
+                            &owner_path,
+                            entry_identity.as_ref(),
+                            Some(pid_str.trim()),
+                        ) {
+                            return false;
+                        }
                         return true;
                     }
 
@@ -6435,8 +6532,14 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     tracing::info!(
                         "[git-lock] legacy owner format with alive PID {pid} and stale age, removing lock"
                     );
-                    let _ = fs::remove_file(&owner_path);
-                    let _ = fs::remove_file(&lock_path);
+                    if !remove_verified_stale_pair(
+                        &lock_path,
+                        &owner_path,
+                        entry_identity.as_ref(),
+                        Some(pid_str.trim()),
+                    ) {
+                        return false;
+                    }
                     return true;
                 }
 
@@ -6447,8 +6550,14 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
             // Remove owner before lock so a racing cleaner cannot pair
             // stale owner metadata with a freshly acquired lock.
             tracing::info!("[git-lock] index.lock held by dead PID {pid}, removing stale lock");
-            let _ = fs::remove_file(&owner_path);
-            let _ = fs::remove_file(&lock_path);
+            if !remove_verified_stale_pair(
+                &lock_path,
+                &owner_path,
+                entry_identity.as_ref(),
+                Some(pid_str.trim()),
+            ) {
+                return false;
+            }
             return true;
         }
     }
@@ -6460,8 +6569,9 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
         && age > max_age_seconds
     {
         tracing::info!("[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)");
-        let _ = fs::remove_file(&owner_path);
-        let _ = fs::remove_file(&lock_path);
+        if !remove_verified_stale_pair(&lock_path, &owner_path, entry_identity.as_ref(), None) {
+            return false;
+        }
         return true;
     }
     false
