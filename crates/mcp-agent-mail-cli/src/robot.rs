@@ -3113,7 +3113,7 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
     context: &str,
 ) -> Result<RobotDbHandle, CliError> {
     fn archive_is_authoritative_for_robot_db(
-        archive: &crate::DoctorArchiveInventory,
+        archive: Option<&crate::DoctorArchiveInventory>,
         db: Option<&crate::DoctorDbInventory>,
         storage_root: &Path,
         local_database_url: Option<&str>,
@@ -3129,15 +3129,19 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
                 {
                     return false;
                 }
-                crate::doctor_archive_is_authoritative_for_db(
-                    archive,
-                    db,
-                    sqlite_path,
-                    storage_root,
-                    archive_root_can_override_external_db,
-                )
+                archive.is_some_and(|archive| {
+                    crate::doctor_archive_is_authoritative_for_db(
+                        archive,
+                        db,
+                        sqlite_path,
+                        storage_root,
+                        archive_root_can_override_external_db,
+                    )
+                })
             }
-            (Some(db), None) => crate::doctor_archive_has_db_overlap(archive, db),
+            (Some(db), None) => {
+                archive.is_some_and(|archive| crate::doctor_archive_has_db_overlap(archive, db))
+            }
             (None, Some(resolved)) => {
                 let sqlite_path = Path::new(&resolved.canonical_path);
                 archive_root_can_override_external_db || sqlite_path.starts_with(storage_root)
@@ -3146,15 +3150,35 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
         }
     }
 
-    let archive = crate::collect_doctor_archive_inventory(storage_root);
-    if archive.counts() == crate::DoctorInventoryCounts::default() {
+    // Cheap lag probe first: counting canonical archive files never opens or
+    // parses message bodies. The full inventory below reads and JSON-parses
+    // EVERY message file in the archive, so the healthy path (local DB
+    // present and not lagging the archive by counts) must never reach it.
+    let archive_counts = crate::collect_doctor_archive_message_counts(storage_root);
+    if archive_counts == crate::DoctorInventoryCounts::default() {
         return Ok(local);
     }
 
     match crate::collect_doctor_db_inventory(&local.conn) {
         Ok(db) => {
+            if db.counts.messages > 0
+                && db.counts.projects >= archive_counts.projects
+                && db.counts.agents >= archive_counts.agents
+                && db.counts.messages >= archive_counts.messages
+            {
+                // The populated local DB is at least as complete as the
+                // archive by cheap counts (`archive_counts.messages` counts
+                // files, an upper bound on the archive's deduplicated
+                // logical message count), so the archive cannot be
+                // meaningfully ahead. Skip the expensive per-message parse.
+                return Ok(local);
+            }
+            let archive = crate::collect_doctor_archive_inventory(storage_root);
+            if archive.counts() == crate::DoctorInventoryCounts::default() {
+                return Ok(local);
+            }
             if !archive_is_authoritative_for_robot_db(
-                &archive,
+                Some(&archive),
                 Some(&db),
                 storage_root,
                 local_database_url,
@@ -3173,8 +3197,11 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
             Ok(local)
         }
         Err(error) => {
+            // With no DB inventory the authoritative check only inspects the
+            // sqlite path vs the storage root, so the full archive inventory
+            // is never needed on this branch.
             if !archive_is_authoritative_for_robot_db(
-                &archive,
+                None,
                 None,
                 storage_root,
                 local_database_url,
@@ -3990,15 +4017,25 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
     let ownership = inspect_mailbox_ownership(&db_path, storage_root);
 
-    let verdict = compute_mailbox_verdict(
-        &config.database_url,
-        storage_root,
-        &VerdictOptions {
-            skip_integrity_check: true,
-            ..VerdictOptions::default()
-        },
-    );
-    let durability = DurabilityState::from_mailbox_state(verdict.state);
+    // Diagnostic-only snapshot: use the fast preset (which keeps the
+    // `skip_integrity_check: true` semantics and additionally skips the
+    // archive count walk and the db-sanity reopen) and skip the verdict's own
+    // ownership probe — `inspect_mailbox_ownership` can shell out to
+    // `lsof`/`ps` several times on macOS and we already ran it above.
+    let verdict = compute_mailbox_verdict(&config.database_url, storage_root, &VerdictOptions::fast());
+    // `VerdictOptions::fast()` sets `skip_ownership_check`, so fold the
+    // ownership inspection we already computed back into the durability
+    // floor exactly as the verdict's own ownership probe would have
+    // (ActiveOtherOwner => Suspect/degraded, stale/deleted/split-brain =>
+    // fatal/corrupt).
+    let ownership_floor = match ownership.disposition {
+        MailboxOwnershipDisposition::Unowned => DurabilityState::Healthy,
+        MailboxOwnershipDisposition::ActiveOtherOwner => DurabilityState::DegradedReadOnly,
+        MailboxOwnershipDisposition::StaleLiveProcess
+        | MailboxOwnershipDisposition::DeletedExecutable
+        | MailboxOwnershipDisposition::SplitBrain => DurabilityState::Corrupt,
+    };
+    let durability = DurabilityState::from_mailbox_state(verdict.state).max_severity(ownership_floor);
 
     if durability == DurabilityState::Healthy && !recovery_lock.active {
         return None;
@@ -5198,7 +5235,7 @@ fn build_recovery_only_status(
         category: "mailbox_recovery".to_string(),
         headline: "Mailbox recovery state detected".to_string(),
         rationale: format!(
-            "robot status could not read the live SQLite index ({source_error}); surfaced a recovery-only status snapshot"
+            "robot status could not resolve a project scope ({source_error}); surfaced a recovery-only status snapshot"
         ),
         remediation: recovery.next_action.clone(),
         playbooks: vec![],
@@ -5237,6 +5274,48 @@ fn build_recovery_only_status(
     Some((data, actions, project_slug, agent_name))
 }
 
+/// Status payload for the benign "current directory is not a registered
+/// project" case. The live SQLite index was opened and read fine; nothing is
+/// degraded, so this must NOT route through the recovery-only diagnostic path
+/// (mailbox ownership shell-outs, forensic git timeline, `health: degraded`).
+/// Returns a normal envelope with an `info` alert explaining how to scope the
+/// command instead.
+fn build_unregistered_project_status(
+    agent_flag: Option<&str>,
+    source_error: &CliError,
+) -> (StatusData, Option<String>, Vec<(String, String, Option<String>)>) {
+    let agent_name = resolved_agent_flag_or_env(agent_flag);
+    let data = StatusData {
+        health: "ok".to_string(),
+        unread: 0,
+        urgent: 0,
+        ack_required: 0,
+        ack_overdue: 0,
+        active_reservations: 0,
+        reservations_expiring_soon: 0,
+        active_agents: 0,
+        recent_messages: 0,
+        my_reservations: vec![],
+        top_threads: vec![],
+        anomalies: vec![],
+        recommendations: vec![],
+        reservation_forecast: None,
+        recovery: None,
+        queued_intents: vec![],
+        search_index: None,
+        forensic_timeline: None,
+    };
+    let detail = redact_recommendation_text(&source_error.to_string());
+    let alerts = vec![(
+        "info".to_string(),
+        format!(
+            "Current directory is not a registered project ({detail}). Pass --project <abs-path> (absolute paths are auto-registered) or register it with the ensure_project tool."
+        ),
+        Some("am robot status --project <abs-path>".to_string()),
+    )];
+    (data, agent_name, alerts)
+}
+
 fn render_status_output(
     cmd_name: &str,
     format: OutputFormat,
@@ -5244,11 +5323,15 @@ fn render_status_output(
     project_slug: Option<String>,
     agent_name: Option<String>,
     actions: Vec<String>,
+    extra_alerts: Vec<(String, String, Option<String>)>,
     mut phase: TailLatencyPhaseRecorder,
 ) -> Result<String, CliError> {
     let mut env = RobotEnvelope::new(cmd_name, format, data);
     env._meta.project = project_slug;
     env._meta.agent = agent_name.clone();
+    for (severity, summary, action) in extra_alerts {
+        env = env.with_alert(severity, summary, action);
+    }
     if agent_name.is_none() {
         env = env.with_alert(
             "info",
@@ -6138,6 +6221,17 @@ fn is_missing_agents_table_error(error: &impl std::fmt::Display) -> bool {
 
 fn is_agent_not_found_error(error: &CliError) -> bool {
     matches!(error, CliError::InvalidArgument(msg) if msg.starts_with("agent not found: "))
+}
+
+/// The benign "no --project flag and the CWD is not a registered project"
+/// resolution failure from `find_project_for_path_or_ancestors`. The DB was
+/// opened and read fine — this must NOT be treated as a mailbox read failure.
+fn is_unregistered_cwd_project_error(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::InvalidArgument(msg)
+            if msg.starts_with("project not found for current directory or its ancestors: ")
+    )
 }
 
 fn load_recipient_placeholders_without_agents(
@@ -13839,11 +13933,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         Some(scope.project_slug),
                         agent_name,
                         actions,
+                        Vec::new(),
                         phase,
                     )?
                 }
                 Err(error) => {
-                    if let Some((data, actions, project_slug, agent_name)) =
+                    // Attribute scope-resolution time to its own phase so the
+                    // fallback below is not billed for it in the ledger.
+                    phase.mark("scope_resolution");
+                    if is_unregistered_cwd_project_error(&error) {
+                        // Benign: the DB was read fine, the CWD simply is not
+                        // a registered project. Skip the recovery-only
+                        // forensic path and answer with a normal envelope.
+                        let (data, agent_name, alerts) =
+                            build_unregistered_project_status(args.agent.as_deref(), &error);
+                        render_status_output(
+                            cmd_name,
+                            format,
+                            data,
+                            None,
+                            agent_name,
+                            Vec::new(),
+                            alerts,
+                            phase,
+                        )?
+                    } else if let Some((data, actions, project_slug, agent_name)) =
                         build_recovery_only_status(
                             args.project.as_deref(),
                             args.agent.as_deref(),
@@ -13862,6 +13976,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                             Some(project_slug),
                             agent_name,
                             actions,
+                            Vec::new(),
                             phase,
                         )?
                     } else {
@@ -14031,13 +14146,21 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         Err(scope_error) => {
                             // No live snapshot and no plain scope: try the
                             // recovery-only path (degraded/corrupt DB) before
-                            // declaring the read-out fully unavailable.
-                            if let Some((status, actions, project_slug, agent_name)) =
+                            // declaring the read-out fully unavailable. The
+                            // benign "CWD is not a registered project" error
+                            // is NOT a DB failure, so it skips straight to
+                            // the unavailable read-out (which already points
+                            // at `--project <abs-path>`).
+                            let recovery_only = if is_unregistered_cwd_project_error(&scope_error) {
+                                None
+                            } else {
                                 build_recovery_only_status(
                                     args.project.as_deref(),
                                     args.agent.as_deref(),
                                     &scope_error,
                                 )
+                            };
+                            if let Some((status, actions, project_slug, agent_name)) = recovery_only
                             {
                                 tracing::debug!(
                                     event = "tui_dump.snapshot_source",
@@ -22161,6 +22284,56 @@ mod tests {
         assert!(!is_agent_not_found_error(&CliError::Other(
             "agent not found: CoralMarsh".to_string()
         )));
+    }
+
+    #[test]
+    fn is_unregistered_cwd_project_error_classification() {
+        assert!(is_unregistered_cwd_project_error(
+            &CliError::InvalidArgument(
+                "project not found for current directory or its ancestors: /tmp/unregistered"
+                    .to_string()
+            )
+        ));
+        // An explicit --project miss is a different failure and keeps its
+        // existing handling (archive fallback / hard error).
+        assert!(!is_unregistered_cwd_project_error(
+            &CliError::InvalidArgument("project not found: /tmp/unregistered".to_string())
+        ));
+        assert!(!is_unregistered_cwd_project_error(&CliError::Other(
+            "project not found for current directory or its ancestors: /tmp/unregistered"
+                .to_string()
+        )));
+    }
+
+    #[test]
+    fn build_unregistered_project_status_is_not_degraded_and_alerts_info() {
+        let error = CliError::InvalidArgument(
+            "project not found for current directory or its ancestors: /tmp/unregistered"
+                .to_string(),
+        );
+        let (data, agent_name, alerts) = build_unregistered_project_status(None, &error);
+
+        assert_eq!(data.health, "ok", "benign not-found must not degrade health");
+        assert!(data.recovery.is_none(), "no recovery snapshot for a readable mailbox");
+        assert!(data.anomalies.is_empty(), "no corruption-flavored anomalies");
+        assert!(data.forensic_timeline.is_none(), "no forensic timeline for a benign miss");
+        assert!(agent_name.is_none());
+
+        assert_eq!(alerts.len(), 1);
+        let (severity, summary, action) = &alerts[0];
+        assert_eq!(severity, "info");
+        assert!(
+            summary.contains("not a registered project"),
+            "alert should explain the miss: {summary}"
+        );
+        assert!(
+            summary.contains("--project") && summary.contains("ensure_project"),
+            "alert should point at --project / ensure_project: {summary}"
+        );
+        assert_eq!(
+            action.as_deref(),
+            Some("am robot status --project <abs-path>")
+        );
     }
 
     #[test]

@@ -27853,6 +27853,99 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInvento
     inventory
 }
 
+/// Count canonical message `.md` files under a project's `messages/`
+/// directory WITHOUT opening or parsing them. Mirrors the traversal filters
+/// of [`scan_doctor_project_messages`] (skips `threads/` digests and
+/// non-`YYYY/MM/<file>.md` layouts).
+fn count_doctor_project_message_files(messages_dir: &Path) -> u64 {
+    let mut count = 0u64;
+    for entry in walkdir::WalkDir::new(messages_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let file_type = entry.file_type();
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(messages_dir) else {
+            continue;
+        };
+        let components = doctor_archive_path_components(relative);
+        if components.first().copied() == Some("threads") {
+            continue;
+        }
+        if components.len() != 3
+            || !doctor_is_archive_year_component(components[0])
+            || !doctor_is_archive_month_component(components[1])
+        {
+            continue;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Cheap variant of [`collect_doctor_archive_inventory`] that only counts
+/// archive entries (project dirs, agent profiles, canonical message files)
+/// and never reads message bodies.
+///
+/// The robot lag probe (`prefer_archive_snapshot_when_local_db_lags_archive`)
+/// runs on every `am robot` invocation; the full inventory reads and
+/// JSON-parses every message file in every project, which made the CLI
+/// O(total archive bytes) per call. The probe only needs approximate counts
+/// to decide whether the expensive parse is worth running. `messages` here
+/// counts canonical message FILES (duplicate ids included), so it is an
+/// upper bound on the deduplicated `messages` the full inventory reports;
+/// the two agree exactly when the archive holds no duplicate message ids.
+fn collect_doctor_archive_message_counts(storage_root: &Path) -> DoctorInventoryCounts {
+    let projects_root = storage_root.join("projects");
+    if !path_is_real_directory(&projects_root) {
+        return DoctorInventoryCounts::default();
+    }
+
+    let mut counts = DoctorInventoryCounts::default();
+    let Ok(entries) = std::fs::read_dir(&projects_root) else {
+        return counts;
+    };
+    for entry in entries.flatten() {
+        let project_path = entry.path();
+        let Ok(project_type) = entry.file_type() else {
+            continue;
+        };
+        if !project_type.is_dir() || project_type.is_symlink() {
+            continue;
+        }
+        counts.projects += 1;
+
+        let agents_dir = project_path.join("agents");
+        if path_is_real_directory(&agents_dir)
+            && let Ok(agent_entries) = std::fs::read_dir(&agents_dir)
+        {
+            for agent_entry in agent_entries.flatten() {
+                let Ok(agent_type) = agent_entry.file_type() else {
+                    continue;
+                };
+                if !agent_type.is_dir() || agent_type.is_symlink() {
+                    continue;
+                }
+                if path_is_real_file(&agent_entry.path().join("profile.json")) {
+                    counts.agents += 1;
+                }
+            }
+        }
+
+        let messages_dir = project_path.join("messages");
+        if path_is_real_directory(&messages_dir) {
+            counts.messages += count_doctor_project_message_files(&messages_dir);
+        }
+    }
+    counts
+}
+
 fn doctor_archive_project_fallback_slug(project_path: &Path) -> String {
     project_path
         .file_name()
@@ -54556,6 +54649,80 @@ startup_timeout_sec = 42
         assert_eq!(
             doctor_archive_inventory_suffix(&archive),
             "; raw canonical files=3 (duplicate files=1 across 1 message id(s)), thread digests=4"
+        );
+    }
+
+    #[test]
+    fn collect_doctor_archive_message_counts_matches_full_inventory_on_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+
+        // Project A: two agents, two canonical messages, one thread digest,
+        // and one non-canonical layout file (both scans must skip the latter
+        // two).
+        let project_a = storage_root.join("projects").join("demo-project");
+        let canonical_a = project_a.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&canonical_a).unwrap();
+        std::fs::write(
+            project_a.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project"}"#,
+        )
+        .unwrap();
+        for agent in ["BlueLake", "RiverStone"] {
+            let agent_dir = project_a.join("agents").join(agent);
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::write(agent_dir.join("profile.json"), "{}").unwrap();
+        }
+        std::fs::write(
+            canonical_a.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"subject\":\"first\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_a.join("2026-03-13T00-00-00Z__second__8.md"),
+            "---json\n{\"id\":8,\"subject\":\"second\"}\n---\nbody\n",
+        )
+        .unwrap();
+        let threads_dir = project_a.join("messages").join("threads");
+        std::fs::create_dir_all(&threads_dir).unwrap();
+        std::fs::write(threads_dir.join("demo-thread.md"), "digest\n").unwrap();
+        std::fs::write(project_a.join("messages").join("stray.md"), "not canonical\n").unwrap();
+
+        // Project B: no agents, one canonical message.
+        let project_b = storage_root.join("projects").join("other-project");
+        let canonical_b = project_b.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&canonical_b).unwrap();
+        std::fs::write(
+            project_b.join("project.json"),
+            r#"{"slug":"other-project","human_key":"/tmp/other-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_b.join("2026-04-01T00-00-00Z__third__9.md"),
+            "---json\n{\"id\":9,\"subject\":\"third\"}\n---\nbody\n",
+        )
+        .unwrap();
+
+        let counts = collect_doctor_archive_message_counts(&storage_root);
+        let inventory = collect_doctor_archive_inventory(&storage_root);
+
+        assert_eq!(counts.projects, inventory.projects);
+        assert_eq!(counts.agents, inventory.agents);
+        // The fixture holds no duplicate message ids, so the cheap file count
+        // matches both the raw canonical file count and the deduplicated
+        // logical message count of the parsing variant.
+        assert_eq!(counts.messages, inventory.canonical_message_files);
+        assert_eq!(counts.messages, inventory.messages);
+        assert_eq!(counts, inventory.counts());
+        assert_eq!(counts.projects, 2);
+        assert_eq!(counts.agents, 2);
+        assert_eq!(counts.messages, 3);
+
+        // Empty/missing storage roots report the default counts, mirroring
+        // the parsing variant's empty-inventory behavior.
+        assert_eq!(
+            collect_doctor_archive_message_counts(&tmp.path().join("missing")),
+            DoctorInventoryCounts::default()
         );
     }
 
