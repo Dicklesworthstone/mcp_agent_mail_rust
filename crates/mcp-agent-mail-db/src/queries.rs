@@ -5864,6 +5864,32 @@ where
     let now = now_micros();
     let mut created_rows = Vec::with_capacity(inserts.len());
 
+    // Rows inserted by THIS call are exactly those with id greater than this
+    // watermark: we hold BEGIN IMMEDIATE so no concurrent writer can
+    // interleave, and AUTOINCREMENT ids only ever increase. Reading ids back
+    // per-tuple (the old approach) aliased every duplicate
+    // (project_id, agent_id, path_pattern) tuple in one batch onto the same
+    // MAX(id), leaving one physical row unaccounted for.
+    let watermark_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT COALESCE(MAX(id), 0) FROM file_reservations",
+                &[],
+            )
+            .await
+        )
+    );
+    let Some(id_watermark) = watermark_rows.first().and_then(row_first_i64) else {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::Internal(
+            "file reservation insert: could not read id watermark".to_string(),
+        ));
+    };
+
     // Batch insert
     for chunk in inserts.chunks(50) {
         let mut query = String::from(
@@ -5906,35 +5932,43 @@ where
             &tracked,
             map_sql_outcome(traw_execute(cx, &tracked, &query, &params).await)
         );
+    }
 
-        // Retrieve the inserted IDs via a deterministic query keyed on the
-        // exact (project_id, created_ts, path_pattern) tuples we just inserted.
-        // Within this IMMEDIATE transaction no concurrent inserts can interleave.
-        let start_idx = created_rows.len() - chunk.len();
-        for (j, (agent_id, path, _, _, _)) in chunk.iter().enumerate() {
-            let id_sql = "SELECT id FROM file_reservations \
-                          WHERE project_id = ? AND agent_id = ? AND path_pattern = ? AND created_ts = ? \
-                          ORDER BY id DESC LIMIT 1";
-            let id_params = [
-                Value::BigInt(project_id),
-                Value::BigInt(*agent_id),
-                Value::Text(path.clone()),
-                Value::BigInt(now),
-            ];
-            let id_rows = try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(traw_query(cx, &tracked, id_sql, &id_params).await)
-            );
-            let Some(id) = id_rows.first().and_then(row_first_i64) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(
-                    "file reservation insert: could not retrieve inserted row id".to_string(),
-                ));
-            };
-            if let Some(cr) = created_rows.get_mut(start_idx + j) {
-                cr.id = Some(id);
-            }
+    // Retrieve all inserted IDs in one pass. AUTOINCREMENT guarantees the
+    // new ids are strictly ascending in insertion order across chunks, so an
+    // ordered zip maps each created row to its own physical row even when
+    // identical (agent_id, path_pattern) tuples appear multiple times in the
+    // batch.
+    let ids_sql = "SELECT id FROM file_reservations \
+                   WHERE project_id = ? AND created_ts = ? AND id > ? \
+                   ORDER BY id ASC";
+    let id_params = [
+        Value::BigInt(project_id),
+        Value::BigInt(now),
+        Value::BigInt(id_watermark),
+    ];
+    let id_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_query(cx, &tracked, ids_sql, &id_params).await)
+    );
+    if id_rows.len() != created_rows.len() {
+        rollback_tx(cx, &tracked).await;
+        return Outcome::Err(DbError::Internal(format!(
+            "file reservation insert: read back {} ids for {} inserted rows",
+            id_rows.len(),
+            created_rows.len()
+        )));
+    }
+    for (idx, row) in id_rows.iter().enumerate() {
+        let Some(id) = row.get(0).and_then(value_as_i64) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "file reservation insert: could not retrieve inserted row id".to_string(),
+            ));
+        };
+        if let Some(cr) = created_rows.get_mut(idx) {
+            cr.id = Some(id);
         }
     }
 
@@ -9207,10 +9241,6 @@ pub async fn mark_message_read(
             rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
         );
 
-        // Invalidate cached inbox stats (unread/ack counts may have changed).
-        crate::cache::read_cache()
-            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
-
         // Read back the actual stored timestamp (may differ from `now` on
         // idempotent calls where COALESCE preserved the original value).
         //
@@ -9253,6 +9283,13 @@ pub async fn mark_message_read(
         };
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Invalidate cached inbox stats AFTER commit, not inside the tx: an
+        // in-tx invalidate lets a concurrent get_inbox_stats repopulate the
+        // cache from the not-yet-committed snapshot and then serve pre-commit
+        // unread/ack counts for a full TTL. Matches the post-commit pattern
+        // already used by the message create/delete paths.
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
         Outcome::Ok(ts)
     })
     .await
@@ -9315,10 +9352,11 @@ pub async fn mark_messages_read_batch(
             rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
         );
 
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Post-commit invalidation — see mark_message_read (an in-tx
+        // invalidate lets a concurrent reader repopulate stale counts).
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
-
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         Outcome::Ok(())
     })
     .await
@@ -9419,10 +9457,10 @@ pub async fn mark_all_messages_read_in_project(
             );
         }
 
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Post-commit invalidation — see mark_message_read.
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
-
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
         let count_i64 =
             i64::try_from(message_ids.len()).expect("message recipient count fits in i64");
@@ -9553,10 +9591,6 @@ async fn acknowledge_message_impl(
             rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
         );
 
-        // Invalidate cached inbox stats (ack_pending_count may have changed).
-        crate::cache::read_cache()
-            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
-
         // Read back the actual stored timestamps (may differ from `now` on
         // idempotent calls where COALESCE preserved the original values).
         //
@@ -9638,6 +9672,9 @@ async fn acknowledge_message_impl(
         }
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Post-commit invalidation — see mark_message_read.
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
         Outcome::Ok(IdempotentOutcome::Fresh((read_ts, ack_ts)))
     })
     .await
@@ -9720,9 +9757,6 @@ pub async fn acknowledge_messages_batch(
             rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
         );
 
-        crate::cache::read_cache()
-            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
-
         let mut stored_by_message_id = BTreeMap::new();
         for chunk in unique_message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
             let ph = placeholders(chunk.len());
@@ -9783,6 +9817,9 @@ pub async fn acknowledge_messages_batch(
             .collect();
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        // Post-commit invalidation — see mark_message_read.
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
         Outcome::Ok(results)
     })
     .await
@@ -9950,30 +9987,25 @@ async fn compute_agent_inbox_stats_in_tx(
     tracked: &TrackedConnection<'_>,
     agent_id: i64,
 ) -> Outcome<Option<AgentInboxStatsRebuild>, DbError> {
+    // Perf: FrankenSQLite's planner does not rewrite uncorrelated
+    // `IN (SELECT ...)` subqueries into semi-joins, so the previous shape
+    // re-scanned `messages` per predicate (O(recipients x messages)) inside
+    // every write transaction. The explicit PK JOIN keeps the exact same
+    // semantics — including the implicit "message still exists" filter the
+    // old `IN (SELECT id FROM messages)` clause provided — while each
+    // recipient row costs one indexed `messages` PK lookup.
     let sql = "\
         SELECT \
             COUNT(*) AS total_count, \
-            SUM(CASE WHEN read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-            SUM(CASE \
-                WHEN ack_ts IS NULL \
-                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1) \
+            SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+            SUM(CASE WHEN mr.ack_ts IS NULL AND m.ack_required = 1 \
                 THEN 1 ELSE 0 END) AS ack_pending_count, \
-            (SELECT MAX(created_ts) \
-               FROM messages \
-              WHERE id IN (SELECT message_id \
-                             FROM message_recipients \
-                            WHERE agent_id = ?)) AS last_message_ts \
-        FROM message_recipients \
-        WHERE agent_id = ? \
-          AND message_id IN (SELECT id FROM messages)";
+            MAX(m.created_ts) AS last_message_ts \
+        FROM message_recipients mr \
+        JOIN messages m ON m.id = mr.message_id \
+        WHERE mr.agent_id = ?";
     let rows = match map_sql_outcome(
-        traw_query(
-            cx,
-            tracked,
-            sql,
-            &[Value::BigInt(agent_id), Value::BigInt(agent_id)],
-        )
-        .await,
+        traw_query(cx, tracked, sql, &[Value::BigInt(agent_id)]).await,
     ) {
         Outcome::Ok(rows) => rows,
         Outcome::Err(error) => return Outcome::Err(error),
@@ -11727,11 +11759,21 @@ async fn list_file_reservations_once(
     };
     let (mut sql, mut params) = if active_only {
         let now = now_micros();
-        // GH#180: candidate rows via the cheap `released_ts` predicate (no
-        // release-ledger join, no `NOT IN`); the ledger is subtracted in Rust
-        // below. Survivors are absent from the ledger, so `fr.released_ts` is
-        // their authoritative released_ts.
-        let candidate_predicate = active_reservation_candidate_predicate_for("fr");
+        // GH#180: unpaginated callers fetch candidate rows via the cheap
+        // `released_ts`-only predicate (no release-ledger anti-join) and the
+        // ledger is subtracted in Rust below — identical results, no O(N·M)
+        // rescan. Paginated callers MUST instead exclude the ledger inside
+        // SQL: LIMIT/OFFSET applied over the candidate superset would let a
+        // ledger-released row consume a page slot and then get dropped in
+        // Rust, producing short pages and shifted/duplicated page boundaries.
+        // This query has no join, so the GH#180 anti-join blowup does not
+        // apply on this path. Survivors are absent from the ledger either
+        // way, so `fr.released_ts` is their authoritative released_ts.
+        let candidate_predicate = if limit.is_some() {
+            active_reservation_predicate_for("fr")
+        } else {
+            active_reservation_candidate_predicate_for("fr")
+        };
         (
             format!(
                 "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
