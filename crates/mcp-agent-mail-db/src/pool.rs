@@ -1949,16 +1949,29 @@ pub const DEFAULT_POOL_RECYCLE_MS: u64 = 30 * 60 * 1000; // 30 minutes
 ///
 /// Returns `(min_connections, max_connections)`.  The heuristic is:
 ///
-/// - `min = clamp(cpus * 4, 10, 50)`  — enough idle connections for moderate load
-/// - `max = clamp(cpus * 12, 50, 200)` — headroom for burst traffic
+/// - `min = clamp(cpus * 2, 4, 16)` — enough idle connections for moderate load
+/// - `max = clamp(cpus * 4, 16, 32)` — bounded burst headroom
 ///
 /// This is used when `DATABASE_POOL_SIZE=auto` (the default when no explicit size
 /// is given).
+///
+/// ## Why max is capped at 32 — FrankenSQLite concurrent-writer contract
+///
+/// FrankenSQLite's page-level MVCC has a hard concurrency contract:
+/// **>= 10 concurrent autocommit writers is UNSUPPORTED** (known corruption
+/// bug bd-9inpb, P0 open), and the swarm-tested multi-process bound is
+/// **N <= 32 short-lived writers**. The old heuristic (`cpus * 12`, up to 200
+/// — 168 connections on a 14-core machine) invited unsupported writer
+/// concurrency under multi-agent load and is a plausible contributor to the
+/// fleet-wide "database corruption detected" reports. Do NOT re-inflate these
+/// bounds without that contract changing. Explicit `DATABASE_POOL_SIZE` /
+/// `DATABASE_MAX_OVERFLOW` overrides are honoured literally and may exceed
+/// the clamp — only this AUTO path is conservative.
 #[must_use]
 pub fn auto_pool_size() -> (usize, usize) {
     let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-    let min = (cpus * 4).clamp(10, 50);
-    let max = (cpus * 12).clamp(50, 200);
+    let min = (cpus * 2).clamp(4, 16);
+    let max = (cpus * 4).clamp(16, 32);
     (min, max)
 }
 
@@ -3354,18 +3367,16 @@ impl DbPool {
                 if let Ok(modified) = metadata.modified()
                     && modified.elapsed().unwrap_or(max_age) < max_age
                 {
-                    match sqlite_canonical_artifact_is_healthy(&bak_path) {
-                        Ok(true) => return Ok(None),
-                        Ok(false) => tracing::warn!(
-                            backup = %bak_path.display(),
-                            "fresh proactive backup failed health checks; refreshing from primary"
-                        ),
-                        Err(error) => tracing::warn!(
-                            backup = %bak_path.display(),
-                            error = %error,
-                            "fresh proactive backup health check failed; refreshing from primary"
-                        ),
-                    }
+                    // Perf: a fresh backup was fully health-checked when it was
+                    // published (`validate_proactive_backup_stage` runs full
+                    // health + checkpoint validation on the staged copy before
+                    // the atomic rename). Re-verifying the whole .bak here on
+                    // every guard cycle (every 5 minutes) is O(backup size)
+                    // for zero new information — the file is immutable between
+                    // refreshes. Verification therefore runs only when the
+                    // backup is actually (re)created, i.e. at most once per
+                    // `max_age` refresh interval.
+                    return Ok(None);
                 }
                 true
             }
@@ -4702,6 +4713,48 @@ pub fn archive_storage_root_is_authoritative_for_sqlite_path(
         || sqlite_path.starts_with(storage_root)
 }
 
+/// Per-path record of archive drift that was detected but had its reconcile
+/// deferred (post-promotion cooldown or in-process write activity).
+///
+/// Keyed by the normalized sqlite identity path so different spellings of the
+/// same file (relative, symlinked parent) share one entry. The periodic retry
+/// ([`retry_archive_drift_reconcile`]) consults this before doing any O(DB) /
+/// O(archive) work: with no pending drift recorded, the 5-minute guard cycle
+/// stays a metadata-cheap no-op instead of re-running `sqlite_file_is_healthy`
+/// plus a full archive `.md` scan every time.
+static PENDING_ARCHIVE_DRIFT: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+fn pending_archive_drift() -> &'static Mutex<BTreeSet<PathBuf>> {
+    PENDING_ARCHIVE_DRIFT.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn pending_archive_drift_key(primary_path: &Path) -> PathBuf {
+    PathBuf::from(normalize_sqlite_identity_path(
+        &primary_path.to_string_lossy(),
+    ))
+}
+
+fn record_pending_archive_drift(primary_path: &Path) {
+    pending_archive_drift()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(pending_archive_drift_key(primary_path));
+}
+
+fn clear_pending_archive_drift(primary_path: &Path) {
+    pending_archive_drift()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&pending_archive_drift_key(primary_path));
+}
+
+fn has_pending_archive_drift(primary_path: &Path) -> bool {
+    pending_archive_drift()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&pending_archive_drift_key(primary_path))
+}
+
 /// Periodic in-process retry for archive-drift catch-up
 /// (mcp_agent_mail_rust#219).
 ///
@@ -4710,7 +4763,14 @@ pub fn archive_storage_root_is_authoritative_for_sqlite_path(
 /// next promotion or process restart, because the per-path init gate latches
 /// after a successful bootstrap. Background maintenance calls this on its
 /// own cadence; all standalone pacing gates (mailbox ownership, cooldown,
-/// write idleness) apply inside, so a call under load is a cheap no-op.
+/// write idleness) apply inside.
+///
+/// Cheap precondition: when the primary exists and no prior attempt recorded
+/// pending drift for this path (see [`PENDING_ARCHIVE_DRIFT`]), this returns
+/// immediately without the expensive health probe, archive inventory scan
+/// (which reads and JSON-parses every archive `.md`), or DB inventory counts.
+/// A missing primary still falls through so the reconstruct-from-archive path
+/// keeps working.
 ///
 /// # Errors
 ///
@@ -4721,6 +4781,9 @@ pub fn retry_archive_drift_reconcile(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<bool, SqlError> {
+    if primary_path.exists() && !has_pending_archive_drift(primary_path) {
+        return Ok(false);
+    }
     reconcile_archive_state_before_init(primary_path, storage_root)
 }
 
@@ -4751,6 +4814,7 @@ fn reconcile_archive_state_before_init(
 
     if !primary_path.exists() {
         let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
+        clear_pending_archive_drift(primary_path);
         tracing::warn!(
             path = %primary_path.display(),
             storage_root = %storage_root.display(),
@@ -4766,6 +4830,9 @@ fn reconcile_archive_state_before_init(
 
     let archive = crate::reconstruct::scan_archive_message_inventory(storage_root);
     if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+        // An empty archive cannot be ahead of anything: converge any stale
+        // pending-drift record for this path.
+        clear_pending_archive_drift(primary_path);
         return Ok(false);
     }
 
@@ -4792,6 +4859,10 @@ fn reconcile_archive_state_before_init(
     );
     let archive_ahead = archive_messages_ahead || archive_latest_id_ahead || archive_metadata_ahead;
     if !archive_ahead {
+        // Full inventory comparison ran and found no drift: converge the
+        // pending-drift record so the periodic retry goes back to its cheap
+        // no-op path.
+        clear_pending_archive_drift(primary_path);
         return Ok(false);
     }
 
@@ -4829,6 +4900,9 @@ fn reconcile_archive_state_before_init(
         if let Some(age) = promotion_age
             && age < cooldown
         {
+            // #219: remember the deferral so the periodic retry knows drift is
+            // actually pending and runs the full reconcile again.
+            record_pending_archive_drift(primary_path);
             tracing::info!(
                 path = %primary_path.display(),
                 promotion_age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
@@ -4838,6 +4912,9 @@ fn reconcile_archive_state_before_init(
             return Ok(false);
         }
         let Some(barrier) = crate::write_barrier::try_acquire_promotion_barrier_if_idle() else {
+            // #219: remember the deferral so the periodic retry knows drift is
+            // actually pending and runs the full reconcile again.
+            record_pending_archive_drift(primary_path);
             tracing::info!(
                 path = %primary_path.display(),
                 foreign_writers = crate::write_barrier::foreign_writer_count(),
@@ -4853,6 +4930,7 @@ fn reconcile_archive_state_before_init(
     // replaying archive-ahead content. Archive-only replacement silently
     // discarded those rows even though the current database was healthy.
     let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
+    clear_pending_archive_drift(primary_path);
     tracing::warn!(
         path = %primary_path.display(),
         storage_root = %storage_root.display(),
@@ -11181,18 +11259,24 @@ mod tests {
         let (min, max) = auto_pool_size();
         // Must be within configured clamp bounds.
         assert!(
-            (10..=50).contains(&min),
-            "auto min={min} should be in [10, 50]"
+            (4..=16).contains(&min),
+            "auto min={min} should be in [4, 16]"
         );
         assert!(
-            (50..=200).contains(&max),
-            "auto max={max} should be in [50, 200]"
+            (16..=32).contains(&max),
+            "auto max={max} should be in [16, 32]"
         );
         assert!(max >= min, "max must be >= min");
-        // On a 4-core machine: min=16, max=48→50.  On 16-core: min=50, max=192.
+        // On a 4-core machine: min=8, max=16.  On 16-core: min=16, max=32.
         let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        assert_eq!(min, (cpus * 4).clamp(10, 50));
-        assert_eq!(max, (cpus * 12).clamp(50, 200));
+        assert_eq!(min, (cpus * 2).clamp(4, 16));
+        assert_eq!(max, (cpus * 4).clamp(16, 32));
+        // fsqlite concurrent-writer contract (bd-9inpb): the AUTO pool max
+        // must never exceed the swarm-tested N<=32 short-lived-writer bound.
+        assert!(
+            max <= 32,
+            "auto max={max} exceeds the fsqlite tested concurrent-writer bound (N<=32)"
+        );
     }
 
     #[test]
@@ -15259,6 +15343,51 @@ mod tests {
     }
 
     #[test]
+    fn pending_archive_drift_record_and_clear_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pending-drift.sqlite3");
+        assert!(
+            !has_pending_archive_drift(&db_path),
+            "no drift recorded yet for a fresh path"
+        );
+        record_pending_archive_drift(&db_path);
+        assert!(
+            has_pending_archive_drift(&db_path),
+            "recorded deferral must be visible to the periodic retry gate"
+        );
+        clear_pending_archive_drift(&db_path);
+        assert!(
+            !has_pending_archive_drift(&db_path),
+            "cleared drift must return the retry gate to its cheap no-op path"
+        );
+    }
+
+    #[test]
+    fn retry_archive_drift_reconcile_is_noop_without_pending_drift() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("retry-gate.sqlite3");
+        // Deliberately NOT a sqlite file: if the gate failed and the full
+        // reconcile ran, the health probe would classify it unhealthy and the
+        // call would still return Ok(false) — so also assert via the archive
+        // side: give the storage root real project dirs so only the gate can
+        // be the reason nothing was scanned.
+        std::fs::write(&db_path, b"not-a-sqlite-file").expect("write primary");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("proj"))
+            .expect("create archive project dir");
+        assert!(
+            !has_pending_archive_drift(&db_path),
+            "precondition: no pending drift recorded"
+        );
+        let reconciled = retry_archive_drift_reconcile(&db_path, &storage_root)
+            .expect("gated retry must not error");
+        assert!(
+            !reconciled,
+            "with no pending drift and an existing primary, the retry is a no-op"
+        );
+    }
+
+    #[test]
     fn reconcile_archive_state_before_init_reconstructs_missing_db() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -16594,7 +16723,7 @@ mod tests {
     }
 
     #[test]
-    fn proactive_backup_refreshes_fresh_but_unhealthy_bak() {
+    fn proactive_backup_skips_fresh_bak_without_reverifying() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test_refresh_bad_bak.db");
         let bak_path = dir.path().join("test_refresh_bad_bak.db.bak");
@@ -16607,9 +16736,23 @@ mod tests {
         write_marker_db(&db_path, "healthy-primary");
         std::fs::write(&bak_path, b"not-a-sqlite-backup").unwrap();
 
-        let refreshed = pool
+        // A fresh .bak is trusted without re-verification: it was fully
+        // health-checked when published, and re-reading the whole file every
+        // guard cycle was pure overhead. Even a (synthetically) corrupt fresh
+        // .bak is skipped — it gets replaced on the next refresh interval.
+        let skipped = pool
             .create_proactive_backup(std::time::Duration::from_hours(1))
-            .expect("fresh corrupt backup should be refreshed");
+            .expect("fresh backup should be skipped without verification");
+        assert!(
+            skipped.is_none(),
+            "fresh .bak must be skipped without re-verification"
+        );
+
+        // Once stale, the refresh path rebuilds it from the healthy primary
+        // (staged copy is fully validated before the atomic publish).
+        let refreshed = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect("stale corrupt backup should be refreshed");
         assert_eq!(
             refreshed.as_deref(),
             Some(bak_path.as_path()),
@@ -16618,7 +16761,7 @@ mod tests {
         assert_eq!(
             sqlite_marker_value(&bak_path).as_deref(),
             Some("healthy-primary"),
-            "fresh but unhealthy .bak should be replaced from the healthy primary"
+            "stale unhealthy .bak should be replaced from the healthy primary"
         );
     }
 
@@ -16750,10 +16893,12 @@ mod tests {
     #[test]
     fn auto_pool_size_returns_valid_bounds() {
         let (min, max) = auto_pool_size();
-        assert!(min >= 10, "min should be at least 10, got {min}");
-        assert!(max >= 50, "max should be at least 50, got {max}");
-        assert!(min <= 50, "min should be at most 50, got {min}");
-        assert!(max <= 200, "max should be at most 200, got {max}");
+        assert!(min >= 4, "min should be at least 4, got {min}");
+        assert!(max >= 16, "max should be at least 16, got {max}");
+        assert!(min <= 16, "min should be at most 16, got {min}");
+        // fsqlite concurrent-writer contract (bd-9inpb): AUTO max stays within
+        // the swarm-tested N<=32 short-lived-writer bound.
+        assert!(max <= 32, "max should be at most 32, got {max}");
         assert!(min <= max, "min ({min}) should not exceed max ({max})");
     }
 
