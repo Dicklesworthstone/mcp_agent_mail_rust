@@ -2710,15 +2710,18 @@ fn render_summary_band(
     let ring_fill_str = format!("{ring_fill}%");
     let drop_count = ring_stats.total_drops();
     let drop_str = format!("{drop_count}");
-    let error_total = counters.status_4xx.saturating_add(counters.status_5xx);
+    // "Error %" tracks server faults (5xx) only, matching the anomaly rail;
+    // client errors (4xx) are surfaced separately so probe/auth noise does not
+    // read as server failure.
     #[allow(clippy::cast_precision_loss)]
     let error_rate = if counters.total == 0 {
         0.0
     } else {
-        error_total as f64 / counters.total as f64
+        counters.status_5xx as f64 / counters.total as f64
     };
     #[allow(clippy::cast_precision_loss)]
     let error_rate_str = format!("{:.1}%", error_rate * 100.0);
+    let status_4xx_str = format!("{}", counters.status_4xx);
 
     // Determine trend directions by comparing to previous snapshot.
     let msg_trend = trend_for(db.messages, prev_stats.messages);
@@ -2792,6 +2795,7 @@ fn render_summary_band(
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
             ("Error %", &error_rate_str, MetricTrend::Flat, error_color),
+            ("4xx", &status_4xx_str, MetricTrend::Flat, tp.severity_warn),
             ("Ring Fill", &ring_fill_str, MetricTrend::Flat, ring_color),
             ("Drops", &drop_str, MetricTrend::Flat, drop_color),
             ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),

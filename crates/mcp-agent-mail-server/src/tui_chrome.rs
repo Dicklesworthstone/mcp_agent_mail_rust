@@ -701,7 +701,8 @@ fn plan_status_segments_for_activity(
 
     // Counter data
     let avg_latency = state.avg_latency_ms();
-    let error_count = counters.status_4xx + counters.status_5xx;
+    // Server faults only (5xx), matching the dashboard "Error %" tile.
+    let error_count = counters.status_5xx;
     let total = counters.total;
     let ok = counters.status_2xx;
     let counter_fg = if error_count > 0 {

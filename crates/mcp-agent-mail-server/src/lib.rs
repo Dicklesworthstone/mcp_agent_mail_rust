@@ -7899,7 +7899,9 @@ fn atc_operator_wait_duration(
     };
     let micros_until_due = next_due_micros.saturating_sub(now_micros).max(0);
     let wait = Duration::from_micros(u64::try_from(micros_until_due).unwrap_or(u64::MAX));
-    wait.min(max_interval)
+    // Clamp to the operator's tick floor: an already-due `next_review_micros`
+    // must not collapse the wait to zero and spin the loop at ~1 kHz.
+    wait.min(max_interval).max(ATC_OPERATOR_MIN_TICK_INTERVAL)
 }
 
 fn maybe_emit_atc_summary_log(state: &tui_bridge::TuiSharedState, snapshot: &AtcOperatorSnapshot) {
@@ -8281,14 +8283,11 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             );
         }
 
-        let wait_duration = {
-            let duration = atc_operator_wait_duration(&snapshot, now_micros, tick_interval);
-            if duration.is_zero() {
-                Duration::from_millis(1)
-            } else {
-                duration
-            }
-        };
+        // Recompute `now` here: `now_micros` was captured before the kernel
+        // tick, so reusing it would systematically shorten the sleep by the
+        // tick's own duration. The helper clamps the result to the tick floor.
+        let wait_now_micros = mcp_agent_mail_core::timestamps::now_micros();
+        let wait_duration = atc_operator_wait_duration(&snapshot, wait_now_micros, tick_interval);
         if !wait_for_atc_operator_interval(stop.as_ref(), wait_duration) {
             break;
         }
@@ -10962,21 +10961,26 @@ impl HttpState {
         }
         // Feed the live TUI when present, otherwise feed the passive fallback
         // state used by `/mail/ws-state` and `/web-dashboard/state`.
+        //
+        // Counters must cover every completed request or the error-rate math
+        // skews (e.g. an idle server whose only counted traffic is 401/404
+        // noise), so only the noisy event-ring emission honors suppression.
         if let (Some(method), Some(path), Some(client_ip)) =
             (method.as_ref(), path.as_ref(), client_ip.as_ref())
-            && !should_suppress_tui_http_event(path)
         {
             let observability_state = tui.as_deref().unwrap_or(self.ws_state_fallback.as_ref());
-            let _ = observability_state
-                .push_event_async(tui_events::MailEvent::http_request(
-                    method.as_str(),
-                    path.as_str(),
-                    resp.status,
-                    dur_ms,
-                    client_ip.as_str(),
-                ))
-                .await;
             observability_state.record_request(resp.status, dur_ms);
+            if !should_suppress_tui_http_event(path) {
+                let _ = observability_state
+                    .push_event_async(tui_events::MailEvent::http_request(
+                        method.as_str(),
+                        path.as_str(),
+                        resp.status,
+                        dur_ms,
+                        client_ip.as_str(),
+                    ))
+                    .await;
+            }
         }
         if self.config.http_request_log_enabled
             && let (Some(method), Some(path), Some(client_ip)) =
@@ -34112,6 +34116,24 @@ first body
 
         let wait = atc_operator_wait_duration(&snapshot, 1_000_000, Duration::from_secs(5));
         assert_eq!(wait, Duration::from_micros(250_000));
+    }
+
+    #[test]
+    fn atc_operator_wait_duration_clamps_overdue_deadline_to_tick_floor() {
+        let snapshot = AtcOperatorSnapshot {
+            enabled: true,
+            source: "live".to_string(),
+            kernel: atc::AtcKernelTelemetry {
+                next_due_micros: Some(500_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // The deadline is already past: the wait must clamp to the tick floor
+        // instead of collapsing toward zero and spinning the loop.
+        let wait = atc_operator_wait_duration(&snapshot, 1_000_000, Duration::from_secs(5));
+        assert_eq!(wait, ATC_OPERATOR_MIN_TICK_INTERVAL);
     }
 
     #[test]

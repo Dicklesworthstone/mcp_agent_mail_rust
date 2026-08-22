@@ -5843,7 +5843,8 @@ fn pulse_meter(phase: u8, width: usize) -> String {
 
 fn runtime_telemetry_line(state: &TuiSharedState, ui_phase: u8) -> String {
     let counters = state.request_counters();
-    let err = counters.status_4xx.saturating_add(counters.status_5xx);
+    // Server faults only (5xx), matching the dashboard "Error %" tile.
+    let err = counters.status_5xx;
     let spark_raw = state.sparkline_snapshot();
     let spark = crate::tui_screens::dashboard::render_sparkline(&spark_raw, 12);
     let meter = pulse_meter(ui_phase, 6);

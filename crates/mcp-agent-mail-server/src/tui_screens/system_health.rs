@@ -899,10 +899,43 @@ fn boot_archive_preflight_remediation(snapshot: &BootArchivePreflightSnapshot) -
     ))
 }
 
-/// Build the optional System Health payload for supported `/mail/ws-state`
-/// polling consumers.
-#[must_use]
-pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
+/// Cached result of the expensive parts of the System Health payload: the
+/// env config read, the dismissal-file load, and the git ref-integrity sweep
+/// (which opens every archive repo and checks each ref against the odb).
+/// `/mail/ws-state?system_health=1` is polled inline on the async workers, so
+/// the sweep must never run more than once per configured
+/// `health_sweep_interval_seconds`.
+#[derive(Debug, Clone)]
+struct SystemHealthSweepCacheEntry {
+    interval: Duration,
+    am_git_binary_set: bool,
+    sweep: GitRefIntegritySweepState,
+}
+
+type SystemHealthSweepCacheValue = (Instant, Option<SystemHealthSweepCacheEntry>);
+
+static SYSTEM_HEALTH_SWEEP_CACHE: std::sync::LazyLock<Mutex<SystemHealthSweepCacheValue>> =
+    std::sync::LazyLock::new(|| {
+        // Start with `None` — the read path checks the entry before trusting
+        // the TTL, so the first call always runs the sweep synchronously.
+        Mutex::new((Instant::now(), None))
+    });
+
+/// Return the git ref-integrity sweep state (plus the `AM_GIT_BINARY`
+/// override flag observed alongside it), refreshing the process-wide cache at
+/// most once per configured sweep interval. The cold path is identical to the
+/// previous per-request behavior: one synchronous sweep.
+fn cached_git_ref_integrity_sweep(state: &TuiSharedState) -> (GitRefIntegritySweepState, bool) {
+    let mut guard = SYSTEM_HEALTH_SWEEP_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (refreshed_at, cached) = &*guard;
+    if let Some(entry) = cached
+        && refreshed_at.elapsed() < entry.interval
+    {
+        return (entry.sweep.clone(), entry.am_git_binary_set);
+    }
+
     let env_cfg = Config::from_env();
     let am_git_binary_set = std::env::var_os("AM_GIT_BINARY").is_some();
     let db_snapshot = state.db_stats_snapshot();
@@ -920,6 +953,22 @@ pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
         &dismissals,
         Utc::now(),
     );
+    *guard = (
+        Instant::now(),
+        Some(SystemHealthSweepCacheEntry {
+            interval: Duration::from_secs(env_cfg.health_sweep_interval_seconds.max(1)),
+            am_git_binary_set,
+            sweep: sweep.clone(),
+        }),
+    );
+    (sweep, am_git_binary_set)
+}
+
+/// Build the optional System Health payload for supported `/mail/ws-state`
+/// polling consumers.
+#[must_use]
+pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
+    let (sweep, am_git_binary_set) = cached_git_ref_integrity_sweep(state);
     let boot_archive_preflight = state.boot_archive_preflight_snapshot();
     let now_micros = mcp_agent_mail_db::now_micros();
     let loop_heartbeats = state.loop_heartbeats_snapshot();
