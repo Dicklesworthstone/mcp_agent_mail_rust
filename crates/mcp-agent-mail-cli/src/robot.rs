@@ -3200,12 +3200,8 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
             // With no DB inventory the authoritative check only inspects the
             // sqlite path vs the storage root, so the full archive inventory
             // is never needed on this branch.
-            if !archive_is_authoritative_for_robot_db(
-                None,
-                None,
-                storage_root,
-                local_database_url,
-            ) {
+            if !archive_is_authoritative_for_robot_db(None, None, storage_root, local_database_url)
+            {
                 return Ok(local);
             }
             tracing::warn!(
@@ -4022,7 +4018,8 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     // archive count walk and the db-sanity reopen) and skip the verdict's own
     // ownership probe — `inspect_mailbox_ownership` can shell out to
     // `lsof`/`ps` several times on macOS and we already ran it above.
-    let verdict = compute_mailbox_verdict(&config.database_url, storage_root, &VerdictOptions::fast());
+    let verdict =
+        compute_mailbox_verdict(&config.database_url, storage_root, &VerdictOptions::fast());
     // `VerdictOptions::fast()` sets `skip_ownership_check`, so fold the
     // ownership inspection we already computed back into the durability
     // floor exactly as the verdict's own ownership probe would have
@@ -4035,7 +4032,8 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
         | MailboxOwnershipDisposition::DeletedExecutable
         | MailboxOwnershipDisposition::SplitBrain => DurabilityState::Corrupt,
     };
-    let durability = DurabilityState::from_mailbox_state(verdict.state).max_severity(ownership_floor);
+    let durability =
+        DurabilityState::from_mailbox_state(verdict.state).max_severity(ownership_floor);
 
     if durability == DurabilityState::Healthy && !recovery_lock.active {
         return None;
@@ -5283,7 +5281,11 @@ fn build_recovery_only_status(
 fn build_unregistered_project_status(
     agent_flag: Option<&str>,
     source_error: &CliError,
-) -> (StatusData, Option<String>, Vec<(String, String, Option<String>)>) {
+) -> (
+    StatusData,
+    Option<String>,
+    Vec<(String, String, Option<String>)>,
+) {
     let agent_name = resolved_agent_flag_or_env(agent_flag);
     let data = StatusData {
         health: "ok".to_string(),
@@ -22313,11 +22315,25 @@ mod tests {
         );
         let (data, agent_name, alerts) = build_unregistered_project_status(None, &error);
 
-        assert_eq!(data.health, "ok", "benign not-found must not degrade health");
-        assert!(data.recovery.is_none(), "no recovery snapshot for a readable mailbox");
-        assert!(data.anomalies.is_empty(), "no corruption-flavored anomalies");
-        assert!(data.forensic_timeline.is_none(), "no forensic timeline for a benign miss");
-        assert!(agent_name.is_none());
+        assert_eq!(
+            data.health, "ok",
+            "benign not-found must not degrade health"
+        );
+        assert!(
+            data.recovery.is_none(),
+            "no recovery snapshot for a readable mailbox"
+        );
+        assert!(
+            data.anomalies.is_empty(),
+            "no corruption-flavored anomalies"
+        );
+        assert!(
+            data.forensic_timeline.is_none(),
+            "no forensic timeline for a benign miss"
+        );
+        // agent_name falls back to AGENT_MAIL_AGENT/AGENT_NAME env vars, so
+        // it is intentionally not asserted here.
+        let _ = agent_name;
 
         assert_eq!(alerts.len(), 1);
         let (severity, summary, action) = &alerts[0];

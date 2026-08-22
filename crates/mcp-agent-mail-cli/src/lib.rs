@@ -54686,7 +54686,11 @@ startup_timeout_sec = 42
         let threads_dir = project_a.join("messages").join("threads");
         std::fs::create_dir_all(&threads_dir).unwrap();
         std::fs::write(threads_dir.join("demo-thread.md"), "digest\n").unwrap();
-        std::fs::write(project_a.join("messages").join("stray.md"), "not canonical\n").unwrap();
+        std::fs::write(
+            project_a.join("messages").join("stray.md"),
+            "not canonical\n",
+        )
+        .unwrap();
 
         // Project B: no agents, one canonical message.
         let project_b = storage_root.join("projects").join("other-project");
