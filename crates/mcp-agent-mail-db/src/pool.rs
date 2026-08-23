@@ -4787,6 +4787,29 @@ pub fn retry_archive_drift_reconcile(
     reconcile_archive_state_before_init(primary_path, storage_root)
 }
 
+/// Full-cadence archive-drift catch-up for maintenance callers.
+///
+/// Unlike [`retry_archive_drift_reconcile`] this does not require a
+/// previously recorded pending-deferral: archive-ahead drift that first
+/// arises AFTER a clean bootstrap (another process crashed between archive
+/// append and DB write, manual/git edits to the archive, an external older
+/// `.bak` restore) never enters `PENDING_ARCHIVE_DRIFT`, so the quick-cycle
+/// cheap gate would short-circuit until process restart or the next durable
+/// promotion. The integrity guard's full cycle calls this on its hourly
+/// cadence instead; all standalone pacing gates (mailbox ownership,
+/// promotion cooldown, write idleness) still apply inside.
+///
+/// # Errors
+///
+/// Propagates reconstruction/promotion failures; not-needed is `Ok(false)`.
+#[allow(clippy::result_large_err)]
+pub fn reconcile_archive_drift_full_cycle(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<bool, SqlError> {
+    reconcile_archive_state_before_init(primary_path, storage_root)
+}
+
 #[allow(clippy::result_large_err)]
 fn reconcile_archive_state_before_init(
     primary_path: &Path,
