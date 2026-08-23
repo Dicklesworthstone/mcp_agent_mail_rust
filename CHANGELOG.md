@@ -8,7 +8,11 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
-## [Unreleased]
+## [v0.3.30](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.30) — 2026-08-23 **[Release]**
+
+Fleet-wide reliability campaign: root-caused the "97% error rate" display
+and the progressive sluggishness that returned within a day of
+`am clear-and-reset-everything`, plus a registry-clean dependency universe.
 
 ### Added
 
@@ -28,10 +32,6 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   error naming the field (nullable `Option<T>` schemas are a pending
   fastmcp enhancement; the test flips to asserting acceptance once that
   lands).
-
-Fleet-wide reliability campaign: root-caused the "97% error rate" display
-and the progressive sluggishness that returned within a day of
-`am clear-and-reset-everything`, plus a registry-clean dependency universe.
 
 ### Fixed
 
@@ -71,6 +71,34 @@ and the progressive sluggishness that returned within a day of
 - **ATC operator loop can no longer spin at ~1 kHz** when an agent review
   is overdue: waits clamp to the 250 ms tick floor and the sleep is
   computed from a fresh timestamp.
+- **Dispatch zombies no longer 503 an idle server forever.** Timed-out
+  blocking work that ignores cancellation still counts against admission
+  for a bounded window (`AM_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS`, default
+  300s) and is then excluded, tracked, and metered
+  (`zombies_expired`/`zombies_expired_total`), with both figures named in
+  timeout diagnostics.
+- **Tool metrics distinguish client refusals from server faults.**
+  Invalid-input, not-found, policy/contact, feature-disabled,
+  idempotency, cursor-window, and sender-token refusals now increment a
+  new per-tool `rejections` counter (surfaced via
+  `resource://tooling/metrics`); `errors` counts only server faults, so
+  a healthy server with `WORKTREES_ENABLED=false` no longer shows
+  `acquire_build_slot` at 100% error. Backpressure sheds record the call
+  and a rejection instead of registering nothing.
+- **Runtime SQLite `busy_timeout` dropped 60s → 20s**
+  (`DB_RUNTIME_BUSY_TIMEOUT_MS`, compile-time-asserted below the 30s
+  dispatch deadline) so lock-contended queries yield their thread before
+  the dispatch layer zombifies it; one-shot recovery/maintenance paths
+  keep 60s deliberately.
+- **`column_exists` probes are DQS-safe on fsqlite 0.3.8+** (share
+  scrub/scope): an unresolved double-quoted identifier degrades to a
+  string literal, so the old `SELECT "col" … LIMIT 0` probe reported
+  phantom columns; `PRAGMA table_info` now runs first.
+- **Lock-free archive commits adapt to git2 0.21** and heal an
+  unloadable HEAD before taking the reference-transaction lock
+  (previously GIT_ELOCKED made in-lock healing impossible); a non-UTF8
+  symbolic HEAD target now surfaces as an error instead of silently
+  detaching via the `HEAD` fallback.
 
 ### Changed
 
