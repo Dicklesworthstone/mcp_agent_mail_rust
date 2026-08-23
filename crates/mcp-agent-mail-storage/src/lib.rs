@@ -11528,6 +11528,7 @@ fn commit_paths(
     let result = commit_tree_advancing_head(repo, &sig, message, |repo| {
         let mut index = repo.index()?;
         reset_index_to_head(repo, &mut index)?;
+        let mut any_added = false;
         for path in rel_paths {
             let path = validate_repo_relative_path("commit path", path)?;
             // git2 expects forward-slash paths on all platforms
@@ -11549,9 +11550,15 @@ fn commit_paths(
                     return Err(err.into());
                 }
             }
+            any_added = true;
         }
         index.write()?;
-        index.write_tree()
+        if !any_added {
+            // Every requested path was already absent from disk and index —
+            // nothing to commit (historical early-out preserved).
+            return Ok(None);
+        }
+        Ok(Some(index.write_tree()?))
     });
 
     if result.is_err() {
@@ -11580,22 +11587,20 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
 
     index.write()?;
     let tree_oid = index.write_tree()?;
-    let tree = repo.find_tree(tree_oid)?;
+    let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
-    let final_message = append_trailers(message);
-    let parent = resolve_head_commit_oid(repo)?
-        .map(|oid| repo.find_commit(oid))
-        .transpose()?;
+    // Same cross-process guard as `commit_paths`: the whole reset → add-all
+    // → tree sequence is a full-state snapshot built under the HEAD ref lock.
+    commit_tree_advancing_head(repo, &sig, message, |repo| {
+        let mut index = repo.index()?;
+        reset_index_to_head(repo, &mut index)?;
 
-    let commit_result = match parent {
-        Some(ref p) => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p]),
-        None => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[]),
-    };
+        // Respect .gitignore, add all changes under the workdir.
+        index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
 
-    if let Err(err) = commit_result {
-        try_restore_index(repo);
-        return Err(err.into());
-    }
+        index.write()?;
+        Ok(Some(index.write_tree()?))
+    })?;
 
     Ok(())
 }
