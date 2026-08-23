@@ -20366,6 +20366,85 @@ mod tests {
         );
     }
 
+    /// Cross-process lost-update guard: two independently opened Repository
+    /// handles (the in-process analog of two server processes sharing one
+    /// storage root) commit concurrently. The reference-transaction lock must
+    /// serialize parent-read → ref-write so EVERY commit is reachable from
+    /// HEAD; the pre-fix `repo.commit(Some("HEAD"), …, parent=read-earlier)`
+    /// pattern orphaned whichever side lost the last-writer-wins ref update.
+    #[test]
+    fn concurrent_handles_commit_without_lost_updates() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "race-survivor").unwrap();
+
+        let threads = 4_usize;
+        let per_thread = 5_usize;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for t in 0..threads {
+            let barrier = Arc::clone(&barrier);
+            let config = config.clone();
+            let repo_root = archive.repo_root.clone();
+            let canonical_root = archive.canonical_repo_root.clone();
+            let root = archive.root.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..per_thread {
+                    // A fresh handle per commit models a separate process.
+                    let repo = Repository::open(&repo_root).unwrap();
+                    let file_path = root
+                        .join("agents")
+                        .join(format!("Agent{t}"))
+                        .join(format!("msg{i}.json"));
+                    fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+                    fs::write(&file_path, format!(r#"{{"t":{t},"i":{i}}}"#)).unwrap();
+                    let rel = rel_path_cached(&canonical_root, &file_path).unwrap();
+                    commit_paths(
+                        &repo,
+                        &config,
+                        &format!("commit t{t} i{i}"),
+                        &[rel.as_str()],
+                    )
+                    .expect("concurrent commit must succeed");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let mut revwalk = repo.revwalk().unwrap();
+        revwalk.push_head().unwrap();
+        let reachable = revwalk.count();
+        assert_eq!(
+            reachable,
+            threads * per_thread + 1, // +1 for ensure_archive's initial commit
+            "every concurrent commit must be reachable from HEAD — an orphaned \
+             commit here means a lost archive write"
+        );
+        for t in 0..threads {
+            for i in 0..per_thread {
+                let path = Path::new("agents")
+                    .join(format!("Agent{t}"))
+                    .join(format!("msg{i}.json"));
+                assert!(
+                    head_tree_contains(&repo, &path),
+                    "file from thread {t} iteration {i} missing from final tree"
+                );
+            }
+        }
+    }
+
+    fn head_tree_contains(repo: &Repository, path: &Path) -> bool {
+        repo.head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .and_then(|commit| commit.tree().ok())
+            .is_some_and(|tree| tree.get_path(path).is_ok())
+    }
+
     #[test]
     fn lockfree_commit_10_concurrent_agents() {
         // Tests that 10 threads can all commit to the same repo without crashing.
