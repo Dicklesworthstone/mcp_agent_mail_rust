@@ -377,11 +377,11 @@ fn reservation_regression_manifest_covers_required_drift_modes() {
     let corruption_ids = corruption_fixture_ids();
 
     for fixture in &manifest.fixtures {
-        assert!(!fixture.title.trim().is_empty());
-        assert!(!fixture.incident_anchor.trim().is_empty());
-        assert!(!fixture.drift_mode.trim().is_empty());
-        assert!(!fixture.expected_detector.trim().is_empty());
-        assert!(!fixture.expected_mismatches.is_empty());
+        assert_ne!(fixture.title.trim(), "");
+        assert_ne!(fixture.incident_anchor.trim(), "");
+        assert_ne!(fixture.drift_mode.trim(), "");
+        assert_ne!(fixture.expected_detector.trim(), "");
+        assert_ne!(fixture.expected_mismatches, [] as [String; 0]);
         assert!(
             fixture
                 .consumers

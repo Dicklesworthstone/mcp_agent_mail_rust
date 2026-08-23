@@ -8189,12 +8189,12 @@ first body
     fn presets_have_valid_structure() {
         assert!(QUERY_PRESETS.len() >= 4);
         for preset in QUERY_PRESETS {
-            assert!(!preset.label.is_empty());
-            assert!(!preset.description.is_empty());
+            assert_ne!(preset.label, "");
+            assert_ne!(preset.description, "");
         }
         // First preset should be "All" (empty query)
         assert_eq!(QUERY_PRESETS[0].label, "All");
-        assert!(QUERY_PRESETS[0].query.is_empty());
+        assert_eq!(QUERY_PRESETS[0].query, "");
     }
 
     #[test]
@@ -8212,7 +8212,7 @@ first body
         let mut screen = MessageBrowserScreen::new();
         screen.apply_preset(QUERY_PRESETS.len()); // Should wrap to 0
         assert_eq!(screen.preset_index, 0);
-        assert!(screen.search_input.value().is_empty());
+        assert_eq!(screen.search_input.value(), "");
     }
 
     #[test]
@@ -8252,7 +8252,7 @@ first body
         });
         screen.update(&ctrl_c, &state);
         assert_eq!(screen.preset_index, 0);
-        assert!(screen.search_input.value().is_empty());
+        assert_eq!(screen.search_input.value(), "");
     }
 
     #[test]
@@ -8310,7 +8310,7 @@ first body
         }
 
         assert!(screen.remove_named_preset("triage"));
-        assert!(screen.preset_names().is_empty());
+        assert_eq!(screen.preset_names(), [] as [String; 0]);
     }
 
     #[test]
@@ -8342,7 +8342,7 @@ first body
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
-        assert!(!screen.preset_names().is_empty());
+        assert_ne!(screen.preset_names(), [] as [String; 0]);
 
         let ctrl_l = Event::Key(ftui::KeyEvent {
             code: KeyCode::Char('l'),
@@ -8353,7 +8353,7 @@ first body
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Load);
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Delete)), &state);
-        assert!(screen.preset_names().is_empty());
+        assert_eq!(screen.preset_names(), [] as [String; 0]);
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
     }
@@ -8600,7 +8600,7 @@ first body
         );
         form.to_input.set_value("Blue");
         form.set_focus(ComposeField::To);
-        assert!(!form.suggestions.is_empty());
+        assert_ne!(form.suggestions, [] as [String; 0]);
         assert!(form.apply_suggestion());
         assert_eq!(form.to_input.value(), "BlueLake");
     }

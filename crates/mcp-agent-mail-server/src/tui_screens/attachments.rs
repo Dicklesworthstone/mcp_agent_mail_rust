@@ -1373,11 +1373,11 @@ mod tests {
     fn new_screen_defaults() {
         let screen = AttachmentExplorerScreen::new();
         assert!(screen.entries.is_empty());
-        assert!(screen.display_indices.is_empty());
+        assert_eq!(screen.display_indices, [] as [usize; 0]);
         assert_eq!(screen.sort_col, COL_DATE);
         assert!(!screen.sort_asc);
         assert_eq!(screen.media_filter, MediaFilter::All);
-        assert!(screen.text_filter.is_empty());
+        assert_eq!(screen.text_filter, "");
         assert!(!screen.text_filter_active);
     }
 

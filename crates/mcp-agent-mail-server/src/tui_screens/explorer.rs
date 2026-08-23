@@ -2477,7 +2477,7 @@ mod tests {
         assert_eq!(screen.ack_filter, AckFilter::All);
         assert!(screen.entries.is_empty());
         assert!(screen.search_dirty);
-        assert!(screen.agent_filter.is_empty());
+        assert_eq!(screen.agent_filter, "");
     }
 
     #[test]
@@ -2914,7 +2914,7 @@ mod tests {
         assert_eq!(screen.sort_mode, SortMode::DateDesc);
         assert_eq!(screen.group_mode, GroupMode::None);
         assert_eq!(screen.ack_filter, AckFilter::All);
-        assert!(screen.agent_filter.is_empty());
+        assert_eq!(screen.agent_filter, "");
         assert!(screen.search_dirty);
     }
 
@@ -3065,10 +3065,10 @@ mod tests {
 
     #[test]
     fn labels_are_nonempty() {
-        assert!(!direction_label(Direction::All).is_empty());
-        assert!(!sort_label(SortMode::DateDesc).is_empty());
-        assert!(!group_label(GroupMode::None).is_empty());
-        assert!(!ack_label(AckFilter::All).is_empty());
+        assert_ne!(direction_label(Direction::All), "");
+        assert_ne!(sort_label(SortMode::DateDesc), "");
+        assert_ne!(group_label(GroupMode::None), "");
+        assert_ne!(ack_label(AckFilter::All), "");
     }
 
     #[test]

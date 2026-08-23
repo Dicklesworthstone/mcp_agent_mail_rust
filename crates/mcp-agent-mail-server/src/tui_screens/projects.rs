@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn new_screen_has_defaults() {
         let screen = ProjectsScreen::new();
-        assert!(screen.projects.is_empty());
+        assert_eq!(screen.projects, [] as [ProjectSummary; 0]);
         assert!(!screen.filter_active);
         assert_eq!(screen.sort_col, COL_CREATED);
         assert!(!screen.sort_asc);
@@ -1384,7 +1384,7 @@ mod tests {
     #[test]
     fn default_impl() {
         let screen = ProjectsScreen::default();
-        assert!(screen.projects.is_empty());
+        assert_eq!(screen.projects, [] as [ProjectSummary; 0]);
     }
 
     #[test]
@@ -2279,7 +2279,7 @@ mod tests {
         });
 
         screen.tick(9, &state);
-        assert!(screen.projects.is_empty());
+        assert_eq!(screen.projects, [] as [ProjectSummary; 0]);
         screen.tick(10, &state);
         assert_eq!(screen.projects.len(), 1);
     }

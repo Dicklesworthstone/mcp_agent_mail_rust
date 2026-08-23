@@ -1836,7 +1836,7 @@ mod tests {
     #[test]
     fn build_key_hints_empty_bindings() {
         let hints = build_key_hints(&[], 6, 80);
-        assert!(hints.is_empty());
+        assert_eq!(hints, "");
     }
 
     #[test]
@@ -2287,8 +2287,8 @@ mod tests {
     fn screen_meta_for_all_ids() {
         for &id in ALL_SCREEN_IDS {
             let meta = screen_meta(id);
-            assert!(!meta.title.is_empty());
-            assert!(!meta.short_label.is_empty());
+            assert_ne!(meta.title, "");
+            assert_ne!(meta.short_label, "");
             assert!(meta.short_label.len() <= 12);
         }
     }

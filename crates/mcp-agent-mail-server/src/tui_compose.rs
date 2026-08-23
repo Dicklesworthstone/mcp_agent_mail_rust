@@ -1564,7 +1564,7 @@ mod tests {
     #[test]
     fn field_labels_non_empty() {
         for &f in ComposeField::ALL {
-            assert!(!f.label().is_empty());
+            assert_ne!(f.label(), "");
         }
     }
 
@@ -1610,8 +1610,8 @@ mod tests {
         assert_eq!(s.active_field, ComposeField::Recipients);
         assert!(!s.dirty);
         assert!(!s.sending);
-        assert!(s.subject.is_empty());
-        assert!(s.body.is_empty());
+        assert_eq!(s.subject, "");
+        assert_eq!(s.body, "");
         assert_eq!(s.importance, Importance::Normal);
         assert!(!s.has_unsaved_changes());
     }
@@ -2062,8 +2062,8 @@ mod tests {
         let env = s.build_envelope().unwrap();
         assert_eq!(env.sender_name, OVERSEER_AGENT_NAME);
         assert_eq!(env.to, vec!["RedLake"]);
-        assert!(env.cc.is_empty());
-        assert!(env.bcc.is_empty());
+        assert_eq!(env.cc, [] as [String; 0]);
+        assert_eq!(env.bcc, [] as [String; 0]);
         assert_eq!(env.subject, "Test subject");
         assert_eq!(env.body_md, "Hello world");
         assert_eq!(env.importance, "high");
@@ -2374,8 +2374,8 @@ mod tests {
 
         let env = s.build_envelope().unwrap();
         assert_eq!(env.to, vec!["RedLake", "BluePeak", "GoldFox"]);
-        assert!(env.cc.is_empty());
-        assert!(env.bcc.is_empty());
+        assert_eq!(env.cc, [] as [String; 0]);
+        assert_eq!(env.bcc, [] as [String; 0]);
     }
 
     // ── Edge-case: ctrl+a select all, ctrl+d clear all via keys ──

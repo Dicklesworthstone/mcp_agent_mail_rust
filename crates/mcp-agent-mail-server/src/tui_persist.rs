@@ -1820,7 +1820,7 @@ mod tests {
         assert!(store.get("reservations", "triage").is_none());
 
         assert!(store.remove("timeline", "triage"));
-        assert!(store.list_names("timeline").is_empty());
+        assert_eq!(store.list_names("timeline"), [] as [String; 0]);
         assert_eq!(
             store.list_names("reservations"),
             vec!["expiring".to_string()]
@@ -1886,12 +1886,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing_screen_filter_presets.json");
         let loaded = load_screen_filter_presets_or_default(&missing);
-        assert!(loaded.list_names("timeline").is_empty());
+        assert_eq!(loaded.list_names("timeline"), [] as [String; 0]);
 
         let corrupt = dir.path().join("screen_filter_presets.json");
         std::fs::write(&corrupt, "{not-valid-json").unwrap();
         let loaded = load_screen_filter_presets_or_default(&corrupt);
-        assert!(loaded.list_names("timeline").is_empty());
+        assert_eq!(loaded.list_names("timeline"), [] as [String; 0]);
     }
 
     // ── Theme persistence tests ─────────────────────────────────

@@ -1416,7 +1416,7 @@ mod tests {
     #[test]
     fn parse_thread_ids_empty_input_returns_empty_vec() {
         let parsed = parse_thread_ids("  , ,   ");
-        assert!(parsed.is_empty());
+        assert_eq!(parsed, [] as [String; 0]);
     }
 
     #[test]
@@ -1782,7 +1782,10 @@ mod tests {
     #[test]
     fn parse_importance_list_empty() {
         let result = parse_importance_list("").unwrap();
-        assert!(result.is_empty());
+        assert_eq!(
+            result,
+            [] as [mcp_agent_mail_db::search_planner::Importance; 0]
+        );
     }
 
     #[test]
@@ -1894,7 +1897,7 @@ mod tests {
     #[test]
     fn summarize_empty_messages() {
         let summary = summarize_messages(&[]);
-        assert!(summary.participants.is_empty());
+        assert_eq!(summary.participants, [] as [String; 0]);
         assert_eq!(summary.total_messages, 0);
     }
 
@@ -1991,7 +1994,7 @@ mod tests {
             "The deploy is unblocked now\nNext.js route is green\nThis is actionable follow-up",
         )];
         let summary = summarize_messages(&rows);
-        assert!(summary.action_items.is_empty());
+        assert_eq!(summary.action_items, [] as [String; 0]);
         assert_eq!(summary.open_actions, 0);
     }
 
@@ -2240,7 +2243,7 @@ mod tests {
     fn summarize_handles_whitespace_only_body() {
         let rows = vec![make_msg("Alice", "   \n\t  \n  ")];
         let summary = summarize_messages(&rows);
-        assert!(summary.key_points.is_empty());
+        assert_eq!(summary.key_points, [] as [String; 0]);
         assert!(summary.mentions.is_empty());
     }
 
@@ -2250,7 +2253,7 @@ mod tests {
         let rows = vec![make_msg("Alice", &format!("- {long_line}"))];
         let summary = summarize_messages(&rows);
         // Should extract the point but may truncate
-        assert!(!summary.key_points.is_empty());
+        assert_ne!(summary.key_points, [] as [String; 0]);
     }
 
     #[test]

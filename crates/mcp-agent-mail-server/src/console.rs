@@ -1618,7 +1618,7 @@ impl ConsoleCaps {
     #[allow(clippy::missing_const_for_fn)]
     pub fn from_capabilities(caps: &ftui::TerminalCapabilities) -> Self {
         Self {
-            true_color: caps.color_depth == ftui::ColorDepth::TrueColor,
+            true_color: caps.true_color,
             osc8_hyperlinks: caps.osc8_hyperlinks,
             mouse_sgr: caps.mouse_sgr,
             sync_output: caps.sync_output,
@@ -3636,7 +3636,7 @@ mod tests {
             buf.sample();
         }
         let rendered = buf.get_data();
-        assert!(!rendered.is_empty());
+        assert_ne!(rendered, [] as [f64; 0]);
     }
 
     // ── Toast tests ──
@@ -4235,7 +4235,7 @@ mod tests {
             in_mux: false,
         };
         let lines = caps.banner_lines();
-        assert!(!lines.is_empty());
+        assert_ne!(lines, [] as [String; 0]);
         let joined = lines.join("\n");
         let stripped = strip_ansi_content(&joined);
         assert!(
@@ -4302,7 +4302,7 @@ mod tests {
     #[test]
     fn console_caps_from_capabilities_maps_fields() {
         let mut ftui_caps = ftui::TerminalCapabilities::basic();
-        ftui_caps.color_depth = ftui::ColorDepth::TrueColor;
+        ftui_caps.true_color = true;
         ftui_caps.osc8_hyperlinks = true;
         ftui_caps.mouse_sgr = false;
         ftui_caps.sync_output = true;
@@ -4429,7 +4429,7 @@ mod tests {
     #[test]
     fn log_pane_caps_addendum_initially_empty() {
         let pane = LogPane::new();
-        assert!(pane.caps_addendum.is_empty());
+        assert_eq!(pane.caps_addendum, "");
     }
 
     #[test]

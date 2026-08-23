@@ -2328,9 +2328,9 @@ mod tests {
         let second_seqs: Vec<u64> = second_batch.iter().map(MailEvent::seq).collect();
         assert_eq!(second_seqs, vec![5, 6]);
 
-        assert!(ring.events_since_seq_limited(6, 2).is_empty());
-        assert!(ring.events_since_seq_limited(10, 2).is_empty());
-        assert!(ring.events_since_seq_limited(2, 0).is_empty());
+        assert_eq!(ring.events_since_seq_limited(6, 2), [] as [MailEvent; 0]);
+        assert_eq!(ring.events_since_seq_limited(10, 2), [] as [MailEvent; 0]);
+        assert_eq!(ring.events_since_seq_limited(2, 0), [] as [MailEvent; 0]);
     }
 
     #[test]
@@ -2686,15 +2686,15 @@ mod tests {
     fn replay_range_empty_on_invalid_range() {
         let ring = EventRingBuffer::with_capacity(10);
         let _ = ring.push(sample_http("/x", 200));
-        assert!(ring.replay_range(5, 2).is_empty());
-        assert!(ring.replay_range(100, 200).is_empty());
+        assert_eq!(ring.replay_range(5, 2), [] as [MailEvent; 0]);
+        assert_eq!(ring.replay_range(100, 200), [] as [MailEvent; 0]);
     }
 
     #[test]
     fn iter_recent_zero_returns_empty() {
         let ring = EventRingBuffer::with_capacity(10);
         let _ = ring.push(sample_http("/x", 200));
-        assert!(ring.iter_recent(0).is_empty());
+        assert_eq!(ring.iter_recent(0), [] as [MailEvent; 0]);
     }
 
     #[test]
@@ -2867,7 +2867,7 @@ mod tests {
             MailEventKind::ServerShutdown.compact_label(),
         ];
         for label in labels {
-            assert!(!label.is_empty());
+            assert_ne!(label, "");
             assert!(label.len() <= 10, "label too long: {label}");
         }
     }
@@ -3086,7 +3086,7 @@ mod tests {
         let ring = EventRingBuffer::with_capacity(100);
         let _ = ring.push(sample_tool_start("t"));
         let events = ring.events_since_seq(0);
-        assert!(!events.is_empty());
+        assert_ne!(events, [] as [MailEvent; 0]);
         let ts = events[0].timestamp_micros();
         // Should be a reasonable recent timestamp (after 2020)
         assert!(

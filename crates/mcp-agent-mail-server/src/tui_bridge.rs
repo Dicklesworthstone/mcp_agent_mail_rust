@@ -2121,7 +2121,7 @@ mod tests {
     fn sparkline_starts_empty() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
-        assert!(state.sparkline_snapshot().is_empty());
+        assert_eq!(state.sparkline_snapshot(), [] as [f64; 0]);
     }
 
     #[test]
@@ -2581,7 +2581,7 @@ mod tests {
             })
         );
         let drained = state.drain_remote_terminal_events(0);
-        assert!(drained.is_empty());
+        assert_eq!(drained, [] as [RemoteTerminalEvent; 0]);
         assert_eq!(state.remote_terminal_queue_len(), 1);
     }
 
@@ -2673,7 +2673,7 @@ mod tests {
         state.push_console_log("beta".to_string());
 
         let future = state.console_log_since(999);
-        assert!(future.is_empty());
+        assert_eq!(future, [] as [(u64, String); 0]);
     }
 
     fn sample_screen_diag(screen: &str) -> ScreenDiagnosticSnapshot {
@@ -2725,7 +2725,7 @@ mod tests {
     fn screen_diagnostics_do_not_log_when_debug_disabled() {
         let state = TuiSharedState::new(&Config::default());
         state.push_screen_diagnostic(sample_screen_diag("agents"));
-        assert!(state.console_log_since(0).is_empty());
+        assert_eq!(state.console_log_since(0), [] as [(u64, String); 0]);
     }
 
     #[test]
@@ -3384,7 +3384,7 @@ mod tests {
         // raw_database_url should have the full URL
         assert_eq!(snap.raw_database_url, config.database_url);
         // sanitized database_url should not expose secrets in common cases
-        assert!(!snap.database_url.is_empty());
+        assert_ne!(snap.database_url, "");
     }
 
     #[test]

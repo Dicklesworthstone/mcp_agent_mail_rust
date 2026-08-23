@@ -786,8 +786,8 @@ mod tests {
     #[test]
     fn global_bindings_have_labels_and_actions() {
         for binding in GLOBAL_BINDINGS {
-            assert!(!binding.label.is_empty());
-            assert!(!binding.action.is_empty());
+            assert_ne!(binding.label, "");
+            assert_ne!(binding.action, "");
         }
     }
 
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn label_to_keycodes_ctrl_modifier_returns_empty() {
         // Ctrl+P doesn't conflict with plain 'P'
-        assert!(label_to_keycodes("Ctrl+P").is_empty());
+        assert_eq!(label_to_keycodes("Ctrl+P"), [] as [KeyCode; 0]);
     }
 
     #[test]
@@ -837,7 +837,7 @@ mod tests {
     fn detect_conflicts_no_overlap() {
         let screen_bindings = &[("x", "Do X"), ("z", "Do Z")];
         let conflicts = detect_conflicts(screen_bindings);
-        assert!(conflicts.is_empty());
+        assert_eq!(conflicts, [] as [(&str, &str, String); 0]);
     }
 
     #[test]
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn profile_labels_non_empty() {
         for p in KeymapProfile::ALL {
-            assert!(!p.label().is_empty());
+            assert_ne!(p.label(), "");
         }
     }
 
@@ -1142,11 +1142,11 @@ mod tests {
     fn registry_help_entries_nonempty() {
         let reg = KeymapRegistry::default();
         let entries = reg.help_entries();
-        assert!(!entries.is_empty());
+        assert_ne!(entries, [] as [(String, String); 0]);
         // First entry should have both label and description
         let (label, action) = &entries[0];
-        assert!(!label.is_empty());
-        assert!(!action.is_empty());
+        assert_ne!(label, "");
+        assert_ne!(action, "");
     }
 
     #[test]
@@ -1216,7 +1216,7 @@ mod tests {
         let reg = KeymapRegistry::default();
         let screen_bindings = &[("q", "Screen quit")];
         let conflicts = reg.conflicts_with(screen_bindings);
-        assert!(!conflicts.is_empty());
+        assert_ne!(conflicts, [] as [(String, String, String); 0]);
     }
 
     #[test]
@@ -1399,6 +1399,6 @@ mod tests {
             screen_section.body_markdown.as_deref(),
             Some("Use this screen for triage.")
         );
-        assert!(screen_section.entries.is_empty());
+        assert_eq!(screen_section.entries, [] as [(String, String); 0]);
     }
 }

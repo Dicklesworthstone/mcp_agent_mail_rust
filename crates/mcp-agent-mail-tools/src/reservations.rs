@@ -3835,7 +3835,10 @@ mod tests {
                     other => panic!("bounded snapshot failed: {other:?}"),
                 };
                 assert!(bounded.overflow);
-                assert!(bounded.reservations.is_empty());
+                assert_eq!(
+                    bounded.reservations,
+                    [] as [queries::ReservationConflictSnapshotRow; 0]
+                );
 
                 let primed = match queries::get_reservation_conflict_snapshot(
                     &cx,
@@ -5266,13 +5269,13 @@ mod tests {
     #[test]
     fn empty_paths_detected() {
         let paths: Vec<String> = vec![];
-        assert!(paths.is_empty());
+        assert_eq!(paths, [] as [String; 0]);
     }
 
     #[test]
     fn non_empty_paths_accepted() {
         let paths = ["src/*.rs".to_string()];
-        assert!(!paths.is_empty());
+        assert_ne!(paths.as_slice(), [] as [String; 0]);
     }
 
     // -----------------------------------------------------------------------
@@ -5353,7 +5356,10 @@ mod tests {
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert!(json["granted"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["granted"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
         assert_eq!(json["conflicts"].as_array().unwrap().len(), 1);
         assert_eq!(json["conflicts"][0]["holders"][0]["agent"], "GoldHawk");
     }
@@ -5579,8 +5585,14 @@ mod tests {
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert!(json["granted"].as_array().unwrap().is_empty());
-        assert!(json["conflicts"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["granted"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
+        assert_eq!(
+            json["conflicts"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]
@@ -6139,7 +6151,10 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["renewed"], 0);
-        assert!(json["file_reservations"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["file_reservations"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     // ── Glob pattern in paths ──

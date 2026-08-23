@@ -1795,14 +1795,14 @@ mod tests {
 
     #[test]
     fn action_ids_constants_nonempty() {
-        assert!(!action_ids::RECORD_START.is_empty());
-        assert!(!action_ids::RECORD_STOP.is_empty());
-        assert!(!action_ids::RECORD_CANCEL.is_empty());
-        assert!(!action_ids::PLAY_PREFIX.is_empty());
-        assert!(!action_ids::PLAY_STEP_PREFIX.is_empty());
-        assert!(!action_ids::DRY_RUN_PREFIX.is_empty());
-        assert!(!action_ids::DELETE_PREFIX.is_empty());
-        assert!(!action_ids::PLAYBACK_STOP.is_empty());
+        assert_ne!(action_ids::RECORD_START, "");
+        assert_ne!(action_ids::RECORD_STOP, "");
+        assert_ne!(action_ids::RECORD_CANCEL, "");
+        assert_ne!(action_ids::PLAY_PREFIX, "");
+        assert_ne!(action_ids::PLAY_STEP_PREFIX, "");
+        assert_ne!(action_ids::DRY_RUN_PREFIX, "");
+        assert_ne!(action_ids::DELETE_PREFIX, "");
+        assert_ne!(action_ids::PLAYBACK_STOP, "");
     }
 
     #[test]

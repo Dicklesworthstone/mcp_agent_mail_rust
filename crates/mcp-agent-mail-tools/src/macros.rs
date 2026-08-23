@@ -1404,7 +1404,7 @@ mod tests {
         let parsed: PrepareThreadResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.thread.total_messages, 0);
         assert!(parsed.thread.examples.is_empty());
-        assert!(parsed.thread.summary.participants.is_empty());
+        assert_eq!(parsed.thread.summary.participants, [] as [String; 0]);
     }
 
     // -----------------------------------------------------------------------
@@ -1475,7 +1475,7 @@ mod tests {
     fn empty_reservation_paths_produces_empty_grants() {
         // When file_reservation_paths is Some but empty, should return empty grants
         let empty_paths: Vec<String> = Vec::new();
-        assert!(empty_paths.is_empty());
+        assert_eq!(empty_paths, [] as [String; 0]);
         // In macro_start_session, this produces ReservationResponse with empty granted/conflicts
     }
 }

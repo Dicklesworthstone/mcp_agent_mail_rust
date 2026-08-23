@@ -3151,7 +3151,7 @@ mod tests {
         assert!(screen.show_released);
 
         assert!(screen.remove_named_preset("triage"));
-        assert!(screen.preset_names().is_empty());
+        assert_eq!(screen.preset_names(), [] as [String; 0]);
     }
 
     #[test]
@@ -3171,7 +3171,7 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
-        assert!(!screen.preset_names().is_empty());
+        assert_ne!(screen.preset_names(), [] as [String; 0]);
 
         let ctrl_l = Event::Key(ftui::KeyEvent {
             code: KeyCode::Char('l'),
@@ -3182,7 +3182,7 @@ mod tests {
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::Load);
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Delete)), &state);
-        assert!(screen.preset_names().is_empty());
+        assert_eq!(screen.preset_names(), [] as [String; 0]);
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
     }
@@ -3315,7 +3315,7 @@ mod tests {
 
         // Without show_released, sorted_keys should be empty
         screen.rebuild_sorted();
-        assert!(screen.sorted_keys.is_empty());
+        assert_eq!(screen.sorted_keys, [] as [String; 0]);
 
         // With show_released
         screen.show_released = true;
@@ -3904,7 +3904,7 @@ mod tests {
 
         assert_eq!(screen.reservations.len(), 2);
         assert_eq!(screen.last_snapshot_micros, 42);
-        assert!(!screen.sorted_keys.is_empty());
+        assert_ne!(screen.sorted_keys, [] as [String; 0]);
     }
 
     // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────

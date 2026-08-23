@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn builtin_default_has_bands() {
         let preset = builtin_default();
-        assert!(!preset.bands.is_empty());
+        assert_ne!(preset.bands, [] as [BandConfig; 0]);
         assert_eq!(preset.name, "default");
     }
 

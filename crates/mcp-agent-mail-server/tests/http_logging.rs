@@ -53,7 +53,7 @@ fn otel_config_default_service_name() {
 #[test]
 fn otel_config_default_endpoint_is_empty() {
     let config = Config::from_env();
-    assert!(config.http_otel_exporter_otlp_endpoint.is_empty());
+    assert_eq!(config.http_otel_exporter_otlp_endpoint, "");
 }
 
 #[test]

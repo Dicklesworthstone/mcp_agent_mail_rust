@@ -1821,14 +1821,14 @@ mod tests {
             stats.record(i * 10, false);
         }
         let spark = stats.sparkline_str();
-        assert!(!spark.is_empty());
+        assert_ne!(spark, "");
         assert_eq!(spark.chars().count(), 10);
     }
 
     #[test]
     fn tool_stats_empty_sparkline() {
         let stats = ToolStats::new("empty".into());
-        assert!(stats.sparkline_str().is_empty());
+        assert_eq!(stats.sparkline_str(), "");
     }
 
     #[test]
@@ -1904,7 +1904,7 @@ mod tests {
 
         // Dirty on non-cadence tick should still rebuild on next cadence tick.
         screen.tick(9, &state);
-        assert!(screen.sorted_tools.is_empty());
+        assert_eq!(screen.sorted_tools, [] as [String; 0]);
         screen.tick(10, &state);
         assert_eq!(screen.sorted_tools, vec!["send_message".to_string()]);
     }
@@ -2656,7 +2656,7 @@ mod tests {
     fn transparency_evidence_ingestion_via_tick() {
         let state = test_state();
         let mut screen = ToolMetricsScreen::new();
-        assert!(screen.evidence_entries.is_empty());
+        assert_eq!(screen.evidence_entries, [] as [EvidenceLedgerEntry; 0]);
 
         // Record an entry to the global evidence ledger.
         evidence_ledger().record(

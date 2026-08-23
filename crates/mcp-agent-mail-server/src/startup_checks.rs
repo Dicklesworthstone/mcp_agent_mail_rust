@@ -3464,7 +3464,7 @@ mod tests {
             ],
         };
         assert!(report.is_ok());
-        assert!(report.format_errors().is_empty());
+        assert_eq!(report.format_errors(), "");
     }
 
     #[test]

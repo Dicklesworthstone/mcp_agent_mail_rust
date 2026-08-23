@@ -807,7 +807,7 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
             assert!(synthesis_advisory.resolved_count >= 2);
             assert!(synthesis_advisory.correct_count >= 1);
             assert!(synthesis_advisory.incorrect_count >= 1);
-            assert!(receiver_open_rows.is_empty());
+            assert_eq!(receiver_open_rows, [] as [ExperienceRow; 0]);
             assert_eq!(retained.deleted_rows, 0);
             assert!(retained.preserved_rollups);
             assert!(

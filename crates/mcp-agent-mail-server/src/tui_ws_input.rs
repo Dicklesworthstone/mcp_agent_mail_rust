@@ -184,7 +184,7 @@ mod tests {
             .collect();
         let body = serde_json::to_vec(&json!({ "events": events })).expect("serialize payload");
         let parsed = parse_remote_terminal_events(&body).expect("parse max-sized batch");
-        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.events, [] as [RemoteTerminalEvent; 0]);
         assert_eq!(parsed.ignored, MAX_INGRESS_EVENTS);
     }
 
@@ -214,7 +214,7 @@ mod tests {
     fn parse_ping_only_payload_is_ignored_not_error() {
         let payload = br#"{"type":"Ping"}"#;
         let parsed = parse_remote_terminal_events(payload).expect("parse ping payload");
-        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.events, [] as [RemoteTerminalEvent; 0]);
         assert_eq!(parsed.ignored, 1);
     }
 
@@ -275,7 +275,7 @@ mod tests {
     fn parse_pong_is_ignored() {
         let payload = br#"{"type":"Pong"}"#;
         let parsed = parse_remote_terminal_events(payload).expect("parse pong");
-        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.events, [] as [RemoteTerminalEvent; 0]);
         assert_eq!(parsed.ignored, 1);
     }
 
@@ -308,7 +308,7 @@ mod tests {
     fn parse_empty_batch() {
         let payload = br#"{"events":[]}"#;
         let parsed = parse_remote_terminal_events(payload).expect("parse empty batch");
-        assert!(parsed.events.is_empty());
+        assert_eq!(parsed.events, [] as [RemoteTerminalEvent; 0]);
         assert_eq!(parsed.ignored, 0);
     }
 }

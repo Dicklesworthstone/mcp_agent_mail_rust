@@ -5528,7 +5528,7 @@ first body
 
     #[test]
     fn active_reservation_predicate_is_nonempty() {
-        assert!(!ACTIVE_RESERVATION_PREDICATE.is_empty());
+        assert_ne!(ACTIVE_RESERVATION_PREDICATE, "");
         assert!(ACTIVE_RESERVATION_PREDICATE.contains("released_ts IS NULL"));
     }
 
@@ -5581,7 +5581,7 @@ first body
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         // No tables created
         let agents = fetch_agents_list(&conn);
-        assert!(agents.is_empty());
+        assert_eq!(agents, [] as [AgentSummary; 0]);
     }
 
     #[test]
@@ -5590,7 +5590,7 @@ first body
         let db_path = dir.path().join("test_projects_no_table.db");
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         let projects = fetch_projects_list(&conn);
-        assert!(projects.is_empty());
+        assert_eq!(projects, [] as [ProjectSummary; 0]);
     }
 
     #[test]
@@ -5666,7 +5666,7 @@ first body
         let db_path = dir.path().join("test_contacts_no_table.db");
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         let contacts = fetch_contacts_list(&conn);
-        assert!(contacts.is_empty());
+        assert_eq!(contacts, [] as [ContactSummary; 0]);
     }
 
     #[test]
@@ -5798,7 +5798,7 @@ first body
         let db_path = dir.path().join("test_reservations_no_table.db");
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         let reservations = fetch_reservation_snapshots(&conn);
-        assert!(reservations.is_empty());
+        assert_eq!(reservations, [] as [ReservationSnapshot; 0]);
     }
 
     #[test]

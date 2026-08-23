@@ -84,5 +84,5 @@ fn health_prefix_config_is_hardcoded() {
     let config = Config::from_env();
     // No config field for health prefix — it's always /health/.
     // The health path bypass is hardcoded as `/health/` prefix check in handle_inner().
-    assert!(!config.http_path.is_empty());
+    assert_ne!(config.http_path, "");
 }

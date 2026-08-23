@@ -4429,7 +4429,7 @@ mod tests {
         let toasts =
             git_segfault_retry_toast_handler(&mut state, &event, Instant::now(), false, true);
 
-        assert!(toasts.is_empty());
+        assert_eq!(toasts, [] as [GitSegfaultRetryToast; 0]);
         assert_eq!(badge.retry_count, 1);
     }
 
@@ -4444,7 +4444,7 @@ mod tests {
             false,
         );
 
-        assert!(toasts.is_empty());
+        assert_eq!(toasts, [] as [GitSegfaultRetryToast; 0]);
     }
 
     #[test]
@@ -4505,7 +4505,7 @@ mod tests {
         let after_window = start + Duration::from_secs(5 * 60 + 1);
         let toasts = git_segfault_retry_toast_handler(&mut state, &event, after_window, true, true);
 
-        assert!(toasts.is_empty());
+        assert_eq!(toasts, [] as [GitSegfaultRetryToast; 0]);
     }
 
     #[test]
@@ -6628,7 +6628,10 @@ reason = "manual prune"
             .expect("dismissals parent");
         std::fs::write(&path, "[[dismissed]\nproject_slug =").expect("invalid toml");
 
-        assert!(load_git_ref_sweep_dismissals(&path).is_empty());
+        assert_eq!(
+            load_git_ref_sweep_dismissals(&path),
+            [] as [GitRefSweepDismissalEntry; 0]
+        );
     }
 
     #[test]
@@ -6704,8 +6707,8 @@ reason = "manual prune"
                 .iter()
                 .all(|(name, value)| !name.is_empty() && !value.is_empty())
         );
-        assert!(!finding.target_sha.is_empty());
-        assert!(!finding.reason.is_empty());
+        assert_ne!(finding.target_sha, "");
+        assert_ne!(finding.reason, "");
     }
 
     #[test]

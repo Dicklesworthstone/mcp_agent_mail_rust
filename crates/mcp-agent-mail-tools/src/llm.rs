@@ -1179,7 +1179,7 @@ mod tests {
         // "best" triggers dynamic selection
         let result = resolve_model_alias("best");
         // Should return some model (depends on env vars)
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
     }
 
     #[test]
@@ -1822,7 +1822,7 @@ mod tests {
         // Can't control env vars in tests, but the function must always
         // return a non-empty string (either from env or DEFAULT_MODEL).
         let result = choose_best_available_model("auto");
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
     }
 
     // ── apply_multi_thread_thread_revisions ──────────────────────────

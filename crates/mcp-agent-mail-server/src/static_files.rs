@@ -407,7 +407,7 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
 
         let candidates = executable_web_candidates(&parent);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [PathBuf; 0]);
     }
 
     #[cfg(unix)]
@@ -424,7 +424,7 @@ mod tests {
         symlink(&outside, root.join(".git")).unwrap();
 
         let candidates = executable_web_candidates(&parent);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [PathBuf; 0]);
     }
 
     #[test]
@@ -446,7 +446,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         let candidates = current_dir_web_candidates(&nested);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [PathBuf; 0]);
     }
 
     #[cfg(unix)]
@@ -463,7 +463,7 @@ mod tests {
         symlink(&outside, root.join("crates")).unwrap();
 
         let candidates = current_dir_web_candidates(&nested);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, [] as [PathBuf; 0]);
     }
 
     #[cfg(unix)]

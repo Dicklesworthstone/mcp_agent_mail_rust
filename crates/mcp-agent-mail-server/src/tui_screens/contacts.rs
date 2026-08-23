@@ -1680,7 +1680,7 @@ mod tests {
     #[test]
     fn new_screen_has_defaults() {
         let screen = ContactsScreen::new();
-        assert!(screen.contacts.is_empty());
+        assert_eq!(screen.contacts, [] as [ContactSummary; 0]);
         assert!(!screen.filter_active);
         assert_eq!(screen.sort_col, COL_UPDATED);
         assert!(!screen.sort_asc);
@@ -1828,7 +1828,7 @@ mod tests {
     #[test]
     fn default_impl() {
         let screen = ContactsScreen::default();
-        assert!(screen.contacts.is_empty());
+        assert_eq!(screen.contacts, [] as [ContactSummary; 0]);
     }
 
     #[test]
@@ -2048,12 +2048,12 @@ mod tests {
             ..Default::default()
         });
         screen.layout_graph(&[]);
-        assert!(!screen.graph_nodes.is_empty());
+        assert_ne!(screen.graph_nodes, [] as [(String, f64, f64); 0]);
         assert!(!screen.graph_node_lookup.is_empty());
 
         screen.contacts.clear();
         screen.layout_graph(&[]);
-        assert!(screen.graph_nodes.is_empty());
+        assert_eq!(screen.graph_nodes, [] as [(String, f64, f64); 0]);
         assert!(screen.graph_node_lookup.is_empty());
     }
 
@@ -2219,7 +2219,7 @@ mod tests {
         });
         screen.rebuild_from_state(&state);
 
-        assert!(screen.contacts.is_empty());
+        assert_eq!(screen.contacts, [] as [ContactSummary; 0]);
     }
 
     #[test]

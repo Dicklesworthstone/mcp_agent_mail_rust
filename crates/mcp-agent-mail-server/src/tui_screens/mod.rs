@@ -579,9 +579,9 @@ mod tests {
         for &id in ALL_SCREEN_IDS {
             let meta = screen_meta(id);
             assert_eq!(meta.id, id);
-            assert!(!meta.title.is_empty());
-            assert!(!meta.short_label.is_empty());
-            assert!(!meta.help_markdown.is_empty());
+            assert_ne!(meta.title, "");
+            assert_ne!(meta.short_label, "");
+            assert_ne!(meta.help_markdown, "");
         }
     }
 
@@ -737,8 +737,8 @@ mod tests {
     #[test]
     fn category_labels_are_nonempty() {
         for &cat in ScreenCategory::ALL {
-            assert!(!cat.label().is_empty());
-            assert!(!cat.short_label().is_empty());
+            assert_ne!(cat.label(), "");
+            assert_ne!(cat.short_label(), "");
             assert!(cat.short_label().len() <= 4);
         }
     }

@@ -521,9 +521,9 @@ mod tests {
 
         // Verify required fields are present.
         for entry in &snapshot {
-            assert!(!entry.name.is_empty());
-            assert!(!entry.cluster.is_empty());
-            assert!(!entry.complexity.is_empty());
+            assert_ne!(entry.name, "");
+            assert_ne!(entry.cluster, "");
+            assert_ne!(entry.complexity, "");
         }
     }
 

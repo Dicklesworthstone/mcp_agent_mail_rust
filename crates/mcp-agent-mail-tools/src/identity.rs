@@ -3451,7 +3451,10 @@ mod tests {
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert!(json["recent_commits"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["recent_commits"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     // ── Path validation (ensure_project logic) ──
@@ -3497,17 +3500,17 @@ mod tests {
 
     #[test]
     fn whitespace_only_program_is_empty_after_trim() {
-        assert!("".trim().is_empty());
-        assert!("  ".trim().is_empty());
-        assert!("\t".trim().is_empty());
-        assert!(!"claude-code".trim().is_empty());
+        assert_eq!("".trim(), "");
+        assert_eq!("  ".trim(), "");
+        assert_eq!("\t".trim(), "");
+        assert_ne!("claude-code".trim(), "");
     }
 
     #[test]
     fn whitespace_only_model_is_empty_after_trim() {
-        assert!("".trim().is_empty());
-        assert!("  ".trim().is_empty());
-        assert!(!"opus-4.5".trim().is_empty());
+        assert_eq!("".trim(), "");
+        assert_eq!("  ".trim(), "");
+        assert_ne!("opus-4.5".trim(), "");
     }
 
     // -----------------------------------------------------------------------

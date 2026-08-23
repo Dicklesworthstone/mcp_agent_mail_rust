@@ -1154,19 +1154,25 @@ mod tests {
     #[test]
     fn extract_links_http_request_is_empty() {
         let event = MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1");
-        assert!(extract_links(&event).is_empty());
+        assert_eq!(extract_links(&event), [] as [CorrelationLink; 0]);
     }
 
     #[test]
     fn extract_links_health_pulse_is_empty() {
         let event = MailEvent::health_pulse(DbStatSnapshot::default());
-        assert!(extract_links(&event).is_empty());
+        assert_eq!(extract_links(&event), [] as [CorrelationLink; 0]);
     }
 
     #[test]
     fn extract_links_server_events_are_empty() {
-        assert!(extract_links(&MailEvent::server_started("http://localhost", "")).is_empty());
-        assert!(extract_links(&MailEvent::server_shutdown()).is_empty());
+        assert_eq!(
+            extract_links(&MailEvent::server_started("http://localhost", "")),
+            [] as [CorrelationLink; 0]
+        );
+        assert_eq!(
+            extract_links(&MailEvent::server_shutdown()),
+            [] as [CorrelationLink; 0]
+        );
     }
 
     #[test]
@@ -1286,8 +1292,8 @@ mod tests {
                 action.label,
                 action.id
             );
-            assert!(!action.id.is_empty());
-            assert!(!action.description.is_empty());
+            assert_ne!(action.id, "");
+            assert_ne!(action.description, "");
         }
     }
 
@@ -1365,7 +1371,7 @@ mod tests {
     fn hints_http_200_fast_no_hints() {
         let event = MailEvent::http_request("GET", "/mcp/", 200, 5, "127.0.0.1");
         let hints = remediation_hints(&event);
-        assert!(hints.is_empty());
+        assert_eq!(hints, [] as [RemediationHint; 0]);
     }
 
     #[test]
@@ -1381,7 +1387,7 @@ mod tests {
             None,
         );
         let hints = remediation_hints(&event);
-        assert!(!hints.is_empty());
+        assert_ne!(hints, [] as [RemediationHint; 0]);
         assert!(hints[0].summary.contains("error"));
     }
 
@@ -1390,7 +1396,7 @@ mod tests {
         let event =
             MailEvent::tool_call_end("fetch_inbox", 3000, None, 10, 50.0, vec![], None, None);
         let hints = remediation_hints(&event);
-        assert!(!hints.is_empty());
+        assert_ne!(hints, [] as [RemediationHint; 0]);
         assert!(hints[0].summary.contains("Slow"));
     }
 
@@ -1399,7 +1405,7 @@ mod tests {
         let event =
             MailEvent::tool_call_end("search_messages", 500, None, 60, 120.0, vec![], None, None);
         let hints = remediation_hints(&event);
-        assert!(!hints.is_empty());
+        assert_ne!(hints, [] as [RemediationHint; 0]);
         assert!(hints.iter().any(|h| h.summary.contains("Excessive")));
     }
 
@@ -1416,7 +1422,7 @@ mod tests {
             None,
         );
         let hints = remediation_hints(&event);
-        assert!(hints.is_empty());
+        assert_eq!(hints, [] as [RemediationHint; 0]);
     }
 
     #[test]
@@ -1439,7 +1445,7 @@ mod tests {
             "",
         );
         let hints = remediation_hints(&event);
-        assert!(hints.is_empty());
+        assert_eq!(hints, [] as [RemediationHint; 0]);
     }
 
     // ── Macro quick action tests ──────────────────────────────────

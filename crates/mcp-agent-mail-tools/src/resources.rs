@@ -3611,7 +3611,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
     let ttl_seconds: u64 = query
         .get("ttl_seconds")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(Config::get().ack_ttl_seconds);
+        .unwrap_or_else(|| Config::get().ack_ttl_seconds);
     let limit = parse_resource_limit(&query);
 
     if project_key.is_empty() {

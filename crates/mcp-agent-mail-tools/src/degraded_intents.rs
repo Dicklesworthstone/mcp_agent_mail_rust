@@ -735,11 +735,13 @@ mod tests {
     fn missing_log_reads_empty() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config(tmp.path());
-        assert!(read_queued_ack_intents(&config).expect("read").is_empty());
-        assert!(
-            read_queued_release_intents(&config)
-                .expect("read")
-                .is_empty()
+        assert_eq!(
+            read_queued_ack_intents(&config).expect("read"),
+            [] as [QueuedAckIntent; 0]
+        );
+        assert_eq!(
+            read_queued_release_intents(&config).expect("read"),
+            [] as [QueuedReleaseIntentView; 0]
         );
     }
 

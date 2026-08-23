@@ -7384,9 +7384,12 @@ mod tests {
 
     #[test]
     fn snapshot_panel_query_terms_ignore_dashboard_quick_query() {
-        assert!(snapshot_panel_query_terms("").is_empty());
-        assert!(snapshot_panel_query_terms("project-a").is_empty());
-        assert!(snapshot_panel_query_terms("agent reservation").is_empty());
+        assert_eq!(snapshot_panel_query_terms(""), [] as [String; 0]);
+        assert_eq!(snapshot_panel_query_terms("project-a"), [] as [String; 0]);
+        assert_eq!(
+            snapshot_panel_query_terms("agent reservation"),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -8124,7 +8127,7 @@ mod tests {
         // Consume dirty flags on a non-refresh tick so the next cadence tick is
         // clean-but-ready. Refresh should still happen on cadence.
         screen.tick(STAT_REFRESH_TICKS.saturating_sub(1), &state);
-        assert!(screen.throughput_history.is_empty());
+        assert_eq!(screen.throughput_history, [] as [f64; 0]);
         assert!(screen.percentile_history.is_empty());
 
         screen.tick(STAT_REFRESH_TICKS, &state);
@@ -9150,14 +9153,14 @@ mod tests {
     #[test]
     fn render_sparkline_empty_data() {
         let out = render_sparkline(&[], 10);
-        assert!(out.is_empty());
+        assert_eq!(out, "");
     }
 
     #[test]
     fn render_sparkline_zero_width() {
         let data = [1.0, 2.0, 3.0];
         let out = render_sparkline(&data, 0);
-        assert!(out.is_empty());
+        assert_eq!(out, "");
     }
 
     // ── KPI ordering tests ──────────────────────────────────────
@@ -9621,7 +9624,7 @@ mod tests {
     #[test]
     fn parse_query_terms_empty_input() {
         let terms = parse_query_terms("");
-        assert!(terms.is_empty());
+        assert_eq!(terms, [] as [String; 0]);
     }
 
     #[test]

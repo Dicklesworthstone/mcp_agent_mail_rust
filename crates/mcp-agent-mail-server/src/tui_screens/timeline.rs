@@ -3170,7 +3170,7 @@ mod tests {
     #[test]
     fn build_filter_tag_empty() {
         let tag = build_filter_tag(&HashSet::new(), &HashSet::new());
-        assert!(tag.is_empty());
+        assert_eq!(tag, "");
     }
 
     #[test]
@@ -4995,7 +4995,7 @@ mod tests {
         assert!(screen.pane.source_filter.contains(&EventSource::Http));
 
         assert!(screen.remove_named_preset("Errors"));
-        assert!(screen.preset_names().is_empty());
+        assert_eq!(screen.preset_names(), [] as [String; 0]);
     }
 
     #[test]
@@ -5013,7 +5013,7 @@ mod tests {
         let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
         screen.update(&enter, &state);
         assert_eq!(screen.preset_dialog_mode, PresetDialogMode::None);
-        assert!(!screen.preset_names().is_empty());
+        assert_ne!(screen.preset_names(), [] as [String; 0]);
 
         let ctrl_l =
             Event::Key(ftui::KeyEvent::new(KeyCode::Char('l')).with_modifiers(Modifiers::CTRL));
@@ -5022,7 +5022,7 @@ mod tests {
 
         let delete = Event::Key(ftui::KeyEvent::new(KeyCode::Delete));
         screen.update(&delete, &state);
-        assert!(screen.preset_names().is_empty());
+        assert_eq!(screen.preset_names(), [] as [String; 0]);
 
         let escape = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
         screen.update(&escape, &state);

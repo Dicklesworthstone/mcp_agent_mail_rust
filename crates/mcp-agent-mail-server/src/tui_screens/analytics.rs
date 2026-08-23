@@ -3502,7 +3502,7 @@ mod tests {
     fn confidence_bar_colored_renders() {
         let line = confidence_bar_colored(0.75, AnomalySeverity::High);
         // Should produce a line with spans, not panic
-        assert!(!line.spans().is_empty());
+        assert_ne!(line.spans(), [] as [ftui::text::Span<'static>; 0]);
     }
 
     #[test]
@@ -4128,8 +4128,8 @@ mod tests {
         assert_eq!(snap.total_errors, 0);
         assert_eq!(snap.active_tools, 0);
         assert!((snap.avg_latency_ms).abs() < f64::EPSILON);
-        assert!(snap.top_call_tools.is_empty());
-        assert!(snap.sparkline.is_empty());
+        assert_eq!(snap.top_call_tools, [] as [(String, f64); 0]);
+        assert_eq!(snap.sparkline, [] as [f64; 0]);
     }
 
     #[test]
@@ -4140,7 +4140,7 @@ mod tests {
         let runtime_metrics = mcp_agent_mail_tools::tool_metrics_snapshot_full();
         let snapshot = build_runtime_viz_snapshot_from_metrics(&state, &runtime_metrics, false);
 
-        assert!(snapshot.top_call_tools.is_empty());
+        assert_eq!(snapshot.top_call_tools, [] as [(String, f64); 0]);
         reset_tool_metrics();
     }
 

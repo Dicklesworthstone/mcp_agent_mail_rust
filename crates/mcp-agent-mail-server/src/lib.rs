@@ -9478,19 +9478,13 @@ impl StartupDashboard {
                 // In search mode, Enter confirms, Escape cancels, everything
                 // else is forwarded to the TextInput widget.
                 match code {
-                    KeyCode::Enter => {
-                        pane.confirm_search();
-                        true
-                    }
-                    KeyCode::Escape => {
-                        pane.cancel_search();
-                        true
-                    }
+                    KeyCode::Enter => pane.confirm_search(),
+                    KeyCode::Escape => pane.cancel_search(),
                     _ => {
                         pane.handle_search_event(event);
-                        true
                     }
                 }
+                true
             }
             LogPaneMode::Help => {
                 // Any key dismisses the help overlay.
@@ -17996,7 +17990,7 @@ mod tests {
 
         handle_tui_readiness_warmup_result(Some(&state), Ok(()));
 
-        assert!(state.console_log_since(0).is_empty());
+        assert_eq!(state.console_log_since(0), [] as [(u64, String); 0]);
         assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Ready);
     }
 
@@ -25478,7 +25472,10 @@ first body
             // Cache should now be populated.
             let cached = state.jwks_cache.lock().unwrap();
             assert!(cached.is_some(), "cache must be populated after bootstrap");
-            assert!(!cached.as_ref().unwrap().jwks.keys.is_empty());
+            assert_ne!(
+                cached.as_ref().unwrap().jwks.keys,
+                [] as [jsonwebtoken::jwk::Jwk; 0]
+            );
             drop(cached);
         });
     }
@@ -25733,7 +25730,7 @@ first body
             runtime.block_on(async {
                 let result = state.fetch_jwks(&jwks_url, false).await;
                 assert!(result.is_ok(), "empty keys array is valid JWKS");
-                assert!(result.unwrap().keys.is_empty());
+                assert_eq!(result.unwrap().keys, [] as [jsonwebtoken::jwk::Jwk; 0]);
             });
         });
     }
@@ -27591,7 +27588,7 @@ first body
         assert!(!config.log_json_enabled, "JSON logging disabled by default");
         assert!(!config.http_otel_enabled, "OTEL disabled by default");
         assert_eq!(config.http_otel_service_name, "mcp-agent-mail");
-        assert!(config.http_otel_exporter_otlp_endpoint.is_empty());
+        assert_eq!(config.http_otel_exporter_otlp_endpoint, "");
     }
 
     // -- OTEL config no-op parity (server-level) --
@@ -28691,8 +28688,8 @@ first body
     #[test]
     fn agent_summary_default_fields() {
         let a = AgentSummary::default();
-        assert!(a.name.is_empty());
-        assert!(a.program.is_empty());
+        assert_eq!(a.name, "");
+        assert_eq!(a.program, "");
         assert_eq!(a.last_active_ts, 0);
     }
 
@@ -29347,7 +29344,7 @@ first body
                 ))
                 .into_result()
                 .expect("fetch build slot rows when disabled");
-                assert!(rows.is_empty());
+                assert_eq!(rows, [] as [ExperienceRow; 0]);
             },
         );
 
@@ -30549,7 +30546,7 @@ first body
         }];
         let events =
             derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [tui_events::MailEvent; 0]);
     }
 
     #[test]

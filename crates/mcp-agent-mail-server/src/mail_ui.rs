@@ -314,8 +314,8 @@ first body
         assert!(view.read);
         assert!(view.excerpt.contains("Hello"));
         assert_eq!(view.created_ts, view.created);
-        assert!(!view.created_full.is_empty());
-        assert!(!view.created_relative.is_empty());
+        assert_ne!(view.created_full, "");
+        assert_ne!(view.created_relative, "");
     }
 
     #[test]
@@ -1826,7 +1826,7 @@ mod utility_tests {
     #[test]
     fn ts_display_opt_some_returns_formatted() {
         let result = ts_display_opt(Some(1_700_000_000_000_000));
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
     }
 
     #[test]

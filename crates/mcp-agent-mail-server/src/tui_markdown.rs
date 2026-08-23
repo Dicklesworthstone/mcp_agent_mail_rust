@@ -992,7 +992,7 @@ Thanks!";
         let text = render_body(md, &theme());
         let lines = text.lines();
         // First line should be the heading
-        assert!(!lines.is_empty());
+        assert_ne!(lines, [] as [Line; 0]);
         // Heading line should have some styled spans (not just raw text)
         let first = &lines[0];
         assert!(!first.spans().is_empty(), "heading should have spans");

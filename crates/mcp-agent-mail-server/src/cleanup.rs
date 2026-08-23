@@ -1072,20 +1072,23 @@ mod tests {
     #[test]
     fn collect_matching_empty_pattern() {
         let tmp = std::env::temp_dir();
-        assert!(collect_matching_paths(&tmp, "").is_empty());
-        assert!(collect_matching_paths(&tmp, "  ").is_empty());
+        assert_eq!(collect_matching_paths(&tmp, ""), [] as [PathBuf; 0]);
+        assert_eq!(collect_matching_paths(&tmp, "  "), [] as [PathBuf; 0]);
     }
 
     #[test]
     fn collect_matching_nonexistent_base() {
         let fake = Path::new("/nonexistent/path/foo");
-        assert!(collect_matching_paths(fake, "*.rs").is_empty());
+        assert_eq!(collect_matching_paths(fake, "*.rs"), [] as [PathBuf; 0]);
     }
 
     #[test]
     fn collect_matching_invalid_glob_pattern_returns_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(collect_matching_paths(tmp.path(), "[unterminated").is_empty());
+        assert_eq!(
+            collect_matching_paths(tmp.path(), "[unterminated"),
+            [] as [PathBuf; 0]
+        );
     }
 
     #[test]
@@ -1115,7 +1118,7 @@ mod tests {
     #[test]
     fn collect_matching_whitespace_only_pattern() {
         let tmp = std::env::temp_dir();
-        assert!(collect_matching_paths(&tmp, "   \t  ").is_empty());
+        assert_eq!(collect_matching_paths(&tmp, "   \t  "), [] as [PathBuf; 0]);
     }
 
     #[test]
@@ -1654,7 +1657,7 @@ mod tests {
         let mut probe_cache = CleanupProbeCache::default();
         let released = detect_and_release_stale(&config, &pool, &cx, project_id, &mut probe_cache)
             .expect("stale pass");
-        assert!(released.is_empty());
+        assert_eq!(released, [] as [i64; 0]);
 
         let rows = match fastmcp_core::block_on(async {
             queries::list_file_reservations(&cx, &pool, project_id, false).await

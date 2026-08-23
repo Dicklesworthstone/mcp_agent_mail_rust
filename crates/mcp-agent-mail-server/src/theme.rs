@@ -299,24 +299,24 @@ mod tests {
     #[test]
     fn semantic_shortcuts_not_empty() {
         let _guard = ScopedThemeLock::new(ThemeId::Darcula);
-        assert!(!primary_bold().is_empty());
-        assert!(!secondary().is_empty());
-        assert!(!secondary_bold().is_empty());
-        assert!(!accent().is_empty());
-        assert!(!success_bold().is_empty());
-        assert!(!warning_bold().is_empty());
-        assert!(!error_bold().is_empty());
-        assert!(!text_bold().is_empty());
-        assert!(!muted().is_empty());
-        assert!(!link().is_empty());
+        assert_ne!(primary_bold(), "");
+        assert_ne!(secondary(), "");
+        assert_ne!(secondary_bold(), "");
+        assert_ne!(accent(), "");
+        assert_ne!(success_bold(), "");
+        assert_ne!(warning_bold(), "");
+        assert_ne!(error_bold(), "");
+        assert_ne!(text_bold(), "");
+        assert_ne!(muted(), "");
+        assert_ne!(link(), "");
     }
 
     #[test]
     fn json_colors_not_empty() {
         let _guard = ScopedThemeLock::new(ThemeId::LumenLight);
-        assert!(!json_key().is_empty());
-        assert!(!json_string().is_empty());
-        assert!(!json_number().is_empty());
+        assert_ne!(json_key(), "");
+        assert_ne!(json_string(), "");
+        assert_ne!(json_number(), "");
     }
 
     #[test]

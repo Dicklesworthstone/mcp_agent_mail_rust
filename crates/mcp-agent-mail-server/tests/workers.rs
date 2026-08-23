@@ -61,7 +61,7 @@ fn ack_ttl_config_defaults() {
     assert_eq!(config.ack_escalation_mode, "log");
     assert_eq!(config.ack_escalation_claim_ttl_seconds, 3600);
     assert!(!config.ack_escalation_claim_exclusive);
-    assert!(config.ack_escalation_claim_holder_name.is_empty());
+    assert_eq!(config.ack_escalation_claim_holder_name, "");
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn retention_config_defaults() {
     let config = Config::from_env();
     assert_eq!(config.retention_report_interval_seconds, 3600);
     assert_eq!(config.retention_max_age_days, 180);
-    assert!(!config.retention_ignore_project_patterns.is_empty());
+    assert_ne!(config.retention_ignore_project_patterns, [] as [String; 0]);
     assert_eq!(config.quota_attachments_limit_bytes, 0);
     assert_eq!(config.quota_inbox_limit_count, 0);
 }
@@ -268,7 +268,10 @@ fn query_tracker_snapshot_to_dict_matches_legacy_format() {
     assert_eq!(dict["slow_query_ms"].as_f64(), Some(250.0));
 
     // No slow queries (all 10ms < 250ms)
-    assert!(dict["slow_queries"].as_array().unwrap().is_empty());
+    assert_eq!(
+        dict["slow_queries"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[test]

@@ -4334,7 +4334,7 @@ mod tests {
         assert!(screen.threads.is_empty());
         assert!(screen.detail_messages.is_empty());
         assert!(screen.list_dirty);
-        assert!(screen.filter_text.is_empty());
+        assert_eq!(screen.filter_text, "");
         assert!(!screen.filter_editing);
     }
 
@@ -6160,7 +6160,7 @@ mod tests {
     #[test]
     fn tree_empty_messages_produces_empty_tree() {
         let tree = build_thread_tree_items(&[]);
-        assert!(tree.is_empty());
+        assert_eq!(tree, [] as [crate::tui_widgets::ThreadTreeItem; 0]);
     }
 
     #[test]
@@ -6169,7 +6169,10 @@ mod tests {
         let tree = build_thread_tree_items(&[msg]);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].message_id, 1);
-        assert!(tree[0].children.is_empty());
+        assert_eq!(
+            tree[0].children,
+            [] as [crate::tui_widgets::ThreadTreeItem; 0]
+        );
     }
 
     #[test]
@@ -6485,7 +6488,7 @@ mod tests {
     fn filter_bar_always_visible_with_hint() {
         // Filter bar should occupy 1 row even when collapsed (showing hint)
         let screen = ThreadExplorerScreen::new();
-        assert!(screen.filter_text.is_empty());
+        assert_eq!(screen.filter_text, "");
         assert!(!screen.filter_editing);
         // The view now always allocates 1 row for the filter bar,
         // so content_height = area.height - 1

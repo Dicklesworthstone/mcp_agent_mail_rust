@@ -2087,7 +2087,10 @@ body
 
         #[test]
         fn parse_attachment_metadata_json_surfaces_malformed_payloads() {
-            assert!(parse_attachment_metadata_json("").is_empty());
+            assert_eq!(
+                parse_attachment_metadata_json(""),
+                [] as [serde_json::Value; 0]
+            );
             assert_eq!(
                 parse_attachment_metadata_json("{not-json")[0]["name"],
                 MALFORMED_ATTACHMENTS_SENTINEL

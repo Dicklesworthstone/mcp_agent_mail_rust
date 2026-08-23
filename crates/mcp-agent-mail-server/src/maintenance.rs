@@ -1820,7 +1820,7 @@ mod tests {
 
         // git is always invoked, with the maintenance subcommand and both tasks
         // when a pack already exists.
-        assert!(!program.is_empty());
+        assert_ne!(program, "");
         assert!(argv.iter().any(|a| a == "git"), "git missing: {argv:?}");
         assert!(
             argv.windows(2)

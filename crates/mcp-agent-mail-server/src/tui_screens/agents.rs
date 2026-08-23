@@ -3221,7 +3221,7 @@ mod tests {
     #[test]
     fn sparkline_cache_refreshed_after_sample() {
         let mut screen = AgentsScreen::new();
-        assert!(screen.cached_sparkline_vec.is_empty());
+        assert_eq!(screen.cached_sparkline_vec, [] as [f64; 0]);
         screen.total_msgs_this_tick = 7;
         screen.record_sparkline_sample();
         assert!(screen.sparkline_dirty);

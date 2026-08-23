@@ -1587,7 +1587,7 @@ mod tests {
     fn focus_manager_with_empty_ring() {
         let fm = FocusManager::with_ring(vec![]);
         assert_eq!(fm.current(), FocusTarget::None);
-        assert!(fm.focus_ring().is_empty());
+        assert_eq!(fm.focus_ring(), [] as [FocusTarget; 0]);
     }
 
     #[test]
@@ -1731,7 +1731,7 @@ mod tests {
     fn focus_graph_for_screen_wrapper() {
         let graph = focus_graph_for_screen(MailScreenId::Dashboard, Rect::new(0, 0, 120, 40));
         assert_eq!(graph.screen(), MailScreenId::Dashboard);
-        assert!(!graph.nodes().is_empty());
+        assert_ne!(graph.nodes(), [] as [FocusNode; 0]);
     }
 
     #[test]

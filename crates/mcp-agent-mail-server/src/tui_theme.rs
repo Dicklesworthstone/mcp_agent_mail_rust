@@ -2568,7 +2568,7 @@ mod tests {
     fn cycle_returns_new_name() {
         let _guard = ScopedThemeLock::new(ThemeId::CyberpunkAurora);
         let name = cycle_and_get_name();
-        assert!(!name.is_empty());
+        assert_ne!(name, "");
         // After cycling from CyberpunkAurora, we should get a different theme
         assert_ne!(name, "Cyberpunk Aurora");
     }
@@ -3215,7 +3215,7 @@ mod tests {
             "display names should be unique"
         );
         for (_, display) in NAMED_THEMES {
-            assert!(!display.is_empty());
+            assert_ne!(*display, "");
         }
     }
 
@@ -3922,7 +3922,7 @@ mod tests {
         let start = Instant::now();
         for &id in &themes {
             let name = set_theme_and_get_name(id);
-            assert!(!name.is_empty());
+            assert_ne!(name, "");
         }
         let elapsed = start.elapsed();
 

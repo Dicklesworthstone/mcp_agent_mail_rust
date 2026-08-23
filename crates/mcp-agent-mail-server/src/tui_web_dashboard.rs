@@ -2116,7 +2116,7 @@ mod tests {
         let mut encoded = String::new();
         base64_encode_into(&input, &mut encoded);
         // Decode with standard library equivalent check.
-        assert!(!encoded.is_empty());
+        assert_ne!(encoded, "");
         assert!(encoded.len() <= (input.len() + 2) / 3 * 4);
         // Verify all chars are valid base64.
         assert!(
@@ -2130,7 +2130,7 @@ mod tests {
     fn base64_encode_empty() {
         let mut out = String::new();
         base64_encode_into(&[], &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, "");
     }
 
     #[test]

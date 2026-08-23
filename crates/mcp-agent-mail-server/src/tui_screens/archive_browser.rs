@@ -1976,7 +1976,7 @@ mod tests {
     fn add_line_numbers_empty_string() {
         let result = add_line_numbers("");
         // "".lines() returns an empty iterator, so the result is empty
-        assert!(result.is_empty());
+        assert_eq!(result, "");
     }
 
     #[test]

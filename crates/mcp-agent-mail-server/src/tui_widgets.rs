@@ -6588,7 +6588,7 @@ mod tests {
         let matrix: Vec<Vec<f64>> = vec![];
         let widget = AgentHeatmap::new(agents, &matrix);
         let actions = widget.drill_down_actions(0);
-        assert!(actions.is_empty());
+        assert_eq!(actions, [] as [DrillDownAction; 0]);
     }
 
     #[test]
@@ -6971,7 +6971,7 @@ mod tests {
     fn wrap_text_basic() {
         let text = "Hello world this is a test";
         let wrapped = wrap_text(text, 12);
-        assert!(!wrapped.is_empty());
+        assert_ne!(wrapped, [] as [String; 0]);
         for line in &wrapped {
             assert!(line.len() <= 12, "line should fit width");
         }
@@ -6980,13 +6980,13 @@ mod tests {
     #[test]
     fn wrap_text_empty() {
         let wrapped = wrap_text("", 80);
-        assert!(wrapped.is_empty());
+        assert_eq!(wrapped, [] as [String; 0]);
     }
 
     #[test]
     fn wrap_text_zero_width() {
         let wrapped = wrap_text("Hello", 0);
-        assert!(wrapped.is_empty());
+        assert_eq!(wrapped, [] as [String; 0]);
     }
 
     #[test]
@@ -7326,7 +7326,7 @@ mod tests {
     fn aggregated_series_trim_empty_is_noop() {
         let mut series = AggregatedTimeSeries::new(Granularity::OneSecond, 1);
         series.trim_to_window(Duration::from_secs(10));
-        assert!(series.buckets.is_empty());
+        assert_eq!(series.buckets, [] as [(i64, Vec<f64>); 0]);
     }
 
     #[test]
@@ -7359,7 +7359,7 @@ mod tests {
         assert_eq!(provider.series_count(), 1);
         assert_eq!(provider.series_label(0), "calls/sec");
         let points = provider.data_points(0, Duration::from_mins(1));
-        assert!(points.is_empty());
+        assert_eq!(points, [] as [(f64, f64); 0]);
         let (lo, hi) = provider.y_range();
         assert_eq!(lo, 0.0);
         assert_eq!(hi, 1.0);
@@ -7486,7 +7486,7 @@ mod tests {
         assert_eq!(provider.series_label(1), "P95");
         assert_eq!(provider.series_label(2), "P99");
         let points = provider.data_points(0, Duration::from_mins(1));
-        assert!(points.is_empty());
+        assert_eq!(points, [] as [(f64, f64); 0]);
     }
 
     #[test]
@@ -7593,7 +7593,10 @@ mod tests {
         assert_eq!(provider.series_label(2), "messages");
         assert_eq!(provider.series_label(3), "reservations");
         for i in 0..4 {
-            assert!(provider.data_points(i, Duration::from_mins(1)).is_empty());
+            assert_eq!(
+                provider.data_points(i, Duration::from_mins(1)),
+                [] as [(f64, f64); 0]
+            );
         }
     }
 
@@ -8164,7 +8167,7 @@ mod tests {
         assert_eq!(widget.color_pending, PackedRgba::rgb(200, 180, 60));
         // Verify rendering doesn't panic with all three status types
         let output = render_widget(&widget, 80, 10);
-        assert!(!output.is_empty());
+        assert_ne!(output, "");
     }
 
     /// Widget renders correctly with very small area.

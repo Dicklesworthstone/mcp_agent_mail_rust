@@ -2326,7 +2326,7 @@ mod conflict_tests {
     fn empty_graph_no_cycles() {
         let graph = ProjectConflictGraph::default();
         let cycles = find_deadlock_cycles(&graph);
-        assert!(cycles.is_empty());
+        assert_eq!(cycles, [] as [Vec<String>; 0]);
     }
 
     #[test]
@@ -6494,7 +6494,10 @@ mod engine_tests {
     #[test]
     fn detect_deadlocks_empty_graphs() {
         let mut engine = AtcEngine::new_for_testing();
-        assert!(engine.detect_deadlocks().is_empty());
+        assert_eq!(
+            engine.detect_deadlocks(),
+            [] as [(String, Vec<Vec<String>>); 0]
+        );
     }
 
     #[test]
@@ -7835,7 +7838,7 @@ mod predictive_tests {
         agents.insert("Confident".to_string(), confident);
 
         let ranked = rank_probe_targets(&agents, 0.0);
-        assert!(!ranked.is_empty());
+        assert_ne!(ranked, [] as [(String, f64); 0]);
         assert_eq!(
             ranked[0].0, "Uncertain",
             "most uncertain should be probed first"
@@ -10885,7 +10888,10 @@ mod alien_enhancement_tests {
     #[test]
     fn submodular_schedule_empty() {
         let agents: HashMap<String, AgentLivenessEntry> = HashMap::new();
-        assert!(submodular_probe_schedule(&agents, 5, 60.0, 1_000_000).is_empty());
+        assert_eq!(
+            submodular_probe_schedule(&agents, 5, 60.0, 1_000_000),
+            [] as [(String, f64); 0]
+        );
     }
 
     #[test]
@@ -11997,7 +12003,7 @@ mod alien_enhancement_tests {
 
         let report = atc_tick_report(now).expect("tick report");
         assert!(report.summary.budget.tick_budget_micros > 0);
-        assert!(!report.summary.policy.incumbent_policy_id.is_empty());
+        assert_ne!(report.summary.policy.incumbent_policy_id, "");
         assert!(report.summary.policy.shadow_enabled);
         assert!(
             report.summary.stage_timings.total_micros

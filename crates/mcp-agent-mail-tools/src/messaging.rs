@@ -6177,13 +6177,13 @@ mod tests {
     #[test]
     fn empty_to_list_detected() {
         let to: Vec<String> = vec![];
-        assert!(to.is_empty());
+        assert_eq!(to, [] as [String; 0]);
     }
 
     #[test]
     fn non_empty_to_list_accepted() {
         let to = ["BlueLake".to_string()];
-        assert!(!to.is_empty());
+        assert_ne!(to.as_slice(), [] as [String; 0]);
     }
 
     #[test]
@@ -6217,7 +6217,10 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["count"], 0);
-        assert!(json["deliveries"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["deliveries"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]
@@ -6386,9 +6389,9 @@ mod tests {
         });
 
         let parsed: InboxMessage = serde_json::from_value(json).expect("deserialize inbox message");
-        assert!(parsed.to.is_empty());
-        assert!(parsed.cc.is_empty());
-        assert!(parsed.bcc.is_empty());
+        assert_eq!(parsed.to, [] as [String; 0]);
+        assert_eq!(parsed.cc, [] as [String; 0]);
+        assert_eq!(parsed.bcc, [] as [String; 0]);
     }
 
     #[test]
@@ -6544,7 +6547,10 @@ mod tests {
         assert_eq!(json["from"], "BlueLake");
         assert_eq!(json["to"][0], "RedFox");
         assert_eq!(json["cc"][0], "GoldHawk");
-        assert!(json["bcc"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["bcc"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
         assert_eq!(json["importance"], "high");
         assert_eq!(json["attachments"][0]["path"], "file.webp");
     }
@@ -7258,8 +7264,8 @@ mod tests {
         .expect("remote markdown images should not require archive init");
 
         assert_eq!(final_body, body);
-        assert!(attachment_meta.is_empty());
-        assert!(rel_paths.is_empty());
+        assert_eq!(attachment_meta, [] as [serde_json::Value; 0]);
+        assert_eq!(rel_paths, [] as [String; 0]);
     }
 
     #[test]
@@ -7287,8 +7293,8 @@ mod tests {
         .expect("empty attachment list should be treated as no attachments");
 
         assert_eq!(final_body, body);
-        assert!(attachment_meta.is_empty());
-        assert!(rel_paths.is_empty());
+        assert_eq!(attachment_meta, [] as [serde_json::Value; 0]);
+        assert_eq!(rel_paths, [] as [String; 0]);
     }
 
     #[test]
