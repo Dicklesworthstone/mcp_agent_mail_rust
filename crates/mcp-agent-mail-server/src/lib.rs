@@ -7899,9 +7899,16 @@ fn atc_operator_wait_duration(
     };
     let micros_until_due = next_due_micros.saturating_sub(now_micros).max(0);
     let wait = Duration::from_micros(u64::try_from(micros_until_due).unwrap_or(u64::MAX));
-    // Clamp to the operator's tick floor: an already-due `next_review_micros`
-    // must not collapse the wait to zero and spin the loop at ~1 kHz.
-    wait.min(max_interval).max(ATC_OPERATOR_MIN_TICK_INTERVAL)
+    // An ALREADY-DUE deadline must not collapse the wait to zero and spin
+    // the loop at ~1 kHz, so only that case clamps up to the tick floor. A
+    // not-yet-due deadline keeps its exact remaining wait — flooring it too
+    // would systematically process every kernel deadline late by up to the
+    // floor duration.
+    if micros_until_due == 0 {
+        wait.min(max_interval).max(ATC_OPERATOR_MIN_TICK_INTERVAL)
+    } else {
+        wait.min(max_interval)
+    }
 }
 
 fn maybe_emit_atc_summary_log(state: &tui_bridge::TuiSharedState, snapshot: &AtcOperatorSnapshot) {
@@ -34131,6 +34138,24 @@ first body
         // instead of collapsing toward zero and spinning the loop.
         let wait = atc_operator_wait_duration(&snapshot, 1_000_000, Duration::from_secs(5));
         assert_eq!(wait, ATC_OPERATOR_MIN_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn atc_operator_wait_duration_keeps_exact_wait_for_not_yet_due_deadline() {
+        let snapshot = AtcOperatorSnapshot {
+            enabled: true,
+            source: "live".to_string(),
+            kernel: atc::AtcKernelTelemetry {
+                next_due_micros: Some(1_000_000 + 100_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // A deadline 100ms out must keep its exact 100ms wait — flooring it
+        // to the tick floor would process every kernel deadline late.
+        let wait = atc_operator_wait_duration(&snapshot, 1_000_000, Duration::from_secs(5));
+        assert_eq!(wait, Duration::from_millis(100));
     }
 
     #[test]
