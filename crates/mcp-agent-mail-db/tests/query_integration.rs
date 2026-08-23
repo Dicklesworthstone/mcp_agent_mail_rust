@@ -605,8 +605,11 @@ fn acknowledge_messages_batch_integration_large_ack_wave_uses_fixed_recipient_qu
     );
     assert_eq!(
         snapshot.per_table.get("message_recipients").copied(),
-        Some(2),
-        "one chunked recipient update and one chunked recipient read-back should cover the wave"
+        Some(3),
+        "fixed-query batch ack = chunked recipient UPDATE + per-agent stats aggregate \
+         SELECT (compute_agent_inbox_stats_in_tx reads message_recipients directly since \
+         the rebuild split out of the single INSERT..SELECT, which used to attribute to \
+         inbox_stats) + chunked recipient read-back"
     );
     assert!(
         snapshot
