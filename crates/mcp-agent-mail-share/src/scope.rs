@@ -477,6 +477,25 @@ fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
 }
 
 fn column_exists(conn: &Conn, table: &str, column: &str) -> Result<bool, ShareError> {
+    // `SELECT "col" FROM t LIMIT 0` false-positives on fsqlite 0.3.8+: an
+    // unresolved double-quoted identifier degrades to a string literal (the
+    // SQLite double-quoted-string misfeature) and the probe succeeds. Use
+    // PRAGMA table_info first; keep the SELECT probe only as a fallback for
+    // engines whose table_info yields no rows.
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("PRAGMA table_info({table}) failed: {e}"),
+        })?;
+    if !rows.is_empty() {
+        for row in &rows {
+            let name: String = row.get_named("name").unwrap_or_default();
+            if name == column {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
     let probe = format!("SELECT \"{column}\" FROM \"{table}\" LIMIT 0");
     match conn.query_sync(&probe, &[]) {
         Ok(_) => Ok(true),

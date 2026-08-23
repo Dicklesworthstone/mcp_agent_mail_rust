@@ -6618,7 +6618,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
 fn head_update_refname(repo: &Repository) -> String {
     repo.find_reference("HEAD")
         .ok()
-        .and_then(|head| head.symbolic_target().map(str::to_string))
+        .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
         .unwrap_or_else(|| "HEAD".to_string())
 }
 
@@ -6715,11 +6715,7 @@ fn commit_paths_lockfree(
             .map(|oid| repo.find_commit(oid))
             .transpose()?
             .and_then(|p| p.tree().ok());
-        Ok(Some(build_tree_with_updates(
-            repo,
-            base_tree.as_ref(),
-            &updates,
-        )))
+        build_tree_with_updates(repo, base_tree.as_ref(), &updates).map(Some)
     })?;
 
     // Lock-free commits bypass the index by design; sync index to HEAD so
