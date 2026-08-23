@@ -1834,8 +1834,12 @@ fn archive_backlog_dead_letter_append(op: &WriteOp, attempts: u32, error: &Stora
 }
 
 /// Per-process monotonic sequence for journal filenames. Combined with a
-/// wall-clock prefix so filenames sort in enqueue order and never collide with
-/// leftover files from a previous process.
+/// wall-clock prefix AND the process id so filenames sort in enqueue order
+/// and can never collide across processes sharing one storage root: `seq`
+/// is process-local (both processes start at 0), and two processes hitting
+/// the same microsecond with equal seq would otherwise truncate each other's
+/// tmp file and rename over each other's durable journal — an entry reported
+/// as Queued (durable) would be silently lost on crash.
 static ARCHIVE_BACKLOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
@@ -1854,7 +1858,13 @@ fn write_op_config(op: &WriteOp) -> &Config {
 }
 
 fn archive_backlog_write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = fs::File::create(path)?;
+    // create_new: refusing to follow/truncate an existing file turns a name
+    // collision into a loud failure instead of silently destroying another
+    // writer's in-flight journal.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -1882,7 +1892,11 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
         }
     };
     let seq = ARCHIVE_BACKLOG_SEQ.fetch_add(1, Ordering::Relaxed);
-    let final_path = dir.join(format!("{:020}-{seq:010}.json", now_micros_u64()));
+    let final_path = dir.join(format!(
+        "{:020}-p{}-{seq:010}.json",
+        now_micros_u64(),
+        std::process::id()
+    ));
     let tmp_path = final_path.with_extension("json.tmp");
     if let Err(error) = archive_backlog_write_tmp(&tmp_path, &bytes) {
         tracing::warn!(error = %error, "archive backlog: journal write failed; in-memory only");
@@ -3521,6 +3535,13 @@ impl FileLock {
     }
 
     /// Acquire the lock with retry and stale detection.
+    ///
+    /// Retry semantics (matching the documented Python defaults): keep
+    /// retrying until [`Self::timeout`] elapses, with exponential backoff
+    /// between attempts; [`Self::max_retries`] is a MINIMUM attempt floor,
+    /// not the overall bound — the old loop gave up after ~2s of backoff no
+    /// matter what budget the caller configured, spurious-failing under
+    /// exactly the contention the timeout exists to absorb.
     pub fn acquire(&mut self) -> Result<()> {
         use fs2::FileExt;
 
@@ -3529,14 +3550,17 @@ impl FileLock {
         self.validate_paths()?;
         ensure_parent_dir(&self.path)?;
 
-        for attempt in 0..=self.max_retries {
+        let mut attempts = 0_usize;
+        loop {
             let elapsed = start.elapsed();
-            if elapsed >= self.timeout && attempt > 0 {
+            let past_floor = attempts > self.max_retries;
+            if attempts > 0 && past_floor && elapsed >= self.timeout {
                 break;
             }
 
             if self.path.exists() && self.cleanup_if_stale()? {
                 // Stale lock quarantined; retry immediately with a fresh lock path.
+                attempts += 1;
                 continue;
             }
 
@@ -3552,6 +3576,7 @@ impl FileLock {
                     // Verify lock identity to prevent race with cleanup_if_stale
                     if !self.verify_lock_identity(&file)? {
                         let _ = file.unlock();
+                        attempts += 1;
                         continue;
                     }
 
@@ -3565,16 +3590,18 @@ impl FileLock {
                     // Lock held by another process - check for stale owner first.
                     if self.cleanup_if_stale()? {
                         // Stale lock quarantined; retry immediately without backoff.
+                        attempts += 1;
                         continue;
                     }
 
-                    if attempt >= self.max_retries {
-                        break;
-                    }
+                    attempts += 1;
 
-                    // Exponential backoff with per-thread jitter.
+                    // Exponential backoff with per-thread jitter, capped by
+                    // the remaining budget so one sleep cannot overshoot the
+                    // timeout by more than the floor tick.
                     // Uses thread-local xorshift instead of PID so threads in
                     // the same process don't synchronize their retry delays.
+                    let attempt = attempts.saturating_sub(1);
                     let base_ms = if attempt == 0 {
                         50
                     } else {
@@ -3586,7 +3613,9 @@ impl FileLock {
                         .saturating_sub(base_ms / 4)
                         .saturating_add(jitter)
                         .max(10);
-                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                    let remaining_ms =
+                        self.timeout.saturating_sub(start.elapsed()).as_millis() as u64;
+                    std::thread::sleep(Duration::from_millis(sleep_ms.min(remaining_ms)));
                 }
             }
         }
@@ -3595,7 +3624,7 @@ impl FileLock {
             "Timed out acquiring lock {} after {:.2}s ({} attempts)",
             self.path.display(),
             start.elapsed().as_secs_f64(),
-            self.max_retries + 1
+            attempts
         )))
     }
 

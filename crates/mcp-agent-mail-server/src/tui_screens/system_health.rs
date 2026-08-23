@@ -921,23 +921,74 @@ static SYSTEM_HEALTH_SWEEP_CACHE: std::sync::LazyLock<Mutex<SystemHealthSweepCac
         Mutex::new((Instant::now(), None))
     });
 
+/// Set while one caller is running the expensive sweep OUTSIDE the cache
+/// mutex; every other poller is served the previous entry immediately
+/// instead of serializing behind a multi-second refresh.
+static SYSTEM_HEALTH_SWEEP_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Return the git ref-integrity sweep state (plus the `AM_GIT_BINARY`
 /// override flag observed alongside it), refreshing the process-wide cache at
-/// most once per configured sweep interval. The cold path is identical to the
-/// previous per-request behavior: one synchronous sweep.
+/// most once per configured sweep interval.
+///
+/// Stale-while-revalidate: the cache mutex is held only for short
+/// copy-in/copy-out sections. When the entry is expired, exactly one caller
+/// (an atomic flag) re-runs the sweep without holding the lock while every
+/// concurrent poller is served the previous entry immediately; a cold cache
+/// with another sweeper in flight reports an empty-target sweep rather than
+/// blocking the async worker.
 fn cached_git_ref_integrity_sweep(state: &TuiSharedState) -> (GitRefIntegritySweepState, bool) {
-    let mut guard = SYSTEM_HEALTH_SWEEP_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (refreshed_at, cached) = &*guard;
-    if let Some(entry) = cached
-        && refreshed_at.elapsed() < entry.interval
+    // Fast path: a fresh entry is a short-lock clone.
     {
-        return (entry.sweep.clone(), entry.am_git_binary_set);
+        let guard = SYSTEM_HEALTH_SWEEP_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = &guard.1
+            && guard.0.elapsed() < entry.interval
+        {
+            return (entry.sweep.clone(), entry.am_git_binary_set);
+        }
     }
 
-    let env_cfg = Config::from_env();
     let am_git_binary_set = std::env::var_os("AM_GIT_BINARY").is_some();
+
+    // Another caller is already sweeping: serve whatever we have.
+    if SYSTEM_HEALTH_SWEEP_REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let guard = SYSTEM_HEALTH_SWEEP_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = &guard.1 {
+            return (entry.sweep.clone(), entry.am_git_binary_set);
+        }
+        // Cold cache plus an in-flight sweeper: an empty target list makes
+        // this construction O(1) while keeping the payload shape identical.
+        let env_cfg = Config::from_env();
+        let dismissals = load_git_ref_sweep_dismissals(&git_ref_sweep_dismissals_path());
+        let sweep = git_ref_integrity_sweep(
+            &[],
+            0,
+            env_cfg.health_sweep_batch,
+            env_cfg.health_sweep_enabled,
+            env_cfg.health_sweep_interval_seconds,
+            am_git_binary_set,
+            &dismissals,
+            Utc::now(),
+        );
+        return (sweep, am_git_binary_set);
+    }
+
+    struct ResetRefreshInFlight;
+    impl Drop for ResetRefreshInFlight {
+        fn drop(&mut self) {
+            SYSTEM_HEALTH_SWEEP_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+    let _reset = ResetRefreshInFlight;
+
+    let env_cfg = Config::from_env();
     let db_snapshot = state.db_stats_snapshot();
     let targets = db_snapshot
         .as_ref()
@@ -953,14 +1004,19 @@ fn cached_git_ref_integrity_sweep(state: &TuiSharedState) -> (GitRefIntegritySwe
         &dismissals,
         Utc::now(),
     );
-    *guard = (
-        Instant::now(),
-        Some(SystemHealthSweepCacheEntry {
-            interval: Duration::from_secs(env_cfg.health_sweep_interval_seconds.max(1)),
-            am_git_binary_set,
-            sweep: sweep.clone(),
-        }),
-    );
+    {
+        let mut guard = SYSTEM_HEALTH_SWEEP_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = (
+            Instant::now(),
+            Some(SystemHealthSweepCacheEntry {
+                interval: Duration::from_secs(env_cfg.health_sweep_interval_seconds.max(1)),
+                am_git_binary_set,
+                sweep: sweep.clone(),
+            }),
+        );
+    }
     (sweep, am_git_binary_set)
 }
 

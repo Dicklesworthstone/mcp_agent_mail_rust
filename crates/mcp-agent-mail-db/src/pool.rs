@@ -15387,26 +15387,66 @@ mod tests {
 
     #[test]
     fn retry_archive_drift_reconcile_is_noop_without_pending_drift() {
+        // The cheap gate must be OBSERVABLY load-bearing: with a healthy
+        // primary and archive-ahead content, the ungated full reconcile would
+        // rebuild the DB file, so "primary bytes unchanged" distinguishes a
+        // gated no-op from an accidental full run (the previous fixture used
+        // a non-sqlite primary, where both paths return Ok(false) and the
+        // test could not detect gate deletion).
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("retry-gate.sqlite3");
-        // Deliberately NOT a sqlite file: if the gate failed and the full
-        // reconcile ran, the health probe would classify it unhealthy and the
-        // call would still return Ok(false) — so also assert via the archive
-        // side: give the storage root real project dirs so only the gate can
-        // be the reason nothing was scanned.
-        std::fs::write(&db_path, b"not-a-sqlite-file").expect("write primary");
+        {
+            let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create healthy primary");
+            conn.execute_raw(&crate::schema::init_schema_sql_base())
+                .expect("initialize schema");
+            conn.execute_raw(&crate::schema::schema_user_version_sql())
+                .expect("stamp user version");
+        }
+
+        // Archive is ahead: one canonical message on disk, zero in the DB.
         let storage_root = dir.path().join("storage");
-        std::fs::create_dir_all(storage_root.join("projects").join("proj"))
-            .expect("create archive project dir");
+        let proj_dir = storage_root.join("projects").join("proj");
+        let msg_dir = proj_dir.join("messages").join("2026").join("01");
+        std::fs::create_dir_all(&msg_dir).expect("create message dir");
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"proj","human_key":"/tmp/retry-gate-proj"}"#,
+        )
+        .expect("write project.json");
+        std::fs::write(
+            msg_dir.join("2026-01-15T10-05-00Z__test__7.md"),
+            "---json\n{\"id\":7,\"from\":\"SwiftFox\",\"to\":[\"CalmLake\"],\"subject\":\"Test\",\"thread_id\":\"t1\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-01-15T10:05:00Z\",\"attachments\":[]}\n---\n\nTest body\n",
+        )
+        .expect("write canonical message");
+
         assert!(
             !has_pending_archive_drift(&db_path),
             "precondition: no pending drift recorded"
         );
+        clear_pending_archive_drift(&db_path);
+        let before = std::fs::read(&db_path).expect("read primary bytes");
         let reconciled = retry_archive_drift_reconcile(&db_path, &storage_root)
             .expect("gated retry must not error");
         assert!(
             !reconciled,
             "with no pending drift and an existing primary, the retry is a no-op"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read primary after gated call"),
+            before,
+            "the cheap gate must leave the primary untouched despite archive-ahead drift"
+        );
+
+        // Divergence proof: recording pending drift lets the SAME call run
+        // the full reconcile, which rebuilds the DB from the archive — i.e.
+        // the fixture really is drift-shaped and only the gate prevented it.
+        record_pending_archive_drift(&db_path);
+        let reconciled = retry_archive_drift_reconcile(&db_path, &storage_root)
+            .expect("ungated retry must not error");
+        assert!(
+            reconciled,
+            "with pending drift recorded, the reconcile must actually run"
         );
     }
 
