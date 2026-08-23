@@ -1414,9 +1414,9 @@ fn list_file_reservations_page_excludes_ledger_released_rows_before_paging() {
     // later page starts at a shifted boundary.
     let (pool, _dir) = make_pool();
     let pid = setup_project(&pool);
-    let agent_id = setup_agent(&pool, pid, "IronHawk");
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
 
-    let paths: Vec<String> = (0..12)
+    let paths: Vec<String> = (0..14)
         .map(|idx| format!("src/paged/res_{idx:02}.rs"))
         .collect();
     let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
@@ -1438,7 +1438,7 @@ fn list_file_reservations_page_excludes_ledger_released_rows_before_paging() {
             other => panic!("bulk reserve failed: {other:?}"),
         }
     });
-    assert_eq!(created.len(), 12);
+    assert_eq!(created.len(), 14);
 
     // Release the 2nd and 4th created reservations through the sidecar
     // ledger ONLY — the file_reservations rows keep their fresh NULL
@@ -1481,6 +1481,12 @@ fn list_file_reservations_page_excludes_ledger_released_rows_before_paging() {
         }
     });
     assert_eq!(page2.len(), 2, "exactly two actives remain for page 2");
+    assert!(
+        !page2
+            .iter()
+            .any(|row| row.id.is_some_and(|id| ledger_ids.contains(&id))),
+        "page 2 must not contain ledger-released rows"
+    );
 }
 
 #[test]
