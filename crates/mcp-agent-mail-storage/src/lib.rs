@@ -11580,7 +11580,6 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
-
     // Same cross-process guard as `commit_paths`: the whole reset → add-all
     // → tree sequence is a full-state snapshot built under the HEAD ref lock.
     commit_tree_advancing_head(repo, &sig, message, |repo| {
