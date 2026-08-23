@@ -221,6 +221,7 @@ fn dispatch_accepts_return_registration_token_false() {
 /// (current fastmcp 0.7.0 contract — see module docs; flip to success once
 /// fastmcp emits nullable schemas for `Option<T>`).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn send_message_null_auto_contact_contract() {
     run_isolated(|cx| async move {
         let ctx = McpContext::new(cx.clone(), 1);
@@ -291,7 +292,13 @@ fn send_message_null_auto_contact_contract() {
         };
         let request_ctx2 = McpContext::new(cx.clone(), 3);
         let call_result = router
-            .handle_tools_call(&request_ctx2, params_omitted, SessionState::new(), None, None)
+            .handle_tools_call(
+                &request_ctx2,
+                params_omitted,
+                SessionState::new(),
+                None,
+                None,
+            )
             .expect("send_message with omitted auto_contact_if_blocked must succeed");
         let text = tool_result_text(&call_result.content);
         let payload = parse(&text);
