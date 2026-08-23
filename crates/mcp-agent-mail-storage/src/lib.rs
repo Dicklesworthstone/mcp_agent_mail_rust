@@ -6694,13 +6694,7 @@ fn commit_paths_lockfree(
     // path, so it must self-heal rather than wedge on every drain.
     heal_unloadable_head(repo)?;
 
-    // Get parent commit and its tree
-    let parent = resolve_head_commit_oid(repo)?
-        .map(|oid| repo.find_commit(oid))
-        .transpose()?;
-    let base_tree = parent.as_ref().and_then(|p| p.tree().ok());
-
-    // Create blob objects for each file
+    // Create blob objects for each file (head-independent; safe pre-lock).
     let mut updates: Vec<(String, Option<git2::Oid>)> = Vec::new();
     for path in rel_paths {
         let path = validate_repo_relative_path("lockfree commit path", path)?;
@@ -6719,21 +6713,16 @@ fn commit_paths_lockfree(
         return Ok(());
     }
 
-    // Build new tree without touching the index
-    let tree_oid = build_tree_with_updates(repo, base_tree.as_ref(), &updates)?;
-    let tree = repo.find_tree(tree_oid)?;
-
-    let final_message = append_trailers(message);
-
-    // Create commit (updates HEAD ref lock, NOT index lock)
-    match parent {
-        Some(ref p) => {
-            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p])?;
-        }
-        None => {
-            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[])?;
-        }
-    }
+    // Tree build + parent read + ref write all happen under the HEAD
+    // reference-transaction lock so a second process cannot interleave and
+    // orphan this side of the race.
+    commit_tree_advancing_head(repo, &sig, message, |repo| {
+        let base_tree = resolve_head_commit_oid(repo)?
+            .map(|oid| repo.find_commit(oid))
+            .transpose()?
+            .and_then(|p| p.tree().ok());
+        build_tree_with_updates(repo, base_tree.as_ref(), &updates)
+    })?;
 
     // Lock-free commits bypass the index by design; sync index to HEAD so
     // status/porcelain views remain clean for tooling and tests.
@@ -11534,61 +11523,42 @@ fn commit_paths(
     }
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
-    let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
 
-    let mut index = repo.index()?;
-    reset_index_to_head(repo, &mut index)?;
-    let mut any_added = false;
-
-    for path in rel_paths {
-        let path = validate_repo_relative_path("commit path", path)?;
-        // git2 expects forward-slash paths on all platforms
-        let p = Path::new(path);
-
-        match index.add_path(p) {
-            Ok(()) => {}
-            Err(err) if err.code() == git2::ErrorCode::NotFound => {
-                // File doesn't exist on disk, remove it from the index (deletion/move).
-                // Ignore "path not in index" errors, but propagate others.
-                if let Err(remove_err) = index.remove_path(p)
-                    && remove_err.code() != git2::ErrorCode::NotFound
-                {
-                    return Err(remove_err.into());
+    // Index reset → stage → tree all run under the HEAD reference-transaction
+    // lock so the committed tree is built against a parent read in the same
+    // critical section that moves the ref (cross-process lost-update guard).
+    let result = commit_tree_advancing_head(repo, &sig, message, |repo| {
+        let mut index = repo.index()?;
+        reset_index_to_head(repo, &mut index)?;
+        for path in rel_paths {
+            let path = validate_repo_relative_path("commit path", path)?;
+            // git2 expects forward-slash paths on all platforms
+            let p = Path::new(path);
+            match index.add_path(p) {
+                Ok(()) => {}
+                Err(err) if err.code() == git2::ErrorCode::NotFound => {
+                    // File doesn't exist on disk, remove it from the index
+                    // (deletion/move). Ignore "path not in index" errors.
+                    if let Err(remove_err) = index.remove_path(p)
+                        && remove_err.code() != git2::ErrorCode::NotFound
+                    {
+                        return Err(remove_err.into());
+                    }
+                }
+                Err(err) => {
+                    // `add_path` already performed the existence/readability
+                    // check. Keep richer errors for non-NotFound failures.
+                    return Err(err.into());
                 }
             }
-            Err(err) => {
-                // `add_path` already performed the existence/readability check.
-                // Keep richer errors for non-NotFound failures.
-                return Err(err.into());
-            }
         }
-        any_added = true;
-    }
+        index.write()?;
+        index.write_tree()
+    });
 
-    if !any_added {
-        return Ok(());
-    }
-
-    index.write()?;
-    let tree_oid = index.write_tree()?;
-    let tree = repo.find_tree(tree_oid)?;
-
-    // Append agent/thread trailers if applicable
-    let final_message = append_trailers(message);
-
-    // Find parent commit (if any)
-    let parent = resolve_head_commit_oid(repo)?
-        .map(|oid| repo.find_commit(oid))
-        .transpose()?;
-
-    let commit_result = match parent {
-        Some(ref p) => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p]),
-        None => repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[]),
-    };
-
-    if let Err(err) = commit_result {
+    if result.is_err() {
         try_restore_index(repo);
-        return Err(err.into());
+        return result;
     }
 
     Ok(())
