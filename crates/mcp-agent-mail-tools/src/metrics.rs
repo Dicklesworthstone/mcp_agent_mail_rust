@@ -27,6 +27,8 @@ static TOOL_CALLS: LazyLock<[AtomicU64; TOOL_COUNT]> =
     LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static TOOL_ERRORS: LazyLock<[AtomicU64; TOOL_COUNT]> =
     LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+static TOOL_REJECTIONS: LazyLock<[AtomicU64; TOOL_COUNT]> =
+    LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static TOOL_LATENCIES: LazyLock<[RwLock<Log2Histogram>; TOOL_COUNT]> =
     LazyLock::new(|| std::array::from_fn(|_| RwLock::new(Log2Histogram::new())));
 
@@ -52,6 +54,19 @@ pub fn record_error_idx(tool_index: usize) {
     TOOL_ERRORS[tool_index].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record a client-side refusal.
+///
+/// Covers invalid input, not-found lookups, policy or feature-disabled
+/// refusals, idempotency conflicts, cursor-window misses, and auth
+/// failures. Rejections are counted separately from `errors` so dashboards
+/// showing server error rates are not polluted by healthy refusals
+/// (br-315wc). The call itself is still counted via [`record_call_idx`].
+#[inline]
+pub fn record_rejection_idx(tool_index: usize) {
+    debug_assert!(tool_index < TOOL_COUNT);
+    TOOL_REJECTIONS[tool_index].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Record a successful tool call.
 pub fn record_call(tool_name: &str) {
     if let Some(idx) = tool_index(tool_name) {
@@ -72,6 +87,18 @@ pub fn record_error(tool_name: &str) {
         debug_assert!(
             false,
             "record_error called with unknown tool name: {tool_name}"
+        );
+    }
+}
+
+/// Record a client-side refusal by tool name (see [`record_rejection_idx`]).
+pub fn record_rejection(tool_name: &str) {
+    if let Some(idx) = tool_index(tool_name) {
+        record_rejection_idx(idx);
+    } else {
+        debug_assert!(
+            false,
+            "record_rejection called with unknown tool name: {tool_name}"
         );
     }
 }
@@ -101,6 +128,9 @@ pub fn reset_tool_metrics() {
     }
     for e in TOOL_ERRORS.iter() {
         e.store(0, Ordering::Relaxed);
+    }
+    for r in TOOL_REJECTIONS.iter() {
+        r.store(0, Ordering::Relaxed);
     }
     for h in TOOL_LATENCIES.iter() {
         if let Ok(guard) = h.write() {
@@ -466,7 +496,14 @@ pub struct LatencySnapshot {
 pub struct MetricsSnapshotEntry {
     pub name: String,
     pub calls: u64,
+    /// Server-fault errors only (DB failures, timeouts, internal panics).
     pub errors: u64,
+    /// Client-side refusals (invalid input, not-found, policy/feature
+    /// refusals, idempotency conflicts, cursor misses, auth failures).
+    /// Counted in `calls` but never in `errors` (br-315wc). Defaults to 0
+    /// when deserializing snapshots produced before this field existed.
+    #[serde(default)]
+    pub rejections: u64,
     pub cluster: String,
     pub capabilities: Vec<String>,
     pub complexity: String,
@@ -517,11 +554,13 @@ pub fn tool_metrics_snapshot() -> Vec<MetricsSnapshotEntry> {
             }
 
             let errors = TOOL_ERRORS[idx].load(Ordering::Relaxed);
+            let rejections = TOOL_REJECTIONS[idx].load(Ordering::Relaxed);
             let meta = tool_meta(name);
             Some(MetricsSnapshotEntry {
                 name: (*name).to_string(),
                 calls,
                 errors,
+                rejections,
                 cluster: (*cluster).to_string(),
                 capabilities: meta
                     .map(|m| m.capabilities.iter().map(|s| (*s).to_string()).collect())
@@ -550,6 +589,7 @@ pub fn tool_metrics_snapshot_full() -> Vec<MetricsSnapshotEntry> {
                 name: (*name).to_string(),
                 calls: TOOL_CALLS[idx].load(Ordering::Relaxed),
                 errors: TOOL_ERRORS[idx].load(Ordering::Relaxed),
+                rejections: TOOL_REJECTIONS[idx].load(Ordering::Relaxed),
                 cluster: (*cluster).to_string(),
                 capabilities: meta
                     .map(|m| m.capabilities.iter().map(|s| (*s).to_string()).collect())
@@ -821,6 +861,33 @@ mod tests {
     }
 
     #[test]
+    fn rejections_counted_separately_from_errors() {
+        let _guard = METRICS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_tool_metrics();
+        let idx = tool_index("send_message").unwrap();
+
+        // One refused call (client fault) and one failed call (server fault).
+        record_call_idx(idx);
+        record_rejection_idx(idx);
+        record_call_idx(idx);
+        record_error_idx(idx);
+
+        let full = tool_metrics_snapshot_full();
+        let sm = full.iter().find(|e| e.name == "send_message").unwrap();
+        assert_eq!(sm.calls, 2, "calls must count refusals and errors alike");
+        assert_eq!(sm.errors, 1, "errors must count only server faults");
+        assert_eq!(sm.rejections, 1, "rejections must count client refusals");
+
+        // Reset clears rejections along with the other counters.
+        reset_tool_metrics();
+        let full = tool_metrics_snapshot_full();
+        let sm = full.iter().find(|e| e.name == "send_message").unwrap();
+        assert_eq!(sm.rejections, 0);
+    }
+
+    #[test]
     fn snapshot_full_accurate_counts_after_calls() {
         let _guard = METRICS_LOCK
             .lock()
@@ -1053,6 +1120,7 @@ mod tests {
             name: "health_check".to_string(),
             calls: 42,
             errors: 3,
+            rejections: 5,
             cluster: "infrastructure".to_string(),
             capabilities: vec!["infrastructure".to_string()],
             complexity: "low".to_string(),
@@ -1063,6 +1131,7 @@ mod tests {
         assert_eq!(deser.name, "health_check");
         assert_eq!(deser.calls, 42);
         assert_eq!(deser.errors, 3);
+        assert_eq!(deser.rejections, 5);
         assert!(deser.latency.is_none());
     }
 
@@ -1072,6 +1141,7 @@ mod tests {
             name: "test".to_string(),
             calls: 1,
             errors: 0,
+            rejections: 0,
             cluster: "test".to_string(),
             capabilities: Vec::new(),
             complexity: "low".to_string(),

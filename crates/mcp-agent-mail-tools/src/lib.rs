@@ -50,14 +50,16 @@ pub use macros::*;
 pub use messaging::*;
 pub use metrics::{
     LatencySnapshot, MetricsSnapshotEntry, record_call, record_call_idx, record_error,
-    record_error_idx, record_latency, record_latency_idx, reset_tool_latencies, reset_tool_metrics,
-    slow_tools, tool_index, tool_meta, tool_metrics_snapshot, tool_metrics_snapshot_full,
+    record_error_idx, record_latency, record_latency_idx, record_rejection, record_rejection_idx,
+    reset_tool_latencies, reset_tool_metrics, slow_tools, tool_index, tool_meta,
+    tool_metrics_snapshot, tool_metrics_snapshot_full,
 };
 pub use products::*;
 pub use reservation_parity::*;
 pub use reservations::*;
 pub use resources::*;
 pub use search::*;
+pub use tool_util::{mcp_error_is_client_refusal, tool_error_code, tool_error_is_client_refusal};
 
 pub mod tool_util {
     use fastmcp::McpErrorCode;
@@ -185,6 +187,80 @@ pub mod tool_util {
             recoverable,
             data,
         )
+    }
+
+    /// Extract the legacy error code from a tool [`McpError`].
+    ///
+    /// Reads `data.error.type` (e.g. `"INVALID_ARGUMENT"`) as built via
+    /// [`legacy_tool_error`] / [`legacy_mcp_error`]. Returns `None` for errors
+    /// without a legacy payload (framework internals, panics).
+    #[must_use]
+    pub fn tool_error_code(err: &McpError) -> Option<&str> {
+        err.data.as_ref()?.get("error")?.get("type")?.as_str()
+    }
+
+    /// Classify a legacy tool error CODE as a pure client-side refusal.
+    ///
+    /// Refusals are invalid input, a not-found lookup, a policy/contact
+    /// refusal, a feature-disabled refusal, an idempotency conflict, a
+    /// cursor-window miss, or an auth (token/proof) validation failure — as
+    /// opposed to a server fault (DB errors, `RESOURCE_BUSY`, timeouts,
+    /// `ARCHIVE_ERROR`, `DISK_FULL`, `DURABILITY_DEGRADED`, internal panics).
+    ///
+    /// Unknown or unparsable codes classify as server faults, failing toward
+    /// visibility (br-315wc).
+    #[must_use]
+    pub fn tool_error_is_client_refusal(code: &str) -> bool {
+        // Availability failures that merely wear an auth-family prefix are
+        // server faults, so exclude them before the prefix rules.
+        if code == "PROOF_NONCE_STORE_UNAVAILABLE" || code == "SENDER_TOKEN_UNAVAILABLE" {
+            return false;
+        }
+        // Families: input validation and auth/proof validation refusals.
+        if code.starts_with("INVALID_") || code.starts_with("EMPTY_") || code.starts_with("PROOF_")
+        {
+            return true;
+        }
+        // Not-found lookups (NOT_FOUND, RECIPIENT_NOT_FOUND, AGENT_NOT_FOUND,
+        // IDENTITY_NOT_FOUND, ...).
+        if code == "NOT_FOUND" || code.ends_with("_NOT_FOUND") {
+            return true;
+        }
+        matches!(
+            code,
+            // Input validation refusals outside the prefix families.
+            "MISSING_FIELD"
+                | "MISSING_PANE_ID"
+                | "TYPE_ERROR"
+                | "TOO_MANY_PATHS"
+                | "PATH_TOO_LONG"
+                | "PAYLOAD_TOO_LARGE"
+                // Policy / contact refusals.
+                | "CONTACT_REQUIRED"
+                | "CONTACT_BLOCKED"
+                | "CONTACTS_ONLY"
+                // Feature-disabled refusals.
+                | "BROADCAST_DISABLED"
+                | "FEATURE_DISABLED"
+                | "WORKTREES_DISABLED"
+                // Advisory conflicts the client is expected to resolve.
+                | "FILE_RESERVATION_CONFLICT"
+                | "IDEMPOTENCY_KEY_CONFLICT"
+                // Cursor-window misses.
+                | "CURSOR_EXPIRED"
+                | "CURSOR_AHEAD"
+                // Auth/token validation failures.
+                | "SENDER_TOKEN_REQUIRED"
+                | "SENDER_TOKEN_MISMATCH"
+        )
+    }
+
+    /// Whole-error variant of [`tool_error_is_client_refusal`]: `true` only
+    /// when the error carries a legacy code that classifies as a client
+    /// refusal. Errors without an extractable code classify as server faults.
+    #[must_use]
+    pub fn mcp_error_is_client_refusal(err: &McpError) -> bool {
+        tool_error_code(err).is_some_and(tool_error_is_client_refusal)
     }
 
     fn is_retryable_post_commit_visibility_probe(message: &str) -> bool {
@@ -2896,6 +2972,94 @@ mod tests {
     fn patterns_overlap_empty_patterns() {
         // An empty pattern normalizes to the root directory, which overlaps with everything
         assert!(patterns_overlap("", "src/main.rs"));
+    }
+
+    // -- error refusal classifier tests (br-315wc) --
+
+    #[test]
+    fn client_refusal_codes_classify_as_rejections() {
+        for code in [
+            "INVALID_ARGUMENT",
+            "INVALID_LIMIT",
+            "NOT_FOUND",
+            "RECIPIENT_NOT_FOUND",
+            "AGENT_NOT_FOUND",
+            "IDENTITY_NOT_FOUND",
+            "MISSING_FIELD",
+            "EMPTY_PATHS",
+            "CONTACT_REQUIRED",
+            "CONTACT_BLOCKED",
+            "BROADCAST_DISABLED",
+            "FEATURE_DISABLED",
+            "WORKTREES_DISABLED",
+            "FILE_RESERVATION_CONFLICT",
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "CURSOR_EXPIRED",
+            "CURSOR_AHEAD",
+            "SENDER_TOKEN_REQUIRED",
+            "SENDER_TOKEN_MISMATCH",
+            "PROOF_REQUIRED",
+            "PROOF_EXPIRED",
+            "PROOF_BAD_SIGNATURE",
+        ] {
+            assert!(
+                tool_error_is_client_refusal(code),
+                "{code} must classify as a client refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn server_fault_codes_stay_errors() {
+        for code in [
+            "DATABASE_ERROR",
+            "DATABASE_CORRUPTION",
+            "DATABASE_POOL_EXHAUSTED",
+            "RESOURCE_BUSY",
+            "ARCHIVE_ERROR",
+            "DISK_FULL",
+            "DURABILITY_DEGRADED",
+            "UNHANDLED_EXCEPTION",
+            "SNAPSHOT_TIMEOUT",
+            "PROOF_NONCE_STORE_UNAVAILABLE",
+            "SENDER_TOKEN_UNAVAILABLE",
+            // Unknown/unparsable codes fail toward visibility.
+            "SOME_FUTURE_CODE",
+            "",
+        ] {
+            assert!(
+                !tool_error_is_client_refusal(code),
+                "{code} must stay classified as a server error"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_error_code_extracts_legacy_payload_type() {
+        let err = tool_util::legacy_tool_error(
+            "CONTACT_REQUIRED",
+            "Contact required",
+            true,
+            serde_json::json!({}),
+        );
+        assert_eq!(tool_error_code(&err), Some("CONTACT_REQUIRED"));
+        assert!(mcp_error_is_client_refusal(&err));
+
+        let db_err = tool_util::legacy_tool_error(
+            "DATABASE_ERROR",
+            "db exploded",
+            false,
+            serde_json::json!({}),
+        );
+        assert_eq!(tool_error_code(&db_err), Some("DATABASE_ERROR"));
+        assert!(!mcp_error_is_client_refusal(&db_err));
+
+        // Errors without a legacy payload have no extractable code and are
+        // never classified as client refusals.
+        let bare =
+            fastmcp::prelude::McpError::new(fastmcp::McpErrorCode::InternalError, "internal panic");
+        assert_eq!(tool_error_code(&bare), None);
+        assert!(!mcp_error_is_client_refusal(&bare));
     }
 
     // -- cluster constants test --

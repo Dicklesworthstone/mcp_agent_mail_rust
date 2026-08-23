@@ -10,6 +10,25 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+### Added
+
+- **Transcript-safe identity creation (GH#255).**
+  `create_agent_identity` now accepts `return_registration_token`
+  (default `true`, Python-parity with the Python server's issue #154).
+  When `false`, the freshly-minted registration token is omitted from
+  the tool result and the response carries
+  `registration_token_returned: false` instead; the token is still
+  generated and persisted server-side. Unlike the Python server there is
+  no per-session identity binding, so an opted-out caller sends with
+  `verified_sender: false` unless it obtains the token via an
+  operator/admin path — the tool description documents this.
+  Also pinned by test: `send_message` with `auto_contact_if_blocked`
+  omitted takes the server-default path (Python-parity), while an
+  explicit JSON `null` is rejected loudly with a typed `InvalidParams`
+  error naming the field (nullable `Option<T>` schemas are a pending
+  fastmcp enhancement; the test flips to asserting acceptance once that
+  lands).
+
 Fleet-wide reliability campaign: root-caused the "97% error rate" display
 and the progressive sluggishness that returned within a day of
 `am clear-and-reset-everything`, plus a registry-clean dependency universe.
