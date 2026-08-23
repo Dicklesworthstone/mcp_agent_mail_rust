@@ -8,6 +8,68 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [Unreleased]
+
+Fleet-wide reliability campaign: root-caused the "97% error rate" display
+and the progressive sluggishness that returned within a day of
+`am clear-and-reset-everything`, plus a registry-clean dependency universe.
+
+### Fixed
+
+- **Dashboard "Error %" no longer lies on idle servers.** HTTP request
+  counters previously excluded every high-volume success path
+  (`/healthz`, `/mail/ws-state`, web-dashboard polls) while still
+  counting 401/404/405s, so a mostly-idle server displayed error rates
+  approaching 100% (the infamous "97%"). All completed requests now
+  count; the summary tile reports server faults (5xx) with 4xx shown
+  separately, and the same math is used on every TUI surface.
+- **`inbox_stats` recompute is no longer O(recipients × messages) inside
+  every write transaction.** The uncorrelated `IN (SELECT … FROM
+  messages)` subqueries (which FrankenSQLite does not rewrite into
+  semi-joins) became indexed PK joins; `rebuild_all_inbox_stats` is one
+  set-based `GROUP BY` aggregate. This was the main "everything slows
+  down as the mailbox grows" driver.
+- **Integrity guard stopped re-verifying the whole backup and walking the
+  entire archive every 5 minutes.** Fresh `.bak` files skip
+  re-verification (they are fully validated at creation); the archive
+  drift reconcile (quick_check + read/JSON-parse of every message file)
+  only retries when a prior drift was actually recorded.
+- **`am robot` commands no longer read and parse every archive message
+  file on every invocation.** The archive-lag probe uses a cheap file
+  count and short-circuits when the local DB is populated and up to
+  date — the source of multi-second CLI latency that regrew after resets.
+- **A benign "project not found for current directory" no longer
+  escalates into a 5.8-second corruption-flavored recovery diagnostic**
+  (duplicate `lsof`/`ps` ownership scans, git forensic timeline, full
+  verdict). Unregistered directories get a fast, honest info alert;
+  genuine DB failures keep the recovery path, now on
+  `VerdictOptions::fast()` with the duplicated ownership scan removed.
+- **`GET /mail/ws-state?system_health=1` no longer runs an unbounded
+  libgit2 ref sweep inline per request** on the 4-worker HTTP runtime
+  (the cause of ws-state hangs while `/health` stayed responsive). The
+  sweep and its config/dismissal loads are cached per configured
+  interval.
+- **ATC operator loop can no longer spin at ~1 kHz** when an agent review
+  is overdue: waits clamp to the 250 ms tick floor and the sleep is
+  computed from a fresh timestamp.
+
+### Changed
+
+- **Pool auto-sizing respects FrankenSQLite's concurrency contract.**
+  `auto_pool_size()` now caps at 32 connections (was up to 200;
+  min 4–16) — ≥10 concurrent autocommit writers is unsupported upstream
+  (fsqlite bd-9inpb, P0) and the swarm-tested bound is N≤32. Explicit
+  `DATABASE_POOL_SIZE` overrides are honored unchanged.
+- **Dependencies resolve from crates.io** — asupersync `=0.4.9`, fsqlite
+  `0.3.8`, sqlmodel `=0.4.0`, fastmcp `0.7.0`, ftui `0.5.0`,
+  franken-agent-detection `0.1.10`, tru `0.2.3`. The machine-specific
+  `/data/projects/frankensqlite`, `../sqlmodel-rel-0327`,
+  `../frankentui`, `../toon_rust`, and `../franken_agent_detection`
+  patches are gone (they made source builds fail on any host without
+  those exact checkouts). Remaining path patches: `beads_rust`
+  (registry pins asupersync `=0.4.4`) and `frankensearch` (registry
+  0.3.2 predates the asupersync 0.4 universe).
+
 ## [v0.3.29](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.29) — 2026-08-19 **[Release]**
 
 Post-0.3.28 hardening of the registry-engine adoption. The v0.3.28
