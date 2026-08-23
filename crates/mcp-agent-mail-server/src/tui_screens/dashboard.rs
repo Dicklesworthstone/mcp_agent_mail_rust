@@ -2763,6 +2763,11 @@ fn render_summary_band(
     } else {
         tp.severity_ok
     };
+    let status_4xx_color = if counters.status_4xx > 0 {
+        tp.severity_warn
+    } else {
+        tp.severity_ok
+    };
     let mut tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = match density {
         DensityHint::Minimal | DensityHint::Compact => vec![
             ("Msg", &msg_str, msg_trend, tp.metric_messages),
@@ -2795,7 +2800,7 @@ fn render_summary_band(
             ("Requests", &req_str, MetricTrend::Flat, req_color),
             ("Avg Lat", &avg_str, MetricTrend::Flat, tp.metric_latency),
             ("Error %", &error_rate_str, MetricTrend::Flat, error_color),
-            ("4xx", &status_4xx_str, MetricTrend::Flat, tp.severity_warn),
+            ("4xx", &status_4xx_str, MetricTrend::Flat, status_4xx_color),
             ("Ring Fill", &ring_fill_str, MetricTrend::Flat, ring_color),
             ("Drops", &drop_str, MetricTrend::Flat, drop_color),
             ("Uptime", &uptime_str, MetricTrend::Flat, tp.metric_uptime),

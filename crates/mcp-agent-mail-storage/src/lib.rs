@@ -6613,13 +6613,21 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
 ///
 /// Commits must update the BRANCH ref (`refs/heads/main`), never the literal
 /// symbolic `HEAD` — replacing a symbolic HEAD with a direct ref would detach
-/// the repository. Falls back to `HEAD` itself when detached, mirroring the
-/// historical behavior of committing through `HEAD`.
-fn head_update_refname(repo: &Repository) -> String {
-    repo.find_reference("HEAD")
-        .ok()
-        .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
-        .unwrap_or_else(|| "HEAD".to_string())
+/// the repository. Falls back to `HEAD` itself when detached (or unborn with
+/// no readable HEAD), mirroring the historical behavior of committing through
+/// `HEAD`.
+///
+/// A symbolic HEAD whose target is not valid UTF-8 is an error rather than a
+/// fallback: git2 0.21 surfaces that case as `Err`, and silently writing a
+/// direct ref over the symbolic `HEAD` would be exactly the detach this
+/// function exists to prevent.
+fn head_update_refname(repo: &Repository) -> Result<String> {
+    let Ok(head) = repo.find_reference("HEAD") else {
+        return Ok("HEAD".to_string());
+    };
+    Ok(head
+        .symbolic_target()?
+        .map_or_else(|| "HEAD".to_string(), str::to_string))
 }
 
 /// Create a commit object from a caller-built tree and atomically advance
@@ -6646,7 +6654,7 @@ fn commit_tree_advancing_head<F>(
 where
     F: FnOnce(&Repository) -> Result<Option<git2::Oid>>,
 {
-    let refname = head_update_refname(repo);
+    let refname = head_update_refname(repo)?;
     let mut tx = repo.transaction()?;
     // Hold the reference lock across tree-build + parent-read + ref-write:
     // this is the critical section another mcp-agent-mail process blocks on.

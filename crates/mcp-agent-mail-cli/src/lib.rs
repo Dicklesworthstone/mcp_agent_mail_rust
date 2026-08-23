@@ -48754,7 +48754,13 @@ http_headers = { Authorization = "Bearer secret" }
 
     #[test]
     fn ensure_dir_missing_path_errors() {
-        let result = ensure_dir(Path::new("/nonexistent/path"));
+        // Root-run build workers can create a literal "/nonexistent/path",
+        // so anchor the failure on something no user can satisfy: a parent
+        // path component that is a regular file.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let result = ensure_dir(&blocker.join("child"));
         assert!(result.is_err());
     }
 

@@ -7899,12 +7899,11 @@ mod query_param_tests {
     #[test]
     fn workspace_root_none_without_workspace_manifest() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        if workspace_root_from(tmp.path()).is_some() {
-            // The tempdir itself sits inside a real cargo workspace (rch
-            // build workers redirect TMPDIR into the repo checkout), so the
-            // "no workspace manifest above" premise cannot hold here. Skip.
-            return;
-        }
+        // The tempdir may itself sit inside a real cargo workspace (rch build
+        // workers redirect TMPDIR into the repo checkout), so "no workspace
+        // manifest above" cannot be assumed. Capture whatever the ambient
+        // resolution is *before* adding the package-only manifest.
+        let ambient = workspace_root_from(tmp.path());
         let nested = tmp.path().join("a").join("b");
         fs::create_dir_all(&nested).expect("mkdirs");
         fs::write(
@@ -7913,7 +7912,13 @@ mod query_param_tests {
         )
         .expect("write pkg manifest");
 
-        assert!(workspace_root_from(&nested).is_none());
+        // A `[package]`-only manifest must never be treated as a workspace
+        // root: the nested lookup resolves to exactly the ambient answer
+        // (None in a clean TMPDIR; the enclosing checkout under rch), and in
+        // particular never to `nested` itself.
+        let found = workspace_root_from(&nested);
+        assert_eq!(found, ambient);
+        assert_ne!(found.as_deref(), Some(nested.as_path()));
     }
 }
 
