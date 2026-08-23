@@ -6609,16 +6609,6 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
 // ---------------------------------------------------------------------------
 // Lock-free git commit path (plumbing-based)
 // ---------------------------------------------------------------------------
-
-/// Commit files without touching the git index (avoids index.lock entirely).
-///
-/// Uses git plumbing operations:
-/// 1. `repo.blob()` — hash and write file content as blob objects
-/// 2. `repo.treebuilder()` — build tree hierarchy without using index
-/// 3. `repo.commit()` — create commit object (uses ref lock, NOT index lock)
-///
-/// This eliminates index.lock contention entirely, since the index is never
-/// read or written. Falls back to `commit_paths()` if tree building fails.
 /// Resolve the reference name that HEAD points at for ref updates.
 ///
 /// Commits must update the BRANCH ref (`refs/heads/main`), never the literal
@@ -6676,6 +6666,15 @@ where
     Ok(commit_oid)
 }
 
+/// Commit files without touching the git index (avoids index.lock entirely).
+///
+/// Uses git plumbing operations:
+/// 1. `repo.blob()` — hash and write file content as blob objects
+/// 2. `repo.treebuilder()` — build tree hierarchy without using index
+/// 3. `repo.commit()` — create commit object (uses ref lock, NOT index lock)
+///
+/// This eliminates index.lock contention entirely, since the index is never
+/// read or written. Falls back to `commit_paths()` if tree building fails.
 fn commit_paths_lockfree(
     repo: &Repository,
     config: &Config,
