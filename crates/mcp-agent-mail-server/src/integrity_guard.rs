@@ -333,6 +333,27 @@ fn run_full_cycle(
                     "integrity guard: verified snapshot capture failed"
                 ),
             }
+            // Archive-ahead drift that first arises AFTER a clean bootstrap
+            // (another process crashed between archive append and DB write,
+            // manual/git archive edits, an external older-.bak restore) is
+            // never in the pending-deferral set, so the quick cycle's cheap
+            // gate short-circuits forever. The full cycle runs hourly and
+            // already does O(DB-size) work, so run the drift predicate here
+            // without the pending precondition; every standalone pacing gate
+            // (ownership, cooldown, write idleness) still applies inside.
+            match mcp_agent_mail_db::pool::reconcile_archive_drift_full_cycle(
+                sqlite_path,
+                storage_root,
+            ) {
+                Ok(true) => tracing::info!(
+                    "integrity guard: reconciled post-bootstrap archive-ahead drift during full cycle"
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "integrity guard: full-cycle archive drift reconcile failed"
+                ),
+            }
             true
         }
         Err(err) => {
