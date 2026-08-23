@@ -6642,17 +6642,21 @@ fn commit_tree_advancing_head<F>(
     sig: &Signature<'_>,
     message: &str,
     build_tree: F,
-) -> Result<git2::Oid>
+) -> Result<()>
 where
-    F: FnOnce(&Repository) -> Result<git2::Oid>,
+    F: FnOnce(&Repository) -> Result<Option<git2::Oid>>,
 {
     let refname = head_update_refname(repo);
     let mut tx = repo.transaction()?;
     // Hold the reference lock across tree-build + parent-read + ref-write:
     // this is the critical section another mcp-agent-mail process blocks on.
     tx.lock_ref(&refname)?;
+    let Some(tree_oid) = build_tree(repo)? else {
+        // Caller produced no changes (e.g. every path was already absent);
+        // releasing the transaction without set_target leaves HEAD intact.
+        return Ok(());
+    };
     let final_message = append_trailers(message);
-    let tree_oid = build_tree(repo)?;
     let tree = repo.find_tree(tree_oid)?;
     let parent = resolve_head_commit_oid(repo)?
         .map(|oid| repo.find_commit(oid))
@@ -6663,18 +6667,8 @@ where
     };
     tx.set_target(&refname, commit_oid, Some(sig), &final_message)?;
     tx.commit()?;
-    Ok(commit_oid)
+    Ok(())
 }
-
-/// Commit files without touching the git index (avoids index.lock entirely).
-///
-/// Uses git plumbing operations:
-/// 1. `repo.blob()` — hash and write file content as blob objects
-/// 2. `repo.treebuilder()` — build tree hierarchy without using index
-/// 3. `repo.commit()` — create commit object (uses ref lock, NOT index lock)
-///
-/// This eliminates index.lock contention entirely, since the index is never
-/// read or written. Falls back to `commit_paths()` if tree building fails.
 fn commit_paths_lockfree(
     repo: &Repository,
     config: &Config,
