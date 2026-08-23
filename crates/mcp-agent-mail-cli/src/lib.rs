@@ -27853,17 +27853,38 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInvento
     inventory
 }
 
-/// Count canonical message `.md` files under a project's `messages/`
-/// directory WITHOUT opening or parsing them. Mirrors the traversal filters
-/// of [`scan_doctor_project_messages`] (skips `threads/` digests and
-/// non-`YYYY/MM/<file>.md` layouts).
-fn count_doctor_project_message_files(messages_dir: &Path) -> u64 {
-    let mut count = 0u64;
-    for entry in walkdir::WalkDir::new(messages_dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+/// Cheap per-project walk result: canonical file count, the highest message
+/// id readable from canonical FILENAMES (`…__<id>.md`, no body parsing), and
+/// whether any observation makes the count/max-id under-report (walk IO
+/// error, or a canonical-layout file whose id could not be read from its
+/// name). Under-reporting must force the caller onto the full-inventory
+/// path: a silent under-count could pass the robot lag gate while the
+/// archive is actually ahead.
+struct DoctorProjectMessageWalk {
+    count: u64,
+    max_message_id: Option<i64>,
+    ambiguous: bool,
+}
+
+/// Walk a project's `messages/` directory WITHOUT opening or parsing message
+/// bodies. Mirrors the traversal filters of [`scan_doctor_project_messages`]
+/// (skips `threads/` digests and non-`YYYY/MM/<file>.md` layouts).
+fn walk_doctor_project_message_files(messages_dir: &Path) -> DoctorProjectMessageWalk {
+    let mut walk = DoctorProjectMessageWalk {
+        count: 0,
+        max_message_id: None,
+        ambiguous: false,
+    };
+    for entry in walkdir::WalkDir::new(messages_dir).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // A swallowed error here would silently under-count, so the
+            // caller must fall back to the full inventory.
+            Err(_) => {
+                walk.ambiguous = true;
+                continue;
+            }
+        };
         let file_type = entry.file_type();
         if !file_type.is_file() || file_type.is_symlink() {
             continue;
@@ -27884,32 +27905,71 @@ fn count_doctor_project_message_files(messages_dir: &Path) -> u64 {
         {
             continue;
         }
-        count += 1;
+        walk.count += 1;
+        // Canonical layout is `{iso}__{slug}__{id}.md`; read the id straight
+        // off the name. A canonical-layout file that does not match is not
+        // counted toward `max_message_id`, so the probe reports ambiguity
+        // instead of guessing.
+        match entry
+            .path()
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.rsplit("__").next())
+            .and_then(|id_part| id_part.parse::<i64>().ok())
+        {
+            Some(id) => {
+                walk.max_message_id =
+                    Some(walk.max_message_id.map_or(id, |current| current.max(id)));
+            }
+            None => walk.ambiguous = true,
+        }
     }
-    count
+    walk
 }
 
-/// Cheap variant of [`collect_doctor_archive_inventory`] that only counts
-/// archive entries (project dirs, agent profiles, canonical message files)
-/// and never reads message bodies.
+/// Cheap archive probe carrying every signal the drift classifier acts on:
+/// counts, the highest canonical message id (read from filenames), and the
+/// same per-project identities the full inventory extracts.
 ///
 /// The robot lag probe (`prefer_archive_snapshot_when_local_db_lags_archive`)
 /// runs on every `am robot` invocation; the full inventory reads and
 /// JSON-parses every message file in every project, which made the CLI
-/// O(total archive bytes) per call. The probe only needs approximate counts
-/// to decide whether the expensive parse is worth running. `messages` here
-/// counts canonical message FILES (duplicate ids included), so it is an
-/// upper bound on the deduplicated `messages` the full inventory reports;
-/// the two agree exactly when the archive holds no duplicate message ids.
-fn collect_doctor_archive_message_counts(storage_root: &Path) -> DoctorInventoryCounts {
+/// O(total archive bytes) per call. `messages` here counts canonical message
+/// FILES (duplicate ids included), an upper bound on the deduplicated
+/// logical count the full inventory reports. Any ambiguity (walk IO error,
+/// unparsable canonical filename) sets `ambiguous`, and the gate must then
+/// fall back to [`collect_doctor_archive_inventory`] rather than trust a
+/// possibly-under-reporting probe.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DoctorArchiveCheapProbe {
+    pub counts: DoctorInventoryCounts,
+    pub latest_message_id: Option<i64>,
+    pub project_identities: std::collections::BTreeSet<DoctorProjectIdentity>,
+    pub ambiguous: bool,
+}
+
+impl DoctorArchiveCheapProbe {
+    fn observe(&mut self, other: DoctorProjectMessageWalk) {
+        self.counts.messages += other.count;
+        self.latest_message_id = match (self.latest_message_id, other.max_message_id) {
+            (Some(current), Some(candidate)) => Some(current.max(candidate)),
+            (Some(current), None) => Some(current),
+            (None, Some(candidate)) => Some(candidate),
+            (None, None) => None,
+        };
+        self.ambiguous |= other.ambiguous;
+    }
+}
+
+/// Collect the cheap archive probe across every project directory.
+fn collect_doctor_archive_cheap_probe(storage_root: &Path) -> DoctorArchiveCheapProbe {
+    let mut probe = DoctorArchiveCheapProbe::default();
     let projects_root = storage_root.join("projects");
     if !path_is_real_directory(&projects_root) {
-        return DoctorInventoryCounts::default();
+        return probe;
     }
-
-    let mut counts = DoctorInventoryCounts::default();
     let Ok(entries) = std::fs::read_dir(&projects_root) else {
-        return counts;
+        return probe;
     };
     for entry in entries.flatten() {
         let project_path = entry.path();
@@ -27919,7 +27979,11 @@ fn collect_doctor_archive_message_counts(storage_root: &Path) -> DoctorInventory
         if !project_type.is_dir() || project_type.is_symlink() {
             continue;
         }
-        counts.projects += 1;
+        probe.counts.projects += 1;
+
+        if let Some(identity) = doctor_archive_project_identity(&project_path) {
+            probe.project_identities.insert(identity);
+        }
 
         let agents_dir = project_path.join("agents");
         if path_is_real_directory(&agents_dir)
@@ -27933,17 +27997,17 @@ fn collect_doctor_archive_message_counts(storage_root: &Path) -> DoctorInventory
                     continue;
                 }
                 if path_is_real_file(&agent_entry.path().join("profile.json")) {
-                    counts.agents += 1;
+                    probe.counts.agents += 1;
                 }
             }
         }
 
         let messages_dir = project_path.join("messages");
         if path_is_real_directory(&messages_dir) {
-            counts.messages += count_doctor_project_message_files(&messages_dir);
+            probe.observe(walk_doctor_project_message_files(&messages_dir));
         }
     }
-    counts
+    probe
 }
 
 fn doctor_archive_project_fallback_slug(project_path: &Path) -> String {
@@ -54653,7 +54717,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn collect_doctor_archive_message_counts_matches_full_inventory_on_fixture() {
+    fn collect_doctor_archive_cheap_probe_matches_full_inventory_on_fixture() {
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tmp.path().join("storage");
 
@@ -54707,27 +54771,50 @@ startup_timeout_sec = 42
         )
         .unwrap();
 
-        let counts = collect_doctor_archive_message_counts(&storage_root);
+        let probe = collect_doctor_archive_cheap_probe(&storage_root);
         let inventory = collect_doctor_archive_inventory(&storage_root);
 
-        assert_eq!(counts.projects, inventory.projects);
-        assert_eq!(counts.agents, inventory.agents);
+        assert!(!probe.ambiguous, "fixture filenames are all parseable");
+        assert_eq!(probe.counts.projects, inventory.projects);
+        assert_eq!(probe.counts.agents, inventory.agents);
         // The fixture holds no duplicate message ids, so the cheap file count
         // matches both the raw canonical file count and the deduplicated
         // logical message count of the parsing variant.
-        assert_eq!(counts.messages, inventory.canonical_message_files);
-        assert_eq!(counts.messages, inventory.messages);
-        assert_eq!(counts, inventory.counts());
-        assert_eq!(counts.projects, 2);
-        assert_eq!(counts.agents, 2);
-        assert_eq!(counts.messages, 3);
+        assert_eq!(probe.counts.messages, inventory.canonical_message_files);
+        assert_eq!(probe.counts.messages, inventory.messages);
+        assert_eq!(probe.counts, inventory.counts());
+        assert_eq!(probe.counts.projects, 2);
+        assert_eq!(probe.counts.agents, 2);
+        assert_eq!(probe.counts.messages, 3);
+        // Filename-derived max id and identities must agree with the
+        // parsing variant exactly — the robot lag gate relies on both.
+        assert_eq!(probe.latest_message_id, inventory.latest_message_id);
+        assert_eq!(probe.latest_message_id, Some(9));
+        assert_eq!(probe.project_identities, inventory.project_identities);
 
-        // Empty/missing storage roots report the default counts, mirroring
+        // Empty/missing storage roots report the default probe, mirroring
         // the parsing variant's empty-inventory behavior.
         assert_eq!(
-            collect_doctor_archive_message_counts(&tmp.path().join("missing")),
+            collect_doctor_archive_cheap_probe(&tmp.path().join("missing")).counts,
             DoctorInventoryCounts::default()
         );
+    }
+
+    #[test]
+    fn collect_doctor_archive_cheap_probe_flags_unparsable_canonical_filename_as_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("projects").join("demo-project");
+        let canonical = project.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("no-id-suffix.md"), "body\n").unwrap();
+
+        let probe = collect_doctor_archive_cheap_probe(tmp.path());
+        assert_eq!(probe.counts.messages, 1, "layout filters still count it");
+        assert!(
+            probe.ambiguous,
+            "a canonical-layout file with no __<id> suffix must force the full-inventory fallback"
+        );
+        assert_eq!(probe.latest_message_id, None);
     }
 
     #[test]

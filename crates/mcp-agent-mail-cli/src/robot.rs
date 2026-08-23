@@ -3150,27 +3150,42 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
         }
     }
 
-    // Cheap lag probe first: counting canonical archive files never opens or
-    // parses message bodies. The full inventory below reads and JSON-parses
-    // EVERY message file in the archive, so the healthy path (local DB
-    // present and not lagging the archive by counts) must never reach it.
-    let archive_counts = crate::collect_doctor_archive_message_counts(storage_root);
-    if archive_counts == crate::DoctorInventoryCounts::default() {
+    // Cheap lag probe first: the probe walks canonical archive filenames
+    // (count, max message id, project identities) without opening or parsing
+    // any message body. The full inventory below reads and JSON-parses EVERY
+    // message file in the archive, so the healthy path (local DB provably
+    // not lagging the archive on ANY classifier signal) must never reach it.
+    //
+    // The gate mirrors every signal of `doctor_archive_db_drift_detail`:
+    // counts, archive latest_message_id (GH#217 data-loss class), and
+    // per-project identity matching. `ambiguous` (walk IO error or an
+    // unparsable canonical filename) means the probe could under-report, so
+    // we fall back to the full inventory instead of trusting it.
+    let probe = crate::collect_doctor_archive_cheap_probe(storage_root);
+    if probe.counts == crate::DoctorInventoryCounts::default() {
         return Ok(local);
     }
 
     match crate::collect_doctor_db_inventory(&local.conn) {
         Ok(db) => {
             if db.counts.messages > 0
-                && db.counts.projects >= archive_counts.projects
-                && db.counts.agents >= archive_counts.agents
-                && db.counts.messages >= archive_counts.messages
+                && !probe.ambiguous
+                && db.counts.projects >= probe.counts.projects
+                && db.counts.agents >= probe.counts.agents
+                && db.counts.messages >= probe.counts.messages
+                && db.max_message_id >= probe.latest_message_id.unwrap_or(0)
+                && probe.project_identities.iter().all(|archive_identity| {
+                    crate::doctor_archive_identity_matches_db(
+                        archive_identity,
+                        &db.project_identities,
+                    )
+                })
             {
                 // The populated local DB is at least as complete as the
-                // archive by cheap counts (`archive_counts.messages` counts
-                // files, an upper bound on the archive's deduplicated
-                // logical message count), so the archive cannot be
-                // meaningfully ahead. Skip the expensive per-message parse.
+                // archive on every drift-classifier signal (`counts.messages`
+                // counts files, an upper bound on the archive's deduplicated
+                // logical count; max ids and identities match exactly).
+                // Skip the expensive per-message parse.
                 return Ok(local);
             }
             let archive = crate::collect_doctor_archive_inventory(storage_root);
