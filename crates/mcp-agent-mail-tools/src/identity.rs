@@ -2286,6 +2286,10 @@ Check that all parameters have valid values."
 /// - `attachments_policy`: Optional attachment handling policy
 /// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
 ///   caller pane explicitly; stdio callers may omit it.
+/// - `return_registration_token`: When `true` (default), the response includes
+///   the freshly-minted `registration_token`. When `false`, the token is
+///   omitted from the tool result (transcript safety, GH#255 / Python issue
+///   #154); the token is still generated and persisted server-side.
 ///
 /// # Returns
 /// New agent profile
@@ -2298,7 +2302,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed."
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nNote: unlike the Python server, this server has no per-session identity binding, so a\ncaller that opts out of the token echo sends messages with `verified_sender: false`\nunless it obtains the token through an operator/admin path. Under the fail-closed send\nprofile a sender token is mandatory; only opt out of the echo if you have another way\nto obtain the token.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -2310,6 +2314,7 @@ pub async fn create_agent_identity(
     attachments_policy: Option<String>,
     pane_id: Option<String>,
     registration_proof: Option<String>,
+    return_registration_token: Option<bool>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -2539,6 +2544,14 @@ Choose a different name (or omit the name to auto-generate one)."
         }
     }
 
+    // Transcript safety (GH#255, Python-parity with issue #154): when the
+    // caller opts out of the token echo, omit the token from the tool result
+    // entirely and mark the omission explicitly. The token was still
+    // generated and persisted above, so the identity is fully functional;
+    // the caller has simply chosen not to have the secret echoed into a
+    // transcript-visible MCP response.
+    let echo_token = return_registration_token.unwrap_or(true);
+
     let response = AgentResponse {
         id: row.id.unwrap_or(0),
         name: row.name,
@@ -2555,11 +2568,21 @@ Choose a different name (or omit the name to auto-generate one)."
             .map(|s| (*s).to_string())
             .collect(),
         // Same contract as register_agent: no persisted token → null.
-        registration_token: (!registration_token.is_empty()).then_some(registration_token),
+        registration_token: (echo_token && !registration_token.is_empty())
+            .then_some(registration_token),
     };
 
-    serde_json::to_string(&response)
-        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+    if echo_token {
+        serde_json::to_string(&response)
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+    } else {
+        let mut value = serde_json::to_value(&response)
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
+        // Python-parity marker: the caller opted out of the token echo.
+        value["registration_token_returned"] = serde_json::Value::Bool(false);
+        serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+    }
 }
 
 /// Validate `attachments_policy` value.

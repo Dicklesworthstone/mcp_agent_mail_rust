@@ -14193,17 +14193,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                             // actively held), so it skips straight to the
                             // unavailable read-out (which already points at
                             // `--project <abs-path>`).
-                            let recovery_only = if is_benign_unregistered_cwd_project_error(
-                                &scope_error,
-                            ) {
-                                None
-                            } else {
-                                build_recovery_only_status(
-                                    args.project.as_deref(),
-                                    args.agent.as_deref(),
-                                    &scope_error,
-                                )
-                            };
+                            let recovery_only =
+                                if is_benign_unregistered_cwd_project_error(&scope_error) {
+                                    None
+                                } else {
+                                    build_recovery_only_status(
+                                        args.project.as_deref(),
+                                        args.agent.as_deref(),
+                                        &scope_error,
+                                    )
+                                };
                             if let Some((status, actions, project_slug, agent_name)) = recovery_only
                             {
                                 tracing::debug!(

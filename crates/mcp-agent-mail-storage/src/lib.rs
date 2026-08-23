@@ -6654,6 +6654,12 @@ fn commit_tree_advancing_head<F>(
 where
     F: FnOnce(&Repository) -> Result<Option<git2::Oid>>,
 {
+    // ts2 (br-bvq1x.9.7): clear a branch whose tip object is missing/corrupt
+    // BEFORE taking the reference-transaction lock. `heal_unloadable_head`
+    // deletes the broken ref, and libgit2 refuses that delete while this
+    // transaction holds the ref's lockfile (GIT_ELOCKED), so healing from
+    // inside the locked closure (via `reset_index_to_head`) can never succeed.
+    heal_unloadable_head(repo)?;
     let refname = head_update_refname(repo)?;
     let mut tx = repo.transaction()?;
     // Hold the reference lock across tree-build + parent-read + ref-write:
@@ -11557,11 +11563,6 @@ fn commit_paths(
             any_added = true;
         }
         index.write()?;
-        eprintln!(
-            "STAGE rel={rel_paths:?} entries={} any_added={any_added} head={:?}",
-            index.len(),
-            resolve_head_commit_oid(repo).map(|o| o.map(|o| o.to_string()[..7].to_string()))
-        );
         if !any_added {
             // Every requested path was already absent from disk and index —
             // nothing to commit (historical early-out preserved).

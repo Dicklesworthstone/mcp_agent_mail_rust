@@ -262,8 +262,8 @@ is used in hot paths.
 | Variable                       | Default               | Description                      |
 |--------------------------------|-----------------------|----------------------------------|
 | `DATABASE_URL`                 | `sqlite+aiosqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
-| `DATABASE_POOL_SIZE`           | auto (25)             | Connection pool size             |
-| `DATABASE_MAX_OVERFLOW`        | auto (75)             | Additional overflow connections   |
+| `DATABASE_POOL_SIZE`           | auto (4-16 by cores)  | Connection pool size             |
+| `DATABASE_MAX_OVERFLOW`        | auto (max 32 total; fsqlite writer bound) | Additional overflow connections   |
 | `DATABASE_POOL_TIMEOUT`        | `15` (seconds)        | Pool acquisition timeout         |
 | `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |

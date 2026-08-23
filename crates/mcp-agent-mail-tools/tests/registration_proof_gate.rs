@@ -215,6 +215,7 @@ fn disabled_gate_registers_without_proof() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("create_agent_identity should succeed with gate disabled");
@@ -281,6 +282,7 @@ fn enabled_gate_blocks_every_entry_point_without_proof() {
                 "opus-4.1".to_string(),
                 Some("GreenCastle".to_string()),
                 Some("no proof".to_string()),
+                None,
                 None,
                 None,
                 None,
