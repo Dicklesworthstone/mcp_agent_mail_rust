@@ -179,9 +179,10 @@ inherits = "release"     # Benchmarks use same optimizations as release
 # - fastmcp family resolves from crates.io (0.7.0, published 2026-08-20).
 #
 # beads_rust: registry 0.3.2 still pins asupersync =0.4.4, unsatisfiable in
-# the =0.4.9 universe, so it stays path-patched to the live ../beads_rust
-# checkout (0.3.2) with its asupersync pin bumped =0.4.8 → =0.4.9 locally.
-# Cleanup trigger: a beads_rust release accepting asupersync 0.4.9+.
+# the =0.4.9 universe, so it stays path-patched to the ../beads_rust checkout
+# on main (0.4.0, asupersync =0.4.9 — not yet on crates.io; the 0.4.0 req in
+# [workspace.dependencies] is satisfied ONLY through this patch).
+# Cleanup trigger: beads_rust 0.4.x published to crates.io.
 beads_rust = { path = "../beads_rust" }
 # ftui 0.5.0, franken-agent-detection 0.1.10, and tru 0.2.3 resolve from
 # crates.io as of 2026-08-22 — the ../frankentui, ../franken_agent_detection,

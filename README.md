@@ -321,7 +321,7 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect locally patched sibling checkouts in the parent directory for **eight** repos: `../asupersync`, `../fastmcp_rust`, `../beads_rust`, `../franken_agent_detection`, `../frankentui`, `../frankensearch`, `../toon_rust`, and `../rich_rust`. SQLmodel and FrankenSQLite resolve from crates.io.
+Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect sibling checkouts in the parent directory for **two** repos: [`../frankensearch`](https://github.com/Dicklesworthstone/frankensearch) (a path dependency; its workspace also needs [`../fast_cmaes`](https://github.com/Dicklesworthstone/fast_cmaes) for workspace-wide `cargo metadata`) and [`../beads_rust`](https://github.com/Dicklesworthstone/beads_rust) on `main` (path-patched until a 0.4.x release lands on crates.io). Everything else -- asupersync, fastmcp, SQLmodel, FrankenSQLite, FrankenTUI, franken-agent-detection, tru, and rich_rust -- resolves from crates.io.
 
 ### Platforms
 

@@ -25,15 +25,14 @@ jobs:
 
       - name: Clone sibling dependencies
         run: |
+          # 2026-08-22 registry universe: only frankensearch (path dep) and
+          # beads_rust (path patch) are sibling checkouts; everything else
+          # resolves from crates.io.
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
-          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for workspace-wide cargo metadata.
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
 
       - uses: dtolnay/rust-toolchain@nightly
 

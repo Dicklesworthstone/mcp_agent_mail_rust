@@ -5606,18 +5606,22 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ensure_rust
   git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
 
-  # Check for local dependency paths required by [patch.crates-io] in Cargo.toml.
-  # These exist only on the project's build server; external users must use pre-built binaries.
-  if [ ! -d "/dp/asupersync" ]; then
-    err "Build from source requires local dependency checkouts under /dp/ that are"
-    err "only available on the project build server."
-    err ""
-    err "For end-user installation, use pre-built release binaries:"
-    err "  curl -fsSL ${INSTALL_SCRIPT_URL} | bash"
-    err ""
-    err "If no release exists yet, check https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases"
-    exit 1
-  fi
+  # Cargo.toml path-depends on ../frankensearch and path-patches beads_rust to
+  # ../beads_rust (registry 0.3.2 pins an older asupersync); everything else
+  # resolves from crates.io. Provision those siblings next to the checkout.
+  # fast_cmaes is a member of frankensearch's workspace and is needed for
+  # workspace-wide cargo metadata there.
+  for sibling in frankensearch fast_cmaes beads_rust; do
+    if ! git clone --depth 1 "https://github.com/Dicklesworthstone/${sibling}.git" "$TMP/$sibling"; then
+      err "Build from source requires a sibling checkout of ${sibling}, and cloning it failed."
+      err ""
+      err "For end-user installation, use pre-built release binaries:"
+      err "  curl -fsSL ${INSTALL_SCRIPT_URL} | bash"
+      err ""
+      err "If no release exists yet, check https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases"
+      exit 1
+    fi
+  done
 
   if ! (cd "$TMP/src" && cargo build --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
     err "Build failed. Check compiler output above for details."

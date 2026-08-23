@@ -18,37 +18,14 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
-          git clone --depth 1 -b harmonize/vlsf2-fsqlite03 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --sparse --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
-          (
-            cd ../frankensqlite
-            git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
-            # bd-lgolw PIN (2026-08-13): frankensqlite main after 7e1075e4a stores
-            # truncated multi-line CREATE TABLE sql in sqlite_master via the am
-            # init path (canonical sqlite3: "malformed database schema"). Pin the
-            # last-good commit until the upstream P0 is fixed, then remove.
-            git checkout 705ea842b743b725aa127e03ba055e3c9337c0a5
-          )
-          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
-            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
-            exit 1
-          fi
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
-          git clone --depth 1 -b harmonize/vlsf2 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
-          # br-41idr: [patch.crates-io] uses absolute /dp/* paths (fleet
-          # convention); provision them on the runner as symlinks to the
-          # sibling clones, and pin the harmonization branches the workspace
-          # is built against (br-vlsf2).
-          sudo mkdir -p /dp
-          parent="$(cd .. && pwd)"
-          for r in asupersync sqlmodel_rust frankensqlite frankentui beads_rust fastmcp_rust toon_rust rich_rust franken_agent_detection frankensearch; do
-            if [ -d "$parent/$r" ]; then sudo ln -sfn "$parent/$r" "/dp/$r"; fi
-          done
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for workspace-wide cargo metadata.
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
+          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
+          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
+          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
+          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -72,37 +49,14 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
-          git clone --depth 1 -b harmonize/vlsf2-fsqlite03 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --sparse --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
-          (
-            cd ../frankensqlite
-            git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
-            # bd-lgolw PIN (2026-08-13): frankensqlite main after 7e1075e4a stores
-            # truncated multi-line CREATE TABLE sql in sqlite_master via the am
-            # init path (canonical sqlite3: "malformed database schema"). Pin the
-            # last-good commit until the upstream P0 is fixed, then remove.
-            git checkout 705ea842b743b725aa127e03ba055e3c9337c0a5
-          )
-          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
-            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
-            exit 1
-          fi
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
-          git clone --depth 1 -b harmonize/vlsf2 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
-          # br-41idr: [patch.crates-io] uses absolute /dp/* paths (fleet
-          # convention); provision them on the runner as symlinks to the
-          # sibling clones, and pin the harmonization branches the workspace
-          # is built against (br-vlsf2).
-          sudo mkdir -p /dp
-          parent="$(cd .. && pwd)"
-          for r in asupersync sqlmodel_rust frankensqlite frankentui beads_rust fastmcp_rust toon_rust rich_rust franken_agent_detection frankensearch; do
-            if [ -d "$parent/$r" ]; then sudo ln -sfn "$parent/$r" "/dp/$r"; fi
-          done
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for workspace-wide cargo metadata.
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
+          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
+          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
+          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
+          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -152,37 +106,14 @@ jobs:
           # Unix runners (the setting is harmless).
           git config --global core.longpaths true
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
-          git clone --depth 1 -b harmonize/vlsf2-fsqlite03 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --sparse --filter=blob:none https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
-          (
-            cd ../frankensqlite
-            git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
-            # bd-lgolw PIN (2026-08-13): frankensqlite main after 7e1075e4a stores
-            # truncated multi-line CREATE TABLE sql in sqlite_master via the am
-            # init path (canonical sqlite3: "malformed database schema"). Pin the
-            # last-good commit until the upstream P0 is fixed, then remove.
-            git checkout 705ea842b743b725aa127e03ba055e3c9337c0a5
-          )
-          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
-            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
-            exit 1
-          fi
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
-          git clone --depth 1 -b harmonize/vlsf2 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
-          # br-41idr: [patch.crates-io] uses absolute /dp/* paths (fleet
-          # convention); provision them on the runner as symlinks to the
-          # sibling clones, and pin the harmonization branches the workspace
-          # is built against (br-vlsf2).
-          sudo mkdir -p /dp
-          parent="$(cd .. && pwd)"
-          for r in asupersync sqlmodel_rust frankensqlite frankentui beads_rust fastmcp_rust toon_rust rich_rust franken_agent_detection frankensearch; do
-            if [ -d "$parent/$r" ]; then sudo ln -sfn "$parent/$r" "/dp/$r"; fi
-          done
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for workspace-wide cargo metadata.
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
+          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
+          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
+          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
+          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
