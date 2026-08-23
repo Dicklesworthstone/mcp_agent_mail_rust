@@ -11579,15 +11579,7 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
     let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
-    let mut index = repo.index()?;
-    reset_index_to_head(repo, &mut index)?;
 
-    // Respect .gitignore, add all changes under the workdir.
-    index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
-
-    index.write()?;
-    let tree_oid = index.write_tree()?;
-    let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
     // Same cross-process guard as `commit_paths`: the whole reset → add-all
     // → tree sequence is a full-state snapshot built under the HEAD ref lock.
