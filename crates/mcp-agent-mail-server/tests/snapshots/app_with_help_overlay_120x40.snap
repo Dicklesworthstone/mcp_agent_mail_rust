@@ -1,7 +1,7 @@
  1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics                   >
-Messages    Ack Pend    Locks       Agents      Contacts    Projects    Requests    Avg Lat     Error %     Ring Fill   
-Drops                                                       Uptime                                                      
-0 ─                                                         0s ─                                                        
+Messages    Ack Pend    Locks       Agents      Contacts    Projects    Requests    Avg Lat     Error %     4xx         
+Ring Fill                               Drops                                   Uptime                                  
+0% ─                                    0 ─                                     0s ─                                    
 ╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────────────────────────────────────────────╮
 │                                                                                                                      │
 │  [A:All]  [M:Ms╭ Help & Keybindings (j/k to scroll) (F1/Esc close) ─────────────────────────────────╮                │
