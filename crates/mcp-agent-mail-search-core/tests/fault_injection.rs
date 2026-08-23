@@ -1155,6 +1155,21 @@ fn checkpoint_read_from_corrupted_file_returns_serialization_error() {
     assert_eq!(result.unwrap_err().error_type(), "SERIALIZATION_ERROR");
 }
 
+/// True when read-only directory permissions are actually enforced for this
+/// process. Root (and some permission-ignoring filesystems) can write into a
+/// mode-555 directory, which makes readonly fault-injection tests vacuous —
+/// callers should skip rather than assert an error that cannot occur.
+fn readonly_dir_is_enforced(readonly_dir: &std::path::Path) -> bool {
+    let probe = readonly_dir.join(".readonly-probe");
+    match std::fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 #[test]
 fn checkpoint_write_to_readonly_dir_returns_io_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1165,6 +1180,14 @@ fn checkpoint_write_to_readonly_dir_returns_io_error() {
     let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
     perms.set_readonly(true);
     std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
+
+    if !readonly_dir_is_enforced(&readonly_dir) {
+        // Running as root (e.g. shared build workers): the fault cannot be
+        // injected, so the assertion would be meaningless. Skip.
+        perms.set_readonly(false);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+        return;
+    }
 
     let cp = IndexCheckpoint {
         schema_hash: SchemaHash("test123456789".to_owned()),

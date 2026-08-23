@@ -3121,7 +3121,12 @@ mod tests {
 
     #[test]
     fn validate_nonexistent_dir() {
-        let result = validate_bundle(Path::new("/nonexistent/path"));
+        // A literal absolute path like "/nonexistent/path" can actually exist
+        // on shared root-run build workers; derive a path that is guaranteed
+        // absent by rooting it in a fresh tempdir instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nonexistent").join("path");
+        let result = validate_bundle(&missing);
         assert!(result.is_err());
     }
 

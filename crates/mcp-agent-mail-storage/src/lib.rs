@@ -6715,7 +6715,11 @@ fn commit_paths_lockfree(
             .map(|oid| repo.find_commit(oid))
             .transpose()?
             .and_then(|p| p.tree().ok());
-        build_tree_with_updates(repo, base_tree.as_ref(), &updates)
+        Ok(Some(build_tree_with_updates(
+            repo,
+            base_tree.as_ref(),
+            &updates,
+        )))
     })?;
 
     // Lock-free commits bypass the index by design; sync index to HEAD so
