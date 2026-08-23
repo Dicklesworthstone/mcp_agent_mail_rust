@@ -7899,6 +7899,12 @@ mod query_param_tests {
     #[test]
     fn workspace_root_none_without_workspace_manifest() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        if workspace_root_from(tmp.path()).is_some() {
+            // The tempdir itself sits inside a real cargo workspace (rch
+            // build workers redirect TMPDIR into the repo checkout), so the
+            // "no workspace manifest above" premise cannot hold here. Skip.
+            return;
+        }
         let nested = tmp.path().join("a").join("b");
         fs::create_dir_all(&nested).expect("mkdirs");
         fs::write(

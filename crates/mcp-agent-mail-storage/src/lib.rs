@@ -11549,6 +11549,11 @@ fn commit_paths(
             any_added = true;
         }
         index.write()?;
+        eprintln!(
+            "STAGE rel={rel_paths:?} entries={} any_added={any_added} head={:?}",
+            index.len(),
+            resolve_head_commit_oid(repo).map(|o| o.map(|o| o.to_string()[..7].to_string()))
+        );
         if !any_added {
             // Every requested path was already absent from disk and index —
             // nothing to commit (historical early-out preserved).
@@ -20377,10 +20382,12 @@ mod tests {
         let threads = 4_usize;
         let per_thread = 5_usize;
         let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let committed_rels = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut handles = Vec::with_capacity(threads);
         for t in 0..threads {
             let barrier = Arc::clone(&barrier);
             let config = config.clone();
+            let committed_rels = Arc::clone(&committed_rels);
             let repo_root = archive.repo_root.clone();
             let canonical_root = archive.canonical_repo_root.clone();
             let root = archive.root.clone();
@@ -20396,6 +20403,10 @@ mod tests {
                     fs::create_dir_all(file_path.parent().unwrap()).unwrap();
                     fs::write(&file_path, format!(r#"{{"t":{t},"i":{i}}}"#)).unwrap();
                     let rel = rel_path_cached(&canonical_root, &file_path).unwrap();
+                    committed_rels
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(rel.clone());
                     commit_paths(
                         &repo,
                         &config,
@@ -20420,16 +20431,48 @@ mod tests {
             "every concurrent commit must be reachable from HEAD — an orphaned \
              commit here means a lost archive write"
         );
-        for t in 0..threads {
-            for i in 0..per_thread {
-                let path = Path::new("agents")
-                    .join(format!("Agent{t}"))
-                    .join(format!("msg{i}.json"));
-                assert!(
-                    head_tree_contains(&repo, &path),
-                    "file from thread {t} iteration {i} missing from final tree"
+        // Diagnostics: dump the reachable chain so any missing-file failure
+        // names the exact commit that dropped it.
+        {
+            let mut revwalk = repo.revwalk().unwrap();
+            revwalk.push_head().unwrap();
+            let mut oids: Vec<git2::Oid> = revwalk.map(|o| o.unwrap()).collect();
+            oids.reverse();
+            for oid in &oids {
+                let commit = repo.find_commit(*oid).unwrap();
+                let tree = commit.tree().unwrap();
+                let mut names = Vec::new();
+                tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+                    if entry.name_bytes().ends_with(b".json") {
+                        names.push(entry.name().unwrap_or("?").to_string());
+                    }
+                    true
+                })
+                .unwrap();
+                eprintln!(
+                    "HIST {} {:?} files={names:?}",
+                    &oid.to_string()[..7],
+                    commit.summary()
                 );
             }
+        }
+        let committed_rels = Arc::try_unwrap(committed_rels)
+            .map(|mutex| {
+                mutex
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            committed_rels.len(),
+            threads * per_thread,
+            "every worker must have recorded its committed rel path"
+        );
+        for rel in &committed_rels {
+            assert!(
+                head_tree_contains(&repo, Path::new(rel)),
+                "committed file {rel} missing from final tree"
+            );
         }
     }
 
