@@ -3817,6 +3817,8 @@ mod tests {
                 blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                     inflight: 1,
                     zombies: 0,
+                    zombies_expired: 0,
+                    zombies_expired_total: 0,
                     timeouts_total: 1,
                 },
             },

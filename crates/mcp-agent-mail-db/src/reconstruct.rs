@@ -1583,6 +1583,8 @@ fn reconstruct_from_archive_impl(
     }
     conn.execute_raw("PRAGMA synchronous=NORMAL;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: synchronous: {e}")))?;
+    // One-shot recovery path with no dispatch deadline: the generous 60s lock
+    // wait is intentional (runtime connections are bounded at 20s, br-ovy6e).
     conn.execute_raw("PRAGMA busy_timeout=60000;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: busy_timeout: {e}")))?;
     conn.execute_raw("BEGIN IMMEDIATE;")

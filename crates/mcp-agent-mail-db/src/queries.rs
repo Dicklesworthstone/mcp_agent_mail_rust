@@ -3739,10 +3739,13 @@ async fn cleanup_committed_message_after_consistency_failure(
 ///   - 8  → 16: #98 reported 6 concurrent `register_agent` callers with
 ///     distinct `project_key`s producing a ~33 % failure rate — the 8-retry
 ///     budget exhausts before all writers settle. 16 retries with the wider
-///     max-delay ceiling below give ~20s cumulative budget while staying
-///     under the 60s SQLite `busy_timeout`, so the last-in-queue writer
-///     still makes it through rather than surfacing RESOURCE_BUSY to
-///     every multi-agent swarm entry-tool caller.
+///     max-delay ceiling below give a ~30s cumulative sleep budget, so the
+///     last-in-queue writer still makes it through rather than surfacing
+///     RESOURCE_BUSY to every multi-agent swarm entry-tool caller.
+///   - br-ovy6e: the runtime SQLite `busy_timeout` dropped 60s → 20s so any
+///     single in-SQLite lock wait ends before the 30s dispatch deadline
+///     abandons the blocking thread. The retry count is unchanged; see
+///     [`mvcc_backoff`] for the full budget arithmetic.
 static MVCC_MAX_RETRIES: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
     std::env::var("FSQLITE_CONCURRENT_RETRIES")
         .ok()
@@ -3911,14 +3914,28 @@ where
 /// Base: 25 ms, max: 3000 ms, ±25 % jitter (via existing LCG in `retry` module).
 ///
 /// Budget summary (before jitter):
-///   - attempts 0..8 : 25+50+100+200+400+800+1600+2000 ≈ 5.2s
-///   - attempts 8..16: 3000 × 8 ≈ 24s (max-delay ceiling reached)
+///   - attempts 0..7 : 25+50+100+200+400+800+1600 ≈ 3.2s
+///   - attempts 7..16: 3000 × 9 = 27s (max-delay ceiling reached)
 ///
-/// Cumulative cap across 16 retries ≈ 29s, which stays comfortably under
-/// the 60s SQLite `busy_timeout` while giving enough runway for 6+
-/// concurrent writers with ~4s each to all settle (see #98). The 3s
-/// ceiling (raised from 2s) lets later retries outlast the tail of WAL
-/// checkpoint stalls that occasionally stretch to 1-2s on busy disks.
+/// Cumulative sleep across 16 retries ≈ 30.2s (≈ 37.7s at the +25 % jitter
+/// extreme), giving enough runway for 6+ concurrent writers with ~4s each to
+/// all settle (see #98). The 3s ceiling (raised from 2s) lets later retries
+/// outlast the tail of WAL checkpoint stalls that occasionally stretch to
+/// 1-2s on busy disks.
+///
+/// Interplay with the dispatch deadline (br-ovy6e): each attempt may also
+/// block up to the runtime `busy_timeout`
+/// ([`mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS`], 20s) inside
+/// SQLite, so the absolute worst case for a fully lock-starved write is
+/// ~17 × 20s + ~30s ≈ 370s. That total cannot be squeezed under the 30s
+/// [`mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS`] by constant
+/// tweaks without gutting the #98 contention budget (even one 20s busy wait
+/// plus the required ~20s of backoff already exceeds 30s). The invariant this
+/// layering guarantees instead is that every *individual* blocking SQLite
+/// wait is bounded at 20s < 30s dispatch deadline < 60s deadline+hard-grace,
+/// so a contended worker thread always returns to Rust code well before the
+/// dispatch layer would have to zombify a thread stuck inside one SQLite
+/// call.
 fn mvcc_backoff(attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {

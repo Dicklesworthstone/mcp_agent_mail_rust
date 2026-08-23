@@ -709,7 +709,13 @@ fn open_sync_conn(sqlite_path: &str) -> Result<DbConn, DbError> {
     }
     .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    let _ = conn.execute_raw("PRAGMA busy_timeout = 60000");
+    // br-ovy6e: keep in lockstep with the runtime pragma bundles. These
+    // blocking helpers serve UI loops and dispatch-adjacent sync paths, so
+    // they must not out-sleep the 30s ecosystem client deadline.
+    let _ = conn.execute_raw(&format!(
+        "PRAGMA busy_timeout = {}",
+        mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS
+    ));
     Ok(conn)
 }
 

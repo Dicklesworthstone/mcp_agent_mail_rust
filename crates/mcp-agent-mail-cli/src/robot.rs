@@ -13301,6 +13301,7 @@ fn build_navigate_tooling(
                             "name": entry.name,
                             "calls": entry.calls,
                             "errors": entry.errors,
+                            "rejections": entry.rejections,
                             "cluster": entry.cluster,
                             "capabilities": entry.capabilities,
                             "complexity": entry.complexity,

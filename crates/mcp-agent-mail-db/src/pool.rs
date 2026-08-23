@@ -5199,7 +5199,22 @@ fn execute_sql_with_lock_retry(
     )
 }
 
-const REQUIRED_STARTUP_BUSY_TIMEOUT_MS: i64 = 60_000;
+/// Busy timeout the startup init gate must observe on the runtime init
+/// connection after applying [`schema::PRAGMA_DB_INIT_SQL`].
+///
+/// "Startup" refers to *when* the check runs (the one-time init gate before
+/// pooled connections are exposed), not to a startup-specific timeout: the
+/// connection under test carries the same pragma bundle every runtime
+/// connection uses, so this must track
+/// [`mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS`] (br-ovy6e).
+const REQUIRED_STARTUP_BUSY_TIMEOUT_MS: i64 = 20_000;
+
+// Compile-time guard: the startup invariant must verify the runtime value.
+const _: () = assert!(
+    REQUIRED_STARTUP_BUSY_TIMEOUT_MS.unsigned_abs()
+        == mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS,
+    "startup pragma invariant must assert the runtime busy_timeout (br-ovy6e)"
+);
 
 fn pragma_integer_i64(value: &Value) -> Option<i64> {
     match value {
@@ -6167,7 +6182,7 @@ pub fn atc_sidecar_sqlite_path(primary: &str) -> String {
 /// connection. The connection is read/write — most callers only `SELECT`, but
 /// the reprocess path also writes — so the name deliberately drops the misleading
 /// `_read_` it carried before br-fv0s1. The standard per-connection PRAGMAs
-/// (notably `busy_timeout = 60000`) are applied best-effort so reads and the
+/// (notably `busy_timeout = 20000`) are applied best-effort so reads and the
 /// reprocess writer back off under lock contention instead of erroring
 /// immediately, matching the pool-backed `open_canonical_atc_conn`. The pragma is
 /// best-effort: a failure to apply it leaves the connection usable for plain
@@ -6947,6 +6962,9 @@ pub fn wal_checkpoint_truncate_path(db_path: &Path) -> DbResult<u64> {
     let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())
         .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
 
+    // Maintenance path with no dispatch deadline: a generous 60s lock wait is
+    // intentional here. Request-path connections use the bounded
+    // `DB_RUNTIME_BUSY_TIMEOUT_MS` (20s) instead (br-ovy6e).
     conn.execute_raw("PRAGMA busy_timeout = 60000;")
         .map_err(|e| DbError::Sqlite(format!("checkpoint: busy_timeout: {e}")))?;
 
@@ -11477,13 +11495,24 @@ mod tests {
         });
     }
 
-    /// Verify PRAGMA settings contain `busy_timeout=60000` matching legacy Python.
+    /// Expected runtime `PRAGMA busy_timeout` fragment, derived from the
+    /// shared ecosystem constant (br-ovy6e).
+    fn runtime_busy_timeout_pragma() -> String {
+        format!(
+            "busy_timeout = {}",
+            mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS
+        )
+    }
+
+    /// Verify PRAGMA settings use the runtime busy timeout, ordered before
+    /// `journal_mode` so lock waits already apply to the WAL switch (br-ovy6e).
     #[test]
-    fn pragma_busy_timeout_matches_legacy() {
+    fn pragma_busy_timeout_matches_runtime_constant() {
+        let busy_pragma = runtime_busy_timeout_pragma();
         let sql = schema::init_schema_sql();
         let busy_idx = sql
-            .find("busy_timeout = 60000")
-            .expect("schema init sql must contain busy_timeout");
+            .find(&busy_pragma)
+            .expect("schema init sql must contain the runtime busy_timeout");
         let wal_idx = sql
             .find("journal_mode = WAL")
             .expect("schema init sql must contain journal_mode=WAL");
@@ -11492,18 +11521,14 @@ mod tests {
             "busy_timeout must be set before journal_mode to avoid SQLITE_BUSY before timeout applies"
         );
         assert!(
-            sql.contains("busy_timeout = 60000"),
-            "PRAGMA busy_timeout must be 60000 (60s) to match Python legacy"
-        );
-        assert!(
             sql.contains("journal_mode = WAL"),
             "WAL mode is required for concurrent access"
         );
 
         let init_sql = schema::PRAGMA_DB_INIT_SQL;
         let init_busy_idx = init_sql
-            .find("busy_timeout = 60000")
-            .expect("startup init SQL must contain busy_timeout");
+            .find(&busy_pragma)
+            .expect("startup init SQL must contain the runtime busy_timeout");
         let init_wal_idx = init_sql
             .find("journal_mode = WAL")
             .expect("startup init SQL must contain journal_mode=WAL");
@@ -11514,6 +11539,66 @@ mod tests {
         assert!(
             !init_sql.contains("DELETE"),
             "runtime startup init must not force rollback-journal mode"
+        );
+    }
+
+    /// br-ovy6e: every runtime pragma bundle must carry the shared runtime
+    /// busy timeout, which in turn must stay below the 30s ecosystem client
+    /// deadline so a lock-contended query gives up before its dispatch thread
+    /// is abandoned. A live connection check proves the pragma actually takes
+    /// effect, not just that the SQL text mentions it.
+    #[test]
+    fn runtime_pragma_bundles_use_runtime_busy_timeout() {
+        let busy_pragma = runtime_busy_timeout_pragma();
+        const {
+            assert!(
+                mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS
+                    < mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS,
+                "runtime busy_timeout must stay below the ecosystem client deadline"
+            );
+        }
+        for (name, sql) in [
+            (
+                "PRAGMA_SETTINGS_SQL",
+                schema::PRAGMA_SETTINGS_SQL.to_string(),
+            ),
+            ("PRAGMA_DB_INIT_SQL", schema::PRAGMA_DB_INIT_SQL.to_string()),
+            (
+                "PRAGMA_CONN_SETTINGS_SQL",
+                schema::PRAGMA_CONN_SETTINGS_SQL.to_string(),
+            ),
+            (
+                "build_conn_pragmas",
+                schema::build_conn_pragmas(4, schema::DEFAULT_CACHE_BUDGET_KB),
+            ),
+        ] {
+            assert!(
+                sql.contains(&busy_pragma),
+                "{name} must use the runtime busy_timeout ({busy_pragma}): {sql}"
+            );
+        }
+
+        // The recovery/export-only base bundle deliberately keeps the longer
+        // 60s wait: it runs outside any dispatch deadline.
+        assert!(
+            schema::PRAGMA_DB_INIT_BASE_SQL.contains("busy_timeout = 60000"),
+            "one-shot recovery bundle intentionally keeps the 60s busy_timeout"
+        );
+
+        // Live check: applying the per-connection bundle must leave the
+        // runtime busy_timeout configured on the connection.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime_busy_timeout.db");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+        let conn =
+            open_sqlite_file_with_lock_retry(db_path_str).expect("open runtime sqlite connection");
+        conn.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL)
+            .expect("apply per-connection pragmas");
+        let configured = read_pragma_i64(&conn, "PRAGMA busy_timeout;", "timeout")
+            .expect("read configured busy_timeout");
+        assert_eq!(
+            configured, REQUIRED_STARTUP_BUSY_TIMEOUT_MS,
+            "live connection busy_timeout must match the runtime constant"
         );
     }
 
@@ -11618,8 +11703,8 @@ mod tests {
                 "all should have 256MB journal_size_limit"
             );
             assert!(
-                sql.contains("busy_timeout = 60000"),
-                "must have busy_timeout"
+                sql.contains(&runtime_busy_timeout_pragma()),
+                "must have the runtime busy_timeout"
             );
             assert!(
                 sql.contains("mmap_size = 268435456"),
@@ -11668,8 +11753,10 @@ mod tests {
 
         let conn = open_sqlite_file_with_lock_retry(db_path_str)
             .expect("runtime sqlite should open before invariant check");
-        conn.execute_raw("PRAGMA busy_timeout = 60000;")
-            .expect("set required runtime busy_timeout");
+        conn.execute_raw(&format!(
+            "PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS};"
+        ))
+        .expect("set required runtime busy_timeout");
 
         let canonical = open_sqlite_file_with_lock_retry_canonical(db_path_str)
             .expect("open canonical sqlite file");
@@ -11718,7 +11805,7 @@ mod tests {
         let row = sqlmodel_core::Row::new(
             vec!["timeout".to_string(), "fallback".to_string()],
             vec![
-                Value::Text("60000".to_string()),
+                Value::Text("20000".to_string()),
                 Value::BigInt(REQUIRED_STARTUP_BUSY_TIMEOUT_MS),
             ],
         );

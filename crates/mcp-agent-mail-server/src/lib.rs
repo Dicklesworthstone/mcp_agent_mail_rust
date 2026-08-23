@@ -252,6 +252,13 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         let _ = mcp_agent_mail_core::refresh_health_level();
         // Backpressure gate: reject shedable tools under Red (when enabled)
         if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
+            // A shed call must still register in the per-tool metrics
+            // (previously it returned before record_call_idx and left no
+            // trace). Count it as a rejection, not an error: shedding is a
+            // deliberate refusal, and no dedicated shed counter exists yet
+            // (br-315wc).
+            mcp_agent_mail_tools::record_call_idx(self.tool_index);
+            mcp_agent_mail_tools::record_rejection_idx(self.tool_index);
             // ToolExecutionError (-32000) is a tool-level refusal, not an
             // opaque framework InternalError. FastMCP's router redacts
             // InternalError to "Internal server error" and treats it as
@@ -285,8 +292,17 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         let elapsed = start.elapsed();
         let latency_us =
             u64::try_from(elapsed.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
-        let is_error = out.is_err();
-        if is_error {
+        // Client-side refusals (invalid input, not-found, policy refusals,
+        // auth failures, ...) are rejections, not server faults: they must
+        // not inflate the error rate of a healthy server (br-315wc).
+        let is_client_refusal = out
+            .as_ref()
+            .err()
+            .is_some_and(mcp_agent_mail_tools::mcp_error_is_client_refusal);
+        let is_error = out.is_err() && !is_client_refusal;
+        if is_client_refusal {
+            mcp_agent_mail_tools::record_rejection_idx(self.tool_index);
+        } else if is_error {
             mcp_agent_mail_tools::record_error_idx(self.tool_index);
         }
         mcp_agent_mail_core::global_metrics()
@@ -356,6 +372,13 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         let _ = mcp_agent_mail_core::refresh_health_level();
         // Backpressure gate: reject shedable tools under Red (when enabled)
         if mcp_agent_mail_core::should_shed_tool(self.tool_name) {
+            // A shed call must still register in the per-tool metrics
+            // (previously it returned before record_call_idx and left no
+            // trace). Count it as a rejection, not an error: shedding is a
+            // deliberate refusal, and no dedicated shed counter exists yet
+            // (br-315wc).
+            mcp_agent_mail_tools::record_call_idx(self.tool_index);
+            mcp_agent_mail_tools::record_rejection_idx(self.tool_index);
             return Box::pin(std::future::ready(fastmcp_core::Outcome::Err(
                 McpError::new(
                     McpErrorCode::ToolExecutionError,
@@ -392,8 +415,18 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             ));
 
             let out = self.inner.call_async(ctx, arguments).await;
-            let is_error = !matches!(out, fastmcp_core::Outcome::Ok(_));
-            if is_error {
+            // Client-side refusals are rejections, not server faults
+            // (br-315wc). Cancelled/Panicked outcomes carry no legacy code
+            // and stay classified as errors (fail toward visibility).
+            let is_client_refusal = matches!(
+                &out,
+                fastmcp_core::Outcome::Err(e)
+                    if mcp_agent_mail_tools::mcp_error_is_client_refusal(e)
+            );
+            let is_error = !matches!(out, fastmcp_core::Outcome::Ok(_)) && !is_client_refusal;
+            if is_client_refusal {
+                mcp_agent_mail_tools::record_rejection_idx(self.tool_index);
+            } else if is_error {
                 mcp_agent_mail_tools::record_error_idx(self.tool_index);
             }
             let elapsed = start.elapsed();
@@ -5373,6 +5406,104 @@ fn dispatch_zombie_count() -> u32 {
     DISPATCH_ZOMBIES.load(Ordering::Relaxed)
 }
 
+/// Default cap (seconds) on how long a zombie dispatch keeps consuming an
+/// admission slot. Counting zombies against admission is deliberate
+/// backpressure against retry storms, but work that *never* observes
+/// cancellation (60s `busy_timeout` waits, `PRAGMA integrity_check`, archive
+/// reconstruction, libgit2 revwalks) would otherwise accumulate zombies until
+/// every request is rejected 503 on an idle server, forever. Past this TTL a
+/// zombie stops counting against admission while its thread remains tracked
+/// (for diagnostics/metrics) until it actually exits.
+const DISPATCH_ZOMBIE_ADMISSION_TTL_SECS: u64 = 300;
+const MIN_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS: u64 = 30;
+const MAX_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS: u64 = 3600;
+
+fn configured_dispatch_zombie_admission_ttl_secs() -> u64 {
+    mcp_agent_mail_core::config::env_value("AM_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DISPATCH_ZOMBIE_ADMISSION_TTL_SECS)
+        .clamp(
+            MIN_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS,
+            MAX_DISPATCH_ZOMBIE_ADMISSION_TTL_SECS,
+        )
+}
+
+/// Per-zombie bookkeeping so admission can age zombies out after
+/// [`DISPATCH_ZOMBIE_ADMISSION_TTL_SECS`] instead of holding their slots
+/// hostage until the OS thread exits (which may be never).
+struct DispatchZombieEntry {
+    /// When the permit was transferred from in-flight to zombie accounting.
+    zombified_at: Instant,
+    /// True once this zombie aged past the admission TTL, stopped counting
+    /// against admission, and was reported to the expiry metrics.
+    expired: bool,
+}
+
+/// Birth registry for zombie dispatches, keyed by [`DispatchPermit::id`].
+/// Entries are inserted by the hard-grace thread when a permit is zombified
+/// and removed by the permit's `Drop` when the surviving thread finally exits.
+static DISPATCH_ZOMBIE_TABLE: std::sync::LazyLock<Mutex<HashMap<u64, DispatchZombieEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Monotonic id source for [`DispatchPermit`]s (keys the zombie table).
+static NEXT_DISPATCH_PERMIT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Count zombies that still consume admission slots at `now`, lazily marking
+/// (and metering) entries older than `ttl` as expired. O(zombies), lock-scoped:
+/// the table only holds threads that already blew a 30s timeout plus hard
+/// grace, so it is empty on a healthy server and tiny otherwise.
+fn dispatch_zombie_admission_count_at(now: Instant, ttl: Duration) -> u32 {
+    // Fast path: no zombies, skip the lock entirely.
+    if DISPATCH_ZOMBIES.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let mut table = lock_mutex(&DISPATCH_ZOMBIE_TABLE);
+    let mut active: u32 = 0;
+    for entry in table.values_mut() {
+        if now.duration_since(entry.zombified_at) >= ttl {
+            if !entry.expired {
+                entry.expired = true;
+                let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
+                metrics.zombies_expired.add(1);
+                metrics.zombies_expired_total.inc();
+            }
+        } else {
+            active = active.saturating_add(1);
+        }
+    }
+    active
+}
+
+/// Zombies currently counted against admission (TTL-aware).
+fn dispatch_zombie_admission_count() -> u32 {
+    dispatch_zombie_admission_count_at(
+        Instant::now(),
+        Duration::from_secs(configured_dispatch_zombie_admission_ttl_secs()),
+    )
+}
+
+/// Record a freshly zombified permit in the birth registry.
+fn register_dispatch_zombie(permit_id: u64, zombified_at: Instant) {
+    lock_mutex(&DISPATCH_ZOMBIE_TABLE).insert(
+        permit_id,
+        DispatchZombieEntry {
+            zombified_at,
+            expired: false,
+        },
+    );
+}
+
+/// Remove a zombie from the birth registry when its thread finally exits,
+/// releasing the expired gauge if it had already aged out of admission.
+fn unregister_dispatch_zombie(permit_id: u64) {
+    let removed = lock_mutex(&DISPATCH_ZOMBIE_TABLE).remove(&permit_id);
+    if removed.is_some_and(|entry| entry.expired) {
+        mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
+            .zombies_expired
+            .sub_saturating(1);
+    }
+}
+
 /// RAII guard that decrements the appropriate dispatch counter on drop, ensuring
 /// accounting stays accurate even when the future is cancelled or panics.
 ///
@@ -5382,6 +5513,9 @@ fn dispatch_zombie_count() -> u32 {
 /// `run_cancellable_blocking_dispatch`), and this Drop then decrements
 /// `DISPATCH_ZOMBIES` when the thread finally exits.
 struct DispatchPermit {
+    /// Unique id keying this permit's entry in [`DISPATCH_ZOMBIE_TABLE`]
+    /// should it ever be zombified.
+    id: u64,
     zombified: Arc<AtomicBool>,
 }
 
@@ -5389,12 +5523,15 @@ impl DispatchPermit {
     /// Try to acquire a dispatch slot.  Returns `None` when the server is at
     /// capacity, counting both live in-flight dispatches and surviving zombies
     /// so uncancellable work that outlived its timeout still exerts backpressure
-    /// against retries (`DISPATCH_INFLIGHT + DISPATCH_ZOMBIES >= cap`).
+    /// against retries (`DISPATCH_INFLIGHT + active zombies >= cap`). Zombies
+    /// older than the admission TTL are aged out of the sum (br-zp2bt): they
+    /// keep being tracked until their thread exits, but they can no longer
+    /// consume admission capacity forever.
     fn try_acquire() -> Option<Self> {
         // Relaxed ordering is fine: the counter is advisory and races between
         // concurrent fetch_add calls are harmless (off-by-one at most).
         let prev = DISPATCH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
-        let zombies = DISPATCH_ZOMBIES.load(Ordering::Relaxed);
+        let zombies = dispatch_zombie_admission_count();
         if prev.saturating_add(zombies) >= MAX_CONCURRENT_DISPATCHES {
             DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
             None
@@ -5403,6 +5540,7 @@ impl DispatchPermit {
                 .inflight
                 .add(1);
             Some(DispatchPermit {
+                id: NEXT_DISPATCH_PERMIT_ID.fetch_add(1, Ordering::Relaxed),
                 zombified: Arc::new(AtomicBool::new(false)),
             })
         }
@@ -5415,6 +5553,7 @@ impl Drop for DispatchPermit {
             // The inflight slot was already released at hard grace; this thread
             // was being accounted as a zombie. Release the zombie slot now that
             // the uncancellable work has finally exited.
+            unregister_dispatch_zombie(self.id);
             DISPATCH_ZOMBIES.fetch_sub(1, Ordering::Relaxed);
             mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
                 .zombies
@@ -5482,6 +5621,7 @@ fn dispatch_timeout_error_text(
          database_write_p99_ms={}; archive_wbq_p99_ms={}; \
          archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
+         blocking_dispatch_zombies_expired={}; \
          blocking_dispatch_timeouts_total={}. \
          (archive stages are off the request path since ack-fast: archive \
          lag cannot cause a tool timeout; archive_commit_queue is \
@@ -5497,6 +5637,7 @@ fn dispatch_timeout_error_text(
         micros_to_millis_ceil(diagnostics.git_commit_p99_us),
         dispatch.inflight,
         dispatch.zombies,
+        dispatch.zombies_expired,
         dispatch.timeouts_total,
     )
 }
@@ -5685,6 +5826,10 @@ where
                         // hit backpressure; when the thread finally exits, its
                         // permit Drop clears the zombie slot.
                         if !permit.zombified.swap(true, Ordering::AcqRel) {
+                            // Record the birth first so the admission scan can
+                            // age this zombie out of capacity accounting after
+                            // the TTL even if its thread never exits (br-zp2bt).
+                            register_dispatch_zombie(permit.id, Instant::now());
                             DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
                             let zombies = DISPATCH_ZOMBIES.fetch_add(1, Ordering::Relaxed) + 1;
                             let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
@@ -17257,6 +17402,49 @@ mod tests {
         }
     }
 
+    /// Test tool that always fails with a legacy-coded tool error (br-315wc).
+    struct FailingTool {
+        code: &'static str,
+    }
+
+    impl fastmcp::ToolHandler for FailingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "failing".to_string(),
+                description: Some("test-only always-failing tool".to_string()),
+                input_schema: serde_json::json!({ "type": "object" }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Err(mcp_agent_mail_tools::tool_util::legacy_tool_error(
+                self.code,
+                "synthetic failure",
+                true,
+                serde_json::json!({}),
+            ))
+        }
+    }
+
+    /// Fetch `(calls, errors, rejections)` for a tool from the full snapshot.
+    fn tool_counts(tool_name: &str) -> (u64, u64, u64) {
+        let full = mcp_agent_mail_tools::tool_metrics_snapshot_full();
+        let entry = full
+            .iter()
+            .find(|e| e.name == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} missing from full snapshot"));
+        (entry.calls, entry.errors, entry.rejections)
+    }
+
     #[test]
     fn stable_tui_diff_config_forces_periodic_terminal_resync() {
         let config = stable_tui_diff_config();
@@ -17445,6 +17633,8 @@ mod tests {
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
                 timeouts_total: 1,
             },
         };
@@ -17455,6 +17645,7 @@ mod tests {
         assert!(text.contains("pool_acquire_p99_ms=9"));
         assert!(text.contains("archive_commit_queue_p99_ms=16778"));
         assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
@@ -17464,8 +17655,9 @@ mod tests {
     fn dispatch_backpressure_sheds_low_priority_before_critical_mutations() {
         with_red_wbq_capacity_metrics(|| {
             let ctx = McpContext::new(Cx::for_testing(), 1);
+            let shed_idx = mcp_agent_mail_tools::tool_index("search_messages").expect("known tool");
             let low_priority = InstrumentedTool {
-                tool_index: 0,
+                tool_index: shed_idx,
                 tool_name: "search_messages",
                 inner: NoopTool,
             };
@@ -17475,6 +17667,7 @@ mod tests {
                 inner: NoopTool,
             };
 
+            let (calls_before, errors_before, rejections_before) = tool_counts("search_messages");
             let low_priority_error = low_priority
                 .call(&ctx, serde_json::json!({}))
                 .expect_err("shedable read should be rejected under red enforced capacity");
@@ -17482,11 +17675,82 @@ mod tests {
             assert!(low_priority_error.contains("Server overloaded"));
             assert!(low_priority_error.contains("search_messages"));
 
+            // A shed must register in the metrics: the call is counted and
+            // classified as a rejection, not a server error (br-315wc).
+            let (calls, errors, rejections) = tool_counts("search_messages");
+            assert_eq!(calls, calls_before + 1, "shed calls must still be counted");
+            assert_eq!(
+                rejections,
+                rejections_before + 1,
+                "a shed must count as a rejection"
+            );
+            assert_eq!(errors, errors_before, "a shed must not count as an error");
+
             let critical_result = critical_mutation
                 .call(&ctx, serde_json::json!({}))
                 .expect("critical message mutation should not be shed");
             assert!(critical_result.is_empty());
         });
+    }
+
+    #[test]
+    fn client_refusal_err_counts_as_rejection_not_error() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool_name = "acquire_build_slot";
+        let idx = mcp_agent_mail_tools::tool_index(tool_name).expect("known tool");
+        let (calls_before, errors_before, rejections_before) = tool_counts(tool_name);
+
+        let tool = InstrumentedTool {
+            tool_index: idx,
+            tool_name,
+            inner: FailingTool {
+                code: "CONTACT_REQUIRED",
+            },
+        };
+        let result = tool.call(&ctx, serde_json::json!({}));
+        assert!(result.is_err(), "refusal must still surface as Err");
+
+        let (calls, errors, rejections) = tool_counts(tool_name);
+        assert_eq!(calls, calls_before + 1, "the call must still be counted");
+        assert_eq!(
+            rejections,
+            rejections_before + 1,
+            "a CONTACT_REQUIRED refusal must count as a rejection"
+        );
+        assert_eq!(
+            errors, errors_before,
+            "a client refusal must not count as a server error"
+        );
+    }
+
+    #[test]
+    fn server_fault_err_counts_as_error_not_rejection() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool_name = "release_build_slot";
+        let idx = mcp_agent_mail_tools::tool_index(tool_name).expect("known tool");
+        let (calls_before, errors_before, rejections_before) = tool_counts(tool_name);
+
+        let tool = InstrumentedTool {
+            tool_index: idx,
+            tool_name,
+            inner: FailingTool {
+                code: "DATABASE_ERROR",
+            },
+        };
+        let result = tool.call(&ctx, serde_json::json!({}));
+        assert!(result.is_err());
+
+        let (calls, errors, rejections) = tool_counts(tool_name);
+        assert_eq!(calls, calls_before + 1);
+        assert_eq!(
+            errors,
+            errors_before + 1,
+            "a DB-flavored failure must count as a server error"
+        );
+        assert_eq!(
+            rejections, rejections_before,
+            "a server fault must not count as a rejection"
+        );
     }
 
     #[test]
@@ -17634,6 +17898,132 @@ mod tests {
                         "in-flight count stays released after the zombie clears"
                     );
                 },
+            );
+        });
+    }
+
+    #[test]
+    fn dispatch_zombie_within_ttl_still_counts_against_admission() {
+        with_serialized_dispatch_permits(|| {
+            // Synthetically zombify enough entries to fill the admission cap,
+            // as if that many blocking dispatches had blown their timeout plus
+            // hard grace while ignoring cancellation.
+            let now = Instant::now();
+            let ids: Vec<u64> = (0..MAX_CONCURRENT_DISPATCHES)
+                .map(|_| NEXT_DISPATCH_PERMIT_ID.fetch_add(1, Ordering::Relaxed))
+                .collect();
+            for id in &ids {
+                register_dispatch_zombie(*id, now);
+            }
+            DISPATCH_ZOMBIES.fetch_add(MAX_CONCURRENT_DISPATCHES, Ordering::Relaxed);
+
+            assert!(
+                DispatchPermit::try_acquire().is_none(),
+                "zombies within the admission TTL must keep occupying admission \
+                 slots (backpressure against retry storms)"
+            );
+
+            // Cleanup: retire the synthetic zombies.
+            for id in &ids {
+                unregister_dispatch_zombie(*id);
+            }
+            DISPATCH_ZOMBIES.fetch_sub(MAX_CONCURRENT_DISPATCHES, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn dispatch_zombie_past_admission_ttl_stops_blocking_admission() {
+        with_serialized_dispatch_permits(|| {
+            let ttl = Duration::from_secs(configured_dispatch_zombie_admission_ttl_secs());
+            let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
+            let expired_total_before = metrics.zombies_expired_total.load();
+            let expired_gauge_before = metrics.zombies_expired.load();
+
+            let born = Instant::now();
+            let ids: Vec<u64> = (0..MAX_CONCURRENT_DISPATCHES)
+                .map(|_| NEXT_DISPATCH_PERMIT_ID.fetch_add(1, Ordering::Relaxed))
+                .collect();
+            for id in &ids {
+                register_dispatch_zombie(*id, born);
+            }
+            DISPATCH_ZOMBIES.fetch_add(MAX_CONCURRENT_DISPATCHES, Ordering::Relaxed);
+
+            // Within the TTL every zombie still counts against admission.
+            assert_eq!(
+                dispatch_zombie_admission_count_at(
+                    born + ttl.saturating_sub(Duration::from_secs(1)),
+                    ttl
+                ),
+                MAX_CONCURRENT_DISPATCHES,
+                "zombies younger than the TTL must all count against admission"
+            );
+            assert!(
+                DispatchPermit::try_acquire().is_none(),
+                "a full table of fresh zombies must reject new dispatches"
+            );
+
+            // Past the TTL the lazy admission scan ages them out and meters
+            // each expiry exactly once.
+            assert_eq!(
+                dispatch_zombie_admission_count_at(born + ttl, ttl),
+                0,
+                "zombies past the TTL must stop counting against admission"
+            );
+            assert_eq!(
+                metrics.zombies_expired_total.load(),
+                expired_total_before + u64::from(MAX_CONCURRENT_DISPATCHES),
+                "each zombie expiry must increment the cumulative counter once"
+            );
+            assert_eq!(
+                metrics.zombies_expired.load(),
+                expired_gauge_before + u64::from(MAX_CONCURRENT_DISPATCHES),
+                "expired zombies must be visible in the gauge for diagnostics"
+            );
+            // Re-scanning must not double-count expiries.
+            assert_eq!(dispatch_zombie_admission_count_at(born + ttl, ttl), 0);
+            assert_eq!(
+                metrics.zombies_expired_total.load(),
+                expired_total_before + u64::from(MAX_CONCURRENT_DISPATCHES),
+            );
+
+            // The threads themselves stay tracked until they actually exit.
+            assert!(
+                DISPATCH_ZOMBIES.load(Ordering::Relaxed) >= MAX_CONCURRENT_DISPATCHES,
+                "expiry must not stop tracking still-running zombie threads"
+            );
+
+            // End-to-end: `try_acquire` evaluates against the real clock, so
+            // rewind the recorded births past the TTL (possible whenever the
+            // process/machine clock has been alive longer than the TTL; the
+            // `count_at` assertions above already covered the exclusion
+            // deterministically).
+            if let Some(old) = Instant::now().checked_sub(ttl + Duration::from_secs(1)) {
+                {
+                    let mut table = lock_mutex(&DISPATCH_ZOMBIE_TABLE);
+                    for id in &ids {
+                        if let Some(entry) = table.get_mut(id) {
+                            entry.zombified_at = old;
+                        }
+                    }
+                }
+                let permit = DispatchPermit::try_acquire();
+                assert!(
+                    permit.is_some(),
+                    "zombies past the admission TTL must no longer block admission"
+                );
+                drop(permit);
+            }
+
+            // Cleanup: retire the synthetic zombies; the expired gauge drains
+            // as each one exits.
+            for id in &ids {
+                unregister_dispatch_zombie(*id);
+            }
+            DISPATCH_ZOMBIES.fetch_sub(MAX_CONCURRENT_DISPATCHES, Ordering::Relaxed);
+            assert_eq!(
+                metrics.zombies_expired.load(),
+                expired_gauge_before,
+                "the expired gauge must drain as expired zombies exit"
             );
         });
     }

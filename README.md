@@ -278,7 +278,7 @@ The Python implementation had three recurring failure modes under real multi-age
 ### What Makes the Difference
 
 - **Git lock contention eliminated.** The commit coalescer batches rapid-fire writes into far fewer git commits (9.1x reduction observed). Lock-free git plumbing commits avoid `index.lock` entirely in most cases.
-- **Pool exhaustion handled gracefully.** Even with 4x more threads than pool connections (60 vs 15), all 600 operations succeeded with 0 timeouts. WAL mode + 60s `busy_timeout` lets writers queue rather than fail.
+- **Pool exhaustion handled gracefully.** Even with 4x more threads than pool connections (60 vs 15), all 600 operations succeeded with 0 timeouts. WAL mode + a bounded 20s `busy_timeout` lets writers queue rather than fail (and give up before the 30s client deadline).
 - **Stale lock recovery works.** Crashed-process lock files are detected via PID checking and cleaned up automatically, so a dead agent never holds the archive hostage.
 - **Write-behind queue backpressure is clean.** 2000 rapid-fire enqueues from 20 threads &mdash; all accepted with 0 fallbacks or errors.
 - **Read/write concurrency is solid.** Concurrent inbox reads and message writes produce 0 errors. WAL mode allows unlimited readers alongside writers.

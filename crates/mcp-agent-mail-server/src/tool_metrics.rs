@@ -1059,6 +1059,7 @@ mod tests {
             name: "send_message".to_string(),
             calls: 1,
             errors: 0,
+            rejections: 0,
             cluster: "messaging".to_string(),
             capabilities: Vec::new(),
             complexity: "simple".to_string(),

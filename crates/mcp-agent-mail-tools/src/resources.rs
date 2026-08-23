@@ -1705,7 +1705,12 @@ pub fn tooling_schemas_query(ctx: &McpContext, query: String) -> McpResult<Strin
 pub struct ToolMetricsEntry {
     pub name: String,
     pub calls: u64,
+    /// Server-fault errors only (br-315wc).
     pub errors: u64,
+    /// Client-side refusals (invalid input, not-found, policy/feature
+    /// refusals, idempotency conflicts, cursor misses, auth failures).
+    #[serde(default)]
+    pub rejections: u64,
     pub cluster: String,
     pub capabilities: Vec<String>,
     pub complexity: String,
@@ -1736,6 +1741,7 @@ pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
             name: e.name,
             calls: e.calls,
             errors: e.errors,
+            rejections: e.rejections,
             cluster: e.cluster,
             capabilities: e.capabilities,
             complexity: e.complexity,

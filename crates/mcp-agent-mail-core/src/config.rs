@@ -17,6 +17,36 @@ use std::sync::OnceLock;
 /// time out.
 pub const ECOSYSTEM_CLIENT_DEADLINE_MS: u64 = 30_000;
 
+/// Runtime SQLite `busy_timeout` (milliseconds) for request-path DB
+/// connections.
+///
+/// Ordering invariant (br-ovy6e):
+///
+/// ```text
+/// DB_RUNTIME_BUSY_TIMEOUT_MS (20s)
+///     < ECOSYSTEM_CLIENT_DEADLINE_MS (30s)
+///     < dispatch deadline + busy-work hard grace
+///       (server AM_DISPATCH_HARD_GRACE_SECS, default +30s)
+/// ```
+///
+/// A lock-contended query must give up while its dispatch is still attached,
+/// so the blocking thread surfaces an attributed error and exits instead of
+/// sleeping inside SQLite past the point where the dispatch layer zombifies
+/// it. The 10s gap below the client deadline leaves headroom for the DB
+/// layer's own MVCC retry backoff before the caller times out.
+///
+/// Maintenance paths (WAL checkpoint, vacuum, one-shot archive
+/// reconstruction) run off the request path and deliberately keep their own,
+/// longer timeouts.
+pub const DB_RUNTIME_BUSY_TIMEOUT_MS: u64 = 20_000;
+
+// Compile-time guard for the ordering invariant documented above.
+const _: () = assert!(
+    DB_RUNTIME_BUSY_TIMEOUT_MS < ECOSYSTEM_CLIENT_DEADLINE_MS,
+    "runtime SQLite busy_timeout must stay below the ecosystem client deadline \
+     so lock-contended queries fail before their dispatch is abandoned (br-ovy6e)"
+);
+
 /// ATC experience write mode: controls whether `atc_note_*` calls persist
 /// experience rows, log shadow traces, or are entirely suppressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

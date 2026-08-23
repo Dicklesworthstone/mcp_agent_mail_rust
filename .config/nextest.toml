@@ -12,7 +12,8 @@
 #
 # This repo's test code is provably free of *unbounded* hangs: every tool-layer
 # retry loop is bounded (<=4 attempts), the DB MVCC retry budget is bounded
-# (~29s), the pool busy_timeout is bounded (60s), and unit tests use per-test
+# (~30s of backoff), the pool busy_timeout is bounded (20s runtime / 60s
+# maintenance-recovery, br-ovy6e), and unit tests use per-test
 # isolated databases (`:memory:` or a fresh tempdir) so there is no cross-test
 # shared-DB deadlock. The remaining risk is therefore environmental, not a code
 # defect — exactly the case a runner-level watchdog is meant to cover.
@@ -29,7 +30,7 @@
 [profile.default]
 # Warn that a test is "slow" once per minute, and hard-terminate it after four
 # such periods (~4 minutes). The slowest *legitimate* test path here is a write
-# under maximal lock contention (pool busy_timeout 60s + bounded MVCC/tool
+# under maximal lock contention (pool busy_timeout 20s + bounded MVCC/tool
 # retries), comfortably under one minute, so 4 minutes never trips a real test
 # while still bounding a genuine hang to minutes instead of days.
 slow-timeout = { period = "60s", terminate-after = 4, grace-period = "10s" }

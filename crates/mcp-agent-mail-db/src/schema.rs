@@ -259,7 +259,13 @@ END;
 ///
 /// - `journal_mode=WAL`: readers never block writers; writers never block readers
 /// - `synchronous=NORMAL`: fsync on commit (not per-statement); safe with WAL
-/// - `busy_timeout=60s`: 60 second wait for locks (matches Python `PRAGMA busy_timeout=60000`)
+/// - `busy_timeout=20s`: bounded wait for locks; must stay below the 30s
+///   ecosystem client deadline so a lock-contended query gives up before its
+///   dispatch thread is abandoned (br-ovy6e). Keep the literal equal to
+///   `mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS` (asserted by
+///   `runtime_pragma_bundles_use_runtime_busy_timeout` in `pool.rs`); the
+///   legacy Python 60s value outlived the 30s dispatch deadline and produced
+///   zombie dispatch threads
 /// - `wal_autocheckpoint=1000`: balanced checkpoint frequency for concurrent workloads
 /// - `cache_size`: budget-aware, scales inversely with pool size (see [`build_conn_pragmas`])
 /// - `mmap_size=256MB`: memory-mapped I/O for sequential scan acceleration
@@ -276,7 +282,7 @@ END;
 ///   DML.
 pub const PRAGMA_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
-PRAGMA busy_timeout = 60000;
+PRAGMA busy_timeout = 20000;
 PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -295,7 +301,7 @@ PRAGMA journal_size_limit = 268435456;
 /// runtime init connections so every phase agrees on lock and journal mode.
 pub const PRAGMA_DB_INIT_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
-PRAGMA busy_timeout = 60000;
+PRAGMA busy_timeout = 20000;
 PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = WAL;
 ";
@@ -305,6 +311,11 @@ PRAGMA journal_mode = WAL;
 /// Runtime startup must use [`PRAGMA_DB_INIT_SQL`] so Agent Mail always opens
 /// file-backed mailboxes in WAL mode. This rollback-journal variant is reserved
 /// for one-shot paths that intentionally avoid the normal pooled runtime.
+///
+/// `busy_timeout` deliberately stays at the generous 60s here: these one-shot
+/// recovery/export paths run outside any dispatch deadline, so waiting out a
+/// long lock is preferable to failing a recovery (br-ovy6e keeps only the
+/// runtime bundles at 20s).
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
@@ -323,7 +334,7 @@ PRAGMA journal_mode = 'DELETE';
 /// contention.
 pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
-PRAGMA busy_timeout = 60000;
+PRAGMA busy_timeout = 20000;
 PRAGMA autocommit_retain = OFF;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;
@@ -361,7 +372,7 @@ pub fn build_conn_pragmas(max_connections: usize, cache_budget_kb: usize) -> Str
     format!(
         "\
 PRAGMA foreign_keys = OFF;
-PRAGMA busy_timeout = 60000;
+PRAGMA busy_timeout = 20000;
 PRAGMA autocommit_retain = OFF;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;

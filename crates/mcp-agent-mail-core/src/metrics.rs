@@ -736,6 +736,12 @@ pub fn database_write_metrics_snapshot() -> DatabaseWriteMetricsSnapshot {
 pub struct BlockingDispatchMetrics {
     pub inflight: GaugeU64,
     pub zombies: GaugeU64,
+    /// Zombies currently past the admission TTL: their threads are still
+    /// alive (tracked in `zombies`) but they no longer consume an admission
+    /// slot, so a stuck thread cannot 503 an idle server forever.
+    pub zombies_expired: GaugeU64,
+    /// Cumulative count of zombies that aged past the admission TTL.
+    pub zombies_expired_total: Counter,
     pub timeouts_total: Counter,
 }
 
@@ -744,6 +750,8 @@ pub struct BlockingDispatchMetrics {
 pub struct BlockingDispatchMetricsSnapshot {
     pub inflight: u64,
     pub zombies: u64,
+    pub zombies_expired: u64,
+    pub zombies_expired_total: u64,
     pub timeouts_total: u64,
 }
 
@@ -753,6 +761,8 @@ impl BlockingDispatchMetrics {
         BlockingDispatchMetricsSnapshot {
             inflight: self.inflight.load(),
             zombies: self.zombies.load(),
+            zombies_expired: self.zombies_expired.load(),
+            zombies_expired_total: self.zombies_expired_total.load(),
             timeouts_total: self.timeouts_total.load(),
         }
     }
@@ -2416,6 +2426,8 @@ mod tests {
             BlockingDispatchMetricsSnapshot {
                 inflight: 4,
                 zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
                 timeouts_total: 1,
             },
         );
@@ -2437,6 +2449,8 @@ mod tests {
             BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
                 timeouts_total: 1,
             },
         );
