@@ -1,0 +1,77 @@
+# Deploy MCP Agent Mail static export to GitHub Pages
+#
+# Usage:
+#   1. Place your bundle output in the `.rch-tmp/.tmpx0g0RY/docs` directory (or configure path below)
+#   2. Enable GitHub Pages in repo Settings > Pages > Source: "GitHub Actions"
+#   3. Push to main branch to trigger deployment
+#
+# Or manually: Actions > "Deploy to GitHub Pages" > "Run workflow"
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.rch-tmp/.tmpx0g0RY/docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate bundle
+        run: |
+          BUNDLE_DIR=".rch-tmp/.tmpx0g0RY/docs"
+          echo "=== Pre-flight checks ==="
+          test -f "$BUNDLE_DIR/manifest.json" || { echo "FAIL: manifest.json missing"; exit 1; }
+          test -f "$BUNDLE_DIR/index.html" || { echo "FAIL: index.html missing"; exit 1; }
+          test -f "$BUNDLE_DIR/.nojekyll" || { echo "WARN: .nojekyll missing"; }
+          test -f "$BUNDLE_DIR/_headers" || { echo "WARN: _headers missing"; }
+          test -d "$BUNDLE_DIR/viewer" || { echo "WARN: viewer/ directory missing"; }
+          echo "=== Manifest ==="
+          python3 -c "import json; m=json.load(open('$BUNDLE_DIR/manifest.json')); print(json.dumps({k: m[k] for k in ['schema_version','generated_at','database'] if k in m}, indent=2))" 2>/dev/null || echo "(manifest parse skipped)"
+          echo "=== Bundle size ==="
+          du -sh "$BUNDLE_DIR"
+          echo "=== All checks passed ==="
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.rch-tmp/.tmpx0g0RY/docs'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Generate deployment report
+        if: always()
+        run: |
+          echo "## Deployment Report" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.deployment.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${{ steps.deployment.outputs.page_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
