@@ -6619,6 +6619,63 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
 ///
 /// This eliminates index.lock contention entirely, since the index is never
 /// read or written. Falls back to `commit_paths()` if tree building fails.
+/// Resolve the reference name that HEAD points at for ref updates.
+///
+/// Commits must update the BRANCH ref (`refs/heads/main`), never the literal
+/// symbolic `HEAD` — replacing a symbolic HEAD with a direct ref would detach
+/// the repository. Falls back to `HEAD` itself when detached, mirroring the
+/// historical behavior of committing through `HEAD`.
+fn head_update_refname(repo: &Repository) -> String {
+    repo.find_reference("HEAD")
+        .ok()
+        .and_then(|head| head.symbolic_target().map(str::to_string))
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+/// Create a commit object from a caller-built tree and atomically advance
+/// HEAD onto it.
+///
+/// Cross-process lost-update guard (the "two servers, one storage root"
+/// deployment): `build_tree` runs while the libgit2 reference-transaction
+/// lock is HELD on HEAD's branch, and the parent commit is read fresh under
+/// that same lock. Two racing processes therefore serialize their
+/// parent-read → ref-write pairs; the loser re-parents onto the winner's
+/// commit instead of orphaning either side's objects. Plain unwrapped `git`
+/// writers remain outside this protocol (the documented AM_GIT_BINARY /
+/// git-with-amlock mitigation covers those).
+///
+/// `build_tree` must produce the FULL state tree (as both the treebuilder
+/// path and the index path do), so re-parenting onto a fresher head is safe.
+#[allow(clippy::result_large_err)]
+fn commit_tree_advancing_head<F>(
+    repo: &Repository,
+    sig: &Signature<'_>,
+    message: &str,
+    build_tree: F,
+) -> Result<git2::Oid>
+where
+    F: FnOnce(&Repository) -> Result<git2::Oid>,
+{
+    let refname = head_update_refname(repo);
+    let mut tx = repo.transaction()?;
+    // Hold the reference lock across tree-build + parent-read + ref-write:
+    // this is the critical section another mcp-agent-mail process blocks on.
+    tx.lock_ref(&refname)?;
+    let final_message = append_trailers(message);
+    let tree_oid = build_tree(repo)?;
+    let tree = repo.find_tree(tree_oid)?;
+    let parent = resolve_head_commit_oid(repo)?
+        .map(|oid| repo.find_commit(oid))
+        .transpose()?;
+    let commit_oid = match &parent {
+        Some(p) => repo.commit(None, sig, sig, &final_message, &tree, &[p])?,
+        None => repo.commit(None, sig, sig, &final_message, &tree, &[])?,
+    };
+    tx.set_target(&refname, commit_oid, Some(sig), &final_message)?;
+    tx.commit()?;
+    Ok(commit_oid)
+}
+
 fn commit_paths_lockfree(
     repo: &Repository,
     config: &Config,
