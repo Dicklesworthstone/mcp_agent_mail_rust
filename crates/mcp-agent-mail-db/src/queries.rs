@@ -27749,8 +27749,10 @@ mod tests {
             );
             assert_eq!(
                 snapshot.per_table.get("message_recipients").copied(),
-                Some(2),
-                "one chunked update and one chunked read-back should touch message_recipients"
+                Some(3),
+                "one chunked update, one chunked read-back, and the inbox_stats \
+                 recompute (whose JOIN form is attributed to its first FROM, \
+                 message_recipients) should touch message_recipients"
             );
 
             assert_eq!(
