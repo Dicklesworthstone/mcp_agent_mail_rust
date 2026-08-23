@@ -1218,6 +1218,13 @@ fn ensure_dirs_on_readonly_root_returns_io_error() {
     perms.set_readonly(true);
     std::fs::set_permissions(&readonly_root, perms.clone()).unwrap();
 
+    if !readonly_dir_is_enforced(&readonly_root) {
+        // Root ignores permission bits; the fault cannot be injected. Skip.
+        perms.set_readonly(false);
+        std::fs::set_permissions(&readonly_root, perms).unwrap();
+        return;
+    }
+
     let layout = IndexLayout::new(&readonly_root);
     let result = layout.ensure_dirs(&test_scope(), &test_schema());
 
