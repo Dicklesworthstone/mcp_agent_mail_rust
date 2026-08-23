@@ -5339,7 +5339,7 @@ fn render_status_output(
     project_slug: Option<String>,
     agent_name: Option<String>,
     actions: Vec<String>,
-    extra_alerts: Vec<(String, String, Option<String>)>,
+    extra_alerts: Vec<StatusAlertEntry>,
     mut phase: TailLatencyPhaseRecorder,
 ) -> Result<String, CliError> {
     let mut env = RobotEnvelope::new(cmd_name, format, data);
@@ -6248,6 +6248,30 @@ fn is_unregistered_cwd_project_error(error: &CliError) -> bool {
         CliError::InvalidArgument(msg)
             if msg.starts_with("project not found for current directory or its ancestors: ")
     )
+}
+
+/// Whether a mailbox recovery lock is currently HELD (live pid). A cheap
+/// single-stat probe on the healthy path; it deliberately avoids the
+/// ownership inspection (`lsof`/`ps` shell-outs) that makes the recovery-only
+/// status path expensive.
+fn mailbox_recovery_lock_is_active_for_robot() -> bool {
+    let config = mcp_agent_mail_core::Config::get();
+    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .ok()
+        .is_some_and(|resolved| {
+            mcp_agent_mail_db::pool::inspect_mailbox_recovery_lock(Path::new(
+                &resolved.canonical_path,
+            ))
+            .active
+        })
+}
+
+/// The benign unregistered-CWD miss may take the fast non-degraded status
+/// path only while no recovery is in progress: an actively held recovery
+/// lock is real mailbox state the operator must see, so it keeps routing
+/// through the recovery-only snapshot.
+fn is_benign_unregistered_cwd_project_error(error: &CliError) -> bool {
+    is_unregistered_cwd_project_error(error) && !mailbox_recovery_lock_is_active_for_robot()
 }
 
 fn load_recipient_placeholders_without_agents(
@@ -13957,10 +13981,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     // Attribute scope-resolution time to its own phase so the
                     // fallback below is not billed for it in the ledger.
                     phase.mark("scope_resolution");
-                    if is_unregistered_cwd_project_error(&error) {
+                    if is_benign_unregistered_cwd_project_error(&error) {
                         // Benign: the DB was read fine, the CWD simply is not
-                        // a registered project. Skip the recovery-only
-                        // forensic path and answer with a normal envelope.
+                        // a registered project, and no recovery is in
+                        // progress. Skip the recovery-only forensic path and
+                        // answer with a normal envelope.
                         let (data, agent_name, alerts) =
                             build_unregistered_project_status(args.agent.as_deref(), &error);
                         render_status_output(
@@ -14164,10 +14189,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                             // recovery-only path (degraded/corrupt DB) before
                             // declaring the read-out fully unavailable. The
                             // benign "CWD is not a registered project" error
-                            // is NOT a DB failure, so it skips straight to
-                            // the unavailable read-out (which already points
-                            // at `--project <abs-path>`).
-                            let recovery_only = if is_unregistered_cwd_project_error(&scope_error) {
+                            // is NOT a DB failure (unless a recovery lock is
+                            // actively held), so it skips straight to the
+                            // unavailable read-out (which already points at
+                            // `--project <abs-path>`).
+                            let recovery_only = if is_benign_unregistered_cwd_project_error(
+                                &scope_error,
+                            ) {
                                 None
                             } else {
                                 build_recovery_only_status(

@@ -8291,8 +8291,12 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         }
 
         // Recompute `now` here: `now_micros` was captured before the kernel
-        // tick, so reusing it would systematically shorten the sleep by the
-        // tick's own duration. The helper clamps the result to the tick floor.
+        // tick, so reusing it would overstate the remaining time until the
+        // next deadline and lengthen the sleep by the tick's own duration,
+        // processing every deadline late. The helper never returns zero: an
+        // already-due deadline clamps to the tick floor and every other path
+        // is bounded below by `ATC_OPERATOR_MIN_TICK_INTERVAL` or the exact
+        // (non-zero) remaining wait.
         let wait_now_micros = mcp_agent_mail_core::timestamps::now_micros();
         let wait_duration = atc_operator_wait_duration(&snapshot, wait_now_micros, tick_interval);
         if !wait_for_atc_operator_interval(stop.as_ref(), wait_duration) {
