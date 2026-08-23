@@ -239,7 +239,7 @@ fn stress_concurrent_ensure_project() {
                     let k = key.clone();
                     async move { queries::ensure_project(&cx, &p, &k).await }
                 });
-                assert!(!row.slug.is_empty());
+                assert_ne!(row.slug, "");
                 row.id.expect("project should have an id")
             })
         })

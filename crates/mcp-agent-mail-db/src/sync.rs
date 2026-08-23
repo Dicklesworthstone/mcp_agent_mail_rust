@@ -1449,7 +1449,7 @@ mod tests {
         // Position-now on an empty inbox: tail 0, no events.
         let empty = inbox_delivery_events_from_conn(&conn, project_id, late_id, None, 5)
             .expect("empty inbox page");
-        assert!(empty.events.is_empty());
+        assert_eq!(empty.events, [] as [InboxDeliveryEvent; 0]);
         assert_eq!(empty.tail_cursor, 0);
 
         // Unrelated traffic advances the global sequence well past 0.
@@ -1498,7 +1498,10 @@ mod tests {
             message_delivery_receipt_from_conn(&conn, project_id, first_message_id)
                 .expect("read persisted receipt");
         assert_eq!(persisted_only.recipients.len(), 1);
-        assert!(persisted_only.recipients[0].signal_receipts.is_empty());
+        assert_eq!(
+            persisted_only.recipients[0].signal_receipts,
+            [] as [MessageDeliverySignalReceipt; 0]
+        );
         assert_eq!(persisted_only.recipients[0].acknowledged_ts, None);
 
         append_message_delivery_signal_receipt(

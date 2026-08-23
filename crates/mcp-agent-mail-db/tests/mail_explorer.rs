@@ -1283,8 +1283,8 @@ fn explorer_entry_fields_populated() {
     let e = &page.entries[0];
     assert!(e.message_id > 0);
     assert!(e.project_id > 0);
-    assert!(!e.project_slug.is_empty());
-    assert!(!e.sender_name.is_empty());
-    assert!(!e.subject.is_empty());
+    assert_ne!(e.project_slug, "");
+    assert_ne!(e.sender_name, "");
+    assert_ne!(e.subject, "");
     assert!(e.created_ts > 0);
 }

@@ -16300,7 +16300,7 @@ mod tests {
             classify_mailbox_ownership(&processes, current_pid);
 
         assert_eq!(disposition, MailboxOwnershipDisposition::Unowned);
-        assert!(competing_pids.is_empty());
+        assert_eq!(competing_pids, [] as [u32; 0]);
         assert!(!supervised_restart_required);
         assert!(detail.contains("no competing"));
     }
@@ -19114,7 +19114,7 @@ mod tests {
         assert_eq!(health.total_size_bytes, health.size_bytes);
         assert_eq!(health.size_share_basis_points, Some(10_000));
         assert_eq!(health.quick_check_ok, Some(true));
-        assert!(health.detail.is_empty());
+        assert_eq!(health.detail, "");
     }
 
     #[test]
@@ -19160,7 +19160,7 @@ mod tests {
         assert!(health.size_bytes > 0);
         assert_eq!(health.experience_rows, None);
         assert_ne!(health.quick_check_ok, Some(true));
-        assert!(!health.detail.is_empty());
+        assert_ne!(health.detail, "");
     }
 
     #[test]
@@ -19247,6 +19247,6 @@ mod tests {
         std::fs::write(&db, b"").expect("touch db file");
         // Nobody holds this fresh file open; this process is excluded by pid even
         // if it briefly touched it. On non-Linux the scan is a stub => also empty.
-        assert!(foreign_db_file_holders(&db).is_empty());
+        assert_eq!(foreign_db_file_holders(&db), [] as [ForeignDbFileHolder; 0]);
     }
 }

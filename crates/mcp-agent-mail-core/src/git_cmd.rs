@@ -509,7 +509,7 @@ fn run_child(
 /// Give stdout/stderr reader threads a short grace period to observe EOF,
 /// then detach any that are still parked.
 ///
-/// After kill() a grandchild that inherited our pipe fds (git hooks,
+/// After `kill()` a grandchild that inherited our pipe fds (git hooks,
 /// credential helpers, `sh -c` wrappers) can hold the pipes open
 /// indefinitely; an unconditional join here would block the caller forever
 /// and defeat the wall-clock timeout this function exists to enforce. The

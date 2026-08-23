@@ -1265,9 +1265,9 @@ mod tests {
             let model = EFFECT_UTILITY_MODELS.iter().find(|m| m.family == family);
             assert!(model.is_some(), "Missing utility model for {family}");
             let m = model.unwrap();
-            assert!(!m.utility.is_empty());
-            assert!(!m.success_criterion.is_empty());
-            assert!(!m.harm_criterion.is_empty());
+            assert_ne!(m.utility, "");
+            assert_ne!(m.success_criterion, "");
+            assert_ne!(m.harm_criterion, "");
         }
     }
 

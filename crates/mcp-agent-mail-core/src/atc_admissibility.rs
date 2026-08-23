@@ -555,7 +555,7 @@ mod tests {
         assert!(result.gates.len() >= 5);
         for gate in &result.gates {
             assert!(gate.passed);
-            assert!(!gate.detail.is_empty());
+            assert_ne!(gate.detail, "");
         }
     }
 }

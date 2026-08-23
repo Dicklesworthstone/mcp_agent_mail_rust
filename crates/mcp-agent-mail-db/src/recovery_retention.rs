@@ -1371,7 +1371,7 @@ mod tests {
             .join("run-x");
         let outcome = consolidate_debris(&plan, &dest).unwrap();
         assert_eq!(outcome.moved, 4, "failures: {:?}", outcome.failures);
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, [] as [(PathBuf, String); 0]);
         // The live DB and .bak survive; quarantines are gone from the DB dir.
         assert!(db_path.exists());
         assert!(storage_root.join("storage.sqlite3.bak").exists());

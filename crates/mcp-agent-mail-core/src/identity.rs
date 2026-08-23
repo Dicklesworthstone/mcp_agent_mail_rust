@@ -907,7 +907,7 @@ mod tests {
         let long = format!("/{}", "a".repeat(5000));
         let slug = slugify(&long);
         assert_eq!(slug, "a".repeat(5000));
-        assert!(!slug.is_empty());
+        assert_ne!(slug, "");
     }
 
     // -----------------------------------------------------------------------
@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn short_sha1_zero_length() {
         let short = short_sha1("hello", 0);
-        assert!(short.is_empty());
+        assert_eq!(short, "");
     }
 
     #[test]
@@ -1225,18 +1225,18 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let identity = resolve_project_identity(&tmp.path().display().to_string());
 
-        assert!(!identity.slug.is_empty());
-        assert!(!identity.canonical_path.is_empty());
-        assert!(!identity.human_key.is_empty());
-        assert!(!identity.project_uid.is_empty());
-        assert!(!identity.identity_mode_used.is_empty());
+        assert_ne!(identity.slug, "");
+        assert_ne!(identity.canonical_path, "");
+        assert_ne!(identity.human_key, "");
+        assert_ne!(identity.project_uid, "");
+        assert_ne!(identity.identity_mode_used, "");
     }
 
     #[test]
     fn compute_project_slug_returns_non_empty_for_existing_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let slug = compute_project_slug(&tmp.path().display().to_string());
-        assert!(!slug.is_empty());
+        assert_ne!(slug, "");
     }
 
     #[test]

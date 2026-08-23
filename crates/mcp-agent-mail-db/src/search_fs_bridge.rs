@@ -559,7 +559,7 @@ mod tests {
         let mapped = map_fs_error(err);
         match mapped {
             crate::search_error::SearchError::Internal(msg) => {
-                assert!(!msg.is_empty());
+                assert_ne!(msg, "");
             }
             other => panic!("expected Internal from catch-all, got {other:?}"),
         }

@@ -930,7 +930,7 @@ mod tests {
     fn sql_clauses_operator_empty() {
         let ctx = operator_ctx();
         let (clauses, params) = build_scope_sql_clauses(&ctx);
-        assert!(clauses.is_empty());
+        assert_eq!(clauses, [] as [String; 0]);
         assert!(params.is_empty());
     }
 
@@ -989,7 +989,7 @@ mod tests {
             ScopeReason::NonMessageEntity,
         ];
         for reason in reasons {
-            assert!(!reason.user_message().is_empty());
+            assert_ne!(reason.user_message(), "");
         }
     }
 

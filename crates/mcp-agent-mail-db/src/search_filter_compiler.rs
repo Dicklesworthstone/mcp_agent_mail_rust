@@ -644,7 +644,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -795,7 +795,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -873,7 +873,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -971,7 +971,7 @@ mod tests {
                 }),
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         // ── apply_to with filters wraps in BooleanQuery ──
@@ -1020,7 +1020,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         // ── Date range exact boundary (inclusive) ──
@@ -1063,7 +1063,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         #[test]
@@ -1074,7 +1074,7 @@ mod tests {
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
-            assert!(ids.is_empty());
+            assert_eq!(ids, [] as [u64; 0]);
         }
 
         // ── compile_filters clause count for all 6 fields ──

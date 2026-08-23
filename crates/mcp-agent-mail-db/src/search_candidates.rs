@@ -1070,7 +1070,7 @@ mod tests {
             combined_limit: 20,
         };
         let prepared = prepare_candidates(&[], &[], budget);
-        assert!(prepared.candidates.is_empty());
+        assert_eq!(prepared.candidates, [] as [PreparedCandidate; 0]);
         assert_eq!(prepared.counts.lexical_considered, 0);
         assert_eq!(prepared.counts.semantic_considered, 0);
         assert_eq!(prepared.counts.deduped_selected, 0);

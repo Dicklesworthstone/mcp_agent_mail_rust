@@ -10004,9 +10004,8 @@ async fn compute_agent_inbox_stats_in_tx(
         FROM message_recipients mr \
         JOIN messages m ON m.id = mr.message_id \
         WHERE mr.agent_id = ?";
-    let rows = match map_sql_outcome(
-        traw_query(cx, tracked, sql, &[Value::BigInt(agent_id)]).await,
-    ) {
+    let rows = match map_sql_outcome(traw_query(cx, tracked, sql, &[Value::BigInt(agent_id)]).await)
+    {
         Outcome::Ok(rows) => rows,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -18021,7 +18020,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("fetch unmatched subject");
-            assert!(unmatched.is_empty());
+            assert_eq!(unmatched, [] as [ExperienceRow; 0]);
         });
     }
 
@@ -18546,7 +18545,7 @@ mod tests {
     #[test]
     fn extract_terms_skips_stopwords() {
         let terms = extract_like_terms("AND OR NOT NEAR", 5);
-        assert!(terms.is_empty());
+        assert_eq!(terms, [] as [String; 0]);
     }
 
     #[test]
@@ -18558,7 +18557,7 @@ mod tests {
     #[test]
     fn extract_terms_only_single_char_tokens_returns_empty() {
         let terms = extract_like_terms("a b c d e", 8);
-        assert!(terms.is_empty());
+        assert_eq!(terms, [] as [String; 0]);
     }
 
     #[test]
@@ -24147,7 +24146,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("empty candidates should short-circuit");
-            assert!(rows.is_empty());
+            assert_eq!(rows, [] as [i64; 0]);
         });
     }
 
@@ -24209,7 +24208,7 @@ mod tests {
             .await
             .into_result()
             .expect("no-result query");
-            assert!(rows.is_empty());
+            assert_eq!(rows, [] as [i64; 0]);
         });
     }
 

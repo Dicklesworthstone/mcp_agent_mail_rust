@@ -898,7 +898,7 @@ mod tests {
         let guard = RerunGuard::new(&h);
         assert_eq!(guard.repro.seed, 123);
         assert_eq!(guard.repro.test_name, "guard_from_harness");
-        assert!(!guard.repro.created_at.is_empty());
+        assert_ne!(guard.repro.created_at, "");
         drop(guard);
     }
 

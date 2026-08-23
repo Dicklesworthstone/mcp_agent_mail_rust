@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn embedding_result_from_hash() {
         let result = EmbeddingResult::from_hash("abc123");
-        assert!(result.vector.is_empty());
+        assert_eq!(result.vector, [] as [f32; 0]);
         assert_eq!(result.model_id, "hash");
         assert_eq!(result.tier, ModelTier::Hash);
         assert_eq!(result.dimension, 0);
@@ -807,7 +807,7 @@ mod tests {
         let embedder = HashEmbedder::new();
         let result = embedder.embed("hello world").unwrap();
         assert!(result.is_hash_only());
-        assert!(!result.content_hash.is_empty());
+        assert_ne!(result.content_hash, "");
         assert_eq!(result.content_hash.len(), 64); // SHA-256 hex
     }
 
@@ -1033,7 +1033,7 @@ mod tests {
             CanonPolicy::Full,
         )
         .unwrap();
-        assert!(!result.content_hash.is_empty());
+        assert_ne!(result.content_hash, "");
         // The hash should be from canonicalized text, not raw
     }
 
@@ -1054,7 +1054,7 @@ mod tests {
     fn model_tier_debug() {
         for tier in [ModelTier::Hash, ModelTier::Fast, ModelTier::Quality] {
             let debug = format!("{tier:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 
@@ -1364,7 +1364,7 @@ mod tests {
             CanonPolicy::Full,
         )
         .unwrap();
-        assert!(!result.content_hash.is_empty());
+        assert_ne!(result.content_hash, "");
     }
 
     #[test]
@@ -1378,7 +1378,7 @@ mod tests {
             CanonPolicy::Full,
         )
         .unwrap();
-        assert!(!result.content_hash.is_empty());
+        assert_ne!(result.content_hash, "");
     }
 
     #[test]

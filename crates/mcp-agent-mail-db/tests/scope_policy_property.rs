@@ -1016,7 +1016,7 @@ fn batch_all_allowed() {
 fn sql_clauses_operator_produces_nothing() {
     let ctx = operator();
     let (clauses, params) = build_scope_sql_clauses(&ctx);
-    assert!(clauses.is_empty());
+    assert_eq!(clauses, [] as [String; 0]);
     assert!(params.is_empty());
 }
 
@@ -1448,7 +1448,7 @@ fn redaction_empty_placeholder() {
     };
     let result = msg(1, 1, "Agent");
     let redacted = apply_redaction(result, &policy);
-    assert!(redacted.body.is_empty());
+    assert_eq!(redacted.body, "");
 }
 
 #[test]

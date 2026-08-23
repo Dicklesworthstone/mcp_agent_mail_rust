@@ -1231,7 +1231,7 @@ pub fn compute_forecasts(
         let rate_per_sec = (cur_val - bl_val) / dt;
         for &h in horizons {
             #[allow(clippy::cast_precision_loss)]
-            let projected = cur_val + rate_per_sec * h as f64;
+            let projected = f64::mul_add(rate_per_sec, h as f64, cur_val);
             forecasts.push(ForecastPoint {
                 metric: name.into(),
                 horizon_secs: h,
@@ -2866,7 +2866,7 @@ mod tests {
         assert!(card.confidence >= 0.7);
         assert_eq!(card.severity, AnomalySeverity::High);
         assert!(card.headline.contains("high_error_rate"));
-        assert!(!card.next_steps.is_empty());
+        assert_ne!(card.next_steps, [] as [String; 0]);
         assert!(card.deep_links.contains(&"screen:tool_metrics".to_string()));
         assert!(card.likely_cause.is_none());
     }
@@ -3101,7 +3101,10 @@ mod tests {
         let json = serde_json::to_value(&feed).expect("InsightFeed should serialize");
         assert_eq!(json["alerts_processed"], 0);
         assert_eq!(json["cards_produced"], 0);
-        assert!(json["cards"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["cards"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]

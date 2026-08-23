@@ -1424,7 +1424,7 @@ mod tests {
         let q = SearchQuery::default();
         let plan = plan_search(&q);
         assert_eq!(plan.method, PlanMethod::Empty);
-        assert!(plan.sql.is_empty());
+        assert_eq!(plan.sql, "");
     }
 
     #[test]
@@ -1652,7 +1652,7 @@ mod tests {
         let explain = plan.explain();
         assert_eq!(explain.method, "like_fallback");
         assert!(explain.used_like_fallback);
-        assert!(!explain.sql.is_empty());
+        assert_ne!(explain.sql, "");
     }
 
     #[test]

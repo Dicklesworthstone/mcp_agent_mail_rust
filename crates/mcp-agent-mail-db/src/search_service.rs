@@ -6296,7 +6296,7 @@ mod tests {
 
     #[test]
     fn parse_search_result_recipients_surfaces_malformed_payloads() {
-        assert!(parse_search_result_recipients("").to.is_empty());
+        assert_eq!(parse_search_result_recipients("").to, [] as [String; 0]);
         assert_eq!(
             parse_search_result_recipients(r#"{"to":"BlueLake"}"#).to,
             vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()]
@@ -6784,7 +6784,7 @@ mod tests {
         let result = generate_zero_result_guidance(&query, 0, None);
         assert!(result.is_some());
         let guidance = result.unwrap();
-        assert!(!guidance.summary.is_empty());
+        assert_ne!(guidance.summary, "");
         // Plain query with no facets → simplify_query suggestion
         assert_eq!(guidance.suggestions.len(), 1);
         assert_eq!(guidance.suggestions[0].kind, "simplify_query");
@@ -7350,7 +7350,7 @@ mod tests {
         assert!(fallback.iter().all(|v| v.abs() > f32::EPSILON));
 
         let empty = TwoTierBridge::synthesize_quality_fallback(&[1.0, 2.0], 0);
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [f32; 0]);
     }
 
     #[cfg(feature = "hybrid")]
@@ -7717,7 +7717,7 @@ mod tests {
         assert!((health.quality_coverage_percent - 50.0).abs() < 0.001);
         assert_eq!(health.fast_dimension, config.fast_dimension);
         assert_eq!(health.quality_dimension, config.quality_dimension);
-        assert!(!health.availability.is_empty());
+        assert_ne!(health.availability, "");
     }
 
     #[cfg(feature = "hybrid")]
@@ -7725,7 +7725,7 @@ mod tests {
     fn two_tier_indexing_health_from_context_reports_availability_without_docs() {
         let health = build_two_tier_indexing_health_from_context();
 
-        assert!(!health.availability.is_empty());
+        assert_ne!(health.availability, "");
         assert_eq!(health.total_docs, 0);
         assert_eq!(health.quality_doc_count, 0);
         assert!(health.quality_coverage_ratio.abs() < f32::EPSILON);

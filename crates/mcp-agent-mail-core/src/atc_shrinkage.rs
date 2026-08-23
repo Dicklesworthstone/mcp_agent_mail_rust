@@ -200,7 +200,7 @@ pub fn shrink_single(estimate: &StratumEstimate, population: &CohortStats) -> Sh
     );
 
     // Effective sample size: local_count + weight × population_count.
-    let effective = n + shrinkage_weight * population.total_count as f64;
+    let effective = f64::mul_add(shrinkage_weight, population.total_count as f64, n);
 
     ShrunkEstimate {
         stratum_key: estimate.stratum_key.clone(),

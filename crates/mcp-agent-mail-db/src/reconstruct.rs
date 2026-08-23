@@ -5845,8 +5845,8 @@ mod tests {
         });
         assert_eq!(json_str_array(&v, "to"), vec!["Alice", "Bob"]);
         assert_eq!(json_str_array(&v, "cc"), vec!["Charlie"]);
-        assert!(json_str_array(&v, "bcc").is_empty());
-        assert!(json_str_array(&v, "missing").is_empty());
+        assert_eq!(json_str_array(&v, "bcc"), [] as [String; 0]);
+        assert_eq!(json_str_array(&v, "missing"), [] as [String; 0]);
     }
 
     #[test]
@@ -5931,8 +5931,8 @@ mod tests {
             })
         );
         assert_eq!(to_names, vec![MALFORMED_RECIPIENTS_SENTINEL]);
-        assert!(cc_names.is_empty());
-        assert!(bcc_names.is_empty());
+        assert_eq!(cc_names, [] as [String; 0]);
+        assert_eq!(bcc_names, [] as [String; 0]);
         assert!(stats.warnings.iter().any(|warning| {
             warning.contains("invalid recipients_json")
                 && warning.contains("preserving malformed recipient metadata sentinel")
@@ -5945,8 +5945,8 @@ mod tests {
             &mut stats,
         );
         assert_eq!(to_names, vec![MALFORMED_RECIPIENTS_SENTINEL]);
-        assert!(cc_names.is_empty());
-        assert!(bcc_names.is_empty());
+        assert_eq!(cc_names, [] as [String; 0]);
+        assert_eq!(bcc_names, [] as [String; 0]);
         assert!(stats.warnings.iter().any(|warning| {
             warning.contains("non-canonical recipients_json")
                 && warning.contains("preserving malformed recipient metadata sentinel")
@@ -5973,8 +5973,8 @@ mod tests {
             })
         );
         assert_eq!(to_names, vec![MALFORMED_RECIPIENTS_SENTINEL]);
-        assert!(cc_names.is_empty());
-        assert!(bcc_names.is_empty());
+        assert_eq!(cc_names, [] as [String; 0]);
+        assert_eq!(bcc_names, [] as [String; 0]);
         assert!(stats.warnings.iter().any(|warning| {
             warning.contains("non-canonical recipient payload")
                 && warning.contains("preserving malformed recipient metadata sentinel")
@@ -5990,8 +5990,8 @@ mod tests {
             normalize_archive_recipients_json(&msg, "archive/test.md", &mut stats);
         assert_eq!(to_names, vec!["Bob"]);
         assert_eq!(cc_names, vec!["Carol"]);
-        assert!(bcc_names.is_empty());
-        assert!(stats.warnings.is_empty());
+        assert_eq!(bcc_names, [] as [String; 0]);
+        assert_eq!(stats.warnings, [] as [String; 0]);
     }
 
     #[test]
@@ -11149,7 +11149,10 @@ archive body
         );
         assert_eq!(json["schema"]["major"], 1);
         assert_eq!(json["archive_only_ids"].as_array().unwrap().len(), 1);
-        assert!(json["db_only_ids"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["db_only_ids"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]

@@ -184,7 +184,7 @@ mod tests {
         let lifecycle = StubLifecycle;
         let stats = lifecycle.rebuild().unwrap();
         assert_eq!(stats.docs_indexed, 0);
-        assert!(stats.warnings.is_empty());
+        assert_eq!(stats.warnings, [] as [String; 0]);
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
             elapsed_ms: 0,
             warnings: vec![],
         };
-        assert!(stats.warnings.is_empty());
+        assert_eq!(stats.warnings, [] as [String; 0]);
     }
 
     // ── Trait object safety ─────────────────────────────────────────────

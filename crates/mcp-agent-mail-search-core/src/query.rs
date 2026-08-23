@@ -416,9 +416,9 @@ mod tests {
     #[test]
     fn search_query_empty_raw_query() {
         let q = SearchQuery::new("");
-        assert!(q.raw_query.is_empty());
+        assert_eq!(q.raw_query, "");
         let json = serde_json::to_string(&q).unwrap();
         let back: SearchQuery = serde_json::from_str(&json).unwrap();
-        assert!(back.raw_query.is_empty());
+        assert_eq!(back.raw_query, "");
     }
 }

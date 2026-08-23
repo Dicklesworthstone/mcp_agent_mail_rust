@@ -800,7 +800,7 @@ mod tests {
     fn fuse_rrf_empty_candidates() {
         let result = fuse_rrf(&[], RrfConfig::default(), 0, 100);
         assert_eq!(result.total_fused, 0);
-        assert!(result.hits.is_empty());
+        assert_eq!(result.hits, [] as [FusedHit; 0]);
         assert_eq!(result.input_count, 0);
     }
 
@@ -871,7 +871,7 @@ mod tests {
         let candidates = vec![make_candidate(1, Some(1), None, Some(0.9), None)];
         let result = fuse_rrf(&candidates, RrfConfig::default(), 100, 10);
         assert_eq!(result.total_fused, 1);
-        assert!(result.hits.is_empty());
+        assert_eq!(result.hits, [] as [FusedHit; 0]);
     }
 
     #[test]

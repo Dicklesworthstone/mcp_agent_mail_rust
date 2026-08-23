@@ -660,7 +660,7 @@ mod tests {
             CanonPolicy::TitleOnly,
         ] {
             let debug = format!("{policy:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 

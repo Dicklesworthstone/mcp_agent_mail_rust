@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn report_builds_without_panic() {
         let report = DiagnosticReport::build(vec![], vec![]);
-        assert!(!report.generated_at.is_empty());
+        assert_ne!(report.generated_at, "");
         assert!(report.system.cpu_count >= 1);
         assert_eq!(report.health.level, "green");
     }
@@ -1533,7 +1533,7 @@ mod tests {
     fn report_json_serializable() {
         let report = DiagnosticReport::build(vec![], vec![]);
         let json = report.to_json();
-        assert!(!json.is_empty());
+        assert_ne!(json, "");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed.get("generated_at").is_some());
         assert!(parsed.get("health").is_some());
@@ -1597,7 +1597,7 @@ mod tests {
     fn system_info_populated() {
         let info = system_info();
         assert!(info.cpu_count >= 1);
-        assert!(!info.os.is_empty());
+        assert_ne!(info.os, "");
     }
 
     fn archive_scan_diagnostic(
@@ -1625,7 +1625,7 @@ mod tests {
         assert_eq!(summary.highest_severity, None);
         assert_eq!(summary.total_findings, 0);
         assert_eq!(summary.deduped_findings, 0);
-        assert!(summary.buckets.is_empty());
+        assert_eq!(summary.buckets, [] as [ArchiveScanSummaryBucket; 0]);
         assert_eq!(summary.headline, "No archive scan findings detected.");
         assert!(summary.next_action.is_none());
     }
@@ -2250,8 +2250,8 @@ mod tests {
         let gate = WarningFloodGate::default_cap();
         assert_eq!(gate.total(), 0);
         assert!(!gate.has_suppressed());
-        assert!(gate.terminal_warnings().is_empty());
-        assert!(gate.all_warnings().is_empty());
+        assert_eq!(gate.terminal_warnings(), [] as [&CappedWarning; 0]);
+        assert_eq!(gate.all_warnings(), []);
         let summary = gate.summary();
         assert_eq!(summary.total_warnings, 0);
         assert_eq!(summary.total_suppressed, 0);
@@ -2426,7 +2426,7 @@ mod tests {
     fn tail_latency_phase_recorder_handles_empty_and_error_outcomes() {
         let empty = TailLatencyPhaseRecorder::new("search_messages").finish("empty");
         assert_eq!(empty.outcome, "empty");
-        assert!(empty.phases.is_empty());
+        assert_eq!(empty.phases, [] as [TailLatencyPhase; 0]);
 
         let mut failing = TailLatencyPhaseRecorder::new("fetch_inbox");
         failing.mark("argument_validation");

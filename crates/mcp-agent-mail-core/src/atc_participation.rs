@@ -414,9 +414,9 @@ mod tests {
     fn feature_mapping_documentation_complete() {
         assert_eq!(PARTICIPATION_FEATURE_MAPPING.len(), 4);
         for mapping in PARTICIPATION_FEATURE_MAPPING {
-            assert!(!mapping.feature_name.is_empty());
-            assert!(!mapping.influences.is_empty());
-            assert!(!mapping.quantization.is_empty());
+            assert_ne!(mapping.feature_name, "");
+            assert_ne!(mapping.influences, "");
+            assert_ne!(mapping.quantization, "");
         }
     }
 

@@ -440,7 +440,7 @@ mod tests {
     fn project_envelope_empty_products() {
         let row = sample_project_row();
         let env = project_to_envelope(&row);
-        assert!(env.visibility.product_ids.is_empty());
+        assert_eq!(env.visibility.product_ids, [] as [i64; 0]);
     }
 
     // ── Serde roundtrip tests ──
@@ -690,9 +690,9 @@ mod tests {
             product_ids: vec![],
         };
         let env = message_to_envelope(&row);
-        assert!(env.document.title.is_empty());
-        assert!(env.document.body.is_empty());
-        assert!(env.visibility.product_ids.is_empty());
+        assert_eq!(env.document.title, "");
+        assert_eq!(env.document.body, "");
+        assert_eq!(env.visibility.product_ids, [] as [i64; 0]);
     }
 
     #[test]

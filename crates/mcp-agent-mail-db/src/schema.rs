@@ -6181,13 +6181,13 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
 
     #[test]
     fn extract_trigger_statements_empty() {
-        assert!(extract_trigger_statements("").is_empty());
+        assert_eq!(extract_trigger_statements(""), [] as [&str; 0]);
     }
 
     #[test]
     fn extract_trigger_statements_no_triggers() {
         let sql = "CREATE TABLE foo (id INT); CREATE INDEX idx ON foo (id);";
-        assert!(extract_trigger_statements(sql).is_empty());
+        assert_eq!(extract_trigger_statements(sql), [] as [&str; 0]);
     }
 
     #[test]

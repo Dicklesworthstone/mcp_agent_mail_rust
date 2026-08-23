@@ -1306,8 +1306,8 @@ mod tests {
 
     #[test]
     fn escalation_criteria_non_empty() {
-        assert!(!ESCALATION_CRITERIA.is_empty());
-        assert!(!SIMPLIFICATION_CRITERIA.is_empty());
+        assert_ne!(ESCALATION_CRITERIA, [] as [&str; 0]);
+        assert_ne!(SIMPLIFICATION_CRITERIA, [] as [&str; 0]);
     }
 
     #[test]

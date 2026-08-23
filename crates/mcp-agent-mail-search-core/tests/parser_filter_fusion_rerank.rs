@@ -112,8 +112,8 @@ fn extract_terms_filters_boolean_operators() {
 
 #[test]
 fn extract_terms_empty_input() {
-    assert!(extract_terms("").is_empty());
-    assert!(extract_terms("   ").is_empty());
+    assert_eq!(extract_terms(""), [] as [String; 0]);
+    assert_eq!(extract_terms("   "), [] as [String; 0]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -352,7 +352,10 @@ fn fusion_pagination_offset_and_limit() {
 #[test]
 fn fusion_empty_candidates() {
     let result = fuse_rrf_default(&[]);
-    assert!(result.hits.is_empty());
+    assert_eq!(
+        result.hits,
+        [] as [mcp_agent_mail_search_core::fusion::FusedHit; 0]
+    );
     assert_eq!(result.total_fused, 0);
     assert_eq!(result.input_count, 0);
 }
@@ -636,7 +639,7 @@ fn prepare_empty_both_pools() {
         combined_limit: 10,
     };
     let prep = prepare_candidates(&[], &[], budget);
-    assert!(prep.candidates.is_empty());
+    assert_eq!(prep.candidates, [] as [PreparedCandidate; 0]);
     assert_eq!(prep.counts.lexical_considered, 0);
     assert_eq!(prep.counts.semantic_considered, 0);
 }

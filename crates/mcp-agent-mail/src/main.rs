@@ -1169,7 +1169,9 @@ mod tests {
     fn serve_command_allowed_host_defaults_empty() {
         let cli = Cli::try_parse_from(["mcp-agent-mail", "serve"]).expect("should parse");
         match cli.command {
-            Some(Commands::Serve { allowed_host, .. }) => assert!(allowed_host.is_empty()),
+            Some(Commands::Serve { allowed_host, .. }) => {
+                assert_eq!(allowed_host, [] as [String; 0]);
+            }
             other => panic!("expected Serve, got {other:?}"),
         }
     }

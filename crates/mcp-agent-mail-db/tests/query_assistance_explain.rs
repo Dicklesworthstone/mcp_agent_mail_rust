@@ -157,7 +157,7 @@ fn hint_parsing_colon_in_value_preserved() {
 fn hint_parsing_empty_value_not_extracted() {
     // "from:" has empty value → treated as plain text
     let qa = parse_query_assistance("from: hello");
-    assert!(qa.applied_filter_hints.is_empty());
+    assert_eq!(qa.applied_filter_hints, [] as [AppliedFilterHint; 0]);
     assert_eq!(qa.query_text, "from: hello");
 }
 
@@ -191,7 +191,7 @@ fn zero_result_guidance_no_assistance_for_plain_text() {
 fn zero_result_guidance_assistance_present_for_hints() {
     let qa = parse_query_assistance("from:Alice deployment");
     // Has a hint → assistance should be non-empty
-    assert!(!qa.applied_filter_hints.is_empty());
+    assert_ne!(qa.applied_filter_hints, [] as [AppliedFilterHint; 0]);
     assert_eq!(qa.query_text, "deployment");
 }
 
@@ -237,8 +237,8 @@ fn zero_result_empty_input_variations() {
     for input in ["", "   ", "\t", "\n", "  \t  \n  "] {
         let qa = parse_query_assistance(input);
         assert!(qa.query_text.is_empty() || qa.query_text.trim().is_empty());
-        assert!(qa.applied_filter_hints.is_empty());
-        assert!(qa.did_you_mean.is_empty());
+        assert_eq!(qa.applied_filter_hints, [] as [AppliedFilterHint; 0]);
+        assert_eq!(qa.did_you_mean, [] as [DidYouMeanHint; 0]);
     }
 }
 

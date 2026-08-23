@@ -211,7 +211,7 @@ mod tests {
         let h1 = schema_hash();
         let h2 = schema_hash();
         assert_eq!(h1, h2);
-        assert!(!h1.is_empty());
+        assert_ne!(h1, "");
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
         while stream.advance() {
             tokens.push(stream.token().text.clone());
         }
-        assert!(tokens.is_empty());
+        assert_eq!(tokens, [] as [String; 0]);
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
         while stream.advance() {
             tokens.push(stream.token().text.clone());
         }
-        assert!(tokens.is_empty());
+        assert_eq!(tokens, [] as [String; 0]);
     }
 
     // ── Multi-doc-kind index ────────────────────────────────────────────
@@ -702,7 +702,7 @@ mod tests {
         let results = searcher
             .search(&AllQuery, &TopDocs::with_limit(10).order_by_score())
             .unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(f32, tantivy::DocAddress); 0]);
     }
 
     // ── Multiple documents search ─────────────────────────────────────
@@ -766,6 +766,6 @@ mod tests {
         while stream.advance() {
             tokens.push(stream.token().text.clone());
         }
-        assert!(tokens.is_empty());
+        assert_eq!(tokens, [] as [String; 0]);
     }
 }

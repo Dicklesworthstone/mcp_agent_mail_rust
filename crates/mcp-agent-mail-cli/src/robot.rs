@@ -5272,6 +5272,9 @@ fn build_recovery_only_status(
     Some((data, actions, project_slug, agent_name))
 }
 
+/// Alert tuple emitted alongside status output: (severity, summary, action).
+type StatusAlertEntry = (String, String, Option<String>);
+
 /// Status payload for the benign "current directory is not a registered
 /// project" case. The live SQLite index was opened and read fine; nothing is
 /// degraded, so this must NOT route through the recovery-only diagnostic path
@@ -5281,11 +5284,7 @@ fn build_recovery_only_status(
 fn build_unregistered_project_status(
     agent_flag: Option<&str>,
     source_error: &CliError,
-) -> (
-    StatusData,
-    Option<String>,
-    Vec<(String, String, Option<String>)>,
-) {
+) -> (StatusData, Option<String>, Vec<StatusAlertEntry>) {
     let agent_name = resolved_agent_flag_or_env(agent_flag);
     let data = StatusData {
         health: "ok".to_string(),

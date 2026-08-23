@@ -3851,7 +3851,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert_eq!(params.host, "127.0.0.1");
         assert_eq!(params.port, 8765);
         assert_eq!(params.path, "/mcp/");
-        assert!(params.token.is_empty());
+        assert_eq!(params.token, "");
         assert_eq!(params.project_dir, PathBuf::from("."));
         assert!(params.home_dir_override.is_none());
         assert!(!params.dry_run);
@@ -3878,7 +3878,7 @@ http_headers = { Authorization = "Bearer tok" }
     #[test]
     fn parse_agent_list_empty_string_returns_empty() {
         let list = parse_agent_list("").unwrap();
-        assert!(list.is_empty());
+        assert_eq!(list, [] as [AgentPlatform; 0]);
     }
 
     #[test]

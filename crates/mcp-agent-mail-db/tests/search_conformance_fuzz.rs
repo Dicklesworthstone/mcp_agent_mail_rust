@@ -400,7 +400,7 @@ fn conformance_explain_contract() {
     assert_eq!(explain.method, "like_fallback");
     // LIKE path does not produce a normalized_query (no FTS normalization step).
     assert!(explain.normalized_query.is_none());
-    assert!(!explain.sql.is_empty());
+    assert_ne!(explain.sql, "");
     assert!(explain.facets_applied.contains(&"project_id".to_string()));
     assert!(explain.facet_count >= 1);
     assert!(explain.used_like_fallback);
@@ -761,7 +761,7 @@ fn fuzz_time_range_extremes() {
         };
         // Must not panic
         let plan = plan_search(&q);
-        assert!(!plan.sql.is_empty());
+        assert_ne!(plan.sql, "");
     }
 }
 

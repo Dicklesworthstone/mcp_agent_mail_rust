@@ -1501,8 +1501,8 @@ mod tests {
             assert!(DEFAULT_CACHE_MAX_ENTRIES > 0);
             assert!(DEFAULT_CACHE_TTL_SECONDS > 0);
         }
-        assert!(!CACHE_MAX_ENTRIES_ENV.is_empty());
-        assert!(!CACHE_TTL_SECONDS_ENV.is_empty());
+        assert_ne!(CACHE_MAX_ENTRIES_ENV, "");
+        assert_ne!(CACHE_TTL_SECONDS_ENV, "");
     }
 
     // ── Invalidator cache accessor ──────────────────────────────────

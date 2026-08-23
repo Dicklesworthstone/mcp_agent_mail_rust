@@ -787,7 +787,7 @@ mod tests {
             Some(std::cmp::min(storage_free, db_free))
         );
         assert_eq!(sample.pressure, DiskPressure::Warning);
-        assert!(sample.errors.is_empty());
+        assert_eq!(sample.errors, [] as [String; 0]);
     }
 
     // ── DiskPressure enum coverage ──────────────────────────────────────

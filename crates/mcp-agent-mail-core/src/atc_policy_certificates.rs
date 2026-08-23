@@ -556,7 +556,7 @@ pub fn compute_doubly_robust(
                 raw_iw
             };
             sum_iw += iw;
-            sum_iw_sq += iw * iw;
+            sum_iw_sq = f64::mul_add(iw, iw, sum_iw_sq);
 
             // DR term: μ̂ + iw × (Y - μ̂), weighted by evidence and attribution.
             let augmentation = iw * (obs.realized_loss - obs.predicted_loss);
@@ -567,7 +567,7 @@ pub fn compute_doubly_robust(
         };
 
         sum_dr += dr_term;
-        sum_dr_sq += dr_term * dr_term;
+        sum_dr_sq = f64::mul_add(dr_term, dr_term, sum_dr_sq);
     }
 
     if n_contributing == 0 {
@@ -584,7 +584,7 @@ pub fn compute_doubly_robust(
     // sentinel instead of INFINITY because this struct derives Serialize and
     // serde_json rejects non-finite f64 values.
     let dr_variance = if n > 1.0 {
-        ((sum_dr_sq / n - candidate_dr_loss * candidate_dr_loss) / (n - 1.0)).max(0.0)
+        (candidate_dr_loss.mul_add(-candidate_dr_loss, sum_dr_sq / n) / (n - 1.0)).max(0.0)
     } else {
         1e15
     };
@@ -1416,7 +1416,7 @@ mod tests {
             "Expected certified, got: {}",
             cert.summary()
         );
-        assert!(cert.block_reasons.is_empty());
+        assert_eq!(cert.block_reasons, [] as [CertificationBlockReason; 0]);
         assert_eq!(cert.verdict, CertificateVerdict::Certified);
     }
 
@@ -1799,8 +1799,8 @@ mod tests {
     fn test_evidence_transfer_rules_complete() {
         // Every rule should have a valid transferability and description.
         for rule in EVIDENCE_TRANSFER_RULES {
-            assert!(!rule.category.is_empty());
-            assert!(!rule.on_regime_change.is_empty());
+            assert_ne!(rule.category, "");
+            assert_ne!(rule.on_regime_change, "");
             let discount = rule.transferability.regime_discount();
             assert!((0.0..=1.0).contains(&discount));
         }

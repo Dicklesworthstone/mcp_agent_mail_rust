@@ -80,10 +80,13 @@ impl NigStats {
         let half_df = df / 2.0;
         let nu_term = f64::midpoint(df, 1.0);
 
-        0.5f64.mul_add(
-            -(df * std::f64::consts::PI * scale_sq).ln(),
-            ln_gamma(nu_term) - ln_gamma(half_df),
-        ) - nu_term * (z * z / df).ln_1p()
+        nu_term.mul_add(
+            -(z * z / df).ln_1p(),
+            0.5f64.mul_add(
+                -(df * std::f64::consts::PI * scale_sq).ln(),
+                ln_gamma(nu_term) - ln_gamma(half_df),
+            ),
+        )
     }
 
     /// Predictive mean (= the current posterior mean of mu).

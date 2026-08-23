@@ -5273,10 +5273,10 @@ mod tests {
             prepare_recovery_receipt(&storage_root, &primary, Some(&primary), &second_candidate)
                 .expect_err("wrong source generation must not extend finalized chain");
         assert!(error.to_string().contains("live marker"));
-        assert!(
+        assert_eq!(
             pending_recovery_receipt_paths(first.final_path.parent().expect("receipt parent"))
-                .expect("scan pending receipts")
-                .is_empty()
+                .expect("scan pending receipts"),
+            [] as [std::path::PathBuf; 0]
         );
     }
 

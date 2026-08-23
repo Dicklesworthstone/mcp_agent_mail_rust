@@ -98,7 +98,7 @@ fn method_filter_only_no_text_with_facets() {
 fn method_empty_no_text_no_facets() {
     let plan = plan_search(&SearchQuery::default());
     assert_eq!(plan.method, PlanMethod::Empty);
-    assert!(plan.sql.is_empty());
+    assert_eq!(plan.sql, "");
     assert!(plan.params.is_empty());
 }
 
@@ -981,7 +981,7 @@ fn explain_fts_output() {
     assert_eq!(explain.method, "like_fallback");
     assert!(explain.used_like_fallback);
     assert!(explain.normalized_query.is_none());
-    assert!(!explain.sql.is_empty());
+    assert_ne!(explain.sql, "");
     assert_eq!(explain.denied_count, 0);
     assert_eq!(explain.redacted_count, 0);
 }
@@ -991,7 +991,7 @@ fn explain_empty_output() {
     let plan = plan_search(&SearchQuery::default());
     let explain = plan.explain();
     assert_eq!(explain.method, "empty");
-    assert!(explain.sql.is_empty());
+    assert_eq!(explain.sql, "");
     assert_eq!(explain.facet_count, 0);
 }
 

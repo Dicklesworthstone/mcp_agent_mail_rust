@@ -205,8 +205,8 @@ mod tests {
         let json = serde_json::to_string(&doc).unwrap();
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, 0);
-        assert!(back.body.is_empty());
-        assert!(back.title.is_empty());
+        assert_eq!(back.body, "");
+        assert_eq!(back.title, "");
     }
 
     #[test]

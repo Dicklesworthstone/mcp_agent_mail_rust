@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn empty_hits_returns_empty() {
         let result = diversify(Vec::new(), &HashMap::new(), &DiversityConfig::default());
-        assert!(result.hits.is_empty());
+        assert_eq!(result.hits, [] as [FusedHit; 0]);
         assert_eq!(result.demotions, 0);
     }
 

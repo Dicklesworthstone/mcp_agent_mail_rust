@@ -865,8 +865,8 @@ mod tests {
 
     #[test]
     fn extract_terms_empty() {
-        assert!(extract_terms("").is_empty());
-        assert!(extract_terms("AND OR NOT").is_empty());
+        assert_eq!(extract_terms(""), [] as [String; 0]);
+        assert_eq!(extract_terms("AND OR NOT"), [] as [String; 0]);
     }
 
     #[test]
@@ -931,13 +931,13 @@ mod tests {
                 },
             ]
         );
-        assert!(assistance.did_you_mean.is_empty());
+        assert_eq!(assistance.did_you_mean, [] as [DidYouMeanHint; 0]);
     }
 
     #[test]
     fn parse_query_assistance_supports_aliases() {
         let assistance = parse_query_assistance("sender:RedPeak prio:urgent since:2026-02-01");
-        assert!(assistance.query_text.is_empty());
+        assert_eq!(assistance.query_text, "");
         assert_eq!(
             assistance.applied_filter_hints,
             vec![
@@ -962,7 +962,7 @@ mod tests {
         let assistance = parse_query_assistance(
             "from_agent:BlueLake project_key:backend-api date_to:2026-02-01",
         );
-        assert!(assistance.query_text.is_empty());
+        assert_eq!(assistance.query_text, "");
         assert_eq!(
             assistance.applied_filter_hints,
             vec![
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn parse_query_assistance_normalizes_timezone_to_utc() {
         let assistance = parse_query_assistance("before:2026-02-01T00:30:00+02:00");
-        assert!(assistance.query_text.is_empty());
+        assert_eq!(assistance.query_text, "");
         assert_eq!(assistance.applied_filter_hints.len(), 1);
         assert_eq!(assistance.applied_filter_hints[0].field, "before");
         assert_eq!(
@@ -1010,7 +1010,10 @@ mod tests {
     fn parse_query_assistance_preserves_unknown_hint_tokens() {
         let assistance = parse_query_assistance("form:BlueLake migration");
         assert_eq!(assistance.query_text, "form:BlueLake migration");
-        assert!(assistance.applied_filter_hints.is_empty());
+        assert_eq!(
+            assistance.applied_filter_hints,
+            [] as [AppliedFilterHint; 0]
+        );
         assert_eq!(assistance.did_you_mean.len(), 1);
         assert_eq!(assistance.did_you_mean[0].suggested_field, "from");
     }
@@ -1028,8 +1031,11 @@ mod tests {
     fn parse_query_assistance_plain_text_compatibility() {
         let assistance = parse_query_assistance("just regular free text");
         assert_eq!(assistance.query_text, "just regular free text");
-        assert!(assistance.applied_filter_hints.is_empty());
-        assert!(assistance.did_you_mean.is_empty());
+        assert_eq!(
+            assistance.applied_filter_hints,
+            [] as [AppliedFilterHint; 0]
+        );
+        assert_eq!(assistance.did_you_mean, [] as [DidYouMeanHint; 0]);
     }
 
     // ── levenshtein_distance tests ──
@@ -1122,8 +1128,8 @@ mod tests {
 
     #[test]
     fn split_query_tokens_empty() {
-        assert!(split_query_tokens("").is_empty());
-        assert!(split_query_tokens("   ").is_empty());
+        assert_eq!(split_query_tokens(""), [] as [String; 0]);
+        assert_eq!(split_query_tokens("   "), [] as [String; 0]);
     }
 
     #[test]
@@ -1275,9 +1281,9 @@ mod tests {
     #[test]
     fn query_assistance_default() {
         let qa = QueryAssistance::default();
-        assert!(qa.query_text.is_empty());
-        assert!(qa.applied_filter_hints.is_empty());
-        assert!(qa.did_you_mean.is_empty());
+        assert_eq!(qa.query_text, "");
+        assert_eq!(qa.applied_filter_hints, [] as [AppliedFilterHint; 0]);
+        assert_eq!(qa.did_you_mean, [] as [DidYouMeanHint; 0]);
     }
 
     #[test]
@@ -1316,9 +1322,9 @@ mod tests {
     #[test]
     fn parse_query_assistance_empty_input() {
         let qa = parse_query_assistance("");
-        assert!(qa.query_text.is_empty());
-        assert!(qa.applied_filter_hints.is_empty());
-        assert!(qa.did_you_mean.is_empty());
+        assert_eq!(qa.query_text, "");
+        assert_eq!(qa.applied_filter_hints, [] as [AppliedFilterHint; 0]);
+        assert_eq!(qa.did_you_mean, [] as [DidYouMeanHint; 0]);
     }
 
     #[test]
@@ -1326,13 +1332,13 @@ mod tests {
         // "from:" has empty value part after trim → kept in query_text
         let qa = parse_query_assistance("from: hello");
         assert_eq!(qa.query_text, "from: hello");
-        assert!(qa.applied_filter_hints.is_empty());
+        assert_eq!(qa.applied_filter_hints, [] as [AppliedFilterHint; 0]);
     }
 
     #[test]
     fn parse_query_assistance_only_hints() {
         let qa = parse_query_assistance("from:X thread:Y project:Z");
-        assert!(qa.query_text.is_empty());
+        assert_eq!(qa.query_text, "");
         assert_eq!(qa.applied_filter_hints.len(), 3);
     }
 
@@ -1501,7 +1507,7 @@ mod tests {
             let hits = searcher
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1586,7 +1592,7 @@ mod tests {
                 .unwrap();
             // "deployment" is in subject of doc2 ("Deployment checklist")
             // "search" is in body of doc2 ("deploying the new search engine")
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1627,7 +1633,7 @@ mod tests {
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
             // "migration" term should still match doc 1
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1651,7 +1657,7 @@ mod tests {
             let hits = searcher
                 .search(&*query, &TopDocs::with_limit(100).order_by_score())
                 .unwrap();
-            assert!(hits.is_empty());
+            assert_eq!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]
@@ -1668,7 +1674,7 @@ mod tests {
             let hits = searcher
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
             // Doc 1 has "plan" in subject (boosted 2x) — should rank first
             let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
             let id = doc.get_first(handles.id).unwrap().as_u64().unwrap();
@@ -1773,7 +1779,7 @@ mod tests {
             let hits = searcher
                 .search(&query, &TopDocs::with_limit(10).order_by_score())
                 .unwrap();
-            assert!(!hits.is_empty());
+            assert_ne!(hits, [] as [(f32, tantivy::DocAddress); 0]);
         }
 
         #[test]

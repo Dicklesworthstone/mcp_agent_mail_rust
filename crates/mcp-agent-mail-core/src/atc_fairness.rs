@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn acceptable_asymmetries_are_explicit_and_bounded() {
-        assert!(!ACCEPTABLE_ASYMMETRY_RULES.is_empty());
+        assert_ne!(ACCEPTABLE_ASYMMETRY_RULES, []);
         assert!(
             ACCEPTABLE_ASYMMETRY_RULES
                 .iter()

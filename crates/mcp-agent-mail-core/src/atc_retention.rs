@@ -672,6 +672,6 @@ mod tests {
 
     #[test]
     fn periodic_audit_is_bounded_and_low_write_amplification() {
-        assert!(!GIT_ARCHIVE_EXPLICIT_EXCLUSIONS.is_empty());
+        assert_ne!(GIT_ARCHIVE_EXPLICIT_EXCLUSIONS, [] as [&str; 0]);
     }
 }

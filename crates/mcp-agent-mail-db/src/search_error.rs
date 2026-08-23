@@ -210,7 +210,7 @@ mod tests {
         ];
         for err in &errors {
             let debug = format!("{err:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 

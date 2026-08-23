@@ -109,7 +109,7 @@ fn snapshot_empty_table_returns_zero_rows() {
             .into_result()
             .expect("snapshot");
         assert_eq!(snap.rollup_rows, 0);
-        assert!(!snap.payload_sha256.is_empty());
+        assert_ne!(snap.payload_sha256, "");
         assert_eq!(snap.captured_ts_micros, 1_000_000);
     });
 }

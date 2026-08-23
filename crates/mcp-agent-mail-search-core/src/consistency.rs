@@ -1716,6 +1716,6 @@ mod tests {
         let restored: ReindexResult = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.stats.docs_indexed, 0);
         assert!(!restored.checkpoint_written);
-        assert!(restored.stats.warnings.is_empty());
+        assert_eq!(restored.stats.warnings, [] as [String; 0]);
     }
 }

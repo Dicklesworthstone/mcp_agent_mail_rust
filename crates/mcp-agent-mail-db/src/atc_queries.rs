@@ -2414,7 +2414,7 @@ mod tests {
         assert!(sql.contains("WHERE state IN"));
         assert!(sql.contains("ORDER BY created_ts DESC"));
         assert!(!sql.contains("LIMIT"));
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [Value; 0]);
     }
 
     #[test]

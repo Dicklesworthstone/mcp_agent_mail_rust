@@ -1497,7 +1497,7 @@ mod tests {
     fn test_score_normalization_empty() {
         let scores: Vec<f32> = vec![];
         let normalized = normalize_scores(&scores);
-        assert!(normalized.is_empty());
+        assert_eq!(normalized, [] as [f32; 0]);
     }
 
     #[test]
@@ -2660,7 +2660,7 @@ mod tests {
             let json = serde_json::to_string(status).unwrap();
             let restored: IndexStatus = serde_json::from_str(&json).unwrap();
             let debug = format!("{restored:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 
@@ -2905,7 +2905,7 @@ mod tests {
     fn detect_zero_quality_docs_empty_index() {
         let config = TwoTierConfig::default();
         let index = TwoTierIndex::new(&config);
-        assert!(index.detect_zero_quality_docs().is_empty());
+        assert_eq!(index.detect_zero_quality_docs(), [] as [u64; 0]);
     }
 
     #[test]

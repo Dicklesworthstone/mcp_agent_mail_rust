@@ -768,7 +768,7 @@ mod tests {
         let ctx = FailureContext::capture("test_example", Some(42), "assertion failed: x == 3");
         assert_eq!(ctx.test_name, "test_example");
         assert_eq!(ctx.harness_seed, Some(42));
-        assert!(!ctx.failure_ts.is_empty());
+        assert_ne!(ctx.failure_ts, "");
         assert!(ctx.repro_command.contains("HARNESS_SEED=42"));
         assert!(ctx.repro_command.contains("test_example"));
     }
@@ -961,7 +961,7 @@ mod tests {
         let report = FlakeReport::from_runs("always_fails", runs);
         assert_eq!(report.verdict, FlakeVerdict::DeterministicFailure);
         assert_eq!(report.failures, 2);
-        assert!(!report.failing_seeds.is_empty());
+        assert_ne!(report.failing_seeds, [] as [u64; 0]);
     }
 
     #[test]
@@ -1538,7 +1538,7 @@ mod tests {
     #[test]
     fn extend_seeds_zero_target() {
         let extended = extend_seeds(&[1, 2, 3], 0);
-        assert!(extended.is_empty());
+        assert_eq!(extended, [] as [u64; 0]);
     }
 
     // ── FlakeReport multiline failure message ────────────────────────

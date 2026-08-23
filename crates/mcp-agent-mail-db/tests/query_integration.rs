@@ -1406,6 +1406,84 @@ fn create_file_reservations_large_handles_many_rows() {
 }
 
 #[test]
+fn list_file_reservations_page_excludes_ledger_released_rows_before_paging() {
+    // Regression for the paginated active listing: rows released via the
+    // sidecar release ledger (with a legacy NULL/sentinel released_ts on the
+    // row itself) must be excluded by SQL BEFORE LIMIT/OFFSET. If they are
+    // only subtracted in Rust after paging, they consume page slots and every
+    // later page starts at a shifted boundary.
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "IronHawk");
+
+    let paths: Vec<String> = (0..12)
+        .map(|idx| format!("src/paged/res_{idx:02}.rs"))
+        .collect();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let pool2 = pool.clone();
+    let created = block_on(|cx| async move {
+        match queries::create_file_reservations(
+            &cx,
+            &pool2,
+            pid,
+            agent_id,
+            &path_refs,
+            3600,
+            true,
+            "paged-ledger-test",
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows,
+            other => panic!("bulk reserve failed: {other:?}"),
+        }
+    });
+    assert_eq!(created.len(), 12);
+
+    // Release the 2nd and 4th created reservations through the sidecar
+    // ledger ONLY — the file_reservations rows keep their fresh NULL
+    // released_ts and still pass the legacy candidate predicate.
+    let ledger_ids = [created[1].id.unwrap(), created[3].id.unwrap()];
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            for id in ledger_ids {
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+                     VALUES ({id}, 1)"
+                ))
+                .expect("insert sidecar ledger release");
+            }
+        }
+    });
+
+    let pool3 = pool.clone();
+    let page1 = block_on(|cx| async move {
+        match queries::list_file_reservations_page(&cx, &pool3, pid, true, 10, 0).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("page 1 failed: {other:?}"),
+        }
+    });
+    assert_eq!(page1.len(), 10, "page 1 must be full of true actives");
+    assert!(
+        !page1
+            .iter()
+            .any(|row| row.id.is_some_and(|id| ledger_ids.contains(&id))),
+        "page 1 must not contain ledger-released rows"
+    );
+
+    let pool4 = pool.clone();
+    let page2 = block_on(|cx| async move {
+        match queries::list_file_reservations_page(&cx, &pool4, pid, true, 10, 10).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("page 2 failed: {other:?}"),
+        }
+    });
+    assert_eq!(page2.len(), 2, "exactly two actives remain for page 2");
+}
+
+#[test]
 fn release_reservations_by_ids_partial_large_set_remains_stable() {
     let (pool, _dir) = make_pool();
     let pid = setup_project(&pool);

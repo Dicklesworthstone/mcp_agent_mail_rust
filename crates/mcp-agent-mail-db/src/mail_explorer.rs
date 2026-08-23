@@ -1021,8 +1021,8 @@ mod tests {
         assert_eq!(q.sort, SortMode::DateDesc);
         assert_eq!(q.group, GroupMode::None);
         assert_eq!(q.ack_filter, AckFilter::All);
-        assert!(q.importance_filter.is_empty());
-        assert!(q.text_filter.is_empty());
+        assert_eq!(q.importance_filter, [] as [String; 0]);
+        assert_eq!(q.text_filter, "");
         assert_eq!(q.limit, 0);
         assert_eq!(q.offset, 0);
     }

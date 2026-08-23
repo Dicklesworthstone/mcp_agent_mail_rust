@@ -735,7 +735,7 @@ mod tests {
             report.reasons
         );
         assert_eq!(report.status, "ok");
-        assert!(report.reasons.is_empty());
+        assert_eq!(report.reasons, [] as [String; 0]);
         // Percentages computed.
         assert_eq!(report.disk_free_pct, Some(50.0));
         assert_eq!(report.inodes_free_pct, Some(90.0));

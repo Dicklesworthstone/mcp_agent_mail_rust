@@ -873,8 +873,8 @@ mod tests {
 
     #[test]
     fn test_evidence_trust_explanations() {
-        assert!(!EvidenceTrustLevel::High.explanation().is_empty());
-        assert!(!EvidenceTrustLevel::Quarantined.explanation().is_empty());
+        assert_ne!(EvidenceTrustLevel::High.explanation(), "");
+        assert_ne!(EvidenceTrustLevel::Quarantined.explanation(), "");
         assert!(
             EvidenceTrustLevel::Quarantined
                 .explanation()
@@ -951,11 +951,11 @@ mod tests {
     fn test_golden_workflows_complete() {
         assert!(GOLDEN_WORKFLOWS.len() >= 7);
         for wf in GOLDEN_WORKFLOWS {
-            assert!(!wf.name.is_empty());
-            assert!(!wf.trigger.is_empty());
-            assert!(!wf.expected_surface.is_empty());
-            assert!(!wf.expected_action.is_empty());
-            assert!(!wf.anti_pattern.is_empty());
+            assert_ne!(wf.name, "");
+            assert_ne!(wf.trigger, "");
+            assert_ne!(wf.expected_surface, "");
+            assert_ne!(wf.expected_action, "");
+            assert_ne!(wf.anti_pattern, "");
         }
     }
 

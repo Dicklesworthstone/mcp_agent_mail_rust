@@ -519,7 +519,7 @@ mod tests {
     fn project_row_default_has_recent_timestamp() {
         let proj = ProjectRow::default();
         assert!(proj.id.is_none());
-        assert!(proj.slug.is_empty());
+        assert_eq!(proj.slug, "");
         let now = now_micros();
         assert!((now - proj.created_at).abs() < 1_000_000);
     }
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(agent.name, "BlueLake");
         assert_eq!(agent.program, "claude-code");
         assert_eq!(agent.model, "opus-4.6");
-        assert!(agent.task_description.is_empty());
+        assert_eq!(agent.task_description, "");
     }
 
     #[test]
@@ -682,7 +682,7 @@ mod tests {
     fn agent_link_default() {
         let link = AgentLinkRow::default();
         assert_eq!(link.status, "pending");
-        assert!(link.reason.is_empty());
+        assert_eq!(link.reason, "");
         assert!(link.expires_ts.is_none());
         assert_eq!(link.created_ts, link.updated_ts);
     }
@@ -768,8 +768,8 @@ mod tests {
     fn product_row_default() {
         let prod = ProductRow::default();
         assert!(prod.id.is_none());
-        assert!(prod.product_uid.is_empty());
-        assert!(prod.name.is_empty());
+        assert_eq!(prod.product_uid, "");
+        assert_eq!(prod.name, "");
     }
 
     // ── Timestamp consistency ───────────────────────────────────────

@@ -818,7 +818,7 @@ mod tests {
         assert!(entry.actual.is_none());
         assert!(entry.correct.is_none());
         assert!(entry.trace_id.is_none());
-        assert!(entry.model.is_empty());
+        assert_eq!(entry.model, "");
         assert!(entry.ts_micros > 0);
     }
 
@@ -914,8 +914,8 @@ mod tests {
         let ledger = EvidenceLedger::new(100);
         assert_eq!(ledger.len(), 0);
         assert!(ledger.is_empty());
-        assert!(ledger.recent(10).is_empty());
-        assert!(ledger.query("anything", 10).is_empty());
+        assert_eq!(ledger.recent(10), [] as [EvidenceLedgerEntry; 0]);
+        assert_eq!(ledger.query("anything", 10), [] as [EvidenceLedgerEntry; 0]);
     }
 
     /// `hit_rate` returns 0.0 when no outcomes are recorded.

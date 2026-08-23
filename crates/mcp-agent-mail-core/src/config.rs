@@ -3885,7 +3885,7 @@ mod tests {
         let config = Config::default();
         // Off by default => self-asserted registration is unchanged.
         assert!(!config.proof_gate.enabled);
-        assert!(config.proof_gate.trusted_keys.is_empty());
+        assert_eq!(config.proof_gate.trusted_keys, [] as [String; 0]);
         assert_eq!(config.proof_gate.max_lifetime_seconds, 300);
         assert_eq!(config.proof_gate.clock_skew_seconds, 60);
         assert!(config.proof_gate.require_nonce);
@@ -4719,7 +4719,7 @@ mod tests {
         // #146: loopback-only by default — no extra Host headers are accepted
         // unless explicitly opted in.
         let config = Config::default();
-        assert!(config.http_allowed_hosts.is_empty());
+        assert_eq!(config.http_allowed_hosts, [] as [String; 0]);
     }
 
     #[test]

@@ -477,7 +477,7 @@ mod tests {
         ];
         for v in &variants {
             let debug = format!("{v:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 

@@ -500,7 +500,7 @@ mod tests {
         engine.add_candidate(candidate_policy("v2"));
 
         let selected = engine.select_deterministic();
-        assert!(!selected.policy_id.is_empty());
+        assert_ne!(selected.policy_id, "");
     }
 
     #[test]

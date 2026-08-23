@@ -1816,7 +1816,7 @@ mod tests {
     #[test]
     fn generate_agent_name_nonempty() {
         let name = generate_agent_name();
-        assert!(!name.is_empty());
+        assert_ne!(name, "");
         assert!(name.len() >= 4, "name should be at least 4 chars: '{name}'");
     }
 

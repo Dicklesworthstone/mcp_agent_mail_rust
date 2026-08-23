@@ -735,10 +735,10 @@ mod tests {
 
     #[test]
     fn freshness_contracts_non_empty() {
-        assert!(!FRESHNESS_CONTRACTS.is_empty());
+        assert_ne!(FRESHNESS_CONTRACTS, []);
         for contract in FRESHNESS_CONTRACTS {
-            assert!(!contract.stale_behavior.is_empty());
-            assert!(!contract.partial_behavior.is_empty());
+            assert_ne!(contract.stale_behavior, "");
+            assert_ne!(contract.partial_behavior, "");
         }
     }
 
