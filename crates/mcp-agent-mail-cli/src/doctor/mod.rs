@@ -690,16 +690,17 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     let config = Config::from_env();
     let storage_root = config.storage_root.clone();
     let canonical_mcp_url = canonical_mcp_url_for_config(&config);
-    // These two fixers reconcile SQLite truth with archive artifacts. Their
-    // pre-mutation revalidation is decisive only while both mailbox authority
-    // domains are held exclusively for the complete detect+fix interval.
-    let _reservation_mutation_locks = if !dry_run
+    // Every auto-fixable detector in the retained logical-read family must
+    // revalidate and mutate while mailbox DB/archive authority is exclusive.
+    let _db_mutation_locks = if !dry_run
         && matches!(
             fm_id,
-            fixers::reservation_db_archive_parity::FM_ID
+            fixers::inbox_stats_divergence::FM_ID
+                | fixers::legacy_fts_residue::FM_ID
+                | fixers::orphan_foreign_key_rows::FM_ID
+                | fixers::reservation_db_archive_parity::FM_ID
                 | fixers::reservation_artifact_normalize::FM_ID
-        )
-    {
+        ) {
         Some(crate::acquire_cli_mailbox_mutation_locks(
             &config.database_url,
             Some(&storage_root),
@@ -948,10 +949,7 @@ pub(crate) fn detect_archive_normalize_reservation_artifacts(
             )
         })
         .collect();
-    fixers::reservation_artifact_normalize::detect_prepared(
-        Some(storage_root),
-        &read_candidates,
-    )
+    fixers::reservation_artifact_normalize::detect_prepared(Some(storage_root), &read_candidates)
 }
 
 /// Apply a pre-confirmed `archive-normalize` reservation artifact plan.
@@ -1046,10 +1044,8 @@ pub(crate) fn apply_archive_normalize_reservation_artifacts(
             outcome.actions_skipped += 1;
             continue;
         };
-        let result = fixers::reservation_artifact_normalize::fix_prepared(
-            &ctx, finding, candidate,
-        )
-        .map_err(|error| {
+        let result = fixers::reservation_artifact_normalize::fix_prepared(&ctx, finding, candidate)
+            .map_err(|error| {
                 CliError::Other(format!(
                     "archive-normalize reservation artifact mutation failed: {error}"
                 ))

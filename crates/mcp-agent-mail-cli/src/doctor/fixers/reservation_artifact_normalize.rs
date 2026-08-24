@@ -10,7 +10,7 @@
 //! ## Fix
 //!
 //! This fixer only acts when it can establish the artifact's identity from its
-//! filename and JSON plus the current immutable SQLite database:
+//! filename and JSON plus a freshly revalidated WAL-aware logical DB source:
 //!
 //! - A legacy artifact is stamped and renamed only when its `(project, id)` has
 //!   a live DB reservation in the current generation.
@@ -198,8 +198,7 @@ pub(crate) fn fix_prepared(
         std::slice::from_ref(&refreshed),
     )
     .into_iter()
-    .next()
-    else {
+    .next() else {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
@@ -591,18 +590,16 @@ mod tests {
             .expect("settle generation baseline");
         mcp_agent_mail_db::close_db_conn(admitted, "settle generation WAL baseline");
 
-        let stale_candidate =
-            super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
-                &db_path,
-                "stale generation plan test",
-            );
+        let stale_candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db_path,
+            "stale generation plan test",
+        );
         let stale_finding =
             detect_prepared(Some(td.path()), std::slice::from_ref(&stale_candidate))
                 .pop()
                 .expect("initial generation should produce a plan");
         assert!(stale_finding.quarantines.iter().any(|artifact| {
-            artifact.source
-                == reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"))
+            artifact.source == reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"))
         }));
 
         let main_before = std::fs::read(&db_path).expect("read settled generation main");
@@ -627,8 +624,7 @@ mod tests {
             "fixture must retain committed generation WAL frames"
         );
 
-        let foreign_artifact =
-            reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"));
+        let foreign_artifact = reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"));
         let foreign_before = std::fs::read(&foreign_artifact).expect("read generation artifact");
         let outcome = fix_prepared(&ctx(&td), &stale_finding, &stale_candidate)
             .expect("refresh generation immediately before mutation");

@@ -166,10 +166,8 @@ impl OrphanForeignKeyRowsFinding {
 /// explicitly offline source. Production dispatch supplies retained logical
 /// snapshots for live FrankenSQLite families instead.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<OrphanForeignKeyRowsFinding> {
-    let read_candidates = super::explicit_offline_db_read_candidates(
-        candidate_dbs,
-        "orphan foreign-key detection",
-    );
+    let read_candidates =
+        super::explicit_offline_db_read_candidates(candidate_dbs, "orphan foreign-key detection");
     detect_prepared(&read_candidates)
 }
 
@@ -250,7 +248,30 @@ pub fn fix(
     ctx: &MutateContext,
     finding: &OrphanForeignKeyRowsFinding,
 ) -> Result<FixOutcome, MutateError> {
-    if !finding.has_auto_fixable_rows() {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "orphan foreign-key pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &MutateContext,
+    _finding: &OrphanForeignKeyRowsFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, MutateError> {
+    let refreshed = candidate.refresh("orphan foreign-key pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(std::slice::from_ref(&refreshed))
+        .into_iter()
+        .next()
+    else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+    if !fresh_finding.has_auto_fixable_rows() {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
@@ -259,7 +280,7 @@ pub fn fix(
     }
     let result = mutate(
         ctx,
-        &finding.db_path,
+        &fresh_finding.db_path,
         Op::DbExec {
             sql: orphan_file_reservations_quarantine_sql(),
         },
@@ -267,7 +288,8 @@ pub fn fix(
     let residual_auto_fixable = if ctx.dry_run || !result.ok {
         false
     } else {
-        detect(std::slice::from_ref(&finding.db_path))
+        let post_mutation = refreshed.refresh("orphan foreign-key post-mutation verification");
+        detect_prepared(std::slice::from_ref(&post_mutation))
             .iter()
             .any(OrphanForeignKeyRowsFinding::has_auto_fixable_rows)
     };

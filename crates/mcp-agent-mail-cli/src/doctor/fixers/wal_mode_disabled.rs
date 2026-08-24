@@ -89,8 +89,8 @@ impl WalModeDisabledFinding {
     }
 }
 
-/// Detector. PURE w.r.t. caller-supplied DB paths; reads from the
-/// SQLite file via `PRAGMA journal_mode;`.
+/// Detector. PURE w.r.t. caller-supplied DB paths; reads the persisted journal
+/// mode directly from the 100-byte SQLite header.
 ///
 /// `candidate_paths` is typically `[<storage_root>/storage.sqlite3]`.
 /// Empty slice skips the FM. `:memory:` URLs should be filtered
@@ -122,6 +122,7 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WalModeDisabledFinding> {
 /// sqlmodel-sqlite's `execute_raw` returns `Result<(), Error>` and
 /// doesn't expose query results. For the PRAGMA we need a query
 /// result, so use `query_sync` instead.
+#[cfg(test)]
 fn read_journal_mode(conn: &sqlmodel_sqlite::SqliteConnection) -> Option<String> {
     let rows = conn.query_sync("PRAGMA journal_mode;", &[]).ok()?;
     let first = rows.first()?;

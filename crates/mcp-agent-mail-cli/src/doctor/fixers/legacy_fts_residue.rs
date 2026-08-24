@@ -165,10 +165,8 @@ impl LegacyFtsResidueFinding {
 /// - the DB can't be opened
 /// - the sqlite_master query fails
 pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
-    let read_candidates = super::explicit_offline_db_read_candidates(
-        candidate_paths,
-        "legacy FTS residue detection",
-    );
+    let read_candidates =
+        super::explicit_offline_db_read_candidates(candidate_paths, "legacy FTS residue detection");
     detect_prepared(&read_candidates)
 }
 
@@ -299,14 +297,30 @@ pub fn fix(
     ctx: &MutateContext,
     finding: &LegacyFtsResidueFinding,
 ) -> Result<FixOutcome, MutateError> {
-    if !finding.db_path.exists() {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "legacy FTS residue pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &MutateContext,
+    _finding: &LegacyFtsResidueFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, MutateError> {
+    let refreshed = candidate.refresh("legacy FTS residue pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(std::slice::from_ref(&refreshed))
+        .into_iter()
+        .next()
+    else {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
             quarantined_paths: Vec::new(),
         });
-    }
-    let sql = build_drop_sql(&finding.residual_objects);
+    };
+    let sql = build_drop_sql(&fresh_finding.residual_objects);
     if sql.trim().is_empty() {
         return Ok(FixOutcome {
             actions_taken: 0,
@@ -314,7 +328,7 @@ pub fn fix(
             quarantined_paths: Vec::new(),
         });
     }
-    mutate(ctx, &finding.db_path, Op::DbExec { sql })?;
+    mutate(ctx, &fresh_finding.db_path, Op::DbExec { sql })?;
     Ok(FixOutcome {
         actions_taken: 1,
         actions_skipped: 0,

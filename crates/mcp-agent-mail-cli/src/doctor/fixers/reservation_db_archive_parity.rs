@@ -406,8 +406,7 @@ pub(crate) fn fix_prepared(
         std::slice::from_ref(&refreshed),
     )
     .into_iter()
-    .next()
-    else {
+    .next() else {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
@@ -624,8 +623,7 @@ mod tests {
 
     #[test]
     fn live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix() {
-        let (storage_root, db_path) =
-            materialize_fixture(STALE_AGENT_SQL, STALE_AGENT_JSON, 101);
+        let (storage_root, db_path) = materialize_fixture(STALE_AGENT_SQL, STALE_AGENT_JSON, 101);
 
         // Align the settled main image with the archive, then admit the family
         // through FrankenSQLite and checkpoint that clean baseline.

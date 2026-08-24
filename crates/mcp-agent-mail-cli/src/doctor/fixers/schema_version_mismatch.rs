@@ -182,9 +182,7 @@ pub(crate) fn detect_prepared(
     out
 }
 
-fn detect_one(
-    candidate: &super::DoctorDbReadCandidate,
-) -> Option<SchemaVersionMismatchFinding> {
+fn detect_one(candidate: &super::DoctorDbReadCandidate) -> Option<SchemaVersionMismatchFinding> {
     let conn = candidate.connection()?;
     let rows = conn.query_sync("PRAGMA user_version", &[]).ok()?;
     let on_disk: i64 = rows.first()?.get_named::<i64>("user_version").ok()?;

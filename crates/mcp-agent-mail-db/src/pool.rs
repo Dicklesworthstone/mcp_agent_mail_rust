@@ -10263,7 +10263,7 @@ pub fn rename_noreplace_preserving_source(
             destination,
             rustix::fs::RenameFlags::NOREPLACE,
         )
-        .map_err(std::io::Error::from);
+        .map_err(std::io::Error::from)
     }
 
     #[cfg(windows)]

@@ -291,7 +291,7 @@ impl DoctorDbReadCandidate {
                     "doctor fixer failed-export physical corruption probe",
                 ) {
                     Err(physical_error)
-                        if integrity_error_is_authoritative_corruption(
+                        if integrity_open_error_is_authoritative_corruption(
                             &physical_error.to_string(),
                         ) =>
                     {
@@ -314,10 +314,7 @@ impl DoctorDbReadCandidate {
     /// Open a caller-designated offline family without ever falling back to a
     /// live FrankenSQLite primary. This is the explicit source used by unit
     /// fixtures and genuinely offline maintenance callers.
-    pub(crate) fn open_explicit_offline(
-        target_path: &std::path::Path,
-        operation: &str,
-    ) -> Self {
+    pub(crate) fn open_explicit_offline(target_path: &std::path::Path, operation: &str) -> Self {
         match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
             target_path,
             operation,
@@ -349,13 +346,16 @@ impl DoctorDbReadCandidate {
     pub(crate) fn integrity_check_one(&self) -> DoctorIntegrityProbe {
         match self.source_kind {
             DoctorDbReadSourceKind::LiveLogicalSnapshot => {
-                let conn = match mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
-                    &self.target_path,
-                    "doctor fixer physical integrity probe",
-                ) {
-                    Ok(conn) => conn,
-                    Err(error) => return classify_integrity_probe_error(error.to_string()),
-                };
+                let conn =
+                    match mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                        &self.target_path,
+                        "doctor fixer physical integrity probe",
+                    ) {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            return classify_integrity_probe_open_error(error.to_string());
+                        }
+                    };
                 match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
                     Ok(rows) => match rows
                         .first()
@@ -382,10 +382,10 @@ impl DoctorDbReadCandidate {
                     Err(error) => classify_integrity_probe_error(error.to_string()),
                 }
             }
-            DoctorDbReadSourceKind::Unavailable => self
-                .physical_corruption_error
-                .clone()
-                .map_or(DoctorIntegrityProbe::Unavailable, DoctorIntegrityProbe::Corruption),
+            DoctorDbReadSourceKind::Unavailable => self.physical_corruption_error.clone().map_or(
+                DoctorIntegrityProbe::Unavailable,
+                DoctorIntegrityProbe::Corruption,
+            ),
         }
     }
 
@@ -410,14 +410,12 @@ impl DoctorDbReadCandidate {
             DoctorDbReadSourceKind::ExplicitOffline => {
                 Self::open_explicit_offline(&self.target_path, operation)
             }
-            DoctorDbReadSourceKind::Unavailable => {
-                Self::unavailable(
-                    &self.target_path,
-                    self.open_error
-                        .clone()
-                        .unwrap_or_else(|| "doctor fixer source is unavailable".to_string()),
-                )
-            }
+            DoctorDbReadSourceKind::Unavailable => Self::unavailable(
+                &self.target_path,
+                self.open_error
+                    .clone()
+                    .unwrap_or_else(|| "doctor fixer source is unavailable".to_string()),
+            ),
         }
     }
 }
@@ -430,12 +428,32 @@ fn classify_integrity_probe_error(detail: String) -> DoctorIntegrityProbe {
     }
 }
 
+fn classify_integrity_probe_open_error(detail: String) -> DoctorIntegrityProbe {
+    if integrity_open_error_is_authoritative_corruption(&detail) {
+        DoctorIntegrityProbe::Corruption(detail)
+    } else {
+        DoctorIntegrityProbe::Unavailable
+    }
+}
+
 fn integrity_error_is_authoritative_corruption(detail: &str) -> bool {
     matches!(
         mcp_agent_mail_db::classify_db_error_message(detail).class,
         mcp_agent_mail_db::DbErrorClass::MainDbBtreeCorruption
-            | mcp_agent_mail_db::DbErrorClass::WalSidecarCorruption
     )
+}
+
+fn integrity_open_error_is_authoritative_corruption(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    ![
+        "file is not a database",
+        "not a database",
+        "database file too small for header",
+        "invalid database header",
+    ]
+    .iter()
+    .any(|ownership_error| normalized.contains(ownership_error))
+        && integrity_error_is_authoritative_corruption(detail)
 }
 
 fn prepare_doctor_db_read_candidates(
@@ -1886,7 +1904,12 @@ pub fn dispatch_only(
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let result = inbox_stats_divergence::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = inbox_stats_divergence::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1907,7 +1930,12 @@ pub fn dispatch_only(
             // Auto-fix via Op::DbExec: dependency-ordered DROP of
             // the residual fts_* objects. Reversible via the
             // chokepoint's whole-DB-file backup.
-            let result = legacy_fts_residue::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = legacy_fts_residue::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1919,7 +1947,12 @@ pub fn dispatch_only(
             // Auto-fix is intentionally narrow: stale file_reservations
             // and release-ledger sidecars are quarantined via DbExec;
             // message-recipient history remains detect-only inside the FM.
-            let result = orphan_foreign_key_rows::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = orphan_foreign_key_rows::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1931,7 +1964,8 @@ pub fn dispatch_only(
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path) else {
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
                 outcome.actions_skipped += 1;
                 continue;
             };
@@ -1947,7 +1981,8 @@ pub fn dispatch_only(
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path) else {
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path)
+            else {
                 outcome.actions_skipped += 1;
                 continue;
             };
@@ -2895,10 +2930,8 @@ mod tests {
         let before_dir = sorted_dir_entries(td.path());
         let before_wal = wal.exists();
         let before_shm = shm.exists();
-        let candidate = DoctorDbReadCandidate::open_explicit_offline(
-            &db,
-            "explicit-offline candidate test",
-        );
+        let candidate =
+            DoctorDbReadCandidate::open_explicit_offline(&db, "explicit-offline candidate test");
         let conn = candidate.connection().expect("guarded offline open");
         let rows = conn
             .query_sync("SELECT COUNT(*) AS n FROM t", &[])

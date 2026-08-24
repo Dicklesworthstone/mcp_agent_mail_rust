@@ -145,10 +145,8 @@ impl IntegrityPageMalformedFinding {
 /// (`--only fm-db-state-files-integrity-page-malformed`) rather
 /// than bundling it into a sub-200ms health probe.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<IntegrityPageMalformedFinding> {
-    let read_candidates = super::explicit_offline_db_read_candidates(
-        candidate_dbs,
-        "integrity-page detection",
-    );
+    let read_candidates =
+        super::explicit_offline_db_read_candidates(candidate_dbs, "integrity-page detection");
     detect_prepared(&read_candidates)
 }
 
@@ -164,9 +162,7 @@ pub(crate) fn detect_prepared(
     out
 }
 
-fn detect_one(
-    candidate: &super::DoctorDbReadCandidate,
-) -> Option<IntegrityPageMalformedFinding> {
+fn detect_one(candidate: &super::DoctorDbReadCandidate) -> Option<IntegrityPageMalformedFinding> {
     let db_path = candidate.target_path();
     let result = match candidate.integrity_check_one() {
         super::DoctorIntegrityProbe::Result(result) => result,
@@ -227,6 +223,139 @@ mod tests {
     }
 
     #[test]
+    fn live_wal_only_check_violation_is_integrity_truth() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
+            .expect("open live integrity fixture");
+        admitted
+            .execute_raw(
+                "CREATE TABLE checked_values(value INTEGER NOT NULL CHECK(value > 0));
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("seed checked table");
+        mcp_agent_mail_db::close_db_conn(admitted, "settle integrity WAL baseline");
+        let main_before = std::fs::read(&db).expect("read settled integrity main");
+
+        // SQLite's integrity_check validates CHECK constraints. Disable only
+        // insertion-time enforcement and commit the invalid row to WAL, leaving
+        // the settled main image healthy. A direct immutable main-file probe
+        // therefore false-greens this fixture.
+        let writer = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
+            .expect("reopen live integrity writer");
+        writer
+            .execute_raw(
+                "PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA ignore_check_constraints = ON;
+                 INSERT INTO checked_values(value) VALUES (-1);",
+            )
+            .expect("commit invalid CHECK row only to WAL");
+        drop(writer);
+        assert_eq!(
+            std::fs::read(&db).expect("read WAL-only integrity main"),
+            main_before,
+            "fixture must keep the violating row out of the main image"
+        );
+        let wal_path = PathBuf::from(format!("{}-wal", db.display()));
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
+            "fixture must retain committed WAL frames"
+        );
+
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db,
+            "WAL-only integrity truth test",
+        );
+        let findings = detect_prepared(std::slice::from_ref(&candidate));
+        assert_eq!(findings.len(), 1, "WAL-only violation must be visible");
+        assert!(
+            findings[0]
+                .integrity_check_result
+                .to_ascii_lowercase()
+                .contains("check constraint"),
+            "unexpected integrity result: {}",
+            findings[0].integrity_check_result
+        );
+    }
+
+    #[test]
+    fn live_physical_index_damage_is_not_hidden_by_logical_snapshot() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE indexed_values(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE INDEX idx_indexed_values_name ON indexed_values(name);",
+        )
+        .unwrap();
+        for id in 1..=50_i64 {
+            conn.execute_raw(&format!(
+                "INSERT INTO indexed_values(id, name) VALUES ({id}, 'IndexWitness{id:02}');"
+            ))
+            .unwrap();
+        }
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let root_page = conn
+            .query_sync(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'idx_indexed_values_name'",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("rootpage")
+            .unwrap();
+        drop(conn);
+
+        let mut bytes = std::fs::read(&db).unwrap();
+        let raw_page_size = u16::from_be_bytes([bytes[16], bytes[17]]);
+        let page_size = if raw_page_size == 1 {
+            65_536_usize
+        } else {
+            usize::from(raw_page_size)
+        };
+        let page_start = (usize::try_from(root_page).unwrap() - 1) * page_size;
+        let page = &bytes[page_start..page_start + page_size];
+        let needle = b"IndexWitness";
+        let hit = page
+            .windows(needle.len())
+            .skip(16)
+            .position(|window| window == needle)
+            .expect("index page must contain a witness key")
+            + 16;
+        bytes[page_start + hit + 7] ^= 0x01;
+        std::fs::write(&db, bytes).unwrap();
+
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
+            .expect("admit physical-index corruption through FrankenSQLite");
+        let rows = admitted
+            .query_sync("SELECT COUNT(*) AS count FROM indexed_values", &[])
+            .expect("table b-tree remains readable");
+        assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 50);
+        mcp_agent_mail_db::close_db_conn(admitted, "settle physical integrity fixture");
+
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db,
+            "physical integrity authority test",
+        );
+        let logical_result = candidate
+            .connection()
+            .expect("logical snapshot")
+            .query_sync("PRAGMA integrity_check(1)", &[])
+            .expect("check rebuilt logical snapshot")[0]
+            .get_named::<String>("integrity_check")
+            .unwrap();
+        assert_eq!(logical_result, "ok", "VACUUM should rebuild the index");
+        let findings = detect_prepared(std::slice::from_ref(&candidate));
+        assert_eq!(
+            findings.len(),
+            1,
+            "physical index corruption must remain authoritative"
+        );
+        assert_ne!(findings[0].integrity_check_result, "ok");
+    }
+
+    #[test]
     fn detector_skips_missing_db() {
         let td = TempDir::new().unwrap();
         let findings = detect(&[td.path().join("nope.sqlite3")]);
@@ -255,6 +384,32 @@ mod tests {
         std::fs::write(&p, super::super::empty_or_truncated_db::SQLITE_MAGIC).unwrap();
         let findings = detect(std::slice::from_ref(&p));
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn production_prepared_source_keeps_non_sqlite_and_truncated_ownership_separate() {
+        let td = TempDir::new().unwrap();
+        let garbage = td.path().join("garbage.sqlite3");
+        let truncated = td.path().join("truncated.sqlite3");
+        std::fs::write(&garbage, b"not a sqlite db").unwrap();
+        std::fs::write(
+            &truncated,
+            super::super::empty_or_truncated_db::SQLITE_MAGIC,
+        )
+        .unwrap();
+        let candidates = [garbage, truncated]
+            .iter()
+            .map(|path| {
+                super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+                    path,
+                    "prepared integrity ownership test",
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            detect_prepared(&candidates).is_empty(),
+            "non-SQLite and truncated targets belong to empty_or_truncated_db"
+        );
     }
 
     #[cfg(unix)]
