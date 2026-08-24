@@ -1036,7 +1036,7 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
         ));
     }
 
-    let conn = crate::pool::open_guarded_read_only_sqlite_file(
+    let conn = crate::pool::open_guarded_read_only_canonical_sqlite_file(
         db_path,
         "database message-id inventory",
     )
@@ -1261,7 +1261,7 @@ pub fn compute_archive_drift_report(
 
 #[allow(clippy::result_large_err)]
 pub fn collect_db_project_identities(
-    conn: &crate::DbConn,
+    conn: &crate::CanonicalDbConn,
 ) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError> {
     let mut project_identities = BTreeSet::new();
     let project_rows = conn.query_sync("SELECT slug, human_key FROM projects", &[])?;

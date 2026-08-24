@@ -46,6 +46,7 @@ rayon = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 
 # sqlmodel dependencies
+fsqlite.workspace = true
 sqlmodel.workspace = true
 sqlmodel-core.workspace = true
 sqlmodel-query.workspace = true

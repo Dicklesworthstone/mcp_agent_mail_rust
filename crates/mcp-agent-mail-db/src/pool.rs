@@ -3045,7 +3045,7 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
-                        match open_guarded_read_only_sqlite_file(
+                        match open_guarded_read_only_franken_existing_file(
                             Path::new(&sqlite_path),
                             "strict query-only pool connection",
                         ) {
@@ -3616,10 +3616,10 @@ impl DbPool {
             return Ok(Vec::new());
         }
 
-        // Keep consistency sampling on FrankenSQLite and avoid JOIN-heavy scans:
+        // Keep consistency sampling read-only and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = open_guarded_read_only_sqlite_file(
+        let conn = open_guarded_read_only_canonical_sqlite_file(
             Path::new(&self.sqlite_path),
             "consistency probe",
         )
@@ -5189,7 +5189,10 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn = open_guarded_read_only_sqlite_file(primary_path, "mailbox database inventory")?;
+    let conn = open_guarded_read_only_canonical_sqlite_file(
+        primary_path,
+        "mailbox database inventory",
+    )?;
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -9485,16 +9488,10 @@ fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError
     let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
     let page_size_is_valid = raw_page_size == 1
         || ((512..=32_768).contains(&raw_page_size) && raw_page_size.is_power_of_two());
-    let page_size = if raw_page_size == 1 {
-        65_536_u64
-    } else {
-        u64::from(raw_page_size)
-    };
     let format_versions_are_valid = matches!(header[18], 1 | 2) && matches!(header[19], 1 | 2);
     let payload_fractions_are_valid = header[21..24] == [64, 32, 32];
     if header[..SQLITE_DATABASE_HEADER.len()] != *SQLITE_DATABASE_HEADER
         || !page_size_is_valid
-        || !metadata.len().is_multiple_of(page_size)
         || !format_versions_are_valid
         || !payload_fractions_are_valid
     {
@@ -9512,16 +9509,16 @@ fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError
 /// records beside the target. Read-only diagnostics therefore reject missing,
 /// non-regular, symlinked, and structurally invalid targets before the engine
 /// sees the pathname. When durable breaker history applies to these exact
-/// primary bytes, breaker authority is unreadable, or the WAL/SHM family is
-/// structurally suspect, a private copy of the exact family must pass the
+/// primary bytes, breaker authority is unreadable, or the generation sidecar
+/// family is structurally suspect, a private copy of the exact family must pass the
 /// no-cleanup health probe before the live read-only open is allowed. This
 /// keeps malformed/tripped authority source-neutral while preserving service
 /// for a family that is independently proven healthy.
 #[allow(clippy::result_large_err)]
-fn preflight_guarded_read_only_sqlite_family<'path>(
-    sqlite_path: &'path Path,
+fn preflight_guarded_read_only_sqlite_family(
+    sqlite_path: &Path,
     context: &str,
-) -> Result<&'path str, SqlError> {
+) -> Result<PathBuf, SqlError> {
     preflight_guarded_read_only_sqlite_family_with_probe(
         sqlite_path,
         context,
@@ -9530,17 +9527,28 @@ fn preflight_guarded_read_only_sqlite_family<'path>(
 }
 
 #[allow(clippy::result_large_err)]
-fn preflight_guarded_read_only_sqlite_family_with_probe<'path, F>(
-    sqlite_path: &'path Path,
+fn preflight_guarded_read_only_sqlite_family_with_probe<F>(
+    sqlite_path: &Path,
     context: &str,
     mut exact_family_probe: F,
-) -> Result<&'path str, SqlError>
+) -> Result<PathBuf, SqlError>
 where
     F: FnMut(&Path) -> Result<bool, SqlError>,
 {
     validate_sqlite_target_path(sqlite_path, context)?;
     let sqlite_path_str = sqlite_path_as_utf8(sqlite_path)?;
     strict_target_precheck(sqlite_path_str)?;
+    // FrankenSQLite canonicalizes before namespace admission. Resolve once
+    // after the no-follow validation above, then hand this exact stable path
+    // to both our admission lease and the engine so relative spellings cannot
+    // coordinate on a different namespace.
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {} after validating it: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    sqlite_path_as_utf8(&stable_path)?;
 
     let nonclean_authority = match crate::recovery_breaker::load(sqlite_path) {
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
@@ -9621,30 +9629,138 @@ where
         }
     }
 
-    Ok(sqlite_path_str)
+    Ok(stable_path)
 }
 
-/// Open an existing live mailbox database through FrankenSQLite's engine-
-/// enforced read-only mode after the source-neutral family preflight.
+#[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
 #[allow(clippy::result_large_err)]
-pub fn open_guarded_read_only_sqlite_file(
+fn begin_guarded_read_only_namespace_admission(
+    stable_path: &Path,
+    context: &str,
+) -> Result<fsqlite::fsqlite_vfs::namespace::PendingNamespaceOpen, SqlError> {
+    use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+
+    // ReadOnlyExisting intentionally treats a namespace with either sidecar
+    // absent as wholly unadmitted. Refuse an asymmetric pair here: silently
+    // ignoring an occupied peer is ambiguous authority, and a non-regular
+    // occupant must never reach the engine's Shared fallback.
+    let mut namespace_sidecars_present = 0_u8;
+    for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
+        let sidecar = sqlite_sidecar_path(stable_path, suffix);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                namespace_sidecars_present = namespace_sidecars_present.saturating_add(1);
+            }
+            Ok(_) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only FrankenSQLite open for {} because namespace sidecar {} is not a regular file",
+                    stable_path.display(),
+                    sidecar.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only FrankenSQLite open for {} because namespace sidecar {} cannot be inspected: {error}",
+                    stable_path.display(),
+                    sidecar.display()
+                )));
+            }
+        }
+    }
+    if namespace_sidecars_present != 2 {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because a complete pre-existing namespace sidecar pair is required",
+            stable_path.display()
+        )));
+    }
+
+    let pending = retry_sqlite_lock_impl(
+        sqlite_path_as_utf8(stable_path)?,
+        "strict read-only namespace admission",
+        || {
+            PendingNamespaceOpen::begin(stable_path, NamespaceOpenIntent::ReadOnlyExisting)
+                .map_err(|error| match error {
+                    fsqlite::FrankenError::Busy
+                    | fsqlite::FrankenError::BusyRecovery
+                    | fsqlite::FrankenError::BusySnapshot { .. }
+                    | fsqlite::FrankenError::DatabaseLocked { .. }
+                    | fsqlite::FrankenError::LockFailed { .. } => {
+                        SqlError::Custom(error.to_string())
+                    }
+                    _ => SqlError::Custom(format!(
+                        "{context}: refusing live read-only FrankenSQLite open for {} because its existing namespace authority is malformed or unsafe",
+                        stable_path.display()
+                    )),
+                })
+        },
+        std::thread::sleep,
+    )?;
+
+    let expected_identity = pending.expected_identity().ok_or_else(|| {
+        SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its namespace authority disappeared during admission",
+            stable_path.display()
+        ))
+    })?;
+    let identity_guard =
+        mcp_agent_mail_core::disk::open_regular_file_no_follow(stable_path).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot pin the validated SQLite identity {} during namespace admission: {error}",
+                stable_path.display()
+            ))
+        })?;
+    let actual_identity = fsqlite::FileIdentity::from_file(&identity_guard).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot identify the validated SQLite file {} during namespace admission: {error}",
+            stable_path.display()
+        ))
+    })?;
+    if actual_identity != Some(expected_identity) {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its quiescent namespace record names a different database generation",
+            stable_path.display()
+        )));
+    }
+
+    Ok(pending)
+}
+
+/// Open one strict query-only pool connection through FrankenSQLite's engine-
+/// enforced read-only mode after the source-neutral family preflight.
+///
+/// A complete pre-existing namespace pair is required and held under
+/// `ReadOnlyExisting` across the engine open. Its recorded identity is checked
+/// before the engine can enter its writer-capable stale-record fallback.
+/// Sidecar-less databases must use the canonical diagnostic opener because
+/// FrankenSQLite cannot lock the absence of its namespace files. Dedicated
+/// mailbox diagnostics therefore use canonical read-only connections.
+#[allow(clippy::result_large_err)]
+pub fn open_guarded_read_only_franken_existing_file(
     sqlite_path: &Path,
     context: &str,
 ) -> Result<DbConn, SqlError> {
-    let sqlite_path_str = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    let stable_path = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
+    // When a namespace pair exists, hold its lease until the engine has
+    // installed its own read-only binding. A copied/stale recorded identity is
+    // refused above, before the engine can rewrite namespace bytes.
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    let _namespace_admission =
+        begin_guarded_read_only_namespace_admission(&stable_path, context)?;
     // The preflight makes retrying only lock/busy failures safe: every attempt
     // uses the engine's read-only mode, and corruption/open failures are
     // returned immediately rather than repeatedly touching the pathname.
     let conn = open_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(|error| {
         SqlError::Custom(format!(
             "{context}: cannot open {} read-only: {error}",
-            sqlite_path.display()
+            stable_path.display()
         ))
     })?;
     if let Err(error) = conn.execute_raw("PRAGMA query_only = ON;") {
         return Err(SqlError::Custom(format!(
             "{context}: cannot enforce query-only mode for {}: {error}",
-            sqlite_path.display()
+            stable_path.display()
         )));
     }
     Ok(conn)
@@ -9657,19 +9773,20 @@ pub fn open_guarded_read_only_canonical_sqlite_file(
     sqlite_path: &Path,
     context: &str,
 ) -> Result<crate::CanonicalDbConn, SqlError> {
-    let sqlite_path_str = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    let stable_path = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
     let conn = open_canonical_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(
         |error| {
             SqlError::Custom(format!(
                 "{context}: cannot open {} with canonical SQLite read-only flags: {error}",
-                sqlite_path.display()
+                stable_path.display()
             ))
         },
     )?;
     conn.execute_raw("PRAGMA query_only = ON;").map_err(|error| {
         SqlError::Custom(format!(
             "{context}: cannot enforce canonical query-only mode for {}: {error}",
-            sqlite_path.display()
+            stable_path.display()
         ))
     })?;
     Ok(conn)
@@ -13599,6 +13716,36 @@ mod tests {
             .expect("populate diagnostic fixture table");
     }
 
+    fn admit_diagnostic_database_with_franken(path: &Path) {
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open diagnostic fixture through FrankenSQLite");
+        conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
+            .expect("query Franken-admitted diagnostic fixture");
+        crate::close_db_conn(conn, "settle Franken-admitted diagnostic fixture");
+        assert!(sqlite_sidecar_path(path, "-fsqlite-ns-gate").is_file());
+        assert!(sqlite_sidecar_path(path, "-fsqlite-ns-use").is_file());
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn seed_quiescent_franken_namespace(path: &Path) {
+        use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+
+        let stable_path = std::fs::canonicalize(path).expect("canonicalize namespace fixture");
+        let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&stable_path)
+            .expect("open namespace fixture identity");
+        let identity = fsqlite::FileIdentity::from_file(&file)
+            .expect("read namespace fixture identity")
+            .expect("native namespace fixture has a stable identity");
+        let binding = PendingNamespaceOpen::begin(&stable_path, NamespaceOpenIntent::Shared)
+            .expect("admit namespace fixture")
+            .bind(identity)
+            .expect("bind namespace fixture identity");
+        binding
+            .finish_bootstrap()
+            .expect("publish namespace fixture identity");
+        drop(binding);
+    }
+
     fn install_diagnostic_breaker(path: &Path, breaker_kind: &str) {
         let breaker_path = crate::recovery_breaker::breaker_sidecar_path(path);
         if breaker_kind == "malformed" {
@@ -13704,7 +13851,7 @@ mod tests {
             install_diagnostic_breaker(&db_path, breaker_kind);
             let before = exact_diagnostic_parent_snapshot(directory.path());
 
-            match open_guarded_read_only_sqlite_file(
+            match open_guarded_read_only_franken_existing_file(
                 &db_path,
                 "Franken diagnostic helper test",
             ) {
@@ -13771,7 +13918,7 @@ mod tests {
             let before = exact_diagnostic_parent_snapshot(directory.path());
 
             assert!(
-                open_guarded_read_only_sqlite_file(
+                open_guarded_read_only_franken_existing_file(
                     &db_path,
                     "non-regular Franken sidecar test",
                 )
@@ -13800,7 +13947,8 @@ mod tests {
         let before = exact_diagnostic_parent_snapshot(directory.path());
 
         assert!(
-            open_guarded_read_only_sqlite_file(&db_path, "corrupt Franken header test").is_err()
+            open_guarded_read_only_franken_existing_file(&db_path, "corrupt Franken header test")
+                .is_err()
         );
         assert!(
             open_guarded_read_only_canonical_sqlite_file(
@@ -13822,29 +13970,7 @@ mod tests {
                 .join(format!("guarded-healthy-{breaker_kind}.sqlite3"));
             seed_settled_diagnostic_database(&db_path);
             install_diagnostic_breaker(&db_path, breaker_kind);
-            let before = exact_diagnostic_parent_snapshot(directory.path());
-
-            {
-                let conn = open_guarded_read_only_sqlite_file(
-                    &db_path,
-                    "healthy Franken diagnostic helper test",
-                )
-                .expect("healthy exact family must remain readable");
-                assert_eq!(
-                    conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
-                        .expect("query healthy Franken diagnostic")[0]
-                        .get_named::<i64>("value")
-                        .expect("decode diagnostic value"),
-                    7
-                );
-                conn.execute_raw("PRAGMA query_only = OFF;")
-                    .expect("disable connection-local Franken query_only guard");
-                assert!(
-                    conn.execute_raw("CREATE TABLE forbidden_franken(value INTEGER)")
-                        .is_err(),
-                    "engine read-only flags must survive a query_only downgrade attempt"
-                );
-            }
+            let canonical_before = exact_diagnostic_parent_snapshot(directory.path());
 
             {
                 let conn = open_guarded_read_only_canonical_sqlite_file(
@@ -13867,14 +13993,285 @@ mod tests {
                     "canonical read-only flags must survive a query_only downgrade attempt"
                 );
             }
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                canonical_before,
+                "successful canonical diagnostics must preserve exact names and bytes"
+            );
+            assert_no_read_only_diagnostic_artifacts(directory.path());
+
+            // A Franken-typed strict pool is admitted only when an exact
+            // pre-existing Franken namespace can be locked and identity-
+            // checked. Seed that authority before the mutation snapshot.
+            admit_diagnostic_database_with_franken(&db_path);
+            let franken_before = exact_diagnostic_parent_snapshot(directory.path());
+
+            {
+                let conn = open_guarded_read_only_franken_existing_file(
+                    &db_path,
+                    "healthy Franken strict-pool helper test",
+                )
+                .expect("healthy admitted exact family must remain readable");
+                assert_eq!(
+                    conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
+                        .expect("query healthy Franken diagnostic")[0]
+                        .get_named::<i64>("value")
+                        .expect("decode Franken diagnostic value"),
+                    7
+                );
+                conn.execute_raw("PRAGMA query_only = OFF;")
+                    .expect("disable connection-local Franken query_only guard");
+                assert!(
+                    conn.execute_raw("CREATE TABLE forbidden_franken(value INTEGER)")
+                        .is_err(),
+                    "Franken read-only flags must survive a query_only downgrade attempt"
+                );
+            }
 
             assert_eq!(
                 exact_diagnostic_parent_snapshot(directory.path()),
-                before,
-                "successful read-only diagnostics must preserve exact names and bytes"
+                franken_before,
+                "successful Franken strict-pool reads must preserve exact names and bytes"
             );
-            assert_no_read_only_diagnostic_artifacts(directory.path());
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn franken_query_only_seam_refuses_malformed_and_stale_namespace_without_rebinding() {
+        for namespace_kind in ["malformed", "stale-generation"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("namespace-{namespace_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            seed_quiescent_franken_namespace(&db_path);
+            let use_path = sqlite_sidecar_path(&db_path, "-fsqlite-ns-use");
+
+            if namespace_kind == "malformed" {
+                std::fs::write(&use_path, b"malformed namespace authority")
+                    .expect("corrupt namespace authority fixture");
+            } else {
+                let displaced = directory.path().join("displaced.sqlite3");
+                std::fs::rename(&db_path, &displaced)
+                    .expect("displace recorded namespace generation");
+                seed_settled_diagnostic_database(&db_path);
+            }
+
+            let sentinel = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            std::fs::File::options()
+                .write(true)
+                .open(&use_path)
+                .expect("open namespace use record for timestamp sentinel")
+                .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+                .expect("set namespace use timestamp sentinel");
+            let use_before = std::fs::read(&use_path).expect("snapshot namespace use bytes");
+            let use_metadata_before = std::fs::metadata(&use_path)
+                .expect("snapshot namespace use metadata");
+            let family_before = exact_diagnostic_parent_snapshot(directory.path());
+
+            match open_guarded_read_only_franken_existing_file(
+                &db_path,
+                "stale namespace query-only pool test",
+            ) {
+                Ok(conn) => {
+                    drop(conn);
+                    panic!("Franken pool seam must refuse {namespace_kind} namespace authority");
+                }
+                Err(_) => {}
+            }
+
+            // Dedicated diagnostics use canonical read-only mode and do not
+            // consume or repair FrankenSQLite's machine-local namespace.
+            let canonical = open_guarded_read_only_canonical_sqlite_file(
+                &db_path,
+                "stale namespace canonical diagnostic control",
+            )
+            .expect("canonical diagnostic remains source-neutral and readable");
+            assert_eq!(
+                canonical
+                    .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                    .expect("query canonical stale-namespace control")[0]
+                    .get_named::<i64>("value")
+                    .expect("decode canonical stale-namespace value"),
+                7
+            );
+            drop(canonical);
+
+            let use_metadata_after =
+                std::fs::metadata(&use_path).expect("inspect preserved namespace use metadata");
+            assert_eq!(std::fs::read(&use_path).unwrap(), use_before);
+            assert_eq!(use_metadata_after.len(), use_metadata_before.len());
+            assert_eq!(
+                use_metadata_after.modified().ok(),
+                use_metadata_before.modified().ok(),
+                "read-only seams must not rewrite namespace authority metadata"
+            );
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                family_before,
+                "read-only seams must preserve every namespace-family name and byte"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_accept_relative_sidecarless_database_without_artifacts() {
+        let current_dir = std::env::current_dir().expect("current directory");
+        let directory = tempfile::Builder::new()
+            .prefix("relative-read-only-")
+            .tempdir_in(&current_dir)
+            .expect("relative-path tempdir");
+        let absolute_db_path = directory.path().join("relative.sqlite3");
+        seed_settled_diagnostic_database(&absolute_db_path);
+        let relative_db_path = absolute_db_path
+            .strip_prefix(&current_dir)
+            .expect("temp database is beneath current directory");
+        assert!(!sqlite_sidecar_path(&absolute_db_path, "-fsqlite-ns-gate").exists());
+        assert!(!sqlite_sidecar_path(&absolute_db_path, "-fsqlite-ns-use").exists());
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+
+        let franken = open_guarded_read_only_franken_existing_file(
+            relative_db_path,
+            "relative sidecar-less Franken control",
+        )
+        .expect("relative sidecar-less Franken open");
+        assert_eq!(
+            franken
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query relative Franken database")[0]
+                .get_named::<i64>("value")
+                .expect("decode relative Franken value"),
+            7
+        );
+        drop(franken);
+
+        let canonical = open_guarded_read_only_canonical_sqlite_file(
+            relative_db_path,
+            "relative sidecar-less canonical control",
+        )
+        .expect("relative sidecar-less canonical open");
+        assert_eq!(
+            canonical
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query relative canonical database")[0]
+                .get_named::<i64>("value")
+                .expect("decode relative canonical value"),
+            7
+        );
+        drop(canonical);
+
+        assert_eq!(exact_diagnostic_parent_snapshot(directory.path()), before);
+        assert_no_read_only_diagnostic_artifacts(directory.path());
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_accept_benign_partial_page_tail_byte_identically() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("partial-page-tail.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&db_path)
+            .expect("open database for benign tail fixture")
+            .write_all(b"benign trailing slack")
+            .expect("append benign partial-page tail");
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+
+        let franken = open_guarded_read_only_franken_existing_file(
+            &db_path,
+            "partial-page-tail Franken control",
+        )
+        .expect("Franken reader accepts benign partial-page tail");
+        assert_eq!(
+            franken
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query Franken partial-tail database")[0]
+                .get_named::<i64>("value")
+                .expect("decode Franken partial-tail value"),
+            7
+        );
+        drop(franken);
+
+        let canonical = open_guarded_read_only_canonical_sqlite_file(
+            &db_path,
+            "partial-page-tail canonical control",
+        )
+        .expect("canonical reader accepts benign partial-page tail");
+        assert_eq!(
+            canonical
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query canonical partial-tail database")[0]
+                .get_named::<i64>("value")
+                .expect("decode canonical partial-tail value"),
+            7
+        );
+        drop(canonical);
+
+        assert_eq!(exact_diagnostic_parent_snapshot(directory.path()), before);
+        assert_no_read_only_diagnostic_artifacts(directory.path());
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_preserve_valid_live_wal_byte_identically() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("valid-live-wal.sqlite3");
+        let writer = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open live WAL writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable live WAL mode");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable automatic WAL checkpoints");
+        writer
+            .execute_raw("CREATE TABLE diagnostic_fixture (value INTEGER NOT NULL);")
+            .expect("create live WAL fixture table");
+        writer
+            .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (7);")
+            .expect("commit uncheckpointed live WAL row");
+        assert!(sqlite_sidecar_path(&db_path, "-wal").is_file());
+        assert!(sqlite_sidecar_path(&db_path, "-shm").is_file());
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+
+        let franken = open_guarded_read_only_franken_existing_file(
+            &db_path,
+            "valid live WAL Franken control",
+        )
+        .expect("Franken reader accepts valid live WAL");
+        assert_eq!(
+            franken
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query valid live WAL through Franken")[0]
+                .get_named::<i64>("value")
+                .expect("decode Franken live-WAL value"),
+            7
+        );
+        drop(franken);
+
+        let canonical = open_guarded_read_only_canonical_sqlite_file(
+            &db_path,
+            "valid live WAL canonical control",
+        )
+        .expect("canonical reader accepts valid live WAL");
+        assert_eq!(
+            canonical
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query valid live WAL through canonical SQLite")[0]
+                .get_named::<i64>("value")
+                .expect("decode canonical live-WAL value"),
+            7
+        );
+        drop(canonical);
+
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            before,
+            "read-only observers must not checkpoint or rewrite a valid live WAL family"
+        );
+        assert_no_read_only_diagnostic_artifacts(directory.path());
+        drop(writer);
     }
 
     #[test]
