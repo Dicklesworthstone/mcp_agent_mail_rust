@@ -20342,6 +20342,80 @@ mod tests {
         recovery_admission().reset();
     }
 
+    #[test]
+    fn archive_ensure_breakers_preserve_exact_truncated_sqlite_family() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("archive-{breaker_kind}.sqlite3"));
+            let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+            let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+            let storage_root = dir.path().join("storage");
+            std::fs::create_dir_all(storage_root.join("projects"))
+                .expect("create authoritative archive root");
+            std::fs::write(&db_path, b"archive primary authority")
+                .expect("write primary fixture");
+            std::fs::write(&wal_path, b"truncated-wal").expect("write WAL fixture");
+            std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "archive fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state)
+                    .expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let names_before = std::fs::read_dir(dir.path())
+                .expect("list archive fixture before ensure")
+                .map(|entry| entry.expect("read archive fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+
+            recovery_admission().reset();
+            let error = ensure_sqlite_file_healthy_with_archive(&db_path, &storage_root)
+                .expect_err("breaker authority must refuse archive recovery before cleanup");
+
+            let expected = if breaker_kind == "malformed" {
+                "could not be trusted"
+            } else {
+                "circuit-broken"
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected {breaker_kind} archive refusal: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&db_path).unwrap(),
+                b"archive primary authority"
+            );
+            assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+            assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            let names_after = std::fs::read_dir(dir.path())
+                .expect("list archive fixture after refusal")
+                .map(|entry| entry.expect("read archive fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                names_after, names_before,
+                "refused archive recovery must not create election, quarantine, or recovery artifacts"
+            );
+            assert!(
+                !storage_root.join("doctor").join("forensics").exists(),
+                "refused archive recovery must not capture forensics"
+            );
+            recovery_admission().reset();
+        }
+    }
+
     fn assert_pool_init_breaker_preserves_truncated_family(
         db_name: &str,
         expected_error_fragment: &str,
@@ -20480,6 +20554,68 @@ mod tests {
         assert!(
             sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-shm").is_empty()
         );
+    }
+
+    #[test]
+    fn primary_read_probe_preserves_breaker_blocked_source_family() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("read-probe-{breaker_kind}.sqlite3"));
+            {
+                let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create source database");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("force standalone primary");
+                conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                    .expect("create fixture table");
+            }
+            let primary_bytes = std::fs::read(&db_path).expect("read primary fixture");
+            let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+            let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+            std::fs::write(&wal_path, b"truncated-wal").expect("write WAL fixture");
+            std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "read-probe fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state)
+                    .expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let names_before = std::fs::read_dir(dir.path())
+                .expect("list read-probe fixture before probe")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+
+            assert!(
+                sqlite_primary_read_path_is_healthy(&db_path)
+                    .expect("run source-neutral primary read probe"),
+                "private staged cleanup should prove the healthy primary readable"
+            );
+            assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+            assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+            assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            let names_after = std::fs::read_dir(dir.path())
+                .expect("list read-probe fixture after probe")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                names_after, names_before,
+                "read-only health probing must not create election, cleanup, or forensic artifacts"
+            );
+        }
     }
 
     #[test]
