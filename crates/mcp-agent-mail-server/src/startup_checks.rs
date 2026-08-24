@@ -2371,9 +2371,12 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         }
     }
 
+    let database_file_missing = resolved_db_path
+        .as_ref()
+        .is_some_and(|path| !path.exists());
+
     // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
-    if let Some(path) = resolved_db_path
-        && !path.exists()
+    if database_file_missing
         && !path_is_real_directory(&std::path::Path::new(&config.storage_root).join("projects"))
     {
         return ProbeResult::Ok { name: "integrity" };
@@ -2417,6 +2420,20 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             None => return integrity_busy_probe_failure(config, &last_err),
         }
     };
+
+    // `run_startup_integrity_check` owns recovery for a database it can open,
+    // but deliberately reports a missing primary as `IntegrityCorruption` so
+    // its caller can decide whether durable archive state should be rebuilt.
+    // Preserve that one caller-owned recovery before constructing the probe
+    // pool; every error returned by the integrity check below is terminal and
+    // must not trigger another attempt.
+    if database_file_missing {
+        tracing::warn!(
+            database_url = %config.database_url,
+            "startup integrity probe found a missing SQLite primary with archive state; attempting one admitted recovery"
+        );
+        return attempt_probe_recovery(config);
+    }
 
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
@@ -2521,27 +2538,39 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             }
             ProbeResult::Ok { name: "integrity" }
         }
-        Err(ref e) => {
+        Err(e) => {
             let err_str = e.to_string();
-
-            // Snapshot conflict during integrity check — same recovery as above.
-            if is_snapshot_conflict(&err_str) {
-                tracing::warn!(
-                    error = %err_str,
-                    "integrity check hit snapshot conflict; attempting admitted database-health recovery"
-                );
-                return admitted_recovery_then_retry_integrity(&pool_config, config);
-            }
 
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
 
+            // `DbPool::run_startup_integrity_check` owns the complete
+            // integrity recovery attempt, including post-recovery reopen and
+            // verification. An error here is therefore terminal evidence from
+            // that attempt. Calling `attempt_probe_recovery` again would start
+            // a second recovery against the same generation, double-account
+            // its failure, and potentially trip the durable breaker during a
+            // single startup probe.
+            let db_target = resolve_server_database_url_sqlite_path(&config.database_url)
+                .map_or_else(
+                    || config.database_url.clone(),
+                    |path| path.display().to_string(),
+                );
             tracing::warn!(
                 error = %err_str,
-                "startup integrity check failed; attempting automatic recovery"
+                database = %db_target,
+                "database-owned startup integrity recovery failed; refusing a second recovery attempt"
             );
-            attempt_probe_recovery(config)
+            ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!(
+                    "Startup integrity recovery failed for {db_target}: {}",
+                    classify_recovery_failure_root_cause(&err_str)
+                ),
+                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
+                    .into(),
+            })
         }
     }
 }
@@ -2725,6 +2754,21 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
     })
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static PROBE_RECOVERY_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_probe_recovery_attempt_count() {
+    PROBE_RECOVERY_ATTEMPTS.set(0);
+}
+
+#[cfg(test)]
+fn probe_recovery_attempt_count() -> u32 {
+    PROBE_RECOVERY_ATTEMPTS.get()
+}
+
 /// Attempt file-level recovery when the integrity probe detects corruption.
 ///
 /// Uses the archive-aware recovery path which tries, in order:
@@ -2736,6 +2780,9 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
 /// 3. Reinitialize an empty database (last resort)
 #[allow(dead_code)]
 fn attempt_probe_recovery(config: &Config) -> ProbeResult {
+    #[cfg(test)]
+    PROBE_RECOVERY_ATTEMPTS.set(PROBE_RECOVERY_ATTEMPTS.get().saturating_add(1));
+
     let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         return ProbeResult::Fail(ProbeFailure {
             name: "integrity",
@@ -4624,6 +4671,48 @@ mod tests {
         assert!(
             matches!(result, ProbeResult::Ok { .. }),
             "probe_integrity should reinit from scratch when no archive; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_integrity_does_not_retry_database_owned_recovery_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("single_recovery_attempt.db");
+        std::fs::write(&db_path, b"not-a-sqlite-db").expect("write corrupt db");
+
+        // The DB-owned recovery gets far enough to arm its durable breaker,
+        // then fails deterministically while creating the forensic bundle.
+        // A second server-owned attempt would replace the original terminal
+        // error with `Automatic recovery failed for ...` and charge this one
+        // startup probe against recovery admission twice.
+        std::fs::write(dir.path().join("doctor"), b"blocks doctor directory")
+            .expect("block forensic bundle directory");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("missing-storage-root");
+
+        let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("failed DB-owned recovery must fail startup: {result:?}");
+        };
+        assert!(
+            failure.problem.starts_with("Startup integrity recovery failed for "),
+            "the original DB-owned recovery failure must be retained: {}",
+            failure.problem
+        );
+        assert!(
+            !failure.problem.starts_with("Automatic recovery failed for "),
+            "the server must not replace the terminal DB-owned failure with a second recovery result: {}",
+            failure.problem
+        );
+
+        let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
+            .expect("load recovery breaker")
+            .expect("failed recovery must persist breaker state");
+        assert_eq!(
+            breaker.consecutive_failures, 1,
+            "one startup integrity probe must account exactly one failed recovery attempt"
         );
     }
 

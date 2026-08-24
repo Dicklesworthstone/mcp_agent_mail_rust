@@ -52867,7 +52867,7 @@ startup_timeout_sec = 42
                 ("AM_RECOVERY_BREAKER_COOLDOWN_SECS", "86400"),
             ],
             || {
-                run_startup_database_self_heal_with(
+                let first_error = run_startup_database_self_heal_with(
                     &db_url,
                     dir.path(),
                     || panic!("promotion-refusal fixture should not repair"),
@@ -52877,6 +52877,12 @@ startup_timeout_sec = 42
                     },
                 )
                 .expect_err("promotion refusal must not boot an unhealthy live DB");
+                assert!(
+                    first_error
+                        .to_string()
+                        .contains("startup cannot continue without a healthy live database"),
+                    "unhealthy promotion refusal must explain why fail-open was denied: {first_error}"
+                );
                 assert!(
                     db_path.is_file(),
                     "health-gated refusal must preserve the live database for forensics"
@@ -52894,7 +52900,7 @@ startup_timeout_sec = 42
                     .map(|entry| entry.expect("directory entry").file_name())
                     .collect::<std::collections::BTreeSet<_>>();
 
-                run_startup_database_self_heal_with(
+                let second_error = run_startup_database_self_heal_with(
                     &db_url,
                     dir.path(),
                     || panic!("open breaker must skip repair"),
@@ -52904,6 +52910,12 @@ startup_timeout_sec = 42
                     },
                 )
                 .expect_err("an open breaker must not boot an unhealthy live DB");
+                assert!(
+                    second_error
+                        .to_string()
+                        .contains("startup cannot continue without a healthy live database"),
+                    "unhealthy circuit-open refusal must explain why fail-open was denied: {second_error}"
+                );
 
                 let entries_after = std::fs::read_dir(dir.path())
                     .expect("re-list recovery directory")
@@ -53059,7 +53071,9 @@ startup_timeout_sec = 42
                 Ok(())
             },
         )
-        .expect_err("tripped startup must not boot a family with a malformed WAL");
+        .expect(
+            "tripped startup may boot only after the private family probe proves the preserved primary healthy",
+        );
 
         assert_eq!(repair_calls.get(), 0);
         assert_eq!(reconstruct_calls.get(), 0);
