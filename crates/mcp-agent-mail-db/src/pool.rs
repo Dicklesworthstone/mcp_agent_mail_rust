@@ -7357,7 +7357,7 @@ fn sqlite_sidecar_occupancy(path: &Path) -> (bool, Option<u64>) {
     }
 }
 
-fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
+pub(crate) fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<(SqliteRecoveryCandidateName, SystemTime, PathBuf)> = Vec::new();
     let Some(file_name) = primary_path.file_name() else {
         return Vec::new();
@@ -8861,7 +8861,15 @@ fn rotate_existing_proactive_backup(backup_path: &Path) -> DbResult<PathBuf> {
             continue;
         }
         match rename_noreplace_preserving_source(backup_path, &rotated) {
-            Ok(()) => return Ok(rotated),
+            Ok(()) => {
+                sync_recovery_parent(&rotated).map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "proactive backup preserved the previous generation at {} but could not durably sync the rotation before publishing a replacement: {error}",
+                        rotated.display()
+                    ))
+                })?;
+                return Ok(rotated);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(DbError::Sqlite(format!(

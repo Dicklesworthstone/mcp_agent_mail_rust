@@ -16,7 +16,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,65 @@ pub fn snapshot_meta_path(primary: &Path) -> PathBuf {
     );
     name.push(".meta.json");
     bak.with_file_name(name)
+}
+
+fn normalized_snapshot_primary(primary: &Path) -> DbResult<PathBuf> {
+    crate::pool::validate_sqlite_target_path(primary, "verified snapshot primary")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    let anchored = if primary.is_absolute() {
+        primary.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "snapshot path: cannot resolve current directory for {}: {error}",
+                    primary.display()
+                ))
+            })?
+            .join(primary)
+    };
+    match std::fs::canonicalize(&anchored) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file_name = anchored.file_name().ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "snapshot path: {} has no database file name",
+                    primary.display()
+                ))
+            })?;
+            let parent = anchored
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let canonical_parent = std::fs::canonicalize(parent).map_err(|parent_error| {
+                DbError::Sqlite(format!(
+                    "snapshot path: cannot canonicalize parent {}: {parent_error}",
+                    parent.display()
+                ))
+            })?;
+            Ok(canonical_parent.join(file_name))
+        }
+        Err(error) => Err(DbError::Sqlite(format!(
+            "snapshot path: cannot canonicalize {}: {error}",
+            anchored.display()
+        ))),
+    }
+}
+
+fn metadata_matches_snapshot_namespace(
+    meta: &VerifiedSnapshotMetadata,
+    primary: &Path,
+    canonical_bak: &Path,
+) -> bool {
+    meta.schema == SNAPSHOT_METADATA_SCHEMA
+        && meta.integrity_verified
+        && meta.integrity_kind == CheckKind::Full.to_string()
+        && primary
+            .to_str()
+            .is_some_and(|path| meta.source_path == path)
+        && canonical_bak
+            .to_str()
+            .is_some_and(|path| meta.snapshot_path == path)
 }
 
 /// Count rows in the core coordination tables on an already-open connection.
@@ -166,11 +225,64 @@ fn snapshot_file_identity_from_reader(
     Ok((size, hex::encode(hasher.finalize())))
 }
 
+fn existing_snapshot_metadata_is_owned(
+    meta_path: &Path,
+    primary: &Path,
+    canonical_bak: &Path,
+) -> DbResult<bool> {
+    match std::fs::symlink_metadata(meta_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                meta_path,
+                MAX_SNAPSHOT_METADATA_BYTES,
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "snapshot metadata cannot read existing authority {}: {error}",
+                    meta_path.display()
+                ))
+            })?;
+            let existing: VerifiedSnapshotMetadata = serde_json::from_slice(&bytes).map_err(
+                |error| {
+                    DbError::Sqlite(format!(
+                        "snapshot metadata refuses to replace unrecognized regular file {}: {error}",
+                        meta_path.display()
+                    ))
+                },
+            )?;
+            if !metadata_matches_snapshot_namespace(&existing, primary, canonical_bak) {
+                return Err(DbError::Sqlite(format!(
+                    "snapshot metadata refuses to replace foreign or future authority {}",
+                    meta_path.display()
+                )));
+            }
+            Ok(true)
+        }
+        Ok(_) => Err(DbError::Sqlite(format!(
+            "snapshot metadata destination {} is not a regular non-symlink file",
+            meta_path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(DbError::Sqlite(format!(
+            "snapshot metadata cannot inspect destination {}: {error}",
+            meta_path.display()
+        ))),
+    }
+}
+
 /// Write the metadata sidecar atomically (tmp file + rename).
 fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> DbResult<()> {
     use std::io::Write as _;
 
-    let meta_path = snapshot_meta_path(primary);
+    let primary = normalized_snapshot_primary(primary)?;
+    let canonical_bak = snapshot_bak_path(&primary);
+    if !metadata_matches_snapshot_namespace(meta, &primary, &canonical_bak) {
+        return Err(DbError::Sqlite(
+            "snapshot metadata refuses to publish a foreign or unsupported authority record"
+                .to_string(),
+        ));
+    }
+    let meta_path = snapshot_meta_path(&primary);
     let json = serde_json::to_vec_pretty(meta)
         .map_err(|e| DbError::Sqlite(format!("snapshot metadata serialize: {e}")))?;
     if u64::try_from(json.len()).unwrap_or(u64::MAX) > MAX_SNAPSHOT_METADATA_BYTES {
@@ -188,22 +300,8 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
             parent.display()
         )));
     }
-    match std::fs::symlink_metadata(&meta_path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(DbError::Sqlite(format!(
-                "snapshot metadata destination {} is not a regular non-symlink file",
-                meta_path.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(DbError::Sqlite(format!(
-                "snapshot metadata cannot inspect destination {}: {error}",
-                meta_path.display()
-            )));
-        }
-    }
+    let replacing_owned_authority =
+        existing_snapshot_metadata_is_owned(&meta_path, &primary, &canonical_bak)?;
 
     let mut staged = tempfile::Builder::new()
         .prefix(".snapshot-meta-")
@@ -215,6 +313,14 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
                 parent.display()
             ))
         })?;
+    mcp_agent_mail_core::disk::set_private_writable_file_permissions(staged.as_file()).map_err(
+        |error| {
+            DbError::Sqlite(format!(
+                "snapshot metadata cannot secure stage {}: {error}",
+                staged.path().display()
+            ))
+        },
+    )?;
     staged.write_all(&json).map_err(|error| {
         DbError::Sqlite(format!(
             "snapshot metadata cannot write stage {}: {error}",
@@ -230,18 +336,19 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
 
     // Revalidate the destination immediately before the atomic replace so an
     // occupied symlink/non-file can never redirect or absorb the write.
-    match std::fs::symlink_metadata(&meta_path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(DbError::Sqlite(format!(
-                "snapshot metadata destination {} changed to a non-regular file",
-                meta_path.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(DbError::Sqlite(error.to_string())),
+    let still_owned = existing_snapshot_metadata_is_owned(&meta_path, &primary, &canonical_bak)?;
+    if still_owned != replacing_owned_authority {
+        return Err(DbError::Sqlite(format!(
+            "snapshot metadata destination {} changed occupancy during publication",
+            meta_path.display()
+        )));
     }
-    let persisted = staged.persist(&meta_path).map_err(|error| {
+    let persisted = if replacing_owned_authority {
+        staged.persist(&meta_path)
+    } else {
+        staged.persist_noclobber(&meta_path)
+    }
+    .map_err(|error| {
         DbError::Sqlite(format!(
             "snapshot metadata atomic publish {}: {}",
             meta_path.display(),
@@ -269,7 +376,8 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
 /// Read the metadata sidecar for a primary database path, if present and parseable.
 #[must_use]
 pub fn read_snapshot_metadata(primary: &Path) -> Option<VerifiedSnapshotMetadata> {
-    let meta_path = snapshot_meta_path(primary);
+    let primary = normalized_snapshot_primary(primary).ok()?;
+    let meta_path = snapshot_meta_path(&primary);
     let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
         &meta_path,
         MAX_SNAPSHOT_METADATA_BYTES,
@@ -286,7 +394,8 @@ pub fn record_snapshot_metadata(
     primary: &Path,
     created_us: i64,
 ) -> DbResult<VerifiedSnapshotMetadata> {
-    let bak = snapshot_bak_path(primary);
+    let primary = normalized_snapshot_primary(primary)?;
+    let bak = snapshot_bak_path(&primary);
     if !crate::pool::sqlite_recovery_candidate_is_standalone(&bak) {
         return Err(DbError::Sqlite(format!(
             "snapshot metadata: {} has companion SQLite or FrankenSQLite state",
@@ -399,35 +508,84 @@ pub fn record_snapshot_metadata(
         snapshot_sha256,
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    write_snapshot_metadata(primary, &meta)?;
+    write_snapshot_metadata(&primary, &meta)?;
     Ok(meta)
 }
 
-/// Return the latest verified snapshot's metadata for a primary path, but only
-/// if it is recorded as integrity-verified AND the `.bak` file actually exists.
+struct SelectedVerifiedSnapshot {
+    metadata: VerifiedSnapshotMetadata,
+    actual_path: PathBuf,
+    source: std::fs::File,
+}
+
+fn select_verified_snapshot(primary: &Path) -> Option<SelectedVerifiedSnapshot> {
+    let primary = normalized_snapshot_primary(primary).ok()?;
+    let meta = read_snapshot_metadata(&primary)?;
+    let canonical_bak = snapshot_bak_path(&primary);
+    if !metadata_matches_snapshot_namespace(&meta, &primary, &canonical_bak) {
+        return None;
+    }
+
+    for candidate in crate::pool::sqlite_backup_candidates(&primary) {
+        if !crate::pool::sqlite_recovery_candidate_is_standalone(&candidate) {
+            continue;
+        }
+        let mut source = match mcp_agent_mail_core::disk::open_regular_file_no_follow(&candidate) {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+        let identity = match snapshot_file_identity_from_reader(&mut source, &candidate) {
+            Ok(identity) => identity,
+            Err(_) => continue,
+        };
+        if identity.0 != meta.snapshot_size_bytes || identity.1 != meta.snapshot_sha256 {
+            continue;
+        }
+        if !matches!(
+            crate::pool::sqlite_recovery_candidate_passes_full_integrity_check(&candidate),
+            Ok(true)
+        ) || !crate::pool::sqlite_recovery_candidate_is_standalone(&candidate)
+        {
+            continue;
+        }
+        let current = match mcp_agent_mail_core::disk::open_regular_file_no_follow(&candidate) {
+            Ok(current) => current,
+            Err(_) => continue,
+        };
+        let retained_identity = match source.try_clone().and_then(same_file::Handle::from_file) {
+            Ok(identity) => identity,
+            Err(_) => continue,
+        };
+        let current_identity = match same_file::Handle::from_file(current) {
+            Ok(identity) => identity,
+            Err(_) => continue,
+        };
+        if retained_identity != current_identity || source.rewind().is_err() {
+            continue;
+        }
+        return Some(SelectedVerifiedSnapshot {
+            metadata: meta,
+            actual_path: candidate,
+            source,
+        });
+    }
+    None
+}
+
+/// Return the latest verified snapshot's metadata for a primary path. The
+/// metadata remains authoritative when its exact bytes have been durably
+/// rotated from `.bak` to a strict `.bak.<timestamp>` generation.
 #[must_use]
 pub fn latest_verified_snapshot(primary: &Path) -> Option<VerifiedSnapshotMetadata> {
-    let meta = read_snapshot_metadata(primary)?;
-    let bak = snapshot_bak_path(primary);
-    if meta.schema != SNAPSHOT_METADATA_SCHEMA
-        || !meta.integrity_verified
-        || meta.integrity_kind != CheckKind::Full.to_string()
-        || meta.source_path != primary.to_str()?
-        || meta.snapshot_path != bak.to_str()?
-    {
-        return None;
-    }
-    if !std::fs::symlink_metadata(&bak).is_ok_and(|metadata| metadata.file_type().is_file()) {
-        return None;
-    }
-    if !crate::pool::sqlite_recovery_candidate_is_standalone(&bak) {
-        return None;
-    }
-    let (size, sha256) = snapshot_file_identity(&bak).ok()?;
-    if size != meta.snapshot_size_bytes || sha256 != meta.snapshot_sha256 {
-        return None;
-    }
-    Some(meta)
+    select_verified_snapshot(primary).map(|selected| selected.metadata)
+}
+
+/// Resolve the strict backup path currently carrying the verified bytes.
+/// Consumers such as retention use this to pin the one authoritative rotated
+/// generation without ever trusting a path read from JSON.
+#[must_use]
+pub fn verified_snapshot_source_path(primary: &Path) -> Option<PathBuf> {
+    select_verified_snapshot(primary).map(|selected| selected.actual_path)
 }
 
 /// Restore the primary database from the latest verified snapshot, if one
@@ -443,39 +601,12 @@ pub fn restore_from_verified_snapshot(
     primary: &Path,
     storage_root: &Path,
 ) -> DbResult<Option<VerifiedSnapshotMetadata>> {
-    let Some(meta) = latest_verified_snapshot(primary) else {
+    let primary = normalized_snapshot_primary(primary)?;
+    let Some(mut selected) = select_verified_snapshot(&primary) else {
         return Ok(None);
     };
-    let bak = snapshot_bak_path(primary);
-
-    // Re-verify the exact, standalone snapshot main before trusting it. The
-    // metadata could be stale relative to a changed main file, while a WAL or
-    // namespace companion would describe state that a one-file copy drops.
-    if !crate::pool::sqlite_recovery_candidate_is_standalone(&bak) {
-        tracing::warn!(
-            snapshot = %bak.display(),
-            "verified snapshot has companion SQLite or FrankenSQLite state; not restoring one file from that family"
-        );
-        return Ok(None);
-    }
-    match crate::pool::sqlite_recovery_candidate_passes_full_integrity_check(&bak) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                snapshot = %bak.display(),
-                "verified snapshot failed strict canonical re-verification; not restoring from it"
-            );
-            return Ok(None);
-        }
-        Err(error) => {
-            tracing::warn!(
-                snapshot = %bak.display(),
-                error = %error,
-                "verified snapshot could not be re-verified; not restoring from it"
-            );
-            return Ok(None);
-        }
-    }
+    let meta = selected.metadata;
+    let actual_snapshot_path = selected.actual_path;
 
     // Stage the snapshot beside the primary, then validate the staged copy.
     let staged = (0_u32..10_000)
@@ -504,12 +635,6 @@ pub fn restore_from_verified_snapshot(
                 primary.display()
             ))
         })?;
-    let mut source = mcp_agent_mail_core::disk::open_regular_file_no_follow(&bak).map_err(|e| {
-        DbError::Sqlite(format!(
-            "snapshot restore: open source {}: {e}",
-            bak.display()
-        ))
-    })?;
     let mut destination = mcp_agent_mail_core::disk::create_new_private_file_no_follow(&staged)
         .map_err(|e| {
             DbError::Sqlite(format!(
@@ -525,10 +650,10 @@ pub fn restore_from_verified_snapshot(
             ))
         },
     )?;
-    std::io::copy(&mut source, &mut destination).map_err(|e| {
+    std::io::copy(&mut selected.source, &mut destination).map_err(|e| {
         DbError::Sqlite(format!(
             "snapshot restore: copy {} -> {}: {e}",
-            bak.display(),
+            actual_snapshot_path.display(),
             staged.display()
         ))
     })?;
@@ -539,15 +664,7 @@ pub fn restore_from_verified_snapshot(
         ))
     })?;
     drop(destination);
-    drop(source);
-    if !crate::pool::sqlite_recovery_candidate_is_standalone(&bak) {
-        tracing::warn!(
-            snapshot = %bak.display(),
-            staged = %staged.display(),
-            "verified snapshot gained companion state during staging; preserving the stage and declining restore"
-        );
-        return Ok(None);
-    }
+    drop(selected.source);
     if !crate::pool::sqlite_recovery_candidate_is_standalone(&staged) {
         return Err(DbError::Sqlite(format!(
             "snapshot restore: staged copy {} has companion state and was preserved for inspection",
@@ -571,7 +688,7 @@ pub fn restore_from_verified_snapshot(
         )));
     }
 
-    crate::pool::promote_recovery_candidate(primary, &staged, storage_root).map_err(|error| {
+    crate::pool::promote_recovery_candidate(&primary, &staged, storage_root).map_err(|error| {
         DbError::Sqlite(format!(
             "snapshot restore: promote {} -> {}: {error}",
             staged.display(),
@@ -584,7 +701,8 @@ pub fn restore_from_verified_snapshot(
         .snapshot_restored_total
         .inc();
     tracing::info!(
-        source = %meta.snapshot_path,
+        source = %actual_snapshot_path.display(),
+        recorded_origin = %meta.snapshot_path,
         created_us = meta.created_us,
         "recovered database from last-known-healthy verified snapshot"
     );

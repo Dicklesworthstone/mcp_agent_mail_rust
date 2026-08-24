@@ -513,9 +513,19 @@ pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
     // / `bak.<ts>` legacy variant. Using a bare `starts_with("bak")` would
     // false-positive future filenames like `backup-plan.txt` that happen to
     // share the prefix — match exact variants only.
+    let strict_bak = mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(
+        std::ffi::OsStr::new("storage.sqlite3"),
+        std::ffi::OsStr::new(file_name),
+    )
+    .is_some_and(|candidate| {
+        matches!(
+            candidate.kind(),
+            mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::ProactiveBak
+                | mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
+        )
+    });
     if after_stem.starts_with("manual-backup-")
-        || after_stem == "bak"
-        || after_stem.starts_with("bak.")
+        || strict_bak
         || after_stem.starts_with("bak-")
     {
         return Some(BackupKind::ManualBackup);
