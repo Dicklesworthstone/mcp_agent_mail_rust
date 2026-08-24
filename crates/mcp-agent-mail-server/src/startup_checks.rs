@@ -3379,6 +3379,60 @@ mod tests {
     }
 
     #[test]
+    fn integrity_probe_missing_db_with_archive_runs_one_caller_owned_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("missing-with-archive.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("test-proj");
+        let agent_dir = project_dir.join("agents").join("SwiftFox");
+        let message_dir = project_dir.join("messages").join("2026").join("01");
+        std::fs::create_dir_all(&agent_dir).expect("create agent archive directory");
+        std::fs::create_dir_all(&message_dir).expect("create message archive directory");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-proj","human_key":"/tmp/test-proj"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"SwiftFox","program":"coder","model":"test","inception_ts":"2026-01-15T10:00:00Z","last_active_ts":"2026-01-15T10:00:01Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-01-15T10-05-00Z__test__7.md"),
+            "---json\n{\"id\":7,\"from\":\"SwiftFox\",\"to\":[\"CalmLake\"],\"subject\":\"Test\",\"thread_id\":\"t1\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-01-15T10:05:00Z\",\"attachments\":[]}\n---\n\nTest body\n",
+        )
+        .expect("write archived message");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+
+        reset_probe_recovery_attempt_count();
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { name: "integrity" }),
+            "missing DB with durable archive state should recover: {result:?}"
+        );
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            1,
+            "a missing primary with archive state needs exactly one caller-owned recovery"
+        );
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open reconstructed database");
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .expect("query reconstructed messages");
+        assert_eq!(rows[0].get_named::<i64>("count").expect("message count"), 1);
+        assert_eq!(rows[0].get_named::<i64>("max_id").expect("max id"), 7);
+    }
+
+    #[test]
     fn sqlite_memory_url_with_query_passes() {
         let mut config = default_config();
         config.database_url = "sqlite:///:memory:?cache=shared".into();
@@ -4692,6 +4746,7 @@ mod tests {
         config.database_url = format!("sqlite:///{}", db_path.display());
         config.storage_root = dir.path().join("missing-storage-root");
 
+        reset_probe_recovery_attempt_count();
         let result = probe_integrity(&config);
         let ProbeResult::Fail(failure) = result else {
             panic!("failed DB-owned recovery must fail startup: {result:?}");
@@ -4702,9 +4757,21 @@ mod tests {
             failure.problem
         );
         assert!(
+            failure
+                .problem
+                .contains("failed to create mailbox forensic bundle"),
+            "the terminal failure must retain the first recovery attempt's root cause: {}",
+            failure.problem
+        );
+        assert!(
             !failure.problem.starts_with("Automatic recovery failed for "),
             "the server must not replace the terminal DB-owned failure with a second recovery result: {}",
             failure.problem
+        );
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            0,
+            "a terminal DB-owned recovery failure must not invoke the server recovery entrypoint"
         );
 
         let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)

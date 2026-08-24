@@ -19932,6 +19932,106 @@ mod tests {
         recovery_admission().reset();
     }
 
+    fn assert_pool_init_breaker_preserves_truncated_family(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"pool-init-primary-authority").expect("write primary fixture");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list pool-init fixture before acquire")
+            .map(|entry| entry.expect("read pool-init fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let cx = Cx::for_testing();
+
+        recovery_admission().reset();
+        let error = match runtime.block_on(pool.acquire(&cx)) {
+            Outcome::Err(error) => error,
+            Outcome::Ok(_) => panic!("breaker authority must refuse pool initialization"),
+            Outcome::Cancelled(reason) => panic!("pool initialization was cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                panic!("pool initialization panicked: {}", payload.message())
+            }
+        };
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected pool-init refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            b"pool-init-primary-authority"
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list pool-init fixture after refusal")
+            .map(|entry| entry.expect("read pool-init fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn pool_init_preserves_truncated_family_behind_malformed_breaker() {
+        assert_pool_init_breaker_preserves_truncated_family(
+            "pool-init-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn pool_init_preserves_truncated_family_behind_tripped_breaker() {
+        assert_pool_init_breaker_preserves_truncated_family(
+            "pool-init-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "pool init fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
+            },
+        );
+    }
+
     #[test]
     fn health_probes_settle_private_copy_without_mutating_source_family() {
         let dir = tempfile::tempdir().expect("tempdir");

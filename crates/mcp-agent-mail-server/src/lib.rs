@@ -944,11 +944,23 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
 }
 
 fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
+    cleanup_shutdown_sqlite_sidecars_with_resolver(
+        config,
+        resolve_server_database_url_sqlite_path,
+    );
+}
+
+fn cleanup_shutdown_sqlite_sidecars_with_resolver<F>(
+    config: &mcp_agent_mail_core::Config,
+    resolve_database_url: F,
+) where
+    F: FnOnce(&str) -> Option<std::path::PathBuf>,
+{
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         return;
     }
 
-    let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
+    let Some(db_path) = resolve_database_url(&config.database_url) else {
         if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
             tracing::warn!(
                 "skipping shutdown WAL cleanup because database URL could not be resolved"
@@ -17526,6 +17538,119 @@ mod tests {
         );
 
         drop(conn);
+    }
+
+    #[test]
+    fn shutdown_cleanup_targets_resolved_authority_not_raw_relative_shadow() {
+        let current_dir = std::env::current_dir().expect("current working directory");
+        let relative_root = tempfile::tempdir_in(&current_dir).expect("relative-family tempdir");
+        let relative_db_absolute = relative_root.path().join("mailbox.sqlite3");
+        let relative_db = relative_db_absolute
+            .strip_prefix(&current_dir)
+            .expect("tempdir must be beneath current directory")
+            .to_path_buf();
+        assert!(
+            relative_db.is_relative(),
+            "fixture must expose a genuinely relative database URL"
+        );
+
+        let authoritative_root = tempfile::tempdir().expect("authoritative-family tempdir");
+        let authoritative_db = authoritative_root.path().join("mailbox.sqlite3");
+        let authoritative_wal = authoritative_db.with_file_name("mailbox.sqlite3-wal");
+        let authoritative_shm = authoritative_db.with_file_name("mailbox.sqlite3-shm");
+        let authoritative_primary_bytes = b"authoritative primary bytes";
+        let authoritative_wal_bytes = b"truncated-authority-wal";
+        let authoritative_shm_bytes = b"authoritative-shm-bytes";
+        std::fs::write(&authoritative_db, authoritative_primary_bytes)
+            .expect("write authoritative primary");
+        std::fs::write(&authoritative_wal, authoritative_wal_bytes)
+            .expect("write authoritative truncated WAL");
+        std::fs::write(&authoritative_shm, authoritative_shm_bytes)
+            .expect("write authoritative SHM");
+        assert!(
+            authoritative_wal_bytes.len()
+                < mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "authoritative WAL fixture must require cleanup"
+        );
+
+        let relative_wal = relative_db_absolute.with_file_name("mailbox.sqlite3-wal");
+        let relative_shm = relative_db_absolute.with_file_name("mailbox.sqlite3-shm");
+        let relative_primary_bytes = b"relative shadow primary bytes";
+        let relative_wal_bytes = b"relative-shadow-wal";
+        let relative_shm_bytes = b"relative-shadow-shm";
+        std::fs::write(&relative_db_absolute, relative_primary_bytes)
+            .expect("write relative shadow primary");
+        std::fs::write(&relative_wal, relative_wal_bytes).expect("write relative shadow WAL");
+        std::fs::write(&relative_shm, relative_shm_bytes).expect("write relative shadow SHM");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite://{}", relative_db.display());
+        cleanup_shutdown_sqlite_sidecars_with_resolver(&config, |database_url| {
+            assert_eq!(database_url, config.database_url.as_str());
+            Some(authoritative_db.clone())
+        });
+
+        assert_eq!(
+            std::fs::read(&authoritative_db).expect("read authoritative primary after cleanup"),
+            authoritative_primary_bytes,
+            "sidecar cleanup must preserve exact authoritative primary bytes"
+        );
+        assert!(
+            !authoritative_wal.exists() && !authoritative_shm.exists(),
+            "the resolved authoritative sidecars must leave the live family"
+        );
+
+        let mut quarantined_wal = Vec::new();
+        let mut quarantined_shm = Vec::new();
+        for entry in std::fs::read_dir(authoritative_root.path())
+            .expect("list authoritative family after cleanup")
+        {
+            let entry = entry.expect("read authoritative family entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("mailbox.sqlite3-wal.cleanup-quarantine-") {
+                quarantined_wal.push(entry.path());
+            } else if name.starts_with("mailbox.sqlite3-shm.cleanup-quarantine-") {
+                quarantined_shm.push(entry.path());
+            }
+        }
+        assert_eq!(quarantined_wal.len(), 1, "one WAL quarantine expected");
+        assert_eq!(quarantined_shm.len(), 1, "one SHM quarantine expected");
+        assert_eq!(
+            std::fs::read(&quarantined_wal[0]).expect("read quarantined authoritative WAL"),
+            authoritative_wal_bytes,
+            "WAL quarantine must retain the exact authoritative bytes"
+        );
+        assert_eq!(
+            std::fs::read(&quarantined_shm[0]).expect("read quarantined authoritative SHM"),
+            authoritative_shm_bytes,
+            "SHM quarantine must retain the exact authoritative bytes"
+        );
+
+        assert_eq!(
+            std::fs::read(&relative_db_absolute).expect("read relative shadow primary"),
+            relative_primary_bytes,
+            "cleanup must not rewrite the raw relative primary"
+        );
+        assert_eq!(
+            std::fs::read(&relative_wal).expect("read relative shadow WAL"),
+            relative_wal_bytes,
+            "cleanup must not move or rewrite the raw relative WAL"
+        );
+        assert_eq!(
+            std::fs::read(&relative_shm).expect("read relative shadow SHM"),
+            relative_shm_bytes,
+            "cleanup must not move or rewrite the raw relative SHM"
+        );
+        let relative_quarantines = std::fs::read_dir(relative_root.path())
+            .expect("list relative shadow family")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".cleanup-quarantine-"))
+            .collect::<Vec<_>>();
+        assert!(
+            relative_quarantines.is_empty(),
+            "raw relative family must not gain cleanup artifacts: {relative_quarantines:?}"
+        );
     }
 
     struct NoopTool;
