@@ -3619,14 +3619,11 @@ impl DbPool {
         // Keep consistency sampling on FrankenSQLite and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = crate::guard_db_conn(
-            open_guarded_read_only_sqlite_file(
-                Path::new(&self.sqlite_path),
-                "consistency probe",
-            )
-                .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?,
-            "consistency probe connection",
-        );
+        let conn = open_guarded_read_only_sqlite_file(
+            Path::new(&self.sqlite_path),
+            "consistency probe",
+        )
+        .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
         // This two-phase strategy is materially faster than a three-way JOIN on
         // large mailboxes and reduces startup probe lock contention.
         let message_rows = conn
@@ -5192,10 +5189,7 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn = crate::guard_db_conn(
-        open_guarded_read_only_sqlite_file(primary_path, "mailbox database inventory")?,
-        "mailbox database inventory",
-    );
+    let conn = open_guarded_read_only_sqlite_file(primary_path, "mailbox database inventory")?;
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -7452,9 +7446,12 @@ pub fn inspect_atc_sidecar_health(primary_sqlite_path: &str) -> AtcSidecarHealth
     let size_bytes = std::fs::metadata(&path).map_or(0, |meta| meta.len());
     let total_size_bytes = primary_size_bytes.saturating_add(size_bytes);
     let (quick_check_ok, experience_rows, detail) =
-        match crate::CanonicalDbConn::open_file(path.as_str()) {
+        match open_guarded_read_only_canonical_sqlite_file(
+            Path::new(&path),
+            "ATC sidecar health diagnostic",
+        ) {
             Ok(conn) => {
-                let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
+                let _ = conn.execute_raw("PRAGMA busy_timeout = 20000;");
                 match crate::integrity::probe_check_rows(
                     |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
                     crate::integrity::CheckKind::Quick,
@@ -9624,7 +9621,6 @@ pub fn open_guarded_read_only_sqlite_file(
         ))
     })?;
     if let Err(error) = conn.execute_raw("PRAGMA query_only = ON;") {
-        crate::close_db_conn(conn, "guarded read-only diagnostic setup failure");
         return Err(SqlError::Custom(format!(
             "{context}: cannot enforce query-only mode for {}: {error}",
             sqlite_path.display()
@@ -13525,6 +13521,270 @@ mod tests {
                 "strict open must create no sidecar or backup"
             );
             assert_eq!(std::fs::read(&db_path).ok(), bytes_before);
+        }
+    }
+
+    fn exact_diagnostic_parent_snapshot(
+        directory: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, (bool, Vec<u8>)> {
+        std::fs::read_dir(directory)
+            .expect("read diagnostic fixture directory")
+            .map(|entry| {
+                let entry = entry.expect("read diagnostic fixture entry");
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .expect("inspect diagnostic fixture entry");
+                let bytes = metadata
+                    .file_type()
+                    .is_file()
+                    .then(|| std::fs::read(&path).expect("read diagnostic fixture file"))
+                    .unwrap_or_default();
+                (entry.file_name(), (metadata.file_type().is_file(), bytes))
+            })
+            .collect()
+    }
+
+    fn assert_no_read_only_diagnostic_artifacts(directory: &Path) {
+        for name in std::fs::read_dir(directory)
+            .expect("read diagnostic artifact directory")
+            .map(|entry| {
+                entry
+                    .expect("read diagnostic artifact entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        {
+            assert!(
+                !name.contains("-fsqlite-ns-")
+                    && !name.ends_with(".am-recovery-breaker.lock")
+                    && !name.ends_with(".recovery.lock")
+                    && !name.contains("cleanup-quarantine")
+                    && !name.contains(".corrupt-")
+                    && !name.contains("forensic"),
+                "read-only diagnostic published forbidden artifact {name}"
+            );
+        }
+    }
+
+    fn seed_settled_diagnostic_database(path: &Path) {
+        let conn = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open diagnostic seed database");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("settle diagnostic seed journal mode");
+        conn.execute_raw("CREATE TABLE diagnostic_fixture (value INTEGER NOT NULL);")
+            .expect("create diagnostic fixture table");
+        conn.execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (7);")
+            .expect("populate diagnostic fixture table");
+    }
+
+    fn install_diagnostic_breaker(path: &Path, breaker_kind: &str) {
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(path);
+        if breaker_kind == "malformed" {
+            std::fs::write(&breaker_path, b"malformed diagnostic breaker authority")
+                .expect("write malformed diagnostic breaker");
+            return;
+        }
+        let config = crate::recovery_breaker::config_from_env();
+        crate::recovery_breaker::store(
+            path,
+            &crate::recovery_breaker::RecoveryBreakerState {
+                schema: 1,
+                db_fingerprint: crate::recovery_breaker::fingerprint_db(path),
+                consecutive_failures: config.max_consecutive_failures,
+                last_failure_unix: recovery_breaker_now_unix(),
+                last_failure_reason: "diagnostic fixture tripped".to_string(),
+                tripped: true,
+            },
+        )
+        .expect("store tripped diagnostic breaker");
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_preserve_suspect_live_families_without_artifacts() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("guarded-{breaker_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                .expect("write damaged diagnostic WAL");
+            std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"coordination-shm")
+                .expect("write diagnostic SHM");
+            install_diagnostic_breaker(&db_path, breaker_kind);
+            let before = exact_diagnostic_parent_snapshot(directory.path());
+
+            match open_guarded_read_only_sqlite_file(
+                &db_path,
+                "Franken diagnostic helper test",
+            ) {
+                Ok(conn) => {
+                    drop(conn);
+                    panic!("Franken helper must refuse suspect exact family");
+                }
+                Err(_) => {}
+            }
+            assert_eq!(exact_diagnostic_parent_snapshot(directory.path()), before);
+
+            match open_guarded_read_only_canonical_sqlite_file(
+                &db_path,
+                "canonical diagnostic helper test",
+            ) {
+                Ok(conn) => {
+                    drop(conn);
+                    panic!("canonical helper must refuse suspect exact family");
+                }
+                Err(_) => {}
+            }
+            assert_eq!(exact_diagnostic_parent_snapshot(directory.path()), before);
+
+            inspect_mailbox_db_inventory(&db_path)
+                .expect_err("public mailbox inventory must refuse suspect exact family");
+            crate::reconstruct::collect_db_message_ids(&db_path)
+                .expect_err("public message inventory must refuse suspect exact family");
+            let integrity = crate::integrity::inspect_mailbox_integrity(
+                &db_path,
+                crate::integrity::CheckKind::Quick,
+            );
+            assert_eq!(
+                integrity.status,
+                crate::integrity::MailboxIntegrityStatus::Broken
+            );
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+                storage_root: Some(directory.path().join("archive")),
+                ..Default::default()
+            })
+            .expect("construct lazy diagnostic pool");
+            pool.sample_recent_message_refs(1)
+                .expect_err("public consistency sampler must refuse suspect exact family");
+
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                before,
+                "every refused public diagnostic must preserve exact names and bytes"
+            );
+            assert_no_read_only_diagnostic_artifacts(directory.path());
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_refuse_every_nonregular_generation_sidecar() {
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("nonregular-sidecar-{}.sqlite3", &suffix[1..]));
+            seed_settled_diagnostic_database(&db_path);
+            let sidecar_path = sqlite_sidecar_path(&db_path, suffix);
+            std::fs::create_dir(&sidecar_path).expect("create non-regular sidecar fixture");
+            let before = exact_diagnostic_parent_snapshot(directory.path());
+
+            assert!(
+                open_guarded_read_only_sqlite_file(
+                    &db_path,
+                    "non-regular Franken sidecar test",
+                )
+                .is_err(),
+                "Franken helper must refuse non-regular {suffix}"
+            );
+            assert!(
+                open_guarded_read_only_canonical_sqlite_file(
+                    &db_path,
+                    "non-regular canonical sidecar test",
+                )
+                .is_err(),
+                "canonical helper must refuse non-regular {suffix}"
+            );
+            assert_eq!(exact_diagnostic_parent_snapshot(directory.path()), before);
+            assert_no_read_only_diagnostic_artifacts(directory.path());
+        }
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_reject_corrupt_primary_before_engine_open() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("corrupt-header.sqlite3");
+        let corrupt_bytes = b"SQLite format 3\0truncated-header-body";
+        std::fs::write(&db_path, corrupt_bytes).expect("write corrupt primary fixture");
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+
+        assert!(
+            open_guarded_read_only_sqlite_file(&db_path, "corrupt Franken header test").is_err()
+        );
+        assert!(
+            open_guarded_read_only_canonical_sqlite_file(
+                &db_path,
+                "corrupt canonical header test",
+            )
+            .is_err()
+        );
+        assert_eq!(exact_diagnostic_parent_snapshot(directory.path()), before);
+        assert_no_read_only_diagnostic_artifacts(directory.path());
+    }
+
+    #[test]
+    fn guarded_read_only_helpers_keep_healthy_nonclean_families_query_only() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("guarded-healthy-{breaker_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            install_diagnostic_breaker(&db_path, breaker_kind);
+            let before = exact_diagnostic_parent_snapshot(directory.path());
+
+            {
+                let conn = open_guarded_read_only_sqlite_file(
+                    &db_path,
+                    "healthy Franken diagnostic helper test",
+                )
+                .expect("healthy exact family must remain readable");
+                assert_eq!(
+                    conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
+                        .expect("query healthy Franken diagnostic")[0]
+                        .get_named::<i64>("value")
+                        .expect("decode diagnostic value"),
+                    7
+                );
+                conn.execute_raw("PRAGMA query_only = OFF;")
+                    .expect("disable connection-local Franken query_only guard");
+                assert!(
+                    conn.execute_raw("CREATE TABLE forbidden_franken(value INTEGER)")
+                        .is_err(),
+                    "engine read-only flags must survive a query_only downgrade attempt"
+                );
+            }
+
+            {
+                let conn = open_guarded_read_only_canonical_sqlite_file(
+                    &db_path,
+                    "healthy canonical diagnostic helper test",
+                )
+                .expect("healthy exact family must remain canonically readable");
+                assert_eq!(
+                    conn.query_sync("SELECT value FROM diagnostic_fixture", &[])
+                        .expect("query healthy canonical diagnostic")[0]
+                        .get_named::<i64>("value")
+                        .expect("decode canonical diagnostic value"),
+                    7
+                );
+                conn.execute_raw("PRAGMA query_only = OFF;")
+                    .expect("disable connection-local canonical query_only guard");
+                assert!(
+                    conn.execute_raw("CREATE TABLE forbidden_canonical(value INTEGER)")
+                        .is_err(),
+                    "canonical read-only flags must survive a query_only downgrade attempt"
+                );
+            }
+
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                before,
+                "successful read-only diagnostics must preserve exact names and bytes"
+            );
+            assert_no_read_only_diagnostic_artifacts(directory.path());
         }
     }
 

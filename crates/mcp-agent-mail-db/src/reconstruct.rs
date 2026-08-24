@@ -1036,14 +1036,11 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
         ));
     }
 
-    let conn = crate::guard_db_conn(
-        crate::pool::open_guarded_read_only_sqlite_file(
-            db_path,
-            "database message-id inventory",
-        )
-        .map_err(|error| SqlError::Custom(format!("collect_db_message_ids: {error}")))?,
+    let conn = crate::pool::open_guarded_read_only_sqlite_file(
+        db_path,
         "database message-id inventory",
-    );
+    )
+    .map_err(|error| SqlError::Custom(format!("collect_db_message_ids: {error}")))?;
     // Check if messages table exists.
     let tables = conn.query_sync(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
