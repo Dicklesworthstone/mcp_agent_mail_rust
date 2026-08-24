@@ -10009,21 +10009,20 @@ fn sqlite_conn_check_ok_canonical(
     Ok(sqlite_pragma_check_rows_ok(&rows, kind))
 }
 
-fn sqlite_file_check_ok_canonical(
+fn sqlite_franken_snapshot_check_ok_canonical(
+    conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
     kind: mcp_agent_mail_db::CheckKind,
 ) -> CliResult<bool> {
-    let path_string = db_path.to_string_lossy().into_owned();
-    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&path_string).map_err(|e| {
-        CliError::Other(format!(
-            "cannot open sqlite file {} for canonical {kind}: {e}",
-            db_path.display()
-        ))
-    })?;
-    sqlite_conn_check_ok_canonical(&conn, kind)
+    with_private_canonical_snapshot_from_franken_conn(
+        conn,
+        db_path,
+        &format!("canonical {kind} second opinion"),
+        |snapshot| sqlite_conn_check_ok_canonical(snapshot, kind),
+    )
 }
 
-fn sqlite_conn_check_ok_with_canonical_file_fallback(
+fn sqlite_conn_check_ok_with_private_canonical_fallback(
     conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
     kind: mcp_agent_mail_db::CheckKind,
@@ -10033,7 +10032,7 @@ fn sqlite_conn_check_ok_with_canonical_file_fallback(
         return primary_result;
     }
 
-    match sqlite_file_check_ok_canonical(db_path, kind) {
+    match sqlite_franken_snapshot_check_ok_canonical(conn, db_path, kind) {
         Ok(true) => Ok(true),
         Ok(false) => Ok(false),
         Err(_) => match primary_result {
@@ -14033,6 +14032,31 @@ impl CanonicalSnapshotSource {
         matches!(self.kind, CanonicalSnapshotSourceKind::ArchiveSnapshot)
     }
 
+    fn create_share_snapshot_context(
+        &self,
+        snapshot_path: &Path,
+        project_filters: &[String],
+        scrub_preset: share::ScrubPreset,
+    ) -> Result<share::SnapshotContext, share::ShareError> {
+        match self.kind {
+            CanonicalSnapshotSourceKind::LiveSqlite => share::create_snapshot_context(
+                &self.actual_path,
+                snapshot_path,
+                project_filters,
+                scrub_preset,
+            ),
+            CanonicalSnapshotSourceKind::LiveSnapshot
+            | CanonicalSnapshotSourceKind::ArchiveSnapshot => {
+                share::create_private_canonical_snapshot_context(
+                    &self.actual_path,
+                    snapshot_path,
+                    project_filters,
+                    scrub_preset,
+                )
+            }
+        }
+    }
+
     fn open_read_only(&self, context: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
         match self.kind {
             CanonicalSnapshotSourceKind::LiveSqlite => {
@@ -14138,6 +14162,54 @@ fn vacuum_live_franken_sqlite_into_snapshot(
             ))
         })?;
     Ok(())
+}
+
+/// Materialize a private logical image from an already-open FrankenSQLite
+/// connection, then run one canonical diagnostic against that private inode.
+///
+/// The caller-supplied connection is reused deliberately. Opening and closing
+/// canonical SQLite (or a raw file descriptor) on `source` while this process
+/// has other FrankenSQLite transactions can erase their classic POSIX
+/// `fcntl` locks. `VACUUM INTO` reads through the existing engine handle and
+/// writes only the fresh temp destination; canonical SQLite never sees the
+/// live main inode.
+fn with_private_canonical_snapshot_from_franken_conn<T, F>(
+    conn: &mcp_agent_mail_db::DbConn,
+    source: &Path,
+    context: &str,
+    probe: F,
+) -> CliResult<T>
+where
+    F: FnOnce(&mcp_agent_mail_db::CanonicalDbConn) -> CliResult<T>,
+{
+    let snapshot_dir = canonical_snapshot_tempdir("canonical-second-opinion-", context)?;
+    let snapshot_path = snapshot_dir.path().join("mailbox.sqlite3");
+    let destination_text = sqlite_snapshot_path_text(&snapshot_path, context, "destination")?;
+    prepare_sqlite_snapshot_destination(&snapshot_path, context)?;
+    let destination_literal = sqlite_string_literal(destination_text);
+    conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context} could not materialize a private canonical snapshot from {}: {error}",
+                source.display()
+            ))
+        })?;
+
+    // FrankenSQLite currently leaves persistent namespace records beside a
+    // successful VACUUM INTO output. They are private to this tempdir and no
+    // Franken handle for the destination remains alive, so this direct
+    // canonical open is process-exclusive. The guarded *offline* canonical
+    // helper intentionally rejects such records and therefore is not the
+    // correct API for this engine-owned private output.
+    let snapshot = mcp_agent_mail_db::CanonicalDbConn::open_file(destination_text).map_err(
+        |error| {
+            CliError::Other(format!(
+                "{context} could not open private canonical snapshot {}: {error}",
+                snapshot_path.display()
+            ))
+        },
+    )?;
+    probe(&snapshot)
 }
 
 fn vacuum_canonical_sqlite_into_snapshot(
@@ -14429,15 +14501,15 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
     storage_root_override: Option<&Path>,
     context: &str,
 ) -> CliResult<CanonicalReadDbPool> {
-    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
-    let storage_root_is_explicit =
-        mailbox_activity_storage_root_is_explicit(&storage_root, storage_root_override);
-    // Live-current mailboxes can be searched directly without materializing a
-    // temp snapshot, which keeps robot search fast under a live server.
-    let source = resolve_canonical_snapshot_source_with_database_url(
+    // Even a nominally read-only pool can open and later close additional
+    // descriptors for its main inode. On Unix that can erase another live
+    // FrankenSQLite connection's process-wide fcntl locks. Materialize first,
+    // exactly like the strict canonical-read helpers above, so this
+    // best-effort lane can only touch a caller-owned private inode.
+    let (storage_root, mailbox_read_locks, source) =
+        open_canonical_async_read_source_with_database_url(
         database_url,
-        &storage_root,
-        storage_root_is_explicit,
+        storage_root_override,
         context,
     )?;
     let conn = source.open_read_only(context)?;
@@ -14452,10 +14524,7 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
         conn,
         pool,
         _source: source,
-        _mailbox_read_locks: CliMailboxReadLocks {
-            _storage_root_lock: None,
-            _sqlite_lock: None,
-        },
+        _mailbox_read_locks: mailbox_read_locks,
     })
 }
 
@@ -25116,11 +25185,16 @@ fn doctor_foreign_key_violations_canonical(
     doctor_foreign_key_violations_from_rows(rows)
 }
 
-fn doctor_foreign_key_violations_canonical_file(
+fn doctor_foreign_key_violations_canonical_snapshot(
+    conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
 ) -> CliResult<Vec<DoctorForeignKeyViolation>> {
-    let conn = doctor_open_canonical_readonly_db_for_diagnostic(db_path, "foreign_key_check")?;
-    doctor_foreign_key_violations_canonical(&conn)
+    with_private_canonical_snapshot_from_franken_conn(
+        conn,
+        db_path,
+        "canonical foreign_key_check fallback",
+        doctor_foreign_key_violations_canonical,
+    )
 }
 
 fn doctor_foreign_key_violations_with_diagnostic_fallback(
@@ -25130,7 +25204,7 @@ fn doctor_foreign_key_violations_with_diagnostic_fallback(
     doctor_probe_with_canonical_fallback(
         DOCTOR_FOREIGN_KEY_CHECK_CAPABILITY,
         || doctor_foreign_key_violations(conn),
-        || doctor_foreign_key_violations_canonical_file(db_path),
+        || doctor_foreign_key_violations_canonical_snapshot(conn, db_path),
     )
 }
 
@@ -25232,12 +25306,16 @@ fn doctor_orphaned_message_recipients_canonical(
     Ok(recipients)
 }
 
-fn doctor_orphaned_message_recipients_canonical_file(
+fn doctor_orphaned_message_recipients_canonical_snapshot(
+    conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
 ) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
-    let conn =
-        doctor_open_canonical_readonly_db_for_diagnostic(db_path, "orphaned_recipient_query")?;
-    doctor_orphaned_message_recipients_canonical(&conn)
+    with_private_canonical_snapshot_from_franken_conn(
+        conn,
+        db_path,
+        "canonical orphaned-recipient fallback",
+        doctor_orphaned_message_recipients_canonical,
+    )
 }
 
 fn doctor_orphaned_message_recipients_with_diagnostic_fallback(
@@ -25247,7 +25325,7 @@ fn doctor_orphaned_message_recipients_with_diagnostic_fallback(
     doctor_probe_with_canonical_fallback(
         DOCTOR_ORPHANED_RECIPIENT_QUERY_CAPABILITY,
         || doctor_orphaned_message_recipients(conn),
-        || doctor_orphaned_message_recipients_canonical_file(db_path),
+        || doctor_orphaned_message_recipients_canonical_snapshot(conn, db_path),
     )
 }
 
@@ -25262,15 +25340,19 @@ fn doctor_relational_integrity_diagnostics(
     // `foreign_key_check` is `O(child_rows × parent_lookup)` and spun the
     // STARTUP self-heal for minutes on large mailboxes (tens of thousands of
     // `file_reservations`) — blocking the listener bind so the interactive
-    // server/TUI looked hung (`am` never opened :8765). The bespoke probes
-    // (each with their own canonical-on-error fallback) remain the fallback for
-    // when the canonical file cannot be opened. The read-only `am doctor health`
-    // path already used the canonical engine, which is why it stayed fast while
-    // startup wedged.
+    // server/TUI looked hung (`am` never opened :8765). Materialize through
+    // the already-open Franken connection, then run canonical SQLite only on
+    // that private inode: a second engine must never open and close the live
+    // main inode while this process may hold classic fcntl locks. The bespoke
+    // probes (each with the same private-snapshot fallback) remain available
+    // if the preferred combined diagnostic cannot run.
     if db_path.as_os_str() != ":memory:"
-        && let Ok(canonical) =
-            doctor_open_canonical_readonly_db_for_diagnostic(db_path, "relational_integrity")
-        && let Ok(diagnostics) = doctor_relational_integrity_diagnostics_canonical(&canonical)
+        && let Ok(diagnostics) = with_private_canonical_snapshot_from_franken_conn(
+            conn,
+            db_path,
+            "canonical relational-integrity diagnostic",
+            doctor_relational_integrity_diagnostics_canonical,
+        )
     {
         return Ok(diagnostics);
     }
@@ -30074,25 +30156,21 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     }
 
     let opened_path = Path::new(&opened.opened_path);
-    // css/ts2 startup-wedge fix: run the FULL integrity_check on the canonical
-    // (real-SQLite) engine rather than the bespoke FrankenSQLite engine. The
-    // bespoke `integrity_check` is linear in DB size but slow on a large file,
-    // and `sqlite_conn_check_ok_with_canonical_file_fallback` runs the bespoke
-    // engine FIRST (only falling back to canonical on error) — so on a healthy
-    // large mailbox the slow engine always executed and added seconds to the
-    // startup self-heal. Canonical is fast and authoritative (A4), matching the
-    // read-only `am doctor health` path.
-    // Prefer the canonical engine (fast + authoritative). On a NON-corruption
-    // canonical failure (e.g. a transient lock/open hiccup on this SECOND
-    // connection, opened while the bespoke `opened.conn` already holds the file)
-    // fall back to the bespoke-first probe rather than hard-failing startup — a
-    // benign canonical open failure must never wedge the boot. A canonical
-    // corruption verdict (recovery error) is kept so it routes to reconstruct.
+    // css/ts2 startup-wedge fix: prefer the canonical engine's FULL check, but
+    // never point that second engine at the live inode. Reuse `opened.conn` to
+    // materialize a private logical snapshot, then run canonical SQLite there.
+    // On a non-corruption snapshot/probe failure, fall back to the
+    // bespoke-first path rather than wedging startup. A canonical corruption
+    // verdict is retained so it can route to reconstruct.
     let integrity_probe =
-        match sqlite_file_check_ok_canonical(opened_path, mcp_agent_mail_db::CheckKind::Full) {
+        match sqlite_franken_snapshot_check_ok_canonical(
+            &opened.conn,
+            opened_path,
+            mcp_agent_mail_db::CheckKind::Full,
+        ) {
             ok @ Ok(_) => ok,
             Err(error) if is_sqlite_recovery_error_message(&error.to_string()) => Err(error),
-            Err(_) => sqlite_conn_check_ok_with_canonical_file_fallback(
+            Err(_) => sqlite_conn_check_ok_with_private_canonical_fallback(
                 &opened.conn,
                 opened_path,
                 mcp_agent_mail_db::CheckKind::Full,
@@ -67633,6 +67711,114 @@ startup_timeout_sec = 42
         assert_eq!(row.get_named::<i64>("max_value").expect("max"), 42);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_canonical_diagnostic_snapshot_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_CLI_DIAGNOSTIC_LOCK_PATH";
+        const CHILD_TEST_NAME: &str =
+            "tests::private_canonical_diagnostic_snapshot_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "cli-private-diagnostic-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let config = sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let contender = mcp_agent_mail_db::CanonicalDbConn::open(&config)
+                .expect("child opens competing canonical connection");
+            let error = contender
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect_err("child must not acquire the parent's reserved writer lock");
+            let error = error.to_string().to_ascii_lowercase();
+            assert!(
+                error.contains("busy") || error.contains("locked"),
+                "child must observe lock contention, not an unrelated failure: {error}"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("canonical-diagnostic-lock.sqlite3");
+        let seed = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open diagnostic lock fixture");
+        seed.execute_raw("PRAGMA journal_mode = DELETE")
+            .expect("use rollback-journal locking");
+        seed.execute_raw("CREATE TABLE diagnostic_witness(value INTEGER NOT NULL)")
+            .expect("create diagnostic witness table");
+        seed.execute_raw("INSERT INTO diagnostic_witness(value) VALUES (7)")
+            .expect("seed diagnostic witness row");
+        drop(seed);
+
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open reserved-lock writer");
+        writer
+            .execute_raw("BEGIN IMMEDIATE")
+            .expect("acquire parent reserved writer lock");
+        assert_child_observes_busy(&db_path);
+
+        let observer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open same-engine diagnostic observer");
+        assert_child_observes_busy(&db_path);
+        let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+        let entries_before = directory_entry_names_for_cli_open_test(dir.path());
+        let count = with_private_canonical_snapshot_from_franken_conn(
+            &observer,
+            &db_path,
+            "CLI canonical diagnostic lock regression",
+            |snapshot| {
+                let rows = snapshot
+                    .query_sync("SELECT COUNT(*) AS count FROM diagnostic_witness", &[])
+                    .map_err(|error| CliError::Other(error.to_string()))?;
+                rows[0]
+                    .get_named::<i64>("count")
+                    .map_err(|error| CliError::Other(error.to_string()))
+            },
+        )
+        .expect("run canonical diagnostic on a private snapshot");
+        assert_eq!(count, 1);
+        assert_child_observes_busy(&db_path);
+        assert_eq!(
+            sqlite_family_bytes_for_cli_open_test(&db_path),
+            family_before,
+            "private canonical diagnostic must not change the live SQLite family"
+        );
+        assert_eq!(
+            directory_entry_names_for_cli_open_test(dir.path()),
+            entries_before,
+            "private canonical diagnostic must not publish artifacts beside the live database"
+        );
+
+        writer.execute_raw("ROLLBACK").expect("release writer lock");
+        drop(observer);
+        drop(writer);
+    }
+
     #[test]
     fn open_db_sync_no_breaker_unhealthy_family_enters_admission_before_writable_open() {
         for family_kind in ["corrupt-primary", "truncated-wal"] {
@@ -72457,7 +72643,6 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         "share export",
     )?;
     let source_path = source.reported_path().display().to_string();
-    let source_db = source.actual_path();
 
     ftui_runtime::ftui_println!("Source database: {source_path}");
     if source.uses_archive_snapshot() {
@@ -72471,8 +72656,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 
         let tmp = tempfile::tempdir()?;
         let snapshot_path = tmp.path().join("_snapshot.sqlite3");
-        let snap_ctx = share::create_snapshot_context(
-            source_db,
+        let snap_ctx = source.create_share_snapshot_context(
             &snapshot_path,
             &params.projects,
             params.scrub_preset,
@@ -72532,8 +72716,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         std::fs::remove_file(&snapshot_path)?;
     }
     let mut snapshot_cleanup = SnapshotCleanupGuard::new(snapshot_path.clone());
-    let snap_ctx = share::create_snapshot_context(
-        source_db,
+    let snap_ctx = source.create_share_snapshot_context(
         &snapshot_path,
         &params.projects,
         params.scrub_preset,
@@ -72662,7 +72845,6 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         "share update",
     )?;
     let source_path = source.reported_path().display().to_string();
-    let source_db = source.actual_path();
 
     ftui_runtime::ftui_println!("Source database: {source_path}");
     if source.uses_archive_snapshot() {
@@ -72690,8 +72872,7 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     if snapshot_path.exists() {
         std::fs::remove_file(&snapshot_path)?;
     }
-    let snap_ctx = share::create_snapshot_context(
-        source_db,
+    let snap_ctx = source.create_share_snapshot_context(
         &snapshot_path,
         &params.projects,
         params.scrub_preset,
@@ -73745,8 +73926,7 @@ fn archive_save_state_internal(
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
 
     ftui_runtime::ftui_println!("Creating mailbox archive...");
-    let context =
-        share::create_snapshot_context(source.actual_path(), &snapshot_path, &projects, preset)?;
+    let context = source.create_share_snapshot_context(&snapshot_path, &projects, preset)?;
 
     let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
     let destination_name = destination
@@ -74927,7 +75107,7 @@ fn handle_doctor_repair_with_options(
     // state, reconstruction is safer than trying to guess which in-place repair
     // operation can recover a malformed b-tree or index.
     {
-        let full_check = sqlite_conn_check_ok_with_canonical_file_fallback(
+        let full_check = sqlite_conn_check_ok_with_private_canonical_fallback(
             &conn,
             &reconstruct_db_path,
             mcp_agent_mail_db::CheckKind::Full,

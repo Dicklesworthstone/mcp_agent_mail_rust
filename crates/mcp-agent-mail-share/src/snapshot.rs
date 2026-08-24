@@ -289,6 +289,9 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
         }
         Err(error) => return Err(ShareError::Io(error)),
     }
+    if matches!(source_profile, SnapshotSourceProfile::CanonicalExport) {
+        validate_private_canonical_snapshot_source(&source)?;
+    }
 
     // Resolve destination to absolute path
     let dest = if destination.is_absolute() {
@@ -469,6 +472,58 @@ fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
         }
     }
     Ok(false)
+}
+
+/// Enforce the engine-exclusive source contract before canonical SQLite can
+/// open the main inode. Franken namespace authority means the path may be live
+/// and must use the guarded same-engine API instead. A multiply-linked inode
+/// likewise defeats pathname-based ownership checks because another alias can
+/// still be live or replaced independently.
+fn validate_private_canonical_snapshot_source(path: &Path) -> Result<(), ShareError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(ShareError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(ShareError::Validation {
+            message: format!(
+                "private canonical snapshot source is not a regular file: {}",
+                path.display()
+            ),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(ShareError::Validation {
+                message: format!(
+                    "private canonical snapshot source must have exactly one hard link: {} has {}",
+                    path.display(),
+                    metadata.nlink()
+                ),
+            });
+        }
+    }
+
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "private canonical snapshot source refuses FrankenSQLite namespace artifact {}",
+                        sidecar.display()
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShareError::Io(error)),
+        }
+    }
+
+    Ok(())
 }
 
 /// How the guarded directory traversal in [`create_real_directory_all`]
@@ -1125,6 +1180,55 @@ mod tests {
             "unexpected live-source refusal: {error}"
         );
         assert!(!refused_live_dest.exists());
+    }
+
+    #[test]
+    fn private_canonical_api_rejects_franken_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("live-franken.sqlite3");
+        let destination = dir.path().join("unsafe-canonical-copy.sqlite3");
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = create_private_canonical_sqlite_snapshot(&source, &destination, false)
+            .expect_err("private canonical API must refuse Franken namespace authority");
+        assert!(
+            error
+                .to_string()
+                .contains("refuses FrankenSQLite namespace artifact"),
+            "unexpected namespace refusal: {error}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_canonical_api_rejects_hard_linked_main_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("private-canonical.sqlite3");
+        let alias = dir.path().join("private-canonical-alias.sqlite3");
+        let destination = dir.path().join("unsafe-hardlink-copy.sqlite3");
+        let conn = CanonicalDbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::hard_link(&source, &alias).unwrap();
+
+        let error = create_private_canonical_sqlite_snapshot(&source, &destination, false)
+            .expect_err("private canonical API must refuse multiply-linked main inodes");
+        assert!(
+            error
+                .to_string()
+                .contains("must have exactly one hard link"),
+            "unexpected hard-link refusal: {error}"
+        );
+        assert!(!destination.exists());
     }
 
     #[test]

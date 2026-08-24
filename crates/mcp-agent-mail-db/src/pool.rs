@@ -9471,21 +9471,55 @@ const SQLITE_DATABASE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
 const RECOVERY_DISK_RESERVE_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Zero-footprint viability check for the strict query-only pool (br-uflow).
+/// No-follow header check for an engine-exclusive canonical diagnostic.
 ///
-/// The strict pool must never create, repair, or leave sidecars beside its
-/// target — but FrankenSQLite's open mints persistent namespace records even
-/// for opens that fail, and only its own cleanup protocol may remove them
-/// (see [`FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES`]). Rejecting absent targets
-/// and files that cannot be a SQLite database (bad magic) here keeps such
-/// pathnames out of FrankenSQLite entirely. Deeper corruption still surfaces
-/// from the real open/query path. A zero-length file is not a materialized
-/// SQLite database and is refused too, so a diagnostic can never turn it into
-/// an engine namespace merely by observing it.
-fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError> {
-    let metadata = std::fs::symlink_metadata(sqlite_path).map_err(|error| {
+/// This function deliberately opens and closes the main inode to read its
+/// header. It must never be reused on a live Franken-admitted database: on
+/// Unix, that close could release classic process-wide `fcntl` locks held by
+/// another same-process connection. The public canonical opener rejects
+/// namespace authority and hard-link aliases before reaching this seam.
+fn strict_offline_canonical_target_precheck(
+    sqlite_path: &str,
+) -> std::result::Result<(), SqlError> {
+    let path = Path::new(sqlite_path);
+    let pathname_metadata = std::fs::symlink_metadata(path).map_err(|error| {
         SqlError::Custom(format!(
-            "strict query-only open refused: cannot stat {sqlite_path}: {error}"
+            "strict query-only open refused: cannot inspect {sqlite_path}: {error}"
+        ))
+    })?;
+    if !pathname_metadata.file_type().is_file() {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is not a regular file"
+        )));
+    }
+    #[cfg(unix)]
+    if pathname_metadata.nlink() != 1 {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} has {} hard links; canonical diagnostics cannot prove that no Franken namespace authority exists beside an alias of the same inode",
+            pathname_metadata.nlink()
+        )));
+    }
+    if pathname_metadata.len() == 0 {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is an empty, unmaterialized database file"
+        )));
+    }
+    if pathname_metadata.len()
+        < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} has a truncated SQLite database header"
+        )));
+    }
+
+    let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path).map_err(|error| {
+        SqlError::Custom(format!(
+            "strict query-only open refused: cannot open {sqlite_path} without following links: {error}"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        SqlError::Custom(format!(
+            "strict query-only open refused: cannot inspect open target {sqlite_path}: {error}"
         ))
     })?;
     if !metadata.is_file() {
@@ -9511,13 +9545,11 @@ fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError
         )));
     }
     let mut header = [0u8; SQLITE_DATABASE_HEADER_BYTES];
-    mcp_agent_mail_core::disk::open_regular_file_no_follow(Path::new(sqlite_path))
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
-        .map_err(|error| {
-            SqlError::Custom(format!(
-                "strict query-only open refused: cannot read header of {sqlite_path}: {error}"
-            ))
-        })?;
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|error| {
+        SqlError::Custom(format!(
+            "strict query-only open refused: cannot read header of {sqlite_path}: {error}"
+        ))
+    })?;
     let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
     let page_size_is_valid = raw_page_size == 1
         || ((512..=32_768).contains(&raw_page_size) && raw_page_size.is_power_of_two());
@@ -9535,24 +9567,22 @@ fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError
     Ok(())
 }
 
-/// Prove an existing live mailbox family is safe to hand to a read-only SQLite
-/// engine without granting that engine any writer authority.
+/// Prove an engine-exclusive or offline family is safe to hand to canonical
+/// SQLite without granting that engine any writer authority.
 ///
-/// Even a failed ordinary FrankenSQLite open can publish persistent namespace
-/// records beside the target. Read-only diagnostics therefore reject missing,
-/// non-regular, symlinked, and structurally invalid targets before the engine
-/// sees the pathname. When durable breaker history applies to these exact
+/// This preflight reads/fingerprints the main inode and may build a private
+/// family copy for a no-cleanup health proof. It is therefore intentionally
+/// separate from [`preflight_bound_live_franken_family`], whose contract is
+/// descriptor-neutral. When durable breaker history applies to these exact
 /// primary bytes, breaker authority is unreadable, or the generation sidecar
-/// family is structurally suspect, a private copy of the exact family must pass the
-/// no-cleanup health probe before the live read-only open is allowed. This
-/// keeps malformed/tripped authority source-neutral while preserving service
-/// for a family that is independently proven healthy.
+/// family is structurally suspect, the private exact-family copy must pass
+/// before the canonical read-only open is allowed.
 #[allow(clippy::result_large_err)]
-fn preflight_guarded_read_only_sqlite_family(
+fn preflight_guarded_offline_canonical_sqlite_family(
     sqlite_path: &Path,
     context: &str,
 ) -> Result<PathBuf, SqlError> {
-    preflight_guarded_read_only_sqlite_family_with_probe(
+    preflight_guarded_offline_canonical_sqlite_family_with_probe(
         sqlite_path,
         context,
         sqlite_file_is_healthy_without_family_cleanup,
@@ -9560,7 +9590,7 @@ fn preflight_guarded_read_only_sqlite_family(
 }
 
 #[allow(clippy::result_large_err)]
-fn preflight_guarded_read_only_sqlite_family_with_probe<F>(
+fn preflight_guarded_offline_canonical_sqlite_family_with_probe<F>(
     sqlite_path: &Path,
     context: &str,
     mut exact_family_probe: F,
@@ -9570,11 +9600,11 @@ where
 {
     validate_sqlite_target_path(sqlite_path, context)?;
     let sqlite_path_str = sqlite_path_as_utf8(sqlite_path)?;
-    strict_target_precheck(sqlite_path_str)?;
-    // FrankenSQLite canonicalizes before namespace admission. Resolve once
-    // after the no-follow validation above, then hand this exact stable path
-    // to both our admission lease and the engine so relative spellings cannot
-    // coordinate on a different namespace.
+    strict_offline_canonical_target_precheck(sqlite_path_str)?;
+    // Resolve once after the no-follow validation above, then inspect and open
+    // the same absolute spelling throughout the canonical/offline path. This
+    // keeps relative callers from classifying one sidecar family and opening a
+    // differently resolved main pathname.
     let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
         SqlError::Custom(format!(
             "{context}: cannot resolve stable SQLite path {} after validating it: {error}",
@@ -9668,6 +9698,32 @@ where
 }
 
 #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+fn map_read_only_namespace_admission_error(
+    error: fsqlite::FrankenError,
+    stable_path: &Path,
+    context: &str,
+) -> SqlError {
+    match &error {
+        fsqlite::FrankenError::Busy
+        | fsqlite::FrankenError::BusyRecovery
+        | fsqlite::FrankenError::BusySnapshot { .. }
+        | fsqlite::FrankenError::DatabaseLocked { .. }
+        | fsqlite::FrankenError::LockFailed { .. } => {
+            // The bounded retry loop classifies SqlError text. In particular,
+            // FrankenError::LockFailed renders as `file locking failed`, which
+            // is not itself one of that classifier's busy/locked phrases.
+            // Preserve the typed decision locally instead of teaching every
+            // unrelated LockFailed detail to retry globally.
+            SqlError::Custom(format!("database is busy: {error}"))
+        }
+        _ => SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its existing namespace authority is malformed or unsafe",
+            stable_path.display()
+        )),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
 #[allow(clippy::result_large_err)]
 fn acquire_guarded_read_only_namespace_binding(
     stable_path: &Path,
@@ -9715,18 +9771,8 @@ fn acquire_guarded_read_only_namespace_binding(
         "strict read-only namespace admission",
         || {
             PendingNamespaceOpen::begin(stable_path, NamespaceOpenIntent::ReadOnlyExisting)
-                .map_err(|error| match error {
-                    fsqlite::FrankenError::Busy
-                    | fsqlite::FrankenError::BusyRecovery
-                    | fsqlite::FrankenError::BusySnapshot { .. }
-                    | fsqlite::FrankenError::DatabaseLocked { .. }
-                    | fsqlite::FrankenError::LockFailed { .. } => {
-                        SqlError::Custom(error.to_string())
-                    }
-                    _ => SqlError::Custom(format!(
-                        "{context}: refusing live read-only FrankenSQLite open for {} because its existing namespace authority is malformed or unsafe",
-                        stable_path.display()
-                    )),
+                .map_err(|error| {
+                    map_read_only_namespace_admission_error(error, stable_path, context)
                 })
         },
         std::thread::sleep,
@@ -9903,8 +9949,8 @@ pub fn open_guarded_read_only_franken_existing_file(
     Ok(conn)
 }
 
-/// Open an existing live mailbox database through canonical SQLite's read-only
-/// flags after the same source-neutral family preflight used by FrankenSQLite.
+/// Open an engine-exclusive or offline database through canonical SQLite's
+/// true read-only flags after a source-neutral family preflight.
 #[allow(clippy::result_large_err)]
 pub fn open_guarded_read_only_canonical_sqlite_file(
     sqlite_path: &Path,
@@ -9923,7 +9969,8 @@ pub fn open_guarded_read_only_canonical_sqlite_file(
             sqlite_path.display()
         )));
     }
-    let stable_path = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    let stable_path =
+        preflight_guarded_offline_canonical_sqlite_family(sqlite_path, context)?;
     let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
     let conn = open_canonical_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(
         |error| {
@@ -13929,7 +13976,7 @@ mod tests {
             install_diagnostic_breaker(&db_path, breaker_kind);
             let probe_calls = std::cell::Cell::new(0_u32);
 
-            preflight_guarded_read_only_sqlite_family_with_probe(
+            preflight_guarded_offline_canonical_sqlite_family_with_probe(
                 &db_path,
                 "breaker-causal diagnostic test",
                 |_| {
@@ -13969,7 +14016,7 @@ mod tests {
                 .expect("store irrelevant diagnostic breaker authority");
             let probe_calls = std::cell::Cell::new(0_u32);
 
-            preflight_guarded_read_only_sqlite_family_with_probe(
+            preflight_guarded_offline_canonical_sqlite_family_with_probe(
                 &db_path,
                 "irrelevant-breaker diagnostic test",
                 |_| {
@@ -14784,6 +14831,14 @@ mod tests {
         writer
             .execute_raw("PRAGMA journal_mode = DELETE;")
             .expect("use main-inode rollback locking");
+        // Snapshot before acquiring the writer lock. Reading the main file
+        // during the transaction would itself open/close the inode and could
+        // release the exact process-wide fcntl lock this test is protecting.
+        let family_before = exact_diagnostic_parent_snapshot(directory.path());
+        let main_entry = family_before
+            .get(db_path.file_name().expect("writer-lock database file name"))
+            .cloned()
+            .expect("snapshot writer-lock main database");
         writer
             .execute_raw("BEGIN IMMEDIATE;")
             .expect("acquire parent reserved writer lock");
@@ -14793,7 +14848,6 @@ mod tests {
         );
 
         assert_child_observes_busy(&db_path);
-        let before = exact_diagnostic_parent_snapshot(directory.path());
         let observer = open_guarded_read_only_franken_existing_file(
             &db_path,
             "same-process writer-lock regression",
@@ -14809,11 +14863,6 @@ mod tests {
         );
         drop(observer);
         assert_child_observes_busy(&db_path);
-        assert_eq!(
-            exact_diagnostic_parent_snapshot(directory.path()),
-            before,
-            "fd-free read-only preflight must preserve both bytes and the parent's writer lock"
-        );
 
         // A pathname-only namespace check is insufficient when another name
         // reaches the same inode: the alias has no adjacent Franken namespace
@@ -14824,7 +14873,14 @@ mod tests {
         let alias_path = directory.path().join("writer-lock-alias.sqlite3");
         std::fs::hard_link(&db_path, &alias_path)
             .expect("create hard-link alias of live writer database");
-        let aliased_before = exact_diagnostic_parent_snapshot(directory.path());
+        let mut aliased_expected = family_before;
+        aliased_expected.insert(
+            alias_path
+                .file_name()
+                .expect("writer-lock alias file name")
+                .to_os_string(),
+            main_entry,
+        );
         assert!(
             open_guarded_read_only_canonical_sqlite_file(
                 &alias_path,
@@ -14842,16 +14898,16 @@ mod tests {
             "Franken diagnostics must require one authoritative main pathname"
         );
         assert_child_observes_busy(&db_path);
-        assert_eq!(
-            exact_diagnostic_parent_snapshot(directory.path()),
-            aliased_before,
-            "hard-link refusals must preserve every family name and byte"
-        );
 
         writer
             .execute_raw("ROLLBACK;")
             .expect("release parent writer lock");
         crate::close_db_conn(writer, "clean up writer-lock test fixture");
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            aliased_expected,
+            "guarded observations and hard-link refusals must preserve every family name and byte"
+        );
     }
 
     #[test]
@@ -24071,6 +24127,41 @@ mod tests {
         assert_eq!(
             sleep_calls.borrow().as_slice(),
             &[sqlite_lock_retry_delay(0), sqlite_lock_retry_delay(1)]
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn namespace_lockfailed_mapping_reaches_bounded_retry() {
+        let attempts = std::cell::Cell::new(0usize);
+        let sleep_calls = std::cell::RefCell::new(Vec::new());
+        let result = retry_sqlite_lock_impl(
+            "ignored.sqlite3",
+            "strict read-only namespace admission test",
+            || {
+                let next = attempts.get().saturating_add(1);
+                attempts.set(next);
+                if next == 1 {
+                    Err(map_read_only_namespace_admission_error(
+                        fsqlite::FrankenError::LockFailed {
+                            detail: "namespace use lock is contended".to_string(),
+                        },
+                        Path::new("ignored.sqlite3"),
+                        "namespace retry test",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| sleep_calls.borrow_mut().push(delay),
+        );
+
+        assert!(result.is_ok(), "mapped namespace contention must retry");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(
+            sleep_calls.borrow().as_slice(),
+            &[sqlite_lock_retry_delay(0)]
         );
     }
 
