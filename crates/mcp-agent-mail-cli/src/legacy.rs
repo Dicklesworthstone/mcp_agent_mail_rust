@@ -210,7 +210,7 @@ enum ImportMode {
     Copy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ImportPlan {
     mode: ImportMode,
     search_root: PathBuf,

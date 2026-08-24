@@ -14,8 +14,7 @@
 //!
 //! ## Detection (pure, on-disk state)
 //!
-//! 1. Open `storage.sqlite3` read-only with URI `?immutable=1`
-//!    (no WAL/SHM sidecar creation or journal replay).
+//! 1. Query the command's retained WAL-aware logical read source.
 //! 2. Verify Search V3 is active by probing the canonical marker
 //!    file: `<storage_root>/search_index/.managed.json`. If
 //!    absent, FTS5 IS the active backend and residue is normal —

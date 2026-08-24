@@ -24,10 +24,9 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Open the DB read-only (URI `?immutable=1` so a WAL probe
-//! cannot create `-shm`). Run a single JOIN comparing stored
-//! vs ground-truth unread counts. Surface up to 100 divergent
-//! agents in the finding evidence.
+//! Query the command's retained WAL-aware logical read source. Run a single
+//! JOIN comparing stored vs ground-truth unread counts. Surface up to 100
+//! divergent agents in the finding evidence.
 //!
 //! ## Fix (`Op::DbExec`)
 //!

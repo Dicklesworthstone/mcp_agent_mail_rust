@@ -201,6 +201,12 @@ enum DoctorDbReadSourceKind {
     Unavailable,
 }
 
+pub(crate) enum DoctorIntegrityProbe {
+    Result(String),
+    Corruption(String),
+    Unavailable,
+}
+
 /// A typed detector source that keeps the repair target distinct from the
 /// inode canonical SQLite is allowed to open.
 ///
@@ -216,6 +222,7 @@ pub(crate) struct DoctorDbReadCandidate {
     _retained_snapshot: Option<crate::CanonicalSnapshotSource>,
     source_kind: DoctorDbReadSourceKind,
     open_error: Option<String>,
+    physical_corruption_error: Option<String>,
 }
 
 impl DoctorDbReadCandidate {
@@ -226,6 +233,22 @@ impl DoctorDbReadCandidate {
             _retained_snapshot: None,
             source_kind: DoctorDbReadSourceKind::Unavailable,
             open_error: Some(error.into()),
+            physical_corruption_error: None,
+        }
+    }
+
+    fn unavailable_with_physical_corruption(
+        target_path: &std::path::Path,
+        error: impl Into<String>,
+        physical_corruption_error: String,
+    ) -> Self {
+        Self {
+            target_path: target_path.to_path_buf(),
+            connection: None,
+            _retained_snapshot: None,
+            source_kind: DoctorDbReadSourceKind::Unavailable,
+            open_error: Some(error.into()),
+            physical_corruption_error: Some(physical_corruption_error),
         }
     }
 
@@ -258,9 +281,33 @@ impl DoctorDbReadCandidate {
                     _retained_snapshot: opened._snapshot_source,
                     source_kind,
                     open_error: None,
+                    physical_corruption_error: None,
                 }
             }
-            Err(error) => Self::unavailable(target_path, error.to_string()),
+            Err(error) => {
+                let source_error = error.to_string();
+                match mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                    target_path,
+                    "doctor fixer failed-export physical corruption probe",
+                ) {
+                    Err(physical_error)
+                        if integrity_error_is_authoritative_corruption(
+                            &physical_error.to_string(),
+                        ) =>
+                    {
+                        Self::unavailable_with_physical_corruption(
+                            target_path,
+                            source_error,
+                            physical_error.to_string(),
+                        )
+                    }
+                    Ok(connection) => {
+                        drop(connection);
+                        Self::unavailable(target_path, source_error)
+                    }
+                    Err(_) => Self::unavailable(target_path, source_error),
+                }
+            }
         }
     }
 
@@ -281,6 +328,7 @@ impl DoctorDbReadCandidate {
                 _retained_snapshot: None,
                 source_kind: DoctorDbReadSourceKind::ExplicitOffline,
                 open_error: None,
+                physical_corruption_error: None,
             },
             Err(error) => Self::unavailable(target_path, error.to_string()),
         }
@@ -298,38 +346,46 @@ impl DoctorDbReadCandidate {
     /// verdict. A VACUUM snapshot is correct for logical rows but can rebuild
     /// a damaged index and therefore cannot prove a live primary's b-tree is
     /// healthy.
-    pub(crate) fn integrity_check_one(&self) -> Result<String, String> {
+    pub(crate) fn integrity_check_one(&self) -> DoctorIntegrityProbe {
         match self.source_kind {
             DoctorDbReadSourceKind::LiveLogicalSnapshot => {
-                let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                let conn = match mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
                     &self.target_path,
                     "doctor fixer physical integrity probe",
-                )
-                .map_err(|error| error.to_string())?;
-                let rows = conn
-                    .query_sync("PRAGMA integrity_check(1)", &[])
-                    .map_err(|error| error.to_string())?;
-                rows.first()
-                    .ok_or_else(|| "PRAGMA integrity_check(1) returned no rows".to_string())?
-                    .get_named::<String>("integrity_check")
-                    .map_err(|error| error.to_string())
+                ) {
+                    Ok(conn) => conn,
+                    Err(error) => return classify_integrity_probe_error(error.to_string()),
+                };
+                match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
+                    Ok(rows) => match rows
+                        .first()
+                        .and_then(|row| row.get_named::<String>("integrity_check").ok())
+                    {
+                        Some(result) => DoctorIntegrityProbe::Result(result),
+                        None => DoctorIntegrityProbe::Unavailable,
+                    },
+                    Err(error) => classify_integrity_probe_error(error.to_string()),
+                }
             }
             DoctorDbReadSourceKind::ExplicitOffline => {
-                let conn = self
-                    .connection()
-                    .ok_or_else(|| "explicit-offline source has no connection".to_string())?;
-                let rows = conn
-                    .query_sync("PRAGMA integrity_check(1)", &[])
-                    .map_err(|error| error.to_string())?;
-                rows.first()
-                    .ok_or_else(|| "PRAGMA integrity_check(1) returned no rows".to_string())?
-                    .get_named::<String>("integrity_check")
-                    .map_err(|error| error.to_string())
+                let Some(conn) = self.connection() else {
+                    return DoctorIntegrityProbe::Unavailable;
+                };
+                match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
+                    Ok(rows) => match rows
+                        .first()
+                        .and_then(|row| row.get_named::<String>("integrity_check").ok())
+                    {
+                        Some(result) => DoctorIntegrityProbe::Result(result),
+                        None => DoctorIntegrityProbe::Unavailable,
+                    },
+                    Err(error) => classify_integrity_probe_error(error.to_string()),
+                }
             }
-            DoctorDbReadSourceKind::Unavailable => Err(self
-                .open_error
+            DoctorDbReadSourceKind::Unavailable => self
+                .physical_corruption_error
                 .clone()
-                .unwrap_or_else(|| "doctor fixer source is unavailable".to_string())),
+                .map_or(DoctorIntegrityProbe::Unavailable, DoctorIntegrityProbe::Corruption),
         }
     }
 
@@ -364,6 +420,22 @@ impl DoctorDbReadCandidate {
             }
         }
     }
+}
+
+fn classify_integrity_probe_error(detail: String) -> DoctorIntegrityProbe {
+    if integrity_error_is_authoritative_corruption(&detail) {
+        DoctorIntegrityProbe::Corruption(detail)
+    } else {
+        DoctorIntegrityProbe::Unavailable
+    }
+}
+
+fn integrity_error_is_authoritative_corruption(detail: &str) -> bool {
+    matches!(
+        mcp_agent_mail_db::classify_db_error_message(detail).class,
+        mcp_agent_mail_db::DbErrorClass::MainDbBtreeCorruption
+            | mcp_agent_mail_db::DbErrorClass::WalSidecarCorruption
+    )
 }
 
 fn prepare_doctor_db_read_candidates(

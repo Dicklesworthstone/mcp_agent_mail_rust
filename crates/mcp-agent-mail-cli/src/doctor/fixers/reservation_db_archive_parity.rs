@@ -623,6 +623,104 @@ mod tests {
     }
 
     #[test]
+    fn live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix() {
+        let (storage_root, db_path) =
+            materialize_fixture(STALE_AGENT_SQL, STALE_AGENT_JSON, 101);
+
+        // Align the settled main image with the archive, then admit the family
+        // through FrankenSQLite and checkpoint that clean baseline.
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("admit live reservation fixture");
+        admitted
+            .execute_raw(
+                "UPDATE file_reservations SET agent_id = 1, released_ts = NULL WHERE id = 101;
+                 DELETE FROM file_reservation_releases WHERE reservation_id = 101;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("settle aligned live reservation baseline");
+        mcp_agent_mail_db::close_db_conn(admitted, "settle reservation WAL baseline");
+        let main_before = std::fs::read(&db_path).expect("read settled main");
+
+        // Commit both decisive drifts only to WAL. An immutable main-file read
+        // sees the aligned holder/active state and therefore false-greens.
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("reopen live reservation writer");
+        writer
+            .execute_raw(
+                "PRAGMA wal_autocheckpoint = 0;
+                 UPDATE file_reservations
+                 SET agent_id = 2, released_ts = 1700001015000000
+                 WHERE id = 101;
+                 INSERT OR REPLACE INTO file_reservation_releases
+                 (reservation_id, released_ts) VALUES (101, 1700001015000000);",
+            )
+            .expect("commit WAL-only holder and release drift");
+        drop(writer);
+        assert_eq!(
+            std::fs::read(&db_path).expect("read WAL-only main"),
+            main_before,
+            "fixture must keep holder and release drift out of the main image"
+        );
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
+            "fixture must retain committed WAL frames"
+        );
+
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db_path,
+            "reservation WAL truth test",
+        );
+        let finding = detect_prepared(Some(storage_root.path()), std::slice::from_ref(&candidate))
+            .pop()
+            .expect("WAL-only reservation drift must be visible");
+        assert_eq!(finding.report.drift.agent_id_mismatches, 1);
+        assert_eq!(finding.report.drift.released_ts_mismatches, 1);
+        assert_eq!(finding.report.drift.active_status_mismatches, 1);
+
+        // Make the live truth clean again while the candidate deliberately
+        // retains the old private snapshot. The fixer must refresh under the
+        // caller's exclusive authority and skip the now-stale plan.
+        let cleaner = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("reopen live reservation cleaner");
+        cleaner
+            .execute_raw(
+                "PRAGMA wal_autocheckpoint = 0;
+                 UPDATE file_reservations SET agent_id = 1, released_ts = NULL WHERE id = 101;
+                 DELETE FROM file_reservation_releases WHERE reservation_id = 101;",
+            )
+            .expect("commit clean current reservation truth");
+        drop(cleaner);
+        let archive_path = storage_root
+            .path()
+            .join("projects/reservation-regression/file_reservations/id-101.json");
+        let archive_before = std::fs::read(&archive_path).expect("read archive witness");
+        let outcome = fix_prepared(
+            &collision_ctx(&storage_root, "reservation-wal-revalidation"),
+            &finding,
+            &candidate,
+        )
+        .expect("revalidate stale WAL finding");
+        assert_eq!(outcome.actions_taken, 0);
+        assert!(outcome.actions_skipped >= 1);
+        assert_eq!(
+            std::fs::read(&archive_path).expect("read archive after skip"),
+            archive_before,
+            "stale release evidence must not rewrite the archive"
+        );
+        let current = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db_path,
+            "reservation WAL post-fix verification",
+        );
+        assert!(
+            detect_prepared(Some(storage_root.path()), std::slice::from_ref(&current)).is_empty(),
+            "fresh live truth is already aligned"
+        );
+    }
+
+    #[test]
     fn finding_advertises_holder_reconcile_with_health_line_evidence() {
         let (storage_root, db_path) = materialize_fixture(STALE_AGENT_SQL, STALE_AGENT_JSON, 101);
         let finding = detect(Some(storage_root.path()), std::slice::from_ref(&db_path))

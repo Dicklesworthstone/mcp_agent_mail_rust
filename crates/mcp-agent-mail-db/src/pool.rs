@@ -2822,6 +2822,8 @@ impl DbPool {
         query_only: bool,
         journal_size_limit_bytes: i64,
     ) -> Arc<String> {
+        use std::fmt::Write as _;
+
         let mut sql = String::new();
         if query_only {
             sql.push_str("PRAGMA query_only = ON;\n");
@@ -2833,9 +2835,8 @@ impl DbPool {
         // `build_conn_pragmas` carries the historical default. Append the
         // operator value so the last assignment is authoritative without
         // widening this pool-only change into schema helpers used elsewhere.
-        sql.push_str(&format!(
-            "PRAGMA journal_size_limit = {journal_size_limit_bytes};\n"
-        ));
+        writeln!(sql, "PRAGMA journal_size_limit = {journal_size_limit_bytes};")
+            .expect("writing connection initialization SQL to a String cannot fail");
         Arc::new(sql)
     }
 
@@ -5789,7 +5790,7 @@ fn is_macos_temp_firmlink(link: &Path, resolved: &Path) -> bool {
 }
 
 pub struct CanonicalSnapshotTempDir {
-    _guard: tempfile::TempDir,
+    guard: tempfile::TempDir,
     canonical_path: PathBuf,
 }
 
@@ -5816,7 +5817,7 @@ impl CanonicalSnapshotTempDir {
     fn from_guard(guard: tempfile::TempDir) -> std::io::Result<Self> {
         let canonical_path = guard.path().canonicalize()?;
         Ok(Self {
-            _guard: guard,
+            guard,
             canonical_path,
         })
     }
@@ -5831,7 +5832,7 @@ impl CanonicalSnapshotTempDir {
     /// companion artifact remains available for forensic inspection.
     #[must_use]
     pub fn preserve(self) -> PathBuf {
-        self._guard.keep()
+        self.guard.keep()
     }
 }
 
@@ -6948,7 +6949,7 @@ fn seal_sqlite_cleanup_sidecar(
     let mut prefix = [0_u8; SQLITE_WAL_HEADER_BYTES_USIZE];
     let mut prefix_len = 0_usize;
     let mut observed_len = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer).map_err(|error| {
             SqlError::Custom(format!(
@@ -7297,7 +7298,7 @@ fn quarantine_sqlite_cleanup_sidecar_witnessed(
                 );
                 return Ok(quarantine);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(SqlError::Custom(format!(
                     "failed to quarantine SQLite sidecar {} at {} without replacement ({reason}): {error}",
@@ -7960,9 +7961,11 @@ fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
 }
 
 /// Run the FrankenSQLite read-path checks against a private copy of the whole
-/// SQLite family. The live primary and every adjacent sidecar remain byte- and
-/// name-identical even if the engine replays a journal or resets WAL/SHM while
-/// opening the staged copy.
+/// SQLite family.
+///
+/// The live primary and every adjacent sidecar remain byte- and name-identical
+/// even if the engine replays a journal or resets WAL/SHM while opening the
+/// staged copy.
 #[allow(clippy::result_large_err)]
 pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
@@ -8467,16 +8470,16 @@ pub(crate) fn recovery_file_link_count(file: &std::fs::File) -> std::io::Result<
     {
         use std::os::unix::fs::MetadataExt as _;
 
-        return Ok(file.metadata()?.nlink());
+        Ok(file.metadata()?.nlink())
     }
 
     #[cfg(windows)]
     {
         let _ = file;
-        return Err(std::io::Error::new(
+        Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "stable Windows cannot prove exclusive recovery candidate hard-link ownership",
-        ));
+        ))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -10253,7 +10256,7 @@ pub fn rename_noreplace_preserving_source(
         target_os = "redox",
     ))]
     {
-        return rustix::fs::renameat_with(
+        rustix::fs::renameat_with(
             rustix::fs::CWD,
             source,
             rustix::fs::CWD,
@@ -10266,10 +10269,10 @@ pub fn rename_noreplace_preserving_source(
     #[cfg(windows)]
     {
         let _ = (source, destination);
-        return Err(std::io::Error::new(
+        Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "atomic no-replace recovery move is unavailable on Windows",
-        ));
+        ))
     }
 
     #[cfg(not(any(
@@ -10592,7 +10595,7 @@ fn rotate_existing_proactive_backup(backup_path: &Path) -> DbResult<PathBuf> {
                 })?;
                 return Ok(rotated);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(DbError::Sqlite(format!(
                     "proactive backup failed to preserve existing generation {} at {}: {error}",
@@ -13978,11 +13981,11 @@ mod tests {
                 let path = entry.path();
                 let metadata = std::fs::symlink_metadata(&path)
                     .expect("inspect diagnostic fixture entry");
-                let bytes = metadata
-                    .file_type()
-                    .is_file()
-                    .then(|| std::fs::read(&path).expect("read diagnostic fixture file"))
-                    .unwrap_or_default();
+                let bytes = if metadata.file_type().is_file() {
+                    std::fs::read(&path).expect("read diagnostic fixture file")
+                } else {
+                    Vec::new()
+                };
                 (entry.file_name(), (metadata.file_type().is_file(), bytes))
             })
             .collect()
@@ -14164,16 +14167,14 @@ mod tests {
             let canonical_before =
                 exact_diagnostic_parent_snapshot(canonical_directory.path());
 
-            match open_guarded_read_only_canonical_sqlite_file(
-                &canonical_db_path,
-                "canonical diagnostic helper test",
-            ) {
-                Ok(conn) => {
-                    drop(conn);
-                    panic!("canonical helper must refuse suspect exact family");
-                }
-                Err(_) => {}
-            }
+            assert!(
+                open_guarded_read_only_canonical_sqlite_file(
+                    &canonical_db_path,
+                    "canonical diagnostic helper test",
+                )
+                .is_err(),
+                "canonical helper must refuse suspect exact family"
+            );
             assert_eq!(
                 exact_diagnostic_parent_snapshot(canonical_directory.path()),
                 canonical_before
@@ -14193,16 +14194,14 @@ mod tests {
             install_diagnostic_breaker(&db_path, breaker_kind);
             let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
 
-            match open_guarded_read_only_franken_existing_file(
-                &db_path,
-                "Franken diagnostic helper test",
-            ) {
-                Ok(conn) => {
-                    drop(conn);
-                    panic!("Franken helper must refuse suspect exact family");
-                }
-                Err(_) => {}
-            }
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &db_path,
+                    "Franken diagnostic helper test",
+                )
+                .is_err(),
+                "Franken helper must refuse suspect exact family"
+            );
             assert_eq!(
                 exact_diagnostic_parent_snapshot(franken_directory.path()),
                 franken_before
@@ -14455,18 +14454,14 @@ mod tests {
             admit_diagnostic_database_with_franken(&db_path);
             let franken_before = exact_diagnostic_parent_snapshot(directory.path());
 
-            match open_guarded_read_only_franken_existing_file(
-                &db_path,
-                "nonclean Franken strict-pool helper test",
-            ) {
-                Ok(conn) => {
-                    drop(conn);
-                    panic!(
-                        "live Franken diagnostics must refuse {breaker_kind} authority without opening the main inode to fingerprint it"
-                    );
-                }
-                Err(_) => {}
-            }
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &db_path,
+                    "nonclean Franken strict-pool helper test",
+                )
+                .is_err(),
+                "live Franken diagnostics must refuse {breaker_kind} authority without opening the main inode to fingerprint it"
+            );
 
             inspect_mailbox_db_inventory(&db_path)
                 .expect_err("public mailbox inventory must honor nonclean authority");
@@ -14569,16 +14564,14 @@ mod tests {
                 .expect("snapshot namespace use metadata");
             let family_before = exact_diagnostic_parent_snapshot(directory.path());
 
-            match open_guarded_read_only_franken_existing_file(
-                &db_path,
-                "stale namespace query-only pool test",
-            ) {
-                Ok(conn) => {
-                    drop(conn);
-                    panic!("Franken pool seam must refuse {namespace_kind} namespace authority");
-                }
-                Err(_) => {}
-            }
+            assert!(
+                open_guarded_read_only_franken_existing_file(
+                    &db_path,
+                    "stale namespace query-only pool test",
+                )
+                .is_err(),
+                "Franken pool seam must refuse {namespace_kind} namespace authority"
+            );
 
             assert!(
                 open_guarded_read_only_canonical_sqlite_file(
@@ -23818,11 +23811,15 @@ mod tests {
         assert_eq!(std::fs::read(&db_path).unwrap(), main_bytes);
         assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
         assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-wal").is_empty()
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-wal"),
+            Vec::<PathBuf>::new(),
+            "health probes must not publish a WAL quarantine beside the source"
         );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-shm").is_empty()
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-shm"),
+            Vec::<PathBuf>::new(),
+            "health probes must not publish an SHM quarantine beside the source"
         );
     }
 
@@ -24017,13 +24014,15 @@ mod tests {
         assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
         assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
         assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-wal")
-                .is_empty()
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-wal"),
+            Vec::<PathBuf>::new(),
+            "breaker refusal must not publish a WAL quarantine"
         );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-shm")
-                .is_empty()
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-shm"),
+            Vec::<PathBuf>::new(),
+            "breaker refusal must not publish an SHM quarantine"
         );
         drop(writer);
         recovery_admission().reset();
@@ -24164,11 +24163,15 @@ mod tests {
             std::fs::read(&wal_cert_head_path).unwrap(),
             b"live-wal-cert-head"
         );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert").is_empty()
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert"),
+            Vec::<PathBuf>::new(),
+            "framed WAL classification must not quarantine its certificate"
         );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert-head").is_empty()
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert-head"),
+            Vec::<PathBuf>::new(),
+            "framed WAL classification must not quarantine its certificate head"
         );
     }
 

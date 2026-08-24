@@ -169,11 +169,8 @@ fn detect_one(
 ) -> Option<IntegrityPageMalformedFinding> {
     let db_path = candidate.target_path();
     let result = match candidate.integrity_check_one() {
-        Ok(result) => result,
-        Err(detail) => {
-            if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
-                return None;
-            }
+        super::DoctorIntegrityProbe::Result(result) => result,
+        super::DoctorIntegrityProbe::Corruption(detail) => {
             let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
             return Some(IntegrityPageMalformedFinding {
                 db_path: db_path.to_path_buf(),
@@ -181,6 +178,7 @@ fn detect_one(
                 db_size_bytes,
             });
         }
+        super::DoctorIntegrityProbe::Unavailable => return None,
     };
     if result == "ok" {
         return None;

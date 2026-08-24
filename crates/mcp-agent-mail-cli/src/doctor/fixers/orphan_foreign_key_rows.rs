@@ -29,9 +29,7 @@
 //!
 //! ## Detection (pure)
 //!
-//! Opens each candidate DB read-only with URI `?immutable=1`
-//! (matches the FM `integrity_page_malformed` pattern: no -shm
-//! creation, no locking) and runs:
+//! Queries the command's retained WAL-aware logical read source and runs:
 //!
 //! ```sql
 //! PRAGMA foreign_keys = ON;

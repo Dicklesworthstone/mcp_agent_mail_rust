@@ -121,8 +121,8 @@ struct QuarantineArtifact {
     reason: QuarantineReason,
 }
 
-/// Detect reservation artifacts that can be safely normalized for each
-/// immutable DB candidate. A DB without a seeded generation identity is left
+/// Detect reservation artifacts that can be safely normalized for each stable
+/// DB read candidate. A DB without a seeded generation identity is left
 /// alone: this read-only detector must never mint an identity token itself.
 pub fn detect(
     storage_root: Option<&Path>,
@@ -575,6 +575,83 @@ mod tests {
         let rendered = finding.to_finding();
         assert!(rendered.remediation.auto_fixable);
         assert_eq!(rendered.remediation.estimated_actions, 3);
+    }
+
+    #[test]
+    fn wal_generation_truth_replaces_stale_quarantine_plan_before_mutation() {
+        let (td, db_path, reservation_dir) = fixture();
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("admit generation fixture through FrankenSQLite");
+        admitted
+            .execute_raw(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("settle generation baseline");
+        mcp_agent_mail_db::close_db_conn(admitted, "settle generation WAL baseline");
+
+        let stale_candidate =
+            super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+                &db_path,
+                "stale generation plan test",
+            );
+        let stale_finding =
+            detect_prepared(Some(td.path()), std::slice::from_ref(&stale_candidate))
+                .pop()
+                .expect("initial generation should produce a plan");
+        assert!(stale_finding.quarantines.iter().any(|artifact| {
+            artifact.source
+                == reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"))
+        }));
+
+        let main_before = std::fs::read(&db_path).expect("read settled generation main");
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open generation WAL writer");
+        writer
+            .execute_raw(&format!(
+                "PRAGMA wal_autocheckpoint = 0;
+                 UPDATE db_identity SET generation_id = '{FOREIGN_GENERATION}'
+                 WHERE singleton = 0;"
+            ))
+            .expect("commit current generation only to WAL");
+        drop(writer);
+        assert_eq!(
+            std::fs::read(&db_path).expect("read WAL-only generation main"),
+            main_before,
+            "fixture must keep the new generation out of the main image"
+        );
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
+            "fixture must retain committed generation WAL frames"
+        );
+
+        let foreign_artifact =
+            reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"));
+        let foreign_before = std::fs::read(&foreign_artifact).expect("read generation artifact");
+        let outcome = fix_prepared(&ctx(&td), &stale_finding, &stale_candidate)
+            .expect("refresh generation immediately before mutation");
+        assert!(
+            outcome.quarantined_paths.is_empty(),
+            "an artifact matching the current WAL generation must not be quarantined"
+        );
+        assert_eq!(
+            std::fs::read(&foreign_artifact).expect("read retained current artifact"),
+            foreign_before
+        );
+        assert!(
+            reservation_dir
+                .join(format!("id-7-g{FOREIGN_GENERATION}.json"))
+                .exists(),
+            "the fresh generation should drive the still-valid legacy migration"
+        );
+        assert!(
+            !reservation_dir
+                .join(format!("id-7-g{CURRENT_GENERATION}.json"))
+                .exists(),
+            "the stale generation must not be stamped into a filename"
+        );
     }
 
     #[test]
