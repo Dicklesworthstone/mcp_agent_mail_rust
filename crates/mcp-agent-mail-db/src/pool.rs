@@ -3188,112 +3188,138 @@ impl DbPool {
             ))
         })?;
 
-        let conn = crate::guard_db_conn(
-            match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
-                Ok(conn) => conn,
-                Err(e) => {
-                    if !is_corruption_error_message(&e.to_string()) {
-                        return Err(DbError::Sqlite(format!(
-                            "startup integrity check: open failed: {e}"
-                        )));
+        let live_family_is_healthy =
+            sqlite_file_is_healthy_without_family_cleanup(Path::new(&self.sqlite_path)).map_err(
+                |error| {
+                    DbError::Sqlite(format!(
+                        "startup integrity check: source-neutral pre-open probe failed: {error}"
+                    ))
+                },
+            )?;
+        let run_live_check = || -> DbResult<integrity::IntegrityCheckResult> {
+            let conn = crate::guard_db_conn(
+                match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        if !is_corruption_error_message(&e.to_string()) {
+                            return Err(DbError::Sqlite(format!(
+                                "startup integrity check: open failed: {e}"
+                            )));
+                        }
+                        tracing::warn!(
+                            path = %self.sqlite_path,
+                            error = %e,
+                            "startup integrity check failed to open sqlite file; attempting auto-recovery"
+                        );
+                        recover_sqlite_file_with_storage_root(
+                            Path::new(&self.sqlite_path),
+                            &self.storage_root,
+                        )
+                        .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
+                        open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
+                            DbError::Sqlite(format!(
+                                "startup integrity check: open failed after recovery: {reopen}"
+                            ))
+                        })?
                     }
+                },
+                "startup integrity check connection",
+            );
+
+            // GH#114: route through the canonical-fallback helper instead of
+            // calling `integrity::quick_check` directly. If the bespoke probe
+            // false-positives (e.g. on a NOCASE-collation index it dislikes) but
+            // canonical SQLite accepts the file, we return Ok and skip recovery
+            // entirely — preventing the runtime verdict pipeline from wedging
+            // `recovery.mode = degraded_read_only` on every 5-min quick-cycle.
+            match self.quick_check_with_canonical_fallback(&conn, "initial") {
+                Ok(res) => Ok(res),
+                Err(DbError::IntegrityCorruption { .. }) => {
+                    // The helper already logged the rejection verdict (primary +
+                    // canonical). This warn marks the recovery action taken in
+                    // response, so an operator following the log can correlate
+                    // verdict → action without scanning code.
+                    tracing::warn!(
+                        path = %self.sqlite_path,
+                        "attempting auto-recovery from backup"
+                    );
+
+                    // Close connection before attempting restore (Windows/locking safety)
+                    drop(conn);
+
+                    if let Err(e) = recover_sqlite_file_with_storage_root(
+                        Path::new(&self.sqlite_path),
+                        &self.storage_root,
+                    ) {
+                        return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
+                    }
+
+                    // Re-open and re-verify. Route post-recovery through the same
+                    // canonical fallback: if the bespoke probe's false-positive was
+                    // index-shape-related (e.g. GH#114's NOCASE-collation idx_agents
+                    // entries-out-of-order verdict on a perfectly valid index), the
+                    // restored file will reproduce the same schema and trip the same
+                    // false positive. Without the fallback we'd return Err here and
+                    // re-wedge recovery.mode despite canonical accepting the file.
+                    let conn = crate::guard_db_conn(
+                        open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "startup integrity check (post-recovery): open failed: {e}"
+                            ))
+                        })?,
+                        "startup integrity check post-recovery connection",
+                    );
+                    self.quick_check_with_canonical_fallback(&conn, "post-recovery")
+                }
+                Err(e)
+                    if is_sqlite_recovery_error_message(&e.to_string())
+                        || is_corruption_error_message(&e.to_string()) =>
+                {
                     tracing::warn!(
                         path = %self.sqlite_path,
                         error = %e,
-                        "startup integrity check failed to open sqlite file; attempting auto-recovery"
+                        "startup integrity probe hit sqlite recovery error; attempting auto-recovery"
                     );
-                    recover_sqlite_file_with_storage_root(
+
+                    drop(conn);
+
+                    if let Err(recovery_error) = recover_sqlite_file_with_storage_root(
                         Path::new(&self.sqlite_path),
                         &self.storage_root,
-                    )
-                    .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
-                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check: open failed after recovery: {reopen}"
-                        ))
-                    })?
+                    ) {
+                        return Err(DbError::Sqlite(format!(
+                            "startup recovery failed: {recovery_error}"
+                        )));
+                    }
+
+                    let conn = crate::guard_db_conn(
+                        open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
+                            DbError::Sqlite(format!(
+                                "startup integrity check (post-recovery): open failed: {reopen}"
+                            ))
+                        })?,
+                        "startup integrity check post-recovery connection",
+                    );
+                    self.quick_check_with_canonical_fallback(&conn, "post-recovery")
                 }
-            },
-            "startup integrity check connection",
-        );
-
-        // GH#114: route through the canonical-fallback helper instead of
-        // calling `integrity::quick_check` directly. If the bespoke probe
-        // false-positives (e.g. on a NOCASE-collation index it dislikes) but
-        // canonical SQLite accepts the file, we return Ok and skip recovery
-        // entirely — preventing the runtime verdict pipeline from wedging
-        // `recovery.mode = degraded_read_only` on every 5-min quick-cycle.
-        match self.quick_check_with_canonical_fallback(&conn, "initial") {
-            Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { .. }) => {
-                // The helper already logged the rejection verdict (primary +
-                // canonical). This warn marks the recovery action taken in
-                // response, so an operator following the log can correlate
-                // verdict → action without scanning code.
-                tracing::warn!(
-                    path = %self.sqlite_path,
-                    "attempting auto-recovery from backup"
-                );
-
-                // Close connection before attempting restore (Windows/locking safety)
-                drop(conn);
-
-                if let Err(e) = recover_sqlite_file_with_storage_root(
-                    Path::new(&self.sqlite_path),
-                    &self.storage_root,
-                ) {
-                    return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
-                }
-
-                // Re-open and re-verify. Route post-recovery through the same
-                // canonical fallback: if the bespoke probe's false-positive was
-                // index-shape-related (e.g. GH#114's NOCASE-collation idx_agents
-                // entries-out-of-order verdict on a perfectly valid index), the
-                // restored file will reproduce the same schema and trip the same
-                // false positive. Without the fallback we'd return Err here and
-                // re-wedge recovery.mode despite canonical accepting the file.
-                let conn = crate::guard_db_conn(
-                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check (post-recovery): open failed: {e}"
-                        ))
-                    })?,
-                    "startup integrity check post-recovery connection",
-                );
-                self.quick_check_with_canonical_fallback(&conn, "post-recovery")
+                Err(e) => Err(e),
             }
-            Err(e)
-                if is_sqlite_recovery_error_message(&e.to_string())
-                    || is_corruption_error_message(&e.to_string()) =>
-            {
-                tracing::warn!(
-                    path = %self.sqlite_path,
-                    error = %e,
-                    "startup integrity probe hit sqlite recovery error; attempting auto-recovery"
-                );
+        };
 
-                drop(conn);
+        if live_family_is_healthy {
+            return run_live_check();
+        }
 
-                if let Err(recovery_error) = recover_sqlite_file_with_storage_root(
-                    Path::new(&self.sqlite_path),
-                    &self.storage_root,
-                ) {
-                    return Err(DbError::Sqlite(format!(
-                        "startup recovery failed: {recovery_error}"
-                    )));
-                }
-
-                let conn = crate::guard_db_conn(
-                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check (post-recovery): open failed: {reopen}"
-                        ))
-                    })?,
-                    "startup integrity check post-recovery connection",
-                );
-                self.quick_check_with_canonical_fallback(&conn, "post-recovery")
-            }
-            Err(e) => Err(e),
+        match with_automatic_recovery_admission(
+            Path::new(&self.sqlite_path),
+            "startup integrity pre-open recovery",
+            run_live_check,
+        ) {
+            Ok(result) => Ok(result),
+            Err(AutomaticRecoveryRunError::Admission { error, .. }) => Err(DbError::Sqlite(
+                format!("startup integrity check: recovery admission failed: {error}"),
+            )),
+            Err(AutomaticRecoveryRunError::Operation(error)) => Err(error),
         }
     }
 

@@ -180,28 +180,28 @@ WORKDIR /build/mcp_agent_mail_rust
 # [workspace.dependencies] and [patch.crates-io] use the same spelling), then
 # resolves it against this WORKDIR exactly as cargo would.
 RUN set -eu; \
-    missing=0; \
-    grep -oE 'path *= *"\.\./[^"]*"' Cargo.toml \
-      | sed -E 's/.*"(.*)"/\1/' \
-      | sort -u \
-      | while IFS= read -r rel; do \
-          if [ -d "$rel" ]; then \
-            echo "+ sibling path dep OK: $rel"; \
-          else \
-            echo "MISSING sibling path dep: $rel (declared in Cargo.toml but not cloned in this Dockerfile)" >&2; \
-            echo "$rel" >> /tmp/missing-siblings; \
-          fi; \
-        done; \
-    if [ -s /tmp/missing-siblings ]; then \
+    missing="$( \
+      grep -oE 'path *= *"\.\./[^"]*"' Cargo.toml \
+        | sed -E 's/.*"(.*)"/\1/' \
+        | sort -u \
+        | while IFS= read -r rel; do \
+            if [ -d "$rel" ]; then \
+              echo "+ sibling path dep present: $rel" >&2; \
+            else \
+              echo "$rel"; \
+            fi; \
+          done \
+    )"; \
+    if [ -n "$missing" ]; then \
       echo "" >&2; \
-      echo "Cargo.toml declares out-of-tree path dependencies this image does not clone." >&2; \
+      echo "Cargo.toml declares out-of-tree path dependencies this image does not clone:" >&2; \
+      printf '%s\n' "$missing" | sed 's/^/  - /' >&2; \
+      echo "" >&2; \
       echo "Add a matching clone_at line to the sibling-clone step above, or move the" >&2; \
-      echo "dependency to crates.io. Missing:" >&2; \
-      sed 's/^/  - /' /tmp/missing-siblings >&2; \
-      missing=1; \
+      echo "dependency to crates.io. See GH#256." >&2; \
+      exit 1; \
     fi; \
-    rm -f /tmp/missing-siblings; \
-    [ "$missing" = 0 ]
+    echo "+ every out-of-tree path dependency is present"
 
 # Pre-install the pinned nightly toolchain so the build step's diagnostics
 # don't interleave a toolchain download with cargo output. `rustup show` is
