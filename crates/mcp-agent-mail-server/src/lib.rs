@@ -17651,19 +17651,20 @@ mod tests {
         std::fs::write(&absolute_wal, wal_bytes).expect("write absolute decoy WAL");
         std::fs::write(&absolute_shm, shm_bytes).expect("write absolute decoy SHM");
 
-        let relative_db =
-            PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        let relative_db = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_db.exists(),
             "fixture requires a missing configured relative target"
         );
         let mut config = mcp_agent_mail_core::Config::default();
         config.database_url = format!("sqlite:///{}", relative_db.display());
-        let runtime_authority = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(
-            &config.database_url,
-        )
-        .expect("resolve DB runtime authority");
-        assert_eq!(runtime_authority.canonical_path, relative_db.to_string_lossy());
+        let runtime_authority =
+            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+                .expect("resolve DB runtime authority");
+        assert_eq!(
+            runtime_authority.canonical_path,
+            relative_db.to_string_lossy()
+        );
         assert_eq!(
             resolve_server_database_url_sqlite_path(&config.database_url),
             Some(relative_db)

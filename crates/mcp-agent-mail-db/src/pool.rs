@@ -1194,12 +1194,10 @@ where
                 "recovery breaker is tripped, but an operator-invoked path holds the bypass; attempting"
             );
         } else {
-            return Err(automatic_recovery_breaker_refusal(
-                primary_path,
-                action,
-                &breaker_verdict,
-            )
-            .expect("refusal verdict must produce an admission error"));
+            return Err(
+                automatic_recovery_breaker_refusal(primary_path, action, &breaker_verdict)
+                    .expect("refusal verdict must produce an admission error"),
+            );
         }
     }
     if matches!(
@@ -3421,8 +3419,8 @@ impl DbPool {
     /// Run `integrity::quick_check` on `conn` and, on `IntegrityCorruption`,
     /// consult canonical SQLite as a second opinion (mirroring
     /// `sqlite_primary_check_is_ok_with_canonical_fallback` from the runtime
-    /// health-verdict path). Used by `run_startup_integrity_check` for both
-    /// the initial probe and the post-recovery re-verification so a
+    /// health-verdict path). Used by `run_integrity_check` for both the
+    /// initial probe and the post-recovery re-verification so a
     /// bespoke-only false positive does not wedge `recovery.mode` (GH#114).
     ///
     /// `phase` is folded into log lines so the operator can tell whether a
@@ -3432,7 +3430,7 @@ impl DbPool {
     /// `self.sqlite_path` — the canonical fallback opens a fresh canonical
     /// connection against `self.sqlite_path` and the two probes only agree
     /// when they're inspecting the same file. The function is private and
-    /// has exactly two call sites in `run_startup_integrity_check`, both of
+    /// has exactly two call sites in `run_integrity_check`, both of
     /// which open `conn` from `self.sqlite_path` immediately before passing
     /// it in; do not call from anywhere that violates this.
     fn quick_check_with_canonical_fallback(
@@ -16960,8 +16958,8 @@ mod tests {
         assert_eq!(resolved, missing_relative);
 
         let database_url = format!("sqlite:///{missing_relative}");
-        let mailbox_path = resolve_mailbox_sqlite_path(&database_url)
-            .expect("resolve shared mailbox authority");
+        let mailbox_path =
+            resolve_mailbox_sqlite_path(&database_url).expect("resolve shared mailbox authority");
         let pool = DbPool::new(&DbPoolConfig {
             database_url,
             ..DbPoolConfig::default()
