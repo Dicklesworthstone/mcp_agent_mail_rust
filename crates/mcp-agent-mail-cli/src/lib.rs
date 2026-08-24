@@ -13156,11 +13156,11 @@ fn resolve_sqlite_runtime_path(path: &str) -> String {
 /// before it may touch the live SQLite family.
 ///
 /// A healthy family with stale or malformed breaker authority may continue to
-/// serve, but only after a source-neutral probe of a private copy proves the
-/// exact primary/WAL/SHM generation is directly usable. An unhealthy or missing
-/// family cannot fail open: the caller must enter admission before a writable
-/// engine open, candidate staging, or fresh-database initialization. With no
-/// unresolved breaker history, the ordinary fast open remains unchanged.
+/// serve, but only after a genuinely read-only probe proves the exact
+/// primary/WAL/SHM generation is directly usable. An unhealthy existing family
+/// cannot fail open: the caller must enter admission before its first writable
+/// engine open or candidate staging. A missing family is a legitimate fresh
+/// start only when no unresolved breaker authority survives beside it.
 fn cli_sqlite_family_requires_preopen_admission(path: &Path) -> CliResult<bool> {
     // Obvious WAL/SHM damage is classified without an engine open. The cleanup
     // helper itself enters mutation-only durable admission when it needs to
@@ -13182,21 +13182,32 @@ fn cli_sqlite_family_requires_preopen_admission(path: &Path) -> CliResult<bool> 
             // case must flow through admission and surface the trust failure.
             Err(_) => true,
         };
-    if !unresolved_breaker_authority {
-        return Ok(false);
+    if !path.exists() {
+        return Ok(unresolved_breaker_authority);
     }
 
-    if !path.exists() {
+    // This connection is only a preflight witness; never return it to a normal
+    // CLI caller. A failed open/probe means the live family is not proven safe
+    // for a writable open, so the whole first open/recovery path must run inside
+    // durable admission. The read-only opener rejects obviously malformed
+    // targets and damaged sidecars before FrankenSQLite sees the live pathname.
+    let path_text = path.to_str().ok_or_else(|| {
+        CliError::Other(format!(
+            "CLI pre-open probe refuses non-UTF-8 SQLite path {}",
+            path.display()
+        ))
+    })?;
+    let Ok((conn, _opened_path)) = open_sqlite_read_only_with_fallback(path_text) else {
         return Ok(true);
-    }
-    mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(path)
-        .map(|healthy| !healthy)
-        .map_err(|error| {
-            CliError::Other(format!(
-                "CLI source-neutral pre-open probe failed for {}: {error}",
-                path.display()
-            ))
-        })
+    };
+    let requires_init = sqlite_conn_requires_canonical_init(&conn);
+    let healthy = if matches!(&requires_init, Ok(false)) {
+        sqlite_conn_is_healthy(&conn)
+    } else {
+        Ok(false)
+    };
+    drop(conn);
+    Ok(!matches!(&requires_init, Ok(false)) || !matches!(healthy, Ok(true)))
 }
 
 fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
@@ -13287,6 +13298,39 @@ fn require_existing_regular_sqlite_source(path: &Path, context: &str) -> CliResu
     Ok(())
 }
 
+fn require_read_only_sqlite_family_source(path: &Path) -> CliResult<()> {
+    require_existing_regular_sqlite_source(path, "read-only SQLite open")?;
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(CliError::Other(format!(
+                    "read-only SQLite open refuses non-regular {suffix} sidecar {}",
+                    sidecar.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "read-only SQLite open failed to inspect {suffix} sidecar {}: {error}",
+                    sidecar.display()
+                )));
+            }
+        }
+    }
+
+    let wal_path = sqlite_sidecar_path(path, "-wal");
+    if mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path) {
+        return Err(CliError::Other(format!(
+            "read-only SQLite open refuses truncated WAL sidecar {} before engine open",
+            wal_path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_existing_sqlite_source_candidate_with_database_url(
     database_url: &str,
     context: &str,
@@ -13326,6 +13370,10 @@ fn open_sqlite_with_fallback_internal(
     read_only: bool,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let open_conn = |candidate: &str| -> Result<mcp_agent_mail_db::DbConn, String> {
+        if read_only && candidate != ":memory:" {
+            require_read_only_sqlite_family_source(Path::new(candidate))
+                .map_err(|error| error.to_string())?;
+        }
         let conn = if candidate == ":memory:" {
             mcp_agent_mail_db::DbConn::open_memory().map_err(|e| e.to_string())?
         } else if read_only {

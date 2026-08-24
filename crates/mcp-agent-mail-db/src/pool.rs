@@ -6543,6 +6543,7 @@ fn reconcile_with_canonical(
 /// cannot discard durable data because the smallest possible frame adds a
 /// 24-byte frame header plus at least one SQLite page.
 pub const SQLITE_WAL_HEADER_BYTES: u64 = 32;
+const SQLITE_WAL_HEADER_BYTES_USIZE: usize = 32;
 
 #[must_use]
 pub const fn sqlite_wal_has_committed_frames(wal_len: u64) -> bool {
@@ -6612,7 +6613,7 @@ struct SqliteCleanupSidecarWitness {
     identity: same_file::Handle,
     len: u64,
     sha256: [u8; 32],
-    prefix: [u8; SQLITE_WAL_HEADER_BYTES as usize],
+    prefix: [u8; SQLITE_WAL_HEADER_BYTES_USIZE],
     prefix_len: usize,
 }
 
@@ -6712,7 +6713,7 @@ fn seal_sqlite_cleanup_sidecar(
         ))
     })?;
     let mut hasher = sha2::Sha256::new();
-    let mut prefix = [0_u8; SQLITE_WAL_HEADER_BYTES as usize];
+    let mut prefix = [0_u8; SQLITE_WAL_HEADER_BYTES_USIZE];
     let mut prefix_len = 0_usize;
     let mut observed_len = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -6766,7 +6767,7 @@ fn witnessed_wal_is_truncation_artifact(wal: &SqliteCleanupSidecarWitness) -> bo
     if wal.len < SQLITE_WAL_HEADER_BYTES {
         return true;
     }
-    wal.prefix_len != SQLITE_WAL_HEADER_BYTES as usize
+    wal.prefix_len != SQLITE_WAL_HEADER_BYTES_USIZE
         || !matches!(
             crate::wal_classify::wal_header_verdict(&wal.prefix),
             crate::wal_classify::WalHeaderVerdict::Valid
@@ -6988,6 +6989,45 @@ fn rollback_drifted_sqlite_cleanup_move(
     )))
 }
 
+fn rollback_prior_sqlite_cleanup_moves(
+    moved: &[(PathBuf, PathBuf)],
+    original_error: SqlError,
+) -> SqlError {
+    if moved.is_empty() {
+        return original_error;
+    }
+
+    let mut rollback_failures = Vec::new();
+    for (source_path, quarantine_path) in moved.iter().rev() {
+        if let Err(error) = rename_noreplace_preserving_source(quarantine_path, source_path) {
+            rollback_failures.push(format!(
+                "{} <- {}: {error}",
+                source_path.display(),
+                quarantine_path.display()
+            ));
+        }
+    }
+    if let Some((source_path, _)) = moved.first()
+        && let Err(error) = sync_recovery_parent(source_path)
+    {
+        rollback_failures.push(format!(
+            "sync restored sidecar parent for {}: {error}",
+            source_path.display()
+        ));
+    }
+
+    if rollback_failures.is_empty() {
+        SqlError::Custom(format!(
+            "{original_error}; all earlier SQLite-family cleanup moves were rolled back"
+        ))
+    } else {
+        SqlError::Custom(format!(
+            "{original_error}; rollback of earlier SQLite-family cleanup moves was incomplete: {}",
+            rollback_failures.join("; ")
+        ))
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn quarantine_sqlite_cleanup_sidecar_witnessed(
     witness: &SqliteCleanupSidecarWitness,
@@ -7038,6 +7078,22 @@ fn quarantine_sqlite_cleanup_sidecar_witnessed(
 }
 
 #[allow(clippy::result_large_err)]
+fn quarantine_sqlite_cleanup_sidecar_or_rollback(
+    witness: &SqliteCleanupSidecarWitness,
+    nonce: &mut Option<String>,
+    reason: &str,
+    moved: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), SqlError> {
+    match quarantine_sqlite_cleanup_sidecar_witnessed(witness, nonce, reason) {
+        Ok(quarantine_path) => {
+            moved.push((witness.path.clone(), quarantine_path));
+            Ok(())
+        }
+        Err(error) => Err(rollback_prior_sqlite_cleanup_moves(moved, error)),
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn apply_classified_sqlite_family_cleanup(
     db_path: &Path,
 ) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
@@ -7062,47 +7118,66 @@ where
     let wal_cert = plan.wal_cert.is_some();
     let wal_cert_head = plan.wal_cert_head.is_some();
     let mut quarantine_nonce = None;
+    let mut moved = Vec::new();
     // Move derived coordination state first and the WAL last. If the process
     // crashes between moves, the WAL evidence remains attached; moving the WAL
     // first would leave SHM/certification state that names a detached generation.
     if let Some(witness) = plan.wal_cert_head.as_ref() {
-        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         before_move(&witness.path);
-        quarantine_sqlite_cleanup_sidecar_witnessed(
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
             "companion WAL is classified for quarantine",
+            &mut moved,
         )?;
     }
     if let Some(witness) = plan.wal_cert.as_ref() {
-        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         before_move(&witness.path);
-        quarantine_sqlite_cleanup_sidecar_witnessed(
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
             "companion WAL is classified for quarantine",
+            &mut moved,
         )?;
     }
     if let Some(witness) = plan.shm.as_ref() {
-        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         before_move(&witness.path);
         let reason = if wal {
             "companion WAL is classified for quarantine"
         } else {
             "empty SHM sidecar"
         };
-        quarantine_sqlite_cleanup_sidecar_witnessed(witness, &mut quarantine_nonce, reason)?;
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
+            witness,
+            &mut quarantine_nonce,
+            reason,
+            &mut moved,
+        )?;
     }
     if let Some(witness) = plan.wal.as_ref() {
-        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         before_move(&witness.path);
-        quarantine_sqlite_cleanup_sidecar_witnessed(
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
             "header-only/truncated WAL sidecar",
+            &mut moved,
         )?;
     }
-    sync_recovery_parent(db_path)?;
+    if let Err(error) = sync_recovery_parent(db_path) {
+        return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+    }
     Ok(SqliteFamilyCleanupOutcome::Quarantined {
         wal,
         shm,
@@ -7887,16 +7962,22 @@ where
     refuse_sqlite_family_cleanup_while_owned(primary_path)?;
     let sidecars = classify_sqlite_sidecars_after_checkpoint(primary_path)?;
     let mut quarantine_nonce = None;
+    let mut moved = Vec::new();
     for witness in &sidecars {
-        refuse_sqlite_family_cleanup_while_owned(primary_path)?;
+        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(primary_path) {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         before_move(&witness.path);
-        let _ = quarantine_sqlite_cleanup_sidecar_witnessed(
+        quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
             "witnessed residual sidecar after successful checkpoint",
+            &mut moved,
         )?;
     }
-    sync_recovery_parent(primary_path)?;
+    if let Err(error) = sync_recovery_parent(primary_path) {
+        return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+    }
     Ok(())
 }
 
@@ -21651,9 +21732,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup-race.sqlite3");
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        let wal_cert_path = sqlite_sidecar_path(&db_path, "-wal-cert");
+        let wal_cert_head_path = sqlite_sidecar_path(&db_path, "-wal-cert-head");
         let preserved_wal_path = dir.path().join("cleanup-race.original-wal");
         std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
         std::fs::write(&wal_path, b"truncated-wal").expect("write classified WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        std::fs::write(&wal_cert_path, b"wal-cert").expect("write WAL certificate");
+        std::fs::write(&wal_cert_head_path, b"wal-cert-head")
+            .expect("write WAL certificate head");
 
         let mut injected = false;
         let error = apply_classified_sqlite_family_cleanup_with_hook(&db_path, |sidecar| {
@@ -21670,16 +21758,33 @@ mod tests {
             error.to_string().contains("changed identity or bytes"),
             "unexpected race refusal: {error}"
         );
+        assert!(
+            error.to_string().contains("all earlier SQLite-family cleanup moves were rolled back"),
+            "the raced WAL must roll back earlier certificate/SHM moves: {error}"
+        );
         assert!(injected, "test must inject the classify-to-rename race");
         assert_eq!(std::fs::read(&wal_path).unwrap(), [0xAA; 64]);
         assert_eq!(
             std::fs::read(&preserved_wal_path).unwrap(),
             b"truncated-wal"
         );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "cleanup-race.sqlite3-wal").is_empty(),
-            "a refused race must not quarantine the unclassified WAL generation"
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&wal_cert_path).unwrap(), b"wal-cert");
+        assert_eq!(
+            std::fs::read(&wal_cert_head_path).unwrap(),
+            b"wal-cert-head"
         );
+        for sidecar_name in [
+            "cleanup-race.sqlite3-wal",
+            "cleanup-race.sqlite3-shm",
+            "cleanup-race.sqlite3-wal-cert",
+            "cleanup-race.sqlite3-wal-cert-head",
+        ] {
+            assert!(
+                sqlite_cleanup_quarantines(dir.path(), sidecar_name).is_empty(),
+                "a refused race must roll back quarantine for {sidecar_name}"
+            );
+        }
     }
 
     #[test]
