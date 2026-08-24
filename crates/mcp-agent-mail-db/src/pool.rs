@@ -18300,6 +18300,49 @@ mod tests {
         recovery_admission().reset();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn nested_recovery_admission_distinguishes_lossy_colliding_unix_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x80.sqlite3".to_vec()));
+        let second = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x81.sqlite3".to_vec()));
+        assert_eq!(
+            first.to_string_lossy(),
+            second.to_string_lossy(),
+            "fixture must collide under lossy UTF-8 conversion"
+        );
+        std::fs::write(&first, b"first generation").unwrap();
+        std::fs::write(&second, b"second generation").unwrap();
+        let second_operation_called = std::cell::Cell::new(false);
+
+        recovery_admission().reset();
+        with_recovery_admission(&first, "outer non-UTF8 recovery", || {
+            let error = with_recovery_admission(&second, "nested non-UTF8 recovery", || {
+                second_operation_called.set(true);
+                Ok(())
+            })
+            .expect_err("lossy-colliding path must not inherit another database's admission");
+            assert!(error.to_string().contains("nested recovery may only target"));
+            Ok(())
+        })
+        .expect("outer recovery should retain its own lossless identity");
+
+        assert!(!second_operation_called.get());
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&second))
+                .is_err(),
+            "path-B refusal must occur before creating its breaker authority"
+        );
+        recovery_admission().reset();
+    }
+
     #[test]
     fn automatic_recovery_refuses_malformed_breaker_authority_before_operation() {
         let dir = tempfile::tempdir().unwrap();
