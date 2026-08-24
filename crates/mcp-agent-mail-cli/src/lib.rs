@@ -13259,17 +13259,6 @@ fn open_sqlite_with_fallback_internal(
         Ok(conn) => Ok((conn, path.to_string())),
         Err(primary_err) => {
             let primary_err_text = primary_err.to_string();
-            if let Some(fallback_path) = sqlite_absolute_fallback_path(path, &primary_err_text) {
-                let fallback_conn = open_conn(&fallback_path).map_err(|fallback_err| {
-                        sqlite_retryable_error(
-                            format!(
-                                "cannot open DB at {path}: {primary_err}; fallback {fallback_path} failed: {fallback_err}"
-                            ),
-                            &fallback_err.to_string(),
-                        )
-                    })?;
-                return Ok((fallback_conn, fallback_path));
-            }
             if allow_recovery
                 && path != ":memory:"
                 && is_sqlite_recovery_error_message(&primary_err_text)
@@ -47657,7 +47646,7 @@ http_headers = { Authorization = "Bearer secret" }
         let relative_db = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_db.exists(),
-            "relative shadow path should be absent so absolute candidate fallback is exercised"
+            "fixture requires a missing configured relative source"
         );
 
         let error = archive_save_state(
@@ -47673,11 +47662,6 @@ http_headers = { Authorization = "Bearer secret" }
                 || error.to_string().contains("requires an existing"),
             "unexpected missing-source error: {error}"
         );
-        assert!(archive_states_dir(false)
-            .expect("archive state directory")
-            .read_dir()
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(true));
         let conn = mcp_agent_mail_db::DbConn::open_file(absolute_db.to_string_lossy().as_ref())
             .expect("reopen absolute decoy");
         assert_eq!(
@@ -84981,7 +84965,7 @@ fn run_share_update_rejects_public_key_output_without_signing_key() {
 }
 
 #[test]
-fn run_share_export_dry_run_uses_absolute_candidate_for_malformed_relative_source_db() {
+fn run_share_export_dry_run_does_not_hijack_absolute_candidate_for_missing_relative_source() {
     let _lock = SHARE_EXPORT_TEST_LOCK
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -84996,8 +84980,13 @@ fn run_share_export_dry_run_uses_absolute_candidate_for_malformed_relative_sourc
         .to_string_lossy()
         .trim_start_matches('/')
         .to_string();
+    assert!(
+        !Path::new(&relative_db).exists(),
+        "fixture requires a missing configured relative source"
+    );
     let database_url = format!("sqlite://{relative_db}");
     let storage_root_text = storage_root.to_string_lossy().to_string();
+    let output = temp.path().join("bundle");
     let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
         &[
             ("DATABASE_URL", database_url.as_str()),
@@ -85005,7 +84994,7 @@ fn run_share_export_dry_run_uses_absolute_candidate_for_malformed_relative_sourc
         ],
         || {
             run_share_export(ShareExportParams {
-                output: temp.path().join("bundle"),
+                output: output.clone(),
                 projects: vec![],
                 inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
                 detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
@@ -85022,9 +85011,15 @@ fn run_share_export_dry_run_uses_absolute_candidate_for_malformed_relative_sourc
     );
 
     assert!(
-        result.is_ok(),
-        "share export dry-run should use the absolute sqlite candidate: {result:?}"
+        result.is_err(),
+        "share export must not treat an absolute decoy as the configured runtime source: {result:?}"
     );
+    assert!(!output.exists(), "failed dry-run must not create a bundle");
+    let conn = mcp_agent_mail_db::DbConn::open_file(source_db.to_string_lossy().as_ref())
+        .expect("reopen absolute decoy");
+    assert!(conn
+        .query_sync("SELECT 1 FROM projects LIMIT 1", &[])
+        .is_ok());
 }
 
 #[test]
