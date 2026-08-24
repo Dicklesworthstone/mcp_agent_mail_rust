@@ -1104,9 +1104,6 @@ mod tests {
         std::fs::create_dir_all(&home).expect("create home");
         std::fs::create_dir_all(&project).expect("create project");
         std::fs::create_dir_all(&appdata).expect("create appdata");
-        std::fs::create_dir_all(home.join(".omp/profiles/work/agent"))
-            .expect("create named OMP profile");
-
         let locations = detect_mcp_config_locations(&McpConfigDetectParams {
             home_dir: Some(home.clone()),
             project_dir: Some(project.clone()),
@@ -1180,39 +1177,41 @@ mod tests {
         assert!(
             contains_location(
                 &locations,
-                McpConfigTool::Omp,
-                &home.join(".omp").join("agent").join("mcp.json")
-            ),
-            "expected OMP default-profile config path"
-        );
-        assert!(
-            contains_location(
-                &locations,
-                McpConfigTool::Omp,
-                &project.join(".omp").join("mcp.json")
-            ),
-            "expected OMP project config path"
-        );
-        assert!(
-            contains_location(
-                &locations,
-                McpConfigTool::Omp,
-                &home.join(".omp/profiles/work/agent/mcp.json")
-            ),
-            "expected OMP named-profile config path"
-        );
-        assert!(
-            contains_location(&locations, McpConfigTool::Omp, &project.join("mcp.json")),
-            "expected OMP project-root fallback config path"
-        );
-        assert!(
-            contains_location(
-                &locations,
                 McpConfigTool::GithubCopilot,
                 &project.join(".vscode").join("mcp.json")
             ),
             "expected copilot workspace mcp path"
         );
+    }
+
+    #[test]
+    fn detect_locations_include_omp_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(home.join(".omp/profiles/work/agent"))
+            .expect("create named OMP profile");
+        std::fs::create_dir_all(&project).expect("create project");
+
+        let locations = detect_mcp_config_locations(&McpConfigDetectParams {
+            home_dir: Some(home.clone()),
+            project_dir: Some(project.clone()),
+            ..McpConfigDetectParams::default()
+        });
+
+        for expected in [
+            home.join(".omp/agent/mcp.json"),
+            home.join(".omp/profiles/work/agent/mcp.json"),
+            project.join(".omp/mcp.json"),
+            project.join("mcp.json"),
+            project.join(".mcp.json"),
+        ] {
+            assert!(
+                contains_location(&locations, McpConfigTool::Omp, &expected),
+                "expected OMP config candidate {}",
+                expected.display()
+            );
+        }
     }
 
     #[test]

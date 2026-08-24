@@ -228,28 +228,34 @@ fn resolve_omp_config_paths(
     config_dir: Option<&str>,
     agent_dir_override: Option<&str>,
 ) -> OmpConfigPaths {
-    let profile = match omp_profile {
-        Some(value) => normalize_omp_profile_name(value),
-        None => pi_profile.and_then(normalize_omp_profile_name),
-    };
+    let profile = omp_profile.map_or_else(
+        || pi_profile.and_then(normalize_omp_profile_name),
+        normalize_omp_profile_name,
+    );
     let config_dir = config_dir
         .filter(|value| !value.is_empty())
         .unwrap_or(".omp")
         .trim_start_matches(std::path::is_separator);
     let config_root = home.join(config_dir);
 
-    let agent_dir = if let Some(profile) = profile {
-        config_root.join("profiles").join(profile).join("agent")
-    } else if let Some(override_path) = agent_dir_override.filter(|value| !value.is_empty()) {
-        let override_path = PathBuf::from(override_path);
-        if override_path.is_absolute() {
-            override_path
-        } else {
-            cwd.join(override_path)
-        }
-    } else {
-        config_root.join("agent")
-    };
+    let agent_dir = profile.map_or_else(
+        || {
+            agent_dir_override
+                .filter(|value| !value.is_empty())
+                .map_or_else(
+                    || config_root.join("agent"),
+                    |override_path| {
+                        let override_path = PathBuf::from(override_path);
+                        if override_path.is_absolute() {
+                            override_path
+                        } else {
+                            cwd.join(override_path)
+                        }
+                    },
+                )
+        },
+        |profile| config_root.join("profiles").join(profile).join("agent"),
+    );
 
     OmpConfigPaths {
         config_root,
