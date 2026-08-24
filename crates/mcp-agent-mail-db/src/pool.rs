@@ -6943,18 +6943,78 @@ fn cleanup_quarantine_nonce(nonce: &mut Option<String>) -> &str {
         .as_str()
 }
 
-fn quarantine_sqlite_cleanup_sidecar(
-    sidecar_path: &Path,
+#[allow(clippy::result_large_err)]
+fn verify_sqlite_cleanup_sidecar_witness(
+    expected: &SqliteCleanupSidecarWitness,
+    observed_path: &Path,
+) -> Result<SqliteCleanupSidecarWitness, SqlError> {
+    let opened = open_sqlite_cleanup_sidecar(observed_path, "witnessed SQLite-family")?
+        .ok_or_else(|| {
+            SqlError::Custom(format!(
+                "SQLite sidecar {} disappeared after cleanup classification; refusing mutation",
+                observed_path.display()
+            ))
+        })?;
+    let observed = seal_sqlite_cleanup_sidecar(opened)?;
+    if observed.identity != expected.identity
+        || observed.len != expected.len
+        || observed.sha256 != expected.sha256
+    {
+        return Err(SqlError::Custom(format!(
+            "SQLite sidecar {} changed identity or bytes after cleanup classification; refusing to move an unclassified generation",
+            observed_path.display()
+        )));
+    }
+    Ok(observed)
+}
+
+#[allow(clippy::result_large_err)]
+fn rollback_drifted_sqlite_cleanup_move(
+    source_path: &Path,
+    quarantine_path: &Path,
+    drift_error: &SqlError,
+) -> Result<(), SqlError> {
+    rename_noreplace_preserving_source(quarantine_path, source_path).map_err(|rollback_error| {
+        SqlError::Custom(format!(
+            "{drift_error}; additionally failed to restore raced SQLite sidecar {} from {} without replacement: {rollback_error}",
+            source_path.display(),
+            quarantine_path.display()
+        ))
+    })?;
+    sync_recovery_parent(source_path)?;
+    Err(SqlError::Custom(format!(
+        "{drift_error}; the raced sidecar was restored to {} and no cleanup was committed",
+        source_path.display()
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_sqlite_cleanup_sidecar_witnessed(
+    witness: &SqliteCleanupSidecarWitness,
     nonce: &mut Option<String>,
     reason: &str,
 ) -> Result<PathBuf, SqlError> {
     let nonce = cleanup_quarantine_nonce(nonce).to_string();
     for collision in 0..=9_999 {
-        let quarantine = sqlite_cleanup_quarantine_path(sidecar_path, &nonce, collision);
-        match rename_noreplace_preserving_source(sidecar_path, &quarantine) {
+        let quarantine = sqlite_cleanup_quarantine_path(&witness.path, &nonce, collision);
+        // Hold both the classification-time handle and this freshly verified
+        // handle across rename. If a path replacement wins after this check,
+        // the post-rename identity check detects it and restores that raced-in
+        // generation instead of silently detaching it.
+        let _verified = verify_sqlite_cleanup_sidecar_witness(witness, &witness.path)?;
+        match rename_noreplace_preserving_source(&witness.path, &quarantine) {
             Ok(()) => {
+                if let Err(drift_error) =
+                    verify_sqlite_cleanup_sidecar_witness(witness, &quarantine)
+                {
+                    return rollback_drifted_sqlite_cleanup_move(
+                        &witness.path,
+                        &quarantine,
+                        &drift_error,
+                    );
+                }
                 tracing::warn!(
-                    path = %sidecar_path.display(),
+                    path = %witness.path.display(),
                     quarantine = %quarantine.display(),
                     reason,
                     "quarantined sqlite sidecar before opening database"
@@ -6965,7 +7025,7 @@ fn quarantine_sqlite_cleanup_sidecar(
             Err(error) => {
                 return Err(SqlError::Custom(format!(
                     "failed to quarantine SQLite sidecar {} at {} without replacement ({reason}): {error}",
-                    sidecar_path.display(),
+                    witness.path.display(),
                     quarantine.display()
                 )));
             }
@@ -6973,7 +7033,7 @@ fn quarantine_sqlite_cleanup_sidecar(
     }
     Err(SqlError::Custom(format!(
         "failed to quarantine SQLite sidecar {} because 10000 collision-safe destinations were occupied",
-        sidecar_path.display()
+        witness.path.display()
     )))
 }
 
@@ -6981,36 +7041,73 @@ fn quarantine_sqlite_cleanup_sidecar(
 fn apply_classified_sqlite_family_cleanup(
     db_path: &Path,
 ) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    apply_classified_sqlite_family_cleanup_with_hook(db_path, |_| {})
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_classified_sqlite_family_cleanup_with_hook<F>(
+    db_path: &Path,
+    mut before_move: F,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError>
+where
+    F: FnMut(&Path),
+{
     let plan = classify_sqlite_family_cleanup(db_path)?;
     if plan.is_empty() {
         return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
     }
 
+    let wal = plan.wal.is_some();
+    let shm = plan.shm.is_some();
+    let wal_cert = plan.wal_cert.is_some();
+    let wal_cert_head = plan.wal_cert_head.is_some();
     let mut quarantine_nonce = None;
-    // Move SHM first. If the process crashes before the WAL move, the durable
-    // WAL remains available and SQLite can rebuild SHM; the reverse ordering
-    // would leave a meaningless live SHM after detaching its WAL.
-    if plan.quarantine_shm {
-        let shm_path = sqlite_sidecar_path(db_path, "-shm");
-        let reason = if plan.quarantine_wal {
+    // Move derived coordination state first and the WAL last. If the process
+    // crashes between moves, the WAL evidence remains attached; moving the WAL
+    // first would leave SHM/certification state that names a detached generation.
+    if let Some(witness) = plan.wal_cert_head.as_ref() {
+        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        before_move(&witness.path);
+        quarantine_sqlite_cleanup_sidecar_witnessed(
+            witness,
+            &mut quarantine_nonce,
+            "companion WAL is classified for quarantine",
+        )?;
+    }
+    if let Some(witness) = plan.wal_cert.as_ref() {
+        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        before_move(&witness.path);
+        quarantine_sqlite_cleanup_sidecar_witnessed(
+            witness,
+            &mut quarantine_nonce,
+            "companion WAL is classified for quarantine",
+        )?;
+    }
+    if let Some(witness) = plan.shm.as_ref() {
+        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        before_move(&witness.path);
+        let reason = if wal {
             "companion WAL is classified for quarantine"
         } else {
             "empty SHM sidecar"
         };
-        quarantine_sqlite_cleanup_sidecar(&shm_path, &mut quarantine_nonce, reason)?;
+        quarantine_sqlite_cleanup_sidecar_witnessed(witness, &mut quarantine_nonce, reason)?;
     }
-    if plan.quarantine_wal {
-        let wal_path = sqlite_sidecar_path(db_path, "-wal");
-        quarantine_sqlite_cleanup_sidecar(
-            &wal_path,
+    if let Some(witness) = plan.wal.as_ref() {
+        refuse_sqlite_family_cleanup_while_owned(db_path)?;
+        before_move(&witness.path);
+        quarantine_sqlite_cleanup_sidecar_witnessed(
+            witness,
             &mut quarantine_nonce,
             "header-only/truncated WAL sidecar",
         )?;
     }
     sync_recovery_parent(db_path)?;
     Ok(SqliteFamilyCleanupOutcome::Quarantined {
-        wal: plan.quarantine_wal,
-        shm: plan.quarantine_shm,
+        wal,
+        shm,
+        wal_cert,
+        wal_cert_head,
     })
 }
 
@@ -7708,6 +7805,11 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
 fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError> {
     wal_checkpoint_truncate_path(primary_path)
         .map_err(|e| SqlError::Custom(format!("checkpoint: {e}")))?;
+    // The checkpoint connection has closed, but a writer could have appeared
+    // in the gap between that close and residual-sidecar classification. Do
+    // not treat checkpoint success as continuing authority to detach whatever
+    // now occupies a sidecar pathname.
+    refuse_sqlite_family_cleanup_while_owned(primary_path)?;
     // Move any residual sidecars left after the successful checkpoint out of
     // the live DB family while keeping them available for post-mortem review.
     quarantine_sqlite_sidecars_after_checkpoint(primary_path)?;
@@ -7722,25 +7824,77 @@ fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError
 
 #[allow(clippy::result_large_err)]
 fn quarantine_sqlite_sidecars_after_checkpoint(primary_path: &Path) -> Result<(), SqlError> {
-    let mut quarantine_nonce = None;
+    quarantine_sqlite_sidecars_after_checkpoint_with_hook(primary_path, |_| {})
+}
+
+#[allow(clippy::result_large_err)]
+fn classify_sqlite_sidecars_after_checkpoint(
+    primary_path: &Path,
+) -> Result<Vec<SqliteCleanupSidecarWitness>, SqlError> {
+    let mut sidecars = HashMap::new();
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let sidecar_path = sqlite_path_with_suffix(primary_path, suffix);
-        match std::fs::symlink_metadata(&sidecar_path) {
-            Ok(_) => {
-                let _ = quarantine_sqlite_cleanup_sidecar(
-                    &sidecar_path,
-                    &mut quarantine_nonce,
-                    "residual sidecar after successful checkpoint",
-                )?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
+        let path = sqlite_path_with_suffix(primary_path, suffix);
+        let Some(opened) =
+            open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
+        else {
+            continue;
+        };
+        // Empty sidecars are ignored by `sqlite_file_has_live_sidecars` and
+        // are safe for SQLite to reuse. Avoid needless namespace churn.
+        if opened.len == 0 {
+            continue;
+        }
+        let witnessed = seal_sqlite_cleanup_sidecar(opened)?;
+        match suffix {
+            "-journal" => {
                 return Err(SqlError::Custom(format!(
-                    "failed to inspect residual sqlite sidecar {} after checkpoint: {e}",
-                    sidecar_path.display()
+                    "checkpoint completed for {} but a non-empty rollback journal appeared; refusing to detach a possibly live transaction",
+                    primary_path.display()
                 )));
             }
+            "-wal" if witnessed.len > SQLITE_WAL_HEADER_BYTES => {
+                return Err(SqlError::Custom(format!(
+                    "checkpoint completed for {} but a WAL with frame bytes appeared; refusing to detach a possibly committed generation",
+                    primary_path.display()
+                )));
+            }
+            _ => {
+                sidecars.insert(suffix, witnessed);
+            }
         }
+    }
+
+    // Derived state moves first and WAL authority last, matching ordinary
+    // damaged-family cleanup. All entries were opened, hashed, and retained
+    // before the first namespace mutation.
+    let mut ordered = Vec::with_capacity(sidecars.len());
+    for suffix in ["-wal-cert-head", "-wal-cert", "-shm", "-wal"] {
+        if let Some(witness) = sidecars.remove(suffix) {
+            ordered.push(witness);
+        }
+    }
+    Ok(ordered)
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_sqlite_sidecars_after_checkpoint_with_hook<F>(
+    primary_path: &Path,
+    mut before_move: F,
+) -> Result<(), SqlError>
+where
+    F: FnMut(&Path),
+{
+    refuse_sqlite_family_cleanup_while_owned(primary_path)?;
+    let sidecars = classify_sqlite_sidecars_after_checkpoint(primary_path)?;
+    let mut quarantine_nonce = None;
+    for witness in &sidecars {
+        refuse_sqlite_family_cleanup_while_owned(primary_path)?;
+        before_move(&witness.path);
+        let _ = quarantine_sqlite_cleanup_sidecar_witnessed(
+            witness,
+            &mut quarantine_nonce,
+            "witnessed residual sidecar after successful checkpoint",
+        )?;
     }
     sync_recovery_parent(primary_path)?;
     Ok(())
@@ -11388,6 +11542,27 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
 
 #[allow(clippy::result_large_err)]
 fn ensure_sqlite_file_healthy_inner(primary_path: &Path) -> Result<(), SqlError> {
+    ensure_sqlite_file_healthy_inner_with_timeout(
+        primary_path,
+        crate::write_barrier::writer_drain_timeout(),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_sqlite_file_healthy_inner_with_timeout(
+    primary_path: &Path,
+    writer_drain_timeout: Duration,
+) -> Result<(), SqlError> {
+    // The non-archive recovery path can repair indexes, capture forensic
+    // artifacts, restore a backup, or reinitialize the live generation. Give
+    // that entire sequence the same writer exclusion as archive recovery so
+    // no in-process write can straddle one of those mutations. Nested
+    // promotion barriers are reentrant.
+    let _promotion_barrier = acquire_recovery_promotion_barrier(
+        primary_path,
+        "sqlite recovery",
+        writer_drain_timeout,
+    )?;
     validate_sqlite_target_path(primary_path, "sqlite recovery target")?;
     let exists = primary_path.exists();
     if exists {

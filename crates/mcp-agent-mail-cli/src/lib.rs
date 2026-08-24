@@ -13206,7 +13206,7 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
 fn open_sqlite_read_only_with_fallback(
     path: &str,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    open_sqlite_with_fallback_internal(path, None, false)
+    open_sqlite_with_fallback_internal(path, None, false, true)
 }
 
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
@@ -13316,21 +13316,34 @@ fn open_sqlite_with_fallback_and_storage_root(
     path: &str,
     storage_root_override: Option<&Path>,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    open_sqlite_with_fallback_internal(path, storage_root_override, true)
+    open_sqlite_with_fallback_internal(path, storage_root_override, true, false)
 }
 
 fn open_sqlite_with_fallback_internal(
     path: &str,
     storage_root_override: Option<&Path>,
     allow_recovery: bool,
+    read_only: bool,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let open_conn = |candidate: &str| -> Result<mcp_agent_mail_db::DbConn, String> {
         let conn = if candidate == ":memory:" {
             mcp_agent_mail_db::DbConn::open_memory().map_err(|e| e.to_string())?
+        } else if read_only {
+            mcp_agent_mail_db::DbConn::open_file_read_only(candidate)
+                .map_err(|e| e.to_string())?
         } else {
             mcp_agent_mail_db::DbConn::open_file(candidate).map_err(|e| e.to_string())?
         };
-        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_CONN_SETTINGS_SQL)
+        let connection_settings = if read_only {
+            // Keep this list connection-local and read-safe. In particular, do
+            // not reuse PRAGMA_CONN_SETTINGS_SQL: synchronous, autocheckpoint,
+            // and journal-size settings carry writer semantics even when their
+            // current value happens not to change.
+            "PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;"
+        } else {
+            mcp_agent_mail_db::schema::PRAGMA_CONN_SETTINGS_SQL
+        };
+        conn.execute_raw(connection_settings)
             .map_err(|e| e.to_string())?;
         Ok(conn)
     };
@@ -19509,7 +19522,8 @@ fn open_db_sync_for_migrate(database_url: &str) -> CliResult<mcp_agent_mail_db::
 
     // `am migrate` is an explicit schema/bootstrap command. It must not
     // silently import archive state from the ambient mailbox storage root.
-    open_sqlite_with_fallback_internal(&path, None, false).map(|(conn, _opened_path)| conn)
+    open_sqlite_with_fallback_internal(&path, None, false, false)
+        .map(|(conn, _opened_path)| conn)
 }
 
 fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> {
@@ -67259,6 +67273,206 @@ startup_timeout_sec = 42
         ));
         assert!(!migrate_format_requires_force(&TimestampFormat::RustMicros));
         assert!(!migrate_format_requires_force(&TimestampFormat::Empty));
+    }
+
+    fn plant_cli_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path);
+        match breaker_kind {
+            "malformed" => {
+                std::fs::write(&breaker_path, b"{malformed-breaker")
+                    .expect("plant malformed breaker authority");
+            }
+            "tripped" => {
+                let now_unix = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock after epoch")
+                        .as_secs(),
+                )
+                .expect("test time fits i64");
+                mcp_agent_mail_db::recovery_breaker::store(
+                    db_path,
+                    &mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                        schema: 1,
+                        db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(
+                            db_path,
+                        ),
+                        consecutive_failures: 1,
+                        last_failure_unix: now_unix,
+                        last_failure_reason: "parked CLI recovery".to_string(),
+                        tripped: true,
+                    },
+                )
+                .expect("plant tripped breaker authority");
+            }
+            other => panic!("unknown breaker fixture kind: {other}"),
+        }
+        breaker_path
+    }
+
+    fn sqlite_family_bytes_for_cli_open_test(db_path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        [
+            db_path.to_path_buf(),
+            sqlite_sidecar_path(db_path, "-wal"),
+            sqlite_sidecar_path(db_path, "-shm"),
+            mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect()
+    }
+
+    fn directory_entry_names_for_cli_open_test(directory: &Path) -> BTreeSet<std::ffi::OsString> {
+        std::fs::read_dir(directory)
+            .expect("list CLI-open fixture directory")
+            .map(|entry| entry.expect("read CLI-open fixture entry").file_name())
+            .collect()
+    }
+
+    #[test]
+    fn open_db_sync_breaker_refusal_precedes_live_open_and_recovery_artifacts() {
+        for family_kind in ["corrupt-primary", "truncated-wal", "missing-primary"] {
+            for breaker_kind in ["malformed", "tripped"] {
+                mcp_agent_mail_db::pool::recovery_admission().reset();
+                let dir = tempfile::tempdir().expect("tempdir");
+                let db_path = dir
+                    .path()
+                    .join(format!("cli-{family_kind}-{breaker_kind}.sqlite3"));
+                let db_url = format!("sqlite:///{}", db_path.display());
+                let backup_path = PathBuf::from(format!("{}.bak", db_path.display()));
+
+                if family_kind == "missing-primary" {
+                    init_schema_sqlite_canonical(&backup_path.display().to_string())
+                        .expect("seed tempting standalone backup");
+                } else {
+                    init_schema_sqlite_canonical(&db_path.display().to_string())
+                        .expect("seed healthy primary");
+                    let conn = mcp_agent_mail_db::DbConn::open_file(
+                        db_path.display().to_string(),
+                    )
+                    .expect("open fixture primary");
+                    conn.execute_raw("CREATE TABLE cli_admission_marker(value TEXT)")
+                        .expect("create marker table");
+                    conn.execute_raw(
+                        "INSERT INTO cli_admission_marker(value) VALUES('from-backup')",
+                    )
+                    .expect("seed marker row");
+                    conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+                        .expect("checkpoint fixture");
+                    drop(conn);
+                    std::fs::copy(&db_path, &backup_path).expect("create tempting backup");
+                }
+
+                match family_kind {
+                    "corrupt-primary" => {
+                        std::fs::write(&db_path, b"not a sqlite database")
+                            .expect("corrupt primary");
+                }
+                    "truncated-wal" => {
+                        std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                            .expect("plant truncated WAL");
+                        std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"coordination-shm")
+                            .expect("plant SHM evidence");
+                    }
+                    "missing-primary" => {
+                        assert!(!db_path.exists(), "fixture primary must remain missing");
+                    }
+                    other => panic!("unknown family fixture kind: {other}"),
+                }
+
+                let breaker_path = plant_cli_open_breaker_fixture(&db_path, breaker_kind);
+                let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+                let entries_before = directory_entry_names_for_cli_open_test(dir.path());
+                let breaker_before =
+                    std::fs::read(&breaker_path).expect("snapshot breaker authority");
+
+                let error = open_db_sync_with_database_url_and_storage_root(
+                    &db_url,
+                    Some(dir.path()),
+                )
+                .expect_err("durable breaker must refuse an unhealthy or missing live family");
+                let error_text = error.to_string();
+                assert!(
+                    error_text.contains("circuit-broken")
+                        || error_text.contains("could not be trusted"),
+                    "unexpected {family_kind}/{breaker_kind} refusal: {error_text}"
+                );
+
+                assert_eq!(
+                    sqlite_family_bytes_for_cli_open_test(&db_path),
+                    family_before,
+                    "{family_kind}/{breaker_kind} refusal must preserve exact primary/WAL/SHM/breaker presence and bytes"
+                );
+                assert_eq!(
+                    std::fs::read(&breaker_path).expect("re-read breaker authority"),
+                    breaker_before,
+                    "{family_kind}/{breaker_kind} refusal must not rewrite breaker authority"
+                );
+
+                let entries_after = directory_entry_names_for_cli_open_test(dir.path());
+                let allowed_new_entries = BTreeSet::from([
+                    std::ffi::OsString::from(".mailbox.activity.lock"),
+                    std::ffi::OsString::from(format!(
+                        "{}.activity.lock",
+                        db_path.file_name().expect("database filename").to_string_lossy()
+                    )),
+                ]);
+                let unexpected_new_entries = entries_after
+                    .difference(&entries_before)
+                    .filter(|entry| !allowed_new_entries.contains(*entry))
+                    .collect::<Vec<_>>();
+                assert!(
+                    unexpected_new_entries.is_empty(),
+                    "{family_kind}/{breaker_kind} refusal created recovery/election/forensic artifacts: {unexpected_new_entries:?}"
+                );
+                assert!(
+                    entries_before.is_subset(&entries_after),
+                    "{family_kind}/{breaker_kind} refusal removed or renamed an existing artifact"
+                );
+                mcp_agent_mail_db::pool::recovery_admission().reset();
+            }
+        }
+    }
+
+    #[test]
+    fn open_db_sync_healthy_family_continues_without_rewriting_breaker_authority() {
+        for breaker_kind in ["malformed", "tripped"] {
+            mcp_agent_mail_db::pool::recovery_admission().reset();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("cli-healthy-{breaker_kind}.sqlite3"));
+            let db_url = format!("sqlite:///{}", db_path.display());
+            init_schema_sqlite_canonical(&db_path.display().to_string())
+                .expect("seed healthy primary");
+            let breaker_path = plant_cli_open_breaker_fixture(&db_path, breaker_kind);
+            let breaker_before =
+                std::fs::read(&breaker_path).expect("snapshot breaker authority");
+
+            let conn = open_db_sync_with_database_url_and_storage_root(
+                &db_url,
+                Some(dir.path()),
+            )
+            .expect("source-neutrally proven healthy family may continue serving");
+            let rows = conn
+                .query_sync("SELECT 1 AS one", &[])
+                .expect("query healthy family");
+            assert_eq!(
+                rows.first()
+                    .and_then(|row| row.get_named::<i64>("one").ok()),
+                Some(1)
+            );
+            drop(conn);
+            assert_eq!(
+                std::fs::read(&breaker_path).expect("re-read breaker authority"),
+                breaker_before,
+                "healthy {breaker_kind} fail-open must not rewrite durable authority"
+            );
+            mcp_agent_mail_db::pool::recovery_admission().reset();
+        }
     }
 
     #[test]

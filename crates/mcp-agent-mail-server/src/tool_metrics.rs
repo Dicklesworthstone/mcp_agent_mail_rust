@@ -110,6 +110,7 @@ fn metrics_loop(config: &Config) {
     let startup_delay = interval.min(std::time::Duration::from_secs(8));
     let mut conn = open_metrics_connection(&config.database_url);
     if let Some(db) = conn.as_ref() {
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         ensure_metrics_schema(db);
     }
     // #219: a recovery promotion replaces the live file by rename; a raw
@@ -182,6 +183,7 @@ fn metrics_loop(config: &Config) {
             if conn.is_none() && (current_epoch != conn_epoch || tick_index.is_multiple_of(12)) {
                 conn = open_metrics_connection(&config.database_url);
                 if let Some(db) = conn.as_ref() {
+                    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
                     ensure_metrics_schema(db);
                 }
                 conn_epoch = current_epoch;

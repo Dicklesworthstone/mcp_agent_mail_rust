@@ -2574,14 +2574,16 @@ pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
     mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path)
 }
 
-/// Refuse a raw live-engine open when durable recovery authority says the exact
-/// SQLite family still needs the pool's recovery-admission path.
+/// Refuse a raw live-engine open when durable recovery authority or a pure
+/// sidecar classification says the exact SQLite family still needs the pool's
+/// recovery-admission path.
 ///
 /// Pool acquisitions pass through the database crate's startup-init gate, but
 /// the health and TUI observability connections intentionally bypass the pool.
 /// Opening SQLite is not a passive operation: it may replay or rewrite WAL/SHM
 /// state before the caller can enable `query_only`. When breaker authority is
-/// unreadable, or records failures for these exact primary bytes, prove a
+/// unreadable, records failures for these exact primary bytes, or a WAL/SHM is
+/// structurally damaged even before the first breaker record exists, prove a
 /// private copy of the complete family can open without cleanup. A suspect
 /// family is refused here, before the live engine sees it. A healthy exact
 /// family remains readable, matching the pool startup policy, and this read
@@ -2603,7 +2605,14 @@ fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Res
             "durable recovery-breaker authority could not be trusted: {error}"
         )),
     };
-    let Some(nonclean_authority) = nonclean_authority else {
+    let sidecar_classification = mcp_agent_mail_db::wal_classify::classify_wal_sidecar(path);
+    let suspicious_family = sidecar_classification.state.is_damaged().then(|| {
+        format!(
+            "the source-neutral sidecar classifier reported {:?}: {}",
+            sidecar_classification.state, sidecar_classification.detail
+        )
+    });
+    let Some(preopen_proof_reason) = nonclean_authority.or(suspicious_family) else {
         return Ok(());
     };
 
@@ -2612,17 +2621,17 @@ fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Res
             tracing::warn!(
                 operation = context,
                 path = %path.display(),
-                authority = %nonclean_authority,
+                reason = %preopen_proof_reason,
                 "raw live SQLite open is proceeding only after a source-neutral exact-family proof"
             );
             Ok(())
         }
         Ok(false) => Err(std::io::Error::other(format!(
-            "{context}: refusing raw live SQLite engine open for {} because {nonclean_authority}, and the exact family is not healthy without recovery cleanup",
+            "{context}: refusing raw live SQLite engine open for {} because {preopen_proof_reason}, and the exact family is not healthy without recovery cleanup",
             path.display()
         ))),
         Err(error) => Err(std::io::Error::other(format!(
-            "{context}: refusing raw live SQLite engine open for {} because {nonclean_authority}, and a source-neutral exact-family proof failed: {error}",
+            "{context}: refusing raw live SQLite engine open for {} because {preopen_proof_reason}, and a source-neutral exact-family proof failed: {error}",
             path.display()
         ))),
     }
@@ -28730,21 +28739,26 @@ first body
 
     fn install_raw_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {
         let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path);
-        if breaker_kind == "malformed" {
-            std::fs::write(&breaker_path, b"malformed breaker authority")
-                .expect("write malformed breaker authority");
-        } else {
-            let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
-                schema: 1,
-                db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path),
-                consecutive_failures:
-                    mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
-                last_failure_unix: i64::MAX,
-                last_failure_reason: "raw-open fixture is circuit-broken".to_string(),
-                tripped: true,
-            };
-            mcp_agent_mail_db::recovery_breaker::store(db_path, &state)
-                .expect("store tripped breaker authority");
+        match breaker_kind {
+            "absent" => {}
+            "malformed" => {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker authority");
+            }
+            "tripped" => {
+                let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures:
+                        mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+                    last_failure_unix: i64::MAX,
+                    last_failure_reason: "raw-open fixture is circuit-broken".to_string(),
+                    tripped: true,
+                };
+                mcp_agent_mail_db::recovery_breaker::store(db_path, &state)
+                    .expect("store tripped breaker authority");
+            }
+            other => panic!("unknown raw-open breaker fixture kind: {other}"),
         }
         breaker_path
     }
@@ -28754,7 +28768,12 @@ first body
         mut open: impl FnMut(&Path, &Path) -> Result<(), String>,
     ) {
         for family_kind in ["damaged-wal", "corrupt-primary"] {
-            for breaker_kind in ["malformed", "tripped"] {
+            let breaker_kinds: &[&str] = if family_kind == "damaged-wal" {
+                &["absent", "malformed", "tripped"]
+            } else {
+                &["malformed", "tripped"]
+            };
+            for &breaker_kind in breaker_kinds {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let storage_root = dir.path().join("storage");
                 std::fs::create_dir_all(&storage_root).expect("create empty storage root");
@@ -28802,6 +28821,13 @@ first body
                 ));
                 let breaker_path = install_raw_open_breaker_fixture(&db_path, breaker_kind);
                 let family_paths = [db_path.clone(), wal_path, shm_path, breaker_path];
+                drop(
+                    acquire_mailbox_activity_lock_for_sqlite_path(
+                        &db_path,
+                        MailboxActivityLockMode::Shared,
+                    )
+                    .expect("materialize the normal readiness activity-lock inode"),
+                );
                 let family_bytes_before =
                     family_paths.each_ref().map(|path| std::fs::read(path).ok());
                 let names_before = std::fs::read_dir(dir.path())
@@ -28810,7 +28836,7 @@ first body
                     .collect::<std::collections::BTreeSet<_>>();
 
                 let error = open(&db_path, &storage_root)
-                    .expect_err("nonclean breaker must refuse the suspect raw live open");
+                    .expect_err("pre-open guard must refuse the suspect raw live open");
                 assert!(
                     error.contains("refusing raw live SQLite engine open"),
                     "unexpected {surface}/{family_kind}/{breaker_kind} refusal: {error}"
@@ -28833,16 +28859,17 @@ first body
     }
 
     #[test]
-    fn health_raw_open_refuses_suspect_family_behind_nonclean_breaker() {
-        assert_raw_live_open_preserves_suspect_family("health", |db_path, _storage_root| {
-            open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref())
-                .map(drop)
-                .map_err(|error| error.to_string())
+    fn health_raw_open_refuses_suspect_family_before_live_engine_open() {
+        assert_raw_live_open_preserves_suspect_family("health", |db_path, storage_root| {
+            let mut config = mcp_agent_mail_core::Config::default();
+            config.database_url = format!("sqlite:///{}", db_path.display());
+            config.storage_root = storage_root.to_path_buf();
+            readiness_check_request_path(&config)
         });
     }
 
     #[test]
-    fn tui_observability_raw_open_refuses_suspect_family_behind_nonclean_breaker() {
+    fn tui_observability_raw_open_refuses_suspect_family_before_live_engine_open() {
         assert_raw_live_open_preserves_suspect_family(
             "tui-observability",
             |db_path, storage_root| {
