@@ -6466,7 +6466,9 @@ fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
     // Keep startup stats on the fastest possible path: banner counts are purely
     // cosmetic, so do not trigger fallback probing or sqlite auto-recovery here.
     // The real readiness/server startup path still performs full recovery checks.
-    let Ok((conn, _opened_path)) = open_live_sqlite_read_only(&sqlite_path) else {
+    let Ok((conn, _opened_path)) =
+        open_live_sqlite_read_only(&sqlite_path, "startup banner statistics")
+    else {
         return PreflightBannerStats::default();
     };
     query_preflight_banner_stats_batched(&conn).unwrap_or_default()
@@ -13197,7 +13199,9 @@ fn cli_sqlite_family_requires_preopen_admission(path: &Path) -> CliResult<bool> 
             path.display()
         ))
     })?;
-    let Ok((conn, _opened_path)) = open_live_sqlite_read_only(path_text) else {
+    let Ok((conn, _opened_path)) =
+        open_live_sqlite_read_only(path_text, "CLI pre-open SQLite health probe")
+    else {
         return Ok(true);
     };
     let requires_init = sqlite_conn_requires_canonical_init(&conn);
@@ -13214,29 +13218,32 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
     open_sqlite_with_fallback_and_storage_root(path, None)
 }
 
-fn open_live_sqlite_read_only(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+fn open_live_sqlite_read_only(
+    path: &str,
+    context: &str,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let conn = if path == ":memory:" {
         let conn = mcp_agent_mail_db::DbConn::open_memory()
-            .map_err(|error| CliError::Other(format!("cannot open in-memory DB: {error}")))?;
+            .map_err(|error| CliError::Other(format!("{context}: cannot open in-memory DB: {error}")))?;
         conn.execute_raw("PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;")
             .map_err(|error| {
                 CliError::Other(format!(
-                    "cannot configure in-memory read-only preflight: {error}"
+                    "{context}: cannot configure in-memory read-only connection: {error}"
                 ))
             })?;
         conn
     } else {
         let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
             Path::new(path),
-            "CLI pre-open SQLite health probe",
+            context,
         )
         .map_err(|error| {
-            CliError::Other(format!("cannot open DB at {path} for read-only preflight: {error}"))
+            CliError::Other(format!("{context}: cannot open DB at {path} read-only: {error}"))
         })?;
         conn.execute_raw("PRAGMA busy_timeout = 20000;")
             .map_err(|error| {
                 CliError::Other(format!(
-                    "cannot configure DB at {path} for read-only preflight: {error}"
+                    "{context}: cannot configure DB at {path} read-only: {error}"
                 ))
             })?;
         conn
@@ -13860,7 +13867,7 @@ fn open_db_sync_read_only_with_database_url_and_path(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    open_live_sqlite_read_only(&path)
+    open_live_sqlite_read_only(&path, "CLI synchronous mailbox read")
 }
 
 fn open_db_sync_read_only_with_database_url(
@@ -14011,8 +14018,13 @@ impl CanonicalSnapshotSource {
     fn open_read_only(&self, context: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
         match self.kind {
             CanonicalSnapshotSourceKind::LiveSqlite => {
-                open_live_sqlite_read_only(self.actual_path.to_string_lossy().as_ref())
-                    .map(|(conn, _opened_path)| conn)
+                let path = self.actual_path.to_str().ok_or_else(|| {
+                    CliError::Other(format!(
+                        "{context} refuses non-UTF-8 live SQLite path {}",
+                        self.actual_path.display()
+                    ))
+                })?;
+                open_live_sqlite_read_only(path, context).map(|(conn, _opened_path)| conn)
             }
             CanonicalSnapshotSourceKind::LiveSnapshot
             | CanonicalSnapshotSourceKind::ArchiveSnapshot => {
@@ -14112,7 +14124,7 @@ fn resolve_canonical_snapshot_source_path(
         )));
     }
 
-    match open_live_sqlite_read_only(&candidate_display) {
+    match open_live_sqlite_read_only(&candidate_display, context) {
         Ok((conn, opened_path)) => {
             let opened_path = PathBuf::from(opened_path);
             let db_inventory = collect_doctor_db_inventory(&conn);
@@ -14477,7 +14489,7 @@ fn open_db_sync_robot_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    let (conn, _opened_path) = open_live_sqlite_read_only(&path)?;
+    let (conn, _opened_path) = open_live_sqlite_read_only(&path, "robot mailbox read")?;
     if sqlite_conn_supports_robot_reads(&conn)? {
         return Ok(conn);
     }
@@ -14497,7 +14509,8 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    let (conn, _opened_path) = open_live_sqlite_read_only(&path)?;
+    let (conn, _opened_path) =
+        open_live_sqlite_read_only(&path, "robot attachment mailbox read")?;
     if sqlite_conn_supports_robot_attachment_reads(&conn)? {
         return Ok(conn);
     }
@@ -19772,7 +19785,8 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    let (format_conn, opened_path) = open_sqlite_read_only_with_fallback(&resolved_path)?;
+    let (format_conn, opened_path) =
+        open_live_sqlite_read_only(&resolved_path, "migration format detection")?;
     resolved_path = opened_path;
     db_path = PathBuf::from(&resolved_path);
     let format = migrate::detect_timestamp_format(&format_conn)
@@ -67392,6 +67406,8 @@ startup_timeout_sec = 42
             sqlite_sidecar_path(db_path, "-wal"),
             sqlite_sidecar_path(db_path, "-shm"),
             mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path),
+            sqlite_sidecar_path(db_path, "-fsqlite-ns-gate"),
+            sqlite_sidecar_path(db_path, "-fsqlite-ns-use"),
         ]
         .into_iter()
         .map(|path| {
@@ -67409,7 +67425,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn open_sqlite_read_only_probe_is_source_namespace_neutral_without_breaker() {
+    fn open_live_sqlite_read_only_is_source_namespace_neutral_without_breaker() {
         for family_kind in ["healthy", "corrupt-primary", "truncated-wal", "missing-primary"] {
             let dir = tempfile::tempdir().expect("tempdir");
             let db_path = dir
@@ -67420,7 +67436,17 @@ startup_timeout_sec = 42
                     .expect("seed read-only probe primary");
             }
             match family_kind {
-                "healthy" | "missing-primary" => {}
+                "healthy" => {
+                    let admitted = mcp_agent_mail_db::DbConn::open_file(
+                        db_path.display().to_string(),
+                    )
+                    .expect("admit healthy CLI read-only fixture through FrankenSQLite");
+                    mcp_agent_mail_db::close_db_conn(
+                        admitted,
+                        "settle healthy CLI read-only fixture",
+                    );
+                }
+                "missing-primary" => {}
                 "corrupt-primary" => {
                     std::fs::write(&db_path, b"not a sqlite database")
                         .expect("corrupt primary");
@@ -67436,17 +67462,18 @@ startup_timeout_sec = 42
 
             let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
             let entries_before = directory_entry_names_for_cli_open_test(dir.path());
-            let opened = open_sqlite_read_only_with_fallback(&db_path.display().to_string());
+            let opened = open_live_sqlite_read_only(
+                &db_path.display().to_string(),
+                "CLI live read-only neutrality test",
+            );
             if family_kind == "healthy" {
                 let (conn, opened_path) = opened.expect("open healthy family read-only");
                 assert_eq!(opened_path, db_path.display().to_string());
                 conn.execute_raw("CREATE TABLE must_be_rejected(id INTEGER)")
                     .expect_err("read-only probe connection must reject writes");
                 drop(conn);
-            } else if let Ok((conn, _)) = opened {
-                // A read-only engine may accept some malformed sidecar shapes,
-                // but it still must not change the live namespace or bytes.
-                drop(conn);
+            } else {
+                opened.expect_err("unadmitted or malformed live family must fail closed");
             }
 
             assert_eq!(
@@ -68888,18 +68915,23 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn open_sqlite_read_only_with_fallback_does_not_quarantine_corrupt_db() {
+    fn open_live_sqlite_read_only_does_not_quarantine_corrupt_db() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
 
-        let error = match open_sqlite_read_only_with_fallback(db_path.to_string_lossy().as_ref()) {
+        let error = match open_live_sqlite_read_only(
+            db_path.to_string_lossy().as_ref(),
+            "CLI corrupt live read-only test",
+        ) {
             Ok(_) => panic!("read-only best-effort open should not auto-recover corruption"),
             Err(error) => error,
         };
         let error_text = error.to_string();
         assert!(
-            error_text.contains("cannot open DB") || error_text.contains("NOTADB"),
+            error_text.contains("read-only")
+                || error_text.contains("refusing")
+                || error_text.contains("NOTADB"),
             "unexpected read-only open error: {error_text}"
         );
 
@@ -81220,7 +81252,7 @@ fn agent_start_active_reservation_conflict_examples(
     if path != ":memory:" && !Path::new(&path).exists() {
         return Ok(Vec::new());
     }
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)
+    let (conn, _opened_path) = open_live_sqlite_read_only(&path, "agent-start reservations")
         .map_err(|error| truncate_doctor_command(&error.to_string()))?;
     let Some(project) = resolve_project_for_cli_best_effort(&conn, project_key)
         .map_err(|error| truncate_doctor_command(&error.to_string()))?

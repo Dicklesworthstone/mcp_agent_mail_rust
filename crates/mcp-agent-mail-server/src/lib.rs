@@ -28996,6 +28996,57 @@ first body
         );
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn health_count_read_only_drop_does_not_checkpoint_live_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("health-count-read-only-drop.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open health-count WAL fixture");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize health-count WAL fixture");
+        conn.execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable health-count fixture WAL mode");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable health-count fixture autocheckpoint");
+        conn.execute_raw(
+            "INSERT INTO projects(slug, human_key, created_at) \
+             VALUES ('health-drop', '/health-drop', 1);",
+        )
+        .expect("write health-count checkpoint sentinel");
+        // Ordinary writer Drop deliberately leaves the counted row in WAL for
+        // the health observer teardown below to preserve.
+        drop(conn);
+
+        let wal_path = db_path.with_file_name(format!(
+            "{}-wal",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let primary_before = std::fs::read(&db_path).expect("snapshot health-count primary");
+        let wal_before = std::fs::read(&wal_path).expect("snapshot health-count WAL");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "fixture must retain committed frames that a checkpointing close would consume"
+        );
+
+        assert_eq!(
+            fetch_health_live_counts(&database_url),
+            Some((1, 0)),
+            "health counts must observe the committed WAL row"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read health-count primary after observer"),
+            primary_before,
+            "health-count teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read health-count WAL after observer"),
+            wal_before,
+            "health-count teardown must not checkpoint or truncate the WAL"
+        );
+    }
+
     fn install_live_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {
         let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path);
         match breaker_kind {
