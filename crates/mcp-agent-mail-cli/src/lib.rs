@@ -13515,7 +13515,7 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
     } else {
         None
     };
-    let (mut conn, mut opened_path) =
+    let (mut conn, opened_path) =
         open_sqlite_with_fallback_and_storage_root(&path, storage_root_override)?;
     if opened_path != ":memory:" {
         if !sqlite_conn_requires_canonical_init(&conn)? {
@@ -13528,30 +13528,14 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
             );
         }
 
-        let mut conn_healthy = sqlite_conn_is_healthy(&conn)?;
-        if !conn_healthy {
-            // If a malformed relative path shadows a healthy absolute DB, prefer that absolute file
-            // before mutating/quarantining the relative artifact.
-            if let Some(absolute_path) = sqlite_absolute_candidate_path(&opened_path)
-                && absolute_path != opened_path
-                && let Ok(fallback_conn) = mcp_agent_mail_db::DbConn::open_file(&absolute_path)
-                && sqlite_conn_is_healthy(&fallback_conn)?
-            {
-                conn = fallback_conn;
-                opened_path = absolute_path;
-                conn_healthy = true;
-            }
-
-            if !conn_healthy {
-                drop(conn);
-                recover_sqlite_file_with_storage_root(
-                    Path::new(&opened_path),
-                    storage_root_override,
-                )?;
-                conn = mcp_agent_mail_db::DbConn::open_file(&opened_path).map_err(|e| {
-                    CliError::Other(format!("cannot reopen DB at {opened_path}: {e}"))
-                })?;
-            }
+        if !sqlite_conn_is_healthy(&conn)? {
+            drop(conn);
+            recover_sqlite_file_with_storage_root(
+                Path::new(&opened_path),
+                storage_root_override,
+            )?;
+            conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
+                .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
         }
 
         // For file-backed DBs, run canonical schema bootstrap only when the file is
@@ -27057,13 +27041,9 @@ fn doctor_database_probe_blocker_read_only(
         return None;
     }
 
-    let mut candidate_path = configured_path.clone();
+    let candidate_path = resolve_sqlite_runtime_path(&configured_path);
     if !Path::new(&candidate_path).exists() {
-        candidate_path = sqlite_absolute_candidate_path(&candidate_path)?;
-    } else if doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).is_some()
-        && let Some(absolute_candidate) = sqlite_absolute_candidate_path(&candidate_path)
-    {
-        candidate_path = absolute_candidate;
+        return None;
     }
 
     doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).map(|detail| {
