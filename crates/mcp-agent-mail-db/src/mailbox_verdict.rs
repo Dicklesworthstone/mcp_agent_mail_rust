@@ -1476,8 +1476,10 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         );
     }
 
-    let path_str = db_path.display().to_string();
-    let conn = match crate::DbConn::open_file(&path_str) {
+    let conn = match crate::pool::open_guarded_read_only_sqlite_file(
+        db_path,
+        "mailbox schema-population diagnostic",
+    ) {
         Ok(conn) => conn,
         Err(error) => {
             return ProbeResult::error(

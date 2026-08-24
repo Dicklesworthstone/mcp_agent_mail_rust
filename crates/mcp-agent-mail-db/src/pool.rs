@@ -3045,17 +3045,10 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
-                        // br-uflow: refuse obviously unopenable targets BEFORE
-                        // FrankenSQLite sees the pathname. Its open can mint
-                        // persistent namespace sidecars (-fsqlite-ns-gate /
-                        // -fsqlite-ns-use) even when the open fails, and those
-                        // records must never be unlinked outside FrankenSQLite's
-                        // own cleanup protocol — while the strict query-only
-                        // contract promises zero filesystem footprint.
-                        if let Err(e) = strict_target_precheck(&sqlite_path) {
-                            return Outcome::Err(e);
-                        }
-                        match DbConn::open_file_read_only(&sqlite_path) {
+                        match open_guarded_read_only_sqlite_file(
+                            Path::new(&sqlite_path),
+                            "strict query-only pool connection",
+                        ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
@@ -3627,7 +3620,10 @@ impl DbPool {
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
         let conn = crate::guard_db_conn(
-            open_sqlite_file_with_lock_retry(&self.sqlite_path)
+            open_guarded_read_only_sqlite_file(
+                Path::new(&self.sqlite_path),
+                "consistency probe",
+            )
                 .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?,
             "consistency probe connection",
         );
@@ -5196,10 +5192,10 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn = open_guarded_read_only_sqlite_file(
-        primary_path,
+    let conn = crate::guard_db_conn(
+        open_guarded_read_only_sqlite_file(primary_path, "mailbox database inventory")?,
         "mailbox database inventory",
-    )?;
+    );
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -5722,6 +5718,30 @@ fn open_sqlite_file_with_lock_retry_canonical(
 }
 
 #[allow(clippy::result_large_err)]
+fn open_sqlite_file_read_only_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
+    open_sqlite_file_with_lock_retry_impl(
+        sqlite_path,
+        |path| DbConn::open_file_read_only(path),
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn open_canonical_sqlite_file_read_only_with_lock_retry(
+    sqlite_path: &str,
+) -> Result<crate::CanonicalDbConn, SqlError> {
+    open_sqlite_file_with_lock_retry_impl(
+        sqlite_path,
+        |path| {
+            let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string())
+                .flags(sqlmodel_sqlite::OpenFlags::read_only());
+            crate::CanonicalDbConn::open(&config)
+        },
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::result_large_err)]
 fn retry_sqlite_lock_impl<T, F, S>(
     sqlite_path: &str,
     operation: &str,
@@ -6198,7 +6218,10 @@ fn sqlite_canonical_file_check_is_ok(
     path: &Path,
     kind: integrity::CheckKind,
 ) -> Result<bool, SqlError> {
-    let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path)?)?;
+    let conn = open_guarded_read_only_canonical_sqlite_file(
+        path,
+        "canonical SQLite integrity diagnostic",
+    )?;
     sqlite_pragma_check_is_ok_canonical(&conn, kind)
 }
 
@@ -6249,7 +6272,10 @@ const DURABLE_MAILBOX_STATE_TABLES: &[&str] = &[
 /// Failure to inspect a present table remains fail-closed.
 #[allow(clippy::result_large_err)]
 fn canonical_mailbox_has_no_durable_rows(path: &Path) -> Result<bool, SqlError> {
-    let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path)?)?;
+    let conn = open_guarded_read_only_canonical_sqlite_file(
+        path,
+        "canonical durable-row diagnostic",
+    )?;
 
     for table in DURABLE_MAILBOX_STATE_TABLES {
         // `table` comes from the static list above, never user input. A
@@ -7888,6 +7914,13 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
         return Ok(false);
     };
+    // A rollback journal may require recovery merely to observe the database.
+    // The no-cleanup contract must not accept a staged open that succeeded by
+    // replaying or resetting that journal, because the corresponding live
+    // read-only observer has no authority to trigger recovery.
+    if path_is_occupied(&sqlite_sidecar_path(&staged.path, "-journal")) {
+        return Ok(false);
+    }
     if !classify_sqlite_family_cleanup(&staged.path)?.is_empty() {
         return Ok(false);
     }
@@ -9404,6 +9437,7 @@ const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 5] =
 // FrankenSQLite's exclusive private-database cleanup protocol may remove them.
 const FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
 const SQLITE_DATABASE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
 const RECOVERY_DISK_RESERVE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Zero-footprint viability check for the strict query-only pool (br-uflow).
@@ -9414,8 +9448,9 @@ const RECOVERY_DISK_RESERVE_BYTES: u64 = 100 * 1024 * 1024;
 /// (see [`FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES`]). Rejecting absent targets
 /// and files that cannot be a SQLite database (bad magic) here keeps such
 /// pathnames out of FrankenSQLite entirely. Deeper corruption still surfaces
-/// from the real open/query path; an empty file is left to the engine, which
-/// treats zero-length databases as valid.
+/// from the real open/query path. A zero-length file is not a materialized
+/// SQLite database and is refused too, so a diagnostic can never turn it into
+/// an engine namespace merely by observing it.
 fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError> {
     let metadata = std::fs::symlink_metadata(sqlite_path).map_err(|error| {
         SqlError::Custom(format!(
@@ -9428,22 +9463,199 @@ fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError
         )));
     }
     if metadata.len() == 0 {
-        return Ok(());
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is an empty, unmaterialized database file"
+        )));
     }
-    let mut header = [0u8; 16];
-    let read = mcp_agent_mail_core::disk::open_regular_file_no_follow(Path::new(sqlite_path))
-        .and_then(|mut file| std::io::Read::read(&mut file, &mut header))
+    if metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX) {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} has a truncated SQLite database header"
+        )));
+    }
+    let mut header = [0u8; SQLITE_DATABASE_HEADER_BYTES];
+    mcp_agent_mail_core::disk::open_regular_file_no_follow(Path::new(sqlite_path))
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
         .map_err(|error| {
             SqlError::Custom(format!(
                 "strict query-only open refused: cannot read header of {sqlite_path}: {error}"
             ))
         })?;
-    if read < header.len() || header != *SQLITE_DATABASE_HEADER {
+    let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size_is_valid = raw_page_size == 1
+        || ((512..=32_768).contains(&raw_page_size) && raw_page_size.is_power_of_two());
+    let page_size = if raw_page_size == 1 {
+        65_536_u64
+    } else {
+        u64::from(raw_page_size)
+    };
+    let format_versions_are_valid = matches!(header[18], 1 | 2) && matches!(header[19], 1 | 2);
+    let payload_fractions_are_valid = header[21..24] == [64, 32, 32];
+    if header[..SQLITE_DATABASE_HEADER.len()] != *SQLITE_DATABASE_HEADER
+        || !page_size_is_valid
+        || !metadata.len().is_multiple_of(page_size)
+        || !format_versions_are_valid
+        || !payload_fractions_are_valid
+    {
         return Err(SqlError::Custom(format!(
-            "strict query-only open refused: {sqlite_path} is not a SQLite database"
+            "strict query-only open refused: {sqlite_path} does not have a valid SQLite database header"
         )));
     }
     Ok(())
+}
+
+/// Prove an existing live mailbox family is safe to hand to a read-only SQLite
+/// engine without granting that engine any writer authority.
+///
+/// Even a failed ordinary FrankenSQLite open can publish persistent namespace
+/// records beside the target. Read-only diagnostics therefore reject missing,
+/// non-regular, symlinked, and structurally invalid targets before the engine
+/// sees the pathname. When durable breaker history applies to these exact
+/// primary bytes, breaker authority is unreadable, or the WAL/SHM family is
+/// structurally suspect, a private copy of the exact family must pass the
+/// no-cleanup health probe before the live read-only open is allowed. This
+/// keeps malformed/tripped authority source-neutral while preserving service
+/// for a family that is independently proven healthy.
+#[allow(clippy::result_large_err)]
+fn preflight_guarded_read_only_sqlite_family<'path>(
+    sqlite_path: &'path Path,
+    context: &str,
+) -> Result<&'path str, SqlError> {
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let sqlite_path_str = sqlite_path_as_utf8(sqlite_path)?;
+    strict_target_precheck(sqlite_path_str)?;
+
+    let nonclean_authority = match crate::recovery_breaker::load(sqlite_path) {
+        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
+            let fingerprint = crate::recovery_breaker::fingerprint_db(sqlite_path);
+            (state.db_fingerprint == fingerprint).then(|| {
+                format!(
+                    "durable recovery-breaker state records {} failed attempt(s) for these exact primary bytes{}",
+                    state.consecutive_failures,
+                    if state.tripped { " and is tripped" } else { "" }
+                )
+            })
+        }
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "durable recovery-breaker authority could not be trusted: {error}"
+        )),
+    };
+    let wal = crate::wal_classify::classify_wal_sidecar(sqlite_path);
+    let sidecars = inspect_mailbox_sidecar_state(sqlite_path);
+    let invalid_sidecar = SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
+        let sidecar_path = sqlite_sidecar_path(sqlite_path, suffix);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.file_type().is_file() => None,
+            Ok(_) => Some(format!(
+                "the {suffix} sidecar pathname {} is occupied by a non-regular object",
+                sidecar_path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "the {suffix} sidecar pathname {} could not be inspected: {error}",
+                sidecar_path.display()
+            )),
+        }
+    });
+    let suspicious_family = if let Some(reason) = invalid_sidecar {
+        Some(reason)
+    } else if wal.state.is_damaged() {
+        Some(format!(
+            "the source-neutral WAL classifier reported {:?}: {}",
+            wal.state, wal.detail
+        ))
+    } else if sidecars.wal_exists && sidecars.wal_bytes.is_none() {
+        Some("the WAL pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.shm_exists && sidecars.shm_bytes.is_none() {
+        Some("the SHM pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.shm_exists && !sidecars.wal_exists {
+        Some("an orphan SHM sidecar exists without a WAL".to_string())
+    } else if sidecars.shm_bytes == Some(0) {
+        Some("an empty SHM sidecar requires family cleanup before a writer open".to_string())
+    } else if sidecars.journal_exists {
+        Some("a rollback journal is attached to the live database family".to_string())
+    } else {
+        None
+    };
+
+    if let Some(reason) = nonclean_authority.or(suspicious_family) {
+        match sqlite_file_is_healthy_without_family_cleanup(sqlite_path) {
+            Ok(true) => {
+                tracing::warn!(
+                    operation = context,
+                    path = %sqlite_path.display(),
+                    %reason,
+                    "live read-only SQLite open is proceeding only after a source-neutral exact-family proof"
+                );
+            }
+            Ok(false) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only SQLite engine open for {} because {reason}, and the exact family is not healthy without recovery cleanup",
+                    sqlite_path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing live read-only SQLite engine open for {} because {reason}, and a source-neutral exact-family proof failed: {error}",
+                    sqlite_path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(sqlite_path_str)
+}
+
+/// Open an existing live mailbox database through FrankenSQLite's engine-
+/// enforced read-only mode after the source-neutral family preflight.
+#[allow(clippy::result_large_err)]
+pub fn open_guarded_read_only_sqlite_file(
+    sqlite_path: &Path,
+    context: &str,
+) -> Result<DbConn, SqlError> {
+    let sqlite_path_str = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    // The preflight makes retrying only lock/busy failures safe: every attempt
+    // uses the engine's read-only mode, and corruption/open failures are
+    // returned immediately rather than repeatedly touching the pathname.
+    let conn = open_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot open {} read-only: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    if let Err(error) = conn.execute_raw("PRAGMA query_only = ON;") {
+        crate::close_db_conn(conn, "guarded read-only diagnostic setup failure");
+        return Err(SqlError::Custom(format!(
+            "{context}: cannot enforce query-only mode for {}: {error}",
+            sqlite_path.display()
+        )));
+    }
+    Ok(conn)
+}
+
+/// Open an existing live mailbox database through canonical SQLite's read-only
+/// flags after the same source-neutral family preflight used by FrankenSQLite.
+#[allow(clippy::result_large_err)]
+pub fn open_guarded_read_only_canonical_sqlite_file(
+    sqlite_path: &Path,
+    context: &str,
+) -> Result<crate::CanonicalDbConn, SqlError> {
+    let sqlite_path_str = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    let conn = open_canonical_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(
+        |error| {
+            SqlError::Custom(format!(
+                "{context}: cannot open {} with canonical SQLite read-only flags: {error}",
+                sqlite_path.display()
+            ))
+        },
+    )?;
+    conn.execute_raw("PRAGMA query_only = ON;").map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot enforce canonical query-only mode for {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    Ok(conn)
 }
 
 fn recovery_required_free_bytes(expected_write_bytes: u64) -> u64 {

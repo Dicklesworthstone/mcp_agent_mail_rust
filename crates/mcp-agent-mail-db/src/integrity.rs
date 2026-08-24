@@ -268,8 +268,10 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
         };
     }
 
-    let path_str = db_path.display().to_string();
-    let conn = match crate::DbConn::open_file(&path_str) {
+    let conn = match crate::pool::open_guarded_read_only_sqlite_file(
+        db_path,
+        "mailbox integrity diagnostic",
+    ) {
         Ok(conn) => conn,
         Err(error) => {
             return MailboxIntegrityVerdict {
@@ -280,6 +282,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
             };
         }
     };
+    let conn = crate::guard_db_conn(conn, "mailbox integrity diagnostic");
 
     match run_check(&conn, kind) {
         Ok(check) => MailboxIntegrityVerdict {

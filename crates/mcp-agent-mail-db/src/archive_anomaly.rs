@@ -1774,12 +1774,11 @@ fn open_canonical_db_for_archive_verifier(db_path: &Path) -> Option<crate::Canon
     if db_path.as_os_str() == ":memory:" {
         return None;
     }
-    crate::pool::validate_sqlite_target_path(db_path, "archive verifier sqlite target").ok()?;
-    let metadata = std::fs::symlink_metadata(db_path).ok()?;
-    if !metadata.file_type().is_file() {
-        return None;
-    }
-    crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).ok()
+    crate::pool::open_guarded_read_only_canonical_sqlite_file(
+        db_path,
+        "archive verifier database diagnostic",
+    )
+    .ok()
 }
 
 fn query_db_message_expectations(

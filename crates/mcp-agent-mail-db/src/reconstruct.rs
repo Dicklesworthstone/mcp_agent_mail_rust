@@ -1036,48 +1036,14 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
         ));
     }
 
-    // `DbConn::open_file` opens SQLite with `SQLITE_OPEN_CREATE`, which would
-    // silently materialize an empty DB stub for a missing mailbox.  This is
-    // a read-only inventory probe used by `compute_archive_drift_report` and
-    // `scan_archive_anomalies_with_db`, so refuse cleanly rather than mutate
-    // the filesystem for the caller. Reject symlinked paths as well: opening a
-    // symlink with SQLite can create journals or WAL files next to the target.
-    crate::pool::validate_sqlite_target_path(db_path, "DB message-id inventory target")
-        .map_err(|error| SqlError::Custom(format!("collect_db_message_ids: {error}")))?;
-    let metadata = match std::fs::symlink_metadata(db_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SqlError::Custom(format!(
-                "collect_db_message_ids: database file not found at {}",
-                db_path.display()
-            )));
-        }
-        Err(error) => {
-            return Err(SqlError::Custom(format!(
-                "collect_db_message_ids: failed to inspect database file {}: {error}",
-                db_path.display()
-            )));
-        }
-    };
-    if !metadata.file_type().is_file() {
-        return Err(SqlError::Custom(format!(
-            "collect_db_message_ids: refusing non-regular database file {}",
-            db_path.display()
-        )));
-    }
-
-    let db_str = db_path.to_str().ok_or_else(|| {
-        SqlError::Custom(format!(
-            "collect_db_message_ids: database path {} is not valid UTF-8",
-            db_path.display()
-        ))
-    })?;
-    let conn = DbConn::open_file(db_str).map_err(|e| {
-        SqlError::Custom(format!(
-            "collect_db_message_ids: cannot open {}: {e}",
-            db_path.display()
-        ))
-    })?;
+    let conn = crate::guard_db_conn(
+        crate::pool::open_guarded_read_only_sqlite_file(
+            db_path,
+            "database message-id inventory",
+        )
+        .map_err(|error| SqlError::Custom(format!("collect_db_message_ids: {error}")))?,
+        "database message-id inventory",
+    );
     // Check if messages table exists.
     let tables = conn.query_sync(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
