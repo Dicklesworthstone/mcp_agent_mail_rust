@@ -874,6 +874,84 @@ mod tests {
     }
 
     #[test]
+    fn failed_quick_cycle_skips_full_check_and_maintenance() {
+        let full_calls = std::cell::Cell::new(0_u8);
+        let maintenance_calls = std::cell::Cell::new(0_u8);
+
+        let followed_up = run_integrity_followups(
+            false,
+            true,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                true
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        );
+
+        assert!(!followed_up);
+        assert_eq!(full_calls.get(), 0, "failed quick verdict must be terminal");
+        assert_eq!(
+            maintenance_calls.get(),
+            0,
+            "failed quick verdict must block every mutating maintenance path"
+        );
+    }
+
+    #[test]
+    fn failed_due_full_cycle_skips_maintenance() {
+        let full_calls = std::cell::Cell::new(0_u8);
+        let maintenance_calls = std::cell::Cell::new(0_u8);
+
+        let followed_up = run_integrity_followups(
+            true,
+            true,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                false
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        );
+
+        assert!(!followed_up);
+        assert_eq!(full_calls.get(), 1, "a due full check must run exactly once");
+        assert_eq!(
+            maintenance_calls.get(),
+            0,
+            "failed full verdict must block mutating maintenance"
+        );
+    }
+
+    #[test]
+    fn passing_integrity_verdicts_run_only_due_followups() {
+        let full_calls = std::cell::Cell::new(0_u8);
+        let maintenance_calls = std::cell::Cell::new(0_u8);
+
+        assert!(run_integrity_followups(
+            true,
+            false,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                true
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        ));
+        assert_eq!(full_calls.get(), 0, "a non-due full check must stay skipped");
+        assert_eq!(maintenance_calls.get(), 1);
+
+        assert!(run_integrity_followups(
+            true,
+            true,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                true
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        ));
+        assert_eq!(full_calls.get(), 1);
+        assert_eq!(maintenance_calls.get(), 2);
+    }
+
+    #[test]
     fn defer_next_proactive_backup_is_one_shot() {
         SKIP_NEXT_PROACTIVE_BACKUP.store(false, Ordering::Release);
         assert!(!take_deferred_proactive_backup());

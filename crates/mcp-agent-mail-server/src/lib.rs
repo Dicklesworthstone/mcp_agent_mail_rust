@@ -2574,6 +2574,60 @@ pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
     mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path)
 }
 
+/// Refuse a raw live-engine open when durable recovery authority says the exact
+/// SQLite family still needs the pool's recovery-admission path.
+///
+/// Pool acquisitions pass through the database crate's startup-init gate, but
+/// the health and TUI observability connections intentionally bypass the pool.
+/// Opening SQLite is not a passive operation: it may replay or rewrite WAL/SHM
+/// state before the caller can enable `query_only`. When breaker authority is
+/// unreadable, or records failures for these exact primary bytes, prove a
+/// private copy of the complete family can open without cleanup. A suspect
+/// family is refused here, before the live engine sees it. A healthy exact
+/// family remains readable, matching the pool startup policy, and this read
+/// path never consumes a half-open recovery attempt or clears breaker history.
+fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Result<()> {
+    let nonclean_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
+        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
+            let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(path);
+            (state.db_fingerprint == fingerprint).then(|| {
+                format!(
+                    "durable recovery-breaker state records {} failed attempt(s) for these exact primary bytes{}",
+                    state.consecutive_failures,
+                    if state.tripped { " and is tripped" } else { "" }
+                )
+            })
+        }
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "durable recovery-breaker authority could not be trusted: {error}"
+        )),
+    };
+    let Some(nonclean_authority) = nonclean_authority else {
+        return Ok(());
+    };
+
+    match mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(path) {
+        Ok(true) => {
+            tracing::warn!(
+                operation = context,
+                path = %path.display(),
+                authority = %nonclean_authority,
+                "raw live SQLite open is proceeding only after a source-neutral exact-family proof"
+            );
+            Ok(())
+        }
+        Ok(false) => Err(std::io::Error::other(format!(
+            "{context}: refusing raw live SQLite engine open for {} because {nonclean_authority}, and the exact family is not healthy without recovery cleanup",
+            path.display()
+        ))),
+        Err(error) => Err(std::io::Error::other(format!(
+            "{context}: refusing raw live SQLite engine open for {} because {nonclean_authority}, and a source-neutral exact-family proof failed: {error}",
+            path.display()
+        ))),
+    }
+}
+
 fn open_sync_db_connection_with_busy_timeout(
     path: &str,
     busy_timeout_ms: u32,
@@ -2582,6 +2636,10 @@ fn open_sync_db_connection_with_busy_timeout(
     let conn = if path == ":memory:" {
         DbConn::open_memory()
     } else {
+        guard_raw_live_sqlite_engine_open(
+            Path::new(&path),
+            "server raw synchronous database connection",
+        )?;
         DbConn::open_file(&path)
     }
     .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
