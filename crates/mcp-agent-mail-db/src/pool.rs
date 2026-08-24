@@ -10850,8 +10850,8 @@ pub(crate) fn quarantine_reconstruction_candidate_path(
     }
 
     let quarantined = allocate_reconstruction_quarantine_path(primary_path, reason, timestamp)?;
-    let mut moves = vec![(candidate_path.to_path_buf(), quarantined.clone())];
-    moves.extend(
+    let mut planned_moves = vec![(candidate_path.to_path_buf(), quarantined.clone())];
+    planned_moves.extend(
         SQLITE_RECOVERY_SIDECAR_SUFFIXES
             .iter()
             .filter_map(|suffix| {
@@ -10861,10 +10861,10 @@ pub(crate) fn quarantine_reconstruction_candidate_path(
             }),
     );
 
-    let mut moved = Vec::with_capacity(moves.len());
-    for (source, target) in moves {
+    let mut completed_moves = Vec::with_capacity(planned_moves.len());
+    for (source, target) in planned_moves {
         if let Err(error) = rename_noreplace_preserving_source(&source, &target) {
-            let rollback = rollback_quarantined_candidate_moves(&moved);
+            let rollback = rollback_quarantined_candidate_moves(&completed_moves);
             return Err(SqlError::Custom(match rollback {
                 Ok(()) => format!(
                     "failed to quarantine reconstructed SQLite artifact {} as {} without replacement: {error}; earlier family moves were rolled back",
@@ -10878,7 +10878,7 @@ pub(crate) fn quarantine_reconstruction_candidate_path(
                 ),
             }));
         }
-        moved.push((source, target));
+        completed_moves.push((source, target));
     }
 
     let source_gained_companion = SQLITE_RECOVERY_SIDECAR_SUFFIXES
@@ -10886,7 +10886,7 @@ pub(crate) fn quarantine_reconstruction_candidate_path(
         .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
         .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate_path, suffix)));
     if source_gained_companion {
-        let rollback = rollback_quarantined_candidate_moves(&moved);
+        let rollback = rollback_quarantined_candidate_moves(&completed_moves);
         return Err(SqlError::Custom(match rollback {
             Ok(()) => format!(
                 "reconstructed SQLite candidate {} gained companion state during quarantine; moved artifacts were restored",

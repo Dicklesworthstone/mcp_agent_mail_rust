@@ -139,6 +139,17 @@ pub fn detect(
     storage_root: Option<&Path>,
     candidate_dbs: &[PathBuf],
 ) -> Vec<ReservationDbArchiveParityFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "reservation DB/archive parity detection",
+    );
+    detect_prepared(storage_root, &read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    storage_root: Option<&Path>,
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<ReservationDbArchiveParityFinding> {
     let Some(storage_root) = storage_root else {
         return Vec::new();
     };
@@ -147,18 +158,18 @@ pub fn detect(
     }
 
     let mut findings = Vec::new();
-    for db_path in candidate_dbs {
-        let Ok(conn) = super::open_immutable_sqlite(db_path) else {
+    for candidate in read_candidates {
+        let Some(conn) = candidate.connection() else {
             continue;
         };
-        let Ok(report) = check_reservation_parity_with_canonical_conn(&conn, storage_root) else {
+        let Ok(report) = check_reservation_parity_with_canonical_conn(conn, storage_root) else {
             continue;
         };
         if report.ok {
             continue;
         }
         findings.push(ReservationDbArchiveParityFinding {
-            db_path: db_path.clone(),
+            db_path: candidate.target_path().to_path_buf(),
             storage_root: storage_root.to_path_buf(),
             report,
         });
@@ -284,16 +295,13 @@ fn build_archive_release_rewrite(
     })
 }
 
-/// Fold the parity report's typed examples plus a live DB/archive read into a
-/// pure reconcile plan. Opens the DB read-only; the connection is dropped before
-/// `fix` issues any writable `Op::DbExec`.
-fn build_reconcile_plan(finding: &ReservationDbArchiveParityFinding) -> ReconcilePlan {
+/// Fold a freshly revalidated parity report plus its retained logical-snapshot
+/// connection into a pure reconcile plan.
+fn build_reconcile_plan(
+    finding: &ReservationDbArchiveParityFinding,
+    conn: &SqliteConnection,
+) -> ReconcilePlan {
     let mut plan = ReconcilePlan::default();
-    let Ok(conn) = super::open_immutable_sqlite(&finding.db_path) else {
-        // Can't read the DB → reconcile nothing. The collision quarantine path in
-        // `fix` is archive-only and still runs.
-        return plan;
-    };
 
     use std::collections::BTreeMap;
     let mut by_reservation: BTreeMap<(String, i64), ReservationDrift> = BTreeMap::new();
@@ -361,7 +369,7 @@ fn build_reconcile_plan(finding: &ReservationDbArchiveParityFinding) -> Reconcil
         //    for a row we are concurrently reconciling to released; correcting a
         //    released row's holder is audit-only (it no longer blocks). ──
         if let Some(archive_agent) = drift.agent_archive {
-            if let Some(agent_id) = resolve_agent_id(&conn, &project_slug, &archive_agent) {
+            if let Some(agent_id) = resolve_agent_id(conn, &project_slug, &archive_agent) {
                 plan.db_statements.push(format!(
                     "UPDATE file_reservations SET agent_id = {agent_id} WHERE id = {reservation_id} AND agent_id <> {agent_id};"
                 ));
@@ -380,17 +388,51 @@ pub fn fix(
     ctx: &crate::doctor::mutate::MutateContext,
     finding: &ReservationDbArchiveParityFinding,
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "reservation DB/archive parity pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &crate::doctor::mutate::MutateContext,
+    finding: &ReservationDbArchiveParityFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let refreshed = candidate.refresh("reservation DB/archive parity pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(
+        Some(&finding.storage_root),
+        std::slice::from_ref(&refreshed),
+    )
+    .into_iter()
+    .next()
+    else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+    let Some(conn) = refreshed.connection() else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+
     let mut actions_taken = 0;
     let mut actions_skipped = 0;
     let mut quarantined_paths = Vec::new();
 
     // ── 1. Principled reconcile of the two #112 drift classes. ──────────────
-    let plan = build_reconcile_plan(finding);
+    let plan = build_reconcile_plan(&fresh_finding, conn);
     // Batch every integer-only DB statement into ONE hash-witnessed Op::DbExec
     // (a single verbatim DB backup, reversible via `am doctor undo`).
     if !plan.db_statements.is_empty() {
         let sql = plan.db_statements.join("\n");
-        let result = mutate(ctx, &finding.db_path, Op::DbExec { sql })?;
+        let result = mutate(ctx, &fresh_finding.db_path, Op::DbExec { sql })?;
         if result.ok {
             actions_taken += 1;
         } else {
@@ -424,13 +466,13 @@ pub fn fix(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mut quarantine_index: u128 = 0;
-    for example in &finding.report.examples {
+    for example in &fresh_finding.report.examples {
         if example.field != "archive_id_collision" {
             continue;
         }
         // Locate the stale duplicate artifact (generation-stamped or legacy,
         // br-n8qh6) under the project slug it lives beneath, by reservation id.
-        let reservation_dir = finding
+        let reservation_dir = fresh_finding
             .storage_root
             .join("projects")
             .join(&example.project_slug)

@@ -128,6 +128,17 @@ pub fn detect(
     storage_root: Option<&Path>,
     candidate_dbs: &[PathBuf],
 ) -> Vec<ReservationArtifactNormalizeFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "reservation artifact normalization detection",
+    );
+    detect_prepared(storage_root, &read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    storage_root: Option<&Path>,
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<ReservationArtifactNormalizeFinding> {
     let Some(storage_root) = storage_root else {
         return Vec::new();
     };
@@ -136,14 +147,14 @@ pub fn detect(
     }
 
     let mut findings = Vec::new();
-    for db_path in candidate_dbs {
-        let Ok(conn) = super::open_immutable_sqlite(db_path) else {
+    for candidate in read_candidates {
+        let Some(conn) = candidate.connection() else {
             continue;
         };
-        let Some(current_generation) = read_current_generation(&conn) else {
+        let Some(current_generation) = read_current_generation(conn) else {
             continue;
         };
-        let Some(live_reservations) = read_live_reservations(&conn) else {
+        let Some(live_reservations) = read_live_reservations(conn) else {
             continue;
         };
         let (legacy_migrations, quarantines) =
@@ -152,7 +163,7 @@ pub fn detect(
             continue;
         }
         findings.push(ReservationArtifactNormalizeFinding {
-            db_path: db_path.clone(),
+            db_path: candidate.target_path().to_path_buf(),
             storage_root: storage_root.to_path_buf(),
             current_generation,
             legacy_migrations,
@@ -169,9 +180,36 @@ pub fn fix(
     ctx: &crate::doctor::mutate::MutateContext,
     finding: &ReservationArtifactNormalizeFinding,
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let candidate = super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+        &finding.db_path,
+        "reservation artifact normalization pre-fix source selection",
+    );
+    fix_prepared(ctx, finding, &candidate)
+}
+
+pub(crate) fn fix_prepared(
+    ctx: &crate::doctor::mutate::MutateContext,
+    finding: &ReservationArtifactNormalizeFinding,
+    candidate: &super::DoctorDbReadCandidate,
+) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    let refreshed = candidate.refresh("reservation artifact pre-mutation revalidation");
+    let Some(fresh_finding) = detect_prepared(
+        Some(&finding.storage_root),
+        std::slice::from_ref(&refreshed),
+    )
+    .into_iter()
+    .next()
+    else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+
     let mut outcome = FixOutcome::default();
 
-    for migration in &finding.legacy_migrations {
+    for migration in &fresh_finding.legacy_migrations {
         if !is_regular_file(&migration.source) || migration.destination.exists() {
             outcome.actions_skipped += 1;
             continue;
@@ -208,7 +246,7 @@ pub fn fix(
         }
     }
 
-    for artifact in &finding.quarantines {
+    for artifact in &fresh_finding.quarantines {
         if !is_regular_file(&artifact.source) {
             outcome.actions_skipped += 1;
             continue;

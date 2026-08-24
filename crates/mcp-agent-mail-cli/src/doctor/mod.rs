@@ -690,6 +690,23 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     let config = Config::from_env();
     let storage_root = config.storage_root.clone();
     let canonical_mcp_url = canonical_mcp_url_for_config(&config);
+    // These two fixers reconcile SQLite truth with archive artifacts. Their
+    // pre-mutation revalidation is decisive only while both mailbox authority
+    // domains are held exclusively for the complete detect+fix interval.
+    let _reservation_mutation_locks = if !dry_run
+        && matches!(
+            fm_id,
+            fixers::reservation_db_archive_parity::FM_ID
+                | fixers::reservation_artifact_normalize::FM_ID
+        )
+    {
+        Some(crate::acquire_cli_mailbox_mutation_locks(
+            &config.database_url,
+            Some(&storage_root),
+        )?)
+    } else {
+        None
+    };
 
     let inputs = fixers::DispatchInputs {
         repo_root: repo_root.clone(),
@@ -922,7 +939,19 @@ pub(crate) fn detect_archive_normalize_reservation_artifacts(
     database_path: Option<&Path>,
 ) -> Vec<fixers::reservation_artifact_normalize::ReservationArtifactNormalizeFinding> {
     let candidates = database_path.map_or_else(Vec::new, |path| vec![path.to_path_buf()]);
-    fixers::reservation_artifact_normalize::detect(Some(storage_root), &candidates)
+    let read_candidates: Vec<_> = candidates
+        .iter()
+        .map(|path| {
+            fixers::DoctorDbReadCandidate::open_live_or_explicit_offline(
+                path,
+                "archive-normalize reservation artifact detection",
+            )
+        })
+        .collect();
+    fixers::reservation_artifact_normalize::detect_prepared(
+        Some(storage_root),
+        &read_candidates,
+    )
 }
 
 /// Apply a pre-confirmed `archive-normalize` reservation artifact plan.
@@ -941,6 +970,30 @@ pub(crate) fn apply_archive_normalize_reservation_artifacts(
     if findings.is_empty() {
         return Ok(ArchiveNormalizeReservationArtifactOutcome::default());
     }
+
+    let mut database_paths: Vec<PathBuf> = findings
+        .iter()
+        .map(|finding| finding.db_path.clone())
+        .collect();
+    database_paths.sort();
+    database_paths.dedup();
+    let _database_mutation_locks: Vec<_> = if dry_run {
+        Vec::new()
+    } else {
+        database_paths
+            .iter()
+            .map(|path| crate::acquire_doctor_mailbox_activity_lock_for_sqlite_path(path, false))
+            .collect::<CliResult<Vec<_>>>()?
+    };
+    let read_candidates: Vec<_> = database_paths
+        .iter()
+        .map(|path| {
+            fixers::DoctorDbReadCandidate::open_live_or_explicit_offline(
+                path,
+                "archive-normalize reservation artifact pre-fix source",
+            )
+        })
+        .collect();
 
     let started_at = Instant::now();
     let repo_root =
@@ -986,8 +1039,17 @@ pub(crate) fn apply_archive_normalize_reservation_artifacts(
         ..ArchiveNormalizeReservationArtifactOutcome::default()
     };
     for finding in findings {
-        let result =
-            fixers::reservation_artifact_normalize::fix(&ctx, finding).map_err(|error| {
+        let Some(candidate) = read_candidates
+            .iter()
+            .find(|candidate| candidate.target_path() == finding.db_path)
+        else {
+            outcome.actions_skipped += 1;
+            continue;
+        };
+        let result = fixers::reservation_artifact_normalize::fix_prepared(
+            &ctx, finding, candidate,
+        )
+        .map_err(|error| {
                 CliError::Other(format!(
                     "archive-normalize reservation artifact mutation failed: {error}"
                 ))

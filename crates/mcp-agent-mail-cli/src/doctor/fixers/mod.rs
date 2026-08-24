@@ -294,8 +294,43 @@ impl DoctorDbReadCandidate {
         self.connection.as_ref()
     }
 
-    pub(crate) fn open_error(&self) -> Option<&str> {
-        self.open_error.as_deref()
+    /// Run the integrity probe against the physical source that owns the
+    /// verdict. A VACUUM snapshot is correct for logical rows but can rebuild
+    /// a damaged index and therefore cannot prove a live primary's b-tree is
+    /// healthy.
+    pub(crate) fn integrity_check_one(&self) -> Result<String, String> {
+        match self.source_kind {
+            DoctorDbReadSourceKind::LiveLogicalSnapshot => {
+                let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                    &self.target_path,
+                    "doctor fixer physical integrity probe",
+                )
+                .map_err(|error| error.to_string())?;
+                let rows = conn
+                    .query_sync("PRAGMA integrity_check(1)", &[])
+                    .map_err(|error| error.to_string())?;
+                rows.first()
+                    .ok_or_else(|| "PRAGMA integrity_check(1) returned no rows".to_string())?
+                    .get_named::<String>("integrity_check")
+                    .map_err(|error| error.to_string())
+            }
+            DoctorDbReadSourceKind::ExplicitOffline => {
+                let conn = self
+                    .connection()
+                    .ok_or_else(|| "explicit-offline source has no connection".to_string())?;
+                let rows = conn
+                    .query_sync("PRAGMA integrity_check(1)", &[])
+                    .map_err(|error| error.to_string())?;
+                rows.first()
+                    .ok_or_else(|| "PRAGMA integrity_check(1) returned no rows".to_string())?
+                    .get_named::<String>("integrity_check")
+                    .map_err(|error| error.to_string())
+            }
+            DoctorDbReadSourceKind::Unavailable => Err(self
+                .open_error
+                .clone()
+                .unwrap_or_else(|| "doctor fixer source is unavailable".to_string())),
+        }
     }
 
     /// Re-observe the decisive database invariants immediately before a
@@ -339,6 +374,29 @@ fn prepare_doctor_db_read_candidates(
         .iter()
         .map(|path| DoctorDbReadCandidate::open_live_or_explicit_offline(path, operation))
         .collect()
+}
+
+fn fm_uses_logical_db_read(fm_id: &str) -> bool {
+    matches!(
+        fm_id,
+        schema_version_mismatch::FM_ID
+            | inbox_stats_divergence::FM_ID
+            | integrity_page_malformed::FM_ID
+            | legacy_fts_residue::FM_ID
+            | orphan_foreign_key_rows::FM_ID
+            | reservation_db_archive_parity::FM_ID
+            | reservation_artifact_normalize::FM_ID
+            | text_timestamp_contamination::FM_ID
+    )
+}
+
+fn db_read_candidate_for_path<'a>(
+    candidates: &'a [DoctorDbReadCandidate],
+    path: &std::path::Path,
+) -> Option<&'a DoctorDbReadCandidate> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.target_path() == path)
 }
 
 pub(crate) fn explicit_offline_db_read_candidates(
@@ -1216,6 +1274,14 @@ pub fn dispatch_only(
     ctx: &crate::doctor::mutate::MutateContext,
     inputs: &DispatchInputs,
 ) -> Result<DispatchOutcome, DispatchError> {
+    let db_read_candidates = if fm_uses_logical_db_read(fm_id) {
+        prepare_doctor_db_read_candidates(
+            &inputs.db_file_candidates,
+            "doctor fixer detect-and-fix dispatch",
+        )
+    } else {
+        Vec::new()
+    };
     let mut outcome = DispatchOutcome {
         fm_id: fm_id.to_string(),
         ..Default::default()
@@ -1735,7 +1801,7 @@ pub fn dispatch_only(
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
     } else if fm_id == schema_version_mismatch::FM_ID {
-        let findings = schema_version_mismatch::detect(&inputs.db_file_candidates);
+        let findings = schema_version_mismatch::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1744,7 +1810,7 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == inbox_stats_divergence::FM_ID {
-        let findings = inbox_stats_divergence::detect(&inputs.db_file_candidates);
+        let findings = inbox_stats_divergence::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1753,7 +1819,7 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == integrity_page_malformed::FM_ID {
-        let findings = integrity_page_malformed::detect(&inputs.db_file_candidates);
+        let findings = integrity_page_malformed::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1762,7 +1828,7 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == legacy_fts_residue::FM_ID {
-        let findings = legacy_fts_residue::detect(&inputs.db_file_candidates);
+        let findings = legacy_fts_residue::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1774,7 +1840,7 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == orphan_foreign_key_rows::FM_ID {
-        let findings = orphan_foreign_key_rows::detect(&inputs.db_file_candidates);
+        let findings = orphan_foreign_key_rows::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1786,26 +1852,34 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == reservation_db_archive_parity::FM_ID {
-        let findings = reservation_db_archive_parity::detect(
+        let findings = reservation_db_archive_parity::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            &db_read_candidates,
         );
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let result = reservation_db_archive_parity::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path) else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = reservation_db_archive_parity::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == reservation_artifact_normalize::FM_ID {
-        let findings = reservation_artifact_normalize::detect(
+        let findings = reservation_artifact_normalize::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            &db_read_candidates,
         );
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            let result = reservation_artifact_normalize::fix(ctx, f)?;
+            let Some(candidate) = db_read_candidate_for_path(&db_read_candidates, &f.db_path) else {
+                outcome.actions_skipped += 1;
+                continue;
+            };
+            let result = reservation_artifact_normalize::fix_prepared(ctx, f, candidate)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
@@ -1882,7 +1956,7 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == text_timestamp_contamination::FM_ID {
-        let findings = text_timestamp_contamination::detect(&inputs.db_file_candidates);
+        let findings = text_timestamp_contamination::detect_prepared(&db_read_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -2086,6 +2160,22 @@ pub struct DetectOutcome {
 /// cheaper than `--dry-run` for FMs whose `fix()` does substantial
 /// pre-mutate work (JSON re-parse, etc.).
 pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome, DispatchError> {
+    let db_read_candidates = if fm_uses_logical_db_read(fm_id) {
+        prepare_doctor_db_read_candidates(
+            &inputs.db_file_candidates,
+            "doctor single-fixer detection",
+        )
+    } else {
+        Vec::new()
+    };
+    detect_only_with_db_reads(fm_id, inputs, &db_read_candidates)
+}
+
+fn detect_only_with_db_reads(
+    fm_id: &str,
+    inputs: &DispatchInputs,
+    db_read_candidates: &[DoctorDbReadCandidate],
+) -> Result<DetectOutcome, DispatchError> {
     let mut outcome = DetectOutcome {
         fm_id: fm_id.to_string(),
         ..Default::default()
@@ -2403,42 +2493,42 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == schema_version_mismatch::FM_ID {
-        schema_version_mismatch::detect(&inputs.db_file_candidates)
+        schema_version_mismatch::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == inbox_stats_divergence::FM_ID {
-        inbox_stats_divergence::detect(&inputs.db_file_candidates)
+        inbox_stats_divergence::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == integrity_page_malformed::FM_ID {
-        integrity_page_malformed::detect(&inputs.db_file_candidates)
+        integrity_page_malformed::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == legacy_fts_residue::FM_ID {
-        legacy_fts_residue::detect(&inputs.db_file_candidates)
+        legacy_fts_residue::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == orphan_foreign_key_rows::FM_ID {
-        orphan_foreign_key_rows::detect(&inputs.db_file_candidates)
+        orphan_foreign_key_rows::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == reservation_db_archive_parity::FM_ID {
-        reservation_db_archive_parity::detect(
+        reservation_db_archive_parity::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            db_read_candidates,
         )
         .iter()
         .map(|f| f.to_finding())
         .collect()
     } else if fm_id == reservation_artifact_normalize::FM_ID {
-        reservation_artifact_normalize::detect(
+        reservation_artifact_normalize::detect_prepared(
             inputs.storage_root.as_deref(),
-            &inputs.db_file_candidates,
+            db_read_candidates,
         )
         .iter()
         .map(|f| f.to_finding())
@@ -2483,7 +2573,7 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == text_timestamp_contamination::FM_ID {
-        text_timestamp_contamination::detect(&inputs.db_file_candidates)
+        text_timestamp_contamination::detect_prepared(db_read_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -2645,6 +2735,10 @@ pub struct DetectAllOutcome {
 /// `am doctor fix --list` report without invoking any fixer.
 pub fn detect_all(inputs: &DispatchInputs) -> Result<DetectAllOutcome, DispatchError> {
     let specs = registry();
+    let db_read_candidates = prepare_doctor_db_read_candidates(
+        &inputs.db_file_candidates,
+        "aggregate doctor fixer detection",
+    );
     let mut outcome = DetectAllOutcome {
         fm_count: specs.len(),
         total_findings: 0,
@@ -2654,7 +2748,7 @@ pub fn detect_all(inputs: &DispatchInputs) -> Result<DetectAllOutcome, DispatchE
     };
 
     for spec in &specs {
-        match detect_only(spec.id, inputs) {
+        match detect_only_with_db_reads(spec.id, inputs, &db_read_candidates) {
             Ok(detected) => {
                 outcome.total_findings += detected.findings_count;
                 outcome.total_actions_planned += detected.actions_planned;
@@ -2711,7 +2805,7 @@ mod tests {
     }
 
     #[test]
-    fn open_immutable_sqlite_does_not_create_wal_sidecars() {
+    fn explicit_offline_candidate_does_not_create_wal_sidecars() {
         let td = TempDir::new().unwrap();
         let db = td.path().join("storage.sqlite3");
         let wal = td.path().join("storage.sqlite3-wal");
@@ -2729,7 +2823,11 @@ mod tests {
         let before_dir = sorted_dir_entries(td.path());
         let before_wal = wal.exists();
         let before_shm = shm.exists();
-        let conn = open_immutable_sqlite(&db).expect("immutable open");
+        let candidate = DoctorDbReadCandidate::open_explicit_offline(
+            &db,
+            "explicit-offline candidate test",
+        );
+        let conn = candidate.connection().expect("guarded offline open");
         let rows = conn
             .query_sync("SELECT COUNT(*) AS n FROM t", &[])
             .expect("immutable read");
@@ -2737,8 +2835,6 @@ mod tests {
             .first()
             .and_then(|row| row.get_named::<i64>("n").ok())
             .expect("count row");
-        drop(conn);
-
         assert_eq!(n, 1);
         assert_eq!(
             before_dir,

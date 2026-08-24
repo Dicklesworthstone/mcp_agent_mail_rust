@@ -168,10 +168,9 @@ fn detect_one(
     candidate: &super::DoctorDbReadCandidate,
 ) -> Option<IntegrityPageMalformedFinding> {
     let db_path = candidate.target_path();
-    let conn = match candidate.connection() {
-        Some(conn) => conn,
-        None => {
-            let detail = candidate.open_error()?;
+    let result = match candidate.integrity_check_one() {
+        Ok(result) => result,
+        Err(detail) => {
             if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
                 return None;
             }
@@ -181,16 +180,6 @@ fn detect_one(
                 integrity_check_result: format!("open failed before integrity_check: {detail}"),
                 db_size_bytes,
             });
-        }
-    };
-    let result = match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
-        Ok(rows) => rows.first()?.get_named::<String>("integrity_check").ok()?,
-        Err(error) => {
-            let detail = error.to_string();
-            if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
-                return None;
-            }
-            format!("PRAGMA integrity_check(1) failed: {detail}")
         }
     };
     if result == "ok" {

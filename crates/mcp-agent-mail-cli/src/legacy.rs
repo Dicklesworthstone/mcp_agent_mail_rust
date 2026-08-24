@@ -231,10 +231,8 @@ struct LegacySourceSnapshot {
 
 impl LegacySourceSnapshot {
     fn capture(original_path: &Path) -> CliResult<Self> {
-        let snapshot_dir = crate::canonical_snapshot_tempdir(
-            "legacy-source-snapshot-",
-            "legacy source capture",
-        )?;
+        let snapshot_dir =
+            crate::canonical_snapshot_tempdir("legacy-source-snapshot-", "legacy source capture")?;
         let snapshot_path = snapshot_dir.path().join("source.sqlite3");
         materialize_legacy_source_snapshot(original_path, &snapshot_path)?;
         Ok(Self {
@@ -1232,12 +1230,7 @@ fn build_detect_report(
     explicit_db: Option<&Path>,
     explicit_storage_root: Option<&Path>,
 ) -> CliResult<LegacyDetectReport> {
-    build_detect_report_with_source_snapshot(
-        search_root,
-        explicit_db,
-        explicit_storage_root,
-        None,
-    )
+    build_detect_report_with_source_snapshot(search_root, explicit_db, explicit_storage_root, None)
 }
 
 fn build_detect_report_with_source_snapshot(
@@ -1996,40 +1989,31 @@ fn legacy_source_has_franken_namespace_artifact(path: &Path) -> CliResult<bool> 
     Ok(false)
 }
 
-fn vacuum_guarded_offline_canonical_source_into_snapshot(
+fn backup_guarded_offline_canonical_source_into_snapshot(
     source: &Path,
     destination: &Path,
 ) -> CliResult<()> {
     let context = "legacy offline source capture";
     let destination_text = crate::sqlite_snapshot_path_text(destination, context, "destination")?;
     crate::prepare_sqlite_snapshot_destination(destination, context)?;
-    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
-        source, context,
-    )
-    .map_err(|error| {
+    let conn =
+        mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(source, context)
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "cannot open offline legacy source {} with guarded canonical SQLite: {error}",
+                    source.display()
+                ))
+            })?;
+    // The online backup API reads through this one guarded read transaction,
+    // including committed WAL frames, and creates only the private destination.
+    // The source connection remains engine-enforced read-only throughout.
+    conn.backup_to_path(destination_text).map_err(|error| {
         CliError::Other(format!(
-            "cannot open offline legacy source {} with guarded canonical SQLite: {error}",
-            source.display()
+            "cannot materialize WAL-aware legacy snapshot from {} to {}: {error}",
+            source.display(),
+            destination.display()
         ))
     })?;
-    // The source pager remains read-only. Disabling the SQL-level query-only
-    // policy permits VACUUM INTO to create only the fresh private destination.
-    conn.execute_raw("PRAGMA query_only = OFF;")
-        .map_err(|error| {
-            CliError::Other(format!(
-                "cannot enable guarded legacy snapshot export from {}: {error}",
-                source.display()
-            ))
-        })?;
-    let destination_literal = crate::sqlite_string_literal(destination_text);
-    conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
-        .map_err(|error| {
-            CliError::Other(format!(
-                "cannot materialize WAL-aware legacy snapshot from {} to {}: {error}",
-                source.display(),
-                destination.display()
-            ))
-        })?;
     Ok(())
 }
 
@@ -2047,7 +2031,7 @@ fn materialize_legacy_source_snapshot(source: &Path, destination: &Path) -> CliR
         // Namespace absence selects the explicit offline/canonical authority.
         // The guarded true-read-only connection sees a complete WAL generation
         // when one is available and fails closed on unstable/suspect families.
-        vacuum_guarded_offline_canonical_source_into_snapshot(source, destination)
+        backup_guarded_offline_canonical_source_into_snapshot(source, destination)
     }
 }
 
@@ -2109,9 +2093,7 @@ fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
 }
 
 /// Verify the one retained SOURCE generation used by this import.
-fn verify_source_canonical_sqlite_readable(
-    snapshot: &LegacySourceSnapshot,
-) -> CliResult<()> {
+fn verify_source_canonical_sqlite_readable(snapshot: &LegacySourceSnapshot) -> CliResult<()> {
     let conn = open_private_immutable_source_snapshot(snapshot)?;
     verify_canonical_quick_check(&conn, snapshot.original_path(), "source DB snapshot")
 }
@@ -3123,9 +3105,11 @@ mod tests {
         writer
             .execute_raw(
                 "INSERT INTO projects (id, slug, human_key, created_at) \
-                 VALUES (2, 'wal-live', '/tmp/wal-live', 1)",
+                 VALUES (2, 'wal-live', '/tmp/wal-live', 1); \
+                 CREATE TRIGGER fts_messages_ai AFTER INSERT ON messages \
+                 BEGIN SELECT 1; END;",
             )
-            .expect("insert WAL-resident project row");
+            .expect("insert WAL-resident project row and legacy signature");
 
         let wal_path = PathBuf::from(format!("{}-wal", source_db.display()));
         let shm_path = PathBuf::from(format!("{}-shm", source_db.display()));
@@ -3153,7 +3137,14 @@ mod tests {
         .expect("detect report");
         assert!(
             report.db_signature.as_ref().is_some_and(|sig| sig.open_ok),
-            "immutable read-only open must succeed on a WAL-mode source"
+            "coherent private source capture must succeed on a WAL-mode source"
+        );
+        assert!(
+            report
+                .db_signature
+                .as_ref()
+                .is_some_and(|sig| sig.legacy_trigger_count == 1),
+            "signature detection must observe legacy DDL committed only in WAL"
         );
 
         // Import (verification + backup + migration of the copy) likewise.
@@ -3224,6 +3215,94 @@ mod tests {
         );
 
         drop(writer);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_source_snapshot_preserves_same_process_franken_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_LEGACY_LOCK_PATH";
+        const CHILD_TEST_NAME: &str =
+            "legacy::tests::legacy_source_snapshot_preserves_same_process_franken_writer_lock";
+        const CHILD_WITNESS: &str = "legacy-source-snapshot-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let contender =
+                CanonicalDbConn::open(&config).expect("child opens competing canonical connection");
+            let error = contender
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect_err("child must not acquire the parent writer lock");
+            let error = error.to_string().to_ascii_lowercase();
+            assert!(
+                error.contains("busy") || error.contains("locked"),
+                "child observed an unrelated failure instead of lock contention: {error}"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_db = temp.path().join("legacy-live-franken.sqlite3");
+        let writer =
+            DbConn::open_file(source_db.display().to_string()).expect("open live Franken source");
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE legacy_lock_witness(value INTEGER NOT NULL); \
+                 INSERT INTO legacy_lock_witness(value) VALUES (41);",
+            )
+            .expect("seed legacy lock fixture");
+        writer
+            .execute_raw("BEGIN IMMEDIATE")
+            .expect("hold live Franken writer lock");
+        assert_child_observes_busy(&source_db);
+
+        let snapshot = LegacySourceSnapshot::capture(&source_db)
+            .expect("capture live Franken source without a cross-engine open");
+        let snapshot_conn = open_private_immutable_source_snapshot(&snapshot)
+            .expect("open retained private snapshot");
+        let rows = snapshot_conn
+            .query_sync("SELECT value FROM legacy_lock_witness", &[])
+            .expect("query retained snapshot witness");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("value").ok()),
+            Some(41)
+        );
+        assert_child_observes_busy(&source_db);
+
+        writer
+            .execute_raw("ROLLBACK")
+            .expect("release live Franken writer lock");
     }
 
     #[cfg(unix)]

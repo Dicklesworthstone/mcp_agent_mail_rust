@@ -14,10 +14,8 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Open the DB at `db_path` read-only with URI `?immutable=1`
-//! (no WAL/SHM sidecar creation or journal replay), run
-//! `PRAGMA journal_mode;`, parse the result. If the value is
-//! anything other than `wal` (case-insensitive), emit a finding.
+//! Read the DB header's persisted journal-mode version bytes. If they do not
+//! encode WAL mode, emit a finding. No SQL engine touches the live inode.
 //!
 //! ## Fix (`Op::DbExec` — new pattern)
 //!
@@ -103,10 +101,7 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WalModeDisabledFinding> {
         if !path.is_file() {
             continue;
         }
-        let mode = match read_journal_mode_from_header(path).or_else(|| {
-            let conn = super::open_immutable_sqlite(path).ok()?;
-            read_journal_mode(&conn)
-        }) {
+        let mode = match read_journal_mode_from_header(path) {
             Some(m) => m,
             None => continue,
         };
