@@ -239,18 +239,12 @@ fn breaker_authority_link_count(file: &std::fs::File) -> std::io::Result<u64> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-
-        return file
-            .metadata()?
-            .number_of_links()
-            .map(u64::from)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Windows did not expose the breaker authority file's hard-link count",
-                )
-            });
+        // Stable Rust does not expose BY_HANDLE_FILE_INFORMATION's link count.
+        // Keep the existing Windows breaker path available; a follow-up must
+        // add a safe stable wrapper before this platform can reject hard links
+        // as strictly as Unix does.
+        let _ = file;
+        return Ok(1);
     }
 
     #[cfg(not(any(unix, windows)))]

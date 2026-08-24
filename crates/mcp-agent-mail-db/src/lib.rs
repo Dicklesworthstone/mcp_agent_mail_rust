@@ -13,7 +13,6 @@
 //! to/from `chrono::NaiveDateTime` for API compatibility.
 
 #![forbid(unsafe_code)]
-#![cfg_attr(windows, feature(windows_by_handle))]
 #![allow(
     clippy::result_large_err,
     clippy::match_same_arms,

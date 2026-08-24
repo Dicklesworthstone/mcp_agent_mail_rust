@@ -7266,18 +7266,11 @@ pub(crate) fn recovery_file_link_count(file: &std::fs::File) -> std::io::Result<
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-
-        return file
-            .metadata()?
-            .number_of_links()
-            .map(u64::from)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Windows did not expose the recovery candidate's hard-link count",
-                )
-            });
+        let _ = file;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stable Windows cannot prove exclusive recovery candidate hard-link ownership",
+        ));
     }
 
     #[cfg(not(any(unix, windows)))]
