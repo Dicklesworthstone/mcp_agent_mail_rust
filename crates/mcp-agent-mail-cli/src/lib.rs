@@ -3936,7 +3936,7 @@ fn database_path_for_status(database_url: &str) -> String {
     }
     sqlite_file_path_from_database_url(database_url).map_or_else(
         || "<unparseable sqlite DATABASE_URL>".to_string(),
-        |path| resolve_sqlite_path_with_absolute_candidate(&path.display().to_string()),
+        |path| resolve_sqlite_runtime_path(&path.display().to_string()),
     )
 }
 
@@ -6459,7 +6459,7 @@ fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
     let Ok(sqlite_path) = cfg.sqlite_path() else {
         return PreflightBannerStats::default();
     };
-    let sqlite_path = resolve_sqlite_path_with_absolute_candidate(&sqlite_path);
+    let sqlite_path = resolve_sqlite_runtime_path(&sqlite_path);
     if sqlite_path != ":memory:" && !Path::new(&sqlite_path).exists() {
         return PreflightBannerStats::default();
     }
@@ -9421,7 +9421,7 @@ fn handle_doctor_reclaim(
             "in-memory databases have no on-disk recovery debris to reclaim".to_string(),
         ));
     }
-    let resolved = resolve_sqlite_path_with_absolute_candidate(&configured_path);
+    let resolved = resolve_sqlite_runtime_path(&configured_path);
     let db_path = PathBuf::from(&resolved);
     let storage_root = config.storage_root.clone();
 
@@ -13115,15 +13115,8 @@ fn sqlite_absolute_candidate_path(path: &str) -> Option<String> {
     Some(absolute_candidate.to_string_lossy().into_owned())
 }
 
-fn resolve_sqlite_path_with_absolute_candidate(path: &str) -> String {
-    let mut resolved = path.to_string();
-    if resolved != ":memory:"
-        && !Path::new(&resolved).exists()
-        && let Some(absolute_path) = sqlite_absolute_candidate_path(&resolved)
-    {
-        resolved = absolute_path;
-    }
-    resolved
+fn resolve_sqlite_runtime_path(path: &str) -> String {
+    mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path)
 }
 
 fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
@@ -13225,7 +13218,7 @@ fn resolve_existing_sqlite_source_candidate_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|error| CliError::Other(format!("bad database URL: {error}")))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     let source_candidate = PathBuf::from(path);
     require_existing_regular_sqlite_source(&source_candidate, context)?;
     Ok(source_candidate)
@@ -13502,7 +13495,7 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     if path != ":memory:" {
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
@@ -13701,7 +13694,7 @@ fn open_db_sync_read_only_with_database_url_and_path(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     open_sqlite_read_only_with_fallback(&path)
 }
 
@@ -13721,7 +13714,7 @@ fn resolve_read_only_sqlite_source_path_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     if path == ":memory:" || !Path::new(&path).exists() {
         return Ok(PathBuf::from(path));
     }
@@ -14310,7 +14303,7 @@ fn open_db_sync_robot_best_effort_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)?;
     if sqlite_conn_supports_robot_reads(&conn)? {
         return Ok(conn);
@@ -14330,7 +14323,7 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)?;
     if sqlite_conn_supports_robot_attachment_reads(&conn)? {
         return Ok(conn);
@@ -19424,7 +19417,7 @@ fn open_db_sync_for_migrate(database_url: &str) -> CliResult<mcp_agent_mail_db::
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     if path != ":memory:" {
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
@@ -19480,7 +19473,7 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
                     }
                 }
             } else {
-                let resolved_path = resolve_sqlite_path_with_absolute_candidate(&path);
+                let resolved_path = resolve_sqlite_runtime_path(&path);
                 let canonical_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&resolved_path)
                     .map_err(|e| {
                         CliError::Other(format!(
@@ -19584,7 +19577,7 @@ fn handle_migrate_cmd(
                 "cannot rollback an in-memory database".to_string(),
             ));
         }
-        let rollback_path = resolve_sqlite_path_with_absolute_candidate(&path);
+        let rollback_path = resolve_sqlite_runtime_path(&path);
         let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
         return handle_migrate_rollback(Path::new(&rollback_path), backup_dir.as_deref(), force);
     }
@@ -19594,7 +19587,7 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    let mut resolved_path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let mut resolved_path = resolve_sqlite_runtime_path(&path);
     let mut db_path = PathBuf::from(&resolved_path);
     if !db_path.exists() {
         if !check {
@@ -21815,7 +21808,7 @@ struct ClearAndResetOutcome {
 fn handle_clear_and_reset(force: bool, archive: bool, no_archive: bool) -> CliResult<()> {
     let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let db_path = match db_cfg.sqlite_path() {
-        Ok(path) => Some(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        Ok(path) => Some(PathBuf::from(resolve_sqlite_runtime_path(
             &path,
         ))),
         Err(err) => {
@@ -21902,7 +21895,7 @@ fn clear_and_reset_everything(
     }
 
     let source_db_for_archive = source_db_for_archive.map(|path| {
-        PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        PathBuf::from(resolve_sqlite_runtime_path(
             &path.to_string_lossy(),
         ))
     });
@@ -24023,7 +24016,7 @@ fn forensic_database_path(database_url: &str) -> String {
             if path == ":memory:" {
                 path
             } else {
-                resolve_sqlite_path_with_absolute_candidate(&path)
+                resolve_sqlite_runtime_path(&path)
             }
         },
     )
@@ -28886,7 +28879,7 @@ fn doctor_resolved_sqlite_path(database_url: &str) -> Option<PathBuf> {
     if configured_path == ":memory:" {
         return None;
     }
-    Some(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+    Some(PathBuf::from(resolve_sqlite_runtime_path(
         &configured_path,
     )))
 }
@@ -29642,7 +29635,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let archive_has_state = archive_inventory
         .as_ref()
         .is_some_and(|inventory| inventory.counts() != DoctorInventoryCounts::default());
-    let resolved_path = resolve_sqlite_path_with_absolute_candidate(&configured_path);
+    let resolved_path = resolve_sqlite_runtime_path(&configured_path);
     let resolved = Path::new(&resolved_path);
     let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
     let archive_reconstruct_available = archive_has_state
@@ -31015,7 +31008,7 @@ fn handle_doctor_check_with_target(
         };
         match cfg.sqlite_path() {
             Ok(db_path) if db_path != ":memory:" => {
-                let db_path = PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&db_path));
+                let db_path = PathBuf::from(resolve_sqlite_runtime_path(&db_path));
                 let lock = mcp_agent_mail_db::inspect_mailbox_recovery_lock(&db_path);
                 let lock_needs_attention = lock.active || (lock.exists && lock.pid.is_none());
                 let status = if lock_needs_attention { "warn" } else { "ok" };
@@ -32430,7 +32423,7 @@ fn handle_doctor_check_with_target(
         };
         match cfg.sqlite_path() {
             Ok(db_path) if db_path != ":memory:" => {
-                let resolved = resolve_sqlite_path_with_absolute_candidate(&db_path);
+                let resolved = resolve_sqlite_runtime_path(&db_path);
                 let p = Path::new(&resolved);
                 if p.exists() {
                     diagnostic_artifacts.push(
@@ -47082,7 +47075,6 @@ http_headers = { Authorization = "Bearer secret" }
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        use std::io::Read;
 
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
@@ -47647,7 +47639,7 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
-    fn archive_save_state_uses_absolute_candidate_for_malformed_relative_source_db() {
+    fn archive_save_state_does_not_hijack_absolute_candidate_for_missing_relative_source() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -47668,28 +47660,32 @@ http_headers = { Authorization = "Bearer secret" }
             "relative shadow path should be absent so absolute candidate fallback is exercised"
         );
 
-        let archive_path = archive_save_state(
+        let error = archive_save_state(
             &relative_db,
             &storage_root,
             vec!["proj-alpha".to_string()],
             "archive".to_string(),
-            Some("abs-fallback".to_string()),
+            Some("no-abs-hijack".to_string()),
         )
-        .expect("archive save should resolve absolute candidate");
-        assert!(archive_path.exists(), "archive should be created");
-
-        let file = std::fs::File::open(&archive_path).unwrap();
-        let mut zip = zip::ZipArchive::new(file).unwrap();
-        let mut meta_contents = String::new();
-        zip.by_name(ARCHIVE_METADATA_FILENAME)
-            .unwrap()
-            .read_to_string(&mut meta_contents)
-            .unwrap();
-        let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
+        .expect_err("a missing runtime source must not fall through to an absolute decoy");
+        assert!(
+            error.to_string().contains("not found")
+                || error.to_string().contains("requires an existing"),
+            "unexpected missing-source error: {error}"
+        );
+        assert!(archive_states_dir(false)
+            .expect("archive state directory")
+            .read_dir()
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true));
+        let conn = mcp_agent_mail_db::DbConn::open_file(absolute_db.to_string_lossy().as_ref())
+            .expect("reopen absolute decoy");
         assert_eq!(
-            meta["database"]["source_path"].as_str(),
-            Some(absolute_db.to_string_lossy().as_ref()),
-            "archive metadata should record the resolved absolute source database path"
+            conn.query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+                .expect("query absolute decoy")[0]
+                .get_named::<i64>("count")
+                .unwrap_or(0),
+            1
         );
     }
 
@@ -56591,7 +56587,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn doctor_reconstruct_dry_run_reports_resolved_absolute_candidate_path() {
+    fn doctor_reconstruct_dry_run_reports_missing_relative_runtime_path() {
         let _guard = stdio_capture_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -56604,7 +56600,7 @@ startup_timeout_sec = 42
             .to_string();
         assert!(
             !Path::new(&relative_db).exists(),
-            "relative fixture should be absent so the absolute candidate is selected"
+            "fixture requires a missing configured relative target"
         );
 
         let storage_root = tmp.path().join("storage");
@@ -56627,9 +56623,10 @@ startup_timeout_sec = 42
             "doctor reconstruct dry-run failed: {output}"
         );
         assert!(
-            output.contains(&format!("Database path: {}", absolute_db.display())),
-            "dry-run output should use the resolved absolute database path, got: {output}"
+            output.contains(&format!("Database path: {relative_db}")),
+            "dry-run output should retain the runtime's relative database authority, got: {output}"
         );
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), b"placeholder");
     }
 
     #[test]
@@ -66525,7 +66522,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn resolve_sqlite_path_with_absolute_candidate_prefers_existing_absolute_file() {
+    fn resolve_sqlite_runtime_path_preserves_missing_relative_authority() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("resolve_absolute.sqlite3");
         std::fs::write(&absolute_db, b"seed").expect("write absolute db");
@@ -66533,20 +66530,20 @@ startup_timeout_sec = 42
         let relative_path = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_path.exists(),
-            "relative fixture should be absent so absolute fallback path is exercised"
+            "fixture requires a missing configured relative target"
         );
 
-        let resolved =
-            resolve_sqlite_path_with_absolute_candidate(&relative_path.display().to_string());
+        let resolved = resolve_sqlite_runtime_path(&relative_path.display().to_string());
         assert_eq!(
             resolved,
-            absolute_db.to_string_lossy(),
-            "resolver should prefer existing absolute candidate when relative path is missing"
+            relative_path.to_string_lossy(),
+            "runtime resolver must not hijack a fresh relative target with an absolute decoy"
         );
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), b"seed");
     }
 
     #[test]
-    fn resolve_sqlite_path_with_absolute_candidate_keeps_explicit_relative_paths() {
+    fn resolve_sqlite_runtime_path_keeps_explicit_relative_paths() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("resolve_explicit_relative.sqlite3");
         std::fs::write(&absolute_db, b"seed").expect("write absolute db");
@@ -66554,7 +66551,7 @@ startup_timeout_sec = 42
         let relative_path = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         let explicit_relative = format!("./{}", relative_path.display());
 
-        let resolved = resolve_sqlite_path_with_absolute_candidate(&explicit_relative);
+        let resolved = resolve_sqlite_runtime_path(&explicit_relative);
         assert_eq!(
             resolved, explicit_relative,
             "explicit relative sqlite paths must not be rewritten to absolute fallback candidates"
@@ -67042,7 +67039,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn preflight_banner_stats_uses_absolute_candidate_for_missing_relative_database_url() {
+    fn preflight_banner_stats_ignores_absolute_decoy_for_missing_relative_database_url() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("preflight_banner_fallback.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
@@ -67068,15 +67065,23 @@ startup_timeout_sec = 42
         let relative_path = PathBuf::from(absolute_db_str.trim_start_matches('/'));
         assert!(
             !relative_path.exists(),
-            "relative fallback fixture should be absent so banner stats must resolve the absolute candidate"
+            "fixture requires a missing configured relative target"
         );
 
         let stats = preflight_banner_stats(&format!("sqlite://{}", relative_path.display()));
-        assert_eq!(stats.projects, 2);
-        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.projects, 0);
+        assert_eq!(stats.messages, 0);
         assert!(
             !relative_path.exists(),
             "preflight banner stats should not create a stray relative sqlite file"
+        );
+        let conn = mcp_agent_mail_db::DbConn::open_file(&absolute_db_str)
+            .expect("reopen absolute decoy");
+        assert_eq!(
+            query_preflight_banner_stats_batched(&conn)
+                .expect("query absolute decoy")
+                .messages,
+            3
         );
     }
 
@@ -73015,7 +73020,7 @@ fn archive_save_state_internal(
     use chrono::Timelike;
     use std::io::Write;
 
-    let source_db = PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+    let source_db = PathBuf::from(resolve_sqlite_runtime_path(
         &source_db.to_string_lossy(),
     ));
 
@@ -73715,7 +73720,7 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                 ));
             }
             let database_path =
-                PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&db_path));
+                PathBuf::from(resolve_sqlite_runtime_path(&db_path));
 
             let config = Config::from_env();
             let storage_root = config.storage_root;
@@ -73990,7 +73995,7 @@ fn handle_doctor_repair_with_options(
     };
     let mut reconstruct_db_path = repair_cfg
         .sqlite_path()
-        .map(|path| PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&path)))
+        .map(|path| PathBuf::from(resolve_sqlite_runtime_path(&path)))
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
     // GH#215: `--dry-run` must be forensically non-mutating. Opening a WAL
@@ -74331,7 +74336,7 @@ fn handle_doctor_repair_with_options(
             ..Default::default()
         };
         let db_path =
-            resolve_sqlite_path_with_absolute_candidate(&cfg.sqlite_path().unwrap_or_default());
+            resolve_sqlite_runtime_path(&cfg.sqlite_path().unwrap_or_default());
         if std::path::Path::new(&db_path).exists() {
             let bak_path =
                 next_timestamped_sqlite_backup_path_in_dir(backup_dir, "pre_repair", &timestamp);
@@ -74689,7 +74694,7 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliR
             "cannot restore into an in-memory database (:memory:)".to_string(),
         ));
     }
-    let dest_path = resolve_sqlite_path_with_absolute_candidate(&dest_path);
+    let dest_path = resolve_sqlite_runtime_path(&dest_path);
 
     let _mailbox_storage_root_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
@@ -74781,7 +74786,7 @@ fn doctor_reconstruct_db_path_from_database_url(database_url: &str) -> CliResult
             "cannot reconstruct an in-memory database (:memory:)".to_string(),
         ));
     }
-    Ok(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+    Ok(PathBuf::from(resolve_sqlite_runtime_path(
         &db_path,
     )))
 }
@@ -76211,7 +76216,7 @@ fn handle_doctor_archive_scan(
         if let Ok(db_path) = db_pool_cfg.sqlite_path()
             && db_path != ":memory:"
         {
-            let resolved = resolve_sqlite_path_with_absolute_candidate(&db_path);
+            let resolved = resolve_sqlite_runtime_path(&db_path);
             if Path::new(&resolved).exists() {
                 scan_artifacts.push(ArtifactPointer::referenced(
                     "sqlite_db",
@@ -76273,7 +76278,7 @@ fn doctor_archive_verify_db_path() -> CliResult<PathBuf> {
     let sqlite_path = db_cfg
         .sqlite_path()
         .map_err(|err| CliError::Other(format!("bad database URL: {err}")))?;
-    Ok(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+    Ok(PathBuf::from(resolve_sqlite_runtime_path(
         &sqlite_path,
     )))
 }
@@ -80718,7 +80723,7 @@ fn agent_start_active_reservation_conflict_examples(
     let path = cfg
         .sqlite_path()
         .map_err(|error| format!("bad database URL: {error}"))?;
-    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let path = resolve_sqlite_runtime_path(&path);
     if path != ":memory:" && !Path::new(&path).exists() {
         return Ok(Vec::new());
     }
