@@ -7051,6 +7051,14 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 
 #[allow(clippy::result_large_err)]
 fn sqlite_primary_read_path_is_healthy_direct(path: &Path) -> Result<bool, SqlError> {
+    sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, true)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_primary_read_path_is_healthy_direct_with_cleanup(
+    path: &Path,
+    allow_family_cleanup: bool,
+) -> Result<bool, SqlError> {
     if !path.exists() {
         return Ok(false);
     }
@@ -7081,6 +7089,9 @@ fn sqlite_primary_read_path_is_healthy_direct(path: &Path) -> Result<bool, SqlEr
                 return Ok(false);
             }
             if is_sqlite_recovery_error_message(&msg) {
+                if !allow_family_cleanup {
+                    return Ok(false);
+                }
                 let _ = apply_classified_sqlite_family_cleanup(path)?;
                 match open_sqlite_file_with_lock_retry(path_str) {
                     Ok(conn) => conn,
@@ -7179,8 +7190,11 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_file_is_healthy_staged(path: &Path) -> Result<bool, SqlError> {
-    if !sqlite_primary_read_path_is_healthy_direct(path)? {
+fn sqlite_file_is_healthy_staged(
+    path: &Path,
+    allow_family_cleanup: bool,
+) -> Result<bool, SqlError> {
+    if !sqlite_primary_read_path_is_healthy_direct_with_cleanup(path, allow_family_cleanup)? {
         return Ok(false);
     }
     normalize_compatibility_probe_result(path, sqlite_file_is_healthy_canonical(path))
@@ -7251,7 +7265,7 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
         return Ok(false);
     };
-    sqlite_file_is_healthy_staged(&staged.path)
+    sqlite_file_is_healthy_staged(&staged.path, true)
 }
 
 /// Prove that the current SQLite family is healthy without first detaching a
@@ -7272,7 +7286,7 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
     if !classify_sqlite_family_cleanup(&staged.path)?.is_empty() {
         return Ok(false);
     }
-    sqlite_file_is_healthy_staged(&staged.path)
+    sqlite_file_is_healthy_staged(&staged.path, false)
 }
 
 #[allow(clippy::result_large_err)]
