@@ -965,14 +965,18 @@ fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
         }
     };
 
-    if let Err(error) = mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path) {
+    // Do not checkpoint here before durable recovery admission: checkpointing
+    // mutates the SQLite family and would destroy the exact WAL/SHM evidence
+    // that a tripped or malformed breaker is meant to preserve. The central DB
+    // helper classifies the family, wins durable admission before any needed
+    // quarantine, then reclassifies under the gate to close the race window.
+    if let Err(error) = mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path) {
         tracing::warn!(
             path = %db_path.display(),
             error = %error,
-            "shutdown SQLite WAL checkpoint failed; continuing with frame-free sidecar cleanup"
+            "shutdown SQLite sidecar cleanup was refused; preserving the exact database family"
         );
     }
-    mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
 }
 
 static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -17395,6 +17399,142 @@ mod tests {
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn shutdown_cleanup_preserves_sqlite_family_when_recovery_breaker_is_tripped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shutdown-breaker.sqlite3");
+        let wal_path = db_path.with_file_name("shutdown-breaker.sqlite3-wal");
+        let shm_path = db_path.with_file_name("shutdown-breaker.sqlite3-shm");
+        let db_bytes = b"database-family-primary";
+        let wal_bytes = vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize];
+        let shm_bytes = b"database-family-shm";
+        std::fs::write(&db_path, db_bytes).expect("write primary");
+        std::fs::write(&wal_path, &wal_bytes).expect("write truncated WAL");
+        std::fs::write(&shm_path, shm_bytes).expect("write SHM");
+
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures:
+                mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            // A future timestamp is valid control state and evaluates as zero
+            // elapsed, making this refusal independent of test duration.
+            last_failure_unix: i64::MAX,
+            last_failure_reason: "synthetic repeated recovery failure".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before cleanup");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("read primary after cleanup refusal"),
+            db_bytes.to_vec(),
+            "tripped breaker must preserve primary bytes"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read WAL after cleanup refusal"),
+            wal_bytes,
+            "tripped breaker must preserve the exact WAL bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read SHM after cleanup refusal"),
+            shm_bytes.to_vec(),
+            "tripped breaker must preserve the exact SHM bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after cleanup refusal"),
+            breaker_bytes,
+            "shutdown cleanup must not rewrite tripped breaker authority"
+        );
+
+        let renamed_family_members = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name.starts_with("shutdown-breaker.sqlite3.corrupt-")
+                    || name.starts_with("shutdown-breaker.sqlite3-wal.")
+                    || name.starts_with("shutdown-breaker.sqlite3-shm.")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            renamed_family_members.is_empty(),
+            "tripped breaker must not create renamed family members: {renamed_family_members:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_cleanup_does_not_checkpoint_framed_wal_before_recovery_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shutdown-framed-wal.sqlite3");
+        let sqlite_path = db_path.to_string_lossy();
+        let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.as_ref())
+            .expect("open sqlite database");
+        conn.execute_raw(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE checkpoint_probe(value TEXT); \
+             INSERT INTO checkpoint_probe(value) VALUES ('committed-in-wal');",
+        )
+        .expect("seed committed WAL frames");
+
+        let wal_path = db_path.with_file_name("shutdown-framed-wal.sqlite3-wal");
+        let shm_path = db_path.with_file_name("shutdown-framed-wal.sqlite3-shm");
+        let db_before = std::fs::read(&db_path).expect("read primary before shutdown cleanup");
+        let wal_before = std::fs::read(&wal_path).expect("read framed WAL before shutdown cleanup");
+        let shm_before = std::fs::read(&shm_path).expect("read SHM before shutdown cleanup");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "test setup must retain at least one committed WAL frame"
+        );
+
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures:
+                mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            last_failure_unix: i64::MAX,
+            last_failure_reason: "synthetic repeated recovery failure".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_before = std::fs::read(&breaker_path).expect("read breaker before cleanup");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("read primary after shutdown cleanup"),
+            db_before,
+            "shutdown cleanup must not checkpoint framed WAL bytes into the primary before admission"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read framed WAL after shutdown cleanup"),
+            wal_before,
+            "shutdown cleanup must not truncate or rewrite framed WAL before admission"
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read SHM after shutdown cleanup"),
+            shm_before,
+            "shutdown cleanup must preserve the exact SHM bytes"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after shutdown cleanup"),
+            breaker_before,
+            "shutdown cleanup must not rewrite tripped breaker authority"
+        );
+
+        drop(conn);
+    }
 
     struct NoopTool;
 
