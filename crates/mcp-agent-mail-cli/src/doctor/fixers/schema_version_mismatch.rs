@@ -163,20 +163,29 @@ impl SchemaVersionMismatchFinding {
 /// for the `.no-migrate` marker. The marker lives next to the DB
 /// at `<dirname(db)>/.no-migrate`.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<SchemaVersionMismatchFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "schema-version mismatch detection",
+    );
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<SchemaVersionMismatchFinding> {
     let mut out = Vec::new();
-    for db in candidate_dbs {
-        if let Some(f) = detect_one(db) {
+    for candidate in read_candidates {
+        if let Some(f) = detect_one(candidate) {
             out.push(f);
         }
     }
     out
 }
 
-fn detect_one(db_path: &std::path::Path) -> Option<SchemaVersionMismatchFinding> {
-    // Pass-35-review Gemini F1 (P1): URI + immutable=1 so the
-    // read-only open cannot create -shm on a WAL-mode DB. See the
-    // detailed rationale in text_timestamp_contamination.rs.
-    let conn = super::open_immutable_sqlite(db_path).ok()?;
+fn detect_one(
+    candidate: &super::DoctorDbReadCandidate,
+) -> Option<SchemaVersionMismatchFinding> {
+    let conn = candidate.connection()?;
     let rows = conn.query_sync("PRAGMA user_version", &[]).ok()?;
     let on_disk: i64 = rows.first()?.get_named::<i64>("user_version").ok()?;
     let on_disk = i32::try_from(on_disk).ok()?;
@@ -189,12 +198,13 @@ fn detect_one(db_path: &std::path::Path) -> Option<SchemaVersionMismatchFinding>
     } else {
         Direction::Newer
     };
-    let no_migrate_marker_present = db_path
+    let no_migrate_marker_present = candidate
+        .target_path()
         .parent()
         .map(|p| p.join(".no-migrate").exists())
         .unwrap_or(false);
     Some(SchemaVersionMismatchFinding {
-        db_path: db_path.to_path_buf(),
+        db_path: candidate.target_path().to_path_buf(),
         on_disk_version: on_disk,
         compiled_version: compiled,
         direction,

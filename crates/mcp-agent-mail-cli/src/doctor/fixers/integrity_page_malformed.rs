@@ -23,8 +23,8 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Opens the DB read-only with URI `?immutable=1` (no -shm
-//! creation, no locking). Runs:
+//! Production dispatch materializes live FrankenSQLite state to one retained
+//! private logical snapshot, then runs:
 //!
 //! ```sql
 //! PRAGMA integrity_check(1)
@@ -145,25 +145,33 @@ impl IntegrityPageMalformedFinding {
 /// (`--only fm-db-state-files-integrity-page-malformed`) rather
 /// than bundling it into a sub-200ms health probe.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<IntegrityPageMalformedFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "integrity-page detection",
+    );
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<IntegrityPageMalformedFinding> {
     let mut out = Vec::new();
-    for db in candidate_dbs {
-        if let Some(f) = detect_one(db) {
+    for candidate in read_candidates {
+        if let Some(f) = detect_one(candidate) {
             out.push(f);
         }
     }
     out
 }
 
-fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding> {
-    if !has_sqlite_header(db_path) {
-        return None;
-    }
-    // URI + immutable=1: read-only, no -shm creation, no
-    // locking. Matches the pass-35H pattern.
-    let conn = match super::open_immutable_sqlite(db_path) {
-        Ok(conn) => conn,
-        Err(error) => {
-            let detail = error.to_string();
+fn detect_one(
+    candidate: &super::DoctorDbReadCandidate,
+) -> Option<IntegrityPageMalformedFinding> {
+    let db_path = candidate.target_path();
+    let conn = match candidate.connection() {
+        Some(conn) => conn,
+        None => {
+            let detail = candidate.open_error()?;
             if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
                 return None;
             }
@@ -194,40 +202,6 @@ fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding
         integrity_check_result: result,
         db_size_bytes,
     })
-}
-
-fn has_sqlite_header(path: &std::path::Path) -> bool {
-    use std::io::Read as _;
-
-    let Ok(mut file) = open_nonblock_for_read(path) else {
-        return false;
-    };
-    let Ok(meta) = file.metadata() else {
-        return false;
-    };
-    if !meta.file_type().is_file() || meta.len() < super::empty_or_truncated_db::SQLITE_HEADER_BYTES
-    {
-        return false;
-    }
-    let mut header = [0u8; 16];
-    if file.read_exact(&mut header).is_err() {
-        return false;
-    }
-    header == *super::empty_or_truncated_db::SQLITE_MAGIC
-}
-
-#[cfg(unix)]
-fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
 }
 
 /// Detect-only FM. `fix()` is a no-op.

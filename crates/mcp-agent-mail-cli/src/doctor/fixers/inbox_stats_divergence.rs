@@ -155,18 +155,29 @@ impl InboxStatsDivergenceFinding {
 
 /// Detector. PURE w.r.t. caller-supplied DB paths.
 pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<InboxStatsDivergenceFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_dbs,
+        "inbox-stats divergence detection",
+    );
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<InboxStatsDivergenceFinding> {
     let mut out = Vec::new();
-    for db in candidate_dbs {
-        if let Some(f) = detect_one(db) {
+    for candidate in read_candidates {
+        if let Some(f) = detect_one(candidate) {
             out.push(f);
         }
     }
     out
 }
 
-fn detect_one(db_path: &std::path::Path) -> Option<InboxStatsDivergenceFinding> {
-    // URI + immutable=1 — read-only, no -shm creation.
-    let conn = super::open_immutable_sqlite(db_path).ok()?;
+fn detect_one(
+    candidate: &super::DoctorDbReadCandidate,
+) -> Option<InboxStatsDivergenceFinding> {
+    let conn = candidate.connection()?;
 
     // Pass-35L review (Codex F1 + Gemini F1 P0): the pre-fix
     // detector drove from `inbox_stats LEFT JOIN aggregate`,
@@ -230,7 +241,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<InboxStatsDivergenceFinding> 
         });
     }
     Some(InboxStatsDivergenceFinding {
-        db_path: db_path.to_path_buf(),
+        db_path: candidate.target_path().to_path_buf(),
         divergent_agents: divergent,
         more_truncated,
     })

@@ -215,10 +215,42 @@ struct ImportPlan {
     mode: ImportMode,
     search_root: PathBuf,
     source_db: PathBuf,
+    source_snapshot: Option<LegacySourceSnapshot>,
     source_storage_root: PathBuf,
     target_db: PathBuf,
     target_storage_root: PathBuf,
     operations: Vec<String>,
+}
+
+#[derive(Debug)]
+struct LegacySourceSnapshot {
+    original_path: PathBuf,
+    snapshot_path: PathBuf,
+    _snapshot_dir: tempfile::TempDir,
+}
+
+impl LegacySourceSnapshot {
+    fn capture(original_path: &Path) -> CliResult<Self> {
+        let snapshot_dir = crate::canonical_snapshot_tempdir(
+            "legacy-source-snapshot-",
+            "legacy source capture",
+        )?;
+        let snapshot_path = snapshot_dir.path().join("source.sqlite3");
+        materialize_legacy_source_snapshot(original_path, &snapshot_path)?;
+        Ok(Self {
+            original_path: original_path.to_path_buf(),
+            snapshot_path,
+            _snapshot_dir: snapshot_dir,
+        })
+    }
+
+    fn original_path(&self) -> &Path {
+        &self.original_path
+    }
+
+    fn snapshot_path(&self) -> &Path {
+        &self.snapshot_path
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -695,16 +727,10 @@ fn run_legacy_import(opts: ImportOptions, fmt: output::CliOutputFormat) -> CliRe
 
 fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
     let root = resolve_search_root(opts.search_root.clone());
-    let detect = build_detect_report(&root, opts.db.as_deref(), opts.storage_root.as_deref())?;
-    if opts.auto && !detect.detected {
-        return Err(CliError::InvalidArgument(
-            "no legacy installation detected; run `am legacy detect` to inspect details"
-                .to_string(),
-        ));
-    }
-
-    let source_db = PathBuf::from(&detect.database.path);
-    let source_storage = PathBuf::from(&detect.storage_root.path);
+    let db_resolved = resolve_database_path(&root, opts.db.as_deref())?;
+    let storage_resolved = resolve_storage_root(&root, opts.storage_root.as_deref())?;
+    let source_db = db_resolved.path;
+    let source_storage = storage_resolved.path;
     if !source_db.exists() {
         return Err(CliError::InvalidArgument(format!(
             "source DB missing: {}",
@@ -772,6 +798,29 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         ));
     }
 
+    // A real import captures one coherent source generation before the prompt
+    // or any target mutation. Detection, both source checks, and the target
+    // backup all consume this retained private image. Dry-run remains a pure
+    // plan: its detector may inspect a short-lived snapshot, but the plan does
+    // not retain or claim an executable source generation.
+    let source_snapshot = if opts.dry_run {
+        None
+    } else {
+        Some(LegacySourceSnapshot::capture(&source_db)?)
+    };
+    let detect = build_detect_report_with_source_snapshot(
+        &root,
+        opts.db.as_deref(),
+        opts.storage_root.as_deref(),
+        source_snapshot.as_ref(),
+    )?;
+    if opts.auto && !detect.detected {
+        return Err(CliError::InvalidArgument(
+            "no legacy installation detected; run `am legacy detect` to inspect details"
+                .to_string(),
+        ));
+    }
+
     let mut operations = Vec::new();
     operations.push(format!("resolve source DB: {}", source_db.display()));
     operations.push(format!(
@@ -779,8 +828,8 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         source_storage.display()
     ));
     operations.push(
-        "verify source DB through canonical SQLite read-only immutable access before copying \
-         (never creates/touches source -wal/-shm sidecars)"
+        "capture one WAL-aware, transactionally coherent private source snapshot and use it for \
+         legacy signature detection, both source checks, and target backup"
             .to_string(),
     );
     operations.push(format!(
@@ -801,6 +850,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
         mode,
         search_root: root,
         source_db,
+        source_snapshot,
         source_storage_root: source_storage,
         target_db,
         target_storage_root: target_storage,
@@ -814,11 +864,17 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
     let _mailbox_locks = acquire_legacy_import_mailbox_locks(&plan)?;
     let now = Utc::now();
     let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let source_snapshot = plan.source_snapshot.as_ref().ok_or_else(|| {
+        CliError::Other(
+            "legacy import execution requires the retained source snapshot omitted by dry-run"
+                .to_string(),
+        )
+    })?;
 
     // Preflight before any target artifact exists: failures here return the
     // error unchanged (there is nothing to stage aside and no target storage
     // root that this run owns to hold a failure receipt).
-    verify_source_canonical_sqlite_readable(&plan.source_db)?;
+    verify_source_canonical_sqlite_readable(source_snapshot)?;
     ensure_target_storage_root_usable(&plan.target_storage_root)?;
 
     match execute_import_body(&plan, should_refresh_setup, &now) {
@@ -839,8 +895,11 @@ fn execute_import_body(
     now: &chrono::DateTime<Utc>,
 ) -> CliResult<LegacyImportReceipt> {
     let mut warnings = Vec::new();
+    let source_snapshot = plan.source_snapshot.as_ref().ok_or_else(|| {
+        CliError::Other("legacy import body lost its retained source snapshot".to_string())
+    })?;
 
-    copy_db_via_sqlite_backup(&plan.source_db, &plan.target_db)?;
+    copy_db_via_sqlite_backup(source_snapshot, &plan.target_db)?;
     copy_dir_recursive(&plan.source_storage_root, &plan.target_storage_root)?;
 
     let migrated_ids = migrate_sqlite_db(&plan.target_db)?;
@@ -852,7 +911,7 @@ fn execute_import_body(
         )));
     }
     let core_counts = query_core_table_counts(&plan.target_db)?;
-    verify_source_canonical_sqlite_readable(&plan.source_db)?;
+    verify_source_canonical_sqlite_readable(source_snapshot)?;
     verify_canonical_sqlite_readable(&plan.target_db, "target DB")?;
     verify_runtime_sqlite_readable(&plan.target_db, "target DB")?;
 
@@ -1173,6 +1232,20 @@ fn build_detect_report(
     explicit_db: Option<&Path>,
     explicit_storage_root: Option<&Path>,
 ) -> CliResult<LegacyDetectReport> {
+    build_detect_report_with_source_snapshot(
+        search_root,
+        explicit_db,
+        explicit_storage_root,
+        None,
+    )
+}
+
+fn build_detect_report_with_source_snapshot(
+    search_root: &Path,
+    explicit_db: Option<&Path>,
+    explicit_storage_root: Option<&Path>,
+    source_snapshot: Option<&LegacySourceSnapshot>,
+) -> CliResult<LegacyDetectReport> {
     let db_resolved = resolve_database_path(search_root, explicit_db)?;
     let storage_resolved = resolve_storage_root(search_root, explicit_storage_root)?;
 
@@ -1219,7 +1292,30 @@ fn build_detect_report(
         });
     }
 
-    let db_signature = inspect_db_signature(&db_resolved.path);
+    let db_signature = if !db_resolved.exists {
+        None
+    } else if let Some(snapshot) = source_snapshot {
+        if snapshot.original_path() != db_resolved.path {
+            return Err(CliError::Other(format!(
+                "legacy detector snapshot source {} does not match resolved database {}",
+                snapshot.original_path().display(),
+                db_resolved.path.display()
+            )));
+        }
+        Some(inspect_db_signature(snapshot))
+    } else {
+        match LegacySourceSnapshot::capture(&db_resolved.path) {
+            Ok(snapshot) => Some(inspect_db_signature(&snapshot)),
+            Err(error) => Some(LegacyDbSignature {
+                open_ok: false,
+                core_tables_present: false,
+                legacy_trigger_count: 0,
+                datetime_like_column_count: 0,
+                migrations_table_present: false,
+                notes: vec![format!("failed to capture coherent sqlite source: {error}")],
+            }),
+        }
+    };
     if let Some(sig) = &db_signature {
         if sig.legacy_trigger_count > 0 {
             markers.push(LegacyMarker {
@@ -1472,25 +1568,21 @@ fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
     None
 }
 
-fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
-    if !path.exists() {
-        return None;
-    }
-    // Detection is part of the source-import path. Do not let the writable
-    // runtime engine establish namespace metadata or attempt schema repair on
-    // a legacy source simply to identify it. The immutable open also keeps a
-    // WAL-mode source's -wal/-shm sidecars untouched (no reader-side creation).
-    let conn = match open_source_canonical_read_only_immutable(path) {
-        Ok(v) => v,
-        Err(_) => {
-            return Some(LegacyDbSignature {
+fn inspect_db_signature(snapshot: &LegacySourceSnapshot) -> LegacyDbSignature {
+    // Immutable SQLite is safe only because the type retains a private,
+    // transactionally materialized source generation. It must never accept an
+    // arbitrary live pathname, where immutable mode would ignore the WAL.
+    let conn = match open_private_immutable_source_snapshot(snapshot) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return LegacyDbSignature {
                 open_ok: false,
                 core_tables_present: false,
                 legacy_trigger_count: 0,
                 datetime_like_column_count: 0,
                 migrations_table_present: false,
-                notes: vec!["failed to open sqlite database".to_string()],
-            });
+                notes: vec![format!("failed to open retained source snapshot: {error}")],
+            };
         }
     };
 
@@ -1570,14 +1662,14 @@ fn inspect_db_signature(path: &Path) -> Option<LegacyDbSignature> {
         notes.push("legacy DATETIME/TEXT timestamp columns present".to_string());
     }
 
-    Some(LegacyDbSignature {
+    LegacyDbSignature {
         open_ok: true,
         core_tables_present,
         legacy_trigger_count,
         datetime_like_column_count,
         migrations_table_present,
         notes,
-    })
+    }
 }
 
 fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResult<ResolvedPath> {
@@ -1887,21 +1979,91 @@ fn sqlite_uri_encode_path(path: &Path) -> String {
     encoded
 }
 
-/// Open a SOURCE database read-only in SQLite immutable mode.
+fn legacy_source_has_franken_namespace_artifact(path: &Path) -> CliResult<bool> {
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let sidecar = mcp_agent_mail_core::disk::sqlite_sidecar_path(path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "cannot inspect legacy source namespace artifact {}: {error}",
+                    sidecar.display()
+                )));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn vacuum_guarded_offline_canonical_source_into_snapshot(
+    source: &Path,
+    destination: &Path,
+) -> CliResult<()> {
+    let context = "legacy offline source capture";
+    let destination_text = crate::sqlite_snapshot_path_text(destination, context, "destination")?;
+    crate::prepare_sqlite_snapshot_destination(destination, context)?;
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+        source, context,
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "cannot open offline legacy source {} with guarded canonical SQLite: {error}",
+            source.display()
+        ))
+    })?;
+    // The source pager remains read-only. Disabling the SQL-level query-only
+    // policy permits VACUUM INTO to create only the fresh private destination.
+    conn.execute_raw("PRAGMA query_only = OFF;")
+        .map_err(|error| {
+            CliError::Other(format!(
+                "cannot enable guarded legacy snapshot export from {}: {error}",
+                source.display()
+            ))
+        })?;
+    let destination_literal = crate::sqlite_string_literal(destination_text);
+    conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
+        .map_err(|error| {
+            CliError::Other(format!(
+                "cannot materialize WAL-aware legacy snapshot from {} to {}: {error}",
+                source.display(),
+                destination.display()
+            ))
+        })?;
+    Ok(())
+}
+
+fn materialize_legacy_source_snapshot(source: &Path, destination: &Path) -> CliResult<()> {
+    if legacy_source_has_franken_namespace_artifact(source)? {
+        // Any namespace occupant makes canonical access ambiguous. The guarded
+        // same-engine path either binds the complete current generation or
+        // fails closed; it never falls back across engines.
+        crate::vacuum_live_franken_sqlite_into_snapshot(
+            source,
+            destination,
+            "legacy live Franken source capture",
+        )
+    } else {
+        // Namespace absence selects the explicit offline/canonical authority.
+        // The guarded true-read-only connection sees a complete WAL generation
+        // when one is available and fails closed on unstable/suspect families.
+        vacuum_guarded_offline_canonical_source_into_snapshot(source, destination)
+    }
+}
+
+/// Open only a retained private source snapshot in SQLite immutable mode.
 ///
-/// A plain read-only open of a WAL-mode database still creates/touches the
-/// `-wal`/`-shm` sidecars (readers need the wal-index). When the legacy Python
-/// server is still live next to the source, that is a write side effect on a
-/// path this command promises never to modify. `immutable=1` (via a URI
-/// filename, which `OpenFlags::uri` enables) makes SQLite treat the file as
-/// unchangeable: no locks, no journal/WAL access, no sidecar creation.
-///
-/// Trade-off: an immutable connection ignores any `-wal` content entirely, so
-/// this open is only used for inspection/verification. The backup path in
-/// [`copy_db_via_sqlite_backup`] detects a non-empty source `-wal` and copies
-/// through a private staging copy instead, so WAL-resident rows are never lost.
-fn open_source_canonical_read_only_immutable(path: &Path) -> CliResult<CanonicalDbConn> {
-    let uri = format!("file:{}?immutable=1", sqlite_uri_encode_path(path));
+/// The typed argument prevents production callers from applying immutable mode
+/// to a live database pathname. SQLite immutable mode intentionally ignores
+/// WAL state; that is correct here because capture already folded one coherent
+/// source transaction into this private standalone image.
+fn open_private_immutable_source_snapshot(
+    snapshot: &LegacySourceSnapshot,
+) -> CliResult<CanonicalDbConn> {
+    let uri = format!(
+        "file:{}?immutable=1",
+        sqlite_uri_encode_path(snapshot.snapshot_path())
+    );
     let flags = {
         let mut flags = mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_only();
         flags.uri = true;
@@ -1910,8 +2072,8 @@ fn open_source_canonical_read_only_immutable(path: &Path) -> CliResult<Canonical
     let config = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(uri).flags(flags);
     CanonicalDbConn::open(&config).map_err(|error| {
         CliError::Other(format!(
-            "cannot open SQLite DB read-only (immutable) {}: {error}",
-            path.display()
+            "cannot open retained legacy source snapshot {} read-only: {error}",
+            snapshot.snapshot_path().display()
         ))
     })
 }
@@ -1946,11 +2108,12 @@ fn verify_canonical_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
     verify_canonical_quick_check(&conn, path, label)
 }
 
-/// Verify the SOURCE database is readable without any filesystem side effects
-/// (immutable open — see [`open_source_canonical_read_only_immutable`]).
-fn verify_source_canonical_sqlite_readable(path: &Path) -> CliResult<()> {
-    let conn = open_source_canonical_read_only_immutable(path)?;
-    verify_canonical_quick_check(&conn, path, "source DB")
+/// Verify the one retained SOURCE generation used by this import.
+fn verify_source_canonical_sqlite_readable(
+    snapshot: &LegacySourceSnapshot,
+) -> CliResult<()> {
+    let conn = open_private_immutable_source_snapshot(snapshot)?;
+    verify_canonical_quick_check(&conn, snapshot.original_path(), "source DB snapshot")
 }
 
 fn verify_runtime_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
@@ -1970,14 +2133,10 @@ fn verify_runtime_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn copy_db_via_sqlite_backup(source_db: &Path, target_db: &Path) -> CliResult<()> {
-    if !source_db.exists() {
-        return Err(CliError::Other(format!(
-            "source database does not exist: {}",
-            source_db.display()
-        )));
-    }
-
+fn copy_db_via_sqlite_backup(
+    source_snapshot: &LegacySourceSnapshot,
+    target_db: &Path,
+) -> CliResult<()> {
     if fs::symlink_metadata(target_db).is_ok() {
         return Err(CliError::InvalidArgument(format!(
             "target database path must not already exist: {}",
@@ -1989,57 +2148,16 @@ fn copy_db_via_sqlite_backup(source_db: &Path, target_db: &Path) -> CliResult<()
         fs::create_dir_all(parent)?;
     }
 
-    // Source opens are immutable so a WAL-mode source next to a live legacy
-    // server never has its -wal/-shm sidecars created or touched by us. An
-    // immutable connection cannot see WAL-resident rows, though, so when the
-    // source has a non-empty -wal we back up from a private byte-level staging
-    // copy (main DB + wal): SQLite then performs WAL recovery on OUR staging
-    // copy, never on the source. The -shm file is deliberately not copied —
-    // it is a transient wal-index that SQLite rebuilds.
-    let source_wal = PathBuf::from(format!("{}-wal", source_db.display()));
-    let wal_len = fs::metadata(&source_wal).map(|m| m.len()).unwrap_or(0);
-
-    if wal_len > 0 {
-        let staging_dir = tempfile::Builder::new()
-            .prefix("am-legacy-import-staging-")
-            .tempdir()
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "cannot create staging directory for WAL-mode source copy: {error}"
-                ))
-            })?;
-        let staging_db = staging_dir.path().join("staging.sqlite3");
-        let staging_wal = staging_dir.path().join("staging.sqlite3-wal");
-        fs::copy(source_db, &staging_db)?;
-        fs::copy(&source_wal, &staging_wal)?;
-
-        let staging =
-            CanonicalDbConn::open_file(staging_db.display().to_string()).map_err(|error| {
-                CliError::Other(format!(
-                    "cannot open staging copy of WAL-mode source {}: {error}",
-                    source_db.display()
-                ))
-            })?;
-        staging
-            .backup_to_path(target_db.to_string_lossy().as_ref())
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "canonical SQLite backup from staged WAL-mode copy of {} to {} failed: {error}",
-                    source_db.display(),
-                    target_db.display()
-                ))
-            })?;
-        // staging_dir (our own temp artifact) is removed on drop.
-        return Ok(());
-    }
-
-    let source = open_source_canonical_read_only_immutable(source_db)?;
+    // All live/offline authority decisions and WAL observation happened once
+    // during capture. Canonical SQLite now sees only the retained private inode,
+    // so no source-side TOCTOU or mixed-engine descriptor close remains.
+    let source = open_private_immutable_source_snapshot(source_snapshot)?;
     source
         .backup_to_path(target_db.to_string_lossy().as_ref())
         .map_err(|error| {
             CliError::Other(format!(
                 "canonical SQLite backup from {} to {} failed: {error}",
-                source_db.display(),
+                source_snapshot.original_path().display(),
                 target_db.display()
             ))
         })?;

@@ -166,8 +166,19 @@ impl LegacyFtsResidueFinding {
 /// - the DB can't be opened
 /// - the sqlite_master query fails
 pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
+    let read_candidates = super::explicit_offline_db_read_candidates(
+        candidate_paths,
+        "legacy FTS residue detection",
+    );
+    detect_prepared(&read_candidates)
+}
+
+pub(crate) fn detect_prepared(
+    read_candidates: &[super::DoctorDbReadCandidate],
+) -> Vec<LegacyFtsResidueFinding> {
     let mut out = Vec::new();
-    for db_path in candidate_paths {
+    for candidate in read_candidates {
+        let db_path = candidate.target_path();
         if !db_path.is_file() {
             continue;
         }
@@ -180,17 +191,17 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
             // expected.
             continue;
         }
-        let Ok(conn) = super::open_immutable_sqlite(db_path) else {
+        let Some(conn) = candidate.connection() else {
             continue;
         };
-        let Some(residue) = read_fts_residue(&conn) else {
+        let Some(residue) = read_fts_residue(conn) else {
             continue;
         };
         if residue.is_empty() {
             continue;
         }
         out.push(LegacyFtsResidueFinding {
-            db_path: db_path.clone(),
+            db_path: db_path.to_path_buf(),
             v3_marker_path: marker_path,
             residual_objects: residue,
         });

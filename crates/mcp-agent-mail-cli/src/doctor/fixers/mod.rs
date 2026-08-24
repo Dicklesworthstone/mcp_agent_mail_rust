@@ -213,7 +213,7 @@ enum DoctorDbReadSourceKind {
 pub(crate) struct DoctorDbReadCandidate {
     target_path: std::path::PathBuf,
     connection: Option<mcp_agent_mail_db::CanonicalDbConn>,
-    retained_snapshot: Option<crate::CanonicalSnapshotSource>,
+    _retained_snapshot: Option<crate::CanonicalSnapshotSource>,
     source_kind: DoctorDbReadSourceKind,
     open_error: Option<String>,
 }
@@ -223,7 +223,7 @@ impl DoctorDbReadCandidate {
         Self {
             target_path: target_path.to_path_buf(),
             connection: None,
-            retained_snapshot: None,
+            _retained_snapshot: None,
             source_kind: DoctorDbReadSourceKind::Unavailable,
             open_error: Some(error.into()),
         }
@@ -255,7 +255,7 @@ impl DoctorDbReadCandidate {
                 Self {
                     target_path: target_path.to_path_buf(),
                     connection: Some(opened.conn),
-                    retained_snapshot: opened._snapshot_source,
+                    _retained_snapshot: opened._snapshot_source,
                     source_kind,
                     open_error: None,
                 }
@@ -278,7 +278,7 @@ impl DoctorDbReadCandidate {
             Ok(connection) => Self {
                 target_path: target_path.to_path_buf(),
                 connection: Some(connection),
-                retained_snapshot: None,
+                _retained_snapshot: None,
                 source_kind: DoctorDbReadSourceKind::ExplicitOffline,
                 open_error: None,
             },
