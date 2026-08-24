@@ -13578,35 +13578,12 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    if path != ":memory:" {
-        ensure_sqlite_parent_dir(Path::new(&path))?;
+    if path == ":memory:" {
+        return open_db_sync_after_mutation_locks(&path, database_url, storage_root_override);
     }
-    let requires_preopen_admission = path != ":memory:"
-        && cli_sqlite_family_requires_preopen_admission(Path::new(&path))?;
-    // `open_sqlite_read_only_with_fallback` is read-only in policy, not at the
-    // engine API: `DbConn::open_file` may create WAL/SHM or materialize a missing
-    // database. Skip it whenever durable authority requires admission and when
-    // the path is absent; both cases must acquire mutation locks first.
-    if !requires_preopen_admission && (path == ":memory:" || Path::new(&path).exists()) {
-        let read_only_open = open_sqlite_read_only_with_fallback(&path);
-        if let Ok((conn, opened_path)) = read_only_open {
-            if opened_path == ":memory:" {
-                return Ok((conn, opened_path));
-            }
-
-            if !sqlite_conn_requires_canonical_init(&conn)? && sqlite_conn_is_healthy(&conn)? {
-                return maybe_reconcile_sync_opened_sqlite_archive_drift(
-                    conn,
-                    opened_path,
-                    database_url,
-                    storage_root_override,
-                    acquire_mutation_locks,
-                );
-            }
-
-            drop(conn);
-        }
-    }
+    ensure_sqlite_parent_dir(Path::new(&path))?;
+    let requires_preopen_admission =
+        cli_sqlite_family_requires_preopen_admission(Path::new(&path))?;
 
     let _mailbox_mutation_locks = if acquire_mutation_locks {
         Some(acquire_cli_mailbox_mutation_locks(
@@ -67333,6 +67310,60 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn open_sqlite_read_only_probe_is_source_namespace_neutral_without_breaker() {
+        for family_kind in ["healthy", "corrupt-primary", "truncated-wal", "missing-primary"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("read-only-{family_kind}.sqlite3"));
+            if family_kind != "missing-primary" {
+                init_schema_sqlite_canonical(&db_path.display().to_string())
+                    .expect("seed read-only probe primary");
+            }
+            match family_kind {
+                "healthy" | "missing-primary" => {}
+                "corrupt-primary" => {
+                    std::fs::write(&db_path, b"not a sqlite database")
+                        .expect("corrupt primary");
+                }
+                "truncated-wal" => {
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                        .expect("plant truncated WAL");
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"coordination-shm")
+                        .expect("plant SHM evidence");
+                }
+                other => panic!("unknown read-only fixture kind: {other}"),
+            }
+
+            let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+            let entries_before = directory_entry_names_for_cli_open_test(dir.path());
+            let opened = open_sqlite_read_only_with_fallback(&db_path.display().to_string());
+            if family_kind == "healthy" {
+                let (conn, opened_path) = opened.expect("open healthy family read-only");
+                assert_eq!(opened_path, db_path.display().to_string());
+                conn.execute_raw("CREATE TABLE must_be_rejected(id INTEGER)")
+                    .expect_err("read-only probe connection must reject writes");
+                drop(conn);
+            } else if let Ok((conn, _)) = opened {
+                // A read-only engine may accept some malformed sidecar shapes,
+                // but it still must not change the live namespace or bytes.
+                drop(conn);
+            }
+
+            assert_eq!(
+                sqlite_family_bytes_for_cli_open_test(&db_path),
+                family_before,
+                "read-only {family_kind} probe changed primary/WAL/SHM/breaker presence or bytes"
+            );
+            assert_eq!(
+                directory_entry_names_for_cli_open_test(dir.path()),
+                entries_before,
+                "read-only {family_kind} probe created, removed, or renamed a live-family artifact"
+            );
+        }
+    }
+
+    #[test]
     fn open_db_sync_breaker_refusal_precedes_live_open_and_recovery_artifacts() {
         for family_kind in ["corrupt-primary", "truncated-wal", "missing-primary"] {
             for breaker_kind in ["malformed", "tripped"] {
@@ -67370,7 +67401,7 @@ startup_timeout_sec = 42
                     "corrupt-primary" => {
                         std::fs::write(&db_path, b"not a sqlite database")
                             .expect("corrupt primary");
-                }
+                    }
                     "truncated-wal" => {
                         std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
                             .expect("plant truncated WAL");

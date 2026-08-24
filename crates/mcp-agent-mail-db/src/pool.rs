@@ -21334,6 +21334,40 @@ mod tests {
     }
 
     #[test]
+    fn non_archive_recovery_refuses_before_mutation_while_writer_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("writer-held-recovery.sqlite3");
+        std::fs::write(&primary, b"corrupt primary authority")
+            .expect("write corrupt primary fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list recovery fixture before refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let writer = crate::write_barrier::begin_write_activity();
+
+        let error = ensure_sqlite_file_healthy_inner_with_timeout(&primary, Duration::ZERO)
+            .expect_err("an active writer must block non-archive recovery");
+
+        assert!(
+            error.to_string().contains("did not drain"),
+            "unexpected writer-drain refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            b"corrupt primary authority"
+        );
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list recovery fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "writer refusal must precede forensic capture, quarantine, restore, or reinitialize"
+        );
+        drop(writer);
+    }
+
+    #[test]
     fn tripped_breaker_preempts_writer_drain_for_sidecar_cleanup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("tripped-writer-held-cleanup.sqlite3");
@@ -21415,6 +21449,8 @@ mod tests {
             SqliteFamilyCleanupOutcome::Quarantined {
                 wal: true,
                 shm: false,
+                wal_cert: false,
+                wal_cert_head: false,
             }
         );
         assert_eq!(
@@ -21524,8 +21560,25 @@ mod tests {
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
         let shm_path = dir.path().join("header_only_test.db-shm");
         std::fs::write(&shm_path, b"stale-shm").expect("create companion shm");
+        let wal_cert_path = dir.path().join("header_only_test.db-wal-cert");
+        std::fs::write(&wal_cert_path, b"stale-wal-cert")
+            .expect("create companion WAL certificate");
+        let wal_cert_head_path = dir.path().join("header_only_test.db-wal-cert-head");
+        std::fs::write(&wal_cert_head_path, b"stale-wal-cert-head")
+            .expect("create companion WAL certificate head");
 
-        cleanup_empty_wal_sidecar(&db_path).expect("quarantine damaged WAL family");
+        let outcome =
+            cleanup_empty_wal_sidecar(&db_path).expect("quarantine damaged WAL family");
+
+        assert_eq!(
+            outcome,
+            SqliteFamilyCleanupOutcome::Quarantined {
+                wal: true,
+                shm: true,
+                wal_cert: true,
+                wal_cert_head: true,
+            }
+        );
 
         assert!(
             !wal_path.exists(),
@@ -21534,6 +21587,14 @@ mod tests {
         assert!(
             !shm_path.exists(),
             "companion SHM should move out of the live DB family with the WAL"
+        );
+        assert!(
+            !wal_cert_path.exists(),
+            "companion WAL certificate should rotate with the damaged WAL"
+        );
+        assert!(
+            !wal_cert_head_path.exists(),
+            "companion WAL certificate head should rotate with the damaged WAL"
         );
 
         let wal_quarantines = sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-wal");
@@ -21556,6 +21617,68 @@ mod tests {
         assert_eq!(
             std::fs::read(&shm_quarantines[0]).expect("read quarantined SHM"),
             b"stale-shm"
+        );
+
+        let wal_cert_quarantines =
+            sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-wal-cert");
+        assert_eq!(
+            wal_cert_quarantines.len(),
+            1,
+            "companion WAL certificate should be preserved in quarantine"
+        );
+        assert_eq!(
+            std::fs::read(&wal_cert_quarantines[0])
+                .expect("read quarantined WAL certificate"),
+            b"stale-wal-cert"
+        );
+
+        let wal_cert_head_quarantines =
+            sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-wal-cert-head");
+        assert_eq!(
+            wal_cert_head_quarantines.len(),
+            1,
+            "companion WAL certificate head should be preserved in quarantine"
+        );
+        assert_eq!(
+            std::fs::read(&wal_cert_head_quarantines[0])
+                .expect("read quarantined WAL certificate head"),
+            b"stale-wal-cert-head"
+        );
+    }
+
+    #[test]
+    fn classified_sidecar_cleanup_refuses_raced_in_wal_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-race.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let preserved_wal_path = dir.path().join("cleanup-race.original-wal");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write classified WAL");
+
+        let mut injected = false;
+        let error = apply_classified_sqlite_family_cleanup_with_hook(&db_path, |sidecar| {
+            if !injected && sidecar == wal_path {
+                std::fs::rename(&wal_path, &preserved_wal_path)
+                    .expect("preserve classified WAL before race");
+                std::fs::write(&wal_path, [0xAA; 64]).expect("race in framed WAL generation");
+                injected = true;
+            }
+        })
+        .expect_err("cleanup must reject a WAL generation that replaced its witness");
+
+        assert!(
+            error.to_string().contains("changed identity or bytes"),
+            "unexpected race refusal: {error}"
+        );
+        assert!(injected, "test must inject the classify-to-rename race");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), [0xAA; 64]);
+        assert_eq!(
+            std::fs::read(&preserved_wal_path).unwrap(),
+            b"truncated-wal"
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "cleanup-race.sqlite3-wal").is_empty(),
+            "a refused race must not quarantine the unclassified WAL generation"
         );
     }
 
@@ -21614,15 +21737,20 @@ mod tests {
         let journal = dir.path().join("checkpoint_sidecars.db-journal");
         let wal = dir.path().join("checkpoint_sidecars.db-wal");
         let shm = dir.path().join("checkpoint_sidecars.db-shm");
-        std::fs::write(&journal, b"journal").expect("write journal");
-        std::fs::write(&wal, [0xAA; 64]).expect("write wal");
+        let wal_cert = dir.path().join("checkpoint_sidecars.db-wal-cert");
+        let wal_cert_head = dir.path().join("checkpoint_sidecars.db-wal-cert-head");
+        std::fs::write(&journal, b"").expect("write benign empty journal");
+        std::fs::write(&wal, [0x00; 32]).expect("write frameless wal");
         std::fs::write(&shm, b"shm").expect("write shm");
+        std::fs::write(&wal_cert, b"wal-cert").expect("write wal certificate");
+        std::fs::write(&wal_cert_head, b"wal-cert-head")
+            .expect("write wal certificate head");
 
         quarantine_sqlite_sidecars_after_checkpoint(&primary).expect("quarantine sidecars");
 
         assert!(
-            !journal.exists(),
-            "residual journal should move out of the live DB family"
+            journal.exists(),
+            "a zero-length journal is benign and should not churn the namespace"
         );
         assert!(
             !wal.exists(),
@@ -21632,10 +21760,18 @@ mod tests {
             !shm.exists(),
             "residual SHM should move out of the live DB family"
         );
+        assert!(
+            !wal_cert.exists(),
+            "residual WAL certificate should move with its generation"
+        );
+        assert!(
+            !wal_cert_head.exists(),
+            "residual WAL certificate head should move with its generation"
+        );
 
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-journal").len(),
-            1
+            0
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-wal").len(),
@@ -21644,6 +21780,77 @@ mod tests {
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-shm").len(),
             1
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-wal-cert").len(),
+            1
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-wal-cert-head").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn checkpoint_sidecar_cleanup_refuses_wal_with_frame_bytes_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("checkpoint-framed-wal.db");
+        let wal = sqlite_sidecar_path(&primary, "-wal");
+        let shm = sqlite_sidecar_path(&primary, "-shm");
+        std::fs::write(&primary, b"primary authority").expect("write primary");
+        std::fs::write(&wal, [0xAA; 64]).expect("write framed WAL fixture");
+        std::fs::write(&shm, b"coordination-shm").expect("write SHM fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list fixture before refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let error = quarantine_sqlite_sidecars_after_checkpoint(&primary)
+            .expect_err("checkpoint cleanup must not detach a WAL with frame bytes");
+
+        assert!(
+            error.to_string().contains("WAL with frame bytes"),
+            "unexpected framed-WAL refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal).unwrap(), [0xAA; 64]);
+        assert_eq!(std::fs::read(&shm).unwrap(), b"coordination-shm");
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+    }
+
+    #[test]
+    fn checkpoint_sidecar_cleanup_refuses_raced_in_wal_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("checkpoint-race.db");
+        let wal = sqlite_sidecar_path(&primary, "-wal");
+        let preserved_wal = dir.path().join("checkpoint-race.original-wal");
+        std::fs::write(&primary, b"primary authority").expect("write primary");
+        std::fs::write(&wal, [0x00; 32]).expect("write classified frameless WAL");
+
+        let mut injected = false;
+        let error = quarantine_sqlite_sidecars_after_checkpoint_with_hook(&primary, |sidecar| {
+            if !injected && sidecar == wal {
+                std::fs::rename(&wal, &preserved_wal).expect("preserve classified WAL");
+                std::fs::write(&wal, [0xAA; 64]).expect("race in framed WAL generation");
+                injected = true;
+            }
+        })
+        .expect_err("checkpoint cleanup must reject a raced-in WAL generation");
+
+        assert!(
+            error.to_string().contains("changed identity or bytes"),
+            "unexpected race refusal: {error}"
+        );
+        assert!(injected, "test must inject the checkpoint cleanup race");
+        assert_eq!(std::fs::read(&wal).unwrap(), [0xAA; 64]);
+        assert_eq!(std::fs::read(&preserved_wal).unwrap(), [0x00; 32]);
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint-race.db-wal").is_empty(),
+            "a refused race must not quarantine the unclassified WAL generation"
         );
     }
 
