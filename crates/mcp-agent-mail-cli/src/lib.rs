@@ -7264,11 +7264,20 @@ fn require_healthy_existing_database_for_startup_fail_open(db_path: &Path) -> Cl
         )));
     }
 
-    if sqlite_file_is_healthy(db_path)? {
+    let directly_usable =
+        mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(db_path).map_err(
+            |error| {
+                CliError::Other(format!(
+                    "source-byte-neutral SQLite fail-open check failed for {}: {error}",
+                    db_path.display()
+                ))
+            },
+        )?;
+    if directly_usable {
         Ok(())
     } else {
         Err(CliError::Other(format!(
-            "startup recovery cannot fail open because the existing SQLite family at {} failed source-byte-neutral health checks",
+            "startup recovery cannot fail open because the existing SQLite family at {} is not healthy without recovery cleanup",
             db_path.display()
         )))
     }
@@ -53022,7 +53031,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn startup_open_breaker_never_quarantines_truncated_wal_or_shm() {
+    fn startup_open_breaker_refuses_truncated_wal_without_mutating_family() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("live.sqlite3");
         seed_project_only_db(&db_path, "live-project", "/live-project");
@@ -53059,7 +53068,7 @@ startup_timeout_sec = 42
         let repair_calls = std::cell::Cell::new(0_u32);
         let reconstruct_calls = std::cell::Cell::new(0_u32);
 
-        run_startup_database_self_heal_with(
+        let error = run_startup_database_self_heal_with(
             &db_url,
             dir.path(),
             || {
@@ -53071,12 +53080,16 @@ startup_timeout_sec = 42
                 Ok(())
             },
         )
-        .expect(
-            "tripped startup may boot only after the private family probe proves the preserved primary healthy",
-        );
+        .expect_err("a breaker-blocked cleanup must not be mistaken for a bootable live family");
 
         assert_eq!(repair_calls.get(), 0);
         assert_eq!(reconstruct_calls.get(), 0);
+        assert!(
+            error
+                .to_string()
+                .contains("is not healthy without recovery cleanup"),
+            "unexpected fail-closed error: {error}"
+        );
         assert_eq!(std::fs::read(&wal).expect("read untouched WAL"), wal_bytes);
         assert_eq!(std::fs::read(&shm).expect("read untouched SHM"), shm_bytes);
         let entries_after = std::fs::read_dir(dir.path())

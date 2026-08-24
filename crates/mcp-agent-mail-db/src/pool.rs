@@ -7254,6 +7254,27 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     sqlite_file_is_healthy_staged(&staged.path)
 }
 
+/// Prove that the current SQLite family is healthy without first detaching a
+/// damaged WAL or SHM sidecar.
+///
+/// This is stricter than [`sqlite_file_is_healthy`]. The ordinary health probe
+/// may quarantine a truncation artifact on its private staged copy before
+/// checking the primary, which is useful when deciding whether recovery can
+/// repair a family. A caller whose durable recovery breaker is already open
+/// must instead prove that the exact staged family is directly usable without
+/// that cleanup; otherwise allowing startup would only defer the same breaker
+/// refusal to the runtime's first database open.
+#[allow(clippy::result_large_err)]
+pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    if !classify_sqlite_family_cleanup(&staged.path)?.is_empty() {
+        return Ok(false);
+    }
+    sqlite_file_is_healthy_staged(&staged.path)
+}
+
 #[allow(clippy::result_large_err)]
 fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), SqlError> {
     if !sqlite_file_has_live_sidecars(primary_path) {
@@ -20053,6 +20074,11 @@ mod tests {
         std::fs::write(&shm_path, b"coordination-shm").unwrap();
 
         assert!(
+            !sqlite_file_is_healthy_without_family_cleanup(&db_path)
+                .expect("strict source-neutral health probe"),
+            "a private probe that requires WAL cleanup is not proof that a breaker-blocked runtime can open the exact live family"
+        );
+        assert!(
             sqlite_primary_read_path_is_healthy(&db_path).expect("primary staged health probe")
         );
         assert!(sqlite_file_is_healthy(&db_path).expect("layered staged health probe"));
@@ -20457,6 +20483,11 @@ mod tests {
         assert!(
             wal.exists(),
             "empty wal stub should exist before health check"
+        );
+        assert!(
+            sqlite_file_is_healthy_without_family_cleanup(&primary)
+                .expect("strict health check with benign empty WAL"),
+            "the strict fail-open probe must not reject a directly usable zero-byte WAL family"
         );
 
         ensure_sqlite_file_healthy(&primary).expect("healthy db with empty wal should pass");
