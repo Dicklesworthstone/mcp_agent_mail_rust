@@ -1798,7 +1798,7 @@ fn normalize_input_path(raw: &str, base: &Path) -> PathBuf {
 }
 
 fn normalize_path_for_overlap(path: &Path) -> PathBuf {
-    crate::canonicalize_existing_prefix(&normalize_lexical_path(path))
+    normalize_lexical_path(&crate::canonicalize_existing_prefix(path))
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -2672,6 +2672,25 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
 
         assert!(!paths_overlap(&source, &sibling_via_parent));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_overlap_resolves_symlink_before_parent_segments() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("source");
+        let nested = source.join("nested");
+        let link = tmp.path().join("nested-link");
+        fs::create_dir_all(&nested).expect("create nested source");
+        symlink(&nested, &link).expect("create nested symlink");
+
+        let disguised_child = link.join("..").join("not-created-yet");
+        assert!(
+            paths_overlap(&source, &disguised_child),
+            "symlink resolution must happen before lexical '..' normalization"
+        );
     }
 
     fn seed_v20_agents_fixture(path: &Path) {

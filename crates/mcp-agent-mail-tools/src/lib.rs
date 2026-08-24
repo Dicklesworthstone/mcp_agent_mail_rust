@@ -780,6 +780,34 @@ pub mod tool_util {
         }
     }
 
+    fn bootstrap_db_pool_with_barrier_handoff(
+        cfg: &DbPoolConfig,
+        storage_root: &Path,
+        sqlite_path: Option<&Path>,
+    ) -> McpResult<(DbPool, crate::archive_read::WriteGuard)> {
+        let (barrier, outcome) =
+            mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
+                mcp_agent_mail_db::write_barrier::writer_drain_timeout(),
+            );
+        if let mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut { remaining_writers } =
+            outcome
+        {
+            drop(barrier);
+            return Err(McpError::internal_error(format!(
+                "database pool bootstrap deferred because {remaining_writers} writer(s) did not drain before the recovery barrier timeout"
+            )));
+        }
+        let pool =
+            get_or_create_pool(cfg).map_err(|error| McpError::internal_error(error.to_string()))?;
+        // Atomic handoff: register the caller as a writer while the promotion
+        // barrier is still closed, then release the barrier. No promotion can
+        // enter between cold bootstrap/recovery and the operation using this
+        // pool.
+        let guard = crate::archive_read::WriteGuard::begin(storage_root, sqlite_path);
+        drop(barrier);
+        Ok((pool, guard))
+    }
+
     pub fn get_db_pool() -> McpResult<WriteDbPool> {
         let cfg = DbPoolConfig::from_env();
         let sqlite_path =
@@ -800,8 +828,21 @@ pub mod tool_util {
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
         );
-        let pool = get_or_create_pool(&cfg)
-            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
+            return Ok(WriteDbPool {
+                pool,
+                _guard: guard,
+            });
+        }
+        // A cold pool may migrate or recover, which requires the promotion
+        // barrier. Relinquish this provisional writer first, then perform an
+        // explicit barrier-to-writer handoff in the helper.
+        drop(guard);
+        let (pool, guard) = bootstrap_db_pool_with_barrier_handoff(
+            &cfg,
+            &storage_root,
+            sqlite_path.as_deref().map(Path::new),
+        )?;
         Ok(WriteDbPool {
             pool,
             _guard: guard,
@@ -864,12 +905,11 @@ pub mod tool_util {
             .storage_root
             .clone()
             .unwrap_or_else(|| Config::from_env().storage_root);
-        let guard = crate::archive_read::WriteGuard::begin(
+        let (pool, guard) = bootstrap_db_pool_with_barrier_handoff(
+            &cfg,
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
-        );
-        let pool = get_or_create_pool(&cfg)
-            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        )?;
         drop(guard);
         Ok(pool)
     }

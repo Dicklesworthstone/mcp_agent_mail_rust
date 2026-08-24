@@ -39,7 +39,11 @@ use chrono::{DateTime, NaiveDate, Utc};
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::McpContext;
 
-use mcp_agent_mail_core::disk::{sqlite_file_path_from_database_url, sqlite_url_from_path};
+use mcp_agent_mail_core::disk::{
+    SqliteRecoveryCandidateKind, SqliteRecoveryCandidateName,
+    classify_sqlite_recovery_candidate_name, sqlite_file_path_from_database_url,
+    sqlite_url_from_path,
+};
 use mcp_agent_mail_core::{
     AgentDetectError, AgentDetectOptions, ArchiveScanDedupeRule, ArchiveScanDiagnostic,
     ArchiveScanScope, ArchiveScanSeverityBucket, ArchiveScanSummary, ArtifactPointer, Config,
@@ -7217,88 +7221,132 @@ fn startup_database_self_heal_action(
     )
 }
 
+fn startup_database_self_heal_action_read_only(
+    database_url: &str,
+    storage_root: &Path,
+) -> CliResult<StartupDatabaseSelfHealAction> {
+    Ok(
+        match doctor_database_fix_strategy_read_only(database_url, storage_root)? {
+            DoctorDatabaseFixStrategy::None(detail) => StartupDatabaseSelfHealAction::None(detail),
+            DoctorDatabaseFixStrategy::Repair(detail) => {
+                StartupDatabaseSelfHealAction::Repair(detail)
+            }
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+                StartupDatabaseSelfHealAction::Reconstruct(detail)
+            }
+        },
+    )
+}
+
 fn run_startup_database_self_heal_with<F, G>(
     database_url: &str,
     storage_root: &Path,
-    run_repair: F,
+    mut run_repair: F,
     mut run_reconstruct: G,
 ) -> CliResult<()>
 where
     F: FnMut() -> CliResult<()>,
     G: FnMut(&Path) -> CliResult<()>,
 {
-    match startup_database_self_heal_action(database_url, storage_root)? {
-        StartupDatabaseSelfHealAction::None(_) => Ok(()),
-        StartupDatabaseSelfHealAction::Repair(detail) => {
-            output::info(&format!(
-                "Startup detected mailbox database issues; running automatic repair ({detail})"
+    let preflight_action = startup_database_self_heal_action_read_only(database_url, storage_root)?;
+    if matches!(preflight_action, StartupDatabaseSelfHealAction::None(_)) {
+        return Ok(());
+    }
+    let recovery_db_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+    let attempt = mcp_agent_mail_db::pool::with_automatic_recovery_admission(
+        &recovery_db_path,
+        "startup database self-heal",
+        || match startup_database_self_heal_action(database_url, storage_root)? {
+            // The read-only preflight saw a repairable state, but cleanup under
+            // admission may itself have resolved it (for example a truncated
+            // WAL/SHM family). Treat the refreshed clean verdict as a successful
+            // admitted recovery attempt and never invoke a stale callback.
+            StartupDatabaseSelfHealAction::None(detail) => {
+                output::info(&format!(
+                    "Startup mailbox self-heal completed during admitted preflight cleanup ({detail})"
+                ));
+                Ok(())
+            }
+            StartupDatabaseSelfHealAction::Repair(detail) => {
+                output::info(&format!(
+                    "Startup detected mailbox database issues; running automatic repair ({detail})"
+                ));
+                let (repair_result, repair_output) =
+                    run_startup_doctor_subcommand_capturing(&mut run_repair);
+                repair_result?;
+                let post_repair_detail =
+                    verify_doctor_database_repair_cleared(database_url, storage_root, &detail)?;
+                cleanup_database_sidecars_after_startup_use(database_url)?;
+                let post_repair_detail =
+                    startup_post_repair_detail_with_artifacts(post_repair_detail, &repair_output);
+                output::info(&format!(
+                    "Automatic mailbox repair completed; {post_repair_detail}; continuing startup"
+                ));
+                auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
+                Ok(())
+            }
+            StartupDatabaseSelfHealAction::Reconstruct(detail) => {
+                // br-mdfpz: index-only corruption is fully repairable in place with
+                // a targeted REINDEX (table b-trees intact, zero row loss). Archive
+                // reconstruction for that class is not only slow — when the archive
+                // lags the DB, the promotion guard correctly refuses the lossy
+                // candidate and a supervised startup crash-loops. Try the fast path
+                // first; skip reconstruction only if the strategy re-check comes
+                // back clean (a persisting archive-drift verdict still reconstructs).
+                if let Some(summary) = doctor_attempt_index_only_reindex(
+                    &recovery_db_path,
+                    &storage_root.join("backups"),
+                ) && matches!(
+                    startup_database_self_heal_action(database_url, storage_root),
+                    Ok(StartupDatabaseSelfHealAction::None(_))
+                ) {
+                    output::info(&format!(
+                        "Startup healed index-only mailbox corruption in place ({summary}); archive reconstruction skipped; continuing startup"
+                    ));
+                    cleanup_stale_db_artifacts(&recovery_db_path)?;
+                    auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
+                    return Ok(());
+                }
+                output::info(&format!(
+                    "Startup detected mailbox database issues; reconstructing from archive ({detail})"
+                ));
+                run_startup_doctor_subcommand_quietly(|| run_reconstruct(&recovery_db_path))?;
+                cleanup_stale_db_artifacts(&recovery_db_path)?;
+                output::info("Automatic mailbox reconstruction completed; continuing startup");
+                auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
+                Ok(())
+            }
+        },
+    );
+
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error))
+            if is_reconstruct_promotion_refusal(&error) && recovery_db_path.is_file() =>
+        {
+            // br-r6awv: a refused promotion means the live DB still holds
+            // coordination keys the archive candidate would drop. Record the
+            // failed attempt in the breaker, then keep the live file and boot.
+            output::warn(&format!(
+                "Automatic mailbox reconstruction refused promotion \
+                 (live database kept): {error}"
             ));
-            let (repair_result, repair_output) =
-                run_startup_doctor_subcommand_capturing(run_repair);
-            repair_result?;
-            let post_repair_detail =
-                verify_doctor_database_repair_cleared(database_url, storage_root, &detail)?;
-            cleanup_database_sidecars_after_startup_use(database_url)?;
-            let post_repair_detail =
-                startup_post_repair_detail_with_artifacts(post_repair_detail, &repair_output);
-            output::info(&format!(
-                "Automatic mailbox repair completed; {post_repair_detail}; continuing startup"
-            ));
-            auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
             Ok(())
         }
-        StartupDatabaseSelfHealAction::Reconstruct(detail) => {
-            let reconstruct_db_path = resolve_mailbox_activity_sqlite_path(database_url)?;
-            // br-mdfpz: index-only corruption is fully repairable in place with
-            // a targeted REINDEX (table b-trees intact, zero row loss). Archive
-            // reconstruction for that class is not only slow — when the archive
-            // lags the DB, the promotion guard correctly refuses the lossy
-            // candidate and a supervised startup crash-loops. Try the fast path
-            // first; skip reconstruction only if the strategy re-check comes
-            // back clean (a persisting archive-drift verdict still reconstructs).
-            if let Some(summary) = doctor_attempt_index_only_reindex(
-                &reconstruct_db_path,
-                &storage_root.join("backups"),
-            ) && matches!(
-                startup_database_self_heal_action(database_url, storage_root),
-                Ok(StartupDatabaseSelfHealAction::None(_))
-            ) {
-                output::info(&format!(
-                    "Startup healed index-only mailbox corruption in place ({summary}); archive reconstruction skipped; continuing startup"
-                ));
-                cleanup_stale_db_artifacts(&reconstruct_db_path)?;
-                auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
-                return Ok(());
-            }
-            output::info(&format!(
-                "Startup detected mailbox database issues; reconstructing from archive ({detail})"
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error)) => Err(error),
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission {
+            kind: mcp_agent_mail_db::pool::AutomaticRecoveryAdmissionFailureKind::CircuitOpen,
+            error,
+        }) if recovery_db_path.is_file() => {
+            output::warn(&format!(
+                "Automatic mailbox recovery remains parked by its durable circuit breaker; \
+                 the existing live database was kept and startup will continue without another \
+                 repair, reconstruction, or forensic capture: {error}"
             ));
-            match run_startup_doctor_subcommand_quietly(|| run_reconstruct(&reconstruct_db_path)) {
-                Ok(()) => {
-                    cleanup_stale_db_artifacts(&reconstruct_db_path)?;
-                    output::info("Automatic mailbox reconstruction completed; continuing startup");
-                    auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
-                    Ok(())
-                }
-                Err(err)
-                    if is_reconstruct_promotion_refusal(&err) && reconstruct_db_path.is_file() =>
-                {
-                    // br-r6awv: a refused promotion means the live DB still
-                    // holds coordination keys the archive candidate would
-                    // drop. Crashing startup here is what crash-looped
-                    // systemd for days. Keep the live file and boot — but
-                    // only when that file is still present. A refusal with
-                    // no live DB is not a heal.
-                    output::warn(&format!(
-                        "Automatic mailbox reconstruction refused promotion \
-                         (live database kept): {err}"
-                    ));
-                    cleanup_stale_db_artifacts(&reconstruct_db_path)?;
-                    auto_reclaim_recovery_debris_after_heal(database_url, storage_root);
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            }
+            Ok(())
+        }
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission { error, .. }) => {
+            Err(CliError::Other(error.to_string()))
         }
     }
 }
@@ -7583,7 +7631,7 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
     run_startup_database_self_heal_with(
         &database_url,
         &storage_root,
-        || run_startup_doctor_repair_subprocess(&database_url, &storage_root, &backup_dir),
+        || run_startup_doctor_repair(&database_url, &storage_root, &backup_dir),
         |reconstruct_db_path| {
             handle_doctor_reconstruct_locked_with_path(
                 Some(reconstruct_db_path),
@@ -7596,76 +7644,23 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
     )
 }
 
-fn run_startup_doctor_repair_subprocess(
+fn run_startup_doctor_repair(
     database_url: &str,
     storage_root: &Path,
     backup_dir: &Path,
 ) -> CliResult<()> {
-    // Issue #127: the spawned `am doctor repair` subprocess crashes with
-    // "WAL file too small for header during rebuild" when a header-only or
-    // truncated WAL sidecar is still attached, which surfaces as a non-zero
-    // exit and traps `serve-http` in a systemd restart loop. The startup-checks
-    // path already quarantines such a WAL, but this subprocess entry point did
-    // not, so the symmetry gap let the crash through. Quarantine it here too
-    // before spawning — a header-only WAL has no committed frames, so detaching
-    // it is non-destructive (and forensics-preserving via quarantine).
-    if let Some(db_path) = sqlite_file_path_from_database_url(database_url) {
-        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
-        if let Ok(meta) = std::fs::metadata(&wal_path)
-            && mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path)
-            && let Some(quarantined) = quarantine_startup_sqlite_sidecar_if_exists(
-                &wal_path,
-                "header-only/truncated WAL before startup doctor repair",
-            )?
-        {
-            eprintln!(
-                "[info] Quarantined header-only/truncated WAL file {} to {} ({} bytes; < {} byte WAL header or invalid magic) before startup doctor repair",
-                wal_path.display(),
-                quarantined.display(),
-                meta.len(),
-                mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
-            );
-        }
-    }
-
-    let exe = std::env::current_exe().map_err(|error| {
-        CliError::Other(format!(
-            "failed to resolve current executable for startup database repair: {error}"
-        ))
-    })?;
-    let output = std::process::Command::new(&exe)
-        .arg("doctor")
-        .arg("repair")
-        .arg("--yes")
-        // br-bvq1x.4.4 (D4): startup self-heal is a controlled, pre-bind repair
-        // (this process is about to own the mailbox); bypass the interactive
-        // supervised-owner guard so boot self-heal behavior is unchanged.
-        .arg("--allow-live-owner")
-        .arg("--backup-dir")
-        .arg(backup_dir)
-        .env("AM_INTERFACE_MODE", "cli")
-        .env("DATABASE_URL", database_url)
-        .env("STORAGE_ROOT", storage_root)
-        .env("TUI_ENABLED", "false")
-        .output()
-        .map_err(|error| {
-            CliError::Other(format!(
-                "failed to run startup database repair subprocess {}: {error}",
-                exe.display()
-            ))
-        })?;
-    let output_text = startup_doctor_subprocess_output_text(&output);
-    replay_startup_doctor_subprocess_output(&output_text);
-    if !output.status.success() {
-        return Err(CliError::Other(format!(
-            "startup database repair subprocess exited with {}; output: {}",
-            output.status,
-            output_text.trim()
-        )));
-    }
-    Ok(())
+    handle_doctor_repair_with_options(
+        database_url,
+        storage_root,
+        backup_dir,
+        None,
+        false,
+        true,
+        DoctorRepairOptions::default(),
+    )
 }
 
+#[cfg(test)]
 fn startup_doctor_subprocess_output_text(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -7675,12 +7670,6 @@ fn startup_doctor_subprocess_output_text(output: &std::process::Output) -> Strin
         stdout.into_owned()
     } else {
         format!("{stdout}\n{stderr}")
-    }
-}
-
-fn replay_startup_doctor_subprocess_output(output: &str) {
-    for line in output.lines() {
-        ftui_runtime::ftui_println!("{line}");
     }
 }
 
@@ -9889,10 +9878,6 @@ where
     names.sort();
     names.dedup();
     names
-}
-
-fn doctor_legacy_fts_tables(conn: &mcp_agent_mail_db::DbConn) -> Vec<String> {
-    doctor_legacy_fts_tables_from_query(|sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()))
 }
 
 fn doctor_legacy_fts_tables_canonical(conn: &mcp_agent_mail_db::CanonicalDbConn) -> Vec<String> {
@@ -12435,7 +12420,8 @@ fn os_str_contains(value: &OsStr, needle: &OsStr) -> bool {
 }
 
 fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
-    let mut candidates: Vec<(std::time::SystemTime, bool, u8, PathBuf)> = Vec::new();
+    let mut candidates: Vec<(SqliteRecoveryCandidateName, std::time::SystemTime, PathBuf)> =
+        Vec::new();
     let Some(file_name) = path.file_name() else {
         return Vec::new();
     };
@@ -12447,18 +12433,19 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     };
 
     let bak = path.with_file_name(os_string_with_suffix(file_name, ".bak"));
-    if path_is_real_file(&bak) {
+    if path_is_real_file(&bak) && mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(&bak) {
         let modified = bak
             .metadata()
             .and_then(|meta| meta.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        candidates.push((modified, true, 0, bak));
+        if let Some(name) = bak
+            .file_name()
+            .and_then(|candidate| classify_sqlite_recovery_candidate_name(file_name, candidate))
+        {
+            candidates.push((name, modified, bak));
+        }
     }
 
-    let backup_prefix = os_string_with_suffix(file_name, ".backup-");
-    let backup_bak_prefix = os_string_with_suffix(file_name, ".bak.");
-    let recovery_prefix = os_string_with_suffix(file_name, ".recovery");
-    let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
     if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let candidate = entry.path();
@@ -12469,42 +12456,42 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let name = entry.file_name();
-
-            let priority = if os_str_starts_with(&name, &backup_bak_prefix) {
-                1
-            } else if os_str_starts_with(&name, &backup_prefix) {
-                2
-            } else if os_str_starts_with(&name, &recovery_prefix) {
-                3
-            } else {
+            let Some(classified) = classify_sqlite_recovery_candidate_name(file_name, &name) else {
                 continue;
             };
-            if sidecar_suffixes
-                .iter()
-                .any(|suffix| os_str_ends_with(&name, suffix.as_os_str()))
+            if classified.kind() == SqliteRecoveryCandidateKind::ProactiveBak
+                || !classified.kind().is_standalone_restore_eligible()
             {
+                // The exact `.bak` path was checked directly above so it is
+                // still available on filesystems that permit opening a file
+                // but deny directory enumeration. Exact `.recovery` and
+                // historical `.backup-*` generations are multi-file families
+                // and cannot be restored as a lone DB.
+                continue;
+            }
+            if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(&candidate) {
                 continue;
             }
             let modified = entry
                 .metadata()
                 .and_then(|meta| meta.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            candidates.push((modified, false, priority, candidate));
+            candidates.push((classified, modified, candidate));
         }
     }
 
     candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| b.3.cmp(&a.3))
+        a.0.cmp_newest_first(a.1, b.0, b.1)
+            .then_with(|| b.2.cmp(&a.2))
     });
-    candidates.into_iter().map(|(_, _, _, path)| path).collect()
+    candidates.into_iter().map(|(_, _, path)| path).collect()
 }
 
 fn find_healthy_sqlite_backup(path: &Path) -> Option<PathBuf> {
     for candidate in sqlite_backup_candidates(path) {
-        if let Ok(true) = sqlite_recovery_candidate_is_healthy_canonical(&candidate) {
+        if let Ok(true) =
+            mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(&candidate)
+        {
             return Some(candidate);
         }
     }
@@ -12813,18 +12800,25 @@ fn recover_sqlite_file_with_storage_root(
         // ensures the original DB is never removed until the replacement
         // is known-good (same pattern as the reconstruct path below).
         let temp_restore = next_doctor_artifact_path(path, "restore", "sqlite3");
-        std::fs::copy(&backup_path, &temp_restore).map_err(|e| {
-            CliError::Other(format!(
-                "failed to copy sqlite backup {} to temp path {}: {e}",
-                backup_path.display(),
-                temp_restore.display()
-            ))
-        })?;
-        if !sqlite_recovery_candidate_is_healthy_canonical(&temp_restore)? {
-            cleanup_doctor_temp_sqlite_artifact(&temp_restore);
+        stage_standalone_sqlite_main(&backup_path, &temp_restore, "sqlite backup recovery")?;
+        if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(&temp_restore)
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "failed to run full integrity check on staged sqlite backup {}: {error}",
+                    temp_restore.display()
+                ))
+            })?
+        {
+            preserve_doctor_temp_sqlite_artifact(&temp_restore);
             return Err(CliError::Other(format!(
-                "sqlite backup {} did not pass health check after copy (original is untouched)",
+                "sqlite backup {} did not pass full integrity check after copy (original is untouched)",
                 backup_path.display()
+            )));
+        }
+        if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(&temp_restore) {
+            return Err(CliError::Other(format!(
+                "staged sqlite backup {} gained companion state after validation; staged family was preserved and original is untouched",
+                temp_restore.display()
             )));
         }
         // Count the validated replacement BEFORE swapping it in.
@@ -12900,10 +12894,18 @@ fn recover_sqlite_file_with_storage_root(
                             ftui_runtime::ftui_eprintln!("Warning: {warning}");
                         }
                     }
-                    if !sqlite_recovery_candidate_is_healthy_canonical(&temp_reconstruct)? {
-                        cleanup_doctor_temp_sqlite_artifact(&temp_reconstruct);
+                    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(
+                        &temp_reconstruct,
+                    )
+                    .map_err(|error| {
+                        CliError::Other(format!(
+                            "failed to run full integrity check on reconstructed sqlite candidate {}: {error}",
+                            temp_reconstruct.display()
+                        ))
+                    })? {
+                        preserve_doctor_temp_sqlite_artifact(&temp_reconstruct);
                         return Err(CliError::Other(format!(
-                            "reconstruction from archive completed, but health checks \
+                            "reconstruction from archive completed, but full integrity checks \
                              still failed (original database is untouched at {})",
                             path.display()
                         )));
@@ -12933,7 +12935,7 @@ fn recover_sqlite_file_with_storage_root(
                 }
                 Err(e) => {
                     // Clean up partial temp file; original is safe.
-                    cleanup_doctor_temp_sqlite_artifact(&temp_reconstruct);
+                    preserve_doctor_temp_sqlite_artifact(&temp_reconstruct);
                     return Err(CliError::Other(format!(
                         "failed to reconstruct database from archive \
                          (original database is untouched): {e}"
@@ -12978,10 +12980,18 @@ fn reconcile_sqlite_file_with_archive_after_restore(
     path: &Path,
     storage_root: &Path,
 ) -> CliResult<()> {
-    let (_recovery_barrier, _drain) =
+    let (recovery_barrier, drain) =
         mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
             mcp_agent_mail_db::write_barrier::writer_drain_timeout(),
         );
+    if let mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut { remaining_writers } = drain {
+        drop(recovery_barrier);
+        return Err(CliError::Other(format!(
+            "archive reconciliation after restore deferred for {}: {remaining_writers} in-process writer(s) did not drain; no additional database generation was renamed",
+            path.display()
+        )));
+    }
+    let _recovery_barrier = recovery_barrier;
     reconcile_sqlite_file_with_archive(path, storage_root)
 }
 
@@ -18764,18 +18774,104 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
         None => std::env::current_dir()
             .map_err(|e| CliError::Other(format!("cannot determine cwd: {e}")))?,
     };
-    if start
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == ".beads")
-        && start.is_dir()
+
+    // A caller that names the Beads directory itself is asking for that exact
+    // workspace, not ancestor discovery. Validate without following arbitrary
+    // symlinks, and accept only a self-redirect so an explicit path cannot be
+    // silently rebound to an unrelated workspace.
+    if path.is_some()
+        && start
+            .file_name()
+            .is_some_and(beads_rust::config::is_beads_dir_name)
     {
-        return std::fs::canonicalize(&start).map_err(|e| {
+        let absolute = if start.is_absolute() {
+            start.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine cwd: {e}")))?
+                .join(&start)
+        };
+        validate_real_existing_directory(&absolute, "explicit beads directory")?;
+        let canonical = std::fs::canonicalize(&absolute).map_err(|e| {
             CliError::InvalidArgument(format!(
                 "cannot resolve beads directory {}: {e}",
-                start.display()
+                absolute.display()
             ))
-        });
+        })?;
+        if !canonical
+            .file_name()
+            .is_some_and(beads_rust::config::is_beads_dir_name)
+        {
+            return Err(CliError::InvalidArgument(format!(
+                "explicit beads directory resolved to an invalid target: {}",
+                canonical.display()
+            )));
+        }
+
+        let redirect_path = canonical.join("redirect");
+        if std::fs::symlink_metadata(&redirect_path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(CliError::InvalidArgument(format!(
+                "explicit beads redirect must not be a symlink: {}",
+                redirect_path.display()
+            )));
+        }
+        if let Some(redirect) =
+            beads_rust::config::routing::read_redirect(&canonical).map_err(|e| {
+                CliError::InvalidArgument(format!(
+                    "cannot read explicit beads redirect {}: {e}",
+                    redirect_path.display()
+                ))
+            })?
+        {
+            let redirect = std::fs::canonicalize(&redirect).map_err(|e| {
+                CliError::InvalidArgument(format!(
+                    "cannot resolve explicit beads redirect {}: {e}",
+                    redirect.display()
+                ))
+            })?;
+            if redirect != canonical {
+                return Err(CliError::InvalidArgument(format!(
+                    "explicit beads directory {} redirects to a different workspace {}; pass the target project path explicitly",
+                    canonical.display(),
+                    redirect.display()
+                )));
+            }
+        }
+        return Ok(canonical);
+    }
+
+    // An explicit project path is an authority boundary: resolve only a Beads
+    // directory directly under that project and never let ambient BEADS_DIR
+    // redirect the request into a different workspace. Ancestor discovery and
+    // environment overrides remain available when no path was supplied.
+    if path.is_some() {
+        let absolute = if start.is_absolute() {
+            start.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine cwd: {e}")))?
+                .join(&start)
+        };
+        validate_real_existing_directory(&absolute, "explicit beads project")?;
+        for name in [".beads", "_beads"] {
+            let candidate = absolute.join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => return resolve_beads_dir(Some(&candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(CliError::InvalidArgument(format!(
+                        "cannot inspect beads directory {}: {error}",
+                        candidate.display()
+                    )));
+                }
+            }
+        }
+        return Err(CliError::InvalidArgument(format!(
+            "no beads directory found directly under explicit project {}",
+            absolute.display()
+        )));
     }
 
     let beads_dir = beads_rust::config::discover_beads_dir(Some(&start)).map_err(|e| {
@@ -18795,8 +18891,7 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
 fn beads_project_dir(beads_dir: &Path) -> PathBuf {
     if beads_dir
         .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == ".beads")
+        .is_some_and(beads_rust::config::is_beads_dir_name)
     {
         beads_dir
             .parent()
@@ -18820,11 +18915,21 @@ fn br_cli_path() -> PathBuf {
     PathBuf::from("br")
 }
 
-fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, String> {
+fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Command, String> {
+    let beads_dir_utf8 = beads_dir.to_str().ok_or_else(|| {
+        format!(
+            "cannot pin br to non-UTF-8 beads directory {}; Beads currently reads BEADS_DIR as UTF-8",
+            beads_dir.display()
+        )
+    })?;
     let project_dir = beads_project_dir(beads_dir);
-    let output = std::process::Command::new(br_cli_path())
-        .current_dir(&project_dir)
+    let mut command = std::process::Command::new(br_cli_path());
+    command
+        .current_dir(project_dir)
         .env("RUST_LOG", "error")
+        .env("BEADS_DIR", beads_dir_utf8)
+        .env_remove("BD_DB")
+        .env_remove("BD_DATABASE")
         .args([
             "--json",
             "--quiet",
@@ -18833,7 +18938,12 @@ fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, S
             "--no-auto-import",
             "--no-auto-flush",
         ])
-        .args(args)
+        .args(args);
+    Ok(command)
+}
+
+fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, String> {
+    let output = br_json_command(beads_dir, args)?
         .output()
         .map_err(|e| format!("failed to execute br: {e}"))?;
 
@@ -19751,10 +19861,8 @@ fn list_db_backups(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Vec<P
     let Some(db_name) = db_path.file_name() else {
         return Ok(Vec::new());
     };
-    let prefix = os_string_with_suffix(db_name, ".bak.");
-    let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
-
-    let mut backups: Vec<PathBuf> = Vec::new();
+    let mut backups: Vec<(SqliteRecoveryCandidateName, std::time::SystemTime, PathBuf)> =
+        Vec::new();
     let entries = std::fs::read_dir(backup_parent).map_err(|e| {
         CliError::Other(format!(
             "cannot list backup directory {}: {e}",
@@ -19770,17 +19878,27 @@ fn list_db_backups(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Vec<P
             continue;
         }
         let name = entry.file_name();
-        if os_str_starts_with(&name, &prefix)
-            && !sidecar_suffixes
-                .iter()
-                .any(|suffix| os_str_ends_with(&name, suffix.as_os_str()))
-        {
-            backups.push(path);
+        let Some(classified) = classify_sqlite_recovery_candidate_name(db_name, &name) else {
+            continue;
+        };
+        if classified.kind() != SqliteRecoveryCandidateKind::TimestampedBak {
+            continue;
         }
+        if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(&path) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        backups.push((classified, modified, path));
     }
 
-    backups.sort_by(|a, b| b.cmp(a)); // newest first because timestamp is embedded in filename
-    Ok(backups)
+    backups.sort_by(|a, b| {
+        a.0.cmp_newest_first(a.1, b.0, b.1)
+            .then_with(|| b.2.cmp(&a.2))
+    });
+    Ok(backups.into_iter().map(|(_, _, path)| path).collect())
 }
 
 fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -19789,7 +19907,87 @@ fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(sidecar_os)
 }
 
-const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 5] =
+    ["-journal", "-wal", "-shm", "-wal-cert", "-wal-cert-head"];
+
+fn stage_standalone_sqlite_main(
+    source: &Path,
+    destination: &Path,
+    operation: &str,
+) -> CliResult<()> {
+    if !path_is_real_file(source) {
+        return Err(CliError::Other(format!(
+            "{operation}: source {} is not a regular non-symlink file",
+            source.display()
+        )));
+    }
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(source) {
+        return Err(CliError::Other(format!(
+            "{operation}: source {} has companion SQLite or FrankenSQLite state; refusing to copy only its main file",
+            source.display()
+        )));
+    }
+    if path_is_occupied(destination)
+        || !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(destination)
+    {
+        return Err(CliError::Other(format!(
+            "{operation}: staged destination family {} is already occupied",
+            destination.display()
+        )));
+    }
+
+    let mut source_file =
+        mcp_agent_mail_core::disk::open_regular_file_no_follow(source).map_err(|error| {
+            CliError::Other(format!(
+                "{operation}: cannot open source {}: {error}",
+                source.display()
+            ))
+        })?;
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{operation}: cannot create staged destination {}: {error}",
+                destination.display()
+            ))
+        })?;
+    if let Err(error) = std::io::copy(&mut source_file, &mut destination_file) {
+        drop(destination_file);
+        preserve_doctor_temp_sqlite_artifact(destination);
+        return Err(CliError::Other(format!(
+            "{operation}: cannot copy {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )));
+    }
+    destination_file.sync_all().map_err(|error| {
+        CliError::Other(format!(
+            "{operation}: cannot sync staged destination {}: {error}",
+            destination.display()
+        ))
+    })?;
+    drop(destination_file);
+    drop(source_file);
+
+    if !path_is_real_file(source)
+        || !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(source)
+    {
+        preserve_doctor_temp_sqlite_artifact(destination);
+        return Err(CliError::Other(format!(
+            "{operation}: source {} changed generation shape while it was being staged; original destination is untouched",
+            source.display()
+        )));
+    }
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(destination) {
+        return Err(CliError::Other(format!(
+            "{operation}: companion state appeared beside staged destination {}; the staged family was preserved for inspection",
+            destination.display()
+        )));
+    }
+    Ok(())
+}
 
 fn remove_sqlite_artifact_file_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
@@ -19870,33 +20068,47 @@ fn validate_staged_sqlite_backup(
     staged_backup: &Path,
     backup_path: &Path,
 ) -> CliResult<()> {
-    if !sqlite_recovery_candidate_is_healthy_canonical(staged_backup)? {
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(staged_backup) {
         return Err(CliError::Other(format!(
-            "backup aborted: staged copy {} from {} failed health checks; backup {} was not created",
+            "backup aborted: staged copy {} from {} has companion SQLite or FrankenSQLite state; staged family was preserved and backup {} was not created",
             staged_backup.display(),
             source_db.display(),
             backup_path.display()
         )));
     }
-    sqlite_checkpoint_truncate(staged_backup).map_err(|e| {
-        CliError::Other(format!(
-            "backup aborted: staged copy {} from {} failed checkpoint validation: {e}; backup {} was not created",
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(staged_backup)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "backup aborted: full integrity check failed for staged copy {} from {}: {error}",
+                staged_backup.display(),
+                source_db.display()
+            ))
+        })?
+    {
+        return Err(CliError::Other(format!(
+            "backup aborted: staged copy {} from {} failed full integrity checks; backup {} was not created",
             staged_backup.display(),
             source_db.display(),
             backup_path.display()
-        ))
-    })?;
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        remove_sqlite_sidecar_if_exists(
-            &sqlite_sidecar_path(staged_backup, suffix),
-            "staged backup",
-        )?;
+        )));
+    }
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(staged_backup) {
+        return Err(CliError::Other(format!(
+            "backup aborted: staged copy {} gained companion state during validation; staged family was preserved and backup {} was not created",
+            staged_backup.display(),
+            backup_path.display()
+        )));
     }
     Ok(())
 }
 
 fn validate_real_existing_directory(path: &Path, label: &str) -> CliResult<()> {
-    let mut current = PathBuf::new();
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| CliError::Other(format!("cannot determine cwd: {error}")))?
+    };
     for component in path.components() {
         use std::path::Component;
 
@@ -19904,11 +20116,12 @@ fn validate_real_existing_directory(path: &Path, label: &str) -> CliResult<()> {
             Component::Prefix(prefix) => current.push(prefix.as_os_str()),
             Component::RootDir => current.push(component.as_os_str()),
             Component::CurDir => {}
+            // Resolve `..` only after every preceding component has been
+            // inspected. Thus `real/../target` works, while
+            // `symlink/../target` is rejected at the symlink before the pop
+            // can erase evidence of the traversal.
             Component::ParentDir => {
-                return Err(CliError::Other(format!(
-                    "refusing to traverse {label} with parent traversal: {}",
-                    path.display()
-                )));
+                let _ = current.pop();
             }
             Component::Normal(segment) => {
                 current.push(segment);
@@ -20021,7 +20234,7 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
         ))
     })?;
     if let Err(error) = validate_staged_sqlite_backup(source_db, &staged_backup, backup_path) {
-        cleanup_doctor_temp_sqlite_artifact(&staged_backup);
+        preserve_doctor_temp_sqlite_artifact(&staged_backup);
         return Err(error);
     }
     std::fs::rename(&staged_backup, backup_path).map_err(|e| {
@@ -20033,20 +20246,6 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
         ))
     })?;
 
-    Ok(())
-}
-
-fn remove_sqlite_sidecar_if_exists(sidecar_path: &Path, context: &str) -> CliResult<()> {
-    match std::fs::symlink_metadata(sidecar_path) {
-        Ok(_) => std::fs::remove_file(sidecar_path).map_err(|e| {
-            CliError::Other(format!(
-                "failed to remove {context} sidecar {}: {e}",
-                sidecar_path.display()
-            ))
-        })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(CliError::Io(err)),
-    }
     Ok(())
 }
 
@@ -20062,26 +20261,26 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
     let restore_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let staged_restore =
         next_doctor_artifact_path_with_timestamp(db_path, "restore", "sqlite3", &restore_ts);
-    std::fs::copy(backup_path, &staged_restore).map_err(|e| {
-        CliError::Other(format!(
-            "failed to copy backup {} to staged restore path {}: {e}",
-            backup_path.display(),
-            staged_restore.display()
-        ))
-    })?;
-    if !sqlite_recovery_candidate_is_healthy_canonical(&staged_restore)? {
-        cleanup_doctor_temp_sqlite_artifact(&staged_restore);
+    stage_standalone_sqlite_main(backup_path, &staged_restore, "sqlite backup restore")?;
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(&staged_restore)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to run full integrity check on staged restore {}: {error}",
+                staged_restore.display()
+            ))
+        })?
+    {
+        preserve_doctor_temp_sqlite_artifact(&staged_restore);
         return Err(CliError::Other(format!(
-            "backup {} did not pass health check after staging copy; live database is untouched",
+            "backup {} did not pass full integrity check after staging copy; live database is untouched",
             backup_path.display()
         )));
     }
-    for (suffix, label) in [
-        ("-journal", "staged restore rollback-journal"),
-        ("-wal", "staged restore WAL"),
-        ("-shm", "staged restore SHM"),
-    ] {
-        remove_sqlite_sidecar_if_exists(&sqlite_sidecar_path(&staged_restore, suffix), label)?;
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(&staged_restore) {
+        return Err(CliError::Other(format!(
+            "staged restore {} gained companion state after validation; staged family was preserved and live database is untouched",
+            staged_restore.display()
+        )));
     }
 
     if db_path.exists() {
@@ -20089,11 +20288,11 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
         let rollback_backup =
             next_sqlite_backup_artifact_path_with_timestamp(db_path, "pre_rollback", &rollback_ts);
         if let Err(error) = ensure_real_file_target_path(&rollback_backup, "pre-rollback backup") {
-            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
+            preserve_doctor_temp_sqlite_artifact(&staged_restore);
             return Err(error);
         }
         std::fs::copy(db_path, &rollback_backup).map_err(|e| {
-            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
+            preserve_doctor_temp_sqlite_artifact(&staged_restore);
             CliError::Other(format!(
                 "failed to create pre-rollback backup {}: {e}",
                 rollback_backup.display()
@@ -20109,18 +20308,6 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
                 db_path.display()
             ))
         })?;
-
-    // Never restore rollback-journal/WAL/SHM sidecars from backup artifacts.
-    // Sidecars can be stale/inconsistent relative to the copied main DB and
-    // have repeatedly caused malformed-image failures. Let SQLite recreate
-    // fresh sidecars.
-    for (suffix, label) in [
-        ("-journal", "post-restore rollback-journal"),
-        ("-wal", "post-restore WAL"),
-        ("-shm", "post-restore SHM"),
-    ] {
-        remove_sqlite_sidecar_if_exists(&sqlite_sidecar_path(db_path, suffix), label)?;
-    }
 
     if !sqlite_file_is_healthy(db_path)? {
         return Err(CliError::Other(format!(
@@ -45486,13 +45673,26 @@ http_headers = { Authorization = "Bearer secret" }
 
         let older = dir.path().join("storage.sqlite3.bak.20260101_000000");
         let newer = dir.path().join("storage.sqlite3.bak.20260102_000000");
+        let private_stage = dir
+            .path()
+            .join("storage.sqlite3.bak.backup-stage-20260103_000000");
+        let metadata = dir.path().join("storage.sqlite3.bak.meta.json");
+        let metadata_stage = dir.path().join("storage.sqlite3.bak.meta.json.tmp");
+        let historical = dir.path().join("storage.sqlite3.backup-20260104-000000");
         std::fs::write(&older, b"old").expect("write old backup");
         std::fs::write(&newer, b"new").expect("write new backup");
+        std::fs::write(&private_stage, b"private stage").expect("write private stage");
+        std::fs::write(&metadata, b"metadata").expect("write metadata");
+        std::fs::write(&metadata_stage, b"metadata stage").expect("write metadata stage");
+        std::fs::write(&historical, b"historical multi-file generation")
+            .expect("write historical backup");
 
         let backups = list_db_backups(&db_path, Some(dir.path())).expect("list backups");
-        assert_eq!(backups.len(), 2);
-        assert_eq!(backups[0], newer);
-        assert_eq!(backups[1], older);
+        assert_eq!(
+            backups,
+            vec![newer, older],
+            "rollback inventory must exclude unpublished stages and control metadata"
+        );
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -45519,7 +45719,11 @@ http_headers = { Authorization = "Bearer secret" }
         std::fs::write(&newer_wal, b"stale wal").expect("write wal sidecar");
 
         let backups = list_db_backups(&db_path, Some(dir.path())).expect("list backups");
-        assert_eq!(backups, vec![newer, older]);
+        assert_eq!(
+            backups,
+            vec![older],
+            "rollback must not list a main file whose WAL family would be discarded"
+        );
     }
 
     #[cfg(unix)]
@@ -45661,6 +45865,8 @@ http_headers = { Authorization = "Bearer secret" }
                 .expect("open marker db"),
             "CLI marker fixture write",
         );
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("create mailbox schema");
         conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT)")
             .expect("create marker table");
         conn.execute_raw("DELETE FROM marker")
@@ -45690,7 +45896,7 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
-    fn restore_db_from_backup_replaces_contents() {
+    fn restore_db_from_backup_rejects_backup_companion_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let backup_path = dir.path().join("storage.sqlite3.bak.20260102_000000");
@@ -45699,82 +45905,82 @@ http_headers = { Authorization = "Bearer secret" }
         write_marker_db(&db_path, "live-db");
         write_marker_db(&backup_source_path, "backup-db");
         std::fs::copy(&backup_source_path, &backup_path).expect("seed backup db");
+        let live_bytes = std::fs::read(&db_path).expect("read live witness");
+        let backup_bytes = std::fs::read(&backup_path).expect("read backup witness");
 
-        let db_journal = sqlite_sidecar_path(&db_path, "-journal");
-        let db_wal = sqlite_sidecar_path(&db_path, "-wal");
-        let db_shm = sqlite_sidecar_path(&db_path, "-shm");
         let backup_journal = sqlite_sidecar_path(&backup_path, "-journal");
         let backup_wal = sqlite_sidecar_path(&backup_path, "-wal");
         let backup_shm = sqlite_sidecar_path(&backup_path, "-shm");
-        std::fs::write(&db_journal, b"live-journal").expect("write live journal");
-        std::fs::write(&db_wal, b"live-wal").expect("write live wal");
-        std::fs::write(&db_shm, b"live-shm").expect("write live shm");
         std::fs::write(&backup_journal, b"backup-journal").expect("write backup journal");
         std::fs::write(&backup_wal, b"backup-wal").expect("write backup wal");
         std::fs::write(&backup_shm, b"backup-shm").expect("write backup shm");
 
-        restore_db_from_backup(&db_path, &backup_path).expect("restore");
-        let restored = read_marker_db(&db_path);
-        assert_eq!(restored, "backup-db");
+        let error = restore_db_from_backup(&db_path, &backup_path)
+            .expect_err("a multi-file backup generation must not be truncated to its main file");
         assert!(
-            !db_journal.exists(),
-            "restore should remove stale rollback journals instead of preserving them"
+            error
+                .to_string()
+                .contains("has companion SQLite or FrankenSQLite state"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read live after rejection"),
+            live_bytes,
+            "rejection must leave the live main byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(&backup_path).expect("read backup after rejection"),
+            backup_bytes,
+            "rejection must leave the backup main byte-identical"
+        );
+        assert_eq!(std::fs::read(&backup_journal).unwrap(), b"backup-journal");
+        assert_eq!(std::fs::read(&backup_wal).unwrap(), b"backup-wal");
+        assert_eq!(std::fs::read(&backup_shm).unwrap(), b"backup-shm");
+    }
+
+    #[test]
+    fn restore_db_from_backup_rejects_committed_wal_only_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let backup_path = dir.path().join("storage.sqlite3.bak.20260102_000000");
+        let backup_source = dir.path().join("backup-source.sqlite3");
+        write_marker_db(&db_path, "live-db");
+        write_marker_db(&backup_source, "backup-main");
+        std::fs::copy(&backup_source, &backup_path).expect("seed backup main");
+
+        let backup_writer = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            backup_path
+                .to_str()
+                .expect("temporary path should be valid UTF-8"),
+        )
+        .expect("open backup writer");
+        backup_writer
+            .execute_raw("PRAGMA journal_mode = WAL")
+            .expect("enable WAL");
+        backup_writer
+            .execute_raw("UPDATE marker SET value = 'committed-only-in-wal'")
+            .expect("commit WAL-only marker");
+        let backup_wal = sqlite_sidecar_path(&backup_path, "-wal");
+        assert!(
+            std::fs::metadata(&backup_wal).is_ok_and(|metadata| metadata.len() > 32),
+            "fixture must retain committed frames beside the backup main"
         );
 
-        if db_wal.exists() {
-            let wal_bytes = std::fs::read(&db_wal).expect("read restored wal");
-            assert_ne!(wal_bytes, b"backup-wal");
-        }
-        if db_shm.exists() {
-            let shm_bytes = std::fs::read(&db_shm).expect("read restored shm");
-            assert_ne!(shm_bytes, b"backup-shm");
-        }
-
-        let quarantined_sidecar = |suffix: &str| {
-            let prefix = format!("storage.sqlite3{suffix}.corrupt-");
-            std::fs::read_dir(dir.path())
-                .expect("read dir")
-                .flatten()
-                .map(|entry| entry.path())
-                .find(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(&prefix))
-                })
-                .expect("missing quarantined sqlite sidecar")
-        };
-        assert_eq!(
-            std::fs::read(quarantined_sidecar("-journal")).expect("read quarantined journal"),
-            b"live-journal",
-            "restore should preserve live rollback journal as a quarantined artifact"
+        let error = restore_db_from_backup(&db_path, &backup_path)
+            .expect_err("restore must not discard committed backup WAL frames");
+        assert!(
+            error
+                .to_string()
+                .contains("has companion SQLite or FrankenSQLite state"),
+            "unexpected error: {error}"
         );
         assert_eq!(
-            std::fs::read(quarantined_sidecar("-wal")).expect("read quarantined wal"),
-            b"live-wal",
-            "restore should preserve live WAL as a quarantined artifact"
+            read_marker_db(&db_path),
+            "live-db",
+            "rejected backup family must not disturb the live database"
         );
-        assert_eq!(
-            std::fs::read(quarantined_sidecar("-shm")).expect("read quarantined shm"),
-            b"live-shm",
-            "restore should preserve live SHM as a quarantined artifact"
-        );
-
-        let backup_prefix = "storage.sqlite3.pre_rollback.";
-        let rollback_artifacts: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(backup_prefix))
-            })
-            .collect();
-        assert_eq!(
-            rollback_artifacts.len(),
-            1,
-            "expected one pre-rollback backup artifact"
-        );
+        assert!(backup_wal.exists(), "backup WAL must remain inspectable");
+        drop(backup_writer);
     }
 
     #[test]
@@ -45840,7 +46046,7 @@ http_headers = { Authorization = "Bearer secret" }
             restore_db_from_backup(&db_path, &backup_path).expect_err("restore should fail closed");
         let msg = err.to_string();
         assert!(
-            msg.contains("did not pass health check after staging copy"),
+            msg.contains("did not pass full integrity check after staging copy"),
             "unexpected error: {msg}"
         );
         assert_eq!(
@@ -52517,31 +52723,143 @@ startup_timeout_sec = 42
         std::fs::write(&db_path, b"not-a-database")
             .expect("plant the live DB that promotion refusal must keep");
         let db_url = format!("sqlite:///{}", db_path.display());
-        let reconstruct_called = std::cell::Cell::new(false);
+        let reconstruct_calls = std::cell::Cell::new(0_u32);
+        let refusal = || {
+            Err(CliError::Other(
+                "reconstruction succeeded but final database promotion failed: \
+                 recovery candidate would lose stable coordination keys from \
+                 live.sqlite3 (messages=951, message_recipients=3776); refusing promotion"
+                    .to_string(),
+            ))
+        };
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "1"),
+                ("AM_RECOVERY_BREAKER_COOLDOWN_SECS", "86400"),
+            ],
+            || {
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    dir.path(),
+                    || panic!("promotion-refusal fixture should not repair"),
+                    |_| {
+                        reconstruct_calls.set(reconstruct_calls.get() + 1);
+                        refusal()
+                    },
+                )
+                .expect("promotion refusal must keep the live DB and continue startup");
+                assert!(
+                    db_path.is_file(),
+                    "fail-open must not remove the live database it claimed to keep"
+                );
+
+                let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
+                    .expect("load durable breaker")
+                    .expect("failed attempt must persist breaker authority");
+                assert!(breaker.tripped);
+                assert_eq!(breaker.consecutive_failures, 1);
+                let sidecar = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+                let breaker_bytes = std::fs::read(&sidecar).expect("read breaker witness");
+                let entries_before = std::fs::read_dir(dir.path())
+                    .expect("list recovery directory")
+                    .map(|entry| entry.expect("directory entry").file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    dir.path(),
+                    || panic!("open breaker must skip repair"),
+                    |_| {
+                        reconstruct_calls.set(reconstruct_calls.get() + 1);
+                        refusal()
+                    },
+                )
+                .expect("an open breaker with a live DB must park recovery and boot");
+
+                let entries_after = std::fs::read_dir(dir.path())
+                    .expect("re-list recovery directory")
+                    .map(|entry| entry.expect("directory entry").file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(entries_after, entries_before);
+                assert_eq!(
+                    std::fs::read(&sidecar).expect("re-read breaker witness"),
+                    breaker_bytes,
+                    "a refused startup must not rewrite its breaker authority"
+                );
+            },
+        );
+
+        assert_eq!(
+            reconstruct_calls.get(),
+            1,
+            "the second startup must be refused before reconstruction or forensics"
+        );
+    }
+
+    #[test]
+    fn startup_open_breaker_never_quarantines_truncated_wal_or_shm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("live.sqlite3");
+        seed_project_only_db(&db_path, "live-project", "/live-project");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm = PathBuf::from(format!("{}-shm", db_path.display()));
+        let wal_bytes = b"truncated-wal";
+        let shm_bytes = b"coordination-shm";
+        std::fs::write(&wal, wal_bytes).expect("plant truncated WAL");
+        std::fs::write(&shm, shm_bytes).expect("plant SHM evidence");
+        let now_unix = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+        )
+        .expect("test time fits i64");
+        mcp_agent_mail_db::recovery_breaker::store(
+            &db_path,
+            &mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                schema: 1,
+                db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+                consecutive_failures: 1,
+                last_failure_unix: now_unix,
+                last_failure_reason: "parked recovery".to_string(),
+                tripped: true,
+            },
+        )
+        .expect("plant tripped breaker authority");
+        let entries_before = std::fs::read_dir(dir.path())
+            .expect("list fixture directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let repair_calls = std::cell::Cell::new(0_u32);
+        let reconstruct_calls = std::cell::Cell::new(0_u32);
 
         run_startup_database_self_heal_with(
             &db_url,
             dir.path(),
-            || panic!("promotion-refusal fixture should not repair"),
+            || {
+                repair_calls.set(repair_calls.get() + 1);
+                Ok(())
+            },
             |_| {
-                reconstruct_called.set(true);
-                Err(CliError::Other(
-                    "reconstruction succeeded but final database promotion failed: \
-                     recovery candidate would lose stable coordination keys from \
-                     live.sqlite3 (messages=951, message_recipients=3776); refusing promotion"
-                        .to_string(),
-                ))
+                reconstruct_calls.set(reconstruct_calls.get() + 1);
+                Ok(())
             },
         )
-        .expect("promotion refusal must keep the live DB and continue startup");
-        assert!(
-            db_path.is_file(),
-            "fail-open must not remove the live database it claimed to keep"
-        );
+        .expect("tripped startup keeps the live DB and boots");
 
-        assert!(
-            reconstruct_called.get(),
-            "reconstruct runner should still be attempted"
+        assert_eq!(repair_calls.get(), 0);
+        assert_eq!(reconstruct_calls.get(), 0);
+        assert_eq!(std::fs::read(&wal).expect("read untouched WAL"), wal_bytes);
+        assert_eq!(std::fs::read(&shm).expect("read untouched SHM"), shm_bytes);
+        let entries_after = std::fs::read_dir(dir.path())
+            .expect("re-list fixture directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            entries_after, entries_before,
+            "breaker refusal must occur before cleanup quarantine or forensic capture"
         );
     }
 
@@ -56502,23 +56820,45 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn cleanup_doctor_temp_sqlite_artifact_removes_orphan_sidecars() {
+    fn preserve_doctor_temp_sqlite_artifact_quarantines_standalone_and_keeps_families() {
         let tmp = tempfile::tempdir().unwrap();
+        let standalone = tmp.path().join("standalone-stage.sqlite3");
+        std::fs::write(&standalone, b"owned standalone stage").unwrap();
+        preserve_doctor_temp_sqlite_artifact(&standalone);
+        assert!(!standalone.exists(), "the stage should move, not be copied");
+        let preserved = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(".reconstruct-failed-"))
+            })
+            .expect("standalone stage must remain under a retention-visible name");
+        assert_eq!(
+            std::fs::read(&preserved).unwrap(),
+            b"owned standalone stage"
+        );
+
         let temp_db_path = tmp.path().join("storage.sqlite3.restore.sqlite3");
         let journal_path = sqlite_sidecar_path(&temp_db_path, "-journal");
         let wal_path = sqlite_sidecar_path(&temp_db_path, "-wal");
         let shm_path = sqlite_sidecar_path(&temp_db_path, "-shm");
 
+        std::fs::write(&temp_db_path, b"staged main witness").unwrap();
         std::fs::write(&journal_path, b"stale-journal").unwrap();
         std::fs::write(&wal_path, b"stale-wal").unwrap();
         std::fs::write(&shm_path, b"stale-shm").unwrap();
 
-        cleanup_doctor_temp_sqlite_artifact(&temp_db_path);
+        preserve_doctor_temp_sqlite_artifact(&temp_db_path);
 
-        assert!(!temp_db_path.exists());
-        assert!(!journal_path.exists());
-        assert!(!wal_path.exists());
-        assert!(!shm_path.exists());
+        assert_eq!(
+            std::fs::read(&temp_db_path).unwrap(),
+            b"staged main witness"
+        );
+        assert_eq!(std::fs::read(&journal_path).unwrap(), b"stale-journal");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"stale-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"stale-shm");
     }
 
     #[test]
@@ -59487,6 +59827,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         let (mut storage, _paths) =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
@@ -59866,6 +60207,153 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn resolve_beads_dir_treats_explicit_dot_and_underscore_directories_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dot_beads = dir.path().join(".beads");
+        let underscore_beads = dir.path().join("_beads");
+        std::fs::create_dir_all(&dot_beads).expect("create .beads");
+        std::fs::create_dir_all(&underscore_beads).expect("create _beads");
+
+        assert_eq!(
+            resolve_beads_dir(Some(&dot_beads)).expect("resolve explicit .beads"),
+            std::fs::canonicalize(&dot_beads).expect("canonical .beads")
+        );
+        assert_eq!(
+            resolve_beads_dir(Some(&underscore_beads)).expect("resolve explicit _beads"),
+            std::fs::canonicalize(&underscore_beads).expect("canonical _beads"),
+            "an explicit _beads path must not lose to a sibling .beads"
+        );
+    }
+
+    #[test]
+    fn resolve_beads_dir_explicit_project_outranks_ambient_beads_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_project = dir.path().join("target-project");
+        let target_beads = target_project.join(".beads");
+        let ambient_project = dir.path().join("ambient-project");
+        let ambient_beads = ambient_project.join(".beads");
+        std::fs::create_dir_all(&target_beads).expect("create target .beads");
+        std::fs::create_dir_all(&ambient_beads).expect("create ambient .beads");
+        let ambient_text = ambient_beads
+            .to_str()
+            .expect("temporary path should be valid UTF-8");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("BEADS_DIR", ambient_text)],
+            || {
+                assert_eq!(
+                    resolve_beads_dir(Some(&target_project))
+                        .expect("resolve explicit project despite poisoned environment"),
+                    std::fs::canonicalize(&target_beads).expect("canonical target .beads")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_beads_dir_accepts_parent_components_after_checking_preceding_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let current = dir.path().join("current");
+        let beads = dir.path().join("project/.beads");
+        std::fs::create_dir_all(&current).expect("create current directory");
+        std::fs::create_dir_all(&beads).expect("create target .beads");
+        let _cwd = CwdGuard::chdir(&current);
+
+        assert_eq!(
+            resolve_beads_dir(Some(Path::new("../project/.beads")))
+                .expect("resolve explicit relative .beads path"),
+            std::fs::canonicalize(&beads).expect("canonical target .beads")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_beads_dir_rejects_explicit_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_project = dir.path().join("real-project");
+        let real_beads = real_project.join(".beads");
+        let linked_project = dir.path().join("linked-project");
+        let leaf_link = dir.path().join(".beads");
+        std::fs::create_dir_all(&real_beads).expect("create real .beads");
+        symlink(&real_project, &linked_project).expect("symlink project ancestor");
+        symlink(&real_beads, &leaf_link).expect("symlink .beads leaf");
+
+        for path in [linked_project.join(".beads"), leaf_link] {
+            let error = resolve_beads_dir(Some(&path))
+                .expect_err("explicit beads paths must reject arbitrary symlinks");
+            assert!(
+                error.to_string().contains("must not be a symlink"),
+                "unexpected error for {}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_beads_dir_allows_only_self_redirect_in_exact_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source/.beads");
+        let target = dir.path().join("target/.beads");
+        std::fs::create_dir_all(&source).expect("create source .beads");
+        std::fs::create_dir_all(&target).expect("create target .beads");
+
+        std::fs::write(source.join("redirect"), ".").expect("write self redirect");
+        assert_eq!(
+            resolve_beads_dir(Some(&source)).expect("self redirect should resolve"),
+            std::fs::canonicalize(&source).expect("canonical source")
+        );
+
+        std::fs::write(
+            source.join("redirect"),
+            target
+                .to_str()
+                .expect("temporary path should be valid UTF-8"),
+        )
+        .expect("write foreign redirect");
+        let error = resolve_beads_dir(Some(&source))
+            .expect_err("exact mode must reject a redirect to another workspace");
+        assert!(
+            error
+                .to_string()
+                .contains("redirects to a different workspace"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn br_json_command_pins_the_validated_beads_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let beads_dir = dir.path().join("_beads");
+        std::fs::create_dir_all(&beads_dir).expect("create _beads");
+        let beads_dir = std::fs::canonicalize(beads_dir).expect("canonical _beads");
+        let command = br_json_command(&beads_dir, &["status".to_string()]).expect("build command");
+        let env = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(command.get_current_dir(), beads_dir.parent());
+        assert_eq!(
+            env.get(OsStr::new("BEADS_DIR")).copied().flatten(),
+            Some(beads_dir.as_os_str())
+        );
+        assert_eq!(env.get(OsStr::new("BD_DB")), Some(&None));
+        assert_eq!(env.get(OsStr::new("BD_DATABASE")), Some(&None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn br_json_command_fails_closed_for_non_utf8_beads_directory() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/\xFF/.beads".to_vec()));
+        let error = br_json_command(&path, &["status".to_string()])
+            .expect_err("Beads cannot consume a non-UTF-8 BEADS_DIR pin");
+        assert!(error.contains("non-UTF-8 beads directory"));
+    }
+
+    #[test]
     fn handle_beads_status_on_fresh_db() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -59873,6 +60361,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         // Initialize a fresh beads storage (creates the DB)
         let storage =
@@ -59905,6 +60394,7 @@ startup_timeout_sec = 42
         let nested = dir.path().join("crates/mcp-agent-mail-cli");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
         std::fs::create_dir_all(&nested).expect("create nested dir");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         let storage =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
@@ -59933,6 +60423,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         let (mut storage, _paths) =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
@@ -59981,6 +60472,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create .beads");
+        let beads_dir = std::fs::canonicalize(&beads_dir).expect("canonicalize .beads");
 
         let storage =
             beads_rust::config::open_storage(&beads_dir, None, None).expect("open storage");
@@ -67065,18 +67557,19 @@ startup_timeout_sec = 42
         let db_path = dir.path().join("storage.sqlite3");
         let db_path_str = db_path.to_string_lossy().into_owned();
 
-        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
-        conn.execute_raw("CREATE TABLE marker(value TEXT)")
-            .expect("create marker table");
-        conn.execute_raw("INSERT INTO marker(value) VALUES('from-ts-backup')")
-            .expect("seed marker");
-        let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-        drop(conn);
+        write_marker_db(&db_path, "from-ts-backup");
 
         let sibling_bak = PathBuf::from(format!("{}.bak", db_path.display()));
         std::fs::copy(&db_path, &sibling_bak).expect("create stale sibling .bak");
-        let stale_conn = mcp_agent_mail_db::DbConn::open_file(sibling_bak.display().to_string())
-            .expect("open stale sibling .bak");
+        let stale_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            sibling_bak
+                .to_str()
+                .expect("temporary path should be valid UTF-8"),
+        )
+        .expect("open stale sibling .bak");
+        stale_conn
+            .execute_raw("PRAGMA journal_mode = DELETE")
+            .expect("keep stale fixture standalone");
         stale_conn
             .execute_raw("DELETE FROM marker")
             .expect("clear stale marker");
@@ -67086,12 +67579,22 @@ startup_timeout_sec = 42
         let _ = stale_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(stale_conn);
 
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::File::options()
+            .write(true)
+            .open(&sibling_bak)
+            .expect("open stale .bak for timestamp control")
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .expect("backdate stale .bak mtime");
         let backup_path = db_path.with_file_name(format!(
             "{}.bak.20260303_000000",
-            db_path.file_name().unwrap_or_default().to_string_lossy()
+            db_path.file_name().unwrap_or_default().to_string_lossy(),
         ));
         std::fs::copy(&db_path, &backup_path).expect("create timestamped .bak backup");
+        assert_eq!(
+            sqlite_backup_candidates(&db_path),
+            vec![backup_path.clone(), sibling_bak.clone()],
+            "fixture must exercise timestamp/mtime ordering with two standalone candidates"
+        );
         std::fs::write(&db_path, b"THIS FILE IS CORRUPT").expect("corrupt primary");
 
         let storage_root_text = storage_root.to_string_lossy().to_string();
@@ -71601,38 +72104,30 @@ fn stage_archive_restore_snapshot(
     Ok((staged_db_dir, staged_db_path))
 }
 
-fn archive_restore_snapshot_check_ok(
-    conn: &mcp_agent_mail_db::CanonicalDbConn,
-    kind: mcp_agent_mail_db::CheckKind,
-) -> CliResult<bool> {
-    match sqlite_conn_check_ok_canonical(conn, kind) {
-        Ok(ok) => Ok(ok),
-        Err(error) => {
-            let message = error.to_string();
-            if is_sqlite_recovery_error_message(&message) || is_snapshot_conflict_cli_error(&error)
-            {
-                return Ok(false);
-            }
-            Err(error)
-        }
-    }
-}
-
 fn archive_restore_snapshot_is_healthy(snapshot_path: &Path) -> CliResult<bool> {
-    let path_string = snapshot_path.to_string_lossy().into_owned();
-    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&path_string).map_err(|e| {
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(snapshot_path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "cannot fully validate staged archive snapshot {}: {error}",
+                snapshot_path.display()
+            ))
+        })?
+    {
+        return Ok(false);
+    }
+
+    let path_string = snapshot_path.to_str().ok_or_else(|| {
+        CliError::Other(format!(
+            "staged archive snapshot path {} is not valid UTF-8",
+            snapshot_path.display()
+        ))
+    })?;
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path_string).map_err(|e| {
         CliError::Other(format!(
             "cannot open staged archive snapshot {}: {e}",
             snapshot_path.display()
         ))
     })?;
-
-    if !archive_restore_snapshot_check_ok(&conn, mcp_agent_mail_db::CheckKind::Quick)? {
-        return Ok(false);
-    }
-    if !archive_restore_snapshot_check_ok(&conn, mcp_agent_mail_db::CheckKind::Incremental)? {
-        return Ok(false);
-    }
 
     sqlite_conn_supports_required_reads_canonical(
         &conn,
@@ -71714,16 +72209,46 @@ fn archive_restore_health_error_requires_fts_cleanup(error: &CliError) -> bool {
 }
 
 fn cleanup_archive_restore_staged_snapshot_fts(snapshot_path: &Path) -> CliResult<bool> {
-    let path_str = snapshot_path.display().to_string();
-    let conn = match mcp_agent_mail_db::DbConn::open_file(&path_str) {
+    let path_str = snapshot_path.to_str().ok_or_else(|| {
+        CliError::Other(format!(
+            "staged archive snapshot path {} is not valid UTF-8",
+            snapshot_path.display()
+        ))
+    })?;
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(snapshot_path) {
+        return Err(CliError::Other(format!(
+            "staged archive snapshot {} has companion state before FTS cleanup",
+            snapshot_path.display()
+        )));
+    }
+    let conn = match mcp_agent_mail_db::CanonicalDbConn::open_file(path_str) {
         Ok(conn) => conn,
         Err(_) => return Ok(false),
     };
-    if doctor_legacy_fts_tables(&conn).is_empty() {
+    conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+        .map_err(|e| {
+            CliError::Other(format!(
+                "staged archive snapshot WAL checkpoint before FTS cleanup failed: {e}"
+            ))
+        })?;
+    conn.execute_raw("PRAGMA journal_mode = DELETE")
+        .map_err(|e| {
+            CliError::Other(format!(
+                "staged archive snapshot could not enter standalone DELETE journal mode: {e}"
+            ))
+        })?;
+    if doctor_legacy_fts_tables_canonical(&conn).is_empty() {
         return Ok(false);
     }
-    mcp_agent_mail_db::schema::enforce_runtime_fts_cleanup(&conn)
+    mcp_agent_mail_db::schema::enforce_runtime_fts_cleanup_canonical(&conn)
         .map_err(|e| CliError::Other(format!("staged archive snapshot FTS cleanup failed: {e}")))?;
+    drop(conn);
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(snapshot_path) {
+        return Err(CliError::Other(format!(
+            "staged archive snapshot {} retained companion state after canonical FTS cleanup",
+            snapshot_path.display()
+        )));
+    }
     Ok(true)
 }
 
@@ -74187,10 +74712,47 @@ fn restore_swapped_replacement_sqlite_artifact_without_original(
     Ok(())
 }
 
-fn cleanup_doctor_temp_sqlite_artifact(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
+fn preserve_doctor_temp_sqlite_artifact(path: &Path) {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to inspect staged SQLite artifact; preserving it in place"
+            );
+            return;
+        }
+    };
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(path) {
+        tracing::warn!(
+            path = %path.display(),
+            "preserving staged SQLite family because companion state is present"
+        );
+        return;
+    }
+    if !metadata.file_type().is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "staged SQLite artifact changed to a non-regular file; preserving it in place"
+        );
+        return;
+    }
+
+    let target = next_doctor_artifact_path(path, "reconstruct-failed", "sqlite3");
+    match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(path, &target) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            quarantine = %target.display(),
+            "preserved rejected standalone SQLite stage under a retention-visible quarantine name"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            quarantine = %target.display(),
+            %error,
+            "failed to quarantine rejected SQLite stage; source remains in place"
+        ),
     }
 }
 
@@ -74221,9 +74783,7 @@ fn quarantine_refused_reconstruct_candidate(
 fn doctor_temp_sqlite_artifact_conflicts(candidate: &Path, extension: &str) -> bool {
     path_is_occupied(candidate)
         || (extension.eq_ignore_ascii_case("sqlite3")
-            && SQLITE_RECOVERY_SIDECAR_SUFFIXES
-                .iter()
-                .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate, suffix))))
+            && !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(candidate))
 }
 
 #[derive(Debug, Clone)]
@@ -74800,7 +75360,7 @@ fn handle_doctor_reconstruct_with(
         Ok(stats) => stats,
         Err(e) => {
             // Clean up the partial temp file; original DB is safe.
-            cleanup_doctor_temp_sqlite_artifact(&temp_db_path);
+            preserve_doctor_temp_sqlite_artifact(&temp_db_path);
             return Err(CliError::Other(format!(
                 "reconstruction failed (original database is untouched): {e}"
             )));
@@ -74808,10 +75368,17 @@ fn handle_doctor_reconstruct_with(
     };
 
     // Validate the reconstructed temp DB before swapping.
-    if !sqlite_recovery_candidate_is_healthy_canonical(&temp_db_path)? {
-        cleanup_doctor_temp_sqlite_artifact(&temp_db_path);
+    if !mcp_agent_mail_db::sqlite_recovery_candidate_passes_full_integrity_check(&temp_db_path)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to run full integrity check on reconstructed database {}: {error}",
+                temp_db_path.display()
+            ))
+        })?
+    {
+        preserve_doctor_temp_sqlite_artifact(&temp_db_path);
         return Err(CliError::Other(format!(
-            "reconstructed database at {} did not pass health checks; \
+            "reconstructed database at {} did not pass full integrity checks; \
              original database is untouched",
             temp_db_path.display()
         )));

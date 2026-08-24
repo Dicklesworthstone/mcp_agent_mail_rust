@@ -2337,7 +2337,10 @@ fn probe_database(config: &Config) -> ProbeResult {
 ///
 /// When corruption is detected, attempts automatic recovery:
 ///
-/// 1. Restore from a healthy `.bak` / `.backup-*` / `.recovery*` file.
+/// 1. Restore from a healthy exact `.bak` or published
+///    `.bak.YYYYMMDD_HHMMSS[-NN]` file. Historical `.backup-*` generations
+///    and `.recovery` WAL families are excluded until recovery can settle and
+///    stage an unambiguous complete family.
 /// 2. If no healthy backup exists, reinitialize an empty database.
 ///
 /// Startup only fails if recovery itself fails. Successful recovery
@@ -2744,7 +2747,10 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
 /// Attempt file-level recovery when the integrity probe detects corruption.
 ///
 /// Uses the archive-aware recovery path which tries, in order:
-/// 1. Restore from a healthy `.bak` / `.backup-*` / `.recovery*` backup
+/// 1. Restore from a healthy exact `.bak` or published
+///    `.bak.YYYYMMDD_HHMMSS[-NN]` backup. Historical `.backup-*` generations
+///    and `.recovery` WAL families are excluded until family-aware settlement
+///    exists.
 /// 2. Reconstruct from the Git archive (recovers messages + agents)
 /// 3. Reinitialize an empty database (last resort)
 #[allow(dead_code)]
