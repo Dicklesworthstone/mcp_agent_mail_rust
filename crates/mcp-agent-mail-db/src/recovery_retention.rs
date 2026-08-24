@@ -524,10 +524,7 @@ pub fn classify_backup_file(file_name: &str) -> Option<BackupKind> {
                 | mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
         )
     });
-    if after_stem.starts_with("manual-backup-")
-        || strict_bak
-        || after_stem.starts_with("bak-")
-    {
+    if after_stem.starts_with("manual-backup-") || strict_bak || after_stem.starts_with("bak-") {
         return Some(BackupKind::ManualBackup);
     }
     if after_stem.starts_with("pre-migrate")

@@ -571,28 +571,19 @@ mod tests {
         fs::copy(&primary, &exact).expect("copy verified exact backup");
         mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 42)
             .expect("record verified authority");
-        let pinned = tmp
-            .path()
-            .join("storage.sqlite3.bak.20260101_000000");
+        let pinned = tmp.path().join("storage.sqlite3.bak.20260101_000000");
         fs::rename(&exact, &pinned).expect("rotate verified bytes");
         sleep(Duration::from_millis(5));
-        touch(
-            &tmp
-                .path()
-                .join("storage.sqlite3.bak.20260102_000000"),
-            13,
-        );
+        touch(&tmp.path().join("storage.sqlite3.bak.20260102_000000"), 13);
         sleep(Duration::from_millis(5));
-        touch(
-            &tmp
-                .path()
-                .join("storage.sqlite3.bak.20260103_000000"),
-            17,
-        );
+        touch(&tmp.path().join("storage.sqlite3.bak.20260103_000000"), 17);
 
         let report = rotate_with_delete_off(tmp.path(), 1);
 
-        assert!(pinned.is_file(), "the verified hash source must remain live");
+        assert!(
+            pinned.is_file(),
+            "the verified hash source must remain live"
+        );
         assert!(
             mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary).is_file(),
             "canonical snapshot authority must never enter rotation"
@@ -627,7 +618,10 @@ mod tests {
         assert_eq!(report.staged, 0);
         assert_eq!(report.deleted, 0);
         assert_eq!(report.kept, backups.len());
-        assert_eq!(fs::read(&metadata).unwrap(), b"untrusted snapshot authority");
+        assert_eq!(
+            fs::read(&metadata).unwrap(),
+            b"untrusted snapshot authority"
+        );
         for path in backups {
             assert!(path.is_file());
         }
