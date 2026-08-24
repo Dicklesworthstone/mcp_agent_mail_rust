@@ -7110,11 +7110,11 @@ body
             .execute_raw("INSERT INTO salvage_witness(value) VALUES (41);")
             .expect("commit WAL-only salvage witness");
         assert!(
-            crate::pool::sqlite_sidecar_path(&source_path, "-wal").is_file(),
+            mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_path, "-wal").is_file(),
             "fixture must retain a WAL sidecar"
         );
         assert!(
-            crate::pool::sqlite_sidecar_path(&source_path, "-shm").is_file(),
+            mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_path, "-shm").is_file(),
             "fixture must retain a SHM sidecar"
         );
         let source_before = exact_test_directory_files(source_dir.path());
@@ -7152,8 +7152,20 @@ body
             .expect("create source table");
         drop(source);
         let source_before = exact_test_directory_files(source_dir.path());
-        assert!(!crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-gate").exists());
-        assert!(!crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-use").exists());
+        assert!(
+            !mcp_agent_mail_core::disk::sqlite_sidecar_path(
+                &source_path,
+                "-fsqlite-ns-gate"
+            )
+            .exists()
+        );
+        assert!(
+            !mcp_agent_mail_core::disk::sqlite_sidecar_path(
+                &source_path,
+                "-fsqlite-ns-use"
+            )
+            .exists()
+        );
 
         let archive_dir = tempfile::tempdir().expect("archive tempdir");
         let storage_root = archive_dir.path().join("storage");

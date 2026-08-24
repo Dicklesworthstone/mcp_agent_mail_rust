@@ -15126,6 +15126,7 @@ mod tests {
         writer
             .execute_raw(
                 "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
                  CREATE TABLE analyze_probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL); \
                  CREATE INDEX analyze_probe_value_idx ON analyze_probe(value); \
                  WITH RECURSIVE seq(n) AS ( \
@@ -15205,6 +15206,7 @@ mod tests {
         writer
             .execute_raw(
                 "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
                  CREATE TABLE vacuum_probe(id INTEGER PRIMARY KEY, payload BLOB NOT NULL); \
                  WITH RECURSIVE seq(n) AS ( \
                      SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 384 \
@@ -15278,6 +15280,7 @@ mod tests {
         writer
             .execute_raw(
                 "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
                  CREATE TABLE checkpoint_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
             )
             .expect("seed checkpoint fixture");
@@ -15354,6 +15357,7 @@ mod tests {
         writer
             .execute_raw(&format!(
                 "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
                  PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS}; \
                  CREATE TABLE startup_probe(id INTEGER PRIMARY KEY);"
             ))
@@ -16159,16 +16163,10 @@ mod tests {
         let conn = open_sqlite_file_with_lock_retry(db_path_str)
             .expect("runtime sqlite should open before invariant check");
         conn.execute_raw(&format!(
-            "PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS};"
+            "PRAGMA journal_mode = DELETE; \
+             PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS};"
         ))
-        .expect("set required runtime busy_timeout");
-
-        let canonical = open_sqlite_file_with_lock_retry_canonical(db_path_str)
-            .expect("open canonical sqlite file");
-        canonical
-            .execute_raw("PRAGMA journal_mode=DELETE;")
-            .expect("force rollback journal mode");
-        drop(canonical);
+        .expect("set rollback mode and required runtime busy_timeout");
 
         let err = assert_required_startup_pragmas(&conn, db_path_str)
             .expect_err("DELETE-mode databases must fail the WAL startup invariant");
