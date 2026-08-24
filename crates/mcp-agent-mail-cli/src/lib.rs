@@ -7370,16 +7370,23 @@ where
 }
 
 fn cleanup_database_sidecars_after_startup_use(database_url: &str) -> CliResult<()> {
-    if let Some(db_path) = sqlite_file_path_from_database_url(database_url) {
-        cleanup_stale_db_activity_locks(&db_path)?;
-        let _outcome =
-            mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path).map_err(|error| {
-                CliError::Other(format!(
-                    "SQLite sidecar cleanup for {} failed or was refused: {error}",
-                    db_path.display()
-                ))
-            })?;
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url)
+        || sqlite_file_path_from_database_url(database_url).is_none()
+    {
+        return Ok(());
     }
+    // Use the same relative/absolute authority resolution as startup's
+    // mailbox lock and recovery admission. Cleaning the raw URL spelling can
+    // otherwise mutate a shadow family while the runtime used `/...`.
+    let db_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+    cleanup_stale_db_activity_locks(&db_path)?;
+    let _outcome =
+        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path).map_err(|error| {
+            CliError::Other(format!(
+                "SQLite sidecar cleanup for {} failed or was refused: {error}",
+                db_path.display()
+            ))
+        })?;
     Ok(())
 }
 

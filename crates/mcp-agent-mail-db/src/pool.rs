@@ -10960,6 +10960,11 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     crate::forensics::verify_recovery_receipt_state(recovery_receipt_root, primary_path)?;
     let exists = primary_path.exists();
     if exists {
+        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+            return with_recovery_admission(primary_path, "automatic sqlite recovery", || {
+                ensure_sqlite_file_healthy_inner(primary_path)
+            });
+        }
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
             return Ok(());
@@ -11061,6 +11066,13 @@ pub fn ensure_sqlite_file_healthy_with_archive(
 
     let had_primary = primary_path.exists();
     if had_primary {
+        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+            return with_recovery_admission(
+                primary_path,
+                "automatic sqlite archive recovery",
+                || ensure_sqlite_file_healthy_with_archive_inner(primary_path, storage_root),
+            );
+        }
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
             let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
@@ -20011,6 +20023,105 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(names_after, names_before);
         drop(writer);
+    }
+
+    #[test]
+    fn successful_sidecar_cleanup_does_not_clear_prior_recovery_failure_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("breaker-history-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        let config = crate::recovery_breaker::RecoveryBreakerConfig {
+            max_consecutive_failures: 3,
+            cooldown_secs: 21_600,
+        };
+        let fingerprint = crate::recovery_breaker::fingerprint_db(&db_path);
+        let prior = crate::recovery_breaker::record_failure(
+            None,
+            &fingerprint,
+            "prior whole-recovery failure",
+            config,
+            1_000,
+        );
+        crate::recovery_breaker::store(&db_path, &prior).expect("store prior breaker state");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes_before =
+            std::fs::read(&breaker_path).expect("read breaker before sidecar cleanup");
+
+        let outcome = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "3")],
+            || cleanup_truncated_wal_sidecar(&db_path),
+        )
+        .expect("admitted sidecar cleanup");
+
+        assert_eq!(
+            outcome,
+            SqliteFamilyCleanupOutcome::Quarantined {
+                wal: true,
+                shm: false,
+            }
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after sidecar cleanup"),
+            breaker_bytes_before,
+            "a sidecar-only mutation is not proof that whole-database recovery succeeded"
+        );
+    }
+
+    #[test]
+    fn nested_sidecar_cleanup_preserves_outer_recovery_failure_lineage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("outer-failure-cleanup.sqlite3");
+        std::fs::write(&db_path, b"corrupt primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        let config = crate::recovery_breaker::RecoveryBreakerConfig {
+            max_consecutive_failures: 3,
+            cooldown_secs: 21_600,
+        };
+        let fingerprint = crate::recovery_breaker::fingerprint_db(&db_path);
+        let prior = crate::recovery_breaker::record_failure(
+            None,
+            &fingerprint,
+            "first whole-recovery failure",
+            config,
+            1_000,
+        );
+        crate::recovery_breaker::store(&db_path, &prior).expect("store prior breaker state");
+
+        recovery_admission().reset();
+        let error = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "3")],
+            || {
+                with_recovery_admission(&db_path, "whole recovery fixture", || {
+                    cleanup_truncated_wal_sidecar(&db_path)?;
+                    Err::<(), SqlError>(SqlError::Custom(
+                        "terminal whole-recovery failure".to_string(),
+                    ))
+                })
+            },
+        )
+        .expect_err("outer recovery fixture must fail after admitted cleanup");
+        assert!(error.to_string().contains("terminal whole-recovery failure"));
+
+        let terminal = crate::recovery_breaker::load(&db_path)
+            .expect("load terminal breaker")
+            .expect("terminal breaker state");
+        assert_eq!(terminal.consecutive_failures, 2);
+        assert_eq!(
+            terminal.last_failure_reason,
+            "terminal whole-recovery failure"
+        );
+        assert!(
+            !wal_path.exists(),
+            "nested cleanup must run so the test is mutation-sensitive"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "outer-failure-cleanup.sqlite3-wal").len(),
+            1
+        );
+        recovery_admission().reset();
     }
 
     #[test]

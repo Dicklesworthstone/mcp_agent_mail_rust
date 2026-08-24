@@ -948,21 +948,13 @@ fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
         return;
     }
 
-    let db_path = match (DbPoolConfig {
-        database_url: config.database_url.clone(),
-        ..Default::default()
-    })
-    .sqlite_path()
-    {
-        Ok(path) if path != ":memory:" => PathBuf::from(path),
-        Ok(_) => return,
-        Err(error) => {
+    let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
+        if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
             tracing::warn!(
-                error = %error,
                 "skipping shutdown WAL cleanup because database URL could not be resolved"
             );
-            return;
         }
+        return;
     };
 
     // Do not checkpoint here before durable recovery admission: checkpointing
