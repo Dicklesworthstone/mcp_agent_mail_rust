@@ -3211,33 +3211,32 @@ impl DbPool {
         // WAL/SHM state. Once the runtime is already live, periodic cycles may
         // avoid that O(database-size) copy unless durable failure history for
         // these exact primary bytes requires the same fail-closed proof.
-        // Malformed breaker authority skips the costly probe and flows
-        // directly into admission, which refuses before opening either the
-        // election file or SQLite itself.
+        // Unreadable breaker authority also requires this proof: a healthy
+        // exact family may continue serving without recovery, while an
+        // unhealthy family flows into admission and refuses before opening
+        // either the election file or SQLite itself.
         let sqlite_path = Path::new(&self.sqlite_path);
-        let live_family_can_open_without_admission =
+        let breaker_requires_source_neutral_proof =
             match crate::recovery_breaker::load(sqlite_path) {
-                Err(_) => false,
-                Ok(_) if require_source_neutral_preopen_proof => {
-                    sqlite_file_is_healthy_without_family_cleanup(sqlite_path).map_err(|error| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check: source-neutral pre-open probe failed: {error}"
-                        ))
-                    })?
-                }
-                Ok(Some(state))
-                    if state.consecutive_failures > 0
+                Err(_) => true,
+                Ok(Some(state)) => {
+                    state.consecutive_failures > 0
                         && state.db_fingerprint
-                            == crate::recovery_breaker::fingerprint_db(sqlite_path) =>
-                {
-                    sqlite_file_is_healthy_without_family_cleanup(sqlite_path).map_err(|error| {
-                        DbError::Sqlite(format!(
-                            "startup integrity check: source-neutral pre-open probe failed: {error}"
-                        ))
-                    })?
+                            == crate::recovery_breaker::fingerprint_db(sqlite_path)
                 }
-                Ok(_) => true,
+                Ok(None) => false,
             };
+        let live_family_can_open_without_admission = if require_source_neutral_preopen_proof
+            || breaker_requires_source_neutral_proof
+        {
+            sqlite_file_is_healthy_without_family_cleanup(sqlite_path).map_err(|error| {
+                DbError::Sqlite(format!(
+                    "startup integrity check: source-neutral pre-open probe failed: {error}"
+                ))
+            })?
+        } else {
+            true
+        };
         let run_live_check = || -> DbResult<integrity::IntegrityCheckResult> {
             let conn = crate::guard_db_conn(
                 match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
@@ -5917,6 +5916,27 @@ async fn initialize_sqlite_file_once(
         && let Err(err) = reconcile_archive_state_before_init(path, storage_root)
     {
         return Outcome::Err(err);
+    }
+
+    // The sidecar classifier above catches damaged WAL/SHM, but a corrupt
+    // main-only family can still make the first writable engine open perform
+    // recovery-adjacent filesystem work before its error is returned. Prove a
+    // private copy of the exact family once at the initialization gate. If it
+    // is unhealthy, complete the admission-controlled recovery before either
+    // migrations or pooled connections open the live path. Missing files are
+    // normal fresh-start authority and remain the init path's responsibility.
+    if sqlite_path != ":memory:" && path.exists() {
+        match sqlite_file_is_healthy_without_family_cleanup(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) =
+                    recover_sqlite_file_with_storage_root(path, storage_root)
+                {
+                    return Outcome::Err(error);
+                }
+            }
+            Err(error) => return Outcome::Err(error),
+        }
     }
 
     match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
@@ -20514,6 +20534,88 @@ mod tests {
                 crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
             },
         );
+    }
+
+    #[test]
+    fn pool_init_breakers_preserve_corrupt_primary_before_engine_open() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("pool-main-only-{breaker_kind}.sqlite3"));
+            let primary_bytes = b"corrupt pool-init primary without sidecars";
+            std::fs::write(&db_path, primary_bytes).expect("write corrupt primary fixture");
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "pool main-only fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state)
+                    .expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let names_before = std::fs::read_dir(dir.path())
+                .expect("list pool main-only fixture before acquire")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(dir.path().join("storage")),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("construct lazy pool");
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build current-thread runtime");
+            let cx = Cx::for_testing();
+
+            recovery_admission().reset();
+            let error = match runtime.block_on(pool.acquire(&cx)) {
+                Outcome::Err(error) => error,
+                Outcome::Ok(_) => panic!("breaker authority must refuse main-only pool init"),
+                Outcome::Cancelled(reason) => {
+                    panic!("pool initialization was cancelled: {reason:?}")
+                }
+                Outcome::Panicked(payload) => {
+                    panic!("pool initialization panicked: {}", payload.message())
+                }
+            };
+
+            let expected = if breaker_kind == "malformed" {
+                "could not be trusted"
+            } else {
+                "circuit-broken"
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected {breaker_kind} pool-init refusal: {error}"
+            );
+            assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            let names_after = std::fs::read_dir(dir.path())
+                .expect("list pool main-only fixture after refusal")
+                .map(|entry| entry.expect("read fixture entry").file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                names_after, names_before,
+                "refused main-only pool init must not create SQLite, election, recovery, or forensic artifacts"
+            );
+            recovery_admission().reset();
+        }
     }
 
     #[test]
