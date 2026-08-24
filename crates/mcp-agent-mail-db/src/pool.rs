@@ -7084,6 +7084,7 @@ fn sqlite_file_is_healthy_staged(path: &Path) -> Result<bool, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
+#[cfg(test)]
 fn sqlite_file_is_healthy_with_compat_probe<F>(
     path: &Path,
     mut compatibility_probe: F,
@@ -7143,7 +7144,7 @@ pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, Sq
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
         return Ok(false);
     };

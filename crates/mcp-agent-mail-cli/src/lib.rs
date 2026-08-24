@@ -12113,6 +12113,7 @@ fn sqlite_recovery_candidate_is_healthy_canonical(path: &Path) -> CliResult<bool
     }
 }
 
+#[cfg(test)]
 fn handle_sqlite_compatibility_probe_result(
     path: &Path,
     result: CliResult<bool>,
@@ -12132,6 +12133,7 @@ fn handle_sqlite_compatibility_probe_result(
     }
 }
 
+#[cfg(test)]
 fn sqlite_file_is_healthy_with_compat_probe<F>(
     path: &Path,
     mut compatibility_probe: F,
@@ -12174,19 +12176,19 @@ where
 }
 
 fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
-    sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
-}
-
-fn sqlite_file_is_healthy_read_only(path: &Path) -> CliResult<bool> {
     if !path.exists() {
         return Ok(true);
     }
+    mcp_agent_mail_db::pool::sqlite_file_is_healthy(path).map_err(|error| {
+        CliError::Other(format!(
+            "source-byte-neutral SQLite health check failed for {}: {error}",
+            path.display()
+        ))
+    })
+}
 
-    let conn = doctor_open_canonical_readonly_db_for_diagnostic(path, "health_check")?;
-    if !sqlite_conn_quick_check_ok_canonical(&conn)? {
-        return Ok(false);
-    }
-    sqlite_conn_incremental_check_ok_canonical(&conn)
+fn sqlite_file_is_healthy_read_only(path: &Path) -> CliResult<bool> {
+    sqlite_file_is_healthy(path)
 }
 
 fn sqlite_doctor_sanity_with_health_probe<F>(
