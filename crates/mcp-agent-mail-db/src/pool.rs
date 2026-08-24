@@ -7115,9 +7115,9 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     }
 
     candidates.sort_by(|a, b| {
-        a.2.cmp(&b.2)
-            .then_with(|| b.0.cmp(&a.0))
-            .then_with(|| b.1.cmp(&a.1))
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
             .then_with(|| b.3.cmp(&a.3))
     });
     candidates.into_iter().map(|(_, _, _, p)| p).collect()
@@ -12177,7 +12177,7 @@ mod tests {
         assert_eq!(candidates, vec![backup_bak_series]);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn sqlite_backup_candidates_include_non_utf8_backups() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -612,7 +612,9 @@ pub fn retention_resident_stats(
     let recovery_debris = enumerate_recovery_debris(storage_root, database_path);
     let recovery_paths = recovery_debris
         .iter()
-        .map(|artifact| artifact.path.clone())
+        .map(|artifact| {
+            std::fs::canonicalize(&artifact.path).unwrap_or_else(|_| artifact.path.clone())
+        })
         .collect::<std::collections::BTreeSet<_>>();
 
     let mut resident_bytes_by_category: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -629,7 +631,9 @@ pub fn retention_resident_stats(
     let mut direct_backup_only_artifacts = 0_usize;
     let mut direct_backup_only_bytes = 0_u64;
     for artifact in &backup_inventory.artifacts {
-        if recovery_paths.contains(&artifact.path) {
+        let identity =
+            std::fs::canonicalize(&artifact.path).unwrap_or_else(|_| artifact.path.clone());
+        if recovery_paths.contains(&identity) {
             continue;
         }
         direct_backup_only_artifacts += 1;

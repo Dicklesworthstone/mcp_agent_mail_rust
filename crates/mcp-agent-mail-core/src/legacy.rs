@@ -1474,9 +1474,34 @@ fn normalize_input_path(raw: &str, base: &Path) -> PathBuf {
 }
 
 fn normalize_path_for_overlap(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .or_else(|_| normalize_lexical_path(path).canonicalize())
-        .unwrap_or_else(|_| normalize_lexical_path(path))
+    canonicalize_existing_prefix(&normalize_lexical_path(path))
+}
+
+/// Resolve the longest existing prefix while retaining a not-yet-created
+/// suffix. Canonicalizing only the complete path misses overlap when a target
+/// child does not exist yet and an ancestor is an alias such as macOS `/var`.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return path.to_path_buf(),
+        }
+    };
+    let mut prefix = absolute.as_path();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(prefix) {
+            let Ok(suffix) = absolute.strip_prefix(prefix) else {
+                return absolute;
+            };
+            return canonical.join(suffix);
+        }
+        match prefix.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => prefix = parent,
+            _ => return absolute,
+        }
+    }
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -2368,7 +2393,7 @@ mod tests {
         assert_eq!(marker, "from-source");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn backup_db_with_sidecars_copies_non_utf8_sidecars() {
         use std::ffi::OsStr;

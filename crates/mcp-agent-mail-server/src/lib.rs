@@ -2534,6 +2534,14 @@ fn startup_readiness_fast_path_active() -> bool {
     }
 }
 
+// br-ovy6e: this 60s tier deliberately exceeds the 30s dispatch deadline,
+// which is safe only because no production code path opens it — the constant
+// and `open_server_sync_db_connection` are dead outside `cfg(test)` (the
+// `allow(dead_code)` below marks exactly that; the sole caller is the unit
+// test pinning this value). The live sync tiers below all stay well under the
+// deadline. If this tier is ever wired into a request-path surface, it must
+// switch to `mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS` (20s)
+// so a lock-contended wait ends before dispatch zombifies the thread.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SERVER_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 60_000;
 // Interactive TUI and web-UI surfaces should degrade quickly under lock
@@ -5420,7 +5428,7 @@ fn dispatch_zombie_count() -> u32 {
 /// Default cap (seconds) on how long a zombie dispatch keeps consuming an
 /// admission slot. Counting zombies against admission is deliberate
 /// backpressure against retry storms, but work that *never* observes
-/// cancellation (60s `busy_timeout` waits, `PRAGMA integrity_check`, archive
+/// cancellation (60s recovery-path `busy_timeout` waits, `PRAGMA integrity_check`, archive
 /// reconstruction, libgit2 revwalks) would otherwise accumulate zombies until
 /// every request is rejected 503 on an idle server, forever. Past this TTL a
 /// zombie stops counting against admission while its thread remains tracked

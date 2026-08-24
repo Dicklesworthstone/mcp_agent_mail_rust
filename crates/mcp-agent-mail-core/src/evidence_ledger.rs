@@ -178,7 +178,12 @@ fn path_existing_prefix_has_symlink(path: &Path) -> io::Result<bool> {
         }
 
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && !crate::disk::is_trusted_system_directory_alias(&current) =>
+            {
+                return Ok(true);
+            }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),

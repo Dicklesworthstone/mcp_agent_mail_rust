@@ -1798,9 +1798,7 @@ fn normalize_input_path(raw: &str, base: &Path) -> PathBuf {
 }
 
 fn normalize_path_for_overlap(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .or_else(|_| normalize_lexical_path(path).canonicalize())
-        .unwrap_or_else(|_| normalize_lexical_path(path))
+    crate::canonicalize_existing_prefix(&normalize_lexical_path(path))
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {

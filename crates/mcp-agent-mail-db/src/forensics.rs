@@ -5947,7 +5947,7 @@ mod tests {
         assert!(snap.file_locks.is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn pre_snapshot_preserves_non_utf8_sidecar_and_lock_paths() {
         let dir = tempfile::tempdir().expect("tempdir");

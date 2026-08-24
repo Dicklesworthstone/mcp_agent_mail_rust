@@ -250,6 +250,7 @@ fn parent_chain_symlinks(hint_path: &Path) -> Vec<SymlinkComponent> {
         current.push(component.as_os_str());
         if let Ok(meta) = std::fs::symlink_metadata(&current)
             && meta.file_type().is_symlink()
+            && !crate::is_trusted_system_directory_alias(&current)
         {
             found.push(SymlinkComponent {
                 path: current.clone(),

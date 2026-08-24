@@ -832,6 +832,9 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
             std::path::Component::Normal(segment) => {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && crate::disk::is_trusted_system_directory_alias(&current) => {}
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
@@ -874,7 +877,12 @@ fn path_has_symlinked_parent(path: &Path) -> std::io::Result<bool> {
             std::path::Component::Normal(segment) => {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && !crate::disk::is_trusted_system_directory_alias(&current) =>
+                    {
+                        return Ok(true);
+                    }
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                     Err(error) => return Err(error),
@@ -1276,7 +1284,7 @@ fn write_identity_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result
             Err(error) => return Err(error),
         }
     }
-    let Some((temp_path, mut file)) = temp_file else {
+    let Some((temp_path, file)) = temp_file else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -1286,27 +1294,39 @@ fn write_identity_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result
         ));
     };
 
-    file.write_all(content)?;
-    file.sync_all()?;
-    drop(file);
+    // From here on the temporary file exists on disk: remove it on any
+    // failure so aborted writes do not strand `.tmp` artifacts that listing
+    // and cleanup deliberately ignore (see `identity_entry_is_internal`).
+    let commit = |mut file: std::fs::File| -> std::io::Result<()> {
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
 
-    // Revalidate immediately before the atomic replace. On Unix, rename
-    // replaces a leaf symlink rather than following it; the parent check also
-    // catches a directory swap that completed before this validation.
-    if path_has_symlinked_parent(path)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "refusing symlinked pane identity directory for {}",
-                path.display()
-            ),
-        ));
+        // Revalidate immediately before the atomic replace. On Unix, rename
+        // replaces a leaf symlink rather than following it; the parent check
+        // also catches a directory swap that completed before this
+        // validation.
+        if path_has_symlinked_parent(path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing symlinked pane identity directory for {}",
+                    path.display()
+                ),
+            ));
+        }
+        validate_identity_file_target(path)?;
+        std::fs::rename(&temp_path, path)?;
+        // The file contents were synced above; syncing the containing
+        // directory makes the rename durable across a sudden power loss as
+        // well.
+        std::fs::File::open(parent)?.sync_all()
+    };
+    let result = commit(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
     }
-    validate_identity_file_target(path)?;
-    std::fs::rename(&temp_path, path)?;
-    // The file contents were synced above; syncing the containing directory
-    // makes the rename durable across a sudden power loss as well.
-    std::fs::File::open(parent)?.sync_all()
+    result
 }
 
 #[cfg(not(unix))]
