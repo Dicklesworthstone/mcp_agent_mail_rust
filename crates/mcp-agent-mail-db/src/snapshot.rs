@@ -63,7 +63,10 @@ pub struct VerifiedSnapshotMetadata {
     pub row_counts: BTreeMap<String, i64>,
     /// Absolute path of the live database the snapshot was taken from.
     pub source_path: String,
-    /// Absolute path of the `.bak` snapshot file this metadata describes.
+    /// Absolute canonical `.bak` publication slot used when these bytes were
+    /// captured. Rotation may later move the same hash-bound bytes to a strict
+    /// `.bak.<timestamp>` sibling; readers derive that live path from the
+    /// recovery-candidate classifier rather than trusting a path from JSON.
     pub snapshot_path: String,
     /// Exact length of the `.bak` bytes described by this record.
     pub snapshot_size_bytes: u64,

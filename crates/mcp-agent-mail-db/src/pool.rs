@@ -3698,9 +3698,26 @@ impl DbPool {
             )));
         }
         if let Err(error) = rename_noreplace_preserving_source(&staged_backup, &bak_path) {
-            let rollback_error = rotated_backup
-                .as_ref()
-                .and_then(|rotated| rename_noreplace_preserving_source(rotated, &bak_path).err());
+            let rollback_error = rotated_backup.as_ref().and_then(|rotated| {
+                rename_noreplace_preserving_source(rotated, &bak_path)
+                    .map_err(|rollback_error| {
+                        format!(
+                            "could not restore {} to {} without replacement: {rollback_error}",
+                            rotated.display(),
+                            bak_path.display()
+                        )
+                    })
+                    .and_then(|()| {
+                        sync_recovery_parent(&bak_path).map_err(|sync_error| {
+                            format!(
+                                "restored {} to {}, but could not durably sync the parent: {sync_error}",
+                                rotated.display(),
+                                bak_path.display()
+                            )
+                        })
+                    })
+                    .err()
+            });
             let preserved_stage = staged_directory.preserve();
             return Err(DbError::Sqlite(
                 match (rotated_backup.as_ref(), rollback_error) {
