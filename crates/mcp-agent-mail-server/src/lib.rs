@@ -2566,35 +2566,12 @@ pub(crate) fn resolve_server_database_url_sqlite_path(
         return None;
     }
 
-    let sqlite_path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)?;
-    Some(std::path::PathBuf::from(resolve_server_sync_sqlite_path(
-        sqlite_path.to_string_lossy().as_ref(),
-    )))
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url).ok()?;
+    Some(std::path::PathBuf::from(resolved.canonical_path))
 }
 
 pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
-    if path == ":memory:" {
-        return path.to_string();
-    }
-
-    let resolved = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path);
-    if resolved != path {
-        return resolved;
-    }
-
-    let relative_path = std::path::Path::new(path);
-    if relative_path.is_absolute() || path.starts_with("./") || path.starts_with("../") {
-        return path.to_string();
-    }
-
-    if !relative_path.exists() {
-        let absolute_candidate = std::path::Path::new("/").join(relative_path);
-        if absolute_candidate.exists() {
-            return absolute_candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    resolved
+    mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path)
 }
 
 fn open_sync_db_connection_with_busy_timeout(

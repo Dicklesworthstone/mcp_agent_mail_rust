@@ -11911,16 +11911,9 @@ fn mailbox_activity_lock_cli_error(err: std::io::Error) -> CliError {
 }
 
 fn resolve_mailbox_activity_sqlite_path(database_url: &str) -> CliResult<PathBuf> {
-    let cfg = mcp_agent_mail_db::DbPoolConfig {
-        database_url: database_url.to_string(),
-        ..Default::default()
-    };
-    let sqlite_path = cfg
-        .sqlite_path()
-        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-    Ok(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
-        &sqlite_path,
-    )))
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(database_url)
+        .map_err(|error| CliError::Other(format!("bad database URL: {error}")))?;
+    Ok(PathBuf::from(resolved.canonical_path))
 }
 
 fn acquire_cli_mailbox_activity_lock_for_storage_root(
@@ -38092,28 +38085,31 @@ mod mail_server_cli_bridge_tests {
     }
 
     #[test]
-    fn doctor_mailbox_activity_lock_uses_resolved_absolute_candidate() {
+    fn doctor_mailbox_activity_path_matches_runtime_for_missing_relative_target() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("doctor-absolute.sqlite3");
-        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+        let decoy_bytes = b"absolute decoy must not become mailbox authority";
+        std::fs::write(&absolute_db, decoy_bytes).expect("create absolute decoy");
 
         let relative_path =
             std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
-
-        let _shared_lock = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
-            &absolute_db,
-            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
-        )
-        .expect("acquire shared lock on absolute candidate");
+        assert!(
+            !relative_path.exists(),
+            "fixture requires a missing configured relative target"
+        );
 
         let database_url = format!("sqlite:///{}", relative_path.display());
-        let error = acquire_doctor_mailbox_activity_lock_for_database_url(&database_url, false)
-            .expect_err("doctor lock should target the resolved absolute candidate");
+        let cli_path = resolve_mailbox_activity_sqlite_path(&database_url)
+            .expect("resolve CLI mailbox activity authority");
+        let runtime_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&database_url)
+            .expect("resolve DB runtime authority");
 
-        assert!(
-            is_resource_busy_cli_error(&error),
-            "absolute-candidate lock contention should be classified as resource busy: {error}"
+        assert_eq!(cli_path, PathBuf::from(&runtime_path.canonical_path));
+        assert_eq!(
+            cli_path, relative_path,
+            "a missing relative runtime target must not be hijacked by an unrelated absolute decoy"
         );
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }
 
     #[test]
