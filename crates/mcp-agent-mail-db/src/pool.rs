@@ -3698,47 +3698,39 @@ impl DbPool {
             )));
         }
         if let Err(error) = rename_noreplace_preserving_source(&staged_backup, &bak_path) {
-            let rollback_error = rotated_backup.as_ref().and_then(|rotated| {
-                rename_noreplace_preserving_source(rotated, &bak_path)
-                    .map_err(|rollback_error| {
-                        format!(
-                            "could not restore {} to {} without replacement: {rollback_error}",
-                            rotated.display(),
-                            bak_path.display()
-                        )
-                    })
-                    .and_then(|()| {
-                        sync_recovery_parent(&bak_path).map_err(|sync_error| {
-                            format!(
-                                "restored {} to {}, but could not durably sync the parent: {sync_error}",
-                                rotated.display(),
-                                bak_path.display()
-                            )
-                        })
-                    })
-                    .err()
-            });
+            let rollback = rollback_rotated_proactive_backup_with(
+                rotated_backup.as_deref(),
+                &bak_path,
+                sync_recovery_parent,
+            );
             let preserved_stage = staged_directory.preserve();
-            return Err(DbError::Sqlite(
-                match (rotated_backup.as_ref(), rollback_error) {
-                    (Some(_), None) => format!(
+            return Err(DbError::Sqlite(match rollback {
+                ProactiveBackupRollbackOutcome::RestoredDurably => format!(
                         "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored",
                         preserved_stage.display(),
                         bak_path.display()
                     ),
-                    (Some(rotated), Some(rollback_error)) => format!(
-                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup remains at {} because rollback also failed: {rollback_error}",
+                ProactiveBackupRollbackOutcome::RestoreMoveFailed(rollback_error) => format!(
+                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup remains at {} because its rollback move failed: {rollback_error}",
                         preserved_stage.display(),
                         bak_path.display(),
-                        rotated.display()
+                        rotated_backup.as_ref().map_or_else(
+                            || "<unknown>".to_string(),
+                            |rotated| rotated.display().to_string()
+                        )
                     ),
-                    (None, _) => format!(
+                ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(sync_error) => format!(
+                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored at {}, but crash durability is uncertain because the parent sync failed: {sync_error}",
+                        preserved_stage.display(),
+                        bak_path.display(),
+                        bak_path.display()
+                    ),
+                ProactiveBackupRollbackOutcome::NotNeeded => format!(
                         "proactive backup failed to publish staged backup from {} to unused destination {} without replacement: {error}; no prior backup existed",
                         preserved_stage.display(),
                         bak_path.display()
                     ),
-                },
-            ));
+            }));
         }
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
             return Err(DbError::Sqlite(format!(
@@ -8862,6 +8854,36 @@ fn proactive_backup_rotation_path(backup_path: &Path, timestamp: &str, collision
         &suffix,
         &format!("storage.sqlite3.bak{suffix}"),
     )
+}
+
+#[derive(Debug)]
+enum ProactiveBackupRollbackOutcome {
+    NotNeeded,
+    RestoredDurably,
+    RestoreMoveFailed(String),
+    RestoredButParentSyncFailed(String),
+}
+
+fn rollback_rotated_proactive_backup_with<F>(
+    rotated_backup: Option<&Path>,
+    backup_path: &Path,
+    sync_parent: F,
+) -> ProactiveBackupRollbackOutcome
+where
+    F: FnOnce(&Path) -> Result<(), SqlError>,
+{
+    let Some(rotated) = rotated_backup else {
+        return ProactiveBackupRollbackOutcome::NotNeeded;
+    };
+    if let Err(error) = rename_noreplace_preserving_source(rotated, backup_path) {
+        return ProactiveBackupRollbackOutcome::RestoreMoveFailed(error.to_string());
+    }
+    match sync_parent(backup_path) {
+        Ok(()) => ProactiveBackupRollbackOutcome::RestoredDurably,
+        Err(error) => {
+            ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(error.to_string())
+        }
+    }
 }
 
 fn rotate_existing_proactive_backup(backup_path: &Path) -> DbResult<PathBuf> {

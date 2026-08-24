@@ -443,16 +443,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_backup_file_matches_legacy_bak_variants_but_not_lookalikes() {
-        // Actual bak backups created by prior versions / ad-hoc tooling.
-        assert_eq!(
-            classify_backup_file("storage.sqlite3.bak"),
-            Some(BackupKind::ManualBackup)
-        );
-        assert_eq!(
-            classify_backup_file("storage.sqlite3.bak.20260326_153504"),
-            Some(BackupKind::ManualBackup)
-        );
+    fn classify_backup_file_matches_strict_bak_families_but_not_lookalikes() {
+        // Published backup generations for the main database and its WAL/SHM
+        // forensic families are recognized through the shared strict grammar.
+        for name in [
+            "storage.sqlite3.bak",
+            "storage.sqlite3.bak.20260326_153504",
+            "storage.sqlite3-wal.bak",
+            "storage.sqlite3-wal.bak.20260326_153504",
+            "storage.sqlite3-shm.bak",
+            "storage.sqlite3-shm.bak.20260326_153504",
+        ] {
+            assert_eq!(
+                classify_backup_file(name),
+                Some(BackupKind::ManualBackup),
+                "strict backup family should classify: {name}"
+            );
+        }
         assert_eq!(
             classify_backup_file("storage.sqlite3.bak.meta.json"),
             None,
@@ -470,7 +477,8 @@ mod tests {
         );
         assert_eq!(
             classify_backup_file("storage.sqlite3.bak-something"),
-            Some(BackupKind::ManualBackup)
+            None,
+            "unpublished bak-prefix lookalikes are not owned backup generations"
         );
         assert_eq!(
             classify_backup_file("storage.sqlite3.manual-backup-20260402_232941"),

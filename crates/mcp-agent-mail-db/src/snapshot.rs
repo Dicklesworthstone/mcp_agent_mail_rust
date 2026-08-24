@@ -151,6 +151,11 @@ fn metadata_matches_snapshot_namespace(
         && canonical_bak
             .to_str()
             .is_some_and(|path| meta.snapshot_path == path)
+        && meta.snapshot_sha256.len() == 64
+        && meta
+            .snapshot_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Count rows in the core coordination tables on an already-open connection.
@@ -537,6 +542,12 @@ fn select_verified_snapshot(primary: &Path) -> Option<SelectedVerifiedSnapshot> 
             Ok(source) => source,
             Err(_) => continue,
         };
+        if !source
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() == meta.snapshot_size_bytes)
+        {
+            continue;
+        }
         let identity = match snapshot_file_identity_from_reader(&mut source, &candidate) {
             Ok(identity) => identity,
             Err(_) => continue,
@@ -915,6 +926,26 @@ mod tests {
             .expect_err("future metadata authority must never be overwritten");
         assert!(error.to_string().contains("future authority"));
         assert_eq!(std::fs::read(&meta_path).unwrap(), before);
+    }
+
+    #[test]
+    fn malformed_snapshot_hash_is_not_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let mut meta = record_snapshot_metadata(&primary, 42).unwrap();
+        meta.snapshot_sha256 = "g".repeat(64);
+        std::fs::write(
+            snapshot_meta_path(&primary),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            latest_verified_snapshot(&primary).is_none(),
+            "non-hex metadata must be rejected before it can authorize backup bytes"
+        );
     }
 
     #[test]
