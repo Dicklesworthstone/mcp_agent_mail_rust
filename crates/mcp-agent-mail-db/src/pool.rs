@@ -9482,6 +9482,9 @@ fn strict_offline_canonical_target_precheck(
     sqlite_path: &str,
 ) -> std::result::Result<(), SqlError> {
     let path = Path::new(sqlite_path);
+    // Reject a stable hard-link alias before opening it. On Unix, discovering
+    // nlink > 1 only after open would be too late: returning would drop that
+    // fd and could release same-process locks held through another name.
     let pathname_metadata = std::fs::symlink_metadata(path).map_err(|error| {
         SqlError::Custom(format!(
             "strict query-only open refused: cannot inspect {sqlite_path}: {error}"
@@ -9517,6 +9520,10 @@ fn strict_offline_canonical_target_precheck(
             "strict query-only open refused: cannot open {sqlite_path} without following links: {error}"
         ))
     })?;
+    // Recheck the opened object for ordinary metadata drift. This is not an
+    // adversarial path-swap lock; the enclosing contract remains explicitly
+    // engine-exclusive/offline because the path-based SQLite API cannot make
+    // link-count validation and its later engine open one atomic operation.
     let metadata = file.metadata().map_err(|error| {
         SqlError::Custom(format!(
             "strict query-only open refused: cannot inspect open target {sqlite_path}: {error}"
@@ -11382,13 +11389,13 @@ where
 fn reconstruct_archive_into_candidate(
     primary_path: &Path,
     storage_root: &Path,
-    salvage_db_path: Option<&Path>,
+    live_salvage_db_path: Option<&Path>,
     timestamp: &str,
 ) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure> {
     reconstruct_archive_into_candidate_with_finalizer(
         primary_path,
         storage_root,
-        salvage_db_path,
+        live_salvage_db_path,
         timestamp,
         crate::forensics::finalize_recovery_receipt,
     )
@@ -11424,7 +11431,7 @@ fn preserve_failed_reconstruction_candidate(
 fn reconstruct_archive_into_candidate_with_finalizer<F>(
     primary_path: &Path,
     storage_root: &Path,
-    salvage_db_path: Option<&Path>,
+    live_salvage_db_path: Option<&Path>,
     timestamp: &str,
     finalize_receipt: F,
 ) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure>
@@ -11434,12 +11441,14 @@ where
     ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
 {
     let candidate_path = reconstruction_candidate_path(primary_path, timestamp);
-    let reconstruct_result = match salvage_db_path {
-        Some(salvage_db_path) => crate::reconstruct::reconstruct_from_archive_with_salvage(
-            &candidate_path,
-            storage_root,
-            Some(salvage_db_path),
-        ),
+    let reconstruct_result = match live_salvage_db_path {
+        Some(live_salvage_db_path) => {
+            crate::reconstruct::reconstruct_from_archive_with_live_franken_salvage(
+                &candidate_path,
+                storage_root,
+                live_salvage_db_path,
+            )
+        }
         None => crate::reconstruct::reconstruct_from_archive(&candidate_path, storage_root),
     };
 
@@ -11840,41 +11849,18 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     // generation remains at the live path. The unified promotion API performs
     // the only quarantine/activation/receipt transition after construction is
     // complete, so no low-level builder ever sees or replaces a live target.
-    let salvage_db_path = if salvage_existing {
-        // The salvage source on this automatic path is the unhealthy primary
-        // itself. When it is so damaged that it cannot even be probed as a
-        // SQLite database, there is no readable DB-only coordination state to
-        // protect, and the strict salvage contract would refuse the archive
-        // candidate and leave the mailbox dead (br-eudur; ts1 incident).
-        // Degrade to an archive-only candidate — the damaged source is still
-        // preserved via quarantine. Probe failures that are NOT clearly
-        // corruption (lock/busy, permissions) keep refusing fail-closed.
-        match crate::reconstruct::probe_salvage_database_for_merge(primary_path) {
-            Ok(()) => Some(primary_path),
-            Err(error) => {
-                let message = error.to_string();
-                if is_corruption_error_message(&message) {
-                    tracing::warn!(
-                        path = %primary_path.display(),
-                        error = %message,
-                        "salvage source is unreadable as a SQLite database; \
-                         degrading to archive-only reconstruction (source is \
-                         preserved in quarantine)"
-                    );
-                    None
-                } else {
-                    return Err(SqlError::Custom(format!(
-                        "archive reconstruction refused: salvage source {} failed probing for a non-corruption reason and DB-only coordination state could still exist: {message}",
-                        primary_path.display()
-                    )));
-                }
-            }
-        }
-    } else {
-        None
-    };
-    reconstruct_archive_into_candidate(primary_path, storage_root, salvage_db_path, &timestamp)
-        .map_err(|failure| failure.error)
+    // The existing primary is live FrankenSQLite state. The reconstruction
+    // layer must materialize it through guarded same-engine access before any
+    // canonical probe; probing the live inode here would reintroduce the
+    // process-wide fcntl lock-erasure hazard this recovery path is avoiding.
+    let live_salvage_db_path = salvage_existing.then_some(primary_path);
+    reconstruct_archive_into_candidate(
+        primary_path,
+        storage_root,
+        live_salvage_db_path,
+        &timestamp,
+    )
+    .map_err(|failure| failure.error)
 }
 
 /// Coalescing window for back-to-back archive-salvage reconstructions.
@@ -14358,6 +14344,28 @@ mod tests {
                 }
                 Err(_) => {}
             }
+
+            inspect_mailbox_db_inventory(&db_path)
+                .expect_err("public mailbox inventory must honor nonclean authority");
+            crate::reconstruct::collect_db_message_ids(&db_path)
+                .expect_err("public message inventory must honor nonclean authority");
+            let integrity = crate::integrity::inspect_mailbox_integrity(
+                &db_path,
+                crate::integrity::CheckKind::Quick,
+            );
+            assert_eq!(
+                integrity.status,
+                crate::integrity::MailboxIntegrityStatus::Broken,
+                "public integrity diagnostics must honor nonclean authority"
+            );
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+                storage_root: Some(directory.path().join("archive")),
+                ..Default::default()
+            })
+            .expect("construct lazy nonclean-authority diagnostic pool");
+            pool.sample_recent_message_refs(1)
+                .expect_err("public consistency sampler must honor nonclean authority");
 
             assert_eq!(
                 exact_diagnostic_parent_snapshot(directory.path()),

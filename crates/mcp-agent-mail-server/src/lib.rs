@@ -3132,19 +3132,19 @@ impl ObservabilitySyncDb {
 
     fn archive_snapshot(
         storage_root: &Path,
-        salvage_db_path: Option<&Path>,
+        live_salvage_db_path: Option<&Path>,
         context: &str,
     ) -> Result<Self, String> {
         let snapshot_dir = SnapshotDirGuard::new("server-observability-mailbox-")
             .map_err(|error| format!("failed to allocate observability snapshot dir: {error}"))?;
         let sqlite_path = snapshot_dir.path().join("mailbox.sqlite3");
-        let reconstruct = salvage_db_path.map_or_else(
+        let reconstruct = live_salvage_db_path.map_or_else(
             || mcp_agent_mail_db::reconstruct_from_archive(&sqlite_path, storage_root),
-            |salvage_db_path| {
-                mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
+            |live_salvage_db_path| {
+                mcp_agent_mail_db::reconstruct_from_archive_with_live_franken_salvage(
                     &sqlite_path,
                     storage_root,
-                    Some(salvage_db_path),
+                    live_salvage_db_path,
                 )
             },
         );
@@ -3153,7 +3153,7 @@ impl ObservabilitySyncDb {
             tracing::warn!(
                 operation = context,
                 storage_root = %storage_root.display(),
-                salvage = ?salvage_db_path.map(|path| path.display().to_string()),
+                salvage = ?live_salvage_db_path.map(|path| path.display().to_string()),
                 error = %error,
                 "failed to build archive-backed observability snapshot"
             );

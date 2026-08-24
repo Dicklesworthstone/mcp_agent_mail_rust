@@ -1833,8 +1833,118 @@ fn reconstruct_from_archive_impl(
     Ok(stats)
 }
 
+struct MaterializedLiveSalvage {
+    _directory: crate::pool::CanonicalSnapshotTempDir,
+    path: PathBuf,
+}
+
+fn materialize_live_franken_salvage(path: &Path) -> DbResult<MaterializedLiveSalvage> {
+    let directory = crate::pool::CanonicalSnapshotTempDir::new("reconstruct-live-salvage-")
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct live salvage: cannot allocate private snapshot directory: {error}"
+            ))
+        })?;
+    let snapshot_path = directory.path().join("salvage.sqlite3");
+    let snapshot_text = snapshot_path.to_str().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "reconstruct live salvage: private snapshot path {} is not valid UTF-8",
+            snapshot_path.display()
+        ))
+    })?;
+    let conn = crate::pool::open_guarded_read_only_franken_existing_file(
+        path,
+        "archive reconstruction live salvage materialization",
+    )
+    .map_err(|error| {
+        DbError::Sqlite(format!(
+            "reconstruct live salvage: cannot open source {} through guarded FrankenSQLite read-only access: {error}",
+            path.display()
+        ))
+    })?;
+    // `query_only` is a connection-local SQL policy. The pager remains in
+    // FrankenSQLite's engine-enforced read-only mode after this is disabled;
+    // `VACUUM INTO` may write only the fresh private destination.
+    conn.execute_raw("PRAGMA query_only = OFF;")
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct live salvage: cannot enable private snapshot export from {}: {error}",
+                path.display()
+            ))
+        })?;
+    let destination_literal = format!("'{}'", snapshot_text.replace('\'', "''"));
+    conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "reconstruct live salvage: cannot materialize {} into private snapshot {}: {error}",
+                path.display(),
+                snapshot_path.display()
+            ))
+        })?;
+    // The read-only source connection drops without a checkpoint. Keep the
+    // private directory alive across every subsequent canonical probe/merge.
+    drop(conn);
+    Ok(MaterializedLiveSalvage {
+        _directory: directory,
+        path: snapshot_path,
+    })
+}
+
+/// Reconstruct from the Git archive and merge an engine-exclusive private or
+/// offline canonical `SQLite` salvage artifact.
+///
+/// This entry point must never receive a live FrankenSQLite primary. Live
+/// callers use [`reconstruct_from_archive_with_live_franken_salvage`] so the
+/// source inode is materialized through guarded same-engine access first.
+pub fn reconstruct_from_archive_with_private_salvage(
+    db_path: &Path,
+    storage_root: &Path,
+    private_salvage_db_path: &Path,
+) -> DbResult<ReconstructStats> {
+    reconstruct_from_archive_with_salvage(
+        db_path,
+        storage_root,
+        Some(private_salvage_db_path),
+    )
+}
+
+/// Reconstruct from the Git archive while salvaging a live FrankenSQLite
+/// primary without ever opening that live inode through canonical SQLite.
+///
+/// A complete, valid FrankenSQLite namespace is mandatory. The live source is
+/// copied logically with guarded engine-enforced read-only access into a
+/// private temporary database; only that private inode reaches the canonical
+/// integrity and merge probes. Namespace-admission, lock, permission, and
+/// other non-corruption failures refuse rather than falling back to a raw or
+/// canonical open of the live source.
+pub fn reconstruct_from_archive_with_live_franken_salvage(
+    db_path: &Path,
+    storage_root: &Path,
+    live_salvage_db_path: &Path,
+) -> DbResult<ReconstructStats> {
+    let materialized = match materialize_live_franken_salvage(live_salvage_db_path) {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            let message = error.to_string();
+            if crate::pool::is_corruption_error_message(&message) {
+                let mut stats = reconstruct_from_archive_impl(db_path, storage_root, true)?;
+                stats.push_warning(format!(
+                    "live salvage source {} could not be materialized because it is corrupt ({message}); rebuilt archive-only candidate",
+                    live_salvage_db_path.display()
+                ));
+                return Ok(stats);
+            }
+            return Err(DbError::Sqlite(format!(
+                "reconstruct live salvage source {} failed guarded materialization; refusing an archive-only candidate because DB-only coordination state could be lost: {error}",
+                live_salvage_db_path.display()
+            )));
+        }
+    };
+    reconstruct_from_archive_with_salvage(db_path, storage_root, Some(&materialized.path))
+}
+
 /// Reconstruct the database from the Git archive and merge any additional
-/// durable state from a salvaged `SQLite` database.
+/// durable state from a private salvaged `SQLite` database.
 ///
 /// This is intended for doctor/recovery flows where the primary database file
 /// was unhealthy, but a directly readable salvage database could still provide
@@ -1849,8 +1959,10 @@ fn reconstruct_from_archive_impl(
 /// - a merge that fails with a corruption-class error also degrades; the
 ///   merge transaction is rolled back first
 ///
-/// Callers that explicitly want archive-only recovery must pass `None`.
-pub fn reconstruct_from_archive_with_salvage(
+/// Private implementation shared by the explicit public source-kind entry
+/// points and the module's focused salvage tests. Production callers must use
+/// one of the named live/private APIs above.
+fn reconstruct_from_archive_with_salvage(
     db_path: &Path,
     storage_root: &Path,
     salvage_db_path: Option<&Path>,

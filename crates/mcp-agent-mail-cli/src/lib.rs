@@ -10010,19 +10010,27 @@ fn sqlite_conn_check_ok_canonical(
 }
 
 fn sqlite_franken_snapshot_check_ok_canonical(
-    conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
     kind: mcp_agent_mail_db::CheckKind,
 ) -> CliResult<bool> {
-    with_private_canonical_snapshot_from_franken_conn(
-        conn,
+    with_private_canonical_snapshot_from_live_franken(
         db_path,
         &format!("canonical {kind} second opinion"),
         |snapshot| sqlite_conn_check_ok_canonical(snapshot, kind),
     )
 }
 
-fn sqlite_conn_check_ok_with_private_canonical_fallback(
+fn reconcile_private_canonical_corroboration(
+    primary_result: CliResult<bool>,
+    canonical_snapshot_result: CliResult<bool>,
+) -> CliResult<bool> {
+    match canonical_snapshot_result {
+        Ok(false) => Ok(false),
+        Ok(true) | Err(_) => primary_result,
+    }
+}
+
+fn sqlite_conn_check_ok_with_private_canonical_corroboration(
     conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
     kind: mcp_agent_mail_db::CheckKind,
@@ -10032,15 +10040,15 @@ fn sqlite_conn_check_ok_with_private_canonical_fallback(
         return primary_result;
     }
 
-    match sqlite_franken_snapshot_check_ok_canonical(conn, db_path, kind) {
-        Ok(true) => Ok(true),
-        Ok(false) => Ok(false),
-        Err(_) => match primary_result {
-            Ok(false) => Ok(false),
-            Ok(true) => Ok(true),
-            Err(primary_error) => Err(primary_error),
-        },
-    }
+    // A FrankenSQLite VACUUM snapshot is a logical rebuild, not a byte-exact
+    // second view of the live b-tree. Canonical rejection is useful
+    // corroborating evidence, but canonical acceptance must never overrule a
+    // primary corruption/error verdict: rebuilding can normalize a damaged
+    // index or omit unreadable state. Keep the primary verdict fail-closed.
+    reconcile_private_canonical_corroboration(
+        primary_result,
+        sqlite_franken_snapshot_check_ok_canonical(db_path, kind),
+    )
 }
 
 fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
@@ -12983,11 +12991,22 @@ fn recover_sqlite_file_with_storage_root_admitted(
             };
             // Reconstruct into a temp file so the original is untouched on failure.
             let temp_reconstruct = next_doctor_artifact_path(path, "reconstruct", "sqlite3");
-            match mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-                &temp_reconstruct,
-                &storage_root,
-                salvage_db_path,
-            ) {
+            let reconstruct = salvage_db_path.map_or_else(
+                || {
+                    mcp_agent_mail_db::reconstruct_from_archive(
+                        &temp_reconstruct,
+                        &storage_root,
+                    )
+                },
+                |private_salvage_db_path| {
+                    mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
+                        &temp_reconstruct,
+                        &storage_root,
+                        private_salvage_db_path,
+                    )
+                },
+            );
+            match reconstruct {
                 Ok(mut stats) => {
                     if let DoctorSalvageAttempt::Succeeded(artifact) = &salvage_attempt {
                         stats.warnings.push(artifact.detail.clone());
@@ -13961,23 +13980,21 @@ impl CanonicalSnapshotSource {
     fn archive_snapshot(
         reported_path: PathBuf,
         storage_root: &Path,
-        salvage_db_path: Option<&Path>,
+        live_salvage_db_path: Option<&Path>,
         context: &str,
     ) -> CliResult<Self> {
         let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-snapshot-", context)?;
         let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
-        let reconstruct = salvage_db_path
-            .filter(|path| path_is_real_file(path))
-            .map_or_else(
-                || mcp_agent_mail_db::reconstruct_from_archive(&actual_path, storage_root),
-                |salvage_db_path| {
-                    mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-                        &actual_path,
-                        storage_root,
-                        Some(salvage_db_path),
-                    )
-                },
-            );
+        let reconstruct = live_salvage_db_path.map_or_else(
+            || mcp_agent_mail_db::reconstruct_from_archive(&actual_path, storage_root),
+            |live_salvage_db_path| {
+                mcp_agent_mail_db::reconstruct_from_archive_with_live_franken_salvage(
+                    &actual_path,
+                    storage_root,
+                    live_salvage_db_path,
+                )
+            },
+        );
         reconstruct.map_err(|e| {
             CliError::Other(format!(
                 "{context} archive snapshot reconstruction failed: {e}"
@@ -14164,17 +14181,17 @@ fn vacuum_live_franken_sqlite_into_snapshot(
     Ok(())
 }
 
-/// Materialize a private logical image from an already-open FrankenSQLite
-/// connection, then run one canonical diagnostic against that private inode.
+/// Materialize a private logical image through a guarded read-only
+/// FrankenSQLite connection, then run one canonical diagnostic against that
+/// private inode.
 ///
-/// The caller-supplied connection is reused deliberately. Opening and closing
-/// canonical SQLite (or a raw file descriptor) on `source` while this process
-/// has other FrankenSQLite transactions can erase their classic POSIX
-/// `fcntl` locks. `VACUUM INTO` reads through the existing engine handle and
-/// writes only the fresh temp destination; canonical SQLite never sees the
-/// live main inode.
-fn with_private_canonical_snapshot_from_franken_conn<T, F>(
-    conn: &mcp_agent_mail_db::DbConn,
+/// Opening and closing canonical SQLite (or a raw file descriptor) on
+/// `source` while this process has other FrankenSQLite transactions can erase
+/// their classic POSIX `fcntl` locks. The guarded same-engine source handle
+/// uses an engine-enforced read-only pager, whose `VACUUM INTO` path reads the
+/// live state and writes only the fresh temp destination. Canonical SQLite
+/// never sees the live main inode.
+fn with_private_canonical_snapshot_from_live_franken<T, F>(
     source: &Path,
     context: &str,
     probe: F,
@@ -14185,15 +14202,7 @@ where
     let snapshot_dir = canonical_snapshot_tempdir("canonical-second-opinion-", context)?;
     let snapshot_path = snapshot_dir.path().join("mailbox.sqlite3");
     let destination_text = sqlite_snapshot_path_text(&snapshot_path, context, "destination")?;
-    prepare_sqlite_snapshot_destination(&snapshot_path, context)?;
-    let destination_literal = sqlite_string_literal(destination_text);
-    conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
-        .map_err(|error| {
-            CliError::Other(format!(
-                "{context} could not materialize a private canonical snapshot from {}: {error}",
-                source.display()
-            ))
-        })?;
+    vacuum_live_franken_sqlite_into_snapshot(source, &snapshot_path, context)?;
 
     // FrankenSQLite currently leaves persistent namespace records beside a
     // successful VACUUM INTO output. They are private to this tempdir and no
@@ -25186,11 +25195,9 @@ fn doctor_foreign_key_violations_canonical(
 }
 
 fn doctor_foreign_key_violations_canonical_snapshot(
-    conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
 ) -> CliResult<Vec<DoctorForeignKeyViolation>> {
-    with_private_canonical_snapshot_from_franken_conn(
-        conn,
+    with_private_canonical_snapshot_from_live_franken(
         db_path,
         "canonical foreign_key_check fallback",
         doctor_foreign_key_violations_canonical,
@@ -25204,7 +25211,7 @@ fn doctor_foreign_key_violations_with_diagnostic_fallback(
     doctor_probe_with_canonical_fallback(
         DOCTOR_FOREIGN_KEY_CHECK_CAPABILITY,
         || doctor_foreign_key_violations(conn),
-        || doctor_foreign_key_violations_canonical_snapshot(conn, db_path),
+        || doctor_foreign_key_violations_canonical_snapshot(db_path),
     )
 }
 
@@ -25307,11 +25314,9 @@ fn doctor_orphaned_message_recipients_canonical(
 }
 
 fn doctor_orphaned_message_recipients_canonical_snapshot(
-    conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
 ) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
-    with_private_canonical_snapshot_from_franken_conn(
-        conn,
+    with_private_canonical_snapshot_from_live_franken(
         db_path,
         "canonical orphaned-recipient fallback",
         doctor_orphaned_message_recipients_canonical,
@@ -25325,7 +25330,7 @@ fn doctor_orphaned_message_recipients_with_diagnostic_fallback(
     doctor_probe_with_canonical_fallback(
         DOCTOR_ORPHANED_RECIPIENT_QUERY_CAPABILITY,
         || doctor_orphaned_message_recipients(conn),
-        || doctor_orphaned_message_recipients_canonical_snapshot(conn, db_path),
+        || doctor_orphaned_message_recipients_canonical_snapshot(db_path),
     )
 }
 
@@ -25340,15 +25345,14 @@ fn doctor_relational_integrity_diagnostics(
     // `foreign_key_check` is `O(child_rows × parent_lookup)` and spun the
     // STARTUP self-heal for minutes on large mailboxes (tens of thousands of
     // `file_reservations`) — blocking the listener bind so the interactive
-    // server/TUI looked hung (`am` never opened :8765). Materialize through
-    // the already-open Franken connection, then run canonical SQLite only on
+    // server/TUI looked hung (`am` never opened :8765). Materialize through a
+    // guarded read-only Franken connection, then run canonical SQLite only on
     // that private inode: a second engine must never open and close the live
     // main inode while this process may hold classic fcntl locks. The bespoke
     // probes (each with the same private-snapshot fallback) remain available
     // if the preferred combined diagnostic cannot run.
     if db_path.as_os_str() != ":memory:"
-        && let Ok(diagnostics) = with_private_canonical_snapshot_from_franken_conn(
-            conn,
+        && let Ok(diagnostics) = with_private_canonical_snapshot_from_live_franken(
             db_path,
             "canonical relational-integrity diagnostic",
             doctor_relational_integrity_diagnostics_canonical,
@@ -30156,26 +30160,15 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     }
 
     let opened_path = Path::new(&opened.opened_path);
-    // css/ts2 startup-wedge fix: prefer the canonical engine's FULL check, but
-    // never point that second engine at the live inode. Reuse `opened.conn` to
-    // materialize a private logical snapshot, then run canonical SQLite there.
-    // On a non-corruption snapshot/probe failure, fall back to the
-    // bespoke-first path rather than wedging startup. A canonical corruption
-    // verdict is retained so it can route to reconstruct.
-    let integrity_probe =
-        match sqlite_franken_snapshot_check_ok_canonical(
-            &opened.conn,
-            opened_path,
-            mcp_agent_mail_db::CheckKind::Full,
-        ) {
-            ok @ Ok(_) => ok,
-            Err(error) if is_sqlite_recovery_error_message(&error.to_string()) => Err(error),
-            Err(_) => sqlite_conn_check_ok_with_private_canonical_fallback(
-                &opened.conn,
-                opened_path,
-                mcp_agent_mail_db::CheckKind::Full,
-            ),
-        };
+    // Run the physical integrity check through the live engine first. A
+    // private logical rebuild may corroborate corruption, but it cannot prove
+    // the original b-tree healthy and therefore must not overrule the primary
+    // verdict.
+    let integrity_probe = sqlite_conn_check_ok_with_private_canonical_corroboration(
+        &opened.conn,
+        opened_path,
+        mcp_agent_mail_db::CheckKind::Full,
+    );
     let integrity_ok = match integrity_probe {
         Ok(ok) => ok,
         Err(error) => {
@@ -56143,11 +56136,29 @@ startup_timeout_sec = 42
             .expect("insert message");
         drop(conn);
 
-        let salvage = attempt_readable_sqlite_salvage_source(&db_path, "database");
+        let salvage = attempt_readable_sqlite_salvage_source(
+            &db_path,
+            "database",
+            DoctorSalvageSourceKind::LiveFranken,
+        );
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
-                assert_eq!(artifact.db_path, db_path);
-                assert!(artifact.detail.contains("Using readable database"));
+                assert_ne!(artifact.db_path, db_path);
+                assert_eq!(artifact.reported_path, db_path);
+                assert!(
+                    artifact
+                        .detail
+                        .contains("guarded private snapshot of live database")
+                );
+                assert!(artifact._snapshot_source.is_some());
+                let probe = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                    artifact.db_path.to_str().expect("private snapshot UTF-8"),
+                )
+                .expect("open private salvage snapshot");
+                let rows = probe
+                    .query_sync("SELECT id FROM messages", &[])
+                    .expect("query private salvage snapshot");
+                assert_eq!(rows.len(), 1);
             }
             DoctorSalvageAttempt::Failed(detail) => {
                 panic!("expected readable salvage source, got failure: {detail}");
@@ -56161,7 +56172,11 @@ startup_timeout_sec = 42
         let db_path = dir.path().join("unreadable-salvage.sqlite3");
         std::fs::write(&db_path, b"THIS IS NOT A SQLITE DATABASE").expect("write garbage db");
 
-        let salvage = attempt_readable_sqlite_salvage_source(&db_path, "database");
+        let salvage = attempt_readable_sqlite_salvage_source(
+            &db_path,
+            "database",
+            DoctorSalvageSourceKind::LiveFranken,
+        );
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
                 panic!(
@@ -56173,7 +56188,9 @@ startup_timeout_sec = 42
                 assert!(
                     detail.contains("could not be opened directly")
                         || detail.contains("failed a direct sqlite probe")
+                        || detail.contains("could not be materialized through guarded live")
                         || detail.contains("could not be opened for canonical salvage read")
+                        || detail.contains("could not be opened for private canonical salvage read")
                         || detail.contains("failed a canonical salvage probe")
                         || detail.contains("failed a canonical salvage quick_check"),
                     "unexpected salvage failure detail: {detail}"
@@ -67455,6 +67472,29 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn private_logical_snapshot_never_overrules_primary_corruption() {
+        assert!(matches!(
+            reconcile_private_canonical_corroboration(Ok(false), Ok(true)),
+            Ok(false)
+        ));
+
+        let error = reconcile_private_canonical_corroboration(
+            Err(CliError::Other("primary b-tree unreadable".to_string())),
+            Ok(true),
+        )
+        .expect_err("a rebuilt logical image cannot prove the live b-tree healthy");
+        assert!(error.to_string().contains("primary b-tree unreadable"));
+
+        assert!(matches!(
+            reconcile_private_canonical_corroboration(
+                Err(CliError::Other("primary probe failed".to_string())),
+                Ok(false),
+            ),
+            Ok(false)
+        ));
+    }
+
+    #[test]
     fn sqlite_file_is_healthy_canonical_accepts_valid_db() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("sqlite_probe_ok.sqlite3");
@@ -67777,18 +67817,21 @@ startup_timeout_sec = 42
 
         let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .expect("open reserved-lock writer");
+        let observer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open same-engine diagnostic observer");
+        // Capture exact bytes after every fixture connection is admitted but
+        // before the transaction starts. Opening the main inode with
+        // `std::fs::read` while the RESERVED lock is live would be the very
+        // mutant this test is meant to detect: closing that raw fd can release
+        // the process-wide lock and make the proof vacuous.
+        let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+        let entries_before = directory_entry_names_for_cli_open_test(dir.path());
         writer
             .execute_raw("BEGIN IMMEDIATE")
             .expect("acquire parent reserved writer lock");
         assert_child_observes_busy(&db_path);
 
-        let observer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open same-engine diagnostic observer");
-        assert_child_observes_busy(&db_path);
-        let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
-        let entries_before = directory_entry_names_for_cli_open_test(dir.path());
-        let count = with_private_canonical_snapshot_from_franken_conn(
-            &observer,
+        let count = with_private_canonical_snapshot_from_live_franken(
             &db_path,
             "CLI canonical diagnostic lock regression",
             |snapshot| {
@@ -67803,6 +67846,10 @@ startup_timeout_sec = 42
         .expect("run canonical diagnostic on a private snapshot");
         assert_eq!(count, 1);
         assert_child_observes_busy(&db_path);
+
+        writer.execute_raw("ROLLBACK").expect("release writer lock");
+        drop(observer);
+        drop(writer);
         assert_eq!(
             sqlite_family_bytes_for_cli_open_test(&db_path),
             family_before,
@@ -67813,10 +67860,6 @@ startup_timeout_sec = 42
             entries_before,
             "private canonical diagnostic must not publish artifacts beside the live database"
         );
-
-        writer.execute_raw("ROLLBACK").expect("release writer lock");
-        drop(observer);
-        drop(writer);
     }
 
     #[test]
@@ -75107,7 +75150,7 @@ fn handle_doctor_repair_with_options(
     // state, reconstruction is safer than trying to guess which in-place repair
     // operation can recover a malformed b-tree or index.
     {
-        let full_check = sqlite_conn_check_ok_with_private_canonical_fallback(
+        let full_check = sqlite_conn_check_ok_with_private_canonical_corroboration(
             &conn,
             &reconstruct_db_path,
             mcp_agent_mail_db::CheckKind::Full,
@@ -76039,16 +76082,24 @@ fn doctor_temp_sqlite_artifact_conflicts(candidate: &Path, extension: &str) -> b
             && !mcp_agent_mail_db::sqlite_recovery_candidate_is_standalone(candidate))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DoctorSalvageArtifact {
     db_path: PathBuf,
+    reported_path: PathBuf,
     detail: String,
+    _snapshot_source: Option<CanonicalSnapshotSource>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum DoctorSalvageAttempt {
     Failed(String),
     Succeeded(DoctorSalvageArtifact),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorSalvageSourceKind {
+    LiveFranken,
+    PrivateCanonical,
 }
 
 const DOCTOR_SALVAGE_PROBE_TABLES: &[&str] = &[
@@ -76125,22 +76176,51 @@ fn next_timestamped_sqlite_backup_path_in_dir(
     candidate
 }
 
-fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> DoctorSalvageAttempt {
-    let conn =
-        match mcp_agent_mail_db::CanonicalDbConn::open_file(sqlite_path.to_string_lossy().as_ref())
-        {
+fn attempt_readable_sqlite_salvage_source(
+    sqlite_path: &Path,
+    label: &str,
+    source_kind: DoctorSalvageSourceKind,
+) -> DoctorSalvageAttempt {
+    let snapshot_source = match source_kind {
+        DoctorSalvageSourceKind::LiveFranken => {
+            match CanonicalSnapshotSource::live_full_sqlite_snapshot(
+                sqlite_path.to_path_buf(),
+                sqlite_path,
+                "doctor live salvage materialization",
+            ) {
+                Ok(source) => Some(source),
+                Err(error) => {
+                    return DoctorSalvageAttempt::Failed(format!(
+                        "{label} {} could not be materialized through guarded live FrankenSQLite access: {error}",
+                        sqlite_path.display()
+                    ));
+                }
+            }
+        }
+        DoctorSalvageSourceKind::PrivateCanonical => None,
+    };
+    let readable_path = snapshot_source
+        .as_ref()
+        .map_or(sqlite_path, CanonicalSnapshotSource::actual_path);
+    let Some(readable_path_text) = readable_path.to_str() else {
+        return DoctorSalvageAttempt::Failed(format!(
+            "{label} {} cannot be represented as an exact UTF-8 SQLite path",
+            sqlite_path.display()
+        ));
+    };
+    let conn = match mcp_agent_mail_db::CanonicalDbConn::open_file(readable_path_text) {
             Ok(conn) => conn,
             Err(error) => {
                 return DoctorSalvageAttempt::Failed(format!(
-                    "{label} {} could not be opened for canonical salvage read: {error}",
-                    sqlite_path.display()
+                    "{label} {} could not be opened for private canonical salvage read: {error}",
+                    readable_path.display()
                 ));
             }
         };
     if let Err(error) = conn.query_sync("SELECT COUNT(*) AS cnt FROM sqlite_master", &[]) {
         return DoctorSalvageAttempt::Failed(format!(
-            "{label} {} failed a canonical salvage probe: {error}",
-            sqlite_path.display()
+            "{label} {} failed a private canonical salvage probe: {error}",
+            readable_path.display()
         ));
     }
     if let Err(error) = probe_doctor_salvage_quick_check(&conn, sqlite_path) {
@@ -76156,12 +76236,21 @@ fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> Do
         ));
     }
 
-    DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
-        db_path: sqlite_path.to_path_buf(),
-        detail: format!(
+    let detail = match source_kind {
+        DoctorSalvageSourceKind::LiveFranken => format!(
+            "Using a guarded private snapshot of live {label} {} as salvage source",
+            sqlite_path.display()
+        ),
+        DoctorSalvageSourceKind::PrivateCanonical => format!(
             "Using readable {label} {} as salvage source",
             sqlite_path.display()
         ),
+    };
+    DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
+        db_path: readable_path.to_path_buf(),
+        reported_path: sqlite_path.to_path_buf(),
+        detail,
+        _snapshot_source: snapshot_source,
     })
 }
 
@@ -76260,23 +76349,33 @@ fn should_fail_doctor_salvage_table_scan(sqlite_path: &Path, table: &str) -> boo
     }
 }
 
-fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf)> {
+fn doctor_salvage_artifact_candidates(
+    current_db: &Path,
+) -> Vec<(String, PathBuf, DoctorSalvageSourceKind)> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    let mut push_candidate = |label: &str, path: PathBuf| {
+    let mut push_candidate = |label: &str, path: PathBuf, source_kind| {
         if !path_is_real_file(&path) {
             return;
         }
         if seen.insert(path.clone()) {
-            candidates.push((label.to_string(), path));
+            candidates.push((label.to_string(), path, source_kind));
         }
     };
 
-    push_candidate("current database", current_db.to_path_buf());
+    push_candidate(
+        "current database",
+        current_db.to_path_buf(),
+        DoctorSalvageSourceKind::LiveFranken,
+    );
 
     for candidate in sqlite_backup_candidates(current_db) {
-        push_candidate("backup candidate", candidate);
+        push_candidate(
+            "backup candidate",
+            candidate,
+            DoctorSalvageSourceKind::PrivateCanonical,
+        );
     }
 
     let Some(file_name) = current_db.file_name() else {
@@ -76339,7 +76438,7 @@ fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf
         }
         group.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         for (_, path) in group {
-            push_candidate(label, path);
+            push_candidate(label, path, DoctorSalvageSourceKind::PrivateCanonical);
         }
     }
 
@@ -76348,11 +76447,11 @@ fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf
 
 fn attempt_best_doctor_salvage_artifact_from_candidates(
     current_db: &Path,
-    candidates: Vec<(String, PathBuf)>,
+    candidates: Vec<(String, PathBuf, DoctorSalvageSourceKind)>,
 ) -> DoctorSalvageAttempt {
     let mut failures = Vec::new();
-    for (label, candidate) in candidates {
-        match attempt_readable_sqlite_salvage_source(&candidate, &label) {
+    for (label, candidate, source_kind) in candidates {
+        match attempt_readable_sqlite_salvage_source(&candidate, &label, source_kind) {
             DoctorSalvageAttempt::Succeeded(artifact) => {
                 return DoctorSalvageAttempt::Succeeded(artifact);
             }
@@ -76605,11 +76704,17 @@ fn handle_doctor_reconstruct_with(
     });
 
     // Reconstruct into the TEMP path — original DB is still untouched.
-    let mut stats = match mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-        &temp_db_path,
-        &storage_root,
-        salvage_db_path,
-    ) {
+    let reconstruct = salvage_db_path.map_or_else(
+        || mcp_agent_mail_db::reconstruct_from_archive(&temp_db_path, &storage_root),
+        |private_salvage_db_path| {
+            mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
+                &temp_db_path,
+                &storage_root,
+                private_salvage_db_path,
+            )
+        },
+    );
+    let mut stats = match reconstruct {
         Ok(stats) => stats,
         Err(e) => {
             // Clean up the partial temp file; original DB is safe.
@@ -76707,7 +76812,7 @@ fn handle_doctor_reconstruct_with(
             Some(DoctorSalvageAttempt::Succeeded(artifact)) => serde_json::json!({
                 "status": "ok",
                 "detail": artifact.detail,
-                "db_path": artifact.db_path.display().to_string(),
+                "db_path": artifact.reported_path.display().to_string(),
             }),
             Some(DoctorSalvageAttempt::Failed(detail)) => serde_json::json!({
                 "status": "warn",
