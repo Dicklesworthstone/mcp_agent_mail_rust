@@ -164,6 +164,12 @@ fn ensure_existing_dir_tree_without_symlink(path: &Path) -> std::io::Result<()> 
 
 fn ensure_existing_dir_leaf_without_symlink(path: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
+        Ok(meta)
+            if meta.file_type().is_symlink()
+                && crate::is_trusted_system_directory_alias(path) =>
+        {
+            Ok(())
+        }
         Ok(meta) if meta.file_type().is_symlink() => Err(symlink_dir_error(path)),
         Ok(meta) if meta.file_type().is_dir() => Ok(()),
         Ok(_) => Err(std::io::Error::new(

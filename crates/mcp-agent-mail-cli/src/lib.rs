@@ -9621,6 +9621,39 @@ fn path_is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
+/// Return whether `path` is one of macOS's protected compatibility aliases.
+///
+/// macOS presents `/var`, `/tmp`, and `/etc` as root-owned symlinks into
+/// `/private`. Security-sensitive path walkers still need to reject every
+/// user-controlled symlink, but treating these exact operating-system aliases
+/// as hostile makes normal temp-backed operations unusable. Verify both the
+/// alias name and its canonical destination so this exception cannot broaden
+/// to an arbitrary symlink.
+pub(crate) fn is_trusted_system_directory_alias(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let expected = if path == Path::new("/var") {
+            Some(Path::new("/private/var"))
+        } else if path == Path::new("/tmp") {
+            Some(Path::new("/private/tmp"))
+        } else if path == Path::new("/etc") {
+            Some(Path::new("/private/etc"))
+        } else {
+            None
+        };
+
+        return expected.is_some_and(|expected| {
+            std::fs::canonicalize(path).is_ok_and(|resolved| resolved == expected)
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 fn project_identity_matches_requested_path(
     stored_human_key: &str,
     requested_identity: &mcp_agent_mail_core::ProjectIdentity,
@@ -19886,6 +19919,9 @@ fn validate_real_existing_directory(path: &Path, label: &str) -> CliResult<()> {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && is_trusted_system_directory_alias(&current) => {}
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         return Err(CliError::Other(format!(
                             "{label} {} must not be a symlink",
@@ -70230,6 +70266,9 @@ fn ensure_real_directory_tree(path: &Path, label: &str) -> CliResult<()> {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && is_trusted_system_directory_alias(&current) => {}
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         return Err(CliError::Other(format!(
                             "{label} {} must not be a symlink",
