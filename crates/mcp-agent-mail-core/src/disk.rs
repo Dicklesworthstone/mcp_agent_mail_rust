@@ -1336,7 +1336,8 @@ mod tests {
         let candidate = std::ffi::OsString::from_vec(candidate);
 
         assert_eq!(
-            classify_sqlite_recovery_candidate_name(&primary, &candidate).map(|name| name.kind()),
+            classify_sqlite_recovery_candidate_name(&primary, &candidate)
+                .map(SqliteRecoveryCandidateName::kind),
             Some(SqliteRecoveryCandidateKind::TimestampedBak)
         );
     }

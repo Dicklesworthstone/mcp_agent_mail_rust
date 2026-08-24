@@ -6449,14 +6449,69 @@ fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyClea
 pub fn cleanup_truncated_wal_sidecar(
     sqlite_path: &Path,
 ) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    cleanup_truncated_wal_sidecar_with_timeout(
+        sqlite_path,
+        crate::write_barrier::writer_drain_timeout(),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn cleanup_truncated_wal_sidecar_with_timeout(
+    sqlite_path: &Path,
+    writer_drain_timeout: Duration,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
     validate_sqlite_target_path(sqlite_path, "SQLite-family cleanup target")?;
     if classify_sqlite_family_cleanup(sqlite_path)?.is_empty() {
         return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
     }
 
+    // Recovery admission serializes recovery participants, but it does not by
+    // itself quiesce normal SQLite writers. Drain this process's write paths
+    // before entering admission, then refuse any external mailbox or foreign
+    // file holder before a sidecar namespace can change.
+    let _promotion_barrier = acquire_recovery_promotion_barrier(
+        sqlite_path,
+        "automatic SQLite-family cleanup",
+        writer_drain_timeout,
+    )?;
     with_recovery_admission(sqlite_path, "automatic SQLite-family cleanup", || {
+        refuse_sqlite_family_cleanup_while_owned(sqlite_path)?;
         apply_classified_sqlite_family_cleanup(sqlite_path)
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn refuse_sqlite_family_cleanup_while_owned(sqlite_path: &Path) -> Result<(), SqlError> {
+    let inferred_storage_root = sqlite_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let ownership = inspect_mailbox_ownership(sqlite_path, inferred_storage_root);
+    if ownership.blocks_mutation() {
+        return Err(SqlError::Custom(format!(
+            "automatic SQLite-family cleanup refused for {} because another mailbox owner is active: {}",
+            sqlite_path.display(),
+            ownership.detail
+        )));
+    }
+    let foreign_holders = foreign_db_file_holders(sqlite_path);
+    if !foreign_holders.is_empty() {
+        let holders = foreign_holders
+            .iter()
+            .map(|holder| {
+                holder.command.as_deref().map_or_else(
+                    || holder.pid.to_string(),
+                    |command| format!("{} ({command})", holder.pid),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SqlError::Custom(format!(
+            "automatic SQLite-family cleanup refused for {} because foreign process holder(s) remain: {holders}",
+            sqlite_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn sqlite_sidecar_cleanup_nonce() -> String {
@@ -18303,9 +18358,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nested_recovery_admission_distinguishes_lossy_colliding_unix_paths() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
         let dir = tempfile::tempdir().unwrap();
         let first = dir
             .path()
@@ -19892,6 +19944,39 @@ mod tests {
             0,
             "0-byte WAL should not create a cleanup quarantine artifact"
         );
+    }
+
+    #[test]
+    fn sqlite_family_cleanup_refuses_before_mutation_while_writer_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("writer-held-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list family before refusal")
+            .map(|entry| entry.expect("read family entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let writer = crate::write_barrier::begin_write_activity();
+
+        let error = cleanup_truncated_wal_sidecar_with_timeout(
+            &db_path,
+            Duration::from_millis(1),
+        )
+        .expect_err("an active writer must block automatic sidecar cleanup");
+
+        assert!(error.to_string().contains("did not drain"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list family after refusal")
+            .map(|entry| entry.expect("read family entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+        drop(writer);
     }
 
     #[test]
