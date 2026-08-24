@@ -3188,14 +3188,29 @@ impl DbPool {
             ))
         })?;
 
-        let live_family_is_healthy =
-            sqlite_file_is_healthy_without_family_cleanup(Path::new(&self.sqlite_path)).map_err(
-                |error| {
-                    DbError::Sqlite(format!(
-                        "startup integrity check: source-neutral pre-open probe failed: {error}"
-                    ))
-                },
-            )?;
+        // Most integrity cycles are healthy steady-state reads and must not
+        // copy the entire database merely to inspect it. A source-neutral
+        // exact-family proof is needed only while durable failure history for
+        // these exact primary bytes exists. Malformed breaker authority skips
+        // the costly probe and flows directly into admission, which will
+        // refuse before opening either the election file or SQLite itself.
+        let sqlite_path = Path::new(&self.sqlite_path);
+        let live_family_can_open_without_admission =
+            match crate::recovery_breaker::load(sqlite_path) {
+                Err(_) => false,
+                Ok(Some(state))
+                    if state.consecutive_failures > 0
+                        && state.db_fingerprint
+                            == crate::recovery_breaker::fingerprint_db(sqlite_path) =>
+                {
+                    sqlite_file_is_healthy_without_family_cleanup(sqlite_path).map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "startup integrity check: source-neutral pre-open probe failed: {error}"
+                        ))
+                    })?
+                }
+                Ok(_) => true,
+            };
         let run_live_check = || -> DbResult<integrity::IntegrityCheckResult> {
             let conn = crate::guard_db_conn(
                 match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
@@ -3306,7 +3321,7 @@ impl DbPool {
             }
         };
 
-        if live_family_is_healthy {
+        if live_family_can_open_without_admission {
             return run_live_check();
         }
 
