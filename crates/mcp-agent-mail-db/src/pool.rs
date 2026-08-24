@@ -7075,29 +7075,28 @@ fn verify_sqlite_cleanup_sidecar_witness(
     Ok(observed)
 }
 
-#[allow(clippy::result_large_err)]
 fn rollback_drifted_sqlite_cleanup_move(
     source_path: &Path,
     quarantine_path: &Path,
     drift_error: &SqlError,
-) -> Result<(), SqlError> {
-    rename_noreplace_preserving_source(quarantine_path, source_path).map_err(|rollback_error| {
-        SqlError::Custom(format!(
+) -> SqlError {
+    if let Err(rollback_error) = rename_noreplace_preserving_source(quarantine_path, source_path) {
+        return SqlError::Custom(format!(
             "{drift_error}; additionally failed to restore raced SQLite sidecar {} from {} without replacement: {rollback_error}",
             source_path.display(),
             quarantine_path.display()
-        ))
-    })?;
+        ));
+    }
     if let Err(sync_error) = sync_recovery_parent(source_path) {
-        return Err(SqlError::Custom(format!(
+        return SqlError::Custom(format!(
             "{drift_error}; the raced sidecar was restored to {}, but syncing its parent failed: {sync_error}",
             source_path.display()
-        )));
+        ));
     }
-    Err(SqlError::Custom(format!(
+    SqlError::Custom(format!(
         "{drift_error}; the raced sidecar was restored to {} and no cleanup was committed",
         source_path.display()
-    )))
+    ))
 }
 
 fn rollback_prior_sqlite_cleanup_moves(
@@ -7158,11 +7157,11 @@ fn quarantine_sqlite_cleanup_sidecar_witnessed(
                 if let Err(drift_error) =
                     verify_sqlite_cleanup_sidecar_witness(witness, &quarantine)
                 {
-                    return rollback_drifted_sqlite_cleanup_move(
+                    return Err(rollback_drifted_sqlite_cleanup_move(
                         &witness.path,
                         &quarantine,
                         &drift_error,
-                    );
+                    ));
                 }
                 tracing::warn!(
                     path = %witness.path.display(),

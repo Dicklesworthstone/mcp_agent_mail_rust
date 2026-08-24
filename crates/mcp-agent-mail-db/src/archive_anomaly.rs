@@ -1819,7 +1819,7 @@ fn query_db_message_expectations(
 }
 
 fn query_db_mailbox_copy_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbMailboxCopyExpectation>, String> {
     let mut expectations = Vec::new();
 
@@ -1888,7 +1888,7 @@ fn query_db_mailbox_copy_expectations(
 }
 
 fn query_db_agent_profile_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbAgentProfileExpectation>, String> {
     let rows = conn
         .query_sync(
@@ -1924,7 +1924,7 @@ fn query_db_agent_profile_expectations(
 }
 
 fn query_db_reservation_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbReservationArtifactExpectation>, String> {
     let rows = conn
         .query_sync(

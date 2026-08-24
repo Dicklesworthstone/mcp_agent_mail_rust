@@ -7494,13 +7494,23 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
         return None;
     }
 
-    // Classify the damage on a read-only immutable connection first.
+    // Classify only an explicitly offline canonical source. A private logical
+    // rebuild can normalize damaged indexes, so it is neither a faithful
+    // index-damage classifier nor authority to mutate the live family.
     let (damaged_indexes, affected_tables) = {
-        let conn =
-            match doctor_open_canonical_readonly_db_for_diagnostic(db_path, "index_only_reindex") {
-                Ok(conn) => conn,
+        let opened =
+            match doctor_open_canonical_source_for_diagnostic(db_path, "index_only_reindex") {
+                Ok(opened) => opened,
                 Err(_) => return None,
             };
+        if opened.is_live_logical_snapshot() {
+            tracing::warn!(
+                db = %db_path.display(),
+                "index-only REINDEX fast path declined: a private logical snapshot cannot classify physical index damage on the live FrankenSQLite family"
+            );
+            return None;
+        }
+        let conn = &opened.conn;
         let rows = sqlite_query_check_rows(
             |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
             mcp_agent_mail_db::CheckKind::Full,
@@ -7515,11 +7525,11 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
         }
         let damaged = mcp_agent_mail_db::integrity::index_only_corruption_index_names(&details)?;
         // Any foreign-key violation means the damage is not index-only.
-        match doctor_foreign_key_violations_canonical(&conn) {
+        match doctor_foreign_key_violations_canonical(conn) {
             Ok(violations) if violations.is_empty() => {}
             _ => return None,
         }
-        let tables = match doctor_index_owner_tables_for_damage(&conn, &damaged) {
+        let tables = match doctor_index_owner_tables_for_damage(conn, &damaged) {
             Ok(tables) => tables,
             Err(error) => {
                 // The global fallback below is still safe for the strictly
@@ -23884,6 +23894,10 @@ struct DoctorOpenContext {
 
 struct DoctorReadOnlyOpenContext {
     conn: mcp_agent_mail_db::CanonicalDbConn,
+    // Retain a private logical snapshot for as long as `conn` can read it.
+    // `None` means `conn` owns an explicitly offline canonical source.
+    _snapshot_source: Option<CanonicalSnapshotSource>,
+    source_kind: DoctorCanonicalDiagnosticSourceKind,
     configured_path: String,
     opened_path: String,
     used_absolute_fallback: bool,
@@ -24025,6 +24039,8 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
             .map_err(|e| CliError::Other(format!("cannot open in-memory database: {e}")))?;
         return Ok(DoctorReadOnlyOpenContext {
             conn,
+            _snapshot_source: None,
+            source_kind: DoctorCanonicalDiagnosticSourceKind::InMemory,
             configured_path: path.clone(),
             opened_path: path,
             used_absolute_fallback: false,
@@ -24063,13 +24079,15 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
         )));
     }
 
-    match doctor_open_canonical_readonly_db_for_diagnostic(
+    match doctor_open_canonical_source_for_diagnostic(
         Path::new(&candidate_path),
         "doctor_check",
     ) {
-        Ok(conn) => match conn.query_sync("SELECT 1 AS one", &[]) {
+        Ok(opened) => match opened.conn.query_sync("SELECT 1 AS one", &[]) {
             Ok(_) => Ok(DoctorReadOnlyOpenContext {
-                conn,
+                conn: opened.conn,
+                _snapshot_source: opened._snapshot_source,
+                source_kind: opened.kind,
                 configured_path: path.clone(),
                 opened_path: candidate_path.clone(),
                 used_absolute_fallback,
@@ -24080,7 +24098,7 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                 if let Some(fallback_path) =
                     sqlite_absolute_fallback_path(&candidate_path, &probe_err_text)
                 {
-                    let fallback_conn = doctor_open_canonical_readonly_db_for_diagnostic(
+                    let fallback = doctor_open_canonical_source_for_diagnostic(
                         Path::new(&fallback_path),
                         "doctor_check",
                     )
@@ -24089,7 +24107,8 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                             "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} failed: {e}"
                         ))
                     })?;
-                    fallback_conn
+                    fallback
+                        .conn
                         .query_sync("SELECT 1 AS one", &[])
                         .map_err(|e| {
                             CliError::Other(format!(
@@ -24097,7 +24116,9 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                             ))
                     })?;
                     return Ok(DoctorReadOnlyOpenContext {
-                        conn: fallback_conn,
+                        conn: fallback.conn,
+                        _snapshot_source: fallback._snapshot_source,
+                        source_kind: fallback.kind,
                         configured_path: path.clone(),
                         opened_path: fallback_path.clone(),
                         used_absolute_fallback: true,
@@ -24114,7 +24135,7 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
             if let Some(fallback_path) =
                 sqlite_absolute_fallback_path(&candidate_path, &primary_err_text)
             {
-                let fallback_conn = doctor_open_canonical_readonly_db_for_diagnostic(
+                let fallback = doctor_open_canonical_source_for_diagnostic(
                     Path::new(&fallback_path),
                     "doctor_check",
                 )
@@ -24123,7 +24144,8 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                         "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
                     ))
                 })?;
-                fallback_conn
+                fallback
+                    .conn
                     .query_sync("SELECT 1 AS one", &[])
                     .map_err(|e| {
                         CliError::Other(format!(
@@ -24131,7 +24153,9 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                         ))
                 })?;
                 return Ok(DoctorReadOnlyOpenContext {
-                    conn: fallback_conn,
+                    conn: fallback.conn,
+                    _snapshot_source: fallback._snapshot_source,
+                    source_kind: fallback.kind,
                     configured_path: path.clone(),
                     opened_path: fallback_path.clone(),
                     used_absolute_fallback: true,
@@ -25124,7 +25148,32 @@ where
     }
 }
 
-fn doctor_open_canonical_readonly_db_for_diagnostic(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorCanonicalDiagnosticSourceKind {
+    InMemory,
+    LiveLogicalSnapshot,
+    OfflineCanonical,
+}
+
+struct DoctorCanonicalDiagnosticOpen {
+    // Drop the connection before the retained tempdir.
+    conn: mcp_agent_mail_db::CanonicalDbConn,
+    _snapshot_source: Option<CanonicalSnapshotSource>,
+    kind: DoctorCanonicalDiagnosticSourceKind,
+}
+
+impl DoctorCanonicalDiagnosticOpen {
+    fn is_live_logical_snapshot(&self) -> bool {
+        self.kind == DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot
+    }
+}
+
+/// Open a canonical connection only on an engine-exclusive private snapshot.
+///
+/// `immutable=1` deliberately skips SQLite locking and change detection. It is
+/// safe for the self-contained temp image retained by the caller, but it must
+/// never be used directly on a live FrankenSQLite main/WAL family.
+fn doctor_open_private_immutable_canonical_snapshot(
     db_path: &Path,
     operation: &str,
 ) -> CliResult<mcp_agent_mail_db::CanonicalDbConn> {
@@ -25143,6 +25192,58 @@ fn doctor_open_canonical_readonly_db_for_diagnostic(
             db_path.display()
         ))
     })
+}
+
+/// Select a lock-safe source for a canonical doctor diagnostic.
+///
+/// A Franken-admitted mailbox is first exported through a guarded read-only
+/// FrankenSQLite connection and canonical SQLite sees only that private inode.
+/// A sidecarless engine-exclusive/offline database may instead use the guarded
+/// canonical read-only opener. Partial namespace authority, hard links, and
+/// ambiguous live families fail closed in both branches.
+fn doctor_open_canonical_source_for_diagnostic(
+    db_path: &Path,
+    operation: &str,
+) -> CliResult<DoctorCanonicalDiagnosticOpen> {
+    if db_path.as_os_str() == ":memory:" {
+        return Err(CliError::Other(format!(
+            "{operation} canonical diagnostic source is unavailable for in-memory databases"
+        )));
+    }
+
+    let live_error = match CanonicalSnapshotSource::live_full_sqlite_snapshot(
+        db_path.to_path_buf(),
+        db_path,
+        operation,
+    ) {
+        Ok(snapshot_source) => {
+            let conn = doctor_open_private_immutable_canonical_snapshot(
+                snapshot_source.actual_path(),
+                operation,
+            )?;
+            return Ok(DoctorCanonicalDiagnosticOpen {
+                conn,
+                _snapshot_source: Some(snapshot_source),
+                kind: DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot,
+            });
+        }
+        Err(error) => error,
+    };
+
+    match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+        db_path, operation,
+    ) {
+        Ok(conn) => Ok(DoctorCanonicalDiagnosticOpen {
+            conn,
+            _snapshot_source: None,
+            kind: DoctorCanonicalDiagnosticSourceKind::OfflineCanonical,
+        }),
+        Err(offline_error) => Err(CliError::Other(format!(
+            "cannot open {} for canonical {operation}: guarded live snapshot failed: {}; guarded offline canonical open failed: {offline_error}",
+            db_path.display(),
+            truncate_doctor_command(&live_error.to_string())
+        ))),
+    }
 }
 
 fn doctor_foreign_key_violation_from_row(
@@ -29318,13 +29419,13 @@ fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
 /// (A1 taxonomy) when the canonical engine PROVES the file healthy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DoctorCanonicalCrossCheck {
-    /// Every applicable canonical probe passed: the file is PROVEN healthy and a
-    /// transient corruption verdict must be reclassified (engine/connection
-    /// limitation), never upheld as "database corrupt".
+    /// Every applicable canonical probe passed on an explicitly offline
+    /// canonical source, so that file is proven healthy. A clean private
+    /// logical rebuild is never promoted to this variant.
     Healthy,
-    /// A canonical probe AUTHORITATIVELY reported damage (integrity/quick check
-    /// corruption rows, a foreign-key violation, or a main-DB corruption engine
-    /// error). The corruption verdict stands.
+    /// A canonical probe reported damage (integrity/quick-check rows or a
+    /// foreign-key violation). On a private logical image this corroborates the
+    /// primary verdict; it does not arise merely from source-selection errors.
     ConfirmsCorruption(String),
     /// The canonical engine could not authoritatively answer (open failure,
     /// engine-probe limitation, benign/suspect rows, schema drift, missing core
@@ -29413,14 +29514,16 @@ fn doctor_fold_probe_authority(
     }
 }
 
-/// br-bvq1x.1.3 (A3): run the AUTHORITATIVE canonical engine's full read-only
-/// battery against a database and report whether it PROVES the file healthy,
-/// CONFIRMS corruption, or is inconclusive.
+/// br-bvq1x.1.3 (A3): run the canonical engine's full read-only battery against
+/// a lock-safe source and report whether it proves an offline file healthy,
+/// corroborates corruption, or is inconclusive.
 ///
-/// The DB is opened read-only/immutable (shares the B2 purity machinery — no
-/// `-wal`/`-shm` creation, no write contention with a live mailbox owner, and no
-/// lock waits, which is what bounds the probe on a sick host). The battery, in
-/// increasing cost, is: `quick_check`, full `integrity_check`,
+/// An offline canonical database is opened through true read-only flags. A
+/// live FrankenSQLite family is first exported to a private logical image, so
+/// canonical SQLite never opens or closes the live main inode. A clean logical
+/// rebuild cannot prove the physical live b-tree healthy and is therefore
+/// inconclusive rather than `Healthy`. The battery, in increasing cost, is:
+/// `quick_check`, full `integrity_check`,
 /// `foreign_key_check`, a schema-table probe (core tables present and readable),
 /// and an FTS read probe when a legacy FTS table exists.
 ///
@@ -29438,30 +29541,21 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
         );
     }
 
-    let conn = match doctor_open_canonical_readonly_db_for_diagnostic(
+    let opened = match doctor_open_canonical_source_for_diagnostic(
         resolved,
         "double_probe_cross_check",
     ) {
-        Ok(conn) => conn,
+        Ok(opened) => opened,
         Err(error) => {
-            // An open failure is a connection/config limitation, not proof of
-            // on-disk damage — UNLESS the engine reports an authoritative
-            // corruption signature in the open error itself.
-            let message = error.to_string();
-            return if matches!(
-                mcp_agent_mail_db::classify_db_error_message(&message).class,
-                mcp_agent_mail_db::DbErrorClass::MainDbBtreeCorruption
-            ) {
-                DoctorCanonicalCrossCheck::ConfirmsCorruption(format!(
-                    "canonical read-only open reported corruption: {message}"
-                ))
-            } else {
-                DoctorCanonicalCrossCheck::Inconclusive(format!(
-                    "canonical read-only open failed: {message}"
-                ))
-            };
+            // The selector can fail while materializing the guarded Franken
+            // source, before canonical SQLite has observed any private bytes.
+            // Never relabel that source-engine error as canonical confirmation.
+            return DoctorCanonicalCrossCheck::Inconclusive(format!(
+                "canonical read-only source selection failed: {error}"
+            ));
         }
     };
+    let conn = &opened.conn;
 
     // First inconclusive reason wins; an authoritative corruption short-circuits.
     let mut inconclusive_reason: Option<String> = None;
@@ -29482,7 +29576,7 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
     }
 
     // 3: foreign_key_check (an empty result is healthy).
-    let fk_authority = match doctor_foreign_key_violations_canonical(&conn) {
+    let fk_authority = match doctor_foreign_key_violations_canonical(conn) {
         Ok(violations) if violations.is_empty() => CanonicalProbeAuthority::Pass,
         Ok(violations) => {
             let first = &violations[0];
@@ -29504,7 +29598,7 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
     }
 
     // 4: schema-table probe — the core tables must be present and readable.
-    let schema_authority = match doctor_required_tables_canonical(&conn) {
+    let schema_authority = match doctor_required_tables_canonical(conn) {
         Ok(missing) if missing.is_empty() => CanonicalProbeAuthority::Pass,
         // Missing core tables is a structural verdict, not B-tree corruption: do
         // not claim health, but do not assert "malformed" either.
@@ -29523,7 +29617,7 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
     // 5: FTS read probe — only when a legacy FTS table exists. A corrupt FTS
     // index raises an FTS error but is rebuildable and does not prove main-DB
     // damage, so it can only downgrade `Healthy` to `Inconclusive`.
-    if let Some(fts_table) = doctor_legacy_fts_tables_canonical(&conn).first() {
+    if let Some(fts_table) = doctor_legacy_fts_tables_canonical(conn).first() {
         let quoted = fts_table.replace('"', "\"\"");
         if let Err(error) = conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[]) {
             let fts_authority = doctor_classify_canonical_probe_error(
@@ -29540,6 +29634,10 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
 
     match inconclusive_reason {
         Some(reason) => DoctorCanonicalCrossCheck::Inconclusive(reason),
+        None if opened.is_live_logical_snapshot() => DoctorCanonicalCrossCheck::Inconclusive(
+            "canonical checks passed only on a private logical rebuild; that cannot prove the live physical b-tree healthy"
+                .to_string(),
+        ),
         None => DoctorCanonicalCrossCheck::Healthy,
     }
 }
@@ -29746,6 +29844,34 @@ fn doctor_database_probe_failure_strategy(
     }
 }
 
+/// Evaluate physical integrity without letting a clean logical rebuild hide a
+/// defect in the admitted live b-tree.
+fn doctor_read_only_physical_integrity_check(
+    opened: &DoctorReadOnlyOpenContext,
+    kind: mcp_agent_mail_db::CheckKind,
+) -> CliResult<bool> {
+    let canonical_result = sqlite_conn_check_ok_canonical(&opened.conn, kind);
+    if opened.source_kind != DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot {
+        return canonical_result;
+    }
+
+    let live_path = Path::new(&opened.opened_path);
+    let primary_result =
+        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+            live_path,
+            "read-only doctor physical integrity probe",
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "guarded live physical integrity open failed for {}: {error}",
+                live_path.display()
+            ))
+        })
+        .and_then(|conn| sqlite_conn_check_ok(&conn, kind));
+
+    reconcile_private_canonical_corroboration(primary_result, canonical_result)
+}
+
 fn doctor_database_fix_strategy_read_only_probes(
     database_url: &str,
     storage_root: &Path,
@@ -29827,7 +29953,8 @@ fn doctor_database_fix_strategy_read_only_probes(
     }
 
     let integrity_ok =
-        match sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full) {
+        match doctor_read_only_physical_integrity_check(&opened, mcp_agent_mail_db::CheckKind::Full)
+        {
             Ok(ok) => ok,
             Err(error) => {
                 let detail = format!(
@@ -53857,8 +53984,13 @@ startup_timeout_sec = 42
         seed_index_only_corrupt_mailbox(&db_path);
 
         // The fixture must classify as index-only damage...
-        let conn = doctor_open_canonical_readonly_db_for_diagnostic(&db_path, "fixture probe")
+        let opened = doctor_open_canonical_source_for_diagnostic(&db_path, "fixture probe")
             .expect("readonly probe open");
+        assert!(
+            !opened.is_live_logical_snapshot(),
+            "sidecarless canonical fixture must use the guarded offline authority"
+        );
+        let conn = &opened.conn;
         let rows = sqlite_query_check_rows(
             |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
             mcp_agent_mail_db::CheckKind::Full,
@@ -53875,7 +54007,7 @@ startup_timeout_sec = 42
         let damaged = mcp_agent_mail_db::integrity::index_only_corruption_index_names(&details)
             .unwrap_or_else(|| panic!("fixture damage must be index-only: {details:?}"));
         assert_eq!(damaged, vec!["idx_agents_project_name"]);
-        drop(conn);
+        drop(opened);
 
         // ...and route the startup strategy to the (lossy-prone) reconstruct arm.
         let action = startup_database_self_heal_action(&db_url, dir.path())
@@ -67804,6 +67936,8 @@ startup_timeout_sec = 42
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("canonical-diagnostic-lock.sqlite3");
+        init_schema_sqlite_canonical(&db_path.display().to_string())
+            .expect("initialize complete mailbox schema for authority probe");
         let seed = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .expect("open diagnostic lock fixture");
         seed.execute_raw("PRAGMA journal_mode = DELETE")
@@ -67844,6 +67978,34 @@ startup_timeout_sec = 42
         )
         .expect("run canonical diagnostic on a private snapshot");
         assert_eq!(count, 1);
+        assert_child_observes_busy(&db_path);
+
+        let cross_check = doctor_canonical_double_probe(&db_path);
+        match cross_check {
+            DoctorCanonicalCrossCheck::Inconclusive(detail) => assert!(
+                detail.contains("private logical rebuild"),
+                "a clean private rebuild must be explicitly non-authoritative for live physical bytes: {detail}"
+            ),
+            other => panic!(
+                "a clean logical snapshot must never override the live physical verdict: {other:?}"
+            ),
+        }
+        assert_child_observes_busy(&db_path);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let read_only = open_db_for_doctor_check_read_only_with_context(&database_url)
+            .expect("open live doctor diagnostics through a retained private snapshot");
+        assert!(
+            read_only._snapshot_source.is_some(),
+            "live read-only doctor diagnostics must retain their private snapshot"
+        );
+        let rows = read_only
+            .conn
+            .query_sync("SELECT COUNT(*) AS count FROM diagnostic_witness", &[])
+            .expect("query retained private doctor snapshot");
+        assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 1);
+        assert_child_observes_busy(&db_path);
+        drop(read_only);
         assert_child_observes_busy(&db_path);
 
         writer.execute_raw("ROLLBACK").expect("release writer lock");
