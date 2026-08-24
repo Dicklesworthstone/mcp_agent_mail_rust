@@ -7256,6 +7256,24 @@ fn startup_database_self_heal_action_read_only(
     )
 }
 
+fn require_healthy_existing_database_for_startup_fail_open(db_path: &Path) -> CliResult<()> {
+    if !path_is_real_file(db_path) {
+        return Err(CliError::Other(format!(
+            "startup recovery cannot fail open because {} is not an existing regular file",
+            db_path.display()
+        )));
+    }
+
+    if sqlite_file_is_healthy(db_path)? {
+        Ok(())
+    } else {
+        Err(CliError::Other(format!(
+            "startup recovery cannot fail open because the existing SQLite family at {} failed source-byte-neutral health checks",
+            db_path.display()
+        )))
+    }
+}
+
 fn run_startup_database_self_heal_with<F, G>(
     database_url: &str,
     storage_root: &Path,
@@ -7340,14 +7358,23 @@ where
     match attempt {
         Ok(()) => Ok(()),
         Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error))
-            if is_reconstruct_promotion_refusal(&error) && recovery_db_path.is_file() =>
+            if is_reconstruct_promotion_refusal(&error) =>
         {
+            require_healthy_existing_database_for_startup_fail_open(&recovery_db_path).map_err(
+                |health_error| {
+                    CliError::Other(format!(
+                        "{error}; promotion refusal preserved the live path, but startup cannot continue without a healthy live database: {health_error}"
+                    ))
+                },
+            )?;
             // br-r6awv: a refused promotion means the live DB still holds
-            // coordination keys the archive candidate would drop. Record the
-            // failed attempt in the breaker, then keep the live file and boot.
+            // coordination keys the archive candidate would drop. The failed
+            // attempt is already recorded in the breaker. Boot only after a
+            // source-byte-neutral whole-family probe proves the preserved live
+            // database remains healthy; a regular pathname alone is not proof.
             output::warn(&format!(
                 "Automatic mailbox reconstruction refused promotion \
-                 (live database kept): {error}"
+                 (healthy live database kept): {error}"
             ));
             Ok(())
         }
@@ -7355,11 +7382,18 @@ where
         Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission {
             kind: mcp_agent_mail_db::pool::AutomaticRecoveryAdmissionFailureKind::CircuitOpen,
             error,
-        }) if recovery_db_path.is_file() => {
+        }) => {
+            require_healthy_existing_database_for_startup_fail_open(&recovery_db_path).map_err(
+                |health_error| {
+                    CliError::Other(format!(
+                        "automatic mailbox recovery remains parked by its durable circuit breaker ({error}); startup cannot continue without a healthy live database: {health_error}"
+                    ))
+                },
+            )?;
             output::warn(&format!(
                 "Automatic mailbox recovery remains parked by its durable circuit breaker; \
-                 the existing live database was kept and startup will continue without another \
-                 repair, reconstruction, or forensic capture: {error}"
+                 the existing live database passed source-byte-neutral health checks and startup \
+                 will continue without another repair, reconstruction, or forensic capture: {error}"
             ));
             Ok(())
         }
@@ -52810,7 +52844,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn startup_database_self_heal_keeps_live_db_when_reconstruct_promotion_refuses() {
+    fn startup_database_self_heal_refuses_to_boot_corrupt_db_after_promotion_refusal() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_archive_mailbox_project(dir.path());
         let db_path = dir.path().join("live.sqlite3");
@@ -52842,10 +52876,10 @@ startup_timeout_sec = 42
                         refusal()
                     },
                 )
-                .expect("promotion refusal must keep the live DB and continue startup");
+                .expect_err("promotion refusal must not boot an unhealthy live DB");
                 assert!(
                     db_path.is_file(),
-                    "fail-open must not remove the live database it claimed to keep"
+                    "health-gated refusal must preserve the live database for forensics"
                 );
 
                 let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
@@ -52869,7 +52903,7 @@ startup_timeout_sec = 42
                         refusal()
                     },
                 )
-                .expect("an open breaker with a live DB must park recovery and boot");
+                .expect_err("an open breaker must not boot an unhealthy live DB");
 
                 let entries_after = std::fs::read_dir(dir.path())
                     .expect("re-list recovery directory")
@@ -52888,6 +52922,90 @@ startup_timeout_sec = 42
             reconstruct_calls.get(),
             1,
             "the second startup must be refused before reconstruction or forensics"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_boots_healthy_db_after_promotion_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_dir = seed_archive_mailbox_project(dir.path());
+        write_archive_mailbox_message(
+            &message_dir,
+            "2026-03-22T12-00-00Z__archive-ahead__1.md",
+            1,
+            "Alice",
+            "Archive ahead",
+            "normal",
+            "2026-03-22T12:00:00Z",
+            "archive message absent from the healthy live DB",
+        );
+        let db_path = dir.path().join("live.sqlite3");
+        seed_project_only_db(&db_path, "ahead-project", "/ahead-project");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_bytes = std::fs::read(&db_path).expect("snapshot healthy live DB");
+        let reconstruct_calls = std::cell::Cell::new(0_u32);
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "1"),
+                ("AM_RECOVERY_BREAKER_COOLDOWN_SECS", "86400"),
+            ],
+            || {
+                let refuse_promotion = |_: &Path| {
+                    reconstruct_calls.set(reconstruct_calls.get() + 1);
+                    Err(CliError::Other(
+                        "reconstruction succeeded but final database promotion failed: \
+                         recovery candidate would lose stable coordination keys"
+                            .to_string(),
+                    ))
+                };
+
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    dir.path(),
+                    || panic!("archive-ahead fixture should not repair"),
+                    refuse_promotion,
+                )
+                .expect("promotion refusal may boot a source-neutrally proven healthy live DB");
+
+                let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
+                    .expect("load durable breaker")
+                    .expect("failed promotion must persist breaker authority");
+                assert!(breaker.tripped);
+                assert_eq!(breaker.consecutive_failures, 1);
+                let breaker_path =
+                    mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+                let breaker_bytes =
+                    std::fs::read(&breaker_path).expect("snapshot breaker authority");
+
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    dir.path(),
+                    || panic!("open breaker must skip repair"),
+                    |_| {
+                        reconstruct_calls.set(reconstruct_calls.get() + 1);
+                        panic!("open breaker must skip reconstruction")
+                    },
+                )
+                .expect("open breaker may park recovery when the live family is healthy");
+
+                assert_eq!(
+                    std::fs::read(&breaker_path).expect("re-read breaker authority"),
+                    breaker_bytes,
+                    "health-gated fail-open must not rewrite breaker authority"
+                );
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("re-read healthy live DB"),
+            db_bytes,
+            "source-byte-neutral fail-open probing must preserve live DB bytes"
+        );
+        assert_eq!(
+            reconstruct_calls.get(),
+            1,
+            "the open breaker must prevent a duplicate reconstruction attempt"
         );
     }
 
@@ -52941,7 +53059,7 @@ startup_timeout_sec = 42
                 Ok(())
             },
         )
-        .expect("tripped startup keeps the live DB and boots");
+        .expect_err("tripped startup must not boot a family with a malformed WAL");
 
         assert_eq!(repair_calls.get(), 0);
         assert_eq!(reconstruct_calls.get(), 0);

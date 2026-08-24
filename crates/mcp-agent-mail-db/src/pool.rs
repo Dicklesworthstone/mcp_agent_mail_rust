@@ -6498,16 +6498,18 @@ fn cleanup_truncated_wal_sidecar_with_timeout(
         return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
     }
 
-    // Recovery admission serializes recovery participants, but it does not by
-    // itself quiesce normal SQLite writers. Drain this process's write paths
-    // before entering admission, then refuse any external mailbox or foreign
-    // file holder before a sidecar namespace can change.
-    let _promotion_barrier = acquire_recovery_promotion_barrier(
-        sqlite_path,
-        "automatic SQLite-family cleanup",
-        writer_drain_timeout,
-    )?;
     with_recovery_mutation_admission(sqlite_path, "automatic SQLite-family cleanup", || {
+        // Recovery admission must precede writer drain: a malformed or tripped
+        // durable breaker is authoritative and should refuse immediately rather
+        // than parking healthy writers behind an operation that cannot run.
+        // Once admitted, quiesce this process's write paths and refuse any
+        // external mailbox or foreign file holder before changing a sidecar
+        // namespace entry.
+        let _promotion_barrier = acquire_recovery_promotion_barrier(
+            sqlite_path,
+            "automatic SQLite-family cleanup",
+            writer_drain_timeout,
+        )?;
         refuse_sqlite_family_cleanup_while_owned(sqlite_path)?;
         apply_classified_sqlite_family_cleanup(sqlite_path)
     })
@@ -20023,6 +20025,59 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(names_after, names_before);
         drop(writer);
+    }
+
+    #[test]
+    fn tripped_breaker_preempts_writer_drain_for_sidecar_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-writer-held-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let config = crate::recovery_breaker::config_from_env();
+        let state = crate::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: config.max_consecutive_failures,
+            last_failure_unix: recovery_breaker_now_unix(),
+            last_failure_reason: "fixture tripped before writer drain".to_string(),
+            tripped: true,
+        };
+        crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read tripped breaker");
+        let writer = crate::write_barrier::begin_write_activity();
+
+        recovery_admission().reset();
+        let error = cleanup_truncated_wal_sidecar_with_timeout(&db_path, Duration::ZERO)
+            .expect_err("tripped breaker must refuse before attempting writer drain");
+
+        assert!(
+            error.to_string().contains("circuit-broken"),
+            "authoritative breaker refusal must preempt the zero-timeout writer-drain error: {error}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        assert!(
+            sqlite_cleanup_quarantines(
+                dir.path(),
+                "tripped-writer-held-cleanup.sqlite3-wal"
+            )
+            .is_empty()
+        );
+        assert!(
+            sqlite_cleanup_quarantines(
+                dir.path(),
+                "tripped-writer-held-cleanup.sqlite3-shm"
+            )
+            .is_empty()
+        );
+        drop(writer);
+        recovery_admission().reset();
     }
 
     #[test]
