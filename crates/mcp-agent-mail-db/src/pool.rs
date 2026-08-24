@@ -6794,9 +6794,16 @@ fn os_str_starts_with(value: &OsStr, prefix: &OsStr) -> bool {
     }
 }
 
-struct SqliteHealthProbeSource {
+pub(crate) struct SqliteHealthProbeSource {
     _directory: CanonicalSnapshotTempDir,
     path: PathBuf,
+}
+
+impl SqliteHealthProbeSource {
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 fn stage_sqlite_family_for_health_probe_once(
@@ -6839,7 +6846,7 @@ fn stage_sqlite_family_for_health_probe_once(
 }
 
 #[allow(clippy::result_large_err)]
-fn stage_sqlite_family_for_health_probe(
+pub(crate) fn stage_sqlite_family_for_health_probe(
     source: &Path,
 ) -> Result<Option<SqliteHealthProbeSource>, SqlError> {
     validate_sqlite_target_path(source, "SQLite health-probe source")?;

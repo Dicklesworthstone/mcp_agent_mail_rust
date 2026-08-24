@@ -786,8 +786,8 @@ fn sqlite_family_sidecar(db_path: &Path, suffix: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(os)
 }
 
-/// Where canonical SQLite evidence reads (continuity snapshot + full
-/// integrity gate) should be pointed for one source database.
+/// Private SQLite-family copy used by canonical evidence reads (continuity
+/// snapshot + full integrity gate) for one source database.
 ///
 /// Canonical SQLite cannot open a WAL-mode family READ-ONLY while a hot
 /// `-wal` sits beside it without a writable `-shm` ("attempt to write a
@@ -797,47 +797,29 @@ fn sqlite_family_sidecar(db_path: &Path, suffix: &str) -> std::path::PathBuf {
 /// to witness. Since the engine stopped checkpointing on connection drop
 /// (bd-daqmp), a hot `-wal` beside a healthy database is the NORMAL resting
 /// state, not an anomaly. Whenever any family sidecar is present, evidence
-/// reads therefore run against a settled private staging copy (db + wal
-/// [+ shm], recovered and checkpointed by canonical SQLite on the COPY);
-/// the source family stays byte-untouched. The staging directory evaporates
-/// on drop.
-enum CanonicalSnapshotSource {
-    Direct(std::path::PathBuf),
-    Staged {
-        _dir: tempfile::TempDir,
-        db_path: std::path::PathBuf,
-    },
+/// reads therefore always run against the central no-follow private family
+/// staging copy. Always staging also prevents a cold, sidecar-free live
+/// database from minting WAL/SHM merely because receipt evidence opened it.
+/// Canonical SQLite recovers and checkpoints only the COPY; the authority
+/// family stays byte- and name-untouched.
+struct CanonicalSnapshotSource {
+    staged: crate::pool::SqliteHealthProbeSource,
 }
 
 impl CanonicalSnapshotSource {
     fn for_family(db_path: &Path) -> Result<Self, SqlError> {
-        let journal = sqlite_family_sidecar(db_path, "-journal");
-        let wal = sqlite_family_sidecar(db_path, "-wal");
-        let shm = sqlite_family_sidecar(db_path, "-shm");
-        let family_requires_staging = journal.symlink_metadata().is_ok()
-            || wal.symlink_metadata().is_ok()
-            || shm.symlink_metadata().is_ok();
-        if !family_requires_staging {
-            return Ok(Self::Direct(db_path.to_path_buf()));
-        }
-
-        let dir = tempfile::TempDir::new()
-            .map_err(|error| recovery_receipt_error("snapshot staging dir", db_path, error))?;
-        let staged_db = dir.path().join("settled-snapshot.sqlite3");
-        std::fs::copy(db_path, &staged_db)
-            .map_err(|error| recovery_receipt_error("snapshot staging copy", db_path, error))?;
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let source_sidecar = sqlite_family_sidecar(db_path, suffix);
-            if source_sidecar.is_file() {
-                std::fs::copy(&source_sidecar, sqlite_family_sidecar(&staged_db, suffix)).map_err(
-                    |error| recovery_receipt_error("snapshot staging sidecar copy", db_path, error),
-                )?;
-            }
-        }
-        // Settle the COPY: canonical SQLite rolls back / recovers whatever the
-        // sidecars held and checkpoints, so the read-only snapshot below sees
-        // every committed row. Garbage sidecars are simply ignored.
-        let settle = crate::CanonicalDbConn::open_file(staged_db.to_string_lossy().as_ref())
+        let staged = crate::pool::stage_sqlite_family_for_health_probe(db_path)?.ok_or_else(|| {
+            recovery_receipt_error(
+                "snapshot staging",
+                db_path,
+                "source is missing or its SQLite family contains a non-regular object",
+            )
+        })?;
+        // Settle the COPY: canonical SQLite rolls back / recovers whatever
+        // valid journal/WAL state was captured and checkpoints the private
+        // family. Malformed family members are rejected by central staging
+        // before this open rather than being skipped or dereferenced.
+        let settle = crate::CanonicalDbConn::open_file(staged.path().to_string_lossy().as_ref())
             .map_err(|error| {
                 recovery_receipt_error("snapshot staging settle open", db_path, error)
             })?;
@@ -847,17 +829,11 @@ impl CanonicalSnapshotSource {
                 recovery_receipt_error("snapshot staging checkpoint", db_path, error)
             })?;
         drop(settle);
-        Ok(Self::Staged {
-            _dir: dir,
-            db_path: staged_db,
-        })
+        Ok(Self { staged })
     }
 
     fn snapshot_path(&self) -> &Path {
-        match self {
-            Self::Direct(path) => path,
-            Self::Staged { db_path, .. } => db_path,
-        }
+        self.staged.path()
     }
 }
 
@@ -2825,31 +2801,46 @@ fn collect_recovery_receipt_evidence(
                 // refused promotion and crash-looped startup (br-r6awv).
                 // Only a source that *passes* full integrity is allowed to
                 // block the archive candidate.
-                Err(snapshot_error) => match CanonicalSnapshotSource::for_family(path).map_or_else(
-                    |_| source_full_integrity_refusal(path),
-                    |snapshot| source_full_integrity_refusal(snapshot.snapshot_path()),
-                ) {
-                    Ok(None) => return Err(snapshot_error),
-                    Ok(Some(reason)) => {
-                        tracing::warn!(
-                            source = %path.display(),
-                            snapshot_error = %snapshot_error,
-                            reason = %reason,
-                            "recovery receipt: source snapshot failed and the file is not \
-                             a trustworthy SQLite generation; not using it as promotion authority"
-                        );
-                        unverified_source_sets(&format!("{snapshot_error}; {reason}"))
+                Err(snapshot_error) => {
+                    // Re-stage once so a semantic-query failure can still be
+                    // distinguished from a corrupt source. Never fall back to
+                    // a writable integrity open on the authority path: if the
+                    // source-neutral family copy itself cannot be obtained,
+                    // recovery must remain fail-closed.
+                    let integrity_snapshot = CanonicalSnapshotSource::for_family(path).map_err(
+                        |staging_error| {
+                            recovery_receipt_error(
+                                "source generation health staging",
+                                path,
+                                format!(
+                                    "semantic snapshot failed ({snapshot_error}) and the source-neutral full-integrity copy failed ({staging_error})"
+                                ),
+                            )
+                        },
+                    )?;
+                    match source_full_integrity_refusal(integrity_snapshot.snapshot_path()) {
+                        Ok(None) => return Err(snapshot_error),
+                        Ok(Some(reason)) => {
+                            tracing::warn!(
+                                source = %path.display(),
+                                snapshot_error = %snapshot_error,
+                                reason = %reason,
+                                "recovery receipt: source snapshot failed and the file is not \
+                                 a trustworthy SQLite generation; not using it as promotion authority"
+                            );
+                            unverified_source_sets(&format!("{snapshot_error}; {reason}"))
+                        }
+                        Err(health_error) => {
+                            return Err(recovery_receipt_error(
+                                "source generation health classification",
+                                path,
+                                format!(
+                                    "semantic snapshot failed ({snapshot_error}); full integrity_check also failed ({health_error})"
+                                ),
+                            ));
+                        }
                     }
-                    Err(health_error) => {
-                        return Err(recovery_receipt_error(
-                            "source generation health classification",
-                            path,
-                            format!(
-                                "semantic snapshot failed ({snapshot_error}); full integrity_check also failed ({health_error})"
-                            ),
-                        ));
-                    }
-                },
+                }
             }
         }
         None => (RecoveryContinuitySets::default(), None),
