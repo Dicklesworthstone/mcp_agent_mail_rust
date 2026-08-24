@@ -253,7 +253,7 @@ fn run_quick_cycle(
     storage_root: &Path,
     last_recovery_attempt: &mut Option<Instant>,
 ) {
-    match pool.run_startup_integrity_check() {
+    match pool.run_periodic_integrity_check() {
         Ok(_) => {
             if take_deferred_proactive_backup() {
                 tracing::debug!(

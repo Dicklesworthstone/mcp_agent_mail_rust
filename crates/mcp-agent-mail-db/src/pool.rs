@@ -3150,14 +3150,34 @@ impl DbPool {
     /// "Healthy" includes the GH#114 case where the bespoke probe rejects
     /// the file but canonical SQLite accepts it; in that case the returned
     /// `IntegrityCheckResult` has `details = ["ok (canonical fallback)"]`
-    /// (see [`Self::quick_check_with_canonical_fallback`]). This is also
-    /// invoked by the periodic 5-minute `run_quick_cycle` in the integrity
-    /// guard, so the canonical fallback applies to both startup and steady
-    /// state.
+    /// (see [`Self::quick_check_with_canonical_fallback`]). The periodic
+    /// 5-minute guard uses [`Self::run_periodic_integrity_check`], which shares
+    /// that same canonical-fallback implementation.
     ///
     /// This opens a dedicated connection (outside the pool) so the check
     /// doesn't consume a pooled slot.
     pub fn run_startup_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
+        self.run_integrity_check(true)
+    }
+
+    /// Run the quick integrity cycle after the runtime has already opened this
+    /// database generation.
+    ///
+    /// Cold startup uses [`Self::run_startup_integrity_check`] and proves a
+    /// private copy of the exact SQLite family before the first live engine
+    /// open. Repeating that full-family copy on every periodic guard cycle
+    /// would make steady-state integrity cost proportional to database size.
+    /// The live cycle may therefore skip that cold-open proof when there is no
+    /// relevant durable recovery history; every cleanup and recovery mutation
+    /// remains admission-controlled.
+    pub fn run_periodic_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
+        self.run_integrity_check(false)
+    }
+
+    fn run_integrity_check(
+        &self,
+        require_source_neutral_preopen_proof: bool,
+    ) -> DbResult<integrity::IntegrityCheckResult> {
         if self.sqlite_path == ":memory:" {
             // In-memory databases cannot be corrupt on startup.
             return Ok(integrity::IntegrityCheckResult {
@@ -3188,16 +3208,25 @@ impl DbPool {
             ))
         })?;
 
-        // Most integrity cycles are healthy steady-state reads and must not
-        // copy the entire database merely to inspect it. A source-neutral
-        // exact-family proof is needed only while durable failure history for
-        // these exact primary bytes exists. Malformed breaker authority skips
-        // the costly probe and flows directly into admission, which will
-        // refuse before opening either the election file or SQLite itself.
+        // A cold startup must prove a private copy of the exact family before
+        // any live engine open: merely opening SQLite can replay or rewrite
+        // WAL/SHM state. Once the runtime is already live, periodic cycles may
+        // avoid that O(database-size) copy unless durable failure history for
+        // these exact primary bytes requires the same fail-closed proof.
+        // Malformed breaker authority skips the costly probe and flows
+        // directly into admission, which refuses before opening either the
+        // election file or SQLite itself.
         let sqlite_path = Path::new(&self.sqlite_path);
         let live_family_can_open_without_admission =
             match crate::recovery_breaker::load(sqlite_path) {
                 Err(_) => false,
+                Ok(_) if require_source_neutral_preopen_proof => {
+                    sqlite_file_is_healthy_without_family_cleanup(sqlite_path).map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "startup integrity check: source-neutral pre-open probe failed: {error}"
+                        ))
+                    })?
+                }
                 Ok(Some(state))
                     if state.consecutive_failures > 0
                         && state.db_fingerprint
@@ -14873,10 +14902,15 @@ mod tests {
     }
 
     #[test]
-    fn startup_integrity_check_recovers_open_failure_without_backup() {
+    fn startup_integrity_check_recovers_corrupt_primary_under_admission() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("startup_corrupt.db");
         std::fs::write(&primary, b"not-a-sqlite-file").expect("write corrupt file");
+        let breaker_lock = crate::recovery_breaker::breaker_lock_path(&primary);
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock).is_err(),
+            "fixture must begin without an election file"
+        );
 
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", primary.display()),
@@ -14896,6 +14930,15 @@ mod tests {
             sqlite_file_is_healthy(&primary).expect("post-startup health check"),
             "sqlite file should be healthy after startup recovery"
         );
+        assert!(
+            breaker_lock.is_file(),
+            "cold-start corruption must acquire durable recovery admission before opening the live family"
+        );
+        let breaker = crate::recovery_breaker::load(&primary)
+            .expect("load breaker after recovery")
+            .expect("successful admitted recovery persists cleared authority");
+        assert_eq!(breaker.consecutive_failures, 0);
+        assert!(!breaker.tripped);
     }
 
     #[test]
@@ -15202,6 +15245,89 @@ mod tests {
                     consecutive_failures: config.max_consecutive_failures,
                     last_failure_unix: recovery_breaker_now_unix(),
                     last_failure_reason: "startup integrity fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
+            },
+        );
+    }
+
+    fn assert_startup_integrity_breaker_preserves_corrupt_primary(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let primary_bytes = b"corrupt-primary-without-sidecars";
+        std::fs::write(&db_path, primary_bytes).expect("write corrupt primary fixture");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list corrupt-primary fixture before probe")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+
+        recovery_admission().reset();
+        let error = pool
+            .run_startup_integrity_check()
+            .expect_err("breaker authority must refuse before opening corrupt primary bytes");
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected corrupt-primary refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list corrupt-primary fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "refused cold-start integrity must not create SQLite, election, recovery, or forensic artifacts"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn startup_integrity_preserves_corrupt_primary_behind_malformed_breaker() {
+        assert_startup_integrity_breaker_preserves_corrupt_primary(
+            "startup-corrupt-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_integrity_preserves_corrupt_primary_behind_tripped_breaker() {
+        assert_startup_integrity_breaker_preserves_corrupt_primary(
+            "startup-corrupt-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "corrupt-primary fixture tripped".to_string(),
                     tripped: true,
                 };
                 crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");

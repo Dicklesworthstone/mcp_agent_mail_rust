@@ -2455,7 +2455,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
                 problem: format!(
-                    "Integrity probe could not open mailbox {}: {}",
+                    "Integrity probe could not initialize the mailbox pool for {}: {}",
                     pool_config.database_url,
                     classify_integrity_open_root_cause(&err_str)
                 ),
@@ -4704,7 +4704,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_preserves_sqlite_family_when_breaker_is_malformed() {
+    fn stdio_startup_probes_preserve_sqlite_family_when_breaker_is_malformed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let wal_path = db_path.with_file_name("storage.sqlite3-wal");
@@ -4719,15 +4719,24 @@ mod tests {
         std::fs::write(&breaker_path, b"malformed breaker authority")
             .expect("write malformed breaker");
         let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before startup");
+        let breaker_lock_path = mcp_agent_mail_db::recovery_breaker::breaker_lock_path(&db_path);
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "fixture must begin without a breaker-election artifact"
+        );
 
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", db_path.display());
         config.storage_root = dir.path().join("storage");
 
-        let result = probe_integrity(&config);
-        let ProbeResult::Fail(failure) = result else {
-            panic!("malformed breaker authority must fail startup closed: {result:?}");
-        };
+        let report = run_stdio_startup_probes(&config);
+        let failure = report
+            .failures()
+            .into_iter()
+            .find(|failure| failure.name == "integrity")
+            .unwrap_or_else(|| {
+                panic!("malformed breaker authority must fail startup closed: {report:?}")
+            });
         assert!(
             failure
                 .problem
@@ -4755,6 +4764,10 @@ mod tests {
             breaker_bytes,
             "startup must not rewrite malformed breaker authority"
         );
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "authoritative refusal must not create a breaker-election artifact"
+        );
 
         let renamed_family_members = std::fs::read_dir(dir.path())
             .expect("read temp dir")
@@ -4773,7 +4786,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_refuses_tripped_breaker_before_opening_damaged_wal_family() {
+    fn stdio_startup_probes_refuse_tripped_breaker_before_opening_damaged_wal_family() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("tripped-before-open.sqlite3");
         {
@@ -4820,10 +4833,14 @@ mod tests {
 
         mcp_agent_mail_db::pool::recovery_admission().reset();
         reset_probe_recovery_attempt_count();
-        let result = probe_integrity(&config);
-        let ProbeResult::Fail(failure) = result else {
-            panic!("tripped breaker must fail startup before SQLite opens: {result:?}");
-        };
+        let report = run_stdio_startup_probes(&config);
+        let failure = report
+            .failures()
+            .into_iter()
+            .find(|failure| failure.name == "integrity")
+            .unwrap_or_else(|| {
+                panic!("tripped breaker must fail startup before SQLite opens: {report:?}")
+            });
         assert!(
             failure.problem.contains("circuit-broken"),
             "startup should surface the durable circuit refusal: {}",

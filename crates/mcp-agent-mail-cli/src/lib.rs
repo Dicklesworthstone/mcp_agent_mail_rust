@@ -13530,10 +13530,7 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
 
         if !sqlite_conn_is_healthy(&conn)? {
             drop(conn);
-            recover_sqlite_file_with_storage_root(
-                Path::new(&opened_path),
-                storage_root_override,
-            )?;
+            recover_sqlite_file_with_storage_root(Path::new(&opened_path), storage_root_override)?;
             conn = mcp_agent_mail_db::DbConn::open_file(&opened_path)
                 .map_err(|e| CliError::Other(format!("cannot reopen DB at {opened_path}: {e}")))?;
         }
@@ -21781,9 +21778,7 @@ struct ClearAndResetOutcome {
 fn handle_clear_and_reset(force: bool, archive: bool, no_archive: bool) -> CliResult<()> {
     let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let db_path = match db_cfg.sqlite_path() {
-        Ok(path) => Some(PathBuf::from(resolve_sqlite_runtime_path(
-            &path,
-        ))),
+        Ok(path) => Some(PathBuf::from(resolve_sqlite_runtime_path(&path))),
         Err(err) => {
             ftui_runtime::ftui_eprintln!(
                 "Warning: failed to parse SQLite database path from DATABASE_URL ({}): {err}",
@@ -21867,11 +21862,8 @@ fn clear_and_reset_everything(
         }
     }
 
-    let source_db_for_archive = source_db_for_archive.map(|path| {
-        PathBuf::from(resolve_sqlite_runtime_path(
-            &path.to_string_lossy(),
-        ))
-    });
+    let source_db_for_archive = source_db_for_archive
+        .map(|path| PathBuf::from(resolve_sqlite_runtime_path(&path.to_string_lossy())));
     let _storage_root_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(storage_root, false)?;
     let _sqlite_lock = if let Some(path) = source_db_for_archive.as_deref() {
@@ -28848,9 +28840,7 @@ fn doctor_resolved_sqlite_path(database_url: &str) -> Option<PathBuf> {
     if configured_path == ":memory:" {
         return None;
     }
-    Some(PathBuf::from(resolve_sqlite_runtime_path(
-        &configured_path,
-    )))
+    Some(PathBuf::from(resolve_sqlite_runtime_path(&configured_path)))
 }
 
 /// A4 (br-bvq1x.1.4): the single chokepoint. Every `am` database fix strategy is
@@ -67039,8 +67029,8 @@ startup_timeout_sec = 42
             !relative_path.exists(),
             "preflight banner stats should not create a stray relative sqlite file"
         );
-        let conn = mcp_agent_mail_db::DbConn::open_file(&absolute_db_str)
-            .expect("reopen absolute decoy");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("reopen absolute decoy");
         assert_eq!(
             query_preflight_banner_stats_batched(&conn)
                 .expect("query absolute decoy")
@@ -72984,9 +72974,7 @@ fn archive_save_state_internal(
     use chrono::Timelike;
     use std::io::Write;
 
-    let source_db = PathBuf::from(resolve_sqlite_runtime_path(
-        &source_db.to_string_lossy(),
-    ));
+    let source_db = PathBuf::from(resolve_sqlite_runtime_path(&source_db.to_string_lossy()));
 
     let preset = match share::normalize_scrub_preset(&scrub_preset) {
         Ok(p) => p,
@@ -73683,8 +73671,7 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
                     "cannot restore into an in-memory database (:memory:)".to_string(),
                 ));
             }
-            let database_path =
-                PathBuf::from(resolve_sqlite_runtime_path(&db_path));
+            let database_path = PathBuf::from(resolve_sqlite_runtime_path(&db_path));
 
             let config = Config::from_env();
             let storage_root = config.storage_root;
@@ -74299,8 +74286,7 @@ fn handle_doctor_repair_with_options(
             database_url: database_url.to_string(),
             ..Default::default()
         };
-        let db_path =
-            resolve_sqlite_runtime_path(&cfg.sqlite_path().unwrap_or_default());
+        let db_path = resolve_sqlite_runtime_path(&cfg.sqlite_path().unwrap_or_default());
         if std::path::Path::new(&db_path).exists() {
             let bak_path =
                 next_timestamped_sqlite_backup_path_in_dir(backup_dir, "pre_repair", &timestamp);
@@ -74750,9 +74736,7 @@ fn doctor_reconstruct_db_path_from_database_url(database_url: &str) -> CliResult
             "cannot reconstruct an in-memory database (:memory:)".to_string(),
         ));
     }
-    Ok(PathBuf::from(resolve_sqlite_runtime_path(
-        &db_path,
-    )))
+    Ok(PathBuf::from(resolve_sqlite_runtime_path(&db_path)))
 }
 
 fn handle_doctor_reconstruct_locked(
@@ -76242,9 +76226,7 @@ fn doctor_archive_verify_db_path() -> CliResult<PathBuf> {
     let sqlite_path = db_cfg
         .sqlite_path()
         .map_err(|err| CliError::Other(format!("bad database URL: {err}")))?;
-    Ok(PathBuf::from(resolve_sqlite_runtime_path(
-        &sqlite_path,
-    )))
+    Ok(PathBuf::from(resolve_sqlite_runtime_path(&sqlite_path)))
 }
 
 fn doctor_archive_verify_summary_text(
@@ -84997,9 +84979,10 @@ fn run_share_export_dry_run_does_not_hijack_absolute_candidate_for_missing_relat
     assert!(!output.exists(), "failed dry-run must not create a bundle");
     let conn = mcp_agent_mail_db::DbConn::open_file(source_db.to_string_lossy().as_ref())
         .expect("reopen absolute decoy");
-    assert!(conn
-        .query_sync("SELECT 1 FROM projects LIMIT 1", &[])
-        .is_ok());
+    assert!(
+        conn.query_sync("SELECT 1 FROM projects LIMIT 1", &[])
+            .is_ok()
+    );
 }
 
 #[test]
