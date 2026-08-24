@@ -14,6 +14,7 @@
 # a specific commit. We still run a checkout step so docker/build-push-action
 # can find the Dockerfile in the workspace.
 name: docker
+# Fork canary builds use workflow_dispatch with a pinned upstream release tag.
 
 on:
   push:
