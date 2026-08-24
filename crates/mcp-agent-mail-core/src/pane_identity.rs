@@ -1172,7 +1172,9 @@ fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> 
                 .as_ref()
                 .and_then(|r| r.socket_path.as_deref())
                 .is_some_and(|socket| !Path::new(socket).exists());
-            !(socket_gone && live_panes.is_empty())
+            // Stale unless this is a socket-gone record on a host with no
+            // local panes (retained; see the doc comment above).
+            !socket_gone || !live_panes.is_empty()
         }
         Some(PaneBindingLiveness::Unverifiable) | None => {
             if live_panes.is_empty() {
