@@ -1053,6 +1053,44 @@ fn automatic_recovery_breaker_refusal<E>(
     ))
 }
 
+/// Fail closed on existing durable breaker authority before pool bootstrap can
+/// create a missing primary or inspect an authoritative archive.
+///
+/// This is deliberately a pure preflight: malformed/tripped authority must be
+/// able to refuse startup without creating the persistent breaker-election
+/// file or any SQLite/forensic artifact. Actual recovery paths still enter the
+/// full election and re-evaluate under its lock before mutating.
+#[allow(clippy::result_large_err)]
+fn preflight_missing_primary_pool_breaker_authority(
+    primary_path: &Path,
+) -> Result<(), SqlError> {
+    validate_sqlite_target_path(primary_path, "pool initialization target")?;
+    if crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active() {
+        return Ok(());
+    }
+
+    let action = "pool initialization";
+    let fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
+    let prior = crate::recovery_breaker::load(primary_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{action} for {} was refused because durable recovery-breaker state could not be trusted: {error}. Run `am doctor repair` or `am doctor reconstruct` for an operator-supervised bypass",
+            primary_path.display()
+        ))
+    })?;
+    let verdict = crate::recovery_breaker::evaluate(
+        prior.as_ref(),
+        &fingerprint,
+        crate::recovery_breaker::config_from_env(),
+        recovery_breaker_now_unix(),
+    );
+    if let Some(refusal) =
+        automatic_recovery_breaker_refusal::<SqlError>(primary_path, action, &verdict)
+    {
+        return flatten_automatic_recovery_result(Err(refusal));
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 #[cfg(test)]
 fn with_recovery_admission_using_clock<T, F, C>(
@@ -5942,6 +5980,18 @@ async fn initialize_sqlite_file_once(
     storage_root: &Path,
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
+    // A missing primary is normally fresh-start authority, but an adjacent
+    // breaker sidecar remains durable authority for that exact pathname.
+    // Consult it before archive inventory, fresh creation, or any engine open.
+    // Existing namespace entries retain the established cleanup/private-health
+    // decision path, which allows a directly healthy exact family to serve
+    // without rewriting historical breaker state.
+    if sqlite_path != ":memory:"
+        && !path_is_occupied(path)
+        && let Err(error) = preflight_missing_primary_pool_breaker_authority(path)
+    {
+        return Outcome::Err(error);
+    }
     // Classify before any engine open or archive inventory. The public cleanup
     // helper enters the durable breaker only when damaged sidecars actually
     // require mutation, then reclassifies before moving them. A malformed or

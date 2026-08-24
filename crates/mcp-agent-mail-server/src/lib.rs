@@ -2659,6 +2659,28 @@ pub(crate) fn open_sync_db_connection_with_busy_timeout(
     Ok(conn)
 }
 
+pub(crate) fn open_read_only_sync_db_connection_with_busy_timeout(
+    path: &str,
+    busy_timeout_ms: u32,
+    context: &str,
+) -> std::io::Result<DbConn> {
+    let path = resolve_server_sync_sqlite_path(path);
+    let conn = if path == ":memory:" {
+        DbConn::open_memory()
+    } else {
+        guard_raw_live_sqlite_engine_open(Path::new(path.as_str()), context)?;
+        DbConn::open_file_read_only(&path)
+    }
+    .map_err(|err| std::io::Error::other(format!("open read-only sqlite file {path}: {err}")))?;
+    conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
+        .map_err(|err| {
+            std::io::Error::other(format!(
+                "configure read-only sqlite busy_timeout={busy_timeout_ms} on {path}: {err}"
+            ))
+        })?;
+    Ok(conn)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
     open_sync_db_connection_with_busy_timeout(

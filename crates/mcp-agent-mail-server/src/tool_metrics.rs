@@ -282,6 +282,24 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
     .ok()
 }
 
+fn open_metrics_read_connection(database_url: &str) -> Option<DbConn> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg.sqlite_path().ok()?;
+    let path = crate::resolve_server_sync_sqlite_path(&path);
+    crate::open_read_only_sync_db_connection_with_busy_timeout(
+        &path,
+        u32::try_from(METRICS_DB_BUSY_TIMEOUT_MS).unwrap_or(u32::MAX),
+        "tool metrics read-only observer",
+    )
+    .ok()
+}
+
 fn ensure_metrics_schema(conn: &DbConn) {
     let _ = conn.execute_sync(
         "CREATE TABLE IF NOT EXISTS tool_metrics_snapshots (\
@@ -447,7 +465,7 @@ fn is_missing_metrics_table_error(err: &impl std::fmt::Display) -> bool {
 
 #[must_use]
 pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<PersistedToolMetric> {
-    let Some(conn) = open_metrics_connection(database_url) else {
+    let Some(conn) = open_metrics_read_connection(database_url) else {
         return Vec::new();
     };
     let conn = guard_db_conn(conn, "tool_metrics::load_latest_persisted_metrics");
@@ -475,7 +493,7 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe
 
 #[must_use]
 pub fn persisted_metric_store_size(database_url: &str) -> u64 {
-    let Some(conn) = open_metrics_connection(database_url) else {
+    let Some(conn) = open_metrics_read_connection(database_url) else {
         return 0;
     };
     let conn = guard_db_conn(conn, "tool_metrics::persisted_metric_store_size");
@@ -1038,6 +1056,36 @@ mod tests {
             configured,
             i64::try_from(METRICS_DB_BUSY_TIMEOUT_MS).unwrap_or(i64::MAX)
         );
+    }
+
+    #[test]
+    fn metrics_observer_connection_is_engine_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("read_only_metrics_observer.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let seed = open_metrics_connection(&database_url).expect("open seed metrics database");
+        seed.execute_raw("CREATE TABLE marker(id INTEGER PRIMARY KEY)")
+            .expect("create seed marker");
+        drop(seed);
+
+        let observer =
+            open_metrics_read_connection(&database_url).expect("open read-only metrics observer");
+        let write_result = observer.execute_raw("CREATE TABLE forbidden_write(id INTEGER)");
+        assert!(
+            write_result.is_err(),
+            "metrics observer must be engine-enforced read-only"
+        );
+        let marker_count = observer
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
+                &[],
+            )
+            .expect("query marker through read-only observer")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(marker_count, 1);
     }
 
     #[test]

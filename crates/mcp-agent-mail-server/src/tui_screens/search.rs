@@ -1209,7 +1209,6 @@ pub struct SearchCockpitScreen {
     // Search state
     db_conn: Option<DbConn>,
     _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
-    metadata_db_conn: Option<DbConn>,
     metadata_database_url: String,
     db_conn_attempted: bool,
     db_context_unavailable: bool,
@@ -1327,7 +1326,6 @@ impl SearchCockpitScreen {
             query_lab_visible: false,
             db_conn: None,
             _db_snapshot_dir: None,
-            metadata_db_conn: None,
             metadata_database_url: String::new(),
             db_conn_attempted: false,
             db_context_unavailable: false,
@@ -1837,15 +1835,13 @@ impl SearchCockpitScreen {
         });
     }
 
-    fn ensure_metadata_db_conn(&mut self, state: &TuiSharedState) {
+    fn ensure_metadata_database_url(&mut self, state: &TuiSharedState) {
         let cfg = state.config_snapshot();
-        if self.metadata_db_conn.is_some() && self.metadata_database_url == cfg.raw_database_url {
+        if self.metadata_database_url == cfg.raw_database_url {
             return;
         }
 
         self.metadata_database_url = cfg.raw_database_url;
-        self.metadata_db_conn =
-            crate::open_live_metadata_sync_db_connection(&self.metadata_database_url);
         self.recipes_loaded = false;
     }
 
@@ -1863,7 +1859,7 @@ impl SearchCockpitScreen {
     /// Ensure we have DB connections.
     fn ensure_db_conn(&mut self, state: &TuiSharedState) {
         if self.db_conn.is_some() || self.db_conn_attempted {
-            self.ensure_metadata_db_conn(state);
+            self.ensure_metadata_database_url(state);
             self.ensure_recipes_loaded();
             return;
         }
@@ -1884,7 +1880,7 @@ impl SearchCockpitScreen {
                 tracing::warn!(error = %error, "search screen db bind failed");
             }
         }
-        self.ensure_metadata_db_conn(state);
+        self.ensure_metadata_database_url(state);
         self.ensure_recipes_loaded();
         self.db_context_unavailable = self.db_conn.is_none();
     }
@@ -2580,6 +2576,10 @@ impl SearchCockpitScreen {
         let Ok(conn) = self.open_live_metadata_operation_db_connection() else {
             return;
         };
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            conn,
+            "search screen recipe/history schema and list",
+        );
         let recipes = list_recipes(&conn);
         let history = list_recent_history(&conn, 50);
         if let Ok(saved_recipes) = recipes.as_ref() {
@@ -2590,11 +2590,9 @@ impl SearchCockpitScreen {
         }
         match (recipes, history) {
             (Ok(_), Ok(_)) => {
-                self.metadata_db_conn = Some(conn);
                 self.recipes_loaded = true;
             }
             (recipes_result, history_result) => {
-                self.metadata_db_conn = Some(conn);
                 if let Err(error) = recipes_result {
                     tracing::warn!(error = %error, "search screen failed loading saved recipes");
                 }
@@ -2622,8 +2620,8 @@ impl SearchCockpitScreen {
         };
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         if let Ok(conn) = self.open_live_metadata_operation_db_connection() {
+            let conn = mcp_agent_mail_db::guard_db_conn(conn, "search screen insert history");
             let _ = insert_history(&conn, &entry);
-            self.metadata_db_conn = Some(conn);
         }
         // Prepend to in-memory history
         self.query_history.insert(0, entry);
@@ -2651,9 +2649,9 @@ impl SearchCockpitScreen {
         };
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         if let Ok(conn) = self.open_live_metadata_operation_db_connection()
+            .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen insert recipe"))
             && let Ok(id) = insert_recipe(&conn, &recipe)
         {
-            self.metadata_db_conn = Some(conn);
             let mut saved = recipe;
             saved.id = Some(id);
             self.saved_recipes.insert(0, saved);
@@ -2697,8 +2695,8 @@ impl SearchCockpitScreen {
         if let Some(id) = recipe.id {
             let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
             if let Ok(conn) = self.open_live_metadata_operation_db_connection() {
+                let conn = mcp_agent_mail_db::guard_db_conn(conn, "search screen touch recipe");
                 let _ = touch_recipe(&conn, id);
-                self.metadata_db_conn = Some(conn);
             }
         }
     }
@@ -6123,7 +6121,10 @@ mod tests {
             screen._db_snapshot_dir.is_some(),
             "search results should use an archive-backed snapshot when the live db is stale"
         );
-        assert!(screen.metadata_db_conn.is_some());
+        assert_eq!(
+            screen.metadata_database_url, config.database_url,
+            "search metadata operations must remain bound to the live configured database"
+        );
         assert!(
             screen
                 .results
