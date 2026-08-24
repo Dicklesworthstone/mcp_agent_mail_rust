@@ -1031,9 +1031,7 @@ where
     validate_sqlite_target_path(primary_path, "recovery admission target").map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
-    let normalized_primary = PathBuf::from(normalize_sqlite_identity_path(
-        primary_path.to_string_lossy().as_ref(),
-    ));
+    let normalized_primary = normalize_sqlite_identity_path_lossless(primary_path);
     if let Some(active_path) = RecoveryAdmissionDepthGuard::active_path() {
         if active_path == normalized_primary {
             return operation().map_err(AutomaticRecoveryRunError::Operation);
@@ -4242,6 +4240,25 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
     );
     sqlite_identity_path_cache_insert(path, &normalized);
     normalized
+}
+
+/// Normalize a filesystem identity without converting its platform-native
+/// name through UTF-8. Recovery admission uses this lossless form because two
+/// distinct Unix paths containing different invalid bytes can have the same
+/// `to_string_lossy()` rendering; treating them as one path would let a nested
+/// operation bypass the second database's durable breaker election.
+#[must_use]
+fn normalize_sqlite_identity_path_lossless(path: &Path) -> PathBuf {
+    if path == Path::new(":memory:") {
+        return path.to_path_buf();
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+        }
+    })
 }
 
 #[must_use]
@@ -20020,9 +20037,11 @@ mod tests {
             sqlite_file_is_healthy(&primary).expect("health check after zero-byte wal"),
             "primary db should remain healthy with an empty wal attached"
         );
-        assert!(
-            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
-            "health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
+        assert!(wal.exists(), "source-neutral health must retain the empty WAL name");
+        assert_eq!(
+            std::fs::metadata(&wal).expect("stat retained WAL").len(),
+            0,
+            "source-neutral health must retain the empty WAL bytes"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal.db-wal").len(),
@@ -20058,8 +20077,13 @@ mod tests {
             "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
-            "archive-aware health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
+            wal.exists(),
+            "archive-aware source-neutral health must retain the empty WAL name"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).expect("stat retained WAL").len(),
+            0,
+            "archive-aware source-neutral health must retain the empty WAL bytes"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal-archive.db-wal").len(),

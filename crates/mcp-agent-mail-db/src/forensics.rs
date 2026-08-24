@@ -4575,6 +4575,101 @@ mod tests {
         drop(live_conn);
     }
 
+    #[test]
+    fn canonical_receipt_snapshot_always_stages_a_cold_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        seed_recovery_receipt_db(&primary, true);
+        let bytes_before = std::fs::read(&primary).expect("read cold source before snapshot");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list cold source directory before snapshot")
+            .map(|entry| entry.expect("read cold source entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let snapshot = super::CanonicalSnapshotSource::for_family(&primary)
+            .expect("stage cold family without opening the authority path");
+        assert_ne!(snapshot.snapshot_path(), primary);
+        assert_eq!(
+            super::source_full_integrity_refusal(snapshot.snapshot_path())
+                .expect("run full integrity against private copy"),
+            None
+        );
+        drop(snapshot);
+
+        assert_eq!(
+            std::fs::read(&primary).expect("read cold source after snapshot"),
+            bytes_before
+        );
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list cold source directory after snapshot")
+            .map(|entry| entry.expect("read cold source entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "cold receipt evidence must not mint WAL/SHM beside the authority path"
+        );
+    }
+
+    #[test]
+    fn canonical_receipt_snapshot_refuses_nonregular_sidecar_without_source_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        seed_recovery_receipt_db(&primary, true);
+        let wal = super::sqlite_family_sidecar(&primary, "-wal");
+        std::fs::create_dir(&wal).expect("create malformed WAL directory");
+        let bytes_before = std::fs::read(&primary).expect("read source before refusal");
+
+        let error = match super::CanonicalSnapshotSource::for_family(&primary) {
+            Ok(_) => panic!("non-regular sidecar must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("non-regular"));
+        assert_eq!(
+            std::fs::read(&primary).expect("read source after refusal"),
+            bytes_before
+        );
+        assert!(
+            std::fs::symlink_metadata(&wal)
+                .expect("inspect preserved malformed WAL")
+                .file_type()
+                .is_dir(),
+            "refusal must preserve the malformed family member in place"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_receipt_snapshot_refuses_symlinked_sidecar_without_dereferencing_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let target = dir.path().join("foreign-shm-target");
+        seed_recovery_receipt_db(&primary, true);
+        std::fs::write(&target, b"foreign shm bytes").expect("write symlink target");
+        let shm = super::sqlite_family_sidecar(&primary, "-shm");
+        symlink(&target, &shm).expect("create malformed SHM symlink");
+        let target_before = std::fs::read(&target).expect("read symlink target before refusal");
+
+        let error = match super::CanonicalSnapshotSource::for_family(&primary) {
+            Ok(_) => panic!("symlinked sidecar must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("non-regular"));
+        assert_eq!(
+            std::fs::read(&target).expect("read symlink target after refusal"),
+            target_before
+        );
+        assert!(
+            std::fs::symlink_metadata(&shm)
+                .expect("inspect preserved SHM symlink")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
     #[cfg(any(
         target_os = "android",
         target_os = "linux",
