@@ -6589,20 +6589,188 @@ pub const fn sqlite_wal_is_header_only_or_truncated(wal_len: u64) -> bool {
 pub enum SqliteFamilyCleanupOutcome {
     /// No damaged WAL or empty/orphaned SHM required quarantine.
     NotNeeded,
-    /// One or both sidecars were durably moved out of the live family.
-    Quarantined { wal: bool, shm: bool },
+    /// One or more generation-bound sidecars were durably moved out of the
+    /// live family.
+    Quarantined {
+        wal: bool,
+        shm: bool,
+        wal_cert: bool,
+        wal_cert_head: bool,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteCleanupSidecarOpen {
+    path: PathBuf,
+    file: std::fs::File,
+    identity: same_file::Handle,
+    len: u64,
+}
+
+struct SqliteCleanupSidecarWitness {
+    path: PathBuf,
+    _file: std::fs::File,
+    identity: same_file::Handle,
+    len: u64,
+    sha256: [u8; 32],
+    prefix: [u8; SQLITE_WAL_HEADER_BYTES as usize],
+    prefix_len: usize,
+}
+
 struct SqliteFamilyCleanupPlan {
-    quarantine_wal: bool,
-    quarantine_shm: bool,
+    wal: Option<SqliteCleanupSidecarWitness>,
+    shm: Option<SqliteCleanupSidecarWitness>,
+    wal_cert: Option<SqliteCleanupSidecarWitness>,
+    wal_cert_head: Option<SqliteCleanupSidecarWitness>,
 }
 
 impl SqliteFamilyCleanupPlan {
-    const fn is_empty(self) -> bool {
-        !self.quarantine_wal && !self.quarantine_shm
+    const fn is_empty(&self) -> bool {
+        self.wal.is_none()
+            && self.shm.is_none()
+            && self.wal_cert.is_none()
+            && self.wal_cert_head.is_none()
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_cleanup_sidecar(
+    path: &Path,
+    label: &str,
+) -> Result<Option<SqliteCleanupSidecarOpen>, SqlError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(SqlError::Custom(format!(
+                "refusing SQLite-family cleanup because {label} sidecar {} is not a regular file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "failed to classify {label} sidecar {} before SQLite-family cleanup: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to open {label} sidecar {} without following links before SQLite-family cleanup: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to inspect opened {label} sidecar {} before SQLite-family cleanup: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(SqlError::Custom(format!(
+            "refusing SQLite-family cleanup because opened {label} sidecar {} is not a regular file",
+            path.display()
+        )));
+    }
+    let identity = same_file::Handle::from_file(file.try_clone().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to retain {label} sidecar identity for {}: {error}",
+            path.display()
+        ))
+    })?)
+    .map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to identify {label} sidecar {} before SQLite-family cleanup: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(SqliteCleanupSidecarOpen {
+        path: path.to_path_buf(),
+        file,
+        identity,
+        len: metadata.len(),
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+fn seal_sqlite_cleanup_sidecar(
+    opened: SqliteCleanupSidecarOpen,
+) -> Result<SqliteCleanupSidecarWitness, SqlError> {
+    use sha2::Digest as _;
+    use std::io::{Read as _, Seek as _};
+
+    let mut reader = opened.file.try_clone().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to clone SQLite sidecar {} for cleanup witnessing: {error}",
+            opened.path.display()
+        ))
+    })?;
+    reader.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to rewind SQLite sidecar {} for cleanup witnessing: {error}",
+            opened.path.display()
+        ))
+    })?;
+    let mut hasher = sha2::Sha256::new();
+    let mut prefix = [0_u8; SQLITE_WAL_HEADER_BYTES as usize];
+    let mut prefix_len = 0_usize;
+    let mut observed_len = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to read SQLite sidecar {} for cleanup witnessing: {error}",
+                opened.path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        if prefix_len < prefix.len() {
+            let copied = (prefix.len() - prefix_len).min(read);
+            prefix[prefix_len..prefix_len + copied].copy_from_slice(&buffer[..copied]);
+            prefix_len += copied;
+        }
+        hasher.update(&buffer[..read]);
+        observed_len = observed_len.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    let after_len = opened.file.metadata().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to re-inspect SQLite sidecar {} after cleanup witnessing: {error}",
+            opened.path.display()
+        ))
+    })?.len();
+    if observed_len != opened.len || after_len != opened.len {
+        return Err(SqlError::Custom(format!(
+            "SQLite sidecar {} changed length while cleanup classified it (expected {}, read {observed_len}, now {after_len}); refusing mutation",
+            opened.path.display(),
+            opened.len
+        )));
+    }
+    Ok(SqliteCleanupSidecarWitness {
+        path: opened.path,
+        _file: opened.file,
+        identity: opened.identity,
+        len: opened.len,
+        sha256: hasher.finalize().into(),
+        prefix,
+        prefix_len,
+    })
+}
+
+#[must_use]
+fn witnessed_wal_is_truncation_artifact(wal: &SqliteCleanupSidecarWitness) -> bool {
+    if wal.len == 0 || wal.len > SQLITE_WAL_HEADER_BYTES {
+        return false;
+    }
+    if wal.len < SQLITE_WAL_HEADER_BYTES {
+        return true;
+    }
+    wal.prefix_len != SQLITE_WAL_HEADER_BYTES as usize
+        || !matches!(
+            crate::wal_classify::wal_header_verdict(&wal.prefix),
+            crate::wal_classify::WalHeaderVerdict::Valid
+        )
 }
 
 /// Classify the complete mutable SQLite sidecar family without opening a
@@ -6623,41 +6791,54 @@ fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyClea
         )));
     }
 
-    let mut sidecar_metadata = HashMap::new();
+    let mut sidecars: HashMap<&'static str, SqliteCleanupSidecarOpen> = HashMap::new();
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let path = sqlite_sidecar_path(sqlite_path, suffix);
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                sidecar_metadata.insert(suffix, metadata);
-            }
-            Ok(_) => {
-                return Err(SqlError::Custom(format!(
-                    "refusing SQLite-family cleanup for {} because {} sidecar {} is not a regular file",
-                    sqlite_path.display(),
-                    sqlite_recovery_sidecar_label(suffix),
-                    path.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(SqlError::Custom(format!(
-                    "failed to classify {} sidecar {} before SQLite-family cleanup: {error}",
-                    sqlite_recovery_sidecar_label(suffix),
-                    path.display()
-                )));
-            }
+        if let Some(opened) =
+            open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
+        {
+            sidecars.insert(suffix, opened);
         }
     }
 
-    let wal_path = sqlite_sidecar_path(sqlite_path, "-wal");
-    let quarantine_wal = sidecar_metadata.contains_key("-wal")
-        && crate::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path);
-    let quarantine_shm = sidecar_metadata
-        .get("-shm")
-        .is_some_and(|metadata| quarantine_wal || metadata.len() == 0);
+    let wal = match sidecars.remove("-wal") {
+        Some(opened) if opened.len > 0 && opened.len <= SQLITE_WAL_HEADER_BYTES => {
+            let witnessed = seal_sqlite_cleanup_sidecar(opened)?;
+            witnessed_wal_is_truncation_artifact(&witnessed).then_some(witnessed)
+        }
+        _ => None,
+    };
+    let shm = match sidecars.remove("-shm") {
+        Some(opened) if wal.is_some() || opened.len == 0 => {
+            Some(seal_sqlite_cleanup_sidecar(opened)?)
+        }
+        _ => None,
+    };
+    // FrankenSQLite's WAL certificates describe the exact WAL/main generation.
+    // Keeping either certificate attached after its damaged WAL is detached can
+    // replay the old db_size against the next generation, so they rotate as one
+    // witnessed family even when their own bytes look well-formed.
+    let wal_cert = if wal.is_some() {
+        sidecars
+            .remove("-wal-cert")
+            .map(seal_sqlite_cleanup_sidecar)
+            .transpose()?
+    } else {
+        None
+    };
+    let wal_cert_head = if wal.is_some() {
+        sidecars
+            .remove("-wal-cert-head")
+            .map(seal_sqlite_cleanup_sidecar)
+            .transpose()?
+    } else {
+        None
+    };
     Ok(SqliteFamilyCleanupPlan {
-        quarantine_wal,
-        quarantine_shm,
+        wal,
+        shm,
+        wal_cert,
+        wal_cert_head,
     })
 }
 

@@ -12816,12 +12816,45 @@ fn recover_sqlite_file_with_storage_root(
     storage_root_override: Option<&Path>,
 ) -> CliResult<()> {
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    match mcp_agent_mail_db::pool::with_automatic_recovery_admission(
+        path,
+        "CLI automatic SQLite recovery",
+        || {
+            recover_sqlite_file_with_storage_root_admitted(
+                path,
+                storage_root_override,
+                &storage_root,
+            )
+        },
+    ) {
+        Ok(()) => Ok(()),
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission { error, .. }) => {
+            Err(CliError::Other(error.to_string()))
+        }
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error)) => Err(error),
+    }
+}
+
+/// Complete an automatic CLI recovery after the durable admission controller
+/// has accepted this exact SQLite path.
+///
+/// Candidate construction is intentionally inside the caller's envelope:
+/// verified-snapshot restore, generic backup staging, salvage, and archive
+/// reconstruction all create persistent artifacts before promotion. Keeping
+/// those steps here ensures a malformed or open breaker refuses before any of
+/// those namespaces are materialized. Nested promotion/reconcile primitives are
+/// safe because same-path recovery admission is re-entrant on this thread.
+fn recover_sqlite_file_with_storage_root_admitted(
+    path: &Path,
+    storage_root_override: Option<&Path>,
+    storage_root: &Path,
+) -> CliResult<()> {
     if !path.exists() {
         return Ok(());
     }
     validate_real_file_target_path(path, "recovery destination")?;
     if sqlite_file_is_healthy(path)? {
-        reconcile_sqlite_file_with_archive(path, &storage_root)?;
+        reconcile_sqlite_file_with_archive(path, storage_root)?;
         return Ok(());
     }
 
@@ -12836,9 +12869,9 @@ fn recover_sqlite_file_with_storage_root(
     // backup that passed a full integrity check and carries metadata — as the
     // fast, lossless recovery path before falling back to a generic backup or an
     // archive rebuild. The restore re-verifies the snapshot before trusting it.
-    match mcp_agent_mail_db::snapshot::restore_from_verified_snapshot(path, &storage_root) {
+    match mcp_agent_mail_db::snapshot::restore_from_verified_snapshot(path, storage_root) {
         Ok(Some(meta)) => {
-            reconcile_sqlite_file_with_archive_after_restore(path, &storage_root)?;
+            reconcile_sqlite_file_with_archive_after_restore(path, storage_root)?;
             let salvage_after = count_salvage_rows(path);
             let suspect_rows = detect_salvage_suspect_typed_rows(path);
             ftui_runtime::ftui_println!(
@@ -12894,7 +12927,7 @@ fn recover_sqlite_file_with_storage_root(
         // Count the validated replacement BEFORE swapping it in.
         let salvage_after = count_salvage_rows(&temp_restore);
         let suspect_rows = detect_salvage_suspect_typed_rows(&temp_restore);
-        mcp_agent_mail_db::promote_recovery_candidate(path, &temp_restore, &storage_root).map_err(
+        mcp_agent_mail_db::promote_recovery_candidate(path, &temp_restore, storage_root).map_err(
             |error| {
                 CliError::Other(format!(
                     "validated sqlite backup promotion failed for {}: {error}",
@@ -12902,7 +12935,7 @@ fn recover_sqlite_file_with_storage_root(
                 ))
             },
         )?;
-        reconcile_sqlite_file_with_archive_after_restore(path, &storage_root)?;
+        reconcile_sqlite_file_with_archive_after_restore(path, storage_root)?;
         emit_salvage_loss_report(
             "backup-restore",
             &salvage_before,
@@ -12987,7 +13020,7 @@ fn recover_sqlite_file_with_storage_root(
                     mcp_agent_mail_db::promote_recovery_candidate(
                         path,
                         &temp_reconstruct,
-                        &storage_root,
+                        storage_root,
                     )
                     .map_err(|error| {
                         CliError::Other(format!(
@@ -12995,7 +13028,7 @@ fn recover_sqlite_file_with_storage_root(
                             path.display()
                         ))
                     })?;
-                    reconcile_sqlite_file_with_archive_after_restore(path, &storage_root)?;
+                    reconcile_sqlite_file_with_archive_after_restore(path, storage_root)?;
                     emit_salvage_loss_report(
                         "archive-reconstruct",
                         &salvage_before,
@@ -13117,6 +13150,53 @@ fn sqlite_absolute_candidate_path(path: &str) -> Option<String> {
 
 fn resolve_sqlite_runtime_path(path: &str) -> String {
     mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(path)
+}
+
+/// Decide whether a normal CLI open must enter durable recovery admission
+/// before it may touch the live SQLite family.
+///
+/// A healthy family with stale or malformed breaker authority may continue to
+/// serve, but only after a source-neutral probe of a private copy proves the
+/// exact primary/WAL/SHM generation is directly usable. An unhealthy or missing
+/// family cannot fail open: the caller must enter admission before a writable
+/// engine open, candidate staging, or fresh-database initialization. With no
+/// unresolved breaker history, the ordinary fast open remains unchanged.
+fn cli_sqlite_family_requires_preopen_admission(path: &Path) -> CliResult<bool> {
+    // Obvious WAL/SHM damage is classified without an engine open. The cleanup
+    // helper itself enters mutation-only durable admission when it needs to
+    // quarantine anything, so malformed/tripped authority refuses here without
+    // creating an election, quarantine, snapshot, or reconstruction artifact.
+    mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(path).map_err(|error| {
+        CliError::Other(format!(
+            "CLI pre-open SQLite-family cleanup failed for {}: {error}",
+            path.display()
+        ))
+    })?;
+
+    let unresolved_breaker_authority =
+        match mcp_agent_mail_db::recovery_breaker::load(path) {
+            Ok(Some(state)) => state.consecutive_failures > 0,
+            Ok(None) => false,
+            // An unreadable breaker is authority we cannot safely ignore. A
+            // directly usable exact family may still serve, but every other
+            // case must flow through admission and surface the trust failure.
+            Err(_) => true,
+        };
+    if !unresolved_breaker_authority {
+        return Ok(false);
+    }
+
+    if !path.exists() {
+        return Ok(true);
+    }
+    mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(path)
+        .map(|healthy| !healthy)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "CLI source-neutral pre-open probe failed for {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
@@ -13488,23 +13568,31 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
     if path != ":memory:" {
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
-    let read_only_open = open_sqlite_read_only_with_fallback(&path);
-    if let Ok((conn, opened_path)) = read_only_open {
-        if opened_path == ":memory:" {
-            return Ok((conn, opened_path));
-        }
+    let requires_preopen_admission = path != ":memory:"
+        && cli_sqlite_family_requires_preopen_admission(Path::new(&path))?;
+    // `open_sqlite_read_only_with_fallback` is read-only in policy, not at the
+    // engine API: `DbConn::open_file` may create WAL/SHM or materialize a missing
+    // database. Skip it whenever durable authority requires admission and when
+    // the path is absent; both cases must acquire mutation locks first.
+    if !requires_preopen_admission && (path == ":memory:" || Path::new(&path).exists()) {
+        let read_only_open = open_sqlite_read_only_with_fallback(&path);
+        if let Ok((conn, opened_path)) = read_only_open {
+            if opened_path == ":memory:" {
+                return Ok((conn, opened_path));
+            }
 
-        if !sqlite_conn_requires_canonical_init(&conn)? && sqlite_conn_is_healthy(&conn)? {
-            return maybe_reconcile_sync_opened_sqlite_archive_drift(
-                conn,
-                opened_path,
-                database_url,
-                storage_root_override,
-                acquire_mutation_locks,
-            );
-        }
+            if !sqlite_conn_requires_canonical_init(&conn)? && sqlite_conn_is_healthy(&conn)? {
+                return maybe_reconcile_sync_opened_sqlite_archive_drift(
+                    conn,
+                    opened_path,
+                    database_url,
+                    storage_root_override,
+                    acquire_mutation_locks,
+                );
+            }
 
-        drop(conn);
+            drop(conn);
+        }
     }
 
     let _mailbox_mutation_locks = if acquire_mutation_locks {
@@ -13515,8 +13603,35 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
     } else {
         None
     };
+    let open_after_mutation_locks = || {
+        open_db_sync_after_mutation_locks(&path, database_url, storage_root_override)
+    };
+    if !requires_preopen_admission {
+        return open_after_mutation_locks();
+    }
+    match mcp_agent_mail_db::pool::with_automatic_recovery_admission(
+        Path::new(&path),
+        "CLI database pre-open recovery",
+        open_after_mutation_locks,
+    ) {
+        Ok(opened) => Ok(opened),
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission { error, .. }) => {
+            Err(CliError::Other(error.to_string()))
+        }
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error)) => Err(error),
+    }
+}
+
+/// Finish a synchronous CLI database open while the caller holds the mailbox's
+/// mutation locks. When durable pre-open admission was required, the caller also
+/// keeps the same-path automatic-recovery envelope active around this function.
+fn open_db_sync_after_mutation_locks(
+    path: &str,
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let (mut conn, opened_path) =
-        open_sqlite_with_fallback_and_storage_root(&path, storage_root_override)?;
+        open_sqlite_with_fallback_and_storage_root(path, storage_root_override)?;
     if opened_path != ":memory:" {
         if !sqlite_conn_requires_canonical_init(&conn)? {
             return maybe_reconcile_sync_opened_sqlite_archive_drift(

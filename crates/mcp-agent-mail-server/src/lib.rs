@@ -2628,18 +2628,16 @@ fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Res
     }
 }
 
-fn open_sync_db_connection_with_busy_timeout(
+pub(crate) fn open_sync_db_connection_with_busy_timeout(
     path: &str,
     busy_timeout_ms: u32,
+    context: &str,
 ) -> std::io::Result<DbConn> {
     let path = resolve_server_sync_sqlite_path(path);
     let conn = if path == ":memory:" {
         DbConn::open_memory()
     } else {
-        guard_raw_live_sqlite_engine_open(
-            Path::new(&path),
-            "server raw synchronous database connection",
-        )?;
+        guard_raw_live_sqlite_engine_open(Path::new(path.as_str()), context)?;
         DbConn::open_file(&path)
     }
     .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
@@ -2654,15 +2652,27 @@ fn open_sync_db_connection_with_busy_timeout(
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    open_sync_db_connection_with_busy_timeout(path, SERVER_SYNC_DB_BUSY_TIMEOUT_MS)
+    open_sync_db_connection_with_busy_timeout(
+        path,
+        SERVER_SYNC_DB_BUSY_TIMEOUT_MS,
+        "server synchronous database connection",
+    )
 }
 
 pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    open_sync_db_connection_with_busy_timeout(path, INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS)
+    open_sync_db_connection_with_busy_timeout(
+        path,
+        INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS,
+        "interactive synchronous database connection",
+    )
 }
 
 pub(crate) fn open_health_probe_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    let conn = open_sync_db_connection_with_busy_timeout(path, HEALTH_SYNC_DB_BUSY_TIMEOUT_MS)?;
+    let conn = open_sync_db_connection_with_busy_timeout(
+        path,
+        HEALTH_SYNC_DB_BUSY_TIMEOUT_MS,
+        "HTTP readiness health probe",
+    )?;
     conn.execute_raw("PRAGMA query_only = ON;").map_err(|err| {
         std::io::Error::other(format!(
             "configure sqlite query_only health probe on {path}: {err}"
@@ -2680,8 +2690,11 @@ pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Optio
 }
 
 pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    let conn =
-        open_sync_db_connection_with_busy_timeout(path, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)?;
+    let conn = open_sync_db_connection_with_busy_timeout(
+        path,
+        BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+        "TUI and dashboard observability",
+    )?;
     ensure_base_schema_on_sync_connection(&conn)?;
     Ok(conn)
 }
@@ -28713,6 +28726,180 @@ first body
             })
             .unwrap_or_default();
         assert_eq!(query_only, 1);
+    }
+
+    fn install_raw_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path);
+        if breaker_kind == "malformed" {
+            std::fs::write(&breaker_path, b"malformed breaker authority")
+                .expect("write malformed breaker authority");
+        } else {
+            let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                schema: 1,
+                db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(db_path),
+                consecutive_failures:
+                    mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+                last_failure_unix: i64::MAX,
+                last_failure_reason: "raw-open fixture is circuit-broken".to_string(),
+                tripped: true,
+            };
+            mcp_agent_mail_db::recovery_breaker::store(db_path, &state)
+                .expect("store tripped breaker authority");
+        }
+        breaker_path
+    }
+
+    fn assert_raw_live_open_preserves_suspect_family(
+        surface: &str,
+        mut open: impl FnMut(&Path, &Path) -> Result<(), String>,
+    ) {
+        for family_kind in ["damaged-wal", "corrupt-primary"] {
+            for breaker_kind in ["malformed", "tripped"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let storage_root = dir.path().join("storage");
+                std::fs::create_dir_all(&storage_root).expect("create empty storage root");
+                let db_path = dir
+                    .path()
+                    .join(format!("{surface}-{family_kind}-{breaker_kind}.sqlite3"));
+                if family_kind == "damaged-wal" {
+                    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                        db_path.to_string_lossy().as_ref(),
+                    )
+                    .expect("create healthy primary fixture");
+                    conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                        .expect("detach fixture WAL mode");
+                    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                        .expect("initialize fixture schema");
+                    drop(conn);
+                    std::fs::write(
+                        db_path.with_file_name(format!(
+                            "{}-wal",
+                            db_path.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+                        b"truncated-wal",
+                    )
+                    .expect("write damaged WAL");
+                    std::fs::write(
+                        db_path.with_file_name(format!(
+                            "{}-shm",
+                            db_path.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+                        b"coordination-shm",
+                    )
+                    .expect("write SHM fixture");
+                } else {
+                    std::fs::write(&db_path, b"corrupt raw-open primary")
+                        .expect("write corrupt primary fixture");
+                }
+
+                let wal_path = db_path.with_file_name(format!(
+                    "{}-wal",
+                    db_path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                let shm_path = db_path.with_file_name(format!(
+                    "{}-shm",
+                    db_path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                let breaker_path = install_raw_open_breaker_fixture(&db_path, breaker_kind);
+                let family_paths = [db_path.clone(), wal_path, shm_path, breaker_path];
+                let family_bytes_before =
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok());
+                let names_before = std::fs::read_dir(dir.path())
+                    .expect("list raw-open fixture before refusal")
+                    .map(|entry| entry.expect("read raw-open fixture entry").file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+
+                let error = open(&db_path, &storage_root)
+                    .expect_err("nonclean breaker must refuse the suspect raw live open");
+                assert!(
+                    error.contains("refusing raw live SQLite engine open"),
+                    "unexpected {surface}/{family_kind}/{breaker_kind} refusal: {error}"
+                );
+                assert_eq!(
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok()),
+                    family_bytes_before,
+                    "{surface} refusal must preserve every SQLite-family byte"
+                );
+                let names_after = std::fs::read_dir(dir.path())
+                    .expect("list raw-open fixture after refusal")
+                    .map(|entry| entry.expect("read raw-open fixture entry").file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    names_after, names_before,
+                    "{surface} refusal must not create election, cleanup, recovery, or forensic artifacts"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn health_raw_open_refuses_suspect_family_behind_nonclean_breaker() {
+        assert_raw_live_open_preserves_suspect_family("health", |db_path, _storage_root| {
+            open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref())
+                .map(drop)
+                .map_err(|error| error.to_string())
+        });
+    }
+
+    #[test]
+    fn tui_observability_raw_open_refuses_suspect_family_behind_nonclean_breaker() {
+        assert_raw_live_open_preserves_suspect_family(
+            "tui-observability",
+            |db_path, storage_root| {
+                open_observability_sync_db_connection(
+                    &format!("sqlite:///{}", db_path.display()),
+                    storage_root,
+                    "TUI db poller test",
+                )
+                .and_then(|opened| {
+                    opened.ok_or_else(|| "observability connection was absent".to_string())
+                })
+                .map(drop)
+            },
+        );
+    }
+
+    #[test]
+    fn raw_live_open_guard_allows_healthy_exact_family_with_nonclean_breaker() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage_root = dir.path().join("storage");
+            std::fs::create_dir_all(&storage_root).expect("create empty storage root");
+            let db_path = dir
+                .path()
+                .join(format!("healthy-raw-open-{breaker_kind}.sqlite3"));
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                db_path.to_string_lossy().as_ref(),
+            )
+            .expect("create healthy raw-open fixture");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("detach fixture WAL mode");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize healthy fixture schema");
+            drop(conn);
+            let breaker_path = install_raw_open_breaker_fixture(&db_path, breaker_kind);
+            let breaker_bytes =
+                std::fs::read(&breaker_path).expect("read nonclean breaker fixture");
+
+            let health =
+                open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref())
+                    .expect("healthy exact family remains available to health reads");
+            drop(health);
+            let observed = open_observability_sync_db_connection(
+                &format!("sqlite:///{}", db_path.display()),
+                &storage_root,
+                "healthy TUI db poller test",
+            )
+            .expect("healthy exact family remains available to observability reads")
+            .expect("healthy observability source should exist");
+            drop(observed);
+
+            assert_eq!(
+                std::fs::read(&breaker_path).expect("read breaker after healthy opens"),
+                breaker_bytes,
+                "raw reads must not consume or clear durable recovery authority"
+            );
+        }
     }
 
     #[test]

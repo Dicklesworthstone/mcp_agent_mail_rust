@@ -262,11 +262,12 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
     };
     let path = cfg.sqlite_path().ok()?;
     let path = crate::resolve_server_sync_sqlite_path(&path);
-    let conn = DbConn::open_file(&path).ok()?;
-    let _ = conn.execute_raw(&format!(
-        "PRAGMA busy_timeout = {METRICS_DB_BUSY_TIMEOUT_MS};"
-    ));
-    Some(conn)
+    crate::open_sync_db_connection_with_busy_timeout(
+        &path,
+        u32::try_from(METRICS_DB_BUSY_TIMEOUT_MS).unwrap_or(u32::MAX),
+        "tool metrics background worker",
+    )
+    .ok()
 }
 
 fn ensure_metrics_schema(conn: &DbConn) {
