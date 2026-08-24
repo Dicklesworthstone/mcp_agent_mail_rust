@@ -14,7 +14,7 @@
 
 A mail-like coordination layer for AI coding agents, exposed as an MCP server with 40 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
 
-**Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
+**Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Oh My Pi (OMP)](https://omp.sh), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
 Watch the [23-minute walkthrough](https://youtu.be/68VVcqMEDrs) to see seven AI coding agents send over 1,000 messages to each other while implementing a development plan over two days.
 
@@ -25,7 +25,7 @@ Watch the [23-minute walkthrough](https://youtu.be/68VVcqMEDrs) to see seven AI 
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh?$(date +%s)" | bash
 ```
 
-<p><em>Works on Linux and macOS (x86_64 and aarch64). Auto-detects your platform, downloads the right binary, and auto-configures detected Codex CLI installs for HTTP MCP.</em></p>
+<p><em>Works on Linux and macOS (x86_64 and aarch64). Auto-detects your platform, downloads the right binary, and configures detected coding agents for HTTP MCP.</em></p>
 </div>
 
 ---
@@ -343,7 +343,7 @@ Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect sib
 am
 ```
 
-Auto-detects all installed coding agents (Claude Code, Codex CLI, Gemini CLI, etc.), refreshes their MCP connections as needed, and starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
+Auto-detects all installed coding agents (Claude Code, Codex CLI, Gemini CLI, OMP, etc.), refreshes their MCP connections as needed, and starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
 
 ### 2. Agents register and coordinate
 
@@ -394,7 +394,7 @@ macro_contact_handshake(project_key="/abs/path/to/repo", requester="GreenCastle"
 
 ## Agent Configuration
 
-The installer and `am` command auto-detect installed agents. If you used the curl installer, detected Codex CLI configs are written automatically in HTTP URL mode; the examples below are the manual fallback.
+The installer and `am` command auto-detect installed agents and write their configs in HTTP URL mode. The examples below are the manual fallback.
 
 ### Claude Code
 
@@ -456,6 +456,27 @@ For a project-local Gemini setup plus Agent Mail identity registration:
 scripts/register_gemini.sh /abs/path/to/repo
 AGENT_NAME=BlueLake AGENT_MODEL=gemini-2.5-pro scripts/register_gemini.sh /abs/path/to/repo
 ```
+
+### Oh My Pi (OMP)
+
+`am setup run --agent omp` writes OMP's native project config at `.omp/mcp.json`
+and its default-profile user config at `~/.omp/agent/mcp.json`. The project
+config applies under every named OMP profile. To configure it manually:
+
+```json
+{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/"
+    }
+  }
+}
+```
+
+When HTTP bearer authentication is enabled, add an `Authorization` entry under
+`headers`; `am setup run` does this automatically and adds `.omp/mcp.json` to
+the project `.gitignore` so the credential is not committed.
 
 ### Any MCP-Compatible Client
 

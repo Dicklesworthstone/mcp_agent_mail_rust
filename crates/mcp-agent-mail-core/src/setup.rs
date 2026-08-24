@@ -46,6 +46,8 @@ pub enum AgentPlatform {
     Codex,
     Cursor,
     Gemini,
+    /// Oh My Pi (`omp`) coding agent.
+    Omp,
     /// Antigravity (`agy`) — Google's successor to the retired Gemini CLI.
     /// Reads MCP servers from `~/.gemini/config/mcp_config.json` (distinct from
     /// Gemini's `~/.gemini/settings.json`), verified empirically against the
@@ -65,6 +67,7 @@ impl AgentPlatform {
         Self::Codex,
         Self::Cursor,
         Self::Gemini,
+        Self::Omp,
         Self::Antigravity,
         Self::OpenCode,
         Self::FactoryDroid,
@@ -81,6 +84,7 @@ impl AgentPlatform {
             "codex" | "codex-cli" => Some(Self::Codex),
             "cursor" => Some(Self::Cursor),
             "gemini" | "gemini-cli" => Some(Self::Gemini),
+            "omp" | "oh-my-pi" => Some(Self::Omp),
             "antigravity" | "agy" | "antigravity-cli" => Some(Self::Antigravity),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "factory" | "factory-droid" => Some(Self::FactoryDroid),
@@ -99,6 +103,7 @@ impl AgentPlatform {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Gemini => "gemini",
+            Self::Omp => "omp",
             Self::Antigravity => "antigravity",
             Self::OpenCode => "opencode",
             Self::FactoryDroid => "factory",
@@ -116,6 +121,7 @@ impl AgentPlatform {
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor",
             Self::Gemini => "Gemini CLI",
+            Self::Omp => "Oh My Pi (OMP)",
             Self::Antigravity => "Antigravity (agy)",
             Self::OpenCode => "OpenCode",
             Self::FactoryDroid => "Factory Droid",
@@ -141,6 +147,7 @@ impl AgentPlatform {
             Self::Claude | Self::Codex => &[],
             Self::Cursor => &["cursor.mcp.json"],
             Self::Gemini => &["gemini.mcp.json"],
+            Self::Omp => &[".omp/mcp.json"],
             Self::Antigravity => &["agy.mcp.json"],
             Self::OpenCode => &["opencode.json"],
             Self::FactoryDroid => &["factory.mcp.json"],
@@ -1031,6 +1038,7 @@ impl AgentPlatform {
                 }]
             }
             Self::Gemini => self.gemini_actions(params, &url, token, pdir, &home),
+            Self::Omp => self.omp_actions(params, &url, token, pdir, &home),
             Self::Antigravity => self.antigravity_actions(params, &url, token, pdir, &home),
             Self::OpenCode => vec![project_local_action(
                 self,
@@ -1188,6 +1196,45 @@ impl AgentPlatform {
                     server_value: json!({ "httpUrl": url }),
                 },
                 permissions: 0o644,
+                backup: true,
+            });
+        }
+        actions
+    }
+
+    /// OMP-native MCP config actions.
+    ///
+    /// OMP loads project `.omp/mcp.json` before the active profile's user
+    /// config. The project file is therefore the profile-independent setup
+    /// surface; the default-profile user file is also refreshed unless the
+    /// caller requests project-local configuration only.
+    fn omp_actions(
+        self,
+        params: &SetupParams,
+        url: &str,
+        token: &str,
+        pdir: &Path,
+        home: &Path,
+    ) -> Vec<ConfigAction> {
+        let mut actions = vec![project_local_action(
+            self,
+            pdir,
+            ".omp/mcp.json",
+            "mcpServers",
+            standard_http_server_value(url, token),
+            "Oh My Pi (OMP) project-local MCP config",
+        )];
+        if !params.skip_user_config {
+            actions.push(ConfigAction {
+                platform: self,
+                file_path: home.join(".omp").join("agent").join("mcp.json"),
+                description: "Oh My Pi (OMP) default-profile MCP config".into(),
+                content: ConfigContent::JsonMerge {
+                    servers_key: "mcpServers",
+                    server_name: "mcp-agent-mail",
+                    server_value: standard_http_server_value(url, token),
+                },
+                permissions: 0o600,
                 backup: true,
             });
         }
@@ -2933,6 +2980,7 @@ mod tests {
         for expected in [
             "cursor.mcp.json",
             "gemini.mcp.json",
+            ".omp/mcp.json",
             "factory.mcp.json",
             "windsurf.mcp.json",
             "cline.mcp.json",
@@ -3073,6 +3121,42 @@ mod tests {
                 );
             }
             _ => panic!("expected JsonMerge"),
+        }
+    }
+
+    #[test]
+    fn config_actions_omp_uses_native_http_config_paths() {
+        let home = PathBuf::from("/tmp/omp-home");
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            home_dir_override: Some(home.clone()),
+            skip_user_config: false,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Omp.config_actions(&params);
+        assert_eq!(
+            actions.len(),
+            2,
+            "project-local + default-profile user config"
+        );
+        assert_eq!(actions[0].file_path, PathBuf::from("/tmp/p/.omp/mcp.json"));
+        assert_eq!(actions[1].file_path, home.join(".omp/agent/mcp.json"));
+
+        for action in &actions {
+            match &action.content {
+                ConfigContent::JsonMerge {
+                    servers_key,
+                    server_value,
+                    ..
+                } => {
+                    assert_eq!(*servers_key, "mcpServers");
+                    assert_eq!(server_value["type"], "http");
+                    assert_eq!(server_value["url"], "http://127.0.0.1:8765/mcp/");
+                    assert_eq!(server_value["headers"]["Authorization"], "Bearer tok");
+                }
+                _ => panic!("expected OMP JsonMerge action"),
+            }
         }
     }
 
@@ -3590,11 +3674,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_platform_all_has_ten() {
-        // 9 original platforms + Antigravity (agy) for the gmi->agy migration
-        // (bd-47kjh.7.2).
-        assert_eq!(AgentPlatform::ALL.len(), 10);
+    fn agent_platform_all_has_eleven() {
+        // 9 original platforms + Antigravity (agy) + Oh My Pi (OMP).
+        assert_eq!(AgentPlatform::ALL.len(), 11);
         assert!(AgentPlatform::ALL.contains(&AgentPlatform::Antigravity));
+        assert!(AgentPlatform::ALL.contains(&AgentPlatform::Omp));
     }
 
     #[test]
@@ -3695,6 +3779,7 @@ http_headers = { Authorization = "Bearer tok" }
             AgentPlatform::from_slug("gemini"),
             Some(AgentPlatform::Gemini)
         );
+        assert_eq!(AgentPlatform::from_slug("omp"), Some(AgentPlatform::Omp));
         assert_eq!(
             AgentPlatform::from_slug("opencode"),
             Some(AgentPlatform::OpenCode)
@@ -3727,6 +3812,10 @@ http_headers = { Authorization = "Bearer tok" }
         assert_eq!(
             AgentPlatform::from_slug("gemini-cli"),
             Some(AgentPlatform::Gemini)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("oh-my-pi"),
+            Some(AgentPlatform::Omp)
         );
         // Antigravity (agy) — primary slug + the agy / antigravity-cli aliases
         // (matches the franken-agent-detection connector slug + aliases).
@@ -3781,6 +3870,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(names.contains(&"Codex CLI"));
         assert!(names.contains(&"Cursor"));
         assert!(names.contains(&"Gemini CLI"));
+        assert!(names.contains(&"Oh My Pi (OMP)"));
         assert!(names.contains(&"Antigravity (agy)"));
         assert!(names.contains(&"OpenCode"));
         assert!(names.contains(&"Factory Droid"));
@@ -3883,11 +3973,12 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn parse_agent_list_alias_slugs() {
-        let list = parse_agent_list("claude-code, codex-cli, copilot").unwrap();
-        assert_eq!(list.len(), 3);
+        let list = parse_agent_list("claude-code, codex-cli, copilot, oh-my-pi").unwrap();
+        assert_eq!(list.len(), 4);
         assert_eq!(list[0], AgentPlatform::Claude);
         assert_eq!(list[1], AgentPlatform::Codex);
         assert_eq!(list[2], AgentPlatform::GithubCopilot);
+        assert_eq!(list[3], AgentPlatform::Omp);
     }
 
     #[test]
@@ -4534,6 +4625,10 @@ http_headers = { Authorization = "Bearer tok" }
         assert_eq!(
             serde_json::to_string(&AgentPlatform::OpenCode).unwrap(),
             "\"open-code\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentPlatform::Omp).unwrap(),
+            "\"omp\""
         );
     }
 

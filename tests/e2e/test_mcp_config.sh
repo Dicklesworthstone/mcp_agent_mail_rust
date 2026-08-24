@@ -41,7 +41,7 @@ FAKE_PROJECT="${WORK}/project"
 FAKE_DEST="${FAKE_HOME}/.local/bin"
 mkdir -p "$FAKE_DEST" "$FAKE_PROJECT" "$FAKE_HOME/.claude" "$FAKE_HOME/.codex" \
          "$FAKE_HOME/.cursor" "$FAKE_HOME/.gemini" "$FAKE_HOME/.windsurf" \
-         "$FAKE_HOME/.cline" "$FAKE_PROJECT/.vscode"
+         "$FAKE_HOME/.cline" "$FAKE_HOME/.omp/agent" "$FAKE_PROJECT/.vscode"
 
 # Copy binary into fake DEST
 cp "$CLI_BIN" "$FAKE_DEST/am"
@@ -505,6 +505,62 @@ done
 
 if [ "$INVALID_COUNT" -eq 0 ] && [ "$VALID_COUNT" -gt 0 ]; then
     e2e_pass "all $VALID_COUNT config files are valid JSON"
+fi
+
+# ===========================================================================
+# Case 13: OMP native project and default-profile configs
+# ===========================================================================
+e2e_case_banner "OMP native project and user configs"
+
+OMP_PROJECT_CONFIG="${FAKE_PROJECT}/.omp/mcp.json"
+OMP_USER_CONFIG="${FAKE_HOME}/.omp/agent/mcp.json"
+mkdir -p "$(dirname "$OMP_PROJECT_CONFIG")"
+cat > "$OMP_PROJECT_CONFIG" <<'EOF'
+{
+  "mcpServers": {
+    "keep-me": {
+      "command": "node",
+      "args": ["server.js"]
+    }
+  }
+}
+EOF
+
+set +e
+run_am setup run --agent omp --yes --no-hooks --project-dir "$FAKE_PROJECT" \
+    --token omp-token-789 >/dev/null 2>&1
+OMP_RC=$?
+set -e
+
+e2e_assert_exit_code "OMP setup exits cleanly" "0" "$OMP_RC"
+
+OMP_PROJECT="$(cat "$OMP_PROJECT_CONFIG")"
+OMP_USER="$(cat "$OMP_USER_CONFIG")"
+e2e_save_artifact "case_13_omp_project.json" "$OMP_PROJECT"
+e2e_save_artifact "case_13_omp_user.json" "$OMP_USER"
+
+if json_get "$OMP_PROJECT" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789'"; then
+    e2e_pass "OMP project config uses native authenticated HTTP shape"
+else
+    e2e_fail "OMP project config shape" "native authenticated HTTP entry" "missing or malformed"
+fi
+
+if json_get "$OMP_PROJECT" "keep=d['mcpServers']['keep-me']; assert keep['command']=='node' and keep['args']==['server.js']"; then
+    e2e_pass "OMP setup preserves sibling MCP servers"
+else
+    e2e_fail "OMP sibling server preservation" "unchanged" "modified or missing"
+fi
+
+if json_get "$OMP_USER" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['headers']['Authorization']=='Bearer omp-token-789'"; then
+    e2e_pass "OMP default-profile user config uses native HTTP shape"
+else
+    e2e_fail "OMP user config shape" "native authenticated HTTP entry" "missing or malformed"
+fi
+
+if grep -Fxq '.omp/mcp.json' "${FAKE_PROJECT}/.gitignore"; then
+    e2e_pass "OMP project config is protected by .gitignore"
+else
+    e2e_fail "OMP project config gitignore" ".omp/mcp.json" "missing"
 fi
 
 # ===========================================================================

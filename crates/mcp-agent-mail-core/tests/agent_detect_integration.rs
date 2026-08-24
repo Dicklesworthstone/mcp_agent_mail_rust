@@ -151,4 +151,29 @@ mod feature_enabled {
         assert_eq!(v["summary"]["total_count"].as_u64(), Some(2));
         assert_eq!(v["summary"]["detected_count"].as_u64(), Some(2));
     }
+
+    #[test]
+    fn detect_installed_agents_supports_omp_alias_and_root_override() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let omp_sessions = tmp.path().join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(&omp_sessions).expect("create OMP sessions");
+
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["oh-my-pi".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![AgentDetectRootOverride {
+                slug: "omp".to_string(),
+                root: omp_sessions.clone(),
+            }],
+        })
+        .expect("detect OMP");
+
+        assert_eq!(report.installed_agents.len(), 1);
+        let entry = &report.installed_agents[0];
+        assert_eq!(entry.slug, "omp");
+        assert!(entry.detected);
+        assert_eq!(entry.root_paths, vec![omp_sessions.display().to_string()]);
+        assert_eq!(report.summary.total_count, 1);
+        assert_eq!(report.summary.detected_count, 1);
+    }
 }

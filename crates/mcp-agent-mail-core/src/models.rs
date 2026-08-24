@@ -682,6 +682,8 @@ pub const KNOWN_PROGRAM_NAMES: &[&str] = &[
     // Gemini CLI. `gemini`/`gemini-cli` are kept above for legacy panes.
     "antigravity",
     "agy",
+    "omp",
+    "oh-my-pi",
     "opencode",
     "vscode",
     "neovim",
@@ -1072,12 +1074,12 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn program_name_detection_all_21() {
+    fn program_name_detection_all_23() {
         // Python's _KNOWN_PROGRAM_NAMES frozenset (19 entries) plus the two
         // Rust-native Antigravity (`agy`) additions for the gmi->agy migration
-        // (bd-47kjh.7.1). `antigravity`/`agy` are NOT in the Python reference;
-        // they are added here so an `agy`-spawned pane that self-reports its
-        // program is labeled correctly rather than mistaken for an agent name.
+        // (bd-47kjh.7.1) and the OMP canonical/alias spellings. These four are
+        // not in the Python reference; they keep agent program labels from
+        // being mistaken for Agent Mail identity names.
         let expected = [
             "claude-code",
             "claude",
@@ -1093,6 +1095,8 @@ mod tests {
             "gemini",
             "antigravity",
             "agy",
+            "omp",
+            "oh-my-pi",
             "opencode",
             "vscode",
             "neovim",
@@ -1103,8 +1107,8 @@ mod tests {
         ];
         assert_eq!(
             KNOWN_PROGRAM_NAMES.len(),
-            21,
-            "must have exactly 21 program names (19 Python-parity + agy/antigravity)"
+            23,
+            "must have exactly 23 program names (19 Python-parity + agy/antigravity + OMP aliases)"
         );
         for name in &expected {
             assert!(
@@ -1132,6 +1136,18 @@ mod tests {
         // The agy program token must NOT be misread as a model name.
         assert!(!looks_like_model_name("agy"));
         assert!(!looks_like_model_name("antigravity"));
+    }
+
+    #[test]
+    fn omp_program_names_are_recognized_not_mistaken_for_agents() {
+        for name in ["omp", "oh-my-pi", "OMP", "Oh-My-Pi", "  omp  "] {
+            assert!(
+                looks_like_program_name(name),
+                "'{name}' must be detected as the OMP program"
+            );
+        }
+        assert!(!looks_like_model_name("omp"));
+        assert!(!looks_like_model_name("oh-my-pi"));
     }
 
     #[test]

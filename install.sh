@@ -2726,6 +2726,11 @@ detect_mcp_configs() {
     candidates+=("gemini|${home_dir}/.gemini/settings.json")
     candidates+=("gemini|${home_dir}/.gemini/mcp.json")
 
+    # Oh My Pi (OMP), default profile. Named profiles use project-local
+    # `.omp/mcp.json`, which applies across every profile.
+    candidates+=("omp|${home_dir}/.omp/agent/mcp.json")
+    candidates+=("omp|${home_dir}/.omp/agent/.mcp.json")
+
     # GitHub Copilot / VS Code settings
     candidates+=("github-copilot|${home_dir}/.config/Code/User/settings.json")
     candidates+=("github-copilot|${home_dir}/Library/Application Support/Code/User/settings.json")
@@ -2752,6 +2757,13 @@ detect_mcp_configs() {
   candidates+=("codex|${project_dir}/codex.mcp.json")
   candidates+=("cursor|${project_dir}/cursor.mcp.json")
   candidates+=("gemini|${project_dir}/gemini.mcp.json")
+  # Only advertise OMP project candidates when the project already owns an
+  # `.omp/` directory. Otherwise the fresh-config grandparent heuristic below
+  # would create OMP config in unrelated checkouts.
+  if [ -d "${project_dir}/.omp" ]; then
+    candidates+=("omp|${project_dir}/.omp/mcp.json")
+    candidates+=("omp|${project_dir}/.omp/.mcp.json")
+  fi
   candidates+=("github-copilot|${project_dir}/.vscode/mcp.json")
   candidates+=("windsurf|${project_dir}/windsurf.mcp.json")
   candidates+=("cline|${project_dir}/cline.mcp.json")

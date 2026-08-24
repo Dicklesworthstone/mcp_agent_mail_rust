@@ -8,6 +8,41 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Verifiable pane-identity bindings (GH#252).** Per-pane identity files
+  now hold a one-line JSON `PaneIdentityRecord` — `name` plus the tmux
+  binding facts `session_name`, `pane_id`, `pane_pid`, `socket_path`,
+  `written_at` — written through the same symlink-hardened path as before;
+  legacy bare-name files still parse (as a record with only `name`), and
+  unknown fields are tolerated on read. A binding is **live** iff
+  `tmux -S <socket_path> display-message -t <pane_id>` reports the recorded
+  `session_name` and `pane_pid` and a non-shell `pane_current_command`;
+  any failing check, a gone server, or a missing socket file is **dead**.
+  Resolution (`resolve_pane_identity`, `am agents resolve-pane`,
+  `macro_start_session` reuse, the `X-Tmux-Pane` header path, the git
+  guard) applies the adoption rule to every candidate in the existing
+  lookup order: a live binding held by a *different* pane is never handed
+  out (the lookup reports not-found so the caller mints a fresh name), a
+  dead binding is adopted and its record atomically rewritten with the
+  adopter's facts, and legacy/unverifiable files resolve under a
+  conservative compatibility rule (kept as-is while the key pane runs an
+  agent, adopted and upgraded to a structured record when it idles in a
+  shell, returned untouched with no tmux context). Writers
+  (`register_agent`, `create_agent_identity`, `write_identity`) populate
+  the new fields and refuse to overwrite a verifiably live binding held by
+  another pane (best-effort warn-and-continue for callers). The
+  `resolve_pane_identity` tool response and `am agents resolve-pane` gain a
+  `binding` field: `verified-live`, `adopted-dead`, or `legacy-unverified`.
+  `cleanup_pane_identities` judges structured records by the same
+  predicate — live bindings are never removed, dead ones are purged — while
+  legacy files keep the live-pane-list rule; a process that cannot execute
+  `tmux` treats structured records as unverifiable, and socket-gone records
+  are purged only when tmux reports live panes on this host, so a stopped
+  or unreachable tmux can never mass-purge identities.
+
 ## [v0.3.30](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.30) — 2026-08-23 **[Release]**
 
 Fleet-wide reliability campaign: root-caused the "97% error rate" display

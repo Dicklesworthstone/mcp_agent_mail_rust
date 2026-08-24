@@ -1191,7 +1191,7 @@ pub enum SetupCommand {
     /// Auto-detect agents and write MCP config files (default subcommand).
     #[command(name = "run")]
     Run {
-        /// Target specific agents (comma-separated: claude,cursor,gemini).
+        /// Target specific agents (comma-separated: claude,codex,cursor,gemini,omp).
         #[arg(long)]
         agent: Option<String>,
         /// Preview changes without writing files.
@@ -1237,7 +1237,7 @@ pub enum SetupCommand {
         /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Target specific agents (comma-separated: claude,codex,cursor,gemini).
+        /// Target specific agents (comma-separated: claude,codex,cursor,gemini,omp).
         #[arg(long)]
         agent: Option<String>,
         /// Expected bearer token for header drift checks.
@@ -32530,6 +32530,7 @@ fn rewrite_json_mcp_entry_to_http_url(
         }
         mcp_agent_mail_core::mcp_config::McpConfigTool::Claude
         | mcp_agent_mail_core::mcp_config::McpConfigTool::Cursor
+        | mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
         | mcp_agent_mail_core::mcp_config::McpConfigTool::GithubCopilot
         | mcp_agent_mail_core::mcp_config::McpConfigTool::Windsurf
         | mcp_agent_mail_core::mcp_config::McpConfigTool::Cline => {
@@ -50781,6 +50782,37 @@ http_headers = { Authorization = "Bearer secret" }
             doc["mcpServers"]["mcp-agent-mail"]["headers"]["Authorization"],
             "Bearer tok123"
         );
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_updates_omp_json_to_native_http_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".omp").join("mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let desired_url = "http://127.0.0.1:8765/api/";
+        std::fs::write(
+            &config,
+            r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"], "transport": "stdio"}}}"#,
+        )
+        .unwrap();
+
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("omp-token"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let entry = &doc["mcpServers"]["mcp-agent-mail"];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], desired_url);
+        assert_eq!(entry["headers"]["Authorization"], "Bearer omp-token");
+        assert!(entry.get("command").is_none());
+        assert!(entry.get("args").is_none());
+        assert!(entry.get("transport").is_none());
     }
 
     #[test]

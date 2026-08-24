@@ -19,6 +19,7 @@ pub enum McpConfigTool {
     Codex,
     Cursor,
     Gemini,
+    Omp,
     GithubCopilot,
     Windsurf,
     Cline,
@@ -35,6 +36,7 @@ impl McpConfigTool {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Gemini => "gemini",
+            Self::Omp => "omp",
             Self::GithubCopilot => "github-copilot",
             Self::Windsurf => "windsurf",
             Self::Cline => "cline",
@@ -523,6 +525,7 @@ fn add_home_candidates(
     add_home_codex_candidates(out, seen, home);
     add_home_cursor_candidates(out, seen, home);
     add_home_gemini_candidates(out, seen, home);
+    add_home_omp_candidates(out, seen, home);
     add_home_github_copilot_candidates(out, seen, home);
     add_home_other_tool_candidates(out, seen, home);
 }
@@ -636,6 +639,16 @@ fn add_home_gemini_candidates(
         McpConfigTool::Gemini,
         home.join(".gemini").join("mcp.json"),
     );
+}
+
+fn add_home_omp_candidates(
+    out: &mut Vec<(McpConfigTool, PathBuf)>,
+    seen: &mut HashSet<(McpConfigTool, PathBuf)>,
+    home: &Path,
+) {
+    let agent_dir = home.join(".omp").join("agent");
+    push_candidate(out, seen, McpConfigTool::Omp, agent_dir.join("mcp.json"));
+    push_candidate(out, seen, McpConfigTool::Omp, agent_dir.join(".mcp.json"));
 }
 
 fn add_home_github_copilot_candidates(
@@ -769,6 +782,18 @@ fn add_project_candidates(
         seen,
         McpConfigTool::Gemini,
         project_dir.join("gemini.mcp.json"),
+    );
+    push_candidate(
+        out,
+        seen,
+        McpConfigTool::Omp,
+        project_dir.join(".omp").join("mcp.json"),
+    );
+    push_candidate(
+        out,
+        seen,
+        McpConfigTool::Omp,
+        project_dir.join(".omp").join(".mcp.json"),
     );
     push_candidate(
         out,
@@ -986,6 +1011,7 @@ pub fn preferred_config_path(tool: McpConfigTool, home: &Path) -> PathBuf {
         McpConfigTool::Codex => home.join(".codex").join("config.toml"),
         McpConfigTool::Cursor => home.join(".cursor").join("mcp.json"),
         McpConfigTool::Gemini => home.join(".gemini").join("settings.json"),
+        McpConfigTool::Omp => home.join(".omp").join("agent").join("mcp.json"),
         McpConfigTool::GithubCopilot => home
             .join(".config")
             .join("Code")
@@ -1092,6 +1118,22 @@ mod tests {
                 &home.join(".gemini").join("settings.json")
             ),
             "expected gemini settings path"
+        );
+        assert!(
+            contains_location(
+                &locations,
+                McpConfigTool::Omp,
+                &home.join(".omp").join("agent").join("mcp.json")
+            ),
+            "expected OMP default-profile config path"
+        );
+        assert!(
+            contains_location(
+                &locations,
+                McpConfigTool::Omp,
+                &project.join(".omp").join("mcp.json")
+            ),
+            "expected OMP project config path"
         );
         assert!(
             contains_location(
@@ -1726,6 +1768,10 @@ mod tests {
         assert_eq!(
             preferred_config_path(McpConfigTool::Gemini, home),
             PathBuf::from("/home/user/.gemini/settings.json")
+        );
+        assert_eq!(
+            preferred_config_path(McpConfigTool::Omp, home),
+            PathBuf::from("/home/user/.omp/agent/mcp.json")
         );
     }
 
