@@ -4215,8 +4215,17 @@ setup_mcp_configs() {
   scan=$(detect_mcp_configs "$PWD" || true)
 
   local bearer_token
-  bearer_token=$(generate_bearer_token)
-  verbose "setup_mcp_configs:generated_token len=${#bearer_token}"
+  bearer_token="$(resolve_setup_http_bearer_token)"
+  if [ -z "$bearer_token" ]; then
+    bearer_token="$(generate_bearer_token)"
+    verbose "setup_mcp_configs:selected_token source=generated len=${#bearer_token}"
+  else
+    verbose "setup_mcp_configs:selected_token source=existing len=${#bearer_token}"
+  fi
+  # Keep every installer phase on one credential. The native OMP/Codex HTTP
+  # writer resolves this variable directly, and update_mcp_configs passes it
+  # to `am setup run`, which persists the same value into config.env.
+  export HTTP_BEARER_TOKEN="$bearer_token"
 
   local storage_root="${STORAGE_ROOT:-}"
   local configured=0

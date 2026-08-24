@@ -20,8 +20,9 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   enforce OMP's lowercase profile-name syntax, cover existing named profiles
   plus OMP's project-root fallbacks, and avoid following symlinked or invalid
   profile directories. Installer migration removes stale stdio/auth fields and
-  canonicalizes OMP entries under `mcpServers`. Pane identity parsing also
-  treats `omp` and `oh-my-pi` as program names rather than agent names.
+  canonicalizes OMP entries under `mcpServers`; every installer phase now
+  shares the same bearer token. Pane identity parsing also treats `omp` and
+  `oh-my-pi` as program names rather than agent names.
 
 - **Verifiable pane-identity bindings (GH#252).** Per-pane identity files
   now hold a one-line JSON `PaneIdentityRecord` — `name` plus the tmux
