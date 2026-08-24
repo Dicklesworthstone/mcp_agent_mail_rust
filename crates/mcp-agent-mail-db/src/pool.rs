@@ -955,6 +955,30 @@ where
     ))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryAdmissionOutcomePolicy {
+    RecordRecoveryOutcome,
+    GuardMutationOnly,
+}
+
+#[allow(clippy::result_large_err)]
+fn with_recovery_mutation_admission<T, F>(
+    primary_path: &Path,
+    action: &'static str,
+    operation: F,
+) -> Result<T, SqlError>
+where
+    F: FnOnce() -> Result<T, SqlError>,
+{
+    flatten_automatic_recovery_result(with_automatic_recovery_admission_using_clock(
+        primary_path,
+        action,
+        operation,
+        recovery_breaker_now_unix,
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly,
+    ))
+}
+
 /// Wrap an entire automatic recovery attempt, including any forensic capture
 /// or candidate construction performed by `operation`, in the durable breaker
 /// election. Nested recovery primitives on the same thread pass through via
@@ -974,6 +998,7 @@ where
         action,
         operation,
         recovery_breaker_now_unix,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
     )
 }
 
@@ -1013,6 +1038,7 @@ where
         action,
         operation,
         now_unix,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
     ))
 }
 
@@ -1022,6 +1048,7 @@ fn with_automatic_recovery_admission_using_clock<T, E, F, C>(
     action: &'static str,
     operation: F,
     mut now_unix: C,
+    outcome_policy: RecoveryAdmissionOutcomePolicy,
 ) -> Result<T, AutomaticRecoveryRunError<E>>
 where
     E: std::fmt::Display,
@@ -1139,7 +1166,9 @@ where
         ));
     };
     let _depth_guard = RecoveryAdmissionDepthGuard::enter(normalized_primary);
-    if !breaker_bypass {
+    if !breaker_bypass
+        && outcome_policy == RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome
+    {
         // Arm the durable state before entering code that may panic, abort, or
         // lose power. The terminal write below replaces this provisional
         // reason without incrementing the attempt twice. A crashed half-open
@@ -1163,7 +1192,11 @@ where
         })?;
     }
 
-    match operation() {
+    let operation_result = operation();
+    if outcome_policy == RecoveryAdmissionOutcomePolicy::GuardMutationOnly {
+        return operation_result.map_err(AutomaticRecoveryRunError::Operation);
+    }
+    match operation_result {
         Ok(value) => {
             recovery_admission().report_success(primary_path);
             let cleared = crate::recovery_breaker::cleared_state(
@@ -6474,7 +6507,7 @@ fn cleanup_truncated_wal_sidecar_with_timeout(
         "automatic SQLite-family cleanup",
         writer_drain_timeout,
     )?;
-    with_recovery_admission(sqlite_path, "automatic SQLite-family cleanup", || {
+    with_recovery_mutation_admission(sqlite_path, "automatic SQLite-family cleanup", || {
         refuse_sqlite_family_cleanup_while_owned(sqlite_path)?;
         apply_classified_sqlite_family_cleanup(sqlite_path)
     })
@@ -18381,7 +18414,11 @@ mod tests {
                 Ok(())
             })
             .expect_err("lossy-colliding path must not inherit another database's admission");
-            assert!(error.to_string().contains("nested recovery may only target"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("nested recovery may only target")
+            );
             Ok(())
         })
         .expect("outer recovery should retain its own lossless identity");
@@ -19961,11 +19998,8 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let writer = crate::write_barrier::begin_write_activity();
 
-        let error = cleanup_truncated_wal_sidecar_with_timeout(
-            &db_path,
-            Duration::from_millis(1),
-        )
-        .expect_err("an active writer must block automatic sidecar cleanup");
+        let error = cleanup_truncated_wal_sidecar_with_timeout(&db_path, Duration::from_millis(1))
+            .expect_err("an active writer must block automatic sidecar cleanup");
 
         assert!(error.to_string().contains("did not drain"));
         assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
@@ -20165,7 +20199,10 @@ mod tests {
             sqlite_file_is_healthy(&primary).expect("health check after zero-byte wal"),
             "primary db should remain healthy with an empty wal attached"
         );
-        assert!(wal.exists(), "source-neutral health must retain the empty WAL name");
+        assert!(
+            wal.exists(),
+            "source-neutral health must retain the empty WAL name"
+        );
         assert_eq!(
             std::fs::metadata(&wal).expect("stat retained WAL").len(),
             0,

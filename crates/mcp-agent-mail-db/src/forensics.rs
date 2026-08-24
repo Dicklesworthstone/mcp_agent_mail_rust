@@ -808,13 +808,14 @@ struct CanonicalSnapshotSource {
 
 impl CanonicalSnapshotSource {
     fn for_family(db_path: &Path) -> Result<Self, SqlError> {
-        let staged = crate::pool::stage_sqlite_family_for_health_probe(db_path)?.ok_or_else(|| {
-            recovery_receipt_error(
-                "snapshot staging",
-                db_path,
-                "source is missing or its SQLite family contains a non-regular object",
-            )
-        })?;
+        let staged =
+            crate::pool::stage_sqlite_family_for_health_probe(db_path)?.ok_or_else(|| {
+                recovery_receipt_error(
+                    "snapshot staging",
+                    db_path,
+                    "source is missing or its SQLite family contains a non-regular object",
+                )
+            })?;
         // Settle the COPY: canonical SQLite rolls back / recovers whatever
         // valid journal/WAL state was captured and checkpoints the private
         // family. Malformed family members are rejected by central staging
