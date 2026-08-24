@@ -19706,6 +19706,112 @@ mod tests {
     }
 
     #[test]
+    fn malformed_breaker_preserves_exact_truncated_sqlite_family_before_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("malformed-breaker.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"primary authority").unwrap();
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        std::fs::write(&breaker_path, b"malformed breaker authority").unwrap();
+
+        recovery_admission().reset();
+        let error = ensure_sqlite_file_healthy(&db_path)
+            .expect_err("malformed breaker must refuse before sidecar cleanup");
+        assert!(error.to_string().contains("could not be trusted"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(
+            std::fs::read(&breaker_path).unwrap(),
+            b"malformed breaker authority"
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-wal").is_empty()
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-shm").is_empty()
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn tripped_breaker_preserves_exact_truncated_sqlite_family_before_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-breaker.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"primary authority").unwrap();
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+        let config = crate::recovery_breaker::config_from_env();
+        let state = crate::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: config.max_consecutive_failures,
+            last_failure_unix: recovery_breaker_now_unix(),
+            last_failure_reason: "fixture tripped".to_string(),
+            tripped: true,
+        };
+        crate::recovery_breaker::store(&db_path, &state).unwrap();
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).unwrap();
+
+        recovery_admission().reset();
+        let error = ensure_sqlite_file_healthy(&db_path)
+            .expect_err("tripped breaker must refuse before sidecar cleanup");
+        assert!(error.to_string().contains("circuit-broken"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-wal").is_empty()
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-shm").is_empty()
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn health_probes_settle_private_copy_without_mutating_source_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source-neutral-health.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create source database");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("force standalone primary");
+            conn.execute_raw("CREATE TABLE t (value INTEGER);")
+                .expect("create table");
+            conn.execute_raw("INSERT INTO t VALUES (1);")
+                .expect("seed table");
+        }
+        let main_bytes = std::fs::read(&db_path).unwrap();
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+
+        assert!(
+            sqlite_primary_read_path_is_healthy(&db_path).expect("primary staged health probe")
+        );
+        assert!(sqlite_file_is_healthy(&db_path).expect("layered staged health probe"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), main_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-wal").is_empty()
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-shm").is_empty()
+        );
+    }
+
+    #[test]
     fn cleanup_empty_wal_sidecar_preserves_zero_byte_wal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup_test.db");
