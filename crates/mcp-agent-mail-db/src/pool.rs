@@ -1154,9 +1154,7 @@ where
     // failures for the SAME database content in a sidecar and refuses HERE,
     // before any capture, until the cooldown elapses, the content changes,
     // or an operator path runs under RecoveryBreakerBypassGuard.
-    let breaker_config = crate::recovery_breaker::config_from_env();
     let breaker_fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
-    let breaker_bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active();
     let breaker_prior = match crate::recovery_breaker::load(primary_path) {
         Ok(state) => state,
         Err(error) if breaker_bypass => {
@@ -1177,7 +1175,7 @@ where
             ));
         }
     };
-    let attempt_started_unix = now_unix();
+    let attempt_started_unix = preflight_attempt_started_unix.unwrap_or_else(&mut now_unix);
     let breaker_verdict = crate::recovery_breaker::evaluate(
         breaker_prior.as_ref(),
         &breaker_fingerprint,
@@ -1186,8 +1184,7 @@ where
     );
     if let crate::recovery_breaker::BreakerVerdict::Refuse {
         consecutive_failures,
-        retry_after_secs,
-        last_failure_reason,
+        ..
     } = &breaker_verdict
     {
         if breaker_bypass {
@@ -1197,19 +1194,12 @@ where
                 "recovery breaker is tripped, but an operator-invoked path holds the bypass; attempting"
             );
         } else {
-            return Err(AutomaticRecoveryRunError::admission(
-                AutomaticRecoveryAdmissionFailureKind::CircuitOpen,
-                SqlError::Custom(format!(
-                    "{action} for {} is circuit-broken: {consecutive_failures} consecutive automatic \
-                     recovery attempts failed on this same database content (last error: \
-                     {last_failure_reason}). Refusing to re-attempt (and re-capture forensics) for \
-                     another {retry_after_secs}s. Operator paths are exempt: run `am doctor repair` \
-                     or `am doctor reconstruct` to intervene now, or quarantine the file (move \
-                     {}* aside) to rebuild from the Git archive.",
-                    primary_path.display(),
-                    primary_path.display(),
-                )),
-            ));
+            return Err(automatic_recovery_breaker_refusal(
+                primary_path,
+                action,
+                &breaker_verdict,
+            )
+            .expect("refusal verdict must produce an admission error"));
         }
     }
     if matches!(
