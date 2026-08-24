@@ -3125,6 +3125,18 @@ impl DbPool {
             });
         }
 
+        // A malformed/header-only WAL can make the first SQLite engine open
+        // consume or rewrite live family state. Classify and, when necessary,
+        // clean the family through the durable recovery-admission boundary
+        // before that open. In particular, malformed or tripped breaker
+        // authority must refuse here while the primary/WAL/SHM namespace is
+        // still byte-for-byte untouched.
+        cleanup_truncated_wal_sidecar(Path::new(&self.sqlite_path)).map_err(|error| {
+            DbError::Sqlite(format!(
+                "startup integrity check: pre-open SQLite-family cleanup failed: {error}"
+            ))
+        })?;
+
         let conn = crate::guard_db_conn(
             match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                 Ok(conn) => conn,
@@ -14998,6 +15010,103 @@ mod tests {
         assert!(
             matches!(result, Err(DbError::IntegrityCorruption { .. })),
             "missing file should be treated as integrity corruption needing recovery"
+        );
+    }
+
+    fn assert_startup_integrity_breaker_preserves_truncated_family(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        {
+            let conn = CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create startup-integrity fixture");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("detach fixture WAL mode");
+            conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                .expect("create fixture table");
+        }
+        let primary_bytes = std::fs::read(&db_path).expect("read primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL fixture");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list startup-integrity fixture before probe")
+            .map(|entry| entry.expect("read startup-integrity fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+
+        recovery_admission().reset();
+        let error = pool
+            .run_startup_integrity_check()
+            .expect_err("breaker authority must refuse before the integrity engine opens");
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected startup-integrity refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), primary_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list startup-integrity fixture after refusal")
+            .map(|entry| entry.expect("read startup-integrity fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "refused startup integrity must not create lock, quarantine, forensic, or SQLite artifacts"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn startup_integrity_preserves_truncated_family_behind_malformed_breaker() {
+        assert_startup_integrity_breaker_preserves_truncated_family(
+            "startup-integrity-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_integrity_preserves_truncated_family_behind_tripped_breaker() {
+        assert_startup_integrity_breaker_preserves_truncated_family(
+            "startup-integrity-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "startup integrity fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state)
+                    .expect("store tripped breaker");
+            },
         );
     }
 

@@ -4874,6 +4874,95 @@ mod tests {
     }
 
     #[test]
+    fn probe_integrity_refuses_tripped_breaker_before_opening_damaged_wal_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-before-open.sqlite3");
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(
+                db_path.to_string_lossy().as_ref(),
+            )
+            .expect("create healthy primary");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("detach fixture WAL mode");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize primary schema");
+        }
+        let db_bytes = std::fs::read(&db_path).expect("read primary before startup");
+        let wal_path = db_path.with_file_name("tripped-before-open.sqlite3-wal");
+        let shm_path = db_path.with_file_name("tripped-before-open.sqlite3-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let breaker_config = mcp_agent_mail_db::recovery_breaker::config_from_env();
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: breaker_config.max_consecutive_failures,
+            last_failure_unix: i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock after epoch")
+                    .as_secs(),
+            )
+            .unwrap_or(i64::MAX),
+            last_failure_reason: "startup fixture is circuit-broken".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_lock_path = mcp_agent_mail_db::recovery_breaker::breaker_lock_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before startup");
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "fixture must begin without a breaker-election artifact"
+        );
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("storage");
+
+        mcp_agent_mail_db::pool::recovery_admission().reset();
+        reset_probe_recovery_attempt_count();
+        let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("tripped breaker must fail startup before SQLite opens: {result:?}");
+        };
+        assert!(
+            failure.problem.contains("circuit-broken"),
+            "startup should surface the durable circuit refusal: {}",
+            failure.problem
+        );
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            0,
+            "the server recovery entrypoint must not run after DB admission refuses"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "authoritative refusal must not create a breaker-election artifact"
+        );
+        let renamed_family_members = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name.starts_with("tripped-before-open.sqlite3.corrupt-")
+                    || name.starts_with("tripped-before-open.sqlite3-wal.")
+                    || name.starts_with("tripped-before-open.sqlite3-shm.")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            renamed_family_members.is_empty(),
+            "refused startup must not publish family or forensic artifacts: {renamed_family_members:?}"
+        );
+        mcp_agent_mail_db::pool::recovery_admission().reset();
+    }
+
+    #[test]
     fn probe_integrity_tolerates_header_only_wal_before_pool_open() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header_only_wal.db");
