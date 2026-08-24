@@ -76,12 +76,14 @@ pub(crate) struct PreparedRecoveryReceipt {
     receipt_bytes_sha256: String,
 }
 
-/// Finalization error annotated with whether the durable `.json` promotion
-/// marker has already replaced `.pending`.
+/// Finalization error annotated with whether the `.json` promotion marker has
+/// already replaced `.pending`, making rollback unsafe.
 ///
 /// Callers may restore the old database only when this is `false`. Once the
 /// marker rename succeeds, restoring the old database would make a valid
-/// finalized receipt attest the wrong live generation.
+/// finalized receipt attest the wrong live generation. A `true` value records
+/// the namespace point of no return; a later parent-directory sync or
+/// verification failure can still mean durability was not fully proven.
 #[derive(Debug)]
 pub(crate) struct RecoveryReceiptFinalizeError {
     error: SqlError,
@@ -812,10 +814,10 @@ impl CanonicalSnapshotSource {
         let journal = sqlite_family_sidecar(db_path, "-journal");
         let wal = sqlite_family_sidecar(db_path, "-wal");
         let shm = sqlite_family_sidecar(db_path, "-shm");
-        let family_is_hot = journal.symlink_metadata().is_ok()
-            || wal.metadata().is_ok_and(|m| m.len() > 0)
+        let family_requires_staging = journal.symlink_metadata().is_ok()
+            || wal.symlink_metadata().is_ok()
             || shm.symlink_metadata().is_ok();
-        if !family_is_hot {
+        if !family_requires_staging {
             return Ok(Self::Direct(db_path.to_path_buf()));
         }
 
@@ -2245,10 +2247,23 @@ fn pending_recovery_receipt_paths(receipts_dir: &Path) -> Result<Vec<PathBuf>, S
 /// A pending filename means that activation may have reached an indeterminate
 /// point, so startup must fail closed while it exists. Once the caller has
 /// proved that the old generation is authoritative (or preparation failed
-/// before activation), an atomic rename to `.aborted` records that terminal
-/// outcome without deleting forensic evidence and releases singleton
+/// before activation), an atomic no-replace move to `.aborted` records that
+/// terminal outcome without deleting forensic evidence and releases singleton
 /// admission for a future recovery.
 fn abort_pending_recovery_receipt_path(pending_path: &Path) -> Result<PathBuf, SqlError> {
+    abort_pending_recovery_receipt_path_with_mover(
+        pending_path,
+        crate::pool::rename_noreplace_preserving_source,
+    )
+}
+
+fn abort_pending_recovery_receipt_path_with_mover<M>(
+    pending_path: &Path,
+    mut move_noreplace: M,
+) -> Result<PathBuf, SqlError>
+where
+    M: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
     let receipts_dir = pending_path.parent().ok_or_else(|| {
         recovery_receipt_error(
             "abort parent resolution",
@@ -2257,26 +2272,36 @@ fn abort_pending_recovery_receipt_path(pending_path: &Path) -> Result<PathBuf, S
         )
     })?;
     let aborted_at_us = mcp_agent_mail_core::timestamps::now_micros();
-    let aborted_path = (0_u32..10_000)
-        .find_map(|suffix| {
-            let candidate = receipts_dir.join(format!(
-                "recovery-aborted-{aborted_at_us:020}-{:010}-{suffix:04}.receipt.aborted",
-                std::process::id()
-            ));
-            (!candidate.exists()).then_some(candidate)
-        })
-        .ok_or_else(|| {
-            recovery_receipt_error(
-                "abort filename allocation",
-                receipts_dir,
-                "exhausted 10,000 aborted receipt suffixes",
-            )
-        })?;
-    std::fs::rename(pending_path, &aborted_path)
-        .map_err(|error| recovery_receipt_error("abort rename", &aborted_path, error))?;
-    sync_recovery_directory(receipts_dir)
-        .map_err(|error| recovery_receipt_error("abort directory sync", receipts_dir, error))?;
-    Ok(aborted_path)
+    for suffix in 0_u32..10_000 {
+        let aborted_path = receipts_dir.join(format!(
+            "recovery-aborted-{aborted_at_us:020}-{:010}-{suffix:04}.receipt.aborted",
+            std::process::id()
+        ));
+        match move_noreplace(pending_path, &aborted_path) {
+            Ok(()) => {
+                sync_recovery_directory(receipts_dir).map_err(|error| {
+                    recovery_receipt_error("abort directory sync", receipts_dir, error)
+                })?;
+                return Ok(aborted_path);
+            }
+            // The terminal name is not embedded in the receipt, so an occupied
+            // suffix can safely advance. Every other failure retains the
+            // singleton pending name and therefore keeps readiness fail-closed.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(recovery_receipt_error(
+                    "abort no-replace rename",
+                    &aborted_path,
+                    error,
+                ));
+            }
+        }
+    }
+    Err(recovery_receipt_error(
+        "abort filename allocation",
+        receipts_dir,
+        "exhausted 10,000 aborted receipt suffixes",
+    ))
 }
 
 fn verify_recovery_receipt_document(
@@ -2492,8 +2517,19 @@ fn verify_live_recovery_marker(
             "finalized recovery receipt exists but the live database is missing or not a regular file",
         ));
     }
-    let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
-        .map_err(|error| recovery_receipt_error("live marker open", db_path, error))?;
+    // A writable canonical open can roll back a hot journal, checkpoint/reset
+    // a WAL, or create/modify SHM state merely while verifying the marker. Use
+    // the same immutable evidence boundary as continuity snapshots: settle any
+    // live family on a private copy, then query that copy (or a sidecar-free
+    // source) through a read-only, query-only connection.
+    let snapshot_source = CanonicalSnapshotSource::for_family(db_path)?;
+    let snapshot_path = snapshot_source.snapshot_path();
+    let config = sqlmodel_sqlite::SqliteConfig::file(snapshot_path.to_string_lossy().into_owned())
+        .flags(sqlmodel_sqlite::OpenFlags::read_only());
+    let conn = crate::CanonicalDbConn::open(&config)
+        .map_err(|error| recovery_receipt_error("live marker read-only open", db_path, error))?;
+    conn.execute_raw("PRAGMA query_only = ON;")
+        .map_err(|error| recovery_receipt_error("live marker query-only", db_path, error))?;
     let rows = conn
         .query_sync(
             &format!(
@@ -2992,10 +3028,7 @@ pub(crate) fn prepare_recovery_receipt(
     // Unique per-receipt pending names would let two processes both pass the
     // preceding empty-directory scan and prepare competing promotions.
     let pending_path = receipts_dir.join(RECOVERY_RECEIPT_SINGLETON_PENDING_FILE);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&pending_path)
+    let mut file = mcp_agent_mail_core::disk::create_new_private_file_no_follow(&pending_path)
         .map_err(|error| recovery_receipt_error("singleton admission", &pending_path, error))?;
 
     let prepare_after_admission = (|| {
@@ -3150,6 +3183,22 @@ fn finalize_recovery_receipt_with_post_rename<F>(
 where
     F: FnOnce(&Path, &RecoveryReceiptDocument) -> Result<(), SqlError>,
 {
+    finalize_recovery_receipt_with_mover_and_post_rename(
+        prepared,
+        crate::pool::rename_noreplace_preserving_source,
+        post_rename,
+    )
+}
+
+fn finalize_recovery_receipt_with_mover_and_post_rename<M, F>(
+    prepared: &PreparedRecoveryReceipt,
+    move_noreplace: M,
+    post_rename: F,
+) -> Result<(), RecoveryReceiptFinalizeError>
+where
+    M: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    F: FnOnce(&Path, &RecoveryReceiptDocument) -> Result<(), SqlError>,
+{
     let bytes = std::fs::read(&prepared.pending_path).map_err(|error| {
         recovery_finalize_error(
             recovery_receipt_error("pending read", &prepared.pending_path, error),
@@ -3217,25 +3266,20 @@ where
         .map_err(|error| recovery_finalize_error(error, false))?;
     verify_live_recovery_candidate_snapshot(Path::new(&document.body.db_path), &document)
         .map_err(|error| recovery_finalize_error(error, false))?;
-    if prepared.final_path.exists() {
-        return Err(recovery_finalize_error(
-            recovery_receipt_error(
-                "final collision check",
-                &prepared.final_path,
-                "destination already exists",
-            ),
-            false,
-        ));
-    }
-    std::fs::rename(&prepared.pending_path, &prepared.final_path).map_err(|error| {
+    move_noreplace(&prepared.pending_path, &prepared.final_path).map_err(|error| {
+        let context = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "promotion-marker destination collision"
+        } else {
+            "promotion-marker no-replace rename"
+        };
         recovery_finalize_error(
-            recovery_receipt_error("promotion-marker rename", &prepared.final_path, error),
+            recovery_receipt_error(context, &prepared.final_path, error),
             false,
         )
     })?;
-    // The atomic rename is the point of no return. Any subsequent error must
-    // leave the activated candidate in place; callers use the typed flag to
-    // avoid rolling it back beneath a finalized receipt.
+    // The atomic no-replace move is the namespace point of no return. Any
+    // subsequent error must leave the activated candidate in place; callers
+    // use the typed flag to avoid rolling it back beneath a finalized receipt.
     post_rename(receipts_dir, &document).map_err(|error| recovery_finalize_error(error, true))
 }
 
@@ -4359,6 +4403,20 @@ mod tests {
             .expect("prepare first recovery receipt");
         assert!(first.pending_path.exists());
         assert!(!first.final_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&first.pending_path)
+                    .expect("inspect pending receipt permissions")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "pending receipt must be private from its first observable byte"
+            );
+        }
         let pending_text =
             std::fs::read_to_string(&first.pending_path).expect("read pending receipt");
         assert!(
@@ -4452,6 +4510,303 @@ mod tests {
             chain_error.to_string().contains("schema check")
                 || chain_error.to_string().contains("self-hash check")
                 || chain_error.to_string().contains("chain-link check")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_marker_verification_preserves_hot_source_family_bytes_and_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, None, &candidate)
+            .expect("prepare receipt");
+        std::fs::rename(&candidate, &primary).expect("activate candidate");
+        finalize_recovery_receipt(&prepared).expect("finalize receipt");
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&prepared.final_path).expect("read finalized receipt"),
+        )
+        .expect("decode finalized receipt");
+
+        let live_conn = crate::CanonicalDbConn::open_file(primary.to_string_lossy().as_ref())
+            .expect("open live database");
+        live_conn
+            .execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("enable persistent WAL");
+        live_conn
+            .execute_raw(
+                "CREATE TABLE marker_verification_probe (value TEXT NOT NULL); \
+                 INSERT INTO marker_verification_probe (value) VALUES ('committed-in-live-wal');",
+            )
+            .expect("materialize committed WAL state");
+
+        let wal = super::sqlite_family_sidecar(&primary, "-wal");
+        let shm = super::sqlite_family_sidecar(&primary, "-shm");
+        assert!(
+            std::fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),
+            "fixture must retain committed WAL frames"
+        );
+        assert!(shm.is_file(), "fixture must retain its live SHM sidecar");
+
+        let family_paths = [&primary, &wal, &shm];
+        let bytes_before = family_paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("read source family before verification"))
+            .collect::<Vec<_>>();
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list source directory before verification")
+            .map(|entry| entry.expect("read source directory entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        super::verify_live_recovery_marker(&primary, &document)
+            .expect("verify live marker through immutable snapshot");
+
+        let bytes_after = family_paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("read source family after verification"))
+            .collect::<Vec<_>>();
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list source directory after verification")
+            .map(|entry| entry.expect("read source directory entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            bytes_after, bytes_before,
+            "marker verification must not checkpoint, truncate, or rewrite the live family"
+        );
+        assert_eq!(
+            names_after, names_before,
+            "marker verification must not create or remove live-family entries"
+        );
+
+        drop(live_conn);
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_vendor = "apple",
+        target_os = "redox",
+    ))]
+    #[test]
+    fn recovery_receipt_finalize_race_preserves_destination_and_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("prepare receipt");
+        let pending_bytes = std::fs::read(&prepared.pending_path).expect("read pending receipt");
+        std::fs::rename(&candidate, &primary).expect("activate candidate");
+
+        let sentinel = b"foreign finalized receipt evidence";
+        let mut move_called = false;
+        let mut post_rename_called = false;
+        let error = super::finalize_recovery_receipt_with_mover_and_post_rename(
+            &prepared,
+            |source_path, destination_path| {
+                move_called = true;
+                let mut sentinel_file =
+                    mcp_agent_mail_core::disk::create_new_private_file_no_follow(destination_path)?;
+                std::io::Write::write_all(&mut sentinel_file, sentinel)?;
+                sentinel_file.sync_all()?;
+                crate::pool::rename_noreplace_preserving_source(source_path, destination_path)
+            },
+            |_receipts_dir, _document| {
+                post_rename_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("raced final destination must refuse receipt publication");
+
+        assert!(move_called, "test must reach the publication boundary");
+        assert!(
+            !post_rename_called,
+            "post-rename work must not run when no marker was published"
+        );
+        assert!(!error.promotion_marker_committed());
+        assert!(error.to_string().contains("destination collision"));
+        assert_eq!(
+            std::fs::read(&prepared.final_path).expect("read preserved sentinel"),
+            sentinel
+        );
+        assert_eq!(
+            std::fs::read(&prepared.pending_path).expect("read preserved pending receipt"),
+            pending_bytes
+        );
+        let readiness_error = verify_recovery_receipt_state(&storage_root, &primary)
+            .expect_err("preserved pending intent must keep readiness fail-closed");
+        assert!(
+            readiness_error
+                .to_string()
+                .contains("unfinalized recovery receipt")
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "linux",
+            target_vendor = "apple",
+            target_os = "redox",
+        )
+    ))]
+    #[test]
+    fn recovery_receipt_finalize_never_replaces_raced_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        let dangling_target = dir.path().join("foreign-evidence-target");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("prepare receipt");
+        let pending_bytes = std::fs::read(&prepared.pending_path).expect("read pending receipt");
+        std::fs::rename(&candidate, &primary).expect("activate candidate");
+
+        let mut post_rename_called = false;
+        let error = super::finalize_recovery_receipt_with_mover_and_post_rename(
+            &prepared,
+            |source_path, destination_path| {
+                symlink(&dangling_target, destination_path)?;
+                crate::pool::rename_noreplace_preserving_source(source_path, destination_path)
+            },
+            |_receipts_dir, _document| {
+                post_rename_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("dangling destination symlink must refuse receipt publication");
+
+        assert!(!post_rename_called);
+        assert!(!error.promotion_marker_committed());
+        assert!(error.to_string().contains("destination collision"));
+        assert!(
+            std::fs::symlink_metadata(&prepared.final_path)
+                .expect("inspect preserved destination")
+                .file_type()
+                .is_symlink(),
+            "no-replace publication must preserve the raced-in symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(&prepared.final_path).expect("read preserved symlink"),
+            dangling_target
+        );
+        assert_eq!(
+            std::fs::read(&prepared.pending_path).expect("read preserved pending receipt"),
+            pending_bytes
+        );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_vendor = "apple",
+        target_os = "redox",
+    ))]
+    #[test]
+    fn recovery_receipt_abort_retries_raced_destination_without_clobber() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("prepare receipt");
+        let pending_bytes = std::fs::read(&prepared.pending_path).expect("read pending receipt");
+        let sentinel = b"foreign aborted receipt evidence";
+        let mut move_calls = 0_u32;
+        let mut collided_path = None;
+        let aborted_path = super::abort_pending_recovery_receipt_path_with_mover(
+            &prepared.pending_path,
+            |source_path, destination_path| {
+                move_calls = move_calls.saturating_add(1);
+                if move_calls == 1 {
+                    collided_path = Some(destination_path.to_path_buf());
+                    let mut sentinel_file =
+                        mcp_agent_mail_core::disk::create_new_private_file_no_follow(
+                            destination_path,
+                        )?;
+                    std::io::Write::write_all(&mut sentinel_file, sentinel)?;
+                    sentinel_file.sync_all()?;
+                }
+                crate::pool::rename_noreplace_preserving_source(source_path, destination_path)
+            },
+        )
+        .expect("abort must retry a raced destination");
+
+        let collided_path = collided_path.expect("first move must record its collision path");
+        assert_eq!(move_calls, 2, "only the occupied suffix should be skipped");
+        assert_ne!(aborted_path, collided_path);
+        assert_eq!(
+            std::fs::read(&collided_path).expect("read preserved abort sentinel"),
+            sentinel
+        );
+        assert_eq!(
+            std::fs::read(&aborted_path).expect("read terminal aborted receipt"),
+            pending_bytes
+        );
+        assert!(
+            std::fs::symlink_metadata(&prepared.pending_path).is_err(),
+            "successful abort must consume the singleton pending name"
+        );
+        verify_recovery_receipt_state(&storage_root, &primary)
+            .expect("aborted artifacts must not block future recovery admission");
+    }
+
+    #[test]
+    fn recovery_receipt_abort_noncollision_error_preserves_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("prepare receipt");
+        let pending_bytes = std::fs::read(&prepared.pending_path).expect("read pending receipt");
+        let mut move_calls = 0_u32;
+        let error = super::abort_pending_recovery_receipt_path_with_mover(
+            &prepared.pending_path,
+            |_source_path, _destination_path| {
+                move_calls = move_calls.saturating_add(1);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected abort publication refusal",
+                ))
+            },
+        )
+        .expect_err("non-collision move errors must not be retried");
+
+        assert_eq!(move_calls, 1);
+        assert!(error.to_string().contains("abort no-replace rename"));
+        assert_eq!(
+            std::fs::read(&prepared.pending_path).expect("read preserved pending receipt"),
+            pending_bytes
+        );
+        let readiness_error = verify_recovery_receipt_state(&storage_root, &primary)
+            .expect_err("failed abort must leave readiness blocked by the pending intent");
+        assert!(
+            readiness_error
+                .to_string()
+                .contains("unfinalized recovery receipt")
         );
     }
 
