@@ -427,8 +427,8 @@ const CROSS_COUNT_TABLES: &[&str] = &[
     "file_reservations",
 ];
 
-/// Open the live family for the cross-count only after the same exact-family
-/// pre-open proof used by every other server-side raw observer.
+/// Open the live family for the cross-count only after the database crate's
+/// guarded read-only family and namespace admission.
 fn open_index_table_cross_count_connection(
     sqlite_path: &Path,
 ) -> std::io::Result<mcp_agent_mail_db::DbConn> {
@@ -459,7 +459,9 @@ fn run_index_table_cross_count(sqlite_path: &Path) -> Option<String> {
         }
     };
     let result = mcp_agent_mail_db::integrity::index_table_cross_count(&conn, CROSS_COUNT_TABLES);
-    mcp_agent_mail_db::close_db_conn(conn, "integrity-guard cross-count");
+    // This is a true read-only observer. Its ordinary Drop path preserves the
+    // live WAL/namespace family; the writable close helper may checkpoint it.
+    drop(conn);
     match result {
         Ok(mismatches) => {
             if mismatches.is_empty() {
@@ -786,6 +788,54 @@ mod tests {
         );
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn cross_count_read_only_drop_does_not_checkpoint_live_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cross-count-read-only-drop.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open cross-count WAL fixture");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize cross-count WAL fixture");
+        conn.execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable cross-count fixture WAL mode");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable cross-count fixture autocheckpoint");
+        conn.execute_raw("CREATE TABLE cross_count_drop_sentinel(value INTEGER NOT NULL);")
+            .expect("create cross-count checkpoint sentinel");
+        conn.execute_raw("INSERT INTO cross_count_drop_sentinel(value) VALUES (1);")
+            .expect("write cross-count checkpoint sentinel");
+        // Ordinary writer Drop deliberately leaves committed WAL frames for
+        // the read-only observer teardown below to preserve.
+        drop(conn);
+
+        let wal_path = path.with_file_name(format!(
+            "{}-wal",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let primary_before = std::fs::read(&path).expect("snapshot cross-count primary");
+        let wal_before = std::fs::read(&wal_path).expect("snapshot cross-count WAL");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "fixture must retain committed frames that a checkpointing close would consume"
+        );
+
+        assert!(
+            run_index_table_cross_count(&path).is_none(),
+            "healthy cross-count fixture must not report desync"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read cross-count primary after observer"),
+            primary_before,
+            "read-only cross-count teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read cross-count WAL after observer"),
+            wal_before,
+            "read-only cross-count teardown must not checkpoint or truncate the WAL"
+        );
+    }
+
     #[test]
     fn cross_count_missing_file_reports_none() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -797,7 +847,8 @@ mod tests {
     }
 
     #[test]
-    fn cross_count_raw_open_refuses_damaged_family_under_nonclean_breaker_authority() {
+    fn cross_count_guarded_read_only_open_refuses_damaged_family_under_nonclean_breaker_authority()
+    {
         fn snapshot_namespace(
             root: &Path,
         ) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
@@ -886,18 +937,15 @@ mod tests {
             let namespace_before = snapshot_namespace(dir.path());
             let error = match open_index_table_cross_count_connection(&path) {
                 Ok(conn) => {
-                    mcp_agent_mail_db::close_db_conn(
-                        conn,
-                        "unexpected admitted cross-count test connection",
-                    );
-                    panic!("cross-count raw open must refuse the suspect live family");
+                    drop(conn);
+                    panic!("cross-count guarded read-only open must refuse the suspect family");
                 }
                 Err(error) => error,
             };
             assert!(
                 error
                     .to_string()
-                    .contains("refusing raw live SQLite engine open"),
+                    .contains("refusing live read-only SQLite engine open"),
                 "unexpected cross-count refusal for {breaker_kind}: {error}"
             );
             assert!(

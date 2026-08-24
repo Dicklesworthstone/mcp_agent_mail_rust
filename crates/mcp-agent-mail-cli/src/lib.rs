@@ -13197,7 +13197,7 @@ fn cli_sqlite_family_requires_preopen_admission(path: &Path) -> CliResult<bool> 
             path.display()
         ))
     })?;
-    let Ok((conn, _opened_path)) = open_sqlite_read_only_with_fallback(path_text) else {
+    let Ok((conn, _opened_path)) = open_sqlite_read_only_preflight(path_text) else {
         return Ok(true);
     };
     let requires_init = sqlite_conn_requires_canonical_init(&conn);
@@ -13214,10 +13214,36 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
     open_sqlite_with_fallback_and_storage_root(path, None)
 }
 
-fn open_sqlite_read_only_with_fallback(
+fn open_sqlite_read_only_preflight(
     path: &str,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    open_sqlite_with_fallback_internal(path, None, false, true)
+    let conn = if path == ":memory:" {
+        let conn = mcp_agent_mail_db::DbConn::open_memory()
+            .map_err(|error| CliError::Other(format!("cannot open in-memory DB: {error}")))?;
+        conn.execute_raw("PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;")
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "cannot configure in-memory read-only preflight: {error}"
+                ))
+            })?;
+        conn
+    } else {
+        let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+            Path::new(path),
+            "CLI pre-open SQLite health probe",
+        )
+        .map_err(|error| {
+            CliError::Other(format!("cannot open DB at {path} for read-only preflight: {error}"))
+        })?;
+        conn.execute_raw("PRAGMA busy_timeout = 20000;")
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "cannot configure DB at {path} for read-only preflight: {error}"
+                ))
+            })?;
+        conn
+    };
+    Ok((conn, path.to_string()))
 }
 
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
@@ -13360,38 +13386,21 @@ fn open_sqlite_with_fallback_and_storage_root(
     path: &str,
     storage_root_override: Option<&Path>,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    open_sqlite_with_fallback_internal(path, storage_root_override, true, false)
+    open_sqlite_with_fallback_internal(path, storage_root_override, true)
 }
 
 fn open_sqlite_with_fallback_internal(
     path: &str,
     storage_root_override: Option<&Path>,
     allow_recovery: bool,
-    read_only: bool,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let open_conn = |candidate: &str| -> Result<mcp_agent_mail_db::DbConn, String> {
-        if read_only && candidate != ":memory:" {
-            require_read_only_sqlite_family_source(Path::new(candidate))
-                .map_err(|error| error.to_string())?;
-        }
         let conn = if candidate == ":memory:" {
             mcp_agent_mail_db::DbConn::open_memory().map_err(|e| e.to_string())?
-        } else if read_only {
-            mcp_agent_mail_db::DbConn::open_file_read_only(candidate)
-                .map_err(|e| e.to_string())?
         } else {
             mcp_agent_mail_db::DbConn::open_file(candidate).map_err(|e| e.to_string())?
         };
-        let connection_settings = if read_only {
-            // Keep this list connection-local and read-safe. In particular, do
-            // not reuse PRAGMA_CONN_SETTINGS_SQL: synchronous, autocheckpoint,
-            // and journal-size settings carry writer semantics even when their
-            // current value happens not to change.
-            "PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;"
-        } else {
-            mcp_agent_mail_db::schema::PRAGMA_CONN_SETTINGS_SQL
-        };
-        conn.execute_raw(connection_settings)
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_CONN_SETTINGS_SQL)
             .map_err(|e| e.to_string())?;
         Ok(conn)
     };
@@ -19547,7 +19556,7 @@ fn open_db_sync_for_migrate(database_url: &str) -> CliResult<mcp_agent_mail_db::
 
     // `am migrate` is an explicit schema/bootstrap command. It must not
     // silently import archive state from the ambient mailbox storage root.
-    open_sqlite_with_fallback_internal(&path, None, false, false)
+    open_sqlite_with_fallback_internal(&path, None, false)
         .map(|(conn, _opened_path)| conn)
 }
 

@@ -1476,7 +1476,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         );
     }
 
-    let conn = match crate::pool::open_guarded_read_only_canonical_sqlite_file(
+    let conn = match crate::pool::open_guarded_read_only_franken_existing_file(
         db_path,
         "mailbox schema-population diagnostic",
     ) {

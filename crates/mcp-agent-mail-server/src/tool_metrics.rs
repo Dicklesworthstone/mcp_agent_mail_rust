@@ -13,7 +13,6 @@
 
 use mcp_agent_mail_core::{Config, kpi_record_sample};
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::guard_db_conn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::now_micros;
@@ -282,6 +281,9 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
     .ok()
 }
 
+// Callers must let the returned true read-only connection use ordinary Drop.
+// `DbConnGuard`/`close_db_conn` are writable close paths and may checkpoint a
+// live WAL even though these observers only issue SELECTs.
 fn open_metrics_read_connection(database_url: &str) -> Option<DbConn> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return None;
@@ -468,7 +470,6 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe
     let Some(conn) = open_metrics_read_connection(database_url) else {
         return Vec::new();
     };
-    let conn = guard_db_conn(conn, "tool_metrics::load_latest_persisted_metrics");
     let limit_i64 = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);
     let sql = "SELECT s.tool_name, s.calls, s.errors, s.cluster, s.complexity, \
                       s.latency_avg_ms, s.latency_p50_ms, s.latency_p95_ms, s.latency_p99_ms, \
@@ -496,7 +497,6 @@ pub fn persisted_metric_store_size(database_url: &str) -> u64 {
     let Some(conn) = open_metrics_read_connection(database_url) else {
         return 0;
     };
-    let conn = guard_db_conn(conn, "tool_metrics::persisted_metric_store_size");
     let sql = format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}");
     let rows = match conn.query_sync(&sql, &[]) {
         Ok(rows) => rows,
@@ -1086,6 +1086,70 @@ mod tests {
             .and_then(|row| row.get_named::<i64>("c").ok())
             .unwrap_or_default();
         assert_eq!(marker_count, 1);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn persisted_metric_readers_do_not_checkpoint_live_wal_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("read_only_metrics_drop.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open metrics WAL fixture");
+        ensure_metrics_schema(&conn);
+        conn.execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable metrics fixture WAL mode");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable metrics fixture autocheckpoint");
+        conn.execute_raw(
+            "INSERT INTO tool_metrics_snapshots (\
+                 collected_ts, tool_name, calls, errors, cluster, capabilities_json, complexity, \
+                 latency_is_slow\
+             ) VALUES (123, 'checkpoint_sentinel', 1, 0, 'test', '[]', 'low', 0);",
+        )
+        .expect("write metrics checkpoint sentinel");
+        // Ordinary writer Drop deliberately leaves committed WAL frames for
+        // both public read-only observer teardowns below to preserve.
+        drop(conn);
+
+        let wal_path = db_path.with_file_name(format!(
+            "{}-wal",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let primary_before = std::fs::read(&db_path).expect("snapshot metrics primary");
+        let wal_before = std::fs::read(&wal_path).expect("snapshot metrics WAL");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "fixture must retain committed frames that a checkpointing close would consume"
+        );
+
+        let rows = load_latest_persisted_metrics(&database_url, 50);
+        assert!(
+            rows.iter()
+                .any(|row| row.tool_name == "checkpoint_sentinel"),
+            "read-only metric loader must observe the committed WAL row"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read metrics primary after loader"),
+            primary_before,
+            "metric-loader teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read metrics WAL after loader"),
+            wal_before,
+            "metric-loader teardown must not checkpoint or truncate the WAL"
+        );
+
+        assert_eq!(persisted_metric_store_size(&database_url), 1);
+        assert_eq!(
+            std::fs::read(&db_path).expect("read metrics primary after store-size observer"),
+            primary_before,
+            "store-size teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read metrics WAL after store-size observer"),
+            wal_before,
+            "store-size teardown must not checkpoint or truncate the WAL"
+        );
     }
 
     #[test]

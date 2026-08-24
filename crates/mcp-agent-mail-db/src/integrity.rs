@@ -268,7 +268,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
         };
     }
 
-    let conn = match crate::pool::open_guarded_read_only_canonical_sqlite_file(
+    let conn = match crate::pool::open_guarded_read_only_franken_existing_file(
         db_path,
         "mailbox integrity diagnostic",
     ) {
@@ -282,10 +282,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
             };
         }
     };
-    match run_check_with_query(
-        |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
-        kind,
-    ) {
+    match run_check(&conn, kind) {
         Ok(check) => MailboxIntegrityVerdict {
             status: MailboxIntegrityStatus::Healthy,
             metrics: integrity_metrics(),
@@ -667,19 +664,12 @@ pub fn details_indicate_ok(details: &[String]) -> bool {
 }
 
 fn run_check(conn: &DbConn, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
-    run_check_with_query(
+    let start = std::time::Instant::now();
+    let rows: Vec<Row> = probe_check_rows(
         |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
         kind,
     )
-}
-
-fn run_check_with_query<F>(query: F, kind: CheckKind) -> DbResult<IntegrityCheckResult>
-where
-    F: FnMut(&str) -> Result<Vec<Row>, String>,
-{
-    let start = std::time::Instant::now();
-    let rows: Vec<Row> = probe_check_rows(query, kind)
-        .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
+    .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
 
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);

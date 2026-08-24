@@ -1770,11 +1770,11 @@ fn collect_archive_db_artifact_index(storage_root: &Path) -> ArchiveDbArtifactIn
     index
 }
 
-fn open_canonical_db_for_archive_verifier(db_path: &Path) -> Option<crate::CanonicalDbConn> {
+fn open_db_for_archive_verifier(db_path: &Path) -> Option<crate::DbConn> {
     if db_path.as_os_str() == ":memory:" {
         return None;
     }
-    crate::pool::open_guarded_read_only_canonical_sqlite_file(
+    crate::pool::open_guarded_read_only_franken_existing_file(
         db_path,
         "archive verifier database diagnostic",
     )
@@ -1782,7 +1782,7 @@ fn open_canonical_db_for_archive_verifier(db_path: &Path) -> Option<crate::Canon
 }
 
 fn query_db_message_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbMessageArtifactExpectation>, String> {
     let rows = conn
         .query_sync(
@@ -2046,7 +2046,7 @@ fn append_archive_db_artifact_cross_checks(
     storage_root: &Path,
     db_path: &Path,
 ) {
-    let Some(conn) = open_canonical_db_for_archive_verifier(db_path) else {
+    let Some(conn) = open_db_for_archive_verifier(db_path) else {
         return;
     };
     let index = collect_archive_db_artifact_index(storage_root);

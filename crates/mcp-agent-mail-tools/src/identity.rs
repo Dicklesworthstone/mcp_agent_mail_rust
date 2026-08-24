@@ -11,7 +11,7 @@ use asupersync::Outcome;
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{DbConn, guard_db_conn, micros_to_iso};
+use mcp_agent_mail_db::{DbConn, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -983,8 +983,11 @@ fn resolve_health_check_sqlite_path(database_url: &str) -> Result<Option<PathBuf
 
 fn open_health_check_sync_db_connection(path: &Path) -> Result<DbConn, String> {
     let display = path.display().to_string();
-    let conn = DbConn::open_file(&display)
-        .map_err(|err| format!("open sqlite file {display} for health_check: {err}"))?;
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        path,
+        "tool health_check semantic-readiness probe",
+    )
+    .map_err(|err| format!("open sqlite file {display} for health_check: {err}"))?;
     conn.execute_raw(&format!(
         "PRAGMA busy_timeout = {HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS};"
     ))
@@ -1054,8 +1057,6 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
             return semantic_readiness_response(status, error);
         }
     };
-    let conn = guard_db_conn(conn, "identity::health_check semantic probe");
-
     if let Err(error) = conn.query_sync("SELECT 1", &[]) {
         let error = error.to_string();
         let status = if mcp_agent_mail_db::is_lock_error(&error) {

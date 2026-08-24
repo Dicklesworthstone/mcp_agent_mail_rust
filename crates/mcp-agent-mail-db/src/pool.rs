@@ -3619,7 +3619,7 @@ impl DbPool {
         // Keep consistency sampling read-only and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = open_guarded_read_only_canonical_sqlite_file(
+        let conn = open_guarded_read_only_franken_existing_file(
             Path::new(&self.sqlite_path),
             "consistency probe",
         )
@@ -5189,10 +5189,8 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn = open_guarded_read_only_canonical_sqlite_file(
-        primary_path,
-        "mailbox database inventory",
-    )?;
+    let conn =
+        open_guarded_read_only_franken_existing_file(primary_path, "mailbox database inventory")?;
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -5250,7 +5248,7 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         (0, 0)
     };
     let project_identities = if present.contains("projects") {
-        crate::reconstruct::collect_db_project_identities_canonical(&conn)?
+        crate::reconstruct::collect_db_project_identities(&conn)?
     } else {
         BTreeSet::new()
     };
@@ -9723,6 +9721,93 @@ fn acquire_guarded_read_only_namespace_binding(
     Ok(binding)
 }
 
+/// File-descriptor-neutral preflight for a live, Franken-admitted database.
+///
+/// Never open the main inode here. On Unix, closing any independently opened
+/// descriptor would release every classic process-wide SQLite `fcntl` lock on
+/// that inode, including locks owned by another live Franken connection. The
+/// retained namespace binding proves the generation identity; FrankenSQLite's
+/// engine-enforced read-only open validates the header and query path.
+#[allow(clippy::result_large_err)]
+fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Result<(), SqlError> {
+    let metadata = std::fs::symlink_metadata(stable_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot inspect admitted SQLite target {}: {error}",
+            stable_path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.len() < u64::try_from(SQLITE_DATABASE_HEADER_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target is not a materialized SQLite file",
+            stable_path.display()
+        )));
+    }
+
+    match crate::recovery_breaker::load(stable_path) {
+        Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
+            return Err(SqlError::Custom(format!(
+                "{context}: refusing live read-only FrankenSQLite open for {} because durable recovery authority is nonclean and cannot be fingerprinted without opening the live main inode",
+                stable_path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "{context}: refusing live read-only FrankenSQLite open for {} because durable recovery authority is malformed or unreadable: {error}",
+                stable_path.display()
+            )));
+        }
+    }
+
+    let invalid_sidecar = SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
+        let sidecar_path = sqlite_sidecar_path(stable_path, suffix);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.file_type().is_file() => None,
+            Ok(_) => Some(format!(
+                "the {suffix} sidecar pathname {} is occupied by a non-regular object",
+                sidecar_path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "the {suffix} sidecar pathname {} could not be inspected: {error}",
+                sidecar_path.display()
+            )),
+        }
+    });
+    let wal = crate::wal_classify::classify_wal_sidecar(stable_path);
+    let sidecars = inspect_mailbox_sidecar_state(stable_path);
+    let suspicious_family = if let Some(reason) = invalid_sidecar {
+        Some(reason)
+    } else if wal.state.is_damaged() {
+        Some(format!(
+            "the source-neutral WAL classifier reported {:?}: {}",
+            wal.state, wal.detail
+        ))
+    } else if sidecars.wal_exists && sidecars.wal_bytes.is_none() {
+        Some("the WAL pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.shm_exists && sidecars.shm_bytes.is_none() {
+        Some("the SHM pathname is occupied by an unreadable or non-regular object".to_string())
+    } else if sidecars.shm_exists && !sidecars.wal_exists {
+        Some("an orphan SHM sidecar exists without a WAL".to_string())
+    } else if sidecars.shm_bytes == Some(0) {
+        Some("an empty SHM sidecar requires family cleanup before a live open".to_string())
+    } else if sidecars.journal_exists {
+        Some("a rollback journal is attached to the live database family".to_string())
+    } else {
+        None
+    };
+    if let Some(reason) = suspicious_family {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because {reason}",
+            stable_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
 /// Open one strict query-only pool connection through FrankenSQLite's engine-
 /// enforced read-only mode after the source-neutral family preflight.
 ///
@@ -9737,7 +9822,13 @@ pub fn open_guarded_read_only_franken_existing_file(
     sqlite_path: &Path,
     context: &str,
 ) -> Result<DbConn, SqlError> {
-    let stable_path = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
+    validate_sqlite_target_path(sqlite_path, context)?;
+    let stable_path = std::fs::canonicalize(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{context}: cannot resolve stable SQLite path {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
     let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
     // When a namespace pair exists, hold its lease until the engine has
     // installed its own read-only binding. A copied/stale recorded identity is
@@ -9745,6 +9836,7 @@ pub fn open_guarded_read_only_franken_existing_file(
     #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
     let _namespace_admission =
         acquire_guarded_read_only_namespace_binding(&stable_path, context)?;
+    preflight_bound_live_franken_family(&stable_path, context)?;
     // The preflight makes retrying only lock/busy failures safe: every attempt
     // uses the engine's read-only mode, and corruption/open failures are
     // returned immediately rather than repeatedly touching the pathname.
@@ -9770,6 +9862,19 @@ pub fn open_guarded_read_only_canonical_sqlite_file(
     sqlite_path: &Path,
     context: &str,
 ) -> Result<crate::CanonicalDbConn, SqlError> {
+    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(sqlite_path, suffix)))
+    {
+        // Opening and later closing a second engine's fd for a Franken-admitted
+        // main inode can release this process's classic POSIX fcntl locks.
+        // Persistent namespace authority is therefore a fail-closed signal:
+        // live mailbox diagnostics must use the bound Franken opener above.
+        return Err(SqlError::Custom(format!(
+            "database is busy: {context} refuses a cross-engine canonical open for Franken-admitted SQLite path {}",
+            sqlite_path.display()
+        )));
+    }
     let stable_path = preflight_guarded_read_only_sqlite_family(sqlite_path, context)?;
     let sqlite_path_str = sqlite_path_as_utf8(&stable_path)?;
     let conn = open_canonical_sqlite_file_read_only_with_lock_retry(sqlite_path_str).map_err(
