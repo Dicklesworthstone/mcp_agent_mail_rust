@@ -2668,8 +2668,10 @@ pub(crate) fn open_read_only_sync_db_connection_with_busy_timeout(
     let conn = if path == ":memory:" {
         DbConn::open_memory()
     } else {
-        guard_raw_live_sqlite_engine_open(Path::new(path.as_str()), context)?;
-        DbConn::open_file_read_only(&path)
+        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+            Path::new(path.as_str()),
+            context,
+        )
     }
     .map_err(|err| std::io::Error::other(format!("open read-only sqlite file {path}: {err}")))?;
     conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
@@ -2678,9 +2680,9 @@ pub(crate) fn open_read_only_sync_db_connection_with_busy_timeout(
                 "configure read-only sqlite busy_timeout={busy_timeout_ms} on {path}: {err}"
             ))
         })?;
-    // `open_file_read_only` is engine-enforced for disk databases. The memory
-    // branch has no read-only open mode, so apply the same contract explicitly
-    // after all connection-local setup that is allowed to write pragmas.
+    // The guarded disk opener already enables engine-enforced read-only and
+    // query-only modes. The memory branch has no read-only open mode, so apply
+    // the same connection-local contract after the busy-timeout setup.
     conn.execute_raw("PRAGMA query_only = ON;").map_err(|err| {
         std::io::Error::other(format!(
             "configure sqlite query_only read-only connection on {path}: {err}"

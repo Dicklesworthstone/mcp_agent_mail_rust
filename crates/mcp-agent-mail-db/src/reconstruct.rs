@@ -1261,10 +1261,29 @@ pub fn compute_archive_drift_report(
 
 #[allow(clippy::result_large_err)]
 pub fn collect_db_project_identities(
+    conn: &crate::DbConn,
+) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError> {
+    collect_db_project_identities_from_rows(conn.query_sync(
+        "SELECT slug, human_key FROM projects",
+        &[],
+    )?)
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn collect_db_project_identities_canonical(
     conn: &crate::CanonicalDbConn,
 ) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError> {
+    collect_db_project_identities_from_rows(conn.query_sync(
+        "SELECT slug, human_key FROM projects",
+        &[],
+    )?)
+}
+
+#[allow(clippy::result_large_err)]
+fn collect_db_project_identities_from_rows(
+    project_rows: Vec<sqlmodel_core::Row>,
+) -> Result<BTreeSet<MailboxProjectIdentity>, SqlError> {
     let mut project_identities = BTreeSet::new();
-    let project_rows = conn.query_sync("SELECT slug, human_key FROM projects", &[])?;
     for row in project_rows {
         let slug = row.get_named::<String>("slug").ok();
         let human_key = row.get_named::<String>("human_key").ok();
