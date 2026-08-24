@@ -184,7 +184,7 @@ impl ScopeReason {
 pub struct RedactionPolicy {
     /// Replace body text with placeholder.
     pub redact_body: bool,
-    /// Remove the `from_agent` field.
+    /// Remove the sender's display name and internal agent ID.
     pub redact_sender: bool,
     /// Remove `thread_id`.
     pub redact_thread: bool,
@@ -446,7 +446,8 @@ pub fn apply_scope(
                 audit.visible_count += 1;
                 audit.redacted_count += 1;
                 let note = decision.reason.user_message().to_string();
-                let redacted = apply_redaction(result, redaction);
+                let mut redacted = apply_redaction(result, redaction);
+                redacted.redaction_reason = Some(note.clone());
                 audit.entries.push(ScopeAuditEntry {
                     result_id: redacted.id,
                     doc_kind: redacted.doc_kind.as_str().to_string(),
@@ -481,14 +482,20 @@ pub fn apply_scope(
 /// Apply field-level redaction to a single search result.
 #[must_use]
 pub fn apply_redaction(mut result: SearchResult, policy: &RedactionPolicy) -> SearchResult {
+    let fields_redacted = policy.redact_body || policy.redact_sender || policy.redact_thread;
     if policy.redact_body {
         result.body.clone_from(&policy.body_placeholder);
     }
     if policy.redact_sender {
         result.from_agent = None;
+        result.from_agent_id = None;
     }
     if policy.redact_thread {
         result.thread_id = None;
+    }
+    if fields_redacted {
+        result.redacted = true;
+        result.redaction_reason = Some("Search result fields redacted by policy.".to_string());
     }
     result
 }
@@ -852,6 +859,11 @@ mod tests {
         );
         assert!(redacted.from_agent.is_some()); // not redacted by default
         assert!(redacted.thread_id.is_some());
+        assert!(redacted.redacted);
+        assert_eq!(
+            redacted.redaction_reason.as_deref(),
+            Some("Search result fields redacted by policy.")
+        );
     }
 
     #[test]
@@ -861,7 +873,31 @@ mod tests {
         let redacted = apply_redaction(result, &policy);
         assert_eq!(redacted.body, "[Content hidden — access restricted]");
         assert!(redacted.from_agent.is_none());
+        assert!(redacted.from_agent_id.is_none());
         assert!(redacted.thread_id.is_none());
+        assert!(redacted.redacted);
+    }
+
+    #[test]
+    fn no_op_redaction_policy_preserves_existing_metadata() {
+        let mut result = make_message_result(1, 1, "BlueLake", 20);
+        result.redacted = true;
+        result.redaction_reason = Some("Earlier redaction".to_string());
+        let policy = RedactionPolicy {
+            redact_body: false,
+            redact_sender: false,
+            redact_thread: false,
+            body_placeholder: "unused".to_string(),
+        };
+
+        let redacted = apply_redaction(result, &policy);
+        assert!(redacted.redacted);
+        assert_eq!(
+            redacted.redaction_reason.as_deref(),
+            Some("Earlier redaction")
+        );
+        assert_eq!(redacted.from_agent.as_deref(), Some("BlueLake"));
+        assert_eq!(redacted.from_agent_id, Some(20));
     }
 
     // ── Batch apply_scope ─────────────────────────────────────────

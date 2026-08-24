@@ -4329,6 +4329,7 @@ fn systemd_service_configured_bind() -> Option<ManagedServiceBinding> {
     None
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn parse_systemd_environment_value(content: &str, key: &str) -> Option<String> {
     let needle = format!("{key}=");
     for line in content.lines() {
@@ -4448,6 +4449,7 @@ fn managed_service_bearer_token() -> Option<String> {
 // systemd/launchd state, probes the port, and inspects mailbox ownership.
 
 /// Raw systemd runtime properties for the agent-mail unit.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 struct SystemdRuntimeState {
     active_state: Option<String>,
@@ -4459,6 +4461,7 @@ struct SystemdRuntimeState {
     exec_main_start_monotonic_usec: Option<u64>,
 }
 
+#[cfg(target_os = "linux")]
 impl SystemdRuntimeState {
     /// Age of the supervised main process, derived from the monotonic start
     /// timestamp against `/proc/uptime`. `None` when either side is missing
@@ -4511,11 +4514,6 @@ fn systemd_service_runtime_state() -> Option<SystemdRuntimeState> {
         }
     }
     Some(state)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn systemd_service_runtime_state() -> Option<SystemdRuntimeState> {
-    None
 }
 
 /// Resolve the *expected-service* dimension: what the service manager
@@ -7514,6 +7512,15 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
 /// minutes old, so an age floor would exempt exactly the junk this cleans up.
 /// Disabled with `DOCTOR_AUTO_RECLAIM_ON_HEAL=false`. Never fails the startup:
 /// every error degrades to a warning.
+fn doctor_reclaim_directory_stamp() -> String {
+    let now = chrono::Utc::now();
+    format!(
+        "{}_{:06}",
+        now.format("%Y%m%d_%H%M%S"),
+        now.timestamp_subsec_micros()
+    )
+}
+
 fn auto_reclaim_recovery_debris_after_heal(database_url: &str, storage_root: &Path) {
     use mcp_agent_mail_db::recovery_retention as rr;
     let config = Config::from_env();
@@ -7543,7 +7550,7 @@ fn auto_reclaim_recovery_debris_after_heal(database_url: &str, storage_root: &Pa
     if !plan.has_reclaimable() {
         return;
     }
-    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let ts = doctor_reclaim_directory_stamp();
     let dest = storage_root.join("doctor").join("reclaimable").join(&ts);
     match rr::consolidate_debris(&plan, &dest) {
         Ok(outcome) => {
@@ -7820,10 +7827,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     let statuses = setup::check_status(&params);
     let status_ok = statuses.iter().all(|status| {
         !status.config_files.is_empty()
-            && status
-                .config_files
-                .iter()
-                .all(|file| file.exists && file.has_server_entry && file.url_matches)
+            && status.config_files.iter().all(setup_status_file_is_healthy)
     });
 
     if status_ok && static_match {
@@ -7864,7 +7868,11 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     Ok(())
 }
 
-const SETUP_SELF_HEAL_CACHE_VERSION: u32 = 2;
+fn setup_status_file_is_healthy(file: &mcp_agent_mail_core::setup::ConfigFileStatus) -> bool {
+    file.exists && file.has_server_entry && file.url_matches && file.drift_reasons.is_empty()
+}
+
+const SETUP_SELF_HEAL_CACHE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SetupSelfHealFileFingerprint {
@@ -7872,6 +7880,8 @@ struct SetupSelfHealFileFingerprint {
     exists: bool,
     len: u64,
     modified_micros: i64,
+    #[serde(default)]
+    content_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7925,6 +7935,8 @@ fn collect_setup_self_heal_file_fingerprints(
             let path_str = path.display().to_string();
             match std::fs::metadata(&path) {
                 Ok(meta) => {
+                    use sha2::{Digest as _, Sha256};
+
                     let modified_micros = meta
                         .modified()
                         .ok()
@@ -7932,11 +7944,14 @@ fn collect_setup_self_heal_file_fingerprints(
                         .map(|value| value.as_micros())
                         .and_then(|value| i64::try_from(value).ok())
                         .unwrap_or(0);
+                    let content_sha256 = read_cache_file_if_real(&path)
+                        .map(|content| hex::encode(Sha256::digest(content.as_bytes())));
                     SetupSelfHealFileFingerprint {
                         path: path_str,
                         exists: true,
                         len: meta.len(),
                         modified_micros,
+                        content_sha256,
                     }
                 }
                 Err(_) => SetupSelfHealFileFingerprint {
@@ -7944,6 +7959,7 @@ fn collect_setup_self_heal_file_fingerprints(
                     exists: false,
                     len: 0,
                     modified_micros: 0,
+                    content_sha256: None,
                 },
             }
         })
@@ -9375,7 +9391,7 @@ fn handle_doctor_reclaim(
     let mut failures: Vec<String> = Vec::new();
 
     if apply && plan.has_reclaimable() {
-        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let ts = doctor_reclaim_directory_stamp();
         let dest = storage_root.join("doctor").join("reclaimable").join(&ts);
         let outcome = rr::consolidate_debris(&plan, &dest)
             .map_err(|e| CliError::Other(format!("reclaim consolidation failed: {e}")))?;
@@ -11626,6 +11642,7 @@ fn linux_device_numbers_for_doctor_locks(dev: u64) -> (u32, u32) {
     (major, minor)
 }
 
+#[cfg(target_os = "linux")]
 fn normalize_proc_lock_mode(raw: &str) -> String {
     match raw {
         "READ" => "shared".to_string(),
@@ -39529,6 +39546,15 @@ mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
 
+    fn canonical_test_tempdir(prefix: &str) -> tempfile::TempDir {
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonicalize system temporary directory");
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(temp_root)
+            .expect("create test tempdir under canonical temporary root")
+    }
+
     fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -42093,12 +42119,98 @@ http_headers = { Authorization = "Bearer secret" }
         }
     }
 
+    #[test]
+    fn setup_self_heal_health_gate_rejects_omp_disablement_drift() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let home_dir = temp.path().join("home");
+        let config_path = project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config_path.parent().expect("OMP config parent"))
+            .expect("create OMP config parent");
+        std::fs::create_dir_all(&home_dir).expect("create home fixture");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "disabledServers": ["mcp-agent-mail"],
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"},
+      "enabled": true
+    }
+  }
+}"#,
+        )
+        .expect("write disabled OMP config");
+        let params = SetupParams {
+            token: "tok".to_string(),
+            project_dir,
+            home_dir_override: Some(home_dir),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        let status = mcp_agent_mail_core::setup::check_status(&params)
+            .into_iter()
+            .next()
+            .expect("OMP status");
+        let file = status
+            .config_files
+            .first()
+            .expect("OMP project config status");
+
+        assert!(file.exists && file.has_server_entry && file.url_matches);
+        assert!(
+            file.drift_reasons
+                .contains(&mcp_agent_mail_core::setup::ConfigDriftReason::DisabledServer)
+        );
+        assert!(
+            !setup_status_file_is_healthy(file),
+            "self-heal must not cache a disabled OMP config as healthy"
+        );
+    }
+
+    #[test]
+    fn setup_self_heal_fingerprint_detects_same_length_content_change() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let config_path = project_dir.join("cline.mcp.json");
+        std::fs::create_dir_all(&project_dir).expect("create project fixture");
+        std::fs::write(&config_path, "aaaa").expect("write first config content");
+        let params = SetupParams {
+            project_dir,
+            agents: Some(vec![AgentPlatform::Cline]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        let first = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Cline]);
+
+        std::fs::write(&config_path, "bbbb").expect("write same-length replacement content");
+        let mut second =
+            collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Cline]);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].len, second[0].len);
+        // Simulate an editor or attacker preserving the old timestamp. The
+        // content digest must still invalidate the cache.
+        second[0].modified_micros = first[0].modified_micros;
+        assert_ne!(first, second);
+        assert_ne!(first[0].content_sha256, second[0].content_sha256);
+    }
+
     #[cfg(unix)]
     #[test]
     fn setup_self_heal_cache_ignores_symlinked_cache_file() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = canonical_test_tempdir("setup-self-heal-symlink-");
         let config = Config {
             storage_root: temp.path().join("storage"),
             ..Config::default()
@@ -42138,7 +42250,7 @@ http_headers = { Authorization = "Bearer secret" }
     #[cfg(unix)]
     #[test]
     fn setup_self_heal_cache_replaces_hard_link_without_mutating_linked_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = canonical_test_tempdir("setup-self-heal-hardlink-");
         let config = Config {
             storage_root: temp.path().join("storage"),
             ..Config::default()

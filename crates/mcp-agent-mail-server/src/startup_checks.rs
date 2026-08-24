@@ -449,9 +449,25 @@ pub fn check_port_status_at_mcp_path(host: &str, port: u16, mcp_path: &str) -> P
 
     // Step 1: Try to bind to the port
     match TcpListener::bind((bind_host.as_ref(), port)) {
-        Ok(_listener) => {
-            // Port is free (listener is dropped immediately, releasing the port)
-            return PortStatus::Free;
+        Ok(listener) => {
+            // Some kernels permit a wildcard listener to coexist with a
+            // pre-existing listener bound to one specific local address. In
+            // that case a successful wildcard bind does not prove exclusive
+            // ownership: traffic can be split between two processes. Drop our
+            // probe listener before discovery so it cannot find itself.
+            if !is_wildcard_host(host) {
+                return PortStatus::Free;
+            }
+            drop(listener);
+            // Prefer non-invasive listener discovery. A connect-only fallback
+            // is useful when `ss`/`lsof` is unavailable, but probing it first
+            // needlessly consumes an accept slot before the MCP ownership
+            // request that follows.
+            if listener_port_holder_pids(host, port).is_empty()
+                && !port_has_active_listener(host, port)
+            {
+                return PortStatus::Free;
+            }
         }
         Err(e) => {
             match e.kind() {
@@ -498,6 +514,7 @@ pub fn check_port_status_at_mcp_path(host: &str, port: u16, mcp_path: &str) -> P
     // proceed instead of surfacing a spurious "Unknown process listening"
     // error to the operator.
     if matches!(health_probe_status, HealthProbeStatus::NoResponse)
+        && listener_port_holder_pids(host, port).is_empty()
         && !port_has_active_listener(host, port)
     {
         tracing::debug!(
@@ -812,6 +829,28 @@ fn is_agent_mail_by_pid(host: &str, port: u16) -> bool {
     !agent_mail_port_holder_pids_with_hint(host, port).is_empty()
 }
 
+/// macOS exposes a few root-owned system directories through stable aliases
+/// such as `/var -> /private/var`. Rejecting those aliases makes ordinary
+/// `TMPDIR` paths unusable, while following arbitrary user-controlled links
+/// would defeat the no-symlink checks below. Permit only Apple's exact,
+/// canonical root aliases; every later path component is still inspected with
+/// `symlink_metadata` and rejected if it is itself a link.
+#[cfg(target_os = "macos")]
+fn is_trusted_platform_directory_alias(path: &Path) -> bool {
+    let expected = match path.to_str() {
+        Some("/etc") => Path::new("/private/etc"),
+        Some("/tmp") => Path::new("/private/tmp"),
+        Some("/var") => Path::new("/private/var"),
+        _ => return false,
+    };
+    std::fs::canonicalize(path).is_ok_and(|resolved| resolved == expected)
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn is_trusted_platform_directory_alias(_path: &Path) -> bool {
+    false
+}
+
 fn path_existing_prefix_has_symlink(path: &Path) -> Result<bool, String> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -831,7 +870,12 @@ fn path_existing_prefix_has_symlink(path: &Path) -> Result<bool, String> {
         }
 
         match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && !is_trusted_platform_directory_alias(&current) =>
+            {
+                return Ok(true);
+            }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
@@ -1258,6 +1302,7 @@ fn port_holder_pids_via_lsof_for_host(host: &str, port: u16) -> Vec<u32> {
     parse_lsof_port_holder_pids_for_host(String::from_utf8_lossy(&output.stdout).as_ref(), host)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn parse_ss_port_holder_pids(output: &str) -> Vec<u32> {
     let mut pids = BTreeSet::new();
     for segment in output.split("pid=").skip(1) {
@@ -1424,9 +1469,10 @@ fn canonicalize_ip(ip: IpAddr) -> IpAddr {
 }
 
 fn is_wildcard_host(host: &str) -> bool {
+    let host = normalize_socket_host(host);
     host == "*"
-        || matches!(parse_canonical_ip(host), Some(IpAddr::V4(v4)) if v4.is_unspecified())
-        || matches!(parse_canonical_ip(host), Some(IpAddr::V6(v6)) if v6.is_unspecified())
+        || matches!(parse_canonical_ip(&host), Some(IpAddr::V4(v4)) if v4.is_unspecified())
+        || matches!(parse_canonical_ip(&host), Some(IpAddr::V6(v6)) if v6.is_unspecified())
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -2105,10 +2151,12 @@ fn validate_real_existing_directory(path: &std::path::Path, label: &str) -> Resu
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) if metadata.file_type().is_dir() => {}
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(format!(
-                            "{label} {} must not be a symlink",
-                            current.display()
-                        ));
+                        if !is_trusted_platform_directory_alias(&current) {
+                            return Err(format!(
+                                "{label} {} must not be a symlink",
+                                current.display()
+                            ));
+                        }
                     }
                     Ok(_) => {
                         return Err(format!(
@@ -2168,10 +2216,12 @@ fn ensure_real_directory_tree(path: &std::path::Path, label: &str) -> Result<(),
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) if metadata.file_type().is_dir() => {}
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(format!(
-                            "{label} {} must not be a symlink",
-                            current.display()
-                        ));
+                        if !is_trusted_platform_directory_alias(&current) {
+                            return Err(format!(
+                                "{label} {} must not be a symlink",
+                                current.display()
+                            ));
+                        }
                     }
                     Ok(_) => {
                         return Err(format!(
@@ -4418,6 +4468,15 @@ mod tests {
         assert!(!listener_host_matches_request("127.0.0.1", "::"));
         assert!(!listener_host_matches_request("::1", "0.0.0.0"));
         assert!(listener_host_matches_request("::1", "::"));
+    }
+
+    #[test]
+    fn wildcard_host_detection_normalizes_configured_host_text() {
+        assert!(is_wildcard_host(" 0.0.0.0 "));
+        assert!(is_wildcard_host(" [::] "));
+        assert!(is_wildcard_host("*"));
+        assert!(!is_wildcard_host("127.0.0.1"));
+        assert!(!is_wildcard_host("::1"));
     }
 
     #[test]

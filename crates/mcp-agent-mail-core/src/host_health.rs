@@ -528,41 +528,39 @@ fn read_inodes(_path: &Path) -> Result<(Option<u64>, Option<u64>), String> {
 }
 
 /// Read the 1-minute load average (Linux `/proc/loadavg`).
+#[cfg(target_os = "linux")]
 fn read_load_avg_1m() -> Option<f64> {
-    #[cfg(target_os = "linux")]
-    {
-        let content = std::fs::read_to_string("/proc/loadavg").ok()?;
-        content.split_whitespace().next()?.parse::<f64>().ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    let content = std::fs::read_to_string("/proc/loadavg").ok()?;
+    content.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn read_load_avg_1m() -> Option<f64> {
+    None
 }
 
 /// Read host available + total memory (Linux `/proc/meminfo`). Returns
 /// `(available_bytes, total_bytes)`.
+#[cfg(target_os = "linux")]
 fn read_host_memory() -> (Option<u64>, Option<u64>) {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
-            return (None, None);
-        };
-        let mut available = None;
-        let mut total = None;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                available = parse_meminfo_kb(rest);
-            } else if let Some(rest) = line.strip_prefix("MemTotal:") {
-                total = parse_meminfo_kb(rest);
-            }
+    let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
+        return (None, None);
+    };
+    let mut available = None;
+    let mut total = None;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            available = parse_meminfo_kb(rest);
+        } else if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total = parse_meminfo_kb(rest);
         }
-        (available, total)
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        (None, None)
-    }
+    (available, total)
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn read_host_memory() -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 /// Parse a `/proc/meminfo` value line like ` 16384000 kB` into bytes.

@@ -611,11 +611,10 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
     ensure_setup_parent_dir(env_path, "token env file")?;
     validate_setup_file_target(env_path, "token env file")?;
 
-    let existing_content = if env_path.exists() {
-        Some(std::fs::read_to_string(env_path)?)
-    } else {
-        None
-    };
+    // Keep token reads under the same no-follow, regular-file-only contract as
+    // setup config reads. An `exists()` + `read_to_string()` pair leaves a
+    // symlink/FIFO substitution window between validation and the read.
+    let existing_content = read_setup_file(env_path, "token env file")?.map(|(content, _)| content);
 
     let content = existing_content.as_deref().map_or_else(
         || format!("HTTP_BEARER_TOKEN={token}\n"),
@@ -681,6 +680,126 @@ pub fn merge_mcp_server(
         }
     }
     servers_obj.insert(server_name.to_string(), server_value);
+
+    Ok(serde_json::to_string_pretty(&doc)? + "\n")
+}
+
+/// Merge an OMP-native MCP server entry and make the requested server
+/// reachable again.
+///
+/// OMP has two independent disablement surfaces: `enabled: false` on the
+/// entry and the active profile's top-level `disabledServers` denylist. A
+/// setup run that refreshes the URL/token but leaves either surface in place
+/// reports success while OMP still suppresses Agent Mail. Keep the generic
+/// JSON merge policy unchanged for other clients and reconcile OMP's native
+/// enablement contract only for OMP actions.
+fn merge_omp_mcp_server(
+    existing: Option<&str>,
+    server_name: &str,
+    mut server_value: Value,
+) -> Result<String, SetupError> {
+    let desired_entry = server_value
+        .as_object_mut()
+        .ok_or(SetupError::NotJsonObject)?;
+    desired_entry.insert("enabled".to_string(), Value::Bool(true));
+
+    let mut doc = match existing {
+        Some(content) if !content.trim().is_empty() => serde_json::from_str(content)?,
+        _ => json!({}),
+    };
+    let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+
+    let aliases: &[&str] = if matches!(server_name, "mcp-agent-mail" | "mcp_agent_mail") {
+        &["mcp-agent-mail", "mcp_agent_mail"]
+    } else {
+        &[server_name]
+    };
+    let native_servers = match obj.get("mcpServers") {
+        Some(value) => Some(value.as_object().ok_or(SetupError::NotJsonObject)?),
+        None => None,
+    };
+    let existing_entry = native_servers
+        .and_then(|servers| {
+            aliases
+                .iter()
+                .find_map(|name| servers.get(*name).and_then(Value::as_object))
+        })
+        .or_else(|| {
+            ["servers", "mcp", "mcp_servers"]
+                .iter()
+                .filter_map(|key| obj.get(*key).and_then(Value::as_object))
+                .find_map(|servers| {
+                    aliases
+                        .iter()
+                        .find_map(|name| servers.get(*name).and_then(Value::as_object))
+                })
+        })
+        .cloned()
+        .unwrap_or_default();
+
+    // Preserve OMP-native tuning/auth fields and unrelated headers, while
+    // removing transport fields that are incompatible with the desired HTTP
+    // entry. This mirrors the installer writer and avoids erasing operator
+    // choices such as `timeout`, `requestIdFormat`, and `oauth`.
+    let mut merged_entry = existing_entry;
+    for key in [
+        "command",
+        "args",
+        "cwd",
+        "environment",
+        "env",
+        "transport",
+        "httpUrl",
+        "http_headers",
+        "bearer_token_env_var",
+    ] {
+        merged_entry.remove(key);
+    }
+    let mut headers = merged_entry
+        .remove("headers")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+    if let Some(desired_headers) = desired_entry.get("headers").and_then(Value::as_object) {
+        headers.extend(desired_headers.clone());
+    }
+    for (key, value) in desired_entry {
+        if key != "headers" {
+            merged_entry.insert(key.clone(), value.clone());
+        }
+    }
+    if !headers.is_empty() {
+        merged_entry.insert("headers".to_string(), Value::Object(headers));
+    }
+
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(SetupError::NotJsonObject)?;
+    for alias in aliases {
+        servers.remove(*alias);
+    }
+    servers.insert(server_name.to_string(), Value::Object(merged_entry));
+
+    // OMP-native configs have used only `mcpServers`, but early Agent Mail
+    // writers emitted its entry under generic legacy containers. Leaving one
+    // behind makes status permanently report a duplicate and can let a stale
+    // higher-priority definition shadow the repaired HTTP entry.
+    for legacy_key in ["servers", "mcp", "mcp_servers"] {
+        if let Some(legacy_servers) = obj.get_mut(legacy_key).and_then(Value::as_object_mut) {
+            for alias in aliases {
+                legacy_servers.remove(*alias);
+            }
+        }
+    }
+
+    if let Some(disabled) = obj.get_mut("disabledServers") {
+        let disabled = disabled.as_array_mut().ok_or_else(|| {
+            SetupError::Other("OMP disabledServers must be a JSON array".to_string())
+        })?;
+        disabled.retain(|value| !value.as_str().is_some_and(|name| aliases.contains(&name)));
+    }
 
     Ok(serde_json::to_string_pretty(&doc)? + "\n")
 }
@@ -956,7 +1075,29 @@ fn merge_toml_section(
                     continue;
                 };
                 let key = lhs.trim();
-                if !target_keys.contains(key) && preserved_target_keys.insert(key.to_string()) {
+                // The desired HTTP section owns every transport/auth key, not
+                // only the keys present in this particular invocation. If the
+                // server switches from stdio to HTTP, or from bearer auth to
+                // no-auth, preserving an omitted managed key leaves Codex on a
+                // conflicting transport or stale credential and makes setup's
+                // status/self-heal loop unable to converge.
+                let setup_managed_key = target_keys.contains(key)
+                    || matches!(
+                        key,
+                        "url"
+                            | "httpUrl"
+                            | "startup_timeout_sec"
+                            | "http_headers"
+                            | "env_http_headers"
+                            | "bearer_token_env_var"
+                            | "command"
+                            | "args"
+                            | "cwd"
+                            | "env"
+                            | "environment"
+                            | "transport"
+                    );
+                if !setup_managed_key && preserved_target_keys.insert(key.to_string()) {
                     preserved_target_lines.push(raw_line.to_string());
                 }
             }
@@ -1056,6 +1197,15 @@ fn standard_http_server_value(url: &str, token: &str) -> Value {
             }
         })
     }
+}
+
+fn omp_http_server_value(url: &str, token: &str) -> Value {
+    let mut value = standard_http_server_value(url, token);
+    value
+        .as_object_mut()
+        .expect("standard HTTP server values are JSON objects")
+        .insert("enabled".to_string(), Value::Bool(true));
+    value
 }
 
 /// Build the `headers` object for an MCP server entry, omitting the
@@ -1336,7 +1486,7 @@ impl AgentPlatform {
             pdir,
             ".omp/mcp.json",
             "mcpServers",
-            standard_http_server_value(url, token),
+            omp_http_server_value(url, token),
             "Oh My Pi (OMP) project-local MCP config",
         )];
         if !params.skip_user_config {
@@ -1350,7 +1500,7 @@ impl AgentPlatform {
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
-                    server_value: standard_http_server_value(url, token),
+                    server_value: omp_http_server_value(url, token),
                 },
                 permissions: 0o600,
                 backup: true,
@@ -1558,9 +1708,34 @@ fn setup_read_file_options() -> std::fs::OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
     }
     options
+}
+
+fn read_setup_file(path: &Path, label: &str) -> Result<Option<(String, u32)>, SetupError> {
+    let mut file = match setup_read_file_options().open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid_setup_path(label, path, "must be a regular file"));
+    }
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o777
+    };
+    #[cfg(not(unix))]
+    let permissions = 0o777;
+
+    Ok(Some((content, permissions)))
 }
 
 fn create_unique_setup_file(
@@ -1612,24 +1787,25 @@ fn write_setup_file_atomic(
 
     validate_setup_file_target(path, label)?;
     std::fs::rename(&temp, path)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
-fn copy_setup_file_to_backup(
-    source: &Path,
+fn write_setup_backup(
+    content: &[u8],
     backup_parent: &Path,
     file_name: &str,
     permissions: u32,
 ) -> Result<(), SetupError> {
-    validate_setup_file_target(source, "config backup source")?;
     let (backup, mut output) =
         create_unique_setup_file(backup_parent, file_name, "bak", permissions)?;
     validate_setup_file_target(&backup, "config backup target")?;
-    let mut input = setup_read_file_options().open(source)?;
-    let mut buf = Vec::new();
-    input.read_to_end(&mut buf)?;
-    output.write_all(&buf)?;
+    output.write_all(content)?;
     output.sync_all()?;
+    drop(output);
+    #[cfg(unix)]
+    std::fs::File::open(backup_parent)?.sync_all()?;
     Ok(())
 }
 
@@ -1639,19 +1815,54 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
     ensure_setup_parent_dir(&action.file_path, "config file")?;
     validate_setup_file_target(&action.file_path, "config file")?;
 
-    let existing = std::fs::read_to_string(&action.file_path).ok();
+    // Read through the same no-follow discipline as the write path. Treating
+    // an arbitrary read failure as "missing" would let setup overwrite an
+    // unreadable or non-UTF config without a backup.
+    let existing_file = read_setup_file(&action.file_path, "config file")?;
+    let existing = existing_file.as_ref().map(|(content, _)| content.clone());
+
+    // Never widen an existing config's permissions. Conversely, when setup is
+    // adding a secret to a previously broad file, tighten it to the action's
+    // requested mode. Backups use the same effective mode so they cannot leak
+    // the pre-update contents.
+    let effective_permissions = existing_file
+        .as_ref()
+        .map_or(action.permissions, |(_, mode)| {
+            #[cfg(unix)]
+            {
+                *mode & action.permissions
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = mode;
+                action.permissions
+            }
+        });
+    #[cfg(unix)]
+    let permissions_need_tightening = existing_file
+        .as_ref()
+        .is_some_and(|(_, mode)| *mode != effective_permissions);
+    #[cfg(not(unix))]
+    let permissions_need_tightening = false;
 
     let new_content = match &action.content {
         ConfigContent::JsonMerge {
             servers_key,
             server_name,
             server_value,
-        } => merge_mcp_server(
-            existing.as_deref(),
-            servers_key,
-            server_name,
-            server_value.clone(),
-        )?,
+        } => {
+            if action.platform == AgentPlatform::Omp {
+                debug_assert_eq!(*servers_key, "mcpServers");
+                merge_omp_mcp_server(existing.as_deref(), server_name, server_value.clone())?
+            } else {
+                merge_mcp_server(
+                    existing.as_deref(),
+                    servers_key,
+                    server_name,
+                    server_value.clone(),
+                )?
+            }
+        }
         ConfigContent::ClaudeLocalScopeMcp {
             project_path,
             server_name,
@@ -1674,7 +1885,7 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
     };
 
     // Check if unchanged
-    if existing.as_deref() == Some(&new_content) {
+    if existing.as_deref() == Some(&new_content) && !permissions_need_tightening {
         return Ok(ActionOutcome::Unchanged);
     }
 
@@ -1687,13 +1898,21 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        copy_setup_file_to_backup(&action.file_path, parent, &file_name, action.permissions)?;
+        write_setup_backup(
+            existing
+                .as_deref()
+                .expect("an existing setup file has pre-update content")
+                .as_bytes(),
+            parent,
+            &file_name,
+            effective_permissions,
+        )?;
     }
 
     write_setup_file_atomic(
         &action.file_path,
         new_content.as_bytes(),
-        action.permissions,
+        effective_permissions,
         "config file",
     )?;
 
@@ -1715,6 +1934,58 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
         .agents
         .clone()
         .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    let project_token_paths = if params.token.is_empty() {
+        std::collections::BTreeSet::new()
+    } else {
+        platforms
+            .iter()
+            .flat_map(|platform| platform.config_actions(params))
+            .filter(|action| {
+                expected_authorization_for_action(action, &params.token).is_some()
+                    && action.file_path.strip_prefix(&params.project_dir).is_ok()
+            })
+            .map(|action| action.file_path)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    // Establish project-secret exclusions before writing any token-bearing
+    // client config. Reporting success after a symlinked, unreadable, or
+    // otherwise unmodifiable `.gitignore` would leave a live bearer token
+    // exposed to the next `git add -A`.
+    let gitignore_error = if params.dry_run {
+        None
+    } else {
+        let gitignore = params.project_dir.join(".gitignore");
+        let mut entries = vec![".env".to_string()];
+        for platform in &platforms {
+            for file in platform.project_local_secret_files() {
+                let entry = (*file).to_string();
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        }
+        for path in &project_token_paths {
+            let Ok(relative) = path.strip_prefix(&params.project_dir) else {
+                continue;
+            };
+            if relative.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }) {
+                let entry = relative.to_string_lossy().replace('\\', "/");
+                if !entry.is_empty() && !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        }
+        let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
+        ensure_gitignore_entries(&gitignore, &entry_refs)
+            .err()
+            .map(|error| error.to_string())
+    };
 
     let mut results = Vec::new();
 
@@ -1723,7 +1994,14 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
         let mut action_results = Vec::new();
 
         for action in &actions {
-            let outcome = if params.dry_run {
+            let is_token_bearing_project_config = project_token_paths.contains(&action.file_path);
+            let outcome = if let Some(error) = gitignore_error.as_deref()
+                && is_token_bearing_project_config
+            {
+                ActionOutcome::Failed(format!(
+                    "refusing to write a token-bearing project config because .gitignore could not be secured: {error}"
+                ))
+            } else if params.dry_run {
                 ActionOutcome::Skipped
             } else {
                 match write_config_atomic(action) {
@@ -1743,29 +2021,6 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
             platform: platform.display_name().to_string(),
             actions: action_results,
         });
-    }
-
-    // Ensure .gitignore has entries for secret files (security issue #148).
-    // Cover EVERY project-local token-bearing file that any configured platform
-    // can emit — not just `.env` + the Claude file — so an unsuspecting
-    // `git add -A` can never commit a live bearer credential. The previous
-    // hardcoded list left `cursor.mcp.json`, `gemini.mcp.json`,
-    // `factory.mcp.json`, `windsurf.mcp.json`, `cline.mcp.json`,
-    // `opencode.json`, and `.vscode/mcp.json` tracked.
-    if !params.dry_run {
-        let gitignore = params.project_dir.join(".gitignore");
-        // .env contains the bearer token — always gitignore it.
-        let mut entries = vec![".env".to_string()];
-        for platform in &platforms {
-            for file in platform.project_local_secret_files() {
-                let entry = (*file).to_string();
-                if !entries.contains(&entry) {
-                    entries.push(entry);
-                }
-            }
-        }
-        let entry_refs: Vec<&str> = entries.iter().map(String::as_str).collect();
-        let _ = ensure_gitignore_entries(&gitignore, &entry_refs);
     }
 
     results
@@ -1795,6 +2050,7 @@ pub enum ConfigDriftReason {
     StaleHttpPath,
     WrongBearerHeader,
     WrongStartupTimeout,
+    DisabledServer,
     DuplicateServerEntries,
     UnsupportedConfig,
 }
@@ -1810,6 +2066,7 @@ impl ConfigDriftReason {
             Self::StaleHttpPath => "stale_http_path",
             Self::WrongBearerHeader => "wrong_bearer_header",
             Self::WrongStartupTimeout => "wrong_startup_timeout",
+            Self::DisabledServer => "disabled_server",
             Self::DuplicateServerEntries => "duplicate_server_entries",
             Self::UnsupportedConfig => "unsupported_config",
         }
@@ -1945,7 +2202,8 @@ fn config_file_status_for_action(
     let expected_timeout = expected_startup_timeout_for_action(action);
     let redacted_path = redact_path_for_status(&action.file_path, home.as_deref());
 
-    if !action.file_path.exists() {
+    let content = read_setup_file(&action.file_path, "config status file");
+    if matches!(&content, Ok(None)) {
         let drift_reasons = vec![ConfigDriftReason::MissingFile];
         return ConfigFileStatus {
             path: action.file_path.display().to_string(),
@@ -1965,8 +2223,17 @@ fn config_file_status_for_action(
         };
     }
 
-    let analysis = std::fs::read_to_string(&action.file_path).map_or_else(
-        |_| ConfigContentAnalysis {
+    let mut analysis = match &content {
+        Ok(Some((content, _))) => analyze_config_content(
+            &action.file_path,
+            content,
+            expected_url,
+            expected_auth.as_deref(),
+            expected_timeout,
+            home.as_deref(),
+        ),
+        Ok(None) => unreachable!("missing setup files return above"),
+        Err(_) => ConfigContentAnalysis {
             has_server_entry: false,
             url_matches: false,
             actual_url: None,
@@ -1974,17 +2241,19 @@ fn config_file_status_for_action(
             current_entry: None,
             drift_reasons: vec![ConfigDriftReason::UnsupportedConfig],
         },
-        |content| {
-            analyze_config_content(
-                &action.file_path,
-                &content,
-                expected_url,
-                expected_auth.as_deref(),
-                expected_timeout,
-                home.as_deref(),
-            )
-        },
-    );
+    };
+
+    if action.platform == AgentPlatform::Omp
+        && let Ok(Some((content, _))) = &content
+    {
+        apply_omp_config_contract(
+            content,
+            &mut analysis,
+            expected_url,
+            expected_auth.as_deref(),
+            home.as_deref(),
+        );
+    }
 
     ConfigFileStatus {
         path: action.file_path.display().to_string(),
@@ -2001,6 +2270,206 @@ fn config_file_status_for_action(
         risk: risk_for_drift_reasons(&analysis.drift_reasons),
         remediation: setup_status_remediation(action, params, &analysis.drift_reasons),
         drift_reasons: analysis.drift_reasons,
+    }
+}
+
+const OMP_SERVER_ALIASES: [&str; 2] = ["mcp-agent-mail", "mcp_agent_mail"];
+
+fn apply_omp_config_contract(
+    content: &str,
+    analysis: &mut ConfigContentAnalysis,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+) {
+    let Ok(doc) = serde_json::from_str::<Value>(content) else {
+        return;
+    };
+    let Some(object) = doc.as_object() else {
+        return;
+    };
+
+    apply_omp_native_server_contract(
+        object,
+        analysis,
+        expected_url,
+        expected_auth,
+        home,
+        &OMP_SERVER_ALIASES,
+    );
+    apply_omp_disabled_servers_contract(object, analysis, &OMP_SERVER_ALIASES);
+}
+
+fn apply_omp_native_server_contract(
+    object: &Map<String, Value>,
+    analysis: &mut ConfigContentAnalysis,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+    aliases: &[&str],
+) {
+    match object.get("mcpServers") {
+        None => {
+            // Generic status parsing recognizes historical containers, but
+            // OMP loads only its native `mcpServers` object. Do not report a
+            // legacy-only entry as runnable.
+            reset_omp_server_analysis(analysis, ConfigDriftReason::MissingServerEntry);
+        }
+        Some(Value::Object(servers)) => {
+            let native_entries = aliases
+                .iter()
+                .filter_map(|name| servers.get(*name).map(|entry| (*name, entry)))
+                .collect::<Vec<_>>();
+            if native_entries.is_empty() {
+                reset_omp_server_analysis(analysis, ConfigDriftReason::MissingServerEntry);
+            } else {
+                apply_omp_native_entries_contract(
+                    &native_entries,
+                    analysis,
+                    expected_url,
+                    expected_auth,
+                    home,
+                );
+            }
+        }
+        Some(_) => reset_omp_server_analysis(analysis, ConfigDriftReason::UnsupportedConfig),
+    }
+}
+
+fn reset_omp_server_analysis(analysis: &mut ConfigContentAnalysis, reason: ConfigDriftReason) {
+    analysis.has_server_entry = false;
+    analysis.url_matches = false;
+    analysis.actual_url = None;
+    analysis.current_entry = None;
+    analysis
+        .drift_reasons
+        .retain(|item| *item == ConfigDriftReason::DuplicateServerEntries);
+    push_drift_reason(&mut analysis.drift_reasons, reason);
+}
+
+fn apply_omp_native_entries_contract(
+    native_entries: &[(&str, &Value)],
+    analysis: &mut ConfigContentAnalysis,
+    expected_url: &str,
+    expected_auth: Option<&str>,
+    home: Option<&Path>,
+) {
+    // Generic JSON analysis deliberately recognizes historical MCP
+    // containers for migration diagnostics. OMP does not load those
+    // containers, so only its native entries may satisfy URL/auth health.
+    // Keep duplicate-location evidence, but recompute every active-entry
+    // verdict from `mcpServers`.
+    analysis.has_server_entry = true;
+    analysis.url_matches = native_entries.iter().any(|(_, entry)| {
+        json_entry_url(entry).is_some_and(|url| urls_match_for_status(url, expected_url))
+    });
+    analysis.actual_url = native_entries
+        .iter()
+        .find_map(|(_, entry)| json_entry_url(entry).map(str::to_string));
+    analysis.current_entry = native_entries.first().map(|(server_name, entry)| {
+        json!({
+            "container": "mcpServers",
+            "server_name": server_name,
+            "entry": redact_value_for_status((*entry).clone(), home),
+        })
+    });
+    analysis
+        .drift_reasons
+        .retain(|reason| *reason == ConfigDriftReason::DuplicateServerEntries);
+
+    if !analysis.url_matches {
+        if native_entries
+            .iter()
+            .any(|(_, entry)| json_entry_has_legacy_stdio(entry))
+        {
+            push_drift_reason(&mut analysis.drift_reasons, ConfigDriftReason::LegacyStdio);
+        } else if analysis.actual_url.is_some() {
+            push_drift_reason(
+                &mut analysis.drift_reasons,
+                ConfigDriftReason::StaleHttpPath,
+            );
+        } else {
+            push_drift_reason(
+                &mut analysis.drift_reasons,
+                ConfigDriftReason::UnsupportedConfig,
+            );
+        }
+    }
+    let auth_matches = expected_auth.map_or_else(
+        || {
+            native_entries
+                .iter()
+                .all(|(_, entry)| json_entry_authorization(entry).is_none())
+        },
+        |expected| {
+            native_entries
+                .iter()
+                .any(|(_, entry)| json_entry_authorization(entry) == Some(expected))
+        },
+    );
+    if !auth_matches {
+        push_drift_reason(
+            &mut analysis.drift_reasons,
+            ConfigDriftReason::WrongBearerHeader,
+        );
+    }
+
+    for (_, entry) in native_entries {
+        let Some(entry) = entry.as_object() else {
+            push_drift_reason(
+                &mut analysis.drift_reasons,
+                ConfigDriftReason::UnsupportedConfig,
+            );
+            continue;
+        };
+        if let Some(enabled) = entry.get("enabled") {
+            let recognized_false_string = enabled.as_str().is_some_and(|value| {
+                matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0")
+            });
+            if enabled == &Value::Bool(false) || recognized_false_string {
+                push_drift_reason(
+                    &mut analysis.drift_reasons,
+                    ConfigDriftReason::DisabledServer,
+                );
+            }
+            if !enabled.is_boolean() && !recognized_false_string {
+                push_drift_reason(
+                    &mut analysis.drift_reasons,
+                    ConfigDriftReason::UnsupportedConfig,
+                );
+            }
+        }
+    }
+}
+
+fn apply_omp_disabled_servers_contract(
+    object: &Map<String, Value>,
+    analysis: &mut ConfigContentAnalysis,
+    aliases: &[&str],
+) {
+    match object.get("disabledServers") {
+        None => {}
+        Some(Value::Array(servers)) => {
+            if servers.iter().any(|value| !value.is_string()) {
+                push_drift_reason(
+                    &mut analysis.drift_reasons,
+                    ConfigDriftReason::UnsupportedConfig,
+                );
+            }
+            if servers
+                .iter()
+                .any(|value| value.as_str().is_some_and(|name| aliases.contains(&name)))
+            {
+                push_drift_reason(
+                    &mut analysis.drift_reasons,
+                    ConfigDriftReason::DisabledServer,
+                );
+            }
+        }
+        Some(_) => push_drift_reason(
+            &mut analysis.drift_reasons,
+            ConfigDriftReason::UnsupportedConfig,
+        ),
     }
 }
 
@@ -2109,13 +2578,20 @@ fn analyze_json_config_content(
         }
     }
 
-    if let Some(expected) = expected_auth {
-        let auth_matches = entries
-            .iter()
-            .any(|entry| json_entry_authorization(entry.entry) == Some(expected));
-        if !auth_matches {
-            push_drift_reason(&mut drift_reasons, ConfigDriftReason::WrongBearerHeader);
-        }
+    let auth_matches = expected_auth.map_or_else(
+        || {
+            entries
+                .iter()
+                .all(|entry| json_entry_authorization(entry.entry).is_none())
+        },
+        |expected| {
+            entries
+                .iter()
+                .any(|entry| json_entry_authorization(entry.entry) == Some(expected))
+        },
+    );
+    if !auth_matches {
+        push_drift_reason(&mut drift_reasons, ConfigDriftReason::WrongBearerHeader);
     }
 
     let first = &entries[0];
@@ -2171,7 +2647,12 @@ fn json_entry_authorization(entry: &Value) -> Option<&str> {
         .get("headers")
         .or_else(|| entry.get("http_headers"))
         .and_then(Value::as_object)
-        .and_then(|headers| headers.get("Authorization"))
+        .and_then(|headers| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value)
+        })
         .and_then(Value::as_str)
 }
 
@@ -2238,13 +2719,20 @@ fn analyze_toml_config_content(
         }
     }
 
-    if let Some(expected) = expected_auth {
-        let auth_matches = sections
-            .iter()
-            .any(|section| section.authorization.as_deref() == Some(expected));
-        if !auth_matches {
-            push_drift_reason(&mut drift_reasons, ConfigDriftReason::WrongBearerHeader);
-        }
+    let auth_matches = expected_auth.map_or_else(
+        || {
+            sections
+                .iter()
+                .all(|section| section.authorization.is_none())
+        },
+        |expected| {
+            sections
+                .iter()
+                .any(|section| section.authorization.as_deref() == Some(expected))
+        },
+    );
+    if !auth_matches {
+        push_drift_reason(&mut drift_reasons, ConfigDriftReason::WrongBearerHeader);
     }
 
     if let Some(expected) = expected_startup_timeout {
@@ -2540,6 +3028,7 @@ fn primary_drift_reason(reasons: &[ConfigDriftReason]) -> ConfigDriftReason {
         ConfigDriftReason::MissingFile,
         ConfigDriftReason::MissingServerEntry,
         ConfigDriftReason::DuplicateServerEntries,
+        ConfigDriftReason::DisabledServer,
         ConfigDriftReason::LegacyStdio,
         ConfigDriftReason::StaleHttpPath,
         ConfigDriftReason::WrongBearerHeader,
@@ -2736,6 +3225,15 @@ fn normalize_status_url_path(path: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn setup_real_tempdir() -> tempfile::TempDir {
+        let temp_root =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+        tempfile::Builder::new()
+            .prefix("mcp-agent-mail-setup-")
+            .tempdir_in(temp_root)
+            .expect("setup temp directory")
+    }
 
     enum EnvVarPrevious {
         Missing,
@@ -3059,7 +3557,7 @@ mod tests {
     /// must be covered by the gitignore `run_setup` generates.
     #[test]
     fn run_setup_gitignore_covers_every_emitted_token_bearing_file() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let params = SetupParams {
             host: "127.0.0.1".into(),
             port: 8765,
@@ -3110,6 +3608,69 @@ mod tests {
                 "gitignore must cover {expected}: {gitignore}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_setup_refuses_project_secret_when_gitignore_cannot_be_secured() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = setup_real_tempdir();
+        let outside = tmp.path().join("outside-gitignore");
+        std::fs::write(&outside, "sentinel\n").unwrap();
+        symlink(&outside, tmp.path().join(".gitignore")).unwrap();
+        let params = SetupParams {
+            token: "live-secret-token".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+
+        let results = run_setup(&params);
+        assert!(matches!(
+            results[0].actions[0].outcome,
+            ActionOutcome::Failed(_)
+        ));
+        assert!(!tmp.path().join(".omp/mcp.json").exists());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel\n");
+    }
+
+    #[test]
+    fn run_setup_gitignores_project_local_omp_agent_dir_override() {
+        let tmp = setup_real_tempdir();
+        let override_path = tmp.path().join("custom-agent/mcp.json");
+        let params = SetupParams {
+            token: "live-secret-token".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            omp_user_config_path_override: Some(override_path.clone()),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: false,
+            skip_hooks: true,
+            ..Default::default()
+        };
+
+        let results = run_setup(&params);
+        assert!(
+            results[0]
+                .actions
+                .iter()
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(
+            gitignore
+                .lines()
+                .any(|line| line == "custom-agent/mcp.json")
+        );
+        assert!(
+            std::fs::read_to_string(override_path)
+                .unwrap()
+                .contains("Bearer live-secret-token")
+        );
     }
 
     /// `project_local_secret_files()` must list exactly the project-dir files
@@ -3272,10 +3833,93 @@ mod tests {
                     assert_eq!(server_value["type"], "http");
                     assert_eq!(server_value["url"], "http://127.0.0.1:8765/mcp/");
                     assert_eq!(server_value["headers"]["Authorization"], "Bearer tok");
+                    assert_eq!(server_value["enabled"], true);
                 }
                 _ => panic!("expected OMP JsonMerge action"),
             }
         }
+    }
+
+    #[test]
+    fn omp_setup_reenables_entry_and_removes_profile_denylist_aliases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // macOS exposes its default temporary directory through the `/var`
+        // compatibility symlink, which the production writer intentionally
+        // refuses to traverse. Exercise the writer through the real path.
+        let tmp_root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        let project_dir = tmp_root.join("project");
+        let config_path = project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config parent");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "disabledServers": ["other", "mcp_agent_mail", "mcp-agent-mail"],
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/api/",
+      "enabled": "false",
+      "timeout": 45000,
+      "requestIdFormat": "string",
+      "headers": {
+        "authorization": "Bearer stale",
+        "X-Trace": "preserve-me"
+      }
+    },
+    "sibling": {"command": "node"}
+  },
+  "servers": {
+    "mcp_agent_mail": {"command": "legacy-agent-mail", "args": []},
+    "legacy-sibling": {"command": "node"}
+  }
+}
+"#,
+        )
+        .expect("write disabled OMP config");
+
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir,
+            home_dir_override: Some(tmp_root.join("home")),
+            skip_user_config: true,
+            ..Default::default()
+        };
+        let action = AgentPlatform::Omp
+            .config_actions(&params)
+            .into_iter()
+            .next()
+            .expect("OMP project action");
+        assert_eq!(
+            write_config_atomic(&action).expect("write config"),
+            ActionOutcome::Updated
+        );
+
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("read updated config"),
+        )
+        .expect("parse updated config");
+        assert_eq!(
+            doc["mcpServers"]["mcp-agent-mail"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(doc["mcpServers"]["mcp-agent-mail"]["timeout"], 45000);
+        assert_eq!(
+            doc["mcpServers"]["mcp-agent-mail"]["requestIdFormat"],
+            "string"
+        );
+        assert_eq!(
+            doc["mcpServers"]["mcp-agent-mail"]["headers"],
+            json!({"Authorization": "Bearer tok", "X-Trace": "preserve-me"})
+        );
+        assert_eq!(doc["mcpServers"]["sibling"]["command"], "node");
+        assert!(doc["servers"].get("mcp_agent_mail").is_none());
+        assert_eq!(doc["servers"]["legacy-sibling"]["command"], "node");
+        assert_eq!(doc["disabledServers"], json!(["other"]));
+        assert_eq!(
+            write_config_atomic(&action).expect("idempotent rewrite"),
+            ActionOutcome::Unchanged
+        );
     }
 
     #[test]
@@ -3547,7 +4191,7 @@ mod tests {
 
     #[test]
     fn write_config_atomic_creates_parent_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let deep = tmp.path().join("a").join("b").join("c").join("config.json");
         let action = ConfigAction {
             platform: AgentPlatform::Cursor,
@@ -3567,7 +4211,7 @@ mod tests {
 
     #[test]
     fn write_config_atomic_backs_up_existing() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let path = tmp.path().join("config.json");
         std::fs::write(&path, r#"{"old": true}"#).unwrap();
 
@@ -3591,12 +4235,116 @@ mod tests {
         assert_eq!(entries.len(), 1, "should have one backup file");
     }
 
+    #[test]
+    fn write_config_atomic_refuses_to_overwrite_non_utf8_config() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        let original = [0xff, 0xfe, 0xfd];
+        std::fs::write(&path, original).unwrap();
+
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: path.clone(),
+            description: "test".into(),
+            content: ConfigContent::JsonFull(json!({"new": true})),
+            permissions: 0o600,
+            backup: true,
+        };
+        let error = write_config_atomic(&action).expect_err("invalid UTF-8 must fail closed");
+
+        assert!(matches!(
+            error,
+            SetupError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_never_widens_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, r#"{"old": true}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: path.clone(),
+            description: "test".into(),
+            content: ConfigContent::JsonFull(json!({"new": true})),
+            permissions: 0o644,
+            backup: true,
+        };
+        assert_eq!(
+            write_config_atomic(&action).unwrap(),
+            ActionOutcome::Updated
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let backup = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .expect("backup file");
+        assert_eq!(
+            backup.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_tightens_permissions_even_when_content_is_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: path.clone(),
+            description: "test".into(),
+            content: ConfigContent::JsonFull(json!({"secret": "value"})),
+            permissions: 0o600,
+            backup: true,
+        };
+        assert_eq!(
+            write_config_atomic(&action).unwrap(),
+            ActionOutcome::Created
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            write_config_atomic(&action).unwrap(),
+            ActionOutcome::Updated,
+            "permission repair is a material update even when bytes already match"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let backups = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            backups[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_config_atomic_rejects_symlinked_target() {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let outside = tmp.path().join("outside.json");
         let linked = tmp.path().join("config.json");
         std::fs::write(&outside, r#"{"outside": true}"#).unwrap();
@@ -3624,7 +4372,7 @@ mod tests {
     fn write_config_atomic_rejects_symlinked_parent_directory() {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let outside_dir = tmp.path().join("outside");
         let linked_dir = tmp.path().join("linked");
         std::fs::create_dir(&outside_dir).unwrap();
@@ -3650,7 +4398,7 @@ mod tests {
 
     #[test]
     fn write_config_atomic_unchanged_noop() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let path = tmp.path().join("config.json");
 
         // Write initial via merge
@@ -3730,7 +4478,7 @@ mod tests {
 
     #[test]
     fn save_token_to_env_file_creates() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let env_path = tmp.path().join(".env");
         save_token_to_env_file(&env_path, "my-token-123").unwrap();
         let content = std::fs::read_to_string(&env_path).unwrap();
@@ -3739,7 +4487,7 @@ mod tests {
 
     #[test]
     fn save_token_to_env_file_updates() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let env_path = tmp.path().join(".env");
         let mut f = std::fs::File::create(&env_path).unwrap();
         writeln!(f, "OTHER=value").unwrap();
@@ -3758,10 +4506,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn save_token_to_env_file_replaces_hard_link_without_mutating_peer() {
+        let tmp = setup_real_tempdir();
+        let outside = tmp.path().join("outside.env");
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&outside, "HTTP_BEARER_TOKEN=outside\n").unwrap();
+        std::fs::hard_link(&outside, &env_path).unwrap();
+
+        save_token_to_env_file(&env_path, "new-token").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "HTTP_BEARER_TOKEN=outside\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env_path).unwrap(),
+            "HTTP_BEARER_TOKEN=new-token\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn save_token_to_env_file_rejects_symlinked_target() {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let outside = tmp.path().join("outside.env");
         let linked = tmp.path().join(".env");
         std::fs::write(&outside, "HTTP_BEARER_TOKEN=outside\n").unwrap();
@@ -3781,7 +4550,7 @@ mod tests {
     fn save_token_to_env_file_rejects_symlinked_parent_directory() {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let outside_dir = tmp.path().join("outside");
         let linked_dir = tmp.path().join("linked");
         std::fs::create_dir(&outside_dir).unwrap();
@@ -3799,7 +4568,7 @@ mod tests {
 
     #[test]
     fn gitignore_append_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let gi = tmp.path().join(".gitignore");
         std::fs::write(&gi, ".env\n").unwrap();
 
@@ -3822,7 +4591,7 @@ mod tests {
     fn ensure_gitignore_entries_rejects_symlinked_target() {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let outside = tmp.path().join("outside-gitignore");
         let linked = tmp.path().join(".gitignore");
         std::fs::write(&outside, ".env\n").unwrap();
@@ -3839,7 +4608,7 @@ mod tests {
     fn ensure_gitignore_entries_rejects_symlinked_parent_directory() {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let outside_dir = tmp.path().join("outside");
         let linked_dir = tmp.path().join("linked");
         std::fs::create_dir(&outside_dir).unwrap();
@@ -4241,7 +5010,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn save_token_to_env_file_appends_when_no_existing_token() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let env_path = tmp.path().join(".env");
         std::fs::write(&env_path, "OTHER=value\n").unwrap();
         save_token_to_env_file(&env_path, "new-token").unwrap();
@@ -4253,7 +5022,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn save_token_to_env_file_creates_parent_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let env_path = tmp.path().join("deep").join("nested").join(".env");
         save_token_to_env_file(&env_path, "tok").unwrap();
         assert!(env_path.exists());
@@ -4263,7 +5032,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn ensure_gitignore_entries_creates_new_file() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let gi = tmp.path().join(".gitignore");
         let changed = ensure_gitignore_entries(&gi, &[".env", "*.log"]).unwrap();
         assert!(changed);
@@ -4274,7 +5043,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn ensure_gitignore_entries_no_trailing_newline_handled() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let gi = tmp.path().join(".gitignore");
         std::fs::write(&gi, "existing").unwrap(); // no trailing newline
         let changed = ensure_gitignore_entries(&gi, &[".env"]).unwrap();
@@ -4354,7 +5123,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn run_setup_creates_gitignore_entries() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let home = tmp.path().join("home");
         // Cline writes a token-bearing project-local file (cline.mcp.json) that
         // must be gitignored; pair it with Claude to exercise both.
@@ -4514,7 +5283,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn check_status_reports_ok_for_all_supported_platforms_in_temp_config_homes() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = setup_real_tempdir();
         let project_dir = tmp.path().join("project");
         let home_dir = tmp.path().join("home");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -4577,6 +5346,130 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
+    fn check_status_reports_omp_disablement_even_when_transport_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            r#"{
+  "disabledServers": ["mcp-agent-mail"],
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"},
+      "enabled": "0"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let file = first_setup_status_file(&params);
+        assert!(file.url_matches);
+        assert_eq!(file.primary_drift_reason, ConfigDriftReason::DisabledServer);
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::DisabledServer)
+        );
+        assert_eq!(file.risk, ConfigDriftRisk::Medium);
+        assert!(file.remediation.contains("am setup run --yes"));
+    }
+
+    #[test]
+    fn check_status_rejects_legacy_only_omp_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            r#"{
+  "servers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"}
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let file = first_setup_status_file(&params);
+        assert!(!file.has_server_entry);
+        assert!(!file.url_matches);
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::MissingServerEntry
+        );
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::MissingServerEntry)
+        );
+    }
+
+    #[test]
+    fn check_status_uses_only_omp_native_entry_for_url_and_auth_health() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:9999/wrong/",
+      "headers": {"Authorization": "Bearer stale"},
+      "enabled": true
+    }
+  },
+  "servers": {
+    "mcp_agent_mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"}
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let file = first_setup_status_file(&params);
+        assert!(
+            !file.url_matches,
+            "ignored legacy entry must not satisfy URL health"
+        );
+        assert_eq!(
+            file.actual_url.as_deref(),
+            Some("http://127.0.0.1:9999/wrong/")
+        );
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::DuplicateServerEntries)
+        );
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::StaleHttpPath)
+        );
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::WrongBearerHeader)
+        );
+        assert_eq!(
+            file.current_entry
+                .as_ref()
+                .and_then(|entry| entry.get("container"))
+                .and_then(Value::as_str),
+            Some("mcpServers")
+        );
+    }
+
+    #[test]
     fn check_status_reports_legacy_stdio_drift() {
         let tmp = tempfile::tempdir().unwrap();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
@@ -4636,6 +5529,29 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
+    fn check_status_reports_unexpected_bearer_header_in_no_auth_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
+        params.token.clear();
+        std::fs::write(
+            params.project_dir.join("cline.mcp.json"),
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"authorization":"Bearer stale"}}}}"#,
+        )
+        .unwrap();
+
+        let file = first_setup_status_file(&params);
+
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::WrongBearerHeader
+        );
+        assert!(file.url_matches);
+        let serialized = serde_json::to_string(&file).unwrap();
+        assert!(serialized.contains("Bearer <redacted>"));
+        assert!(!serialized.contains("Bearer stale"));
+    }
+
+    #[test]
     fn check_status_reports_duplicate_server_entries_drift() {
         let tmp = tempfile::tempdir().unwrap();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Cline);
@@ -4674,6 +5590,54 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(!merged.contains("mcp-agent-mail"));
         assert!(merged.contains("url = \"http://127.0.0.1:8765/mcp/\""));
         assert!(merged.contains("startup_timeout_sec = 15"));
+    }
+
+    #[test]
+    fn setup_toml_http_migration_removes_stale_transport_and_auth_keys() {
+        let merged = merge_toml_section(
+            Some(
+                "[mcp_servers.mcp_agent_mail]\n\
+                 command = \"mcp-agent-mail\"\n\
+                 args = [\"serve\"]\n\
+                 cwd = \"/stale\"\n\
+                 env = { TOKEN = \"stale\" }\n\
+                 transport = \"stdio\"\n\
+                 http_headers = { Authorization = \"Bearer stale\" }\n\
+                 env_http_headers = { Authorization = \"TOKEN_ENV\" }\n\
+                 bearer_token_env_var = \"TOKEN_ENV\"\n\
+                 tool_timeout_sec = 45\n",
+            ),
+            "[mcp_servers.mcp_agent_mail]",
+            &[
+                (
+                    "url".to_string(),
+                    "\"http://127.0.0.1:8765/mcp/\"".to_string(),
+                ),
+                ("startup_timeout_sec".to_string(), "30".to_string()),
+            ],
+        );
+
+        for stale_key in [
+            "command",
+            "args",
+            "cwd",
+            "env",
+            "transport",
+            "http_headers",
+            "env_http_headers",
+            "bearer_token_env_var",
+        ] {
+            assert!(
+                !merged.lines().any(|line| {
+                    line.split_once('=')
+                        .is_some_and(|(key, _)| key.trim() == stale_key)
+                }),
+                "stale setup-owned key remained: {stale_key}\n{merged}"
+            );
+        }
+        assert!(merged.contains("url = \"http://127.0.0.1:8765/mcp/\""));
+        assert!(merged.contains("startup_timeout_sec = 30"));
+        assert!(merged.contains("tool_timeout_sec = 45"));
     }
 
     #[test]

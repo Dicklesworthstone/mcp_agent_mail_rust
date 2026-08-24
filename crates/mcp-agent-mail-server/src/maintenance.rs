@@ -94,8 +94,20 @@ pub enum MaintenanceObservedEffect {
 enum RecordedProcessLiveness {
     Alive,
     Dead,
+    #[cfg(target_os = "linux")]
     Reused,
     Unknown,
+}
+
+impl RecordedProcessLiveness {
+    const fn safe_to_reap(self) -> bool {
+        match self {
+            Self::Dead => true,
+            #[cfg(target_os = "linux")]
+            Self::Reused => true,
+            Self::Alive | Self::Unknown => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -618,11 +630,11 @@ fn recorded_process_liveness(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-        return match status {
+        match status {
             Ok(status) if status.success() => RecordedProcessLiveness::Alive,
             Ok(_) => RecordedProcessLiveness::Dead,
             Err(_) => RecordedProcessLiveness::Unknown,
-        };
+        }
     }
 }
 
@@ -1075,10 +1087,7 @@ fn preflight_maintenance_lock(git_dir: &Path) -> MaintenanceLockPreflight {
     };
 
     let liveness = recorded_process_liveness(&evidence);
-    if !matches!(
-        liveness,
-        RecordedProcessLiveness::Dead | RecordedProcessLiveness::Reused
-    ) {
+    if !liveness.safe_to_reap() {
         return MaintenanceLockPreflight {
             evidence: Some(format!(
                 "maintenance lock at {} belongs to {evidence_kind} git pid {} ({liveness:?}); not reaping",

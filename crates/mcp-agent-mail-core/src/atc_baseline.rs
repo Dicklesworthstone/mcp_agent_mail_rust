@@ -62,11 +62,11 @@ use serde::{Deserialize, Serialize};
 /// Release:         100      20       1
 /// ```
 ///
-/// **Key asymmetry**: Releasing an alive agent (100) costs 100x more
-/// than failing to release a dead agent (1). This reflects extreme
-/// reluctance to destroy work — the system strongly prefers false
-/// negatives (missing a dead agent) over false positives (wrongly
-/// releasing a live one).
+/// **Key asymmetry**: Releasing an alive agent (100) costs 2x more
+/// than declaring a dead agent alive (50). This reflects strong
+/// reluctance to destroy work — the system prefers false negatives
+/// (missing a dead agent) over false positives (wrongly releasing a
+/// live one).
 pub const BASELINE_LIVENESS_LOSSES: [[f64; 3]; 3] = [
     // [Alive, Flaky, Dead]
     [0.0, 3.0, 50.0],   // DeclareAlive
@@ -300,12 +300,12 @@ pub struct EffectCostAsymmetry {
 
 /// Pre-learning cost asymmetries per effect type.
 pub const BASELINE_COST_ASYMMETRIES: &[EffectCostAsymmetry] = &[
-    // ReleaseReservations on Alive agent (100) vs not releasing Dead (1)
+    // ReleaseReservations on Alive agent (100) vs DeclareAlive on Dead (50)
     EffectCostAsymmetry {
         effect: "ReleaseReservations",
         false_positive_cost: 100.0,
-        false_negative_cost: 1.0,
-        asymmetry_ratio: 100.0,
+        false_negative_cost: 50.0,
+        asymmetry_ratio: 2.0,
     },
     // ForceReservation on NoConflict (12) vs ignoring SevereCollision (100)
     // NOTE: conflict is OPPOSITE — false negatives are more expensive
@@ -429,8 +429,8 @@ mod tests {
     }
 
     #[test]
-    fn liveness_asymmetry_extreme_reluctance() {
-        // False positive (release alive) should be 100x false negative (miss dead)
+    fn liveness_asymmetry_favors_false_negatives() {
+        // False positive (release alive) should exceed false negative (miss dead).
         let release_alive = BASELINE_LIVENESS_LOSSES[2][0]; // Release, Alive
         let miss_dead = BASELINE_LIVENESS_LOSSES[0][2]; // DeclareAlive, Dead
         assert!(
@@ -464,7 +464,13 @@ mod tests {
     fn cost_asymmetries_consistent_with_loss_matrices() {
         let release = &BASELINE_COST_ASYMMETRIES[0];
         assert_eq!(release.effect, "ReleaseReservations");
-        assert!((release.asymmetry_ratio - 100.0).abs() < f64::EPSILON);
+        assert_eq!(release.false_positive_cost, BASELINE_LIVENESS_LOSSES[2][0]);
+        assert_eq!(release.false_negative_cost, BASELINE_LIVENESS_LOSSES[0][2]);
+        assert!(
+            (release.asymmetry_ratio - release.false_positive_cost / release.false_negative_cost)
+                .abs()
+                < f64::EPSILON
+        );
 
         let force = &BASELINE_COST_ASYMMETRIES[1];
         assert_eq!(force.effect, "ForceReservation");

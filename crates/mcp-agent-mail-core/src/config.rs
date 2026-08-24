@@ -1091,25 +1091,34 @@ pub fn is_running_under_cargo_test_harness() -> bool {
     // `am` / `mcp-agent-mail` binaries live one level up in `<target>/<profile>/`
     // (or an install dir like `~/.local/bin`), so a `current_exe` whose immediate
     // parent directory is `deps` is a cargo test/bench binary — never production.
-    current_exe_is_in_cargo_deps_dir()
+    current_exe_is_cargo_test_artifact()
 }
 
-/// True when the running executable is a cargo-compiled test/bench binary
+/// True when this crate is compiled as a unit-test harness or the running
+/// executable has Cargo's conventional test/bench artifact layout
 /// (`<target>/<profile>/deps/<name>-<hash>`).
 ///
 /// Marker-independent fallback for [`is_running_under_cargo_test_harness`] so
 /// `cargo test --lib` unit tests — which set none of the harness env markers —
 /// are still guarded against writing to the default user archive (br-3jkqw).
-/// Robust to a renamed `CARGO_TARGET_DIR` (only the fixed `deps` leaf matters)
-/// and false-positive safe: production binaries never live directly under a
-/// `deps` directory.
+/// Robust to custom/remote runners that relocate unit-test binaries and to a
+/// renamed `CARGO_TARGET_DIR` (only the fixed `deps` leaf matters for dependent
+/// integration-test artifacts). Production binaries are compiled without
+/// `cfg(test)` and never live directly under a `deps` directory.
 ///
 /// `AM_ASSUME_PRODUCTION_EXE` is a test-only escape hatch that forces `false` so
 /// the production-path guard test can be exercised from within a (necessarily
 /// `deps`-hosted) test binary. It must never be set outside tests.
-fn current_exe_is_in_cargo_deps_dir() -> bool {
+fn current_exe_is_cargo_test_artifact() -> bool {
     if env_truthy("AM_ASSUME_PRODUCTION_EXE") {
         return false;
+    }
+    // Unit-test binaries are not guaranteed to execute directly from a
+    // `deps/` directory. Remote-build artifact retrieval and custom Cargo
+    // runners may relocate them under `build/<hash>/out/`. The compile-time
+    // harness bit is authoritative and leaves production builds unchanged.
+    if cfg!(test) {
+        return true;
     }
     std::env::current_exe()
         .ok()
@@ -2762,7 +2771,7 @@ impl Config {
             // and AM_ATC_EXECUTOR_MODE (default Live) — NOT by atc_write_mode.
             // Setting only the write mode silently leaves the Live operator
             // churning the ledger, whose index corrupts under sustained load.
-            // Force the master gate off so the documented switch truly stops it.
+            // Force the top-level gate off so the documented switch truly stops it.
             config.atc_write_mode = AtcWriteMode::Off;
             config.atc_enabled = false;
         }

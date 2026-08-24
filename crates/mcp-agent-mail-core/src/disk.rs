@@ -473,31 +473,30 @@ pub fn sample_disk(config: &Config) -> DiskSample {
 ///
 /// See: <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/17>
 #[must_use]
+#[cfg(target_os = "linux")]
 pub fn read_proc_io_bytes() -> (u64, u64) {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(content) = std::fs::read_to_string("/proc/self/io") else {
-            return (0, 0);
-        };
+    let Ok(content) = std::fs::read_to_string("/proc/self/io") else {
+        return (0, 0);
+    };
 
-        let mut read_bytes = 0u64;
-        let mut write_bytes = 0u64;
+    let mut read_bytes = 0u64;
+    let mut write_bytes = 0u64;
 
-        for line in content.lines() {
-            if let Some(val) = line.strip_prefix("read_bytes: ") {
-                read_bytes = val.trim().parse().unwrap_or(0);
-            } else if let Some(val) = line.strip_prefix("write_bytes: ") {
-                write_bytes = val.trim().parse().unwrap_or(0);
-            }
+    for line in content.lines() {
+        if let Some(val) = line.strip_prefix("read_bytes: ") {
+            read_bytes = val.trim().parse().unwrap_or(0);
+        } else if let Some(val) = line.strip_prefix("write_bytes: ") {
+            write_bytes = val.trim().parse().unwrap_or(0);
         }
-
-        (read_bytes, write_bytes)
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        (0, 0)
-    }
+    (read_bytes, write_bytes)
+}
+
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn read_proc_io_bytes() -> (u64, u64) {
+    (0, 0)
 }
 
 /// Sample disk space and update core system metrics gauges.

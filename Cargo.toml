@@ -112,7 +112,9 @@ proptest = "1"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
 fs2 = "0.4"
 walkdir = "2"
-tantivy = "0.26.1"
+# Tantivy 0.26.1 pins lru 0.16.x, which is affected by RUSTSEC-2026-0253.
+# Use the same immutable 0.27 commit as frankensearch; it carries lru 0.18.2.
+tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "1f32c1a8af0eb9d68bd3f5576caf20941364b657" }
 indexmap = "2"
 nix = "0.31.3"
 signal-hook = "0.4.4"

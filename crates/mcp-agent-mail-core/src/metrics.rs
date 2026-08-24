@@ -927,7 +927,7 @@ pub fn read_fd_limits() -> (Option<u64>, Option<u64>) {
 /// Read the soft/hard `RLIMIT_NOFILE` for the current process (non-Linux stub).
 #[must_use]
 #[cfg(not(target_os = "linux"))]
-pub fn read_fd_limits() -> (Option<u64>, Option<u64>) {
+pub const fn read_fd_limits() -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
@@ -946,7 +946,7 @@ pub fn count_open_fds() -> Option<u64> {
 /// Count open file descriptors for the current process (non-Linux stub).
 #[must_use]
 #[cfg(not(target_os = "linux"))]
-pub fn count_open_fds() -> Option<u64> {
+pub const fn count_open_fds() -> Option<u64> {
     None
 }
 

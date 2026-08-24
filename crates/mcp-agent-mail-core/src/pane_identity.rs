@@ -536,7 +536,7 @@ pub fn resolve_identity_with_binding(
     // 3. Legacy NTM path: /tmp/agent-mail-name.<project_hash>.<pane_id>
     let hash = project_hash(project_key);
     let sanitized = sanitize_pane_id(pane_id);
-    let legacy_ntm = PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{sanitized}"));
+    let legacy_ntm = legacy_ntm_root().join(format!("agent-mail-name.{hash}.{sanitized}"));
     if let Some(hit) = resolver.consider(legacy_ntm) {
         return Some(hit);
     }
@@ -548,7 +548,7 @@ pub fn resolve_identity_with_binding(
         let bare_sanitized = sanitize_pane_id(bare.trim());
         if bare_sanitized != sanitized {
             let legacy_ntm_bare =
-                PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{bare_sanitized}"));
+                legacy_ntm_root().join(format!("agent-mail-name.{hash}.{bare_sanitized}"));
             if let Some(hit) = resolver.consider(legacy_ntm_bare) {
                 return Some(hit);
             }
@@ -556,6 +556,10 @@ pub fn resolve_identity_with_binding(
     }
 
     None
+}
+
+fn legacy_ntm_root() -> PathBuf {
+    std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
 /// Classify which identity-file convention produced a resolved path.
@@ -589,7 +593,7 @@ pub fn identity_source_category(path: &Path) -> &'static str {
         .file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| name.starts_with("agent-mail-name."));
-    if is_ntm_name && path.starts_with("/tmp") {
+    if is_ntm_name && (path.starts_with("/tmp") || path.starts_with(legacy_ntm_root())) {
         return "legacy-ntm";
     }
     "compatible"
@@ -681,6 +685,9 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
     };
 
     for entry in entries.flatten() {
+        if identity_entry_is_internal(&entry) {
+            continue;
+        }
         if identity_entry_is_stale(&entry, &live_panes) {
             let path = entry.path();
             if dir_entry_is_real_file(&entry) && std::fs::remove_file(&path).is_ok() {
@@ -722,6 +729,9 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
             continue;
         };
         for file_entry in files.flatten() {
+            if identity_entry_is_internal(&file_entry) {
+                continue;
+            }
             if identity_entry_is_stale(&file_entry, &live_panes) {
                 let path = file_entry.path();
                 if dir_entry_is_real_file(&file_entry) && std::fs::remove_file(&path).is_ok() {
@@ -769,6 +779,9 @@ pub fn list_identities_with_paths(project_key: &str) -> Vec<(String, String, Pat
     };
 
     for entry in entries.flatten() {
+        if identity_entry_is_internal(&entry) {
+            continue;
+        }
         let pane_id = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
         if let Some(name) = read_identity_file(&path) {
@@ -797,6 +810,10 @@ fn dir_entry_is_real_directory(entry: &std::fs::DirEntry) -> bool {
 
 fn dir_entry_is_real_file(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|file_type| file_type.is_file())
+}
+
+fn identity_entry_is_internal(entry: &std::fs::DirEntry) -> bool {
+    entry.file_name().to_string_lossy().starts_with('.')
 }
 
 fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
@@ -1219,20 +1236,116 @@ fn read_identity_file_no_follow(path: &Path) -> std::io::Result<String> {
 #[cfg(unix)]
 fn write_identity_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?;
-    file.write_all(content)
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_real_directory(parent)?;
+    validate_identity_file_target(path)?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("pane identity path must name a file: {}", path.display()),
+        )
+    })?;
+    let pid = std::process::id();
+    let now = crate::timestamps::now_micros();
+    let mut temp_file = None;
+    for attempt in 0..1024 {
+        let temp_path = parent.join(format!(
+            ".{}.{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            pid,
+            now,
+            attempt
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+        }
+        match options.open(&temp_path) {
+            Ok(file) => {
+                temp_file = Some((temp_path, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let Some((temp_path, mut file)) = temp_file else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "could not create a unique pane identity temporary file next to {}",
+                path.display()
+            ),
+        ));
+    };
+
+    file.write_all(content)?;
+    file.sync_all()?;
+    drop(file);
+
+    // Revalidate immediately before the atomic replace. On Unix, rename
+    // replaces a leaf symlink rather than following it; the parent check also
+    // catches a directory swap that completed before this validation.
+    if path_has_symlinked_parent(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing symlinked pane identity directory for {}",
+                path.display()
+            ),
+        ));
+    }
+    validate_identity_file_target(path)?;
+    std::fs::rename(&temp_path, path)?;
+    // The file contents were synced above; syncing the containing directory
+    // makes the rename durable across a sudden power loss as well.
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
 fn write_identity_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, content)
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_real_directory(parent)?;
+    validate_identity_file_target(path)?;
+
+    // `std::fs::rename` cannot atomically replace an existing destination on
+    // every non-Unix platform. Preserve the pre-existing portable behavior
+    // instead of making identity refreshes fail after their first write.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(content)?;
+    file.sync_all()
+}
+
+fn validate_identity_file_target(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite symlinked pane identity {}",
+                path.display()
+            ),
+        )),
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("pane identity target is not a file: {}", path.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[must_use]
@@ -1486,6 +1599,15 @@ mod tests {
 
     static TEST_CONFIG_BASE_DIR_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    fn identity_real_tempdir() -> tempfile::TempDir {
+        let temp_root =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+        tempfile::Builder::new()
+            .prefix("mcp-agent-mail-pane-identity-")
+            .tempdir_in(temp_root)
+            .expect("pane identity temp directory")
+    }
+
     struct IsolatedConfigBaseDir {
         _guard: MutexGuard<'static, ()>,
         tempdir: tempfile::TempDir,
@@ -1496,7 +1618,11 @@ mod tests {
             let guard = TEST_CONFIG_BASE_DIR_SERIAL
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let tempdir = tempfile::tempdir().expect("temp config dir");
+            // On macOS, `std::env::temp_dir()` commonly resolves through the
+            // `/var` -> `/private/var` compatibility symlink. Production code
+            // deliberately rejects symlinked config-directory components, so
+            // create the fixture beneath the canonical temp root.
+            let tempdir = identity_real_tempdir();
             set_test_config_base_dir(Some(tempdir.path().to_path_buf()));
             Self {
                 _guard: guard,
@@ -1729,7 +1855,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_test_config_base_dir(None);
 
-        let tmp = tempfile::tempdir().expect("temp home");
+        let tmp = identity_real_tempdir();
         let home = tmp.path().join("home");
         let home_text = home.to_string_lossy().into_owned();
         let identity_dir = home.join(".claude").join("agent-mail");
@@ -1752,7 +1878,7 @@ mod tests {
 
     #[test]
     fn write_then_resolve_roundtrip() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = identity_real_tempdir();
         // Override config dir by writing directly to a temp path
         let identity_dir = tmp.path().join("agent-mail/identity");
         let hash = project_hash("/data/test-project");
@@ -1912,6 +2038,53 @@ mod tests {
         assert!(
             entries.iter().any(|(p, n)| p == "99" && n == "RedFox"),
             "expected RedFox entry: {entries:?}"
+        );
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_identity_replacement_leaves_one_complete_visible_record() {
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("atomic-replace-project");
+        let pane = "%99";
+        let path = write_identity(&unique_key, pane, "RedFox").expect("initial identity");
+        write_identity(&unique_key, pane, "BlueLake").expect("replace identity");
+
+        let record = read_identity_record(&path).expect("complete replacement record");
+        assert_eq!(record.name, "BlueLake");
+        let parent = path.parent().expect("identity parent");
+        let names = std::fs::read_dir(parent)
+            .expect("read identity parent")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["99"]);
+        assert_eq!(
+            list_identities(&unique_key),
+            vec![("99".into(), "BlueLake".into())]
+        );
+        drop(config);
+    }
+
+    #[test]
+    fn list_identities_ignores_internal_atomic_write_artifacts() {
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("internal-artifact-project");
+        let real_path = write_identity(&unique_key, "%4", "RedFox").expect("write identity");
+        std::fs::write(
+            real_path
+                .parent()
+                .expect("identity parent")
+                .join(".4.123.456.0.tmp"),
+            r#"{"name":"PhantomAgent"}
+"#,
+        )
+        .expect("write simulated interrupted temporary file");
+
+        assert_eq!(
+            list_identities(&unique_key),
+            vec![("4".into(), "RedFox".into())]
         );
         drop(config);
     }
@@ -2197,7 +2370,7 @@ mod tests {
 
     #[test]
     fn resolve_identity_with_path_reports_legacy_ntm_path() {
-        let tmp = tempfile::tempdir().expect("temp project key");
+        let tmp = identity_real_tempdir();
         let unique_key = tmp
             .path()
             .join("legacy-project")
@@ -2206,7 +2379,7 @@ mod tests {
         let pane = "%42";
         let hash = project_hash(&unique_key);
         let sanitized = sanitize_pane_id(pane);
-        let legacy_ntm = PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{sanitized}"));
+        let legacy_ntm = legacy_ntm_root().join(format!("agent-mail-name.{hash}.{sanitized}"));
         std::fs::write(&legacy_ntm, "BlueLake\n").expect("write legacy identity");
 
         let resolved =

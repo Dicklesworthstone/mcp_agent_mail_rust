@@ -6,8 +6,8 @@
 //!
 //! `am serve-http` will refuse to start (or silently bind to a
 //! different port via fallback heuristics) when the configured
-//! HTTP host:port is already held by another process. Common
-//! culprits:
+//! HTTP host:port is invalid or already held by another process.
+//! Common culprits:
 //!
 //! - A leftover Python `mcp_agent_mail` from a previous
 //!   deployment (sibling FM:
@@ -18,10 +18,9 @@
 //! - An unrelated service that grabbed port 8765 (the default
 //!   `HTTP_PORT`).
 //!
-//! Without explicit detection, operators see a confusing
-//! "address already in use" inside `am serve` logs and waste
-//! cycles diagnosing PATH / config issues before realizing the
-//! port is foreign-held.
+//! Without explicit detection, operators see a late bind or
+//! address-resolution error inside `am serve` logs and waste
+//! cycles diagnosing unrelated PATH / client-config issues.
 //!
 //! ## Detection (pure function)
 //!
@@ -113,12 +112,31 @@ pub struct PortBoundByForeignProcessFinding {
 
 impl PortBoundByForeignProcessFinding {
     pub fn to_finding(&self) -> super::Finding {
-        let title = format!(
-            "Cannot bind {}:{} ({}); foreign process likely holds the port",
-            self.host,
-            self.port,
-            self.reason.as_kebab(),
-        );
+        let title = match self.reason {
+            Reason::AddrInUse => format!(
+                "Cannot bind {}:{} ({}); foreign process likely holds the port",
+                self.host,
+                self.port,
+                self.reason.as_kebab(),
+            ),
+            Reason::OtherBindError => format!(
+                "Cannot bind configured HTTP endpoint {}:{} ({})",
+                self.host,
+                self.port,
+                self.reason.as_kebab(),
+            ),
+        };
+        let investigation_commands = match self.reason {
+            Reason::AddrInUse => vec![
+                format!("ss -tlnp | grep ':{}'", self.port),
+                format!("lsof -i :{}", self.port),
+                format!("netstat -tlnp | grep ':{}'", self.port),
+            ],
+            Reason::OtherBindError => vec![
+                "Inspect HTTP_HOST and HTTP_PORT in $XDG_CONFIG_HOME/mcp-agent-mail/config.env"
+                    .to_string(),
+            ],
+        };
         super::Finding {
             id: FM_ID,
             severity: FM_SEVERITY,
@@ -137,11 +155,7 @@ impl PortBoundByForeignProcessFinding {
                 "reason": self.reason.as_kebab(),
                 "os_error": self.os_error,
                 "error_message": self.error_message,
-                "investigation_commands": [
-                    format!("ss -tlnp | grep ':{}'", self.port),
-                    format!("lsof -i :{}", self.port),
-                    format!("netstat -tlnp | grep ':{}'", self.port),
-                ],
+                "investigation_commands": investigation_commands,
             }),
             remediation: FindingRemediation {
                 command: format!("am doctor explain {FM_ID}"),
@@ -155,8 +169,9 @@ impl PortBoundByForeignProcessFinding {
     }
 
     pub fn manual_remediation_text(&self) -> String {
-        format!(
-            "Port {host}:{port} is held by another process. Investigate via:\n\
+        match self.reason {
+            Reason::AddrInUse => format!(
+                "Port {host}:{port} is held by another process. Investigate via:\n\
              \n  ss -tlnp | grep ':{port}'\n  lsof -i :{port}\n  netstat -tlnp | grep ':{port}'\n\
              \nOnce you identify the holder, you have three options:\n\
              \n  (a) Kill the foreign process if it's a stale `am`/`mcp-agent-mail`/python \
@@ -168,9 +183,20 @@ impl PortBoundByForeignProcessFinding {
              `fm-mcp-config-files-wrong-http-url-or-scheme`).\n\
              \nThe doctor REFUSES to auto-kill foreign processes — operators must explicitly \
              choose the right remediation.",
-            host = self.host,
-            port = self.port,
-        )
+                host = self.host,
+                port = self.port,
+            ),
+            Reason::OtherBindError => format!(
+                "The configured HTTP endpoint {host}:{port} could not be resolved or bound: \
+                 {error}. Validate HTTP_HOST and HTTP_PORT, then run `am doctor fix --only \
+                 {fm_id} --list` again. The doctor will not alter network configuration or kill \
+                 processes for this detect-only finding.",
+                host = self.host,
+                port = self.port,
+                error = self.error_message,
+                fm_id = FM_ID,
+            ),
+        }
     }
 }
 
@@ -185,11 +211,19 @@ pub struct DetectInputs {
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn health_probe_connect_host(host: &str) -> &str {
-    match host {
+    let normalized = socket_host(host);
+    match normalized {
         "" | "0.0.0.0" => "127.0.0.1",
         "::" => "::1",
-        _ => host,
+        _ => normalized,
     }
+}
+
+fn socket_host(host: &str) -> &str {
+    let host = host.trim();
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 fn health_probe_host_header(host: &str, port: u16) -> String {
@@ -198,6 +232,20 @@ fn health_probe_host_header(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+fn response_has_agent_mail_health_signature(response: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(response);
+    let mut lines = text.lines();
+    let status_ok = lines.next().and_then(|line| line.split_whitespace().nth(1)) == Some("200");
+    status_ok
+        && lines
+            .take_while(|line| !line.trim().is_empty())
+            .any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("x-agent-mail-health") && value.trim() == "1"
+                })
+            })
 }
 
 fn agent_mail_health_probe(host: &str, port: u16) -> bool {
@@ -237,8 +285,7 @@ fn agent_mail_health_probe(host: &str, port: u16) -> bool {
                 Err(_) => break,
             }
         }
-        let lower = String::from_utf8_lossy(&response).to_ascii_lowercase();
-        if lower.starts_with("http/1.1 200") && lower.contains("\r\nx-agent-mail-health: 1") {
+        if response_has_agent_mail_health_signature(&response) {
             return true;
         }
     }
@@ -260,15 +307,11 @@ pub fn detect(inputs: &DetectInputs) -> Vec<PortBoundByForeignProcessFinding> {
         return Vec::new();
     }
 
-    let mut addrs = match (inputs.host.as_str(), inputs.port).to_socket_addrs() {
-        Ok(it) => it,
-        Err(_) => return Vec::new(), // malformed host — different FM
-    };
-    let addr = match addrs.next() {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-    match TcpListener::bind(addr) {
+    // Pass the complete host/port pair so `TcpListener::bind` tries every
+    // resolved address, matching the real HTTP listener's bind semantics.
+    // Selecting only the first address can false-positive on hosts such as
+    // `localhost` when one address family is occupied but another is free.
+    match TcpListener::bind((socket_host(&inputs.host), inputs.port)) {
         Ok(_listener) => Vec::new(), // freed on drop here
         Err(e) => {
             let reason = if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -388,6 +431,22 @@ mod tests {
     }
 
     #[test]
+    fn health_signature_requires_exact_status_and_header_value() {
+        assert!(response_has_agent_mail_health_signature(
+            b"HTTP/1.1 200 OK\r\nX-Agent-Mail-Health: 1\r\n\r\n"
+        ));
+        assert!(!response_has_agent_mail_health_signature(
+            b"HTTP/1.1 200 OK\r\nX-Agent-Mail-Health: 10\r\n\r\n"
+        ));
+        assert!(!response_has_agent_mail_health_signature(
+            b"HTTP/1.1 2000 Odd\r\nX-Agent-Mail-Health: 1\r\n\r\n"
+        ));
+        assert!(!response_has_agent_mail_health_signature(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nx-agent-mail-health: 1"
+        ));
+    }
+
+    #[test]
     fn detector_handles_ipv6_loopback_host() {
         // Pass-35-review Gemini F2 (P0): pre-fix, `format!("{}:{}",
         // "::1", 8765).parse()` failed because IPv6 needs the
@@ -410,14 +469,30 @@ mod tests {
     }
 
     #[test]
-    fn detector_returns_empty_for_malformed_host() {
+    fn detector_flags_malformed_host_as_bind_error() {
         let inputs = DetectInputs {
             host: "not a valid hostname".to_string(),
             port: 8080,
         };
-        // Malformed host → parse fails → no finding (different
-        // FM owns the "invalid host config" surface).
-        assert!(detect(&inputs).is_empty());
+        let findings = detect(&inputs);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].reason, Reason::OtherBindError);
+        assert!(!findings[0].error_message.is_empty());
+    }
+
+    #[test]
+    fn detector_accepts_bracketed_ipv6_loopback_host() {
+        if TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let inputs = DetectInputs {
+            host: " [::1] ".to_string(),
+            port: 0,
+        };
+        assert!(
+            detect(&inputs).is_empty(),
+            "trimmed, bracketed IPv6 loopback port 0 should bind freely"
+        );
     }
 
     #[test]
@@ -476,5 +551,20 @@ mod tests {
         assert!(text.contains("(a) Kill"));
         assert!(text.contains("(b) Rebind"));
         assert!(text.contains("(c) If the holder is a legitimate service"));
+    }
+
+    #[test]
+    fn invalid_endpoint_remediation_does_not_claim_a_foreign_holder() {
+        let f = PortBoundByForeignProcessFinding {
+            host: "invalid host".to_string(),
+            port: 8765,
+            reason: Reason::OtherBindError,
+            os_error: None,
+            error_message: "failed to resolve".to_string(),
+        };
+        let text = f.manual_remediation_text();
+        assert!(text.contains("could not be resolved or bound"));
+        assert!(text.contains("Validate HTTP_HOST and HTTP_PORT"));
+        assert!(!text.contains("held by another process"));
     }
 }

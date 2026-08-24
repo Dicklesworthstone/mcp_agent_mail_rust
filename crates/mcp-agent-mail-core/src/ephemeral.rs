@@ -432,15 +432,24 @@ pub fn classify_ephemeral(
     let resolved =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let normalized = resolved.to_string_lossy().replace('\\', "/");
+    let raw_normalized = project_root.to_string_lossy().replace('\\', "/");
 
     // ---- Tier 1: System temp (path-based) ----
-    signals.path_tmp = normalized == "/tmp" || normalized.starts_with("/tmp/");
-    signals.path_var_tmp = normalized == "/var/tmp" || normalized.starts_with("/var/tmp/");
-    signals.path_dev_shm = normalized == "/dev/shm" || normalized.starts_with("/dev/shm/");
-    signals.path_private_tmp =
-        normalized == "/private/tmp" || normalized.starts_with("/private/tmp/");
-    signals.path_var_folders =
-        normalized == "/var/folders" || normalized.starts_with("/var/folders/");
+    signals.path_tmp = [raw_normalized.as_str(), normalized.as_str()]
+        .iter()
+        .any(|path| *path == "/tmp" || path.starts_with("/tmp/"));
+    signals.path_var_tmp = [raw_normalized.as_str(), normalized.as_str()]
+        .iter()
+        .any(|path| *path == "/var/tmp" || path.starts_with("/var/tmp/"));
+    signals.path_dev_shm = [raw_normalized.as_str(), normalized.as_str()]
+        .iter()
+        .any(|path| *path == "/dev/shm" || path.starts_with("/dev/shm/"));
+    signals.path_private_tmp = [raw_normalized.as_str(), normalized.as_str()]
+        .iter()
+        .any(|path| *path == "/private/tmp" || path.starts_with("/private/tmp/"));
+    signals.path_var_folders = [raw_normalized.as_str(), normalized.as_str()]
+        .iter()
+        .any(|path| *path == "/var/folders" || path.starts_with("/var/folders/"));
 
     // Also check std::env::temp_dir() at runtime (and its canonical target).
     // On this fleet TMPDIR is often `/data/tmp`, or `/tmp` is a symlink to

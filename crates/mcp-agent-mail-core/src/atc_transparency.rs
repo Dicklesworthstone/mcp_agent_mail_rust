@@ -470,7 +470,7 @@ pub struct MethodLedgerEntry {
 /// The complete method ledger for the ATC learning stack.
 ///
 /// Each entry ties a mathematical mechanism back to user value, safety,
-/// and explicit sunset criteria. This is the master reference for
+/// and explicit sunset criteria. This is the canonical reference for
 /// "why does this exist and when should we remove it?"
 pub const METHOD_LEDGER: &[MethodLedgerEntry] = &[
     MethodLedgerEntry {

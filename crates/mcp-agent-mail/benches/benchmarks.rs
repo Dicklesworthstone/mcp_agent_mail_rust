@@ -30,6 +30,15 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 
+fn benchmark_tempdir() -> TempDir {
+    let temp_root = std::fs::canonicalize(std::env::temp_dir())
+        .expect("canonicalize system temporary directory");
+    tempfile::Builder::new()
+        .prefix("mcp-agent-mail-benchmark-")
+        .tempdir_in(temp_root)
+        .expect("benchmark tempdir under canonical temporary root")
+}
+
 fn fixtures_path() -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR` is `crates/mcp-agent-mail` for this bench crate.
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -105,7 +114,7 @@ fn bench_tools(c: &mut Criterion) {
     }
 
     // Ensure DB is initialized before anything touches the pool cache.
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = benchmark_tempdir();
     let original_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(tmp.path()).expect("chdir to tempdir");
 
@@ -665,7 +674,7 @@ fn run_archive_harness_once() {
 
                 let mut samples_us: Vec<u64> = Vec::with_capacity(*ops);
                 for _ in 0..*ops {
-                    let tmp = TempDir::new().expect("tempdir");
+                    let tmp = benchmark_tempdir();
                     std::env::set_current_dir(tmp.path()).expect("chdir");
 
                     let mut config = mcp_agent_mail_core::Config::from_env();
@@ -771,7 +780,7 @@ fn run_archive_harness_once() {
                 continue;
             }
 
-            let tmp = TempDir::new().expect("tempdir");
+            let tmp = benchmark_tempdir();
             let original_cwd = std::env::current_dir().expect("cwd");
             std::env::set_current_dir(tmp.path()).expect("chdir");
 
@@ -1683,7 +1692,7 @@ fn run_archive_perf_profile_once_inner(force: bool) {
         ];
 
         for (batch_size, sample_count) in sample_counts {
-            let tmp = TempDir::new().expect("tempdir");
+            let tmp = benchmark_tempdir();
             let original_cwd = std::env::current_dir().expect("cwd");
             std::env::set_current_dir(tmp.path()).expect("chdir");
 
@@ -1865,7 +1874,7 @@ fn bench_archive_write(c: &mut Criterion) {
             &scenario,
             |b, &scenario| {
                 b.iter_custom(|iters| {
-                    let tmp = TempDir::new().expect("tempdir");
+                    let tmp = benchmark_tempdir();
                     let original_cwd = std::env::current_dir().expect("cwd");
                     std::env::set_current_dir(tmp.path()).expect("chdir");
 
@@ -2043,7 +2052,7 @@ fn bench_archive_write(c: &mut Criterion) {
             &scenario,
             |b, &scenario| {
                 b.iter_custom(|iters| {
-                    let tmp = TempDir::new().expect("tempdir");
+                    let tmp = benchmark_tempdir();
                     let original_cwd = std::env::current_dir().expect("cwd");
                     std::env::set_current_dir(tmp.path()).expect("chdir");
 
@@ -2205,7 +2214,7 @@ struct SearchFixture {
 }
 
 fn seed_search_fixture(scenario: SearchScenario) -> SearchFixture {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = benchmark_tempdir();
     let db_path = tmp.path().join("storage.sqlite3");
 
     let cx = Cx::for_testing();
@@ -3090,7 +3099,7 @@ fn run_share_harness_once() {
         let mut regressions = 0usize;
 
         for scenario in scenarios {
-            let base = TempDir::new().expect("tempdir");
+            let base = benchmark_tempdir();
             let fixture = seed_share_fixture(&base, *scenario);
 
             let mut total_samples = Vec::with_capacity(scenario.ops());
@@ -3109,7 +3118,7 @@ fn run_share_harness_once() {
             let mut output_zip_bytes: u64 = 0;
 
             for op_idx in 0..scenario.ops() {
-                let run_tmp = TempDir::new().expect("tempdir");
+                let run_tmp = benchmark_tempdir();
                 let out_root = run_tmp.path().join("out");
 
                 let sample = run_share_export_once(
@@ -3298,13 +3307,13 @@ fn bench_share_export(c: &mut Criterion) {
             &scenario,
             |b, &scenario| {
                 b.iter_custom(|iters| {
-                    let base = TempDir::new().expect("tempdir");
+                    let base = benchmark_tempdir();
                     let fixture = seed_share_fixture(&base, scenario);
 
                     let t0 = Instant::now();
                     let iters_us = usize::try_from(iters).unwrap_or(usize::MAX);
                     for _ in 0..iters_us {
-                        let run_tmp = TempDir::new().expect("tempdir");
+                        let run_tmp = benchmark_tempdir();
                         let out_root = run_tmp.path().join("out");
                         let _sample = run_share_export_once(
                             &fixture,
@@ -3407,7 +3416,7 @@ fn collect_canonical_message_paths(dir: &Path, out: &mut Vec<PathBuf>) -> io::Re
 }
 
 fn seed_archive_read_dataset(dataset_size: usize) -> (TempDir, Vec<PathBuf>) {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = benchmark_tempdir();
     let _cwd_guard = CurrentDirGuard::push(tmp.path()).expect("chdir");
 
     let mut config = mcp_agent_mail_core::Config::from_env();

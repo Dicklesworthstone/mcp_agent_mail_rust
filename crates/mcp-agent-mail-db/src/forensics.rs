@@ -3759,7 +3759,7 @@ fn pid_command_line(pid: u32) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join(" "))
 }
 
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(test)]
 fn parse_ps_output_value(stdout: &[u8]) -> Option<String> {
     String::from_utf8_lossy(stdout)
         .lines()
@@ -3768,33 +3768,9 @@ fn parse_ps_output_value(stdout: &[u8]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn ps_output_value(pid: u32, column: &str) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", column])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_ps_output_value(&output.stdout)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pid_command_line(pid: u32) -> Option<String> {
-    ps_output_value(pid, "command=")
-}
-
 #[cfg(target_os = "linux")]
 fn pid_executable_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pid_executable_path(pid: u32) -> Option<PathBuf> {
-    ps_output_value(pid, "comm=").map(PathBuf::from)
 }
 
 /// Capture a mailbox forensic bundle and return the bundle directory.

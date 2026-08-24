@@ -7,7 +7,7 @@
 //! files totaling ~1.3 GB in a single storage_root.
 //!
 //! This module keeps the N most recent of each *kind* and quarantines the
-//! rest by moving them into `doctor/reclaimable/rotation-<ts>/` inside the
+//! rest by moving them into `doctor/reclaimable/rotation-<ts>[-<n>]/` inside the
 //! storage root, where an operator (or `am doctor`) can inspect and reclaim
 //! them later. Nothing is hard-deleted unless the operator explicitly opts
 //! back in via `AM_BACKUP_ROTATION_DELETE`. Kinds are classified by filename
@@ -41,7 +41,7 @@ pub use mcp_agent_mail_db::recovery_retention::{
 
 /// Report returned by `rotate_storage_backups`. One entry per non-empty kind.
 ///
-/// "Staged" means moved into the `doctor/reclaimable/rotation-<ts>/`
+/// "Staged" means moved into a `doctor/reclaimable/rotation-<ts>[-<n>]/`
 /// quarantine directory (the default); "deleted" means hard-removed, which
 /// only happens behind the explicit `AM_BACKUP_ROTATION_DELETE` opt-in.
 /// Staged bytes are *not* reclaimed disk — they still live in the storage
@@ -102,10 +102,43 @@ pub fn rotation_delete_opted_in() -> bool {
     })
 }
 
+/// Create a quarantine directory owned exclusively by this rotation pass.
+///
+/// Rotation can run concurrently in two cold-starting processes. A shared
+/// second-resolution directory would let both processes target the same file
+/// name, and `rename` is allowed to replace an existing destination on Unix.
+/// Claiming the directory with `create_dir` keeps each pass isolated and makes
+/// the later moves non-overwriting among cooperative rotation processes.
+fn create_unique_quarantine_dir(parent: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(parent)?;
+
+    for suffix in 0_u32..=u32::from(u16::MAX) {
+        let directory_name = if suffix == 0 {
+            stem.to_string()
+        } else {
+            format!("{stem}-{suffix}")
+        };
+        let candidate = parent.join(directory_name);
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "no unique rotation quarantine directory available under {}",
+            parent.display()
+        ),
+    ))
+}
+
 /// Rotate backup files in `storage_root`, staging evictions for reclaim.
 ///
 /// Keeps `keep_per_kind` newest of each kind and stages the rest into
-/// `<storage_root>/doctor/reclaimable/rotation-<UTC ts>/` for operator
+/// `<storage_root>/doctor/reclaimable/rotation-<UTC ts>[-<n>]/` for operator
 /// reclaim. With the explicit `AM_BACKUP_ROTATION_DELETE` opt-in the evicted
 /// files are hard-deleted instead (the legacy behavior).
 ///
@@ -134,10 +167,16 @@ pub fn rotate_storage_backups(
     // Group candidate files by kind so we can rotate each independently.
     let mut by_kind: BTreeMap<BackupKind, Vec<(PathBuf, SystemTime, u64)>> = BTreeMap::new();
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            // `DirEntry::metadata()` follows symlinks. Check the directory
+            // entry itself first so a backup-shaped symlink is never moved or
+            // accounted as though its target were an owned backup file.
             continue;
         }
+        let Ok(meta) = entry.metadata() else { continue };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -162,14 +201,9 @@ pub fn rotate_storage_backups(
 
     // Quarantine directory for this rotation pass. Created lazily on the
     // first staged file so a no-op rotation leaves no empty directories.
-    let quarantine_dir = storage_root
-        .join("doctor")
-        .join("reclaimable")
-        .join(format!(
-            "rotation-{}",
-            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-        ));
-    let mut quarantine_ready = false;
+    let quarantine_parent = storage_root.join("doctor").join("reclaimable");
+    let quarantine_stem = format!("rotation-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let mut quarantine_dir = None;
 
     for (kind, mut files) in by_kind {
         // Sort descending by mtime — oldest tail will be evicted.
@@ -208,25 +242,35 @@ pub fn rotate_storage_backups(
             }
 
             // Default: quarantine instead of delete (RULE 1). Move the file
-            // into `doctor/reclaimable/rotation-<ts>/` so an operator (or a
+            // into `doctor/reclaimable/rotation-<ts>[-<n>]/` so an operator (or a
             // later explicit reclaim) decides when disk is actually freed.
-            if !quarantine_ready {
-                if let Err(err) = fs::create_dir_all(&quarantine_dir) {
-                    warn!(
-                        dir = %quarantine_dir.display(),
-                        %err,
-                        "failed to create rotation quarantine dir; leaving evicted backups in place"
-                    );
-                    summary.kept += 1;
-                    continue;
+            if quarantine_dir.is_none() {
+                match create_unique_quarantine_dir(&quarantine_parent, &quarantine_stem) {
+                    Ok(directory) => quarantine_dir = Some(directory),
+                    Err(err) => {
+                        warn!(
+                            parent = %quarantine_parent.display(),
+                            %err,
+                            "failed to claim a unique rotation quarantine dir; leaving evicted backups in place"
+                        );
+                        summary.kept += 1;
+                        continue;
+                    }
                 }
-                quarantine_ready = true;
             }
             let file_name = path.file_name().map_or_else(
                 || std::ffi::OsString::from("unnamed-backup"),
                 std::ffi::OsStr::to_os_string,
             );
-            let dest = quarantine_dir.join(file_name);
+            let Some(directory) = quarantine_dir.as_ref() else {
+                warn!(
+                    path = %path.display(),
+                    "rotation quarantine directory unexpectedly unavailable; keeping backup in place"
+                );
+                summary.kept += 1;
+                continue;
+            };
+            let dest = directory.join(file_name);
             match fs::rename(path, &dest) {
                 Ok(()) => {
                     debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
@@ -476,6 +520,33 @@ mod tests {
         assert!(tmp.path().join("storage.codex.sqlite3").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rotate_storage_backups_ignores_backup_shaped_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("outside-evidence");
+        let real_backup = tmp.path().join("storage.sqlite3.corrupt-real");
+        let linked_backup = tmp.path().join("storage.sqlite3.corrupt-linked");
+        touch(&target, 23);
+        touch(&real_backup, 11);
+        symlink(&target, &linked_backup).unwrap();
+
+        let report = rotate_with_delete_off(tmp.path(), 1);
+        assert_eq!(report.staged, 0);
+        assert_eq!(report.kept, 1);
+        assert!(real_backup.is_file());
+        assert!(
+            linked_backup
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target).unwrap(), vec![0_u8; 23]);
+    }
+
     #[test]
     fn rotate_storage_backups_on_missing_root_is_noop() {
         let tmp = TempDir::new().unwrap();
@@ -575,6 +646,25 @@ mod tests {
             .len();
             assert_eq!(bytes, 100, "staged file body must survive the move");
         }
+    }
+
+    #[test]
+    fn unique_quarantine_directory_never_reuses_an_existing_rotation() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("doctor").join("reclaimable");
+
+        let first = create_unique_quarantine_dir(&parent, "rotation-fixed").unwrap();
+        touch(&first.join("storage.sqlite3.corrupt-same-name"), 17);
+        let second = create_unique_quarantine_dir(&parent, "rotation-fixed").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first.file_name().unwrap(), "rotation-fixed");
+        assert_eq!(second.file_name().unwrap(), "rotation-fixed-1");
+        assert_eq!(
+            fs::read(first.join("storage.sqlite3.corrupt-same-name")).unwrap(),
+            vec![0_u8; 17],
+            "claiming a later rotation directory must not replace prior evidence"
+        );
     }
 
     /// Name of the single `rotation-*` quarantine dir under

@@ -245,6 +245,10 @@ impl LockStats {
 
     #[inline]
     fn record_hold(&self, hold_ns: u64) {
+        // A completed hold is a real event even when the platform clock's
+        // resolution reports a zero-length interval. Preserve that invariant
+        // instead of making the aggregate indistinguishable from no holds.
+        let hold_ns = hold_ns.max(1);
         self.total_hold_ns.fetch_add(hold_ns, Ordering::Relaxed);
         update_max(&self.max_hold_ns, hold_ns);
     }
@@ -664,6 +668,14 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    static CONTENTION_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn contention_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CONTENTION_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn ordered_mutex_allows_increasing_order() {
         let pool_cache = OrderedMutex::new(LockLevel::DbPoolCache, ());
@@ -686,6 +698,7 @@ mod tests {
 
     #[test]
     fn stress_no_deadlock_under_contention_short() {
+        let _stats_guard = contention_test_guard();
         let pool_cache = Arc::new(OrderedMutex::new(LockLevel::DbPoolCache, ()));
         let projects_by_slug =
             Arc::new(OrderedRwLock::new(LockLevel::DbReadCacheProjectsBySlug, ()));
@@ -760,8 +773,9 @@ mod tests {
     // -----------------------------------------------------------------------
     // Contention tracking: basic
     //
-    // Note: global lock stats are process-wide, so parallel tests can
-    // interfere. Tests use baseline readings and check deltas.
+    // Global lock stats are process-wide. Tests that inspect or reset them use
+    // `contention_test_guard()` so a reset cannot invalidate another test's
+    // baseline while it is making assertions.
     // -----------------------------------------------------------------------
 
     fn stats_for(level: LockLevel) -> (u64, u64, u64, u64) {
@@ -776,6 +790,7 @@ mod tests {
 
     #[test]
     fn contention_snapshot_tracks_uncontended_acquire() {
+        let _stats_guard = contention_test_guard();
         let level = LockLevel::DbPoolCache;
         let (base_acq, base_cont, base_hold, _) = stats_for(level);
         let m = OrderedMutex::new(level, 42u32);
@@ -792,6 +807,7 @@ mod tests {
 
     #[test]
     fn contention_snapshot_tracks_try_lock() {
+        let _stats_guard = contention_test_guard();
         let level = LockLevel::DbSqliteInitGates;
         let (base_acq, base_cont, _, _) = stats_for(level);
         let m = OrderedMutex::new(level, ());
@@ -805,6 +821,7 @@ mod tests {
 
     #[test]
     fn contention_snapshot_filters_zero_levels() {
+        let _stats_guard = contention_test_guard();
         // Verify that lock_contention_snapshot() excludes levels with 0 acquires.
         let snap = lock_contention_snapshot();
         for entry in &snap {
@@ -818,6 +835,7 @@ mod tests {
 
     #[test]
     fn contention_reset_zeros_single_level() {
+        let _stats_guard = contention_test_guard();
         // Verify that LockStats::reset() works on a single level.
         let level = LockLevel::ToolsBridgedEnv;
         let m = OrderedMutex::new(level, ());
@@ -834,6 +852,7 @@ mod tests {
 
     #[test]
     fn contention_global_reset() {
+        let _stats_guard = contention_test_guard();
         // Verify lock_contention_reset() runs without panic.
         lock_contention_reset();
         // Snapshot after reset should be empty or near-empty.
@@ -848,6 +867,7 @@ mod tests {
 
     #[test]
     fn contention_detected_under_contention() {
+        let _stats_guard = contention_test_guard();
         // Verify that multi-threaded contention produces correct data
         // and that contention tracking doesn't corrupt the protected value.
         let m = Arc::new(OrderedMutex::new(LockLevel::StorageCommitQueue, 0u64));
@@ -898,6 +918,7 @@ mod tests {
 
     #[test]
     fn rwlock_contention_tracking() {
+        let _stats_guard = contention_test_guard();
         lock_contention_reset();
         let rw = OrderedRwLock::new(LockLevel::ServerLiveDashboard, 0u64);
         // Multiple reads should be uncontended with each other.

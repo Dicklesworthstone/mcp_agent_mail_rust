@@ -1787,11 +1787,16 @@ const HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES: u32 = 10;
 const HTTP_SERVER_STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_SERVER_FORCE_CLOSE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(target_os = "linux")]
 const TUI_SPIN_WATCHDOG_SAMPLE_SECS_DEFAULT: u64 = 2;
+#[cfg(target_os = "linux")]
 const TUI_SPIN_WATCHDOG_WINDOW_SECS_DEFAULT: u64 = 20;
+#[cfg(target_os = "linux")]
 const TUI_SPIN_WATCHDOG_STARTUP_SECS_DEFAULT: u64 = 180;
+#[cfg(target_os = "linux")]
 const TUI_SPIN_WATCHDOG_CPU_PCT_DEFAULT: u64 = 250;
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct TuiSpinWatchdogConfig {
     sample_interval: Duration,
@@ -1839,6 +1844,7 @@ impl TuiSpinWatchdog {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_tui_spin_watchdog_config() -> Option<TuiSpinWatchdogConfig> {
     if !env_truthy_default_true("AM_TUI_SPIN_WATCHDOG_ENABLED") {
         return None;
@@ -1873,6 +1879,7 @@ fn read_tui_spin_watchdog_config() -> Option<TuiSpinWatchdogConfig> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn env_truthy_default_true(key: &str) -> bool {
     std::env::var(key).map_or(true, |value| {
         matches!(
@@ -2165,6 +2172,10 @@ fn format_http_authority_host(host: &str) -> String {
     } else {
         host.to_string()
     }
+}
+
+fn format_socket_bind_address(host: &str, port: u16) -> String {
+    format!("{}:{port}", format_http_authority_host(host.trim()))
 }
 
 pub(crate) fn connect_authority_host(http_host: &str) -> String {
@@ -4560,7 +4571,7 @@ async fn spawn_http_server_instance(
     let server_info = server.info().clone();
     let server_capabilities = server.capabilities().clone();
     let router = Arc::new(server.into_router());
-    let addr = format!("{}:{}", config.http_host, config.http_port);
+    let addr = format_socket_bind_address(&config.http_host, config.http_port);
     // am#149: warn loudly when bound beyond loopback with no auth configured.
     // The loopback default is safe, but `HTTP_HOST=0.0.0.0`/a LAN IP with no
     // bearer token or JWT exposes every route — including the mail UI's mutating
@@ -28836,6 +28847,16 @@ first body
         assert_eq!(
             build_web_ui_url("2001:db8::42", 8765, None),
             "http://[2001:db8::42]:8765/mail"
+        );
+    }
+
+    #[test]
+    fn socket_bind_address_brackets_raw_ipv6_hosts_once() {
+        assert_eq!(format_socket_bind_address("::1", 8765), "[::1]:8765");
+        assert_eq!(format_socket_bind_address("[::1]", 8765), "[::1]:8765");
+        assert_eq!(
+            format_socket_bind_address("127.0.0.1", 8765),
+            "127.0.0.1:8765"
         );
     }
 

@@ -677,13 +677,20 @@ pub struct ReclaimOutcome {
 /// Per RULE 1 and the forensic-bundle manifest's no-automatic-deletion
 /// contract, this never removes data; it relocates each artifact under one
 /// operator-reclaimable directory so disk is freed only by an explicit later
-/// `rm` the operator chooses to run. Same-filesystem renames are atomic and
-/// cheap.
+/// `rm` the operator chooses to run. The destination directory is claimed with
+/// `create_dir`, never reused, so concurrent reclaim passes cannot overwrite
+/// one another's evidence. Same-filesystem renames are atomic and cheap.
 pub fn consolidate_debris(plan: &ReclaimPlan, dest_dir: &Path) -> std::io::Result<ReclaimOutcome> {
     if plan.prune.is_empty() {
         return Ok(ReclaimOutcome::default());
     }
-    std::fs::create_dir_all(dest_dir)?;
+    if let Some(parent) = dest_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(dest_dir)?;
     let mut outcome = ReclaimOutcome::default();
     for art in &plan.prune {
         let Some(name) = art.path.file_name() else {
@@ -1390,5 +1397,33 @@ mod tests {
             3_000,
             "move-only consolidation remains resident until an operator removes the staging dir"
         );
+    }
+
+    #[test]
+    fn consolidate_refuses_to_reuse_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("storage.sqlite3.corrupt-incident");
+        std::fs::write(&source, b"new evidence").unwrap();
+        let dest = dir.path().join("doctor").join("reclaimable").join("run");
+        std::fs::create_dir_all(&dest).unwrap();
+        let sentinel = dest.join("storage.sqlite3.corrupt-incident");
+        std::fs::write(&sentinel, b"prior evidence").unwrap();
+        let plan = ReclaimPlan {
+            prune: vec![DebrisArtifact {
+                path: source.clone(),
+                bytes: 12,
+                modified_us: 1,
+                category: DebrisCategory::CorruptQuarantine,
+            }],
+            kept_count: 0,
+            total_count: 1,
+            reclaimable_bytes: 12,
+            total_bytes: 12,
+        };
+
+        let error = consolidate_debris(&plan, &dest).expect_err("existing destination must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&source).unwrap(), b"new evidence");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"prior evidence");
     }
 }

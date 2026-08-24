@@ -453,7 +453,14 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use tempfile::tempdir;
+    fn evidence_real_tempdir() -> tempfile::TempDir {
+        let temp_root =
+            std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+        tempfile::Builder::new()
+            .prefix("mcp-agent-mail-evidence-")
+            .tempdir_in(temp_root)
+            .expect("evidence temp directory")
+    }
 
     #[test]
     fn parse_configured_path_rejects_blank_values() {
@@ -470,7 +477,7 @@ mod tests {
 
     #[test]
     fn append_to_path_writes_line_delimited_json() {
-        let dir = tempdir().unwrap();
+        let dir = evidence_real_tempdir();
         let path = dir.path().join("ledger.jsonl");
         let entry = EvidenceLedgerEntry::new(
             "decision-1",
@@ -491,7 +498,7 @@ mod tests {
 
     #[test]
     fn append_to_path_creates_parent_directories() {
-        let dir = tempdir().unwrap();
+        let dir = evidence_real_tempdir();
         let nested = dir.path().join("nested/audit/ledger.jsonl");
         let entry = EvidenceLedgerEntry::new(
             "decision-2",
@@ -509,7 +516,7 @@ mod tests {
     fn append_to_path_rejects_symlinked_ledger_file() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempdir().unwrap();
+        let dir = evidence_real_tempdir();
         let outside = dir.path().join("outside.jsonl");
         let linked = dir.path().join("ledger.jsonl");
         std::fs::write(&outside, b"outside\n").unwrap();
@@ -536,7 +543,7 @@ mod tests {
     fn append_to_path_rejects_symlinked_parent_directory() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempdir().unwrap();
+        let dir = evidence_real_tempdir();
         let outside_dir = dir.path().join("outside");
         let linked_dir = dir.path().join("linked");
         std::fs::create_dir(&outside_dir).unwrap();
@@ -564,7 +571,7 @@ mod tests {
 
     #[test]
     fn concurrent_appends_keep_all_records() {
-        let dir = tempdir().unwrap();
+        let dir = evidence_real_tempdir();
         let path = Arc::new(dir.path().join("ledger.jsonl"));
 
         let mut handles = Vec::new();
@@ -720,7 +727,7 @@ mod tests {
     /// 6. Write to tempfile, read back, verify valid JSONL.
     #[test]
     fn evidence_jsonl_file_output() {
-        let dir = tempdir().unwrap();
+        let dir = evidence_real_tempdir();
         let path = dir.path().join("evidence.jsonl");
 
         let ledger = EvidenceLedger::with_file(&path, 1000).unwrap();
@@ -757,7 +764,7 @@ mod tests {
     fn evidence_with_file_rejects_symlinked_ledger_file() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempdir().unwrap();
+        let dir = evidence_real_tempdir();
         let outside = dir.path().join("outside.jsonl");
         let linked = dir.path().join("evidence.jsonl");
         std::fs::write(&outside, b"outside\n").unwrap();

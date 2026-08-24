@@ -779,7 +779,7 @@ pub fn registry() -> Vec<FixerSpec> {
             subsystem: "runtime_processes",
             op_pattern: "detect-only",
             auto_fixable: false,
-            one_line_description: "Configured HTTP_HOST:HTTP_PORT is held by a foreign process (am serve-http would fail to bind)",
+            one_line_description: "Configured HTTP_HOST:HTTP_PORT cannot be bound because it is occupied or invalid (am serve-http would fail to bind)",
             source_module: "doctor::fixers::port_bound_by_foreign_process",
         },
         FixerSpec {
