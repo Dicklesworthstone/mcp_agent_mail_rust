@@ -583,6 +583,125 @@ EOF
 fi
 
 # ===========================================================================
+# Case 16: OMP installer helpers honor the native profile and HTTP contracts
+# ===========================================================================
+e2e_case_banner "OMP installer profile and HTTP config contracts"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  e2e_skip "python3 unavailable; skipping OMP installer helper case"
+else
+  OMP_INSTALLER_DIR="${FAKE_HOME}/omp-installer-contract"
+  OMP_CONFIG="${OMP_INSTALLER_DIR}/mcp.json"
+  mkdir -p "${OMP_INSTALLER_DIR}"
+  cat > "${OMP_CONFIG}" <<'EOF'
+{
+  "mcpServers": {
+    "sibling": {"type": "http", "url": "http://sibling.invalid/mcp"}
+  },
+  "servers": {
+    "mcp_agent_mail": {
+      "command": "legacy-agent-mail",
+      "args": [],
+      "env": {"HTTP_BEARER_TOKEN": "stale-token"},
+      "headers": {
+        "authorization": "Bearer stale-token",
+        "X-Trace": "preserve-me"
+      }
+    },
+    "other": {"command": "other-server"}
+  }
+}
+EOF
+
+  OMP_WRITER_FUNCTION="$(
+    sed -n '/^setup_single_standard_http_json_config() {/,/^setup_single_opencode_json_config() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+  )"
+  if [ -z "${OMP_WRITER_FUNCTION}" ]; then
+    e2e_fail "extract OMP installer writer" "function body" "missing"
+  else
+    set +e
+    (
+      # These stubs are invoked by the installer function loaded via `eval`.
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      eval "${OMP_WRITER_FUNCTION}"
+      setup_single_standard_http_json_config omp "${OMP_CONFIG}"
+    )
+    OMP_WRITER_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer converts legacy config" "0" "${OMP_WRITER_RC}"
+
+    OMP_WRITER_ASSERTIONS="$(python3 - "${OMP_CONFIG}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+
+entry = doc["mcpServers"]["mcp-agent-mail"]
+assert entry["type"] == "http"
+assert entry["url"] == "http://127.0.0.1:8765/mcp/"
+assert entry["headers"] == {"X-Trace": "preserve-me"}
+assert "command" not in entry and "args" not in entry and "env" not in entry
+assert "mcp_agent_mail" not in doc["servers"]
+assert doc["servers"]["other"]["command"] == "other-server"
+assert doc["mcpServers"]["sibling"]["url"] == "http://sibling.invalid/mcp"
+print("valid")
+PY
+)"
+    e2e_assert_eq "OMP installer writer emits one clean native HTTP entry" "valid" "${OMP_WRITER_ASSERTIONS}"
+
+    set +e
+    (
+      # These stubs are invoked by the installer function loaded via `eval`.
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      eval "${OMP_WRITER_FUNCTION}"
+      setup_single_standard_http_json_config omp "${OMP_CONFIG}"
+    )
+    OMP_WRITER_SECOND_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer is idempotent" "1" "${OMP_WRITER_SECOND_RC}"
+  fi
+
+  OMP_DETECT_FUNCTION="$(
+    sed -n '/^detect_mcp_configs() {/,/^generate_bearer_token() {/p' "${INSTALL_SH}" \
+      | sed '$d'
+  )"
+  if [ -z "${OMP_DETECT_FUNCTION}" ]; then
+    e2e_fail "extract OMP installer detector" "function body" "missing"
+  else
+    mkdir -p "${FAKE_HOME}/.omp/profiles/Work/agent" "${FAKE_HOME}/custom-agent"
+    ln -s "${OMP_INSTALLER_DIR}" "${FAKE_HOME}/.omp/profiles/linked"
+    OMP_DETECT_OUT="$(
+      eval "${OMP_DETECT_FUNCTION}"
+      OMP_PROFILE=Work PI_CODING_AGENT_DIR="${FAKE_HOME}/custom-agent" \
+        detect_mcp_configs "${FAKE_HOME}"
+    )"
+    e2e_assert_contains "invalid uppercase OMP profile falls back to the default override" \
+      "${OMP_DETECT_OUT}" "${FAKE_HOME}/custom-agent/mcp.json"
+    e2e_assert_not_contains "invalid uppercase OMP profile is not advertised" \
+      "${OMP_DETECT_OUT}" "/profiles/Work/"
+
+    OMP_SYMLINK_DETECT_OUT="$(
+      eval "${OMP_DETECT_FUNCTION}"
+      OMP_PROFILE=linked detect_mcp_configs "${FAKE_HOME}"
+    )"
+    e2e_assert_not_contains "symlinked OMP profile is not followed" \
+      "${OMP_SYMLINK_DETECT_OUT}" "/profiles/linked/"
+  fi
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 e2e_summary

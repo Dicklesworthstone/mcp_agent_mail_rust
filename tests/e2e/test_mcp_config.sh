@@ -578,9 +578,9 @@ fi
 # ===========================================================================
 e2e_case_banner "OMP active named profile and custom config root"
 
-OMP_PROFILE_CONFIG="${FAKE_HOME}/custom-omp/profiles/Work/agent/mcp.json"
+OMP_PROFILE_CONFIG="${FAKE_HOME}/custom-omp/profiles/work/agent/mcp.json"
 set +e
-OMP_PROFILE=Work PI_CONFIG_DIR=custom-omp \
+OMP_PROFILE=work PI_CONFIG_DIR=custom-omp \
     run_am setup run --agent omp --yes --no-hooks --project-dir "$FAKE_PROJECT" \
     --token omp-profile-token >/dev/null 2>&1
 OMP_PROFILE_RC=$?

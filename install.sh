@@ -2704,6 +2704,8 @@ detect_mcp_configs() {
   local omp_config_root
   local omp_profile
   local omp_profile_base
+  local omp_profile_dir
+  local omp_profiles_root
   local profile_dir
   local profile_name
   local -a candidates=()
@@ -2741,6 +2743,7 @@ detect_mcp_configs() {
       omp_config_name="${omp_config_name#/}"
     done
     omp_config_root="${home_dir}/${omp_config_name}"
+    omp_profiles_root="${omp_config_root}/profiles"
     omp_profile=""
     if [ "${OMP_PROFILE+x}" = "x" ]; then
       omp_profile="${OMP_PROFILE}"
@@ -2752,30 +2755,39 @@ detect_mcp_configs() {
     omp_profile_base="${omp_profile%%.*}"
     if [ -n "$omp_profile" ] \
       && [ "$omp_profile" != "default" ] \
-      && printf '%s\n' "$omp_profile" | LC_ALL=C grep -Eq '^[[:alnum:]][[:alnum:]._-]{0,63}$' \
+      && printf '%s\n' "$omp_profile" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' \
       && ! printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' \
       && [ "${omp_profile%.}" = "$omp_profile" ]; then
-      candidates+=("omp|${omp_config_root}/profiles/${omp_profile}/agent/mcp.json")
-      candidates+=("omp|${omp_config_root}/profiles/${omp_profile}/agent/.mcp.json")
+      omp_profile_dir="${omp_profiles_root}/${omp_profile}"
+      if [ ! -L "$omp_profiles_root" ] \
+        && [ ! -L "$omp_profile_dir" ] \
+        && [ ! -L "${omp_profile_dir}/agent" ]; then
+        candidates+=("omp|${omp_profile_dir}/agent/mcp.json")
+        candidates+=("omp|${omp_profile_dir}/agent/.mcp.json")
+      fi
     elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
       candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
       candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
     fi
     candidates+=("omp|${omp_config_root}/agent/mcp.json")
     candidates+=("omp|${omp_config_root}/agent/.mcp.json")
-    for profile_dir in "${omp_config_root}/profiles"/*; do
-      if [ ! -d "$profile_dir" ] || [ -L "$profile_dir" ]; then
-        continue
-      fi
-      profile_name="${profile_dir##*/}"
-      [ "$profile_name" != "default" ] || continue
-      omp_profile_base="${profile_name%%.*}"
-      printf '%s\n' "$profile_name" | LC_ALL=C grep -Eq '^[[:alnum:]][[:alnum:]._-]{0,63}$' || continue
-      printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' && continue
-      [ "${profile_name%.}" = "$profile_name" ] || continue
-      candidates+=("omp|${profile_dir}/agent/mcp.json")
-      candidates+=("omp|${profile_dir}/agent/.mcp.json")
-    done
+    if [ ! -L "$omp_profiles_root" ]; then
+      for profile_dir in "${omp_profiles_root}"/*; do
+        if [ ! -d "$profile_dir" ] \
+          || [ -L "$profile_dir" ] \
+          || [ -L "${profile_dir}/agent" ]; then
+          continue
+        fi
+        profile_name="${profile_dir##*/}"
+        [ "$profile_name" != "default" ] || continue
+        omp_profile_base="${profile_name%%.*}"
+        printf '%s\n' "$profile_name" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || continue
+        printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' && continue
+        [ "${profile_name%.}" = "$profile_name" ] || continue
+        candidates+=("omp|${profile_dir}/agent/mcp.json")
+        candidates+=("omp|${profile_dir}/agent/.mcp.json")
+      done
+    fi
 
     # GitHub Copilot / VS Code settings
     candidates+=("github-copilot|${home_dir}/.config/Code/User/settings.json")
@@ -2806,7 +2818,7 @@ detect_mcp_configs() {
   # Only advertise OMP project candidates when the project already owns an
   # `.omp/` directory. Otherwise the fresh-config grandparent heuristic below
   # would create OMP config in unrelated checkouts.
-  if [ -d "${project_dir}/.omp" ]; then
+  if [ -d "${project_dir}/.omp" ] && [ ! -L "${project_dir}/.omp" ]; then
     candidates+=("omp|${project_dir}/.omp/mcp.json")
     candidates+=("omp|${project_dir}/.omp/.mcp.json")
   fi
@@ -3639,7 +3651,7 @@ setup_single_standard_http_json_config() {
   fi
 
   local result
-  result=$(python3 - "$config_path" "$desired_url" "$desired_auth_header" <<'PY'
+  result=$(python3 - "$tool" "$config_path" "$desired_url" "$desired_auth_header" <<'PY'
 import json
 import os
 import re
@@ -3647,7 +3659,7 @@ import shutil
 import sys
 from datetime import datetime, timezone
 
-config_path, desired_url, desired_auth_header = sys.argv[1:4]
+tool, config_path, desired_url, desired_auth_header = sys.argv[1:5]
 
 
 def load_text(path: str) -> str:
@@ -3682,32 +3694,62 @@ if not isinstance(doc, dict):
     print("ERROR:not_object")
     raise SystemExit(0)
 
-container_key = None
-for key in ("mcpServers", "servers", "mcp", "mcp_servers"):
-    value = doc.get(key)
-    if isinstance(value, dict):
-        container_key = key
-        break
-if container_key is None:
+container_keys = ("mcpServers", "servers", "mcp", "mcp_servers")
+if tool == "omp":
+    existing_container = doc.get("mcpServers")
+    if existing_container is not None and not isinstance(existing_container, dict):
+        print("ERROR:mcp_servers_not_object")
+        raise SystemExit(0)
     container_key = "mcpServers"
-    doc[container_key] = {}
+    if existing_container is None:
+        doc[container_key] = {}
+else:
+    container_key = None
+    for key in container_keys:
+        value = doc.get(key)
+        if isinstance(value, dict):
+            container_key = key
+            break
+    if container_key is None:
+        container_key = "mcpServers"
+        doc[container_key] = {}
 
 container = doc[container_key]
 entry_key = "mcp-agent-mail"
 for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
     value = container.get(candidate)
     if isinstance(value, dict):
-      entry_key = candidate
-      break
+        entry_key = candidate
+        break
 
 existing_entry = container.get(entry_key)
+if tool == "omp" and not isinstance(existing_entry, dict):
+    for legacy_key in ("servers", "mcp", "mcp_servers"):
+        legacy_container = doc.get(legacy_key)
+        if not isinstance(legacy_container, dict):
+            continue
+        for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+            candidate_entry = legacy_container.get(candidate)
+            if isinstance(candidate_entry, dict):
+                existing_entry = candidate_entry
+                break
+        if isinstance(existing_entry, dict):
+            break
 if not isinstance(existing_entry, dict):
     existing_entry = {}
 
 new_entry = {
     key: value
     for key, value in existing_entry.items()
-    if key not in {"command", "args", "transport", "httpUrl", "bearer_token_env_var"}
+    if key not in {
+        "command",
+        "args",
+        "environment",
+        "env",
+        "transport",
+        "httpUrl",
+        "bearer_token_env_var",
+    }
 }
 new_entry["type"] = "http"
 new_entry["url"] = desired_url
@@ -3718,6 +3760,9 @@ if headers is not None and not isinstance(headers, dict):
 if headers is None:
     headers = {}
 
+headers = {
+    key: value for key, value in headers.items() if key.lower() != "authorization"
+}
 if desired_auth_header:
     headers["Authorization"] = desired_auth_header
 
@@ -3727,6 +3772,17 @@ else:
     new_entry.pop("headers", None)
 
 container[entry_key] = new_entry
+for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+    if candidate != entry_key:
+        container.pop(candidate, None)
+
+if tool == "omp":
+    for legacy_key in ("servers", "mcp", "mcp_servers"):
+        legacy_container = doc.get(legacy_key)
+        if not isinstance(legacy_container, dict):
+            continue
+        legacy_container.pop("mcp-agent-mail", None)
+        legacy_container.pop("mcp_agent_mail", None)
 new_text = dump_json(doc)
 if new_text == dump_json(parse_json(text)):
     print("SKIP:unchanged")
