@@ -3706,30 +3706,30 @@ impl DbPool {
             let preserved_stage = staged_directory.preserve();
             return Err(DbError::Sqlite(match rollback {
                 ProactiveBackupRollbackOutcome::RestoredDurably => format!(
-                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored",
-                        preserved_stage.display(),
-                        bak_path.display()
-                    ),
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored",
+                    preserved_stage.display(),
+                    bak_path.display()
+                ),
                 ProactiveBackupRollbackOutcome::RestoreMoveFailed(rollback_error) => format!(
-                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup remains at {} because its rollback move failed: {rollback_error}",
-                        preserved_stage.display(),
-                        bak_path.display(),
-                        rotated_backup.as_ref().map_or_else(
-                            || "<unknown>".to_string(),
-                            |rotated| rotated.display().to_string()
-                        )
-                    ),
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup remains at {} because its rollback move failed: {rollback_error}",
+                    preserved_stage.display(),
+                    bak_path.display(),
+                    rotated_backup.as_ref().map_or_else(
+                        || "<unknown>".to_string(),
+                        |rotated| rotated.display().to_string()
+                    )
+                ),
                 ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(sync_error) => format!(
-                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored at {}, but crash durability is uncertain because the parent sync failed: {sync_error}",
-                        preserved_stage.display(),
-                        bak_path.display(),
-                        bak_path.display()
-                    ),
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored at {}, but crash durability is uncertain because the parent sync failed: {sync_error}",
+                    preserved_stage.display(),
+                    bak_path.display(),
+                    bak_path.display()
+                ),
                 ProactiveBackupRollbackOutcome::NotNeeded => format!(
-                        "proactive backup failed to publish staged backup from {} to unused destination {} without replacement: {error}; no prior backup existed",
-                        preserved_stage.display(),
-                        bak_path.display()
-                    ),
+                    "proactive backup failed to publish staged backup from {} to unused destination {} without replacement: {error}; no prior backup existed",
+                    preserved_stage.display(),
+                    bak_path.display()
+                ),
             }));
         }
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
@@ -18974,6 +18974,34 @@ mod tests {
             .find(|path| sqlite_marker_value(path).as_deref() == Some("generation-one"))
             .expect("the previous verified backup generation must be preserved");
         assert!(preserved.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn proactive_backup_rollback_distinguishes_restored_but_unsynced_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let rotated = dir.path().join("storage.sqlite3.bak.20260824_120000");
+        std::fs::write(&rotated, b"prior verified generation").unwrap();
+
+        let outcome = rollback_rotated_proactive_backup_with(Some(&rotated), &backup, |_| {
+            Err(SqlError::Custom("injected parent sync failure".to_string()))
+        });
+
+        assert!(matches!(
+            outcome,
+            ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(ref detail)
+                if detail.contains("injected parent sync failure")
+        ));
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"prior verified generation",
+            "the namespace is restored even though its crash durability is uncertain"
+        );
+        assert!(
+            std::fs::symlink_metadata(&rotated).is_err(),
+            "state-honest reporting must not claim the generation remains rotated"
+        );
     }
 
     #[cfg(not(windows))]
