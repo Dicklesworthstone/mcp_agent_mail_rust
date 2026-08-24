@@ -230,12 +230,11 @@ pub fn binding_liveness(record: &PaneIdentityRecord) -> PaneBindingLiveness {
     // binding; the latter says nothing and must not enable adoption or
     // cleanup purges.
     let mut tmux_unavailable = false;
-    let outcome = binding_liveness_with(record, |args| match run_tmux_capture(args) {
-        Ok(stdout) => stdout,
-        Err(_) => {
+    let outcome = binding_liveness_with(record, |args| {
+        run_tmux_capture(args).unwrap_or_else(|_| {
             tmux_unavailable = true;
             None
-        }
+        })
     });
     if tmux_unavailable {
         return PaneBindingLiveness::Unverifiable;
