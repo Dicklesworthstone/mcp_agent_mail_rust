@@ -1166,9 +1166,7 @@ where
         ));
     };
     let _depth_guard = RecoveryAdmissionDepthGuard::enter(normalized_primary);
-    if !breaker_bypass
-        && outcome_policy == RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome
-    {
+    if !breaker_bypass && outcome_policy == RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome {
         // Arm the durable state before entering code that may panic, abort, or
         // lose power. The terminal write below replaces this provisional
         // reason without incrementing the attempt twice. A crashed half-open
@@ -15021,7 +15019,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(db_name);
         {
-            let conn = CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
                 .expect("create startup-integrity fixture");
             conn.execute_raw("PRAGMA journal_mode = DELETE;")
                 .expect("detach fixture WAL mode");
@@ -15038,7 +15036,11 @@ mod tests {
         let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
         let names_before = std::fs::read_dir(dir.path())
             .expect("list startup-integrity fixture before probe")
-            .map(|entry| entry.expect("read startup-integrity fixture entry").file_name())
+            .map(|entry| {
+                entry
+                    .expect("read startup-integrity fixture entry")
+                    .file_name()
+            })
             .collect::<BTreeSet<_>>();
         let pool = DbPool::new(&DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
@@ -15065,7 +15067,11 @@ mod tests {
         assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
         let names_after = std::fs::read_dir(dir.path())
             .expect("list startup-integrity fixture after refusal")
-            .map(|entry| entry.expect("read startup-integrity fixture entry").file_name())
+            .map(|entry| {
+                entry
+                    .expect("read startup-integrity fixture entry")
+                    .file_name()
+            })
             .collect::<BTreeSet<_>>();
         assert_eq!(
             names_after, names_before,
@@ -15104,8 +15110,7 @@ mod tests {
                     last_failure_reason: "startup integrity fixture tripped".to_string(),
                     tripped: true,
                 };
-                crate::recovery_breaker::store(db_path, &state)
-                    .expect("store tripped breaker");
+                crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
             },
         );
     }
@@ -20312,18 +20317,12 @@ mod tests {
         assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
         assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
         assert!(
-            sqlite_cleanup_quarantines(
-                dir.path(),
-                "tripped-writer-held-cleanup.sqlite3-wal"
-            )
-            .is_empty()
+            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-wal")
+                .is_empty()
         );
         assert!(
-            sqlite_cleanup_quarantines(
-                dir.path(),
-                "tripped-writer-held-cleanup.sqlite3-shm"
-            )
-            .is_empty()
+            sqlite_cleanup_quarantines(dir.path(), "tripped-writer-held-cleanup.sqlite3-shm")
+                .is_empty()
         );
         drop(writer);
         recovery_admission().reset();
@@ -20407,7 +20406,11 @@ mod tests {
             },
         )
         .expect_err("outer recovery fixture must fail after admitted cleanup");
-        assert!(error.to_string().contains("terminal whole-recovery failure"));
+        assert!(
+            error
+                .to_string()
+                .contains("terminal whole-recovery failure")
+        );
 
         let terminal = crate::recovery_breaker::load(&db_path)
             .expect("load terminal breaker")

@@ -7264,15 +7264,15 @@ fn require_healthy_existing_database_for_startup_fail_open(db_path: &Path) -> Cl
         )));
     }
 
-    let directly_usable =
-        mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(db_path).map_err(
-            |error| {
-                CliError::Other(format!(
-                    "source-byte-neutral SQLite fail-open check failed for {}: {error}",
-                    db_path.display()
-                ))
-            },
-        )?;
+    let directly_usable = mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(
+        db_path,
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "source-byte-neutral SQLite fail-open check failed for {}: {error}",
+            db_path.display()
+        ))
+    })?;
     if directly_usable {
         Ok(())
     } else {

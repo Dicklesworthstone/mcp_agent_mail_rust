@@ -944,10 +944,7 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
 }
 
 fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
-    cleanup_shutdown_sqlite_sidecars_with_resolver(
-        config,
-        resolve_server_database_url_sqlite_path,
-    );
+    cleanup_shutdown_sqlite_sidecars_with_resolver(config, resolve_server_database_url_sqlite_path);
 }
 
 fn cleanup_shutdown_sqlite_sidecars_with_resolver<F>(

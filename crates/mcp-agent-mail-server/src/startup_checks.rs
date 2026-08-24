@@ -2371,9 +2371,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         }
     }
 
-    let database_file_missing = resolved_db_path
-        .as_ref()
-        .is_some_and(|path| !path.exists());
+    let database_file_missing = resolved_db_path.as_ref().is_some_and(|path| !path.exists());
 
     // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
     if database_file_missing
@@ -4752,7 +4750,9 @@ mod tests {
             panic!("failed DB-owned recovery must fail startup: {result:?}");
         };
         assert!(
-            failure.problem.starts_with("Startup integrity recovery failed for "),
+            failure
+                .problem
+                .starts_with("Startup integrity recovery failed for "),
             "the original DB-owned recovery failure must be retained: {}",
             failure.problem
         );
@@ -4764,7 +4764,9 @@ mod tests {
             failure.problem
         );
         assert!(
-            !failure.problem.starts_with("Automatic recovery failed for "),
+            !failure
+                .problem
+                .starts_with("Automatic recovery failed for "),
             "the server must not replace the terminal DB-owned failure with a second recovery result: {}",
             failure.problem
         );
@@ -4878,10 +4880,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("tripped-before-open.sqlite3");
         {
-            let conn = mcp_agent_mail_db::DbConn::open_file(
-                db_path.to_string_lossy().as_ref(),
-            )
-            .expect("create healthy primary");
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create healthy primary");
             conn.execute_raw("PRAGMA journal_mode = DELETE;")
                 .expect("detach fixture WAL mode");
             conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
