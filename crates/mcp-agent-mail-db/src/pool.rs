@@ -16791,6 +16791,20 @@ mod tests {
 
         let resolved = resolve_sqlite_path_with_absolute_fallback(&missing_relative);
         assert_eq!(resolved, missing_relative);
+
+        let database_url = format!("sqlite:///{missing_relative}");
+        let mailbox_path = resolve_mailbox_sqlite_path(&database_url)
+            .expect("resolve shared mailbox authority");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url,
+            ..DbPoolConfig::default()
+        })
+        .expect("construct lazy pool");
+        assert_eq!(mailbox_path.canonical_path, missing_relative);
+        assert_eq!(
+            pool.sqlite_path, missing_relative,
+            "the shared resolver and actual pool must retain one fresh-start authority"
+        );
     }
 
     #[test]
@@ -18658,6 +18672,8 @@ mod tests {
             b"malformed breaker state",
         )
         .unwrap();
+        let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+        assert!(std::fs::symlink_metadata(&election_path).is_err());
         let operation_called = std::cell::Cell::new(false);
 
         recovery_admission().reset();
@@ -18670,6 +18686,33 @@ mod tests {
         assert!(
             !operation_called.get(),
             "automatic operation must not run when breaker authority is malformed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&election_path).is_err(),
+            "malformed authority must refuse without creating a persistent election artifact"
+        );
+    }
+
+    #[test]
+    fn automatic_recovery_allowed_preflight_still_acquires_durable_election() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"recoverable-content").unwrap();
+        let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+        assert!(std::fs::symlink_metadata(&election_path).is_err());
+        let operation_called = std::cell::Cell::new(false);
+
+        recovery_admission().reset();
+        with_recovery_admission(&db, "test admitted recovery", || {
+            operation_called.set(true);
+            Ok(())
+        })
+        .expect("clean breaker preflight should admit recovery");
+
+        assert!(operation_called.get());
+        assert!(
+            std::fs::symlink_metadata(&election_path).is_ok_and(|metadata| metadata.is_file()),
+            "an allowed attempt must still use the durable cross-process election"
         );
     }
 

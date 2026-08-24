@@ -66049,15 +66049,16 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn resolve_auto_clear_db_blockers_sqlite_path_prefers_absolute_candidate() {
+    fn resolve_auto_clear_db_blockers_path_matches_missing_relative_runtime_authority() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("auto-clear.sqlite3");
-        std::fs::write(&absolute_db, b"seed").expect("write absolute db");
+        let decoy_bytes = b"absolute auto-clear decoy";
+        std::fs::write(&absolute_db, decoy_bytes).expect("write absolute decoy");
 
         let relative_path = PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_path.exists(),
-            "relative shadow path should be absent so auto-clear resolves the absolute candidate"
+            "fixture requires a missing configured relative target"
         );
 
         let mut config = Config::from_env();
@@ -66066,9 +66067,10 @@ startup_timeout_sec = 42
         let resolved = resolve_auto_clear_db_blockers_sqlite_path(&config)
             .expect("resolve auto-clear sqlite path");
         assert_eq!(
-            resolved, absolute_db,
-            "auto-clear should target the resolved absolute candidate"
+            resolved, relative_path,
+            "auto-clear must inspect the same missing relative authority that DbPool will initialize"
         );
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }
 
     #[test]
