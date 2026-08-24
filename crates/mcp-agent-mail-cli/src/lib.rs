@@ -13238,6 +13238,11 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
                 &e.to_string(),
             )
         })?;
+        // One-shot canonical schema bootstrap in the CLI process: no dispatch
+        // deadline applies, so the generous 60s lock wait (matching
+        // `PRAGMA_DB_INIT_BASE_SQL` below) is intentional. Request-path
+        // connections are bounded at `DB_RUNTIME_BUSY_TIMEOUT_MS` (20s)
+        // instead (br-ovy6e).
         conn.execute_raw("PRAGMA busy_timeout = 60000;")
             .map_err(|e| {
                 sqlite_retryable_error(

@@ -2547,9 +2547,7 @@ fn reject_symlink_ancestor(path: &Path, label: &str) -> CliResult<()> {
         match fs::symlink_metadata(&current) {
             Ok(meta)
                 if meta.file_type().is_symlink()
-                    && crate::is_trusted_system_directory_alias(&current) =>
-            {
-            }
+                    && crate::is_trusted_system_directory_alias(&current) => {}
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(CliError::Other(format!(
                     "{label} contains a symlink component and will not be followed: {}",

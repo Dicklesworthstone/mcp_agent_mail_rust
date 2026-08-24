@@ -122,7 +122,7 @@ impl RetainedAutocommitLeakFinding {
                     "steps": [
                         "Edit `crates/mcp-agent-mail-db/src/schema.rs`: ensure `PRAGMA_CONN_SETTINGS_SQL` contains the line `PRAGMA autocommit_retain = OFF;`.",
                         "Edit the same file's `build_conn_pragmas()` function so its formatted output also contains the directive.",
-                        "Run the canonical regression test: `cargo test -p mcp-agent-mail-db pragma_busy_timeout_matches_runtime_constant sqlite_pool_connection_disables_retained_autocommit_for_durable_visibility`.",
+                        "Run the canonical regression test: `cargo test -p mcp-agent-mail-db -- pragma_busy_timeout_matches_runtime_constant sqlite_pool_connection_disables_retained_autocommit_for_durable_visibility`.",
                         "Rebuild and redeploy `mcp-agent-mail` / `am` binaries.",
                     ],
                     "note": "Auto-fix is intentionally not implemented — the directive lives in compiled Rust code; only a rebuild can resolve the finding.",
