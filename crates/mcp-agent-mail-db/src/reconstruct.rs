@@ -30,7 +30,13 @@ use std::path::{Path, PathBuf};
 type DbConn = crate::CanonicalDbConn;
 
 fn open_read_only_salvage_db(path: &Path) -> DbResult<DbConn> {
-    let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy().into_owned())
+    let path_str = path.to_str().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "reconstruct salvage: source path {} is not valid UTF-8; refusing a lossy alias",
+            path.display()
+        ))
+    })?;
+    let config = sqlmodel_sqlite::SqliteConfig::file(path_str.to_string())
         .flags(sqlmodel_sqlite::OpenFlags::read_only());
     let conn = DbConn::open(&config).map_err(|e| {
         DbError::Sqlite(format!(
@@ -271,12 +277,15 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
 /// correct post-recovery state. A `:memory:` target keeps ATC co-located, so there
 /// is no sidecar to build.
 pub(crate) fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()> {
-    let Some(primary) = primary_db_path.to_str() else {
-        return Ok(());
-    };
-    if primary == ":memory:" {
+    if primary_db_path.as_os_str() == ":memory:" {
         return Ok(());
     }
+    let primary = primary_db_path.to_str().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "reconstruct: primary database path {} is not valid UTF-8; cannot derive the ATC sidecar path",
+            primary_db_path.display()
+        ))
+    })?;
     let sidecar_path = crate::pool::atc_sidecar_sqlite_path(primary);
     // Refuse a symlinked sidecar target, exactly like the primary reconstruct
     // target and the salvage source: recovery must never write through a
@@ -285,7 +294,12 @@ pub(crate) fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()
         .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
     match apply_atc_sidecar_schema(&sidecar_path) {
         Ok(()) => Ok(()),
-        Err(first_error) if Path::new(&sidecar_path).exists() => {
+        Err(first_error)
+            if !matches!(
+                std::fs::symlink_metadata(&sidecar_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) =>
+        {
             // A pre-existing sidecar that cannot be opened/migrated (the disk
             // incident that corrupted the primary DB usually hits its
             // same-directory sibling too) must NOT wedge recovery of the
@@ -294,23 +308,34 @@ pub(crate) fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()
             // intervenes. Quarantine the unusable sidecar by rename (never
             // delete) and rebuild a fresh one; only a failure on the fresh
             // file — a genuine environment problem — stays fatal.
-            let quarantine_path = format!("{sidecar_path}.quarantined-{}", crate::now_micros());
-            std::fs::rename(&sidecar_path, &quarantine_path).map_err(|rename_error| {
+            let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+            let quarantine_path = crate::pool::quarantine_reconstruction_candidate_path(
+                Path::new(&sidecar_path),
+                Path::new(&sidecar_path),
+                "atc-quarantined",
+                &timestamp,
+            )
+            .map_err(|quarantine_error| {
                 DbError::Sqlite(format!(
-                    "reconstruct: ATC sidecar {sidecar_path} is unusable ({first_error}) and \
-                     could not be quarantined to {quarantine_path}: {rename_error}"
+                    "reconstruct: ATC sidecar {sidecar_path} is unusable ({first_error}) and its complete SQLite family could not be quarantined: {quarantine_error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct: ATC sidecar {sidecar_path} failed schema application ({first_error}) but disappeared before its family could be quarantined"
                 ))
             })?;
             tracing::warn!(
                 sidecar = %sidecar_path,
-                quarantine = %quarantine_path,
+                quarantine = %quarantine_path.display(),
                 error = %first_error,
                 "reconstruct: quarantined unusable ATC sidecar; rebuilding a fresh one"
             );
             apply_atc_sidecar_schema(&sidecar_path).map_err(|retry_error| {
                 DbError::Sqlite(format!(
                     "reconstruct: rebuild ATC sidecar {sidecar_path} after quarantining the \
-                     unusable one at {quarantine_path}: {retry_error}"
+                     unusable one at {}: {retry_error}",
+                    quarantine_path.display()
                 ))
             })
         }
@@ -329,7 +354,57 @@ pub(crate) fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()
 /// `PRAGMA_DB_INIT_SQL` and private 0600 permissions — it carries project keys,
 /// subjects, and evidence summaries just like `storage.sqlite3`.
 fn apply_atc_sidecar_schema(sidecar_path: &str) -> DbResult<()> {
-    let preexisting = Path::new(sidecar_path).exists();
+    let sidecar_path_ref = Path::new(sidecar_path);
+    let preexisting = match std::fs::symlink_metadata(sidecar_path_ref) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let file =
+                mcp_agent_mail_core::disk::open_regular_file_for_permission_change_no_follow(
+                    sidecar_path_ref,
+                )
+                .map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "reconstruct: securely open existing ATC sidecar {sidecar_path}: {error}"
+                    ))
+                })?;
+            let links = crate::pool::recovery_file_link_count(&file).map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: prove exclusive ownership of ATC sidecar {sidecar_path}: {error}"
+                ))
+            })?;
+            if links != 1 {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct: ATC sidecar {sidecar_path} has {links} hard links; refusing to mutate a shared inode"
+                )));
+            }
+            mcp_agent_mail_core::disk::set_private_writable_file_permissions(&file).map_err(
+                |error| {
+                    DbError::Sqlite(format!(
+                        "reconstruct: secure existing ATC sidecar {sidecar_path}: {error}"
+                    ))
+                },
+            )?;
+            true
+        }
+        Ok(_) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: ATC sidecar {sidecar_path} is not a regular non-symlink file"
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            mcp_agent_mail_core::disk::create_new_private_file_no_follow(sidecar_path_ref)
+                .map_err(|create_error| {
+                    DbError::Sqlite(format!(
+                        "reconstruct: privately claim new ATC sidecar {sidecar_path}: {create_error}"
+                    ))
+                })?;
+            false
+        }
+        Err(error) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: inspect ATC sidecar {sidecar_path}: {error}"
+            )));
+        }
+    };
     let sidecar = DbConn::open_file(sidecar_path).map_err(|error| {
         DbError::Sqlite(format!(
             "reconstruct: open ATC sidecar {sidecar_path}: {error}"
@@ -347,21 +422,6 @@ fn apply_atc_sidecar_schema(sidecar_path: &str) -> DbResult<()> {
                     "reconstruct: set ATC sidecar db pragmas for {sidecar_path}: {error}"
                 ))
             })?;
-        // Best-effort 0600, matching the runtime creation path: a chmod failure
-        // must not block recovery.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) =
-                std::fs::set_permissions(sidecar_path, std::fs::Permissions::from_mode(0o600))
-            {
-                tracing::warn!(
-                    path = %sidecar_path,
-                    error = %error,
-                    "reconstruct: failed to restrict ATC sidecar permissions to 0600"
-                );
-            }
-        }
     }
     apply_snapshot_migrations(
         &sidecar,
@@ -1006,8 +1066,13 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
         )));
     }
 
-    let db_str = db_path.to_string_lossy();
-    let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
+    let db_str = db_path.to_str().ok_or_else(|| {
+        SqlError::Custom(format!(
+            "collect_db_message_ids: database path {} is not valid UTF-8",
+            db_path.display()
+        ))
+    })?;
+    let conn = DbConn::open_file(db_str).map_err(|e| {
         SqlError::Custom(format!(
             "collect_db_message_ids: cannot open {}: {e}",
             db_path.display()
@@ -1450,17 +1515,26 @@ fn ensure_unoccupied_reconstruction_target_family(db_path: &Path) -> DbResult<()
         return Ok(());
     }
 
-    for path in std::iter::once(db_path.to_path_buf()).chain(
-        ["-journal", "-wal", "-shm"]
-            .into_iter()
-            .map(|suffix| crate::pool::sqlite_path_with_suffix(db_path, suffix)),
-    ) {
-        if std::fs::symlink_metadata(&path).is_ok() {
+    match std::fs::symlink_metadata(db_path) {
+        Ok(_) => {
             return Err(DbError::Sqlite(format!(
                 "reconstruct: target family is already occupied at {}; reconstruction requires a fresh candidate path and never mutates an existing database generation",
-                path.display()
+                db_path.display()
             )));
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: cannot prove target {} is unoccupied: {error}",
+                db_path.display()
+            )));
+        }
+    }
+    if !crate::pool::sqlite_recovery_candidate_is_standalone(db_path) {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: target {} has occupied SQLite or FrankenSQLite companion state; reconstruction requires a wholly fresh generation namespace",
+            db_path.display()
+        )));
     }
     Ok(())
 }
@@ -1475,28 +1549,21 @@ fn claim_fresh_reconstruction_target(db_path: &Path) -> DbResult<()> {
     // The low-level reconstruction API owns only fresh candidates. `create_new`
     // is the race-safe admission primitive: two builders can never both pass a
     // check-then-open window and replay into the same SQLite file.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(db_path)
-        .map_err(|error| {
-            DbError::Sqlite(format!(
-                "reconstruct: failed to claim fresh candidate {}: {error}",
-                db_path.display()
-            ))
-        })?;
+    mcp_agent_mail_core::disk::create_new_private_file_no_follow(db_path).map_err(|error| {
+        DbError::Sqlite(format!(
+            "reconstruct: failed to claim fresh candidate {}: {error}",
+            db_path.display()
+        ))
+    })?;
 
     // Refuse sidecars that raced with candidate admission. The newly claimed
     // empty main file is intentionally retained as evidence; callers allocate
     // unique staging names and may quarantine failed candidates.
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let sidecar = crate::pool::sqlite_path_with_suffix(db_path, suffix);
-        if std::fs::symlink_metadata(&sidecar).is_ok() {
-            return Err(DbError::Sqlite(format!(
-                "reconstruct: target sidecar appeared during fresh-candidate admission at {}; refusing to share a SQLite generation",
-                sidecar.display()
-            )));
-        }
+    if !crate::pool::sqlite_recovery_candidate_is_standalone(db_path) {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: target companion state appeared during fresh-candidate admission beside {}; refusing to share a SQLite generation",
+            db_path.display()
+        )));
     }
     Ok(())
 }
@@ -1510,6 +1577,12 @@ fn reconstruct_from_archive_impl(
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
         .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
+    let db_str = db_path.to_str().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "reconstruct: target path {} is not valid UTF-8",
+            db_path.display()
+        ))
+    })?;
     ensure_unoccupied_reconstruction_target_family(db_path)?;
     let projects_dir = storage_root.join("projects");
     let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
@@ -1562,8 +1635,7 @@ fn reconstruct_from_archive_impl(
 
     claim_fresh_reconstruction_target(db_path)?;
 
-    let db_str = db_path.to_string_lossy();
-    let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
+    let conn = DbConn::open_file(db_str).map_err(|e| {
         DbError::Sqlite(format!(
             "reconstruct: cannot open {}: {e}",
             db_path.display()
@@ -3596,13 +3668,18 @@ fn merge_salvaged_database(
     salvage_db_path: &Path,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
-    let target_conn =
-        DbConn::open_file(target_db_path.to_string_lossy().as_ref()).map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct salvage: cannot open target {}: {e}",
-                target_db_path.display()
-            ))
-        })?;
+    let target_path = target_db_path.to_str().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "reconstruct salvage: target path {} is not valid UTF-8",
+            target_db_path.display()
+        ))
+    })?;
+    let target_conn = DbConn::open_file(target_path).map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct salvage: cannot open target {}: {e}",
+            target_db_path.display()
+        ))
+    })?;
     let salvage_conn = open_read_only_salvage_db(salvage_db_path)?;
 
     let has_projects = table_exists(&salvage_conn, "projects")?;
@@ -6276,6 +6353,27 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_named::<String>("value").unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_reconstruction_claim_is_private_before_sqlite_opens_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let candidate = tmp.path().join("candidate.sqlite3");
+
+        claim_fresh_reconstruction_target(&candidate).expect("claim private candidate");
+
+        assert_eq!(
+            std::fs::symlink_metadata(&candidate)
+                .expect("candidate metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "candidate inode must be private before any mailbox bytes are written"
+        );
     }
 
     #[test]
@@ -10112,6 +10210,92 @@ archive body
         );
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn reconstruct_with_salvage_never_validates_a_lossy_utf8_alias() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_non_utf8_salvage.db");
+        let storage_root = tmp.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("archive root");
+
+        let invalid_name = std::ffi::OsString::from_vec(b"salvage-\xFF.sqlite3".to_vec());
+        let salvage_db_path = tmp.path().join(&invalid_name);
+        std::fs::write(&salvage_db_path, b"bytes that were never validated")
+            .expect("write invalid-byte salvage source");
+
+        let lossy_alias = tmp.path().join(invalid_name.to_string_lossy().into_owned());
+        let alias_conn = SqliteDbConn::open_file(
+            lossy_alias
+                .to_str()
+                .expect("lossy alias should be valid UTF-8"),
+        )
+        .expect("open healthy lossy alias");
+        alias_conn
+            .execute_raw("CREATE TABLE marker(value TEXT NOT NULL);")
+            .expect("create marker table in alias");
+        drop(alias_conn);
+
+        let error =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect_err("salvage must fail closed instead of inspecting the U+FFFD alias");
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "unexpected salvage validation error: {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "a path-identity failure must not create a promotable candidate"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn reconstruct_target_never_mutates_a_lossy_utf8_alias() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_root = tmp.path().join("archive");
+        write_archive_message(&storage_root, "test-project", 1);
+
+        let invalid_name = std::ffi::OsString::from_vec(b"target-\xFF.sqlite3".to_vec());
+        let db_path = tmp.path().join(&invalid_name);
+        let lossy_alias = tmp.path().join(invalid_name.to_string_lossy().into_owned());
+        let alias_conn = SqliteDbConn::open_file(
+            lossy_alias
+                .to_str()
+                .expect("lossy alias should be valid UTF-8"),
+        )
+        .expect("open healthy lossy alias");
+        alias_conn
+            .execute_raw(
+                "CREATE TABLE marker(value TEXT NOT NULL); INSERT INTO marker VALUES ('untouched')",
+            )
+            .expect("seed alias marker");
+        drop(alias_conn);
+
+        let error = reconstruct_from_archive(&db_path, &storage_root)
+            .expect_err("reconstruct must reject a non-UTF-8 target identity");
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "unexpected target validation error: {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "a rejected target must not even be claimed as an empty file"
+        );
+        let alias_conn = SqliteDbConn::open_file(lossy_alias.to_str().unwrap()).unwrap();
+        let rows = alias_conn
+            .query_sync("SELECT value FROM marker", &[])
+            .expect("read alias marker");
+        assert_eq!(
+            rows[0].get_named::<String>("value").unwrap(),
+            "untouched",
+            "reconstruct must not redirect writes into the U+FFFD sibling"
+        );
+    }
+
     #[test]
     fn reconstruct_with_salvage_degrades_to_archive_when_source_fails_integrity() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -10985,6 +11169,66 @@ archive body
             err.to_string().contains("symlinked path"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn collect_db_message_ids_never_reads_a_lossy_utf8_alias() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let invalid_name = std::ffi::OsString::from_vec(b"mailbox-\xFF.sqlite3".to_vec());
+        let db_path = tmp.path().join(&invalid_name);
+        std::fs::write(&db_path, b"raw non-UTF path witness").unwrap();
+        let lossy_alias = tmp.path().join(invalid_name.to_string_lossy().into_owned());
+        setup_db_with_messages(&lossy_alias, &[5, 15, 25]);
+
+        let error = collect_db_message_ids(&db_path)
+            .expect_err("inventory must reject rather than inspect the U+FFFD sibling");
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            b"raw non-UTF path witness",
+            "the exact raw path must remain untouched"
+        );
+        assert_eq!(
+            collect_db_message_ids(&lossy_alias).unwrap(),
+            BTreeSet::from([5, 15, 25]),
+            "the healthy alias remains a distinct database"
+        );
+    }
+
+    #[test]
+    fn reconstruct_rejects_stale_certification_and_namespace_target_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("archive");
+
+        for suffix in ["-wal-cert", "-fsqlite-ns-use"] {
+            let db_path = tmp.path().join(format!(
+                "candidate-{}.sqlite3",
+                suffix.trim_start_matches('-')
+            ));
+            let companion = crate::pool::sqlite_path_with_suffix(&db_path, suffix);
+            std::fs::write(&companion, b"stale generation witness").unwrap();
+
+            let error = reconstruct_from_archive(&db_path, &storage_root)
+                .expect_err("stale companion state must block target admission");
+            assert!(
+                error.to_string().contains("companion state"),
+                "unexpected error for {suffix}: {error}"
+            );
+            assert!(
+                !db_path.exists(),
+                "reconstruction must not claim a main file beside stale {suffix} state"
+            );
+            assert_eq!(
+                std::fs::read(&companion).unwrap(),
+                b"stale generation witness"
+            );
+        }
     }
 
     #[test]

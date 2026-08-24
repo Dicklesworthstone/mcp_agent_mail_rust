@@ -117,6 +117,8 @@ walkdir = "2"
 tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "1f32c1a8af0eb9d68bd3f5576caf20941364b657" }
 indexmap = "2"
 nix = "0.31.3"
+rustix = { version = "1.1.4", features = ["fs"] }
+url = "2.5.8"
 signal-hook = "0.4.4"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.

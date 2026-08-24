@@ -25,15 +25,15 @@
 //!     immediately re-arm (the "3 reconstructions in 40 s" loop).
 //!   * **Corruption recovery** acquires via
 //!     [`acquire_promotion_barrier_draining`], which blocks new writers,
-//!     waits a bounded time for in-flight writers to drain, then proceeds
-//!     regardless — a write racing a corrupt database is already doomed, and
-//!     refusing recovery indefinitely is strictly worse.
+//!     and waits a bounded time for in-flight writers to drain. A timeout is a
+//!     fail-closed outcome: callers must release the barrier and defer recovery
+//!     without renaming any member of the live SQLite generation.
 //!
-//! The barrier is reentrant per thread (recovery code that re-enters helper
-//! paths must not deadlock on itself), and a thread's own write activity is
-//! exempt from draining: a write tool whose pool bootstrap triggers recovery
-//! *is* the current writer, and it is sequentially parked inside the recovery
-//! call, not writing concurrently.
+//! The promotion barrier is reentrant per thread (recovery code that re-enters
+//! helper paths must not deadlock on itself). Write activity has no per-thread
+//! exemption: async tool futures are `Send` and may migrate between executor
+//! threads. Cold pool bootstrap therefore uses an explicit promotion-barrier
+//! to writer handoff before returning the live pool.
 //!
 //! The barrier is process-global rather than per-path: promotions are rare,
 //! and a global gate keeps the lock graph trivial.
@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 const WRITER_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Default bound on how long corruption recovery waits for in-flight writers
-/// to drain before proceeding anyway.
+/// to drain before failing closed and deferring recovery.
 const DEFAULT_WRITER_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 /// Default minimum interval between archive-drift reconciles of the same
@@ -119,16 +119,8 @@ fn barrier() -> &'static Barrier {
 }
 
 thread_local! {
-    /// Nesting depth of write activity held by the current thread
-    /// (`send_message` nests `macro_contact_handshake`, which takes its own
-    /// pool lease).
-    static THREAD_WRITE_DEPTH: Cell<usize> = const { Cell::new(0) };
     /// Whether the current thread already holds the promotion barrier.
     static THREAD_BARRIER_DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-fn current_thread_write_depth() -> usize {
-    THREAD_WRITE_DEPTH.with(Cell::get)
 }
 
 fn current_thread_holds_barrier() -> bool {
@@ -152,10 +144,9 @@ pub fn current_thread_holds_promotion_barrier() -> bool {
 /// stalled tool call is strictly better than a write landing across a file
 /// swap.
 ///
-/// Same-thread contract: like the existing `ReadOnlyIntentGuard` /
-/// `RecoveryAdmissionDepthGuard` / `RecoveryBreakerBypassGuard` patterns,
-/// per-thread depth accounting assumes acquisition and release happen on the
-/// same OS thread. The global writer count stays correct regardless.
+/// This guard is safely `Send`: its ownership is process-global and dropping
+/// it on a different executor thread decrements the same global count. No
+/// thread-local writer exemption is used.
 #[must_use = "write activity ends when this guard drops"]
 pub struct WriteActivityGuard {
     _priv: (),
@@ -197,13 +188,11 @@ pub fn begin_write_activity() -> WriteActivityGuard {
     }
     state.writers = state.writers.saturating_add(1);
     drop(state);
-    THREAD_WRITE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
     WriteActivityGuard { _priv: () }
 }
 
 impl Drop for WriteActivityGuard {
     fn drop(&mut self) {
-        THREAD_WRITE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
         let b = barrier();
         let mut state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.writers = state.writers.saturating_sub(1);
@@ -212,24 +201,24 @@ impl Drop for WriteActivityGuard {
     }
 }
 
-/// Number of write-path operations currently in flight in this process,
-/// excluding any held by the calling thread.
+/// Number of write-path operations currently in flight in this process.
 #[must_use]
-pub fn foreign_writer_count() -> usize {
+pub fn active_writer_count() -> usize {
     let b = barrier();
     let state = b.state.lock().unwrap_or_else(PoisonError::into_inner);
-    state.writers.saturating_sub(current_thread_write_depth())
+    state.writers
 }
 
 /// Outcome of a draining barrier acquisition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
-    /// No foreign writers were active at acquisition.
+    /// No writers were active at acquisition.
     Idle,
     /// Foreign writers drained within the timeout.
     Drained { waited: Duration },
-    /// The timeout elapsed with writers still in flight; the barrier is held
-    /// anyway (new writers stay blocked) and recovery proceeds.
+    /// The timeout elapsed with writers still in flight. The barrier is still
+    /// held when this outcome is returned so the caller can observe a stable
+    /// count, but the caller must release it and abort before any mutation.
     TimedOut { remaining_writers: usize },
 }
 
@@ -241,17 +230,27 @@ pub enum DrainOutcome {
 #[must_use = "the promotion barrier releases when this guard drops"]
 pub struct PromotionBarrierGuard {
     passthrough: bool,
+    // Barrier nesting is intentionally thread-local and all promotion work is
+    // synchronous. Prevent an executor or caller from moving this guard and
+    // corrupting the depth/release contract.
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl PromotionBarrierGuard {
     fn new_held() -> Self {
         THREAD_BARRIER_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-        Self { passthrough: false }
+        Self {
+            passthrough: false,
+            _not_send: std::marker::PhantomData,
+        }
     }
 
     fn new_passthrough() -> Self {
         THREAD_BARRIER_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-        Self { passthrough: true }
+        Self {
+            passthrough: true,
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 
@@ -279,11 +278,9 @@ impl Drop for PromotionBarrierGuard {
 
 /// Acquire the promotion barrier only if the process is write-idle.
 ///
-/// Returns `None` when another promotion is active or when any foreign write
+/// Returns `None` when another promotion is active or when any write
 /// is in flight — the caller (an archive-drift reconcile) should defer and
-/// let the admission machinery retry later. The calling thread's own write
-/// activity is exempt (it is parked inside this very call, not writing
-/// concurrently).
+/// let the admission machinery retry later.
 #[must_use]
 pub fn try_acquire_promotion_barrier_if_idle() -> Option<PromotionBarrierGuard> {
     if current_thread_holds_barrier() {
@@ -294,7 +291,7 @@ pub fn try_acquire_promotion_barrier_if_idle() -> Option<PromotionBarrierGuard> 
     if state.promotion_active {
         return None;
     }
-    if state.writers.saturating_sub(current_thread_write_depth()) > 0 {
+    if state.writers > 0 {
         return None;
     }
     state.promotion_active = true;
@@ -303,8 +300,9 @@ pub fn try_acquire_promotion_barrier_if_idle() -> Option<PromotionBarrierGuard> 
 }
 
 /// Acquire the promotion barrier for corruption recovery: block new writers
-/// immediately, wait up to `timeout` for in-flight foreign writers to drain,
-/// then proceed regardless.
+/// immediately, wait up to `timeout` for every in-flight writer to drain,
+/// then return [`DrainOutcome::TimedOut`] if any remain. A timed-out guard must
+/// only be used to fail closed; it does not authorize promotion.
 pub fn acquire_promotion_barrier_draining(
     timeout: Duration,
 ) -> (PromotionBarrierGuard, DrainOutcome) {
@@ -323,16 +321,15 @@ pub fn acquire_promotion_barrier_draining(
     }
     state.promotion_active = true;
 
-    let self_depth = current_thread_write_depth();
     let started = Instant::now();
-    let outcome = if state.writers.saturating_sub(self_depth) == 0 {
+    let outcome = if state.writers == 0 {
         DrainOutcome::Idle
     } else {
         loop {
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break DrainOutcome::TimedOut {
-                    remaining_writers: state.writers.saturating_sub(self_depth),
+                    remaining_writers: state.writers,
                 };
             }
             let (next, _timeout) = b
@@ -340,7 +337,7 @@ pub fn acquire_promotion_barrier_draining(
                 .wait_timeout(state, remaining.min(WRITER_WAIT_WARN_INTERVAL))
                 .unwrap_or_else(PoisonError::into_inner);
             state = next;
-            if state.writers.saturating_sub(self_depth) == 0 {
+            if state.writers == 0 {
                 break DrainOutcome::Drained {
                     waited: started.elapsed(),
                 };
@@ -459,14 +456,30 @@ mod tests {
     }
 
     #[test]
-    fn own_write_activity_is_exempt_from_idle_check() {
+    fn write_activity_blocks_idle_promotion_even_on_same_thread() {
         let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         reset_for_test();
         let _activity = begin_write_activity();
         let barrier = try_acquire_promotion_barrier_if_idle();
         assert!(
-            barrier.is_some(),
-            "a thread's own write activity must not block its own recovery"
+            barrier.is_none(),
+            "every live writer must block promotion; cold bootstrap performs an explicit barrier-to-writer handoff"
+        );
+    }
+
+    #[test]
+    fn migrated_write_guard_cannot_leave_a_false_self_exemption() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset_for_test();
+        let migrated = begin_write_activity();
+        std::thread::spawn(move || drop(migrated))
+            .join()
+            .expect("drop migrated writer");
+
+        let _fresh = begin_write_activity();
+        assert!(
+            try_acquire_promotion_barrier_if_idle().is_none(),
+            "dropping a Send guard on another thread must not leave ghost ownership that hides a real writer"
         );
     }
 
@@ -550,7 +563,7 @@ mod tests {
         drop(inner);
         // Barrier must still be held by the outer guard.
         assert!(
-            foreign_writer_count() == 0,
+            active_writer_count() == 0,
             "sanity: no writers involved in this test"
         );
         let b = barrier();

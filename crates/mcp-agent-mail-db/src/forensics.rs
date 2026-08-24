@@ -323,7 +323,7 @@ impl ForensicPreSnapshot {
 fn read_sqlite_header_fields(db_path: &Path) -> Option<(u32, u32)> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(db_path).ok()?;
+    let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(db_path).ok()?;
     let mut header = [0u8; 32];
     file.read_exact(&mut header).ok()?;
 
@@ -340,6 +340,11 @@ fn read_sqlite_header_fields(db_path: &Path) -> Option<(u32, u32)> {
     };
     let page_count = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
     Some((page_size, page_count))
+}
+
+fn regular_file_len_no_follow(path: &Path) -> Option<u64> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    metadata.file_type().is_file().then_some(metadata.len())
 }
 
 /// Capture a lightweight pre-recovery snapshot of the live DB state.
@@ -382,13 +387,13 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
         return snapshot;
     }
 
-    let db_bytes = std::fs::metadata(db_path).ok().map(|m| m.len());
+    let db_bytes = regular_file_len_no_follow(db_path);
     let journal_path = sqlite_path_with_suffix(db_path, "-journal");
     let wal_path = sqlite_path_with_suffix(db_path, "-wal");
     let shm_path = sqlite_path_with_suffix(db_path, "-shm");
-    let journal_bytes = std::fs::metadata(&journal_path).ok().map(|m| m.len());
-    let wal_bytes = std::fs::metadata(&wal_path).ok().map(|m| m.len());
-    let shm_bytes = std::fs::metadata(&shm_path).ok().map(|m| m.len());
+    let journal_bytes = regular_file_len_no_follow(&journal_path);
+    let wal_bytes = regular_file_len_no_follow(&wal_path);
+    let shm_bytes = regular_file_len_no_follow(&shm_path);
     let (page_size, page_count) =
         read_sqlite_header_fields(db_path).map_or((None, None), |(ps, pc)| (Some(ps), Some(pc)));
 
@@ -4235,9 +4240,9 @@ mod tests {
         prepare_recovery_receipt, read_sqlite_header_fields, redact_database_url,
         verify_recovery_receipt_state, verify_recovery_receipt_state_for_promotion,
     };
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use std::ffi::OsString;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use std::os::unix::ffi::OsStringExt;
 
     /// br-r6awv: reduced multiplicity of a SURVIVING identity is
@@ -6057,6 +6062,7 @@ mod tests {
         assert_eq!(snap.recovery_lock_pid, Some(std::process::id()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn pre_snapshot_detects_stale_recovery_lock() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6074,6 +6080,49 @@ mod tests {
             "stale lock should not be active"
         );
         assert_eq!(snap.recovery_lock_pid, Some(999_999_999));
+    }
+
+    #[test]
+    fn pre_snapshot_fails_closed_on_invalid_recovery_lock_authority() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("invalid-lock.sqlite3");
+        std::fs::write(&db_path, b"data").expect("write db");
+        let lock_path = dir.path().join("invalid-lock.sqlite3.recovery.lock");
+        std::fs::write(&lock_path, b"not-a-pid").expect("write invalid lock");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "invalid-lock");
+
+        assert!(
+            snap.recovery_lock_active,
+            "occupied lock authority with an unprovable owner must block recovery"
+        );
+        assert_eq!(snap.recovery_lock_pid, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_snapshot_never_follows_symlinked_recovery_lock_authority() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("linked-lock.sqlite3");
+        std::fs::write(&db_path, b"data").expect("write db");
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, std::process::id().to_string()).expect("write sentinel");
+        let lock_path = dir.path().join("linked-lock.sqlite3.recovery.lock");
+        symlink(&sentinel, &lock_path).expect("symlink recovery lock");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "linked-lock");
+
+        assert!(
+            snap.recovery_lock_active,
+            "symlinked ownership authority must fail closed"
+        );
+        assert_eq!(snap.recovery_lock_pid, None);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("read untouched sentinel"),
+            std::process::id().to_string()
+        );
     }
 
     #[test]
@@ -6124,5 +6173,34 @@ mod tests {
                 "page size {raw_page_size} should be rejected"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_recovery_snapshot_never_follows_a_database_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sentinel = dir.path().join("sentinel.sqlite3");
+        let linked = dir.path().join("storage.sqlite3");
+        let mut header = vec![0_u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        header[31] = 7;
+        std::fs::write(&sentinel, &header).expect("write sentinel");
+        let before = std::fs::read(&sentinel).expect("read sentinel before");
+        symlink(&sentinel, &linked).expect("plant database symlink");
+
+        let snapshot = capture_pre_recovery_snapshot(&linked, "symlink-regression");
+
+        assert_eq!(snapshot.db_bytes, None);
+        assert_eq!(snapshot.page_size, None);
+        assert_eq!(snapshot.page_count, None);
+        assert!(read_sqlite_header_fields(&linked).is_none());
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read sentinel after"),
+            before,
+            "forensic collection must neither follow nor alter the symlink target"
+        );
     }
 }

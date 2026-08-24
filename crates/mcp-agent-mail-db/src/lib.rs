@@ -13,6 +13,7 @@
 //! to/from `chrono::NaiveDateTime` for API compatibility.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(windows, feature(windows_by_handle))]
 #![allow(
     clippy::result_large_err,
     clippy::match_same_arms,
@@ -312,6 +313,8 @@ pub use pool::{
     recovery_admission,
     resolve_mailbox_sqlite_path,
     sqlite_primary_read_path_is_healthy,
+    sqlite_recovery_candidate_is_standalone,
+    sqlite_recovery_candidate_passes_full_integrity_check,
 };
 pub use queries::{LeaseOutcome, MvccRetryMetrics, RollupSnapshot, mvcc_retry_metrics};
 pub use reconstruct::{

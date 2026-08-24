@@ -2534,6 +2534,23 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
     Ok(())
 }
 
+/// Canonical-SQLite variant of [`enforce_runtime_fts_cleanup`].
+///
+/// Recovery staging paths must never be opened through FrankenSQLite because
+/// its persistent namespace records make a subsequently renamed candidate
+/// ambiguous. Archive restore uses this variant while converting a private
+/// staged legacy database to the runtime's FTS-free schema.
+#[allow(clippy::result_large_err)]
+pub fn enforce_runtime_fts_cleanup_canonical(
+    conn: &crate::CanonicalDbConn,
+) -> std::result::Result<(), SqlError> {
+    for migration in base_trigger_cleanup_migrations() {
+        conn.execute_raw(&migration.up)?;
+    }
+    conn.execute_raw("DROP TABLE IF EXISTS fts_messages")?;
+    Ok(())
+}
+
 /// Migrations excluding FTS5 object migrations, canonical-only cleanup ledger
 /// IDs, and runtime-canonical follow-ups.
 ///

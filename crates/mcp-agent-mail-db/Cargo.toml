@@ -24,6 +24,11 @@ unicode-normalization.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+fs2.workspace = true
+same-file.workspace = true
+nix = { workspace = true, features = ["fs", "process", "signal"] }
+rustix.workspace = true
+url.workspace = true
 
 # frankensearch: two-tier hybrid search implementation (optional, for hybrid feature)
 frankensearch = { workspace = true, optional = true }
@@ -100,10 +105,6 @@ hybrid = [
 loom-tests = []
 # Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)
 s3fifo = []
-
-[target.'cfg(windows)'.dependencies]
-# Stable file-identity check (std's windows_by_handle is still unstable).
-same-file.workspace = true
 
 [dev-dependencies]
 # asupersync `Cx::for_testing()` (the `Cx<cap::All>` constructor) is gated
