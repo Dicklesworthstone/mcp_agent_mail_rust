@@ -274,10 +274,10 @@ pub(crate) fn normalize_omp_profile_name(profile: &str) -> Option<&str> {
         || !profile
             .chars()
             .next()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric())
-        || !profile
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+            .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        || !profile.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
     {
         return None;
     }
@@ -3281,7 +3281,7 @@ mod tests {
     #[test]
     fn config_actions_omp_honors_resolved_active_profile_path() {
         let active_profile_config =
-            PathBuf::from("/tmp/omp-home/.omp/profiles/Work/agent/mcp.json");
+            PathBuf::from("/tmp/omp-home/.omp/profiles/work/agent/mcp.json");
         let params = SetupParams {
             token: "tok".into(),
             project_dir: PathBuf::from("/tmp/p"),
@@ -3305,7 +3305,7 @@ mod tests {
         let named = resolve_omp_config_paths(
             home,
             cwd,
-            Some(" Work "),
+            Some(" work "),
             Some("legacy"),
             Some(".custom-omp"),
             Some("ignored-for-named-profile"),
@@ -3313,7 +3313,7 @@ mod tests {
         assert_eq!(named.config_root, PathBuf::from("/home/alice/.custom-omp"));
         assert_eq!(
             named.user_mcp_config,
-            PathBuf::from("/home/alice/.custom-omp/profiles/Work/agent/mcp.json")
+            PathBuf::from("/home/alice/.custom-omp/profiles/work/agent/mcp.json")
         );
 
         let explicit_default = resolve_omp_config_paths(
@@ -3353,6 +3353,7 @@ mod tests {
             ".",
             "..",
             "bad profile",
+            "Work",
             "CON",
             "LPT9.txt",
             "bad.",

@@ -666,10 +666,17 @@ fn add_home_omp_candidates(
     config_root: &Path,
     active_user_config: &Path,
 ) {
-    add_omp_agent_candidates(out, seen, active_user_config);
+    let profiles_root = config_root.join("profiles");
+    if !omp_profile_config_traverses_symlink(&profiles_root, active_user_config) {
+        add_omp_agent_candidates(out, seen, active_user_config);
+    }
     add_omp_agent_candidates(out, seen, &config_root.join("agent").join("mcp.json"));
 
-    let profiles_root = config_root.join("profiles");
+    if std::fs::symlink_metadata(&profiles_root)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return;
+    }
     let mut profile_dirs = std::fs::read_dir(&profiles_root)
         .into_iter()
         .flatten()
@@ -686,8 +693,38 @@ fn add_home_omp_candidates(
         .collect::<Vec<_>>();
     profile_dirs.sort();
     for profile_dir in profile_dirs {
-        add_omp_agent_candidates(out, seen, &profile_dir.join("agent").join("mcp.json"));
+        let primary_config = profile_dir.join("agent").join("mcp.json");
+        if !omp_profile_config_traverses_symlink(&profiles_root, &primary_config) {
+            add_omp_agent_candidates(out, seen, &primary_config);
+        }
     }
+}
+
+fn omp_profile_config_traverses_symlink(profiles_root: &Path, config: &Path) -> bool {
+    let Ok(relative) = config.strip_prefix(profiles_root) else {
+        return false;
+    };
+    let mut current = profiles_root.to_path_buf();
+    if std::fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return true;
+    }
+
+    let Some(parent) = relative.parent() else {
+        return false;
+    };
+    for component in parent.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return true;
+        };
+        current.push(segment);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 fn add_omp_agent_candidates(
@@ -1262,7 +1299,7 @@ mod tests {
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
         let omp_root = home.join("custom-omp");
-        let active_config = omp_root.join("profiles/Work/agent/mcp.json");
+        let active_config = omp_root.join("profiles/work/agent/mcp.json");
         std::fs::create_dir_all(active_config.parent().expect("active profile parent"))
             .expect("create active profile");
         std::fs::write(&active_config, "{}").expect("write active profile config");
@@ -1293,6 +1330,38 @@ mod tests {
                 })
                 .is_some_and(|entry| entry.exists),
             "the active OMP profile candidate should report its live existence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_locations_skip_symlinked_omp_profile_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let omp_root = home.join(".omp");
+        let outside = tmp.path().join("outside");
+        let outside_config = outside.join("agent/mcp.json");
+        std::fs::create_dir_all(outside_config.parent().expect("outside config parent"))
+            .expect("create outside profile");
+        std::fs::write(&outside_config, "{}").expect("write outside profile config");
+        std::fs::create_dir_all(omp_root.join("profiles")).expect("create profiles root");
+        symlink(&outside, omp_root.join("profiles/linked")).expect("link profile directory");
+
+        let linked_config = omp_root.join("profiles/linked/agent/mcp.json");
+        let locations = detect_mcp_config_locations(&McpConfigDetectParams {
+            home_dir: Some(home),
+            project_dir: Some(project),
+            omp_config_root: Some(omp_root),
+            omp_user_mcp_config: Some(linked_config.clone()),
+            ..McpConfigDetectParams::default()
+        });
+
+        assert!(
+            !contains_location(&locations, McpConfigTool::Omp, &linked_config),
+            "OMP discovery must not follow an active or enumerated symlinked profile"
         );
     }
 

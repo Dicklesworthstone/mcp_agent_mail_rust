@@ -17,9 +17,12 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   authenticated HTTP MCP shape to the project config and active-profile user
   config. Discovery, doctor repair, and the installer honor `OMP_PROFILE`,
   `PI_PROFILE`, `PI_CONFIG_DIR`, and default-profile `PI_CODING_AGENT_DIR`,
-  cover existing named profiles plus OMP's project-root fallbacks, and avoid
-  following symlinked or invalid profile directories. Pane identity parsing
-  also treats `omp` and `oh-my-pi` as program names rather than agent names.
+  enforce OMP's lowercase profile-name syntax, cover existing named profiles
+  plus OMP's project-root fallbacks, and avoid following symlinked or invalid
+  profile directories. Installer migration removes stale stdio/auth fields and
+  canonicalizes OMP entries under `mcpServers`; every installer phase now
+  shares the same bearer token. Pane identity parsing also treats `omp` and
+  `oh-my-pi` as program names rather than agent names.
 
 - **Verifiable pane-identity bindings (GH#252).** Per-pane identity files
   now hold a one-line JSON `PaneIdentityRecord` — `name` plus the tmux

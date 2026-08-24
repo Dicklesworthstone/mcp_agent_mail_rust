@@ -583,6 +583,174 @@ EOF
 fi
 
 # ===========================================================================
+# Case 16: OMP installer helpers honor the native profile and HTTP contracts
+# ===========================================================================
+e2e_case_banner "OMP installer profile and HTTP config contracts"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  e2e_skip "python3 unavailable; skipping OMP installer helper case"
+else
+  OMP_INSTALLER_DIR="${FAKE_HOME}/omp-installer-contract"
+  OMP_CONFIG="${OMP_INSTALLER_DIR}/mcp.json"
+  mkdir -p "${OMP_INSTALLER_DIR}"
+  cat > "${OMP_CONFIG}" <<'EOF'
+{
+  "mcpServers": {
+    "sibling": {"type": "http", "url": "http://sibling.invalid/mcp"}
+  },
+  "servers": {
+    "mcp_agent_mail": {
+      "command": "legacy-agent-mail",
+      "args": [],
+      "env": {"HTTP_BEARER_TOKEN": "stale-token"},
+      "headers": {
+        "authorization": "Bearer stale-token",
+        "X-Trace": "preserve-me"
+      }
+    },
+    "other": {"command": "other-server"}
+  }
+}
+EOF
+
+  OMP_WRITER_LIBRARY="${OMP_INSTALLER_DIR}/writer-function.sh"
+  sed -n '/^setup_single_standard_http_json_config() {/,/^setup_single_opencode_json_config() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${OMP_WRITER_LIBRARY}"
+  if [ ! -s "${OMP_WRITER_LIBRARY}" ]; then
+    e2e_fail "extract OMP installer writer" "function body" "missing"
+  else
+    set +e
+    (
+      # These stubs are invoked by the sourced installer helper.
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      # shellcheck disable=SC1090
+      source "${OMP_WRITER_LIBRARY}"
+      setup_single_standard_http_json_config omp "${OMP_CONFIG}"
+    )
+    OMP_WRITER_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer converts legacy config" "0" "${OMP_WRITER_RC}"
+
+    OMP_WRITER_ASSERTIONS="$(python3 - "${OMP_CONFIG}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+
+entry = doc["mcpServers"]["mcp-agent-mail"]
+assert entry["type"] == "http"
+assert entry["url"] == "http://127.0.0.1:8765/mcp/"
+assert entry["headers"] == {"X-Trace": "preserve-me"}
+assert "command" not in entry and "args" not in entry and "env" not in entry
+assert "mcp_agent_mail" not in doc["servers"]
+assert doc["servers"]["other"]["command"] == "other-server"
+assert doc["mcpServers"]["sibling"]["url"] == "http://sibling.invalid/mcp"
+print("valid")
+PY
+)"
+    e2e_assert_eq "OMP installer writer emits one clean native HTTP entry" "valid" "${OMP_WRITER_ASSERTIONS}"
+
+    set +e
+    (
+      # These stubs are invoked by the sourced installer helper.
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      # shellcheck disable=SC1090
+      source "${OMP_WRITER_LIBRARY}"
+      setup_single_standard_http_json_config omp "${OMP_CONFIG}"
+    )
+    OMP_WRITER_SECOND_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer is idempotent" "1" "${OMP_WRITER_SECOND_RC}"
+  fi
+
+  OMP_DETECT_LIBRARY="${OMP_INSTALLER_DIR}/detect-function.sh"
+  sed -n '/^detect_mcp_configs() {/,/^generate_bearer_token() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${OMP_DETECT_LIBRARY}"
+  if [ ! -s "${OMP_DETECT_LIBRARY}" ]; then
+    e2e_fail "extract OMP installer detector" "function body" "missing"
+  else
+    mkdir -p "${FAKE_HOME}/.omp/profiles/Work/agent" "${FAKE_HOME}/custom-agent"
+    ln -s "${OMP_INSTALLER_DIR}" "${FAKE_HOME}/.omp/profiles/linked"
+    OMP_DETECT_OUT="$(
+      # shellcheck disable=SC1090
+      source "${OMP_DETECT_LIBRARY}"
+      OMP_PROFILE=Work PI_CODING_AGENT_DIR="${FAKE_HOME}/custom-agent" \
+        detect_mcp_configs "${FAKE_HOME}"
+    )"
+    e2e_assert_contains "invalid uppercase OMP profile falls back to the default override" \
+      "${OMP_DETECT_OUT}" "${FAKE_HOME}/custom-agent/mcp.json"
+    e2e_assert_not_contains "invalid uppercase OMP profile is not advertised" \
+      "${OMP_DETECT_OUT}" "/profiles/Work/"
+
+    OMP_SYMLINK_DETECT_OUT="$(
+      # shellcheck disable=SC1090
+      source "${OMP_DETECT_LIBRARY}"
+      OMP_PROFILE=linked detect_mcp_configs "${FAKE_HOME}"
+    )"
+    e2e_assert_not_contains "symlinked OMP profile is not followed" \
+      "${OMP_SYMLINK_DETECT_OUT}" "/profiles/linked/"
+  fi
+
+  OMP_SETUP_LIBRARY="${OMP_INSTALLER_DIR}/setup-mcp-configs-function.sh"
+  sed -n '/^setup_mcp_configs() {/,/^sync_codex_http_configs() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${OMP_SETUP_LIBRARY}"
+  if [ ! -s "${OMP_SETUP_LIBRARY}" ]; then
+    e2e_fail "extract installer MCP setup orchestrator" "function body" "missing"
+  else
+    OMP_TOKEN_CONTRACT="$(
+      # These stubs let the orchestration contract run without touching any
+      # real client or invoking the installed binary.
+      # shellcheck disable=SC2329
+      detect_mcp_configs() { printf 'omp\t%s\t1\n' "${OMP_CONFIG}"; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'existing-token'; }
+      # shellcheck disable=SC2329
+      generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
+      # shellcheck disable=SC2329
+      setup_claude_code_mcp_via_cli() { return 1; }
+      OMP_TOKEN_CALL_VALID=0
+      # shellcheck disable=SC2329
+      setup_single_mcp_config() {
+        if [ "$4" = "existing-token" ] && [ "${HTTP_BEARER_TOKEN:-}" = "existing-token" ]; then
+          OMP_TOKEN_CALL_VALID=1
+          return 1
+        fi
+        return 2
+      }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${OMP_SETUP_LIBRARY}"
+      unset HTTP_BEARER_TOKEN
+      setup_mcp_configs "/unused/mcp-agent-mail"
+      if [ "$OMP_TOKEN_CALL_VALID" -eq 1 ] \
+        && [ "${HTTP_BEARER_TOKEN:-}" = "existing-token" ]; then
+        printf '%s' 'valid'
+      else
+        printf '%s' 'invalid'
+      fi
+    )"
+    e2e_assert_eq "installer reuses one bearer token across OMP setup phases" \
+      "valid" "${OMP_TOKEN_CONTRACT}"
+  fi
+fi
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 e2e_summary
