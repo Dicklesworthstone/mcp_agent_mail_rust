@@ -2443,42 +2443,15 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         ..DbPoolConfig::default()
     };
 
-    // Helper: returns true when the error looks like a stale WAL / snapshot
-    // conflict that can be fixed by quarantining WAL+SHM sidecars. These are NOT
-    // genuine "another process is busy" situations — they mean the DB file has
-    // a WAL that is inconsistent with the main file (e.g. after a crash or
-    // SIGKILL). Treating them as hard "busy" failures causes `am` to refuse
-    // to start when `doctor repair --yes` would succeed immediately.
-    let is_snapshot_conflict =
-        |msg: &str| -> bool { mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(msg) };
-
     let pool = match mcp_agent_mail_db::DbPool::new(&pool_config) {
         Ok(p) => p,
         Err(e) => {
             let err_str = e.to_string();
-
-            // Snapshot conflicts (stale WAL) are recoverable, but detaching a
-            // WAL/SHM family is itself a recovery mutation. Check this before
-            // the generic lock classification because snapshot conflicts
-            // match both, then delegate to the admitted DB health entrypoint.
-            if is_snapshot_conflict(&err_str) {
-                tracing::warn!(
-                    error = %err_str,
-                    "pool open hit snapshot conflict; attempting admitted database-health recovery"
-                );
-                return admitted_recovery_then_retry_integrity(&pool_config, config);
-            }
-
-            if mcp_agent_mail_db::is_lock_error(&err_str) {
-                return integrity_busy_probe_failure(config, &err_str);
-            }
-
-            // Corruption (malformed schema, WAL too small, etc.) follows the
-            // same admitted health/recovery path.
-            if mcp_agent_mail_db::is_corruption_error_message(&err_str) {
-                return admitted_recovery_then_retry_integrity(&pool_config, config);
-            }
-
+            // `DbPool::new` is deliberately lazy: it validates configuration
+            // and constructs the in-memory pool, but it does not open SQLite.
+            // Live lock, WAL, and corruption failures therefore cannot occur
+            // here. They are classified by `run_startup_integrity_check`,
+            // whose single recovery path owns durable admission and retry.
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
                 problem: format!(
@@ -2565,84 +2538,6 @@ fn probe_integrity(config: &Config) -> ProbeResult {
                 problem: format!(
                     "Startup integrity recovery failed for {db_target}: {}",
                     classify_recovery_failure_root_cause(&err_str)
-                ),
-                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
-                    .into(),
-            })
-        }
-    }
-}
-
-/// Sidecar cleanup is recovery: it changes which SQLite generation will be
-/// opened next. Delegate it to the common DB health entrypoint so the durable
-/// recovery breaker is loaded and admission is won before any WAL/SHM rename
-/// or checkpoint. Retain the explicit pool/integrity retry as a postcondition
-/// check after admitted recovery succeeds.
-fn admitted_recovery_then_retry_integrity(
-    pool_config: &DbPoolConfig,
-    config: &Config,
-) -> ProbeResult {
-    match attempt_probe_recovery(config) {
-        ProbeResult::Ok { .. } => {}
-        failure => return failure,
-    }
-
-    let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
-        || config.database_url.clone(),
-        |path| path.display().to_string(),
-    );
-    tracing::info!(
-        database = %db_target,
-        "admitted database-health recovery completed; retrying pool open"
-    );
-
-    let retry_pool = match mcp_agent_mail_db::DbPool::new(pool_config) {
-        Ok(pool) => pool,
-        Err(error) => {
-            let detail = error.to_string();
-            tracing::warn!(
-                database = %db_target,
-                error = %detail,
-                "pool open still failed after admitted database-health recovery"
-            );
-            if mcp_agent_mail_db::is_lock_error(&detail) {
-                return integrity_busy_probe_failure(config, &detail);
-            }
-            return ProbeResult::Fail(ProbeFailure {
-                name: "integrity",
-                problem: format!(
-                    "Admitted database-health recovery completed for {db_target}, but the startup pool retry still failed: {}",
-                    classify_integrity_open_root_cause(&detail)
-                ),
-                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unavailable, run `am doctor reconstruct --yes`."
-                    .into(),
-            });
-        }
-    };
-
-    match retry_pool.run_startup_integrity_check() {
-        Ok(_) => {
-            tracing::info!(
-                database = %db_target,
-                "pool open and integrity retry succeeded after admitted database-health recovery"
-            );
-            ProbeResult::Ok { name: "integrity" }
-        }
-        Err(error) => {
-            let detail = error.to_string();
-            tracing::warn!(
-                database = %db_target,
-                error = %detail,
-                "integrity retry still failed after admitted database-health recovery"
-            );
-            if mcp_agent_mail_db::is_lock_error(&detail) {
-                return integrity_busy_probe_failure(config, &detail);
-            }
-            ProbeResult::Fail(ProbeFailure {
-                name: "integrity",
-                problem: format!(
-                    "Admitted database-health recovery completed for {db_target}, but the startup integrity retry still failed: {}",
-                    classify_recovery_failure_root_cause(&detail)
                 ),
                 fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
                     .into(),
