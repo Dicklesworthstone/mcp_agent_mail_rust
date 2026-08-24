@@ -9092,6 +9092,12 @@ archive body
         conn.query_sync(&format!("INSERT INTO messages (id) VALUES {values}"), &[])
             .unwrap();
         drop(conn);
+        let admitted = crate::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("admit paged message-id fixture through FrankenSQLite");
+        admitted
+            .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+            .expect("query admitted paged message-id fixture");
+        crate::close_db_conn(admitted, "settle paged message-id fixture");
 
         let ids = collect_db_message_ids(&db_path).expect("collect ids");
         assert_eq!(ids.len(), DB_MESSAGE_ID_BATCH_ROWS);
@@ -11062,6 +11068,13 @@ archive body
             )
             .unwrap();
         }
+        drop(conn);
+        let admitted = crate::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("admit message inventory fixture through FrankenSQLite");
+        admitted
+            .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+            .expect("query admitted message inventory fixture");
+        crate::close_db_conn(admitted, "settle message inventory fixture");
     }
 
     #[test]
@@ -11101,6 +11114,12 @@ archive body
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
         conn.execute_raw("CREATE TABLE dummy (id INTEGER)").unwrap();
         drop(conn);
+        let admitted = crate::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("admit missing-table fixture through FrankenSQLite");
+        admitted
+            .query_sync("SELECT COUNT(*) AS n FROM dummy", &[])
+            .expect("query admitted missing-table fixture");
+        crate::close_db_conn(admitted, "settle missing-table fixture");
         let ids = collect_db_message_ids(&db_path).unwrap();
         assert!(ids.is_empty());
     }

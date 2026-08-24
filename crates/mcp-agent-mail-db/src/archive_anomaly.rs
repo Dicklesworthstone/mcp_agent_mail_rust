@@ -2460,9 +2460,8 @@ mod tests {
         assert_eq!(reservation.tag(), "file_reservation_artifact_mismatch");
     }
 
-    fn init_archive_verifier_db(db_path: &Path) -> crate::CanonicalDbConn {
-        let conn =
-            crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+    fn init_archive_verifier_db(db_path: &Path) -> crate::DbConn {
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
         conn.execute_raw(&crate::schema::init_schema_sql_base())
             .expect("init schema");
         conn
@@ -2522,6 +2521,7 @@ mod tests {
              ) VALUES (23, 1, 12, 'src/lib.rs', 1, 'verify', 0, 999999999, NULL);",
         )
         .expect("seed db");
+        crate::close_db_conn(conn, "settle archive verifier test fixture");
 
         let project_dir = storage_root.join("projects").join("demo-project");
         std::fs::create_dir_all(&project_dir).expect("create project dir");

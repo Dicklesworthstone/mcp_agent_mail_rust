@@ -13288,7 +13288,7 @@ fn open_private_sqlite_read_only(
 
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
 
-fn require_existing_regular_sqlite_source(path: &Path, context: &str) -> CliResult<()> {
+fn require_existing_regular_sqlite_path_metadata(path: &Path, context: &str) -> CliResult<()> {
     if path == Path::new(":memory:") {
         return Err(CliError::Other(format!(
             "{context} requires an existing file-backed SQLite database; :memory: cannot be snapshotted"
@@ -13322,6 +13322,23 @@ fn require_existing_regular_sqlite_source(path: &Path, context: &str) -> CliResu
             path.display()
         )));
     }
+
+    Ok(())
+}
+
+/// Validate a private, caller-owned SQLite materialization including its
+/// header bytes.
+///
+/// This helper opens and closes the main inode and therefore must never receive
+/// a live FrankenSQLite-managed mailbox path: classic process-wide `fcntl`
+/// locks can be released when any descriptor for that inode closes. Live paths
+/// use [`require_existing_regular_sqlite_path_metadata`] and are validated by
+/// the retained guarded FrankenSQLite connection itself.
+fn require_existing_regular_private_sqlite_source(
+    path: &Path,
+    context: &str,
+) -> CliResult<()> {
+    require_existing_regular_sqlite_path_metadata(path, context)?;
 
     let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
     let mut file = doctor::platform::open_regular_file_no_follow(path).map_err(|error| {
@@ -13365,7 +13382,7 @@ fn require_existing_regular_sqlite_source(path: &Path, context: &str) -> CliResu
 }
 
 fn require_read_only_sqlite_family_source(path: &Path) -> CliResult<()> {
-    require_existing_regular_sqlite_source(path, "read-only SQLite open")?;
+    require_existing_regular_private_sqlite_source(path, "private read-only SQLite open")?;
 
     for suffix in ["-journal", "-wal", "-shm"] {
         let sidecar = sqlite_sidecar_path(path, suffix);
@@ -13410,7 +13427,7 @@ fn resolve_existing_sqlite_source_candidate_with_database_url(
         .map_err(|error| CliError::Other(format!("bad database URL: {error}")))?;
     let path = resolve_sqlite_runtime_path(&path);
     let source_candidate = PathBuf::from(path);
-    require_existing_regular_sqlite_source(&source_candidate, context)?;
+    require_existing_regular_sqlite_path_metadata(&source_candidate, context)?;
     Ok(source_candidate)
 }
 
@@ -13418,7 +13435,7 @@ fn validated_live_sqlite_snapshot_source_path_from_candidate(
     source_candidate: &Path,
     context: &str,
 ) -> CliResult<PathBuf> {
-    require_existing_regular_sqlite_source(source_candidate, context)?;
+    require_existing_regular_sqlite_path_metadata(source_candidate, context)?;
     Ok(source_candidate.to_path_buf())
 }
 
@@ -13994,7 +14011,7 @@ impl CanonicalSnapshotSource {
     ) -> CliResult<Self> {
         let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-full-snapshot-", context)?;
         let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
-        vacuum_into_sqlite_snapshot(source_path, &actual_path, context)?;
+        vacuum_live_franken_sqlite_into_snapshot(source_path, &actual_path, context)?;
         Ok(Self {
             actual_path,
             reported_path,
@@ -14051,7 +14068,20 @@ fn sqlite_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn vacuum_into_sqlite_snapshot(source: &Path, destination: &Path, context: &str) -> CliResult<()> {
+fn sqlite_snapshot_path_text<'a>(
+    path: &'a Path,
+    context: &str,
+    role: &str,
+) -> CliResult<&'a str> {
+    path.to_str().ok_or_else(|| {
+        CliError::Other(format!(
+            "{context} refuses non-UTF-8 SQLite {role} path {}",
+            path.display()
+        ))
+    })
+}
+
+fn prepare_sqlite_snapshot_destination(destination: &Path, context: &str) -> CliResult<()> {
     if destination.exists() {
         return Err(CliError::Other(format!(
             "{context} full snapshot destination already exists: {}",
@@ -14068,14 +14098,62 @@ fn vacuum_into_sqlite_snapshot(source: &Path, destination: &Path, context: &str)
             ))
         })?;
     }
-    let source_str = source.display().to_string();
-    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&source_str).map_err(|error| {
+    Ok(())
+}
+
+fn vacuum_live_franken_sqlite_into_snapshot(
+    source: &Path,
+    destination: &Path,
+    context: &str,
+) -> CliResult<()> {
+    let destination_text = sqlite_snapshot_path_text(destination, context, "destination")?;
+    prepare_sqlite_snapshot_destination(destination, context)?;
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        source, context,
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "{context} guarded live snapshot source open failed for {}: {error}",
+            source.display()
+        ))
+    })?;
+    // `query_only` is a connection-local SQL policy. The pager remains
+    // engine-enforced read-only after this is disabled, while FrankenSQLite's
+    // `VACUUM INTO` may create only the new private destination.
+    conn.execute_raw("PRAGMA query_only = OFF;")
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context} could not enable guarded snapshot export from {}: {error}",
+                source.display()
+            ))
+        })?;
+    let destination_literal = sqlite_string_literal(destination_text);
+    conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context} guarded live snapshot failed from {} to {}: {error}",
+                source.display(),
+                destination.display()
+            ))
+        })?;
+    Ok(())
+}
+
+fn vacuum_canonical_sqlite_into_snapshot(
+    source: &Path,
+    destination: &Path,
+    context: &str,
+) -> CliResult<()> {
+    let source_text = sqlite_snapshot_path_text(source, context, "source")?;
+    let destination_text = sqlite_snapshot_path_text(destination, context, "destination")?;
+    prepare_sqlite_snapshot_destination(destination, context)?;
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(source_text).map_err(|error| {
         CliError::Other(format!(
             "{context} full snapshot source open failed for {}: {error}",
             source.display()
         ))
     })?;
-    let destination_literal = sqlite_string_literal(&destination.display().to_string());
+    let destination_literal = sqlite_string_literal(destination_text);
     conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
         .map_err(|error| {
             CliError::Other(format!(
@@ -14407,7 +14485,11 @@ fn open_atc_simulate_read_pool_with_database_url(
     ));
     if live_sidecar.is_file() {
         let snapshot_sidecar = source.actual_path().with_file_name("atc.sqlite3");
-        vacuum_into_sqlite_snapshot(&live_sidecar, &snapshot_sidecar, "ATC simulate sidecar")?;
+        vacuum_canonical_sqlite_into_snapshot(
+            &live_sidecar,
+            &snapshot_sidecar,
+            "ATC simulate sidecar",
+        )?;
     }
     let conn = source.open_read_only("ATC simulate snapshot")?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -67403,8 +67485,11 @@ startup_timeout_sec = 42
     fn sqlite_family_bytes_for_cli_open_test(db_path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         [
             db_path.to_path_buf(),
+            sqlite_sidecar_path(db_path, "-journal"),
             sqlite_sidecar_path(db_path, "-wal"),
             sqlite_sidecar_path(db_path, "-shm"),
+            sqlite_sidecar_path(db_path, "-wal-cert"),
+            sqlite_sidecar_path(db_path, "-wal-cert-head"),
             mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path),
             sqlite_sidecar_path(db_path, "-fsqlite-ns-gate"),
             sqlite_sidecar_path(db_path, "-fsqlite-ns-use"),
@@ -67487,6 +67572,64 @@ startup_timeout_sec = 42
                 "read-only {family_kind} probe created, removed, or renamed a live-family artifact"
             );
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn guarded_live_vacuum_snapshot_preserves_source_family_and_reads_wal_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("guarded-vacuum-source.sqlite3");
+        let snapshot_path = dir.path().join("guarded-vacuum-snapshot.sqlite3");
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open guarded VACUUM source");
+        writer
+            .execute_raw("CREATE TABLE snapshot_witness(value INTEGER NOT NULL);")
+            .expect("create guarded VACUUM witness table");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("configure guarded VACUUM WAL fixture");
+        writer
+            .execute_raw("INSERT INTO snapshot_witness(value) VALUES (41), (42);")
+            .expect("commit guarded VACUUM WAL rows");
+        drop(writer);
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| {
+                metadata.len()
+                    > u64::from(mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES)
+            }),
+            "fixture must retain committed WAL frames"
+        );
+        let source_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+
+        vacuum_live_franken_sqlite_into_snapshot(
+            &db_path,
+            &snapshot_path,
+            "guarded live VACUUM test",
+        )
+        .expect("materialize guarded live snapshot");
+
+        assert_eq!(
+            sqlite_family_bytes_for_cli_open_test(&db_path),
+            source_before,
+            "guarded live VACUUM must not checkpoint or rewrite the source family"
+        );
+        let snapshot = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            snapshot_path.display().to_string(),
+        )
+        .expect("open guarded VACUUM output");
+        let row = snapshot
+            .query_sync(
+                "SELECT COUNT(*) AS count, MAX(value) AS max_value FROM snapshot_witness",
+                &[],
+            )
+            .expect("query guarded VACUUM output")
+            .into_iter()
+            .next()
+            .expect("guarded VACUUM aggregate row");
+        assert_eq!(row.get_named::<i64>("count").expect("count"), 2);
+        assert_eq!(row.get_named::<i64>("max_value").expect("max"), 42);
     }
 
     #[test]

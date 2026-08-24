@@ -14115,6 +14115,76 @@ mod tests {
     }
 
     #[test]
+    fn guarded_read_only_helpers_refuse_valid_wal_without_shm_byte_identically() {
+        let source_directory = tempfile::tempdir().expect("WAL source tempdir");
+        let source_path = source_directory.path().join("source.sqlite3");
+        seed_settled_diagnostic_database(&source_path);
+        let source_writer =
+            crate::CanonicalDbConn::open_file(source_path.to_string_lossy().as_ref())
+                .expect("open WAL source writer");
+        source_writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable source WAL mode");
+        source_writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable source autocheckpoint");
+        source_writer
+            .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+            .expect("commit source WAL frame");
+        let wal_bytes = std::fs::read(sqlite_sidecar_path(&source_path, "-wal"))
+            .expect("read valid source WAL");
+        assert!(wal_bytes.len() > SQLITE_WAL_HEADER_BYTES_USIZE);
+
+        let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
+        let canonical_db_path = canonical_directory.path().join("missing-shm.sqlite3");
+        seed_settled_diagnostic_database(&canonical_db_path);
+        std::fs::write(
+            sqlite_sidecar_path(&canonical_db_path, "-wal"),
+            &wal_bytes,
+        )
+        .expect("write canonical WAL-without-SHM fixture");
+        assert!(!sqlite_sidecar_path(&canonical_db_path, "-shm").exists());
+        let canonical_before = exact_diagnostic_parent_snapshot(canonical_directory.path());
+        assert!(
+            open_guarded_read_only_canonical_sqlite_file(
+                &canonical_db_path,
+                "canonical WAL-without-SHM refusal",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(canonical_directory.path()),
+            canonical_before
+        );
+        assert_no_read_only_diagnostic_artifacts(canonical_directory.path());
+
+        let franken_directory = tempfile::tempdir().expect("Franken tempdir");
+        let franken_db_path = franken_directory.path().join("missing-shm.sqlite3");
+        seed_settled_diagnostic_database(&franken_db_path);
+        seed_quiescent_franken_namespace(&franken_db_path);
+        std::fs::write(
+            sqlite_sidecar_path(&franken_db_path, "-wal"),
+            &wal_bytes,
+        )
+        .expect("write Franken WAL-without-SHM fixture");
+        assert!(!sqlite_sidecar_path(&franken_db_path, "-shm").exists());
+        let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
+        assert!(
+            open_guarded_read_only_franken_existing_file(
+                &franken_db_path,
+                "Franken WAL-without-SHM refusal",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(franken_directory.path()),
+            franken_before
+        );
+
+        drop(source_writer);
+    }
+
+    #[test]
     fn guarded_read_only_helpers_reject_corrupt_primaries_without_artifacts() {
         for (corruption, corrupt_bytes) in
             [("empty", Vec::new()), ("invalid-header", vec![0xA5; 4096])]
@@ -14472,27 +14542,77 @@ mod tests {
 
     #[test]
     fn guarded_read_only_helpers_preserve_valid_live_wal_byte_identically() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let db_path = directory.path().join("valid-live-wal.sqlite3");
-        seed_settled_diagnostic_database(&db_path);
-        admit_diagnostic_database_with_franken(&db_path);
-        let writer = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
-            .expect("open live WAL writer");
-        writer
+        let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
+        let canonical_db_path = canonical_directory.path().join("canonical-live-wal.sqlite3");
+        seed_settled_diagnostic_database(&canonical_db_path);
+        let canonical_writer =
+            crate::CanonicalDbConn::open_file(canonical_db_path.to_string_lossy().as_ref())
+                .expect("open canonical live WAL writer");
+        canonical_writer
             .execute_raw("PRAGMA journal_mode = WAL;")
-            .expect("enable live WAL mode");
-        writer
+            .expect("enable canonical live WAL mode");
+        canonical_writer
             .execute_raw("PRAGMA wal_autocheckpoint = 0;")
-            .expect("disable automatic WAL checkpoints");
-        writer
+            .expect("disable canonical automatic WAL checkpoints");
+        canonical_writer
             .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
-            .expect("commit uncheckpointed live WAL row");
-        assert!(sqlite_sidecar_path(&db_path, "-wal").is_file());
-        assert!(sqlite_sidecar_path(&db_path, "-shm").is_file());
-        let before = exact_diagnostic_parent_snapshot(directory.path());
+            .expect("commit canonical uncheckpointed live WAL row");
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&canonical_db_path, "-wal"))
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "canonical fixture must retain at least one committed WAL frame"
+        );
+        assert!(sqlite_sidecar_path(&canonical_db_path, "-shm").is_file());
+        let canonical_before =
+            exact_diagnostic_parent_snapshot(canonical_directory.path());
+
+        let canonical = open_guarded_read_only_canonical_sqlite_file(
+            &canonical_db_path,
+            "valid live WAL canonical control",
+        )
+        .expect("canonical reader accepts valid live WAL with read-only SHM");
+        assert_eq!(
+            canonical
+                .query_sync("SELECT MAX(value) AS value FROM diagnostic_fixture", &[])
+                .expect("query valid live WAL through canonical SQLite")[0]
+                .get_named::<i64>("value")
+                .expect("decode canonical live-WAL value"),
+            8
+        );
+        drop(canonical);
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(canonical_directory.path()),
+            canonical_before,
+            "canonical read-only observer must not checkpoint or rewrite a valid live WAL family"
+        );
+        drop(canonical_writer);
+
+        let franken_directory = tempfile::tempdir().expect("Franken tempdir");
+        let franken_db_path = franken_directory.path().join("franken-live-wal.sqlite3");
+        seed_settled_diagnostic_database(&franken_db_path);
+        let franken_writer = DbConn::open_file(franken_db_path.to_string_lossy().as_ref())
+            .expect("open Franken live WAL writer");
+        franken_writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable Franken live WAL mode");
+        franken_writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable Franken automatic WAL checkpoints");
+        franken_writer
+            .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+            .expect("commit Franken uncheckpointed live WAL row");
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&franken_db_path, "-wal"))
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "Franken fixture must retain at least one committed WAL frame"
+        );
+        assert!(sqlite_sidecar_path(&franken_db_path, "-shm").is_file());
+        assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-gate").is_file());
+        assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-use").is_file());
+        let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
 
         let franken = open_guarded_read_only_franken_existing_file(
-            &db_path,
+            &franken_db_path,
             "valid live WAL Franken control",
         )
         .expect("Franken reader accepts valid live WAL");
@@ -14505,28 +14625,105 @@ mod tests {
             8
         );
         drop(franken);
-
-        let canonical = open_guarded_read_only_canonical_sqlite_file(
-            &db_path,
-            "valid live WAL canonical control",
-        )
-        .expect("canonical reader accepts valid live WAL");
         assert_eq!(
-            canonical
-                .query_sync("SELECT MAX(value) AS value FROM diagnostic_fixture", &[])
-                .expect("query valid live WAL through canonical SQLite")[0]
-                .get_named::<i64>("value")
-                .expect("decode canonical live-WAL value"),
-            8
+            exact_diagnostic_parent_snapshot(franken_directory.path()),
+            franken_before,
+            "Franken read-only observer must not checkpoint or rewrite a valid live WAL family"
         );
-        drop(canonical);
+        crate::close_db_conn(franken_writer, "clean up live-WAL test writer");
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn guarded_read_only_franken_preflight_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::guarded_read_only_franken_preflight_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "guarded-read-only-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let config = sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let competitor = crate::CanonicalDbConn::open(&config)
+                .expect("child opens competing canonical connection");
+            assert!(
+                competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
+                "separate process must not acquire the parent's reserved writer lock"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal lock probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("writer-lock.sqlite3");
+        seed_settled_diagnostic_database(&db_path);
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open Franken writer-lock fixture");
+        writer
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use main-inode rollback locking");
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent reserved writer lock");
+        assert!(
+            !sqlite_sidecar_path(&db_path, "-journal").exists(),
+            "BEGIN IMMEDIATE without a write should not materialize a rollback journal"
+        );
+
+        assert_child_observes_busy(&db_path);
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+        let observer = open_guarded_read_only_franken_existing_file(
+            &db_path,
+            "same-process writer-lock regression",
+        )
+        .expect("read-only observer coexists with a reserved writer");
+        assert_eq!(
+            observer
+                .query_sync("SELECT value FROM diagnostic_fixture", &[])
+                .expect("query while writer holds reserved lock")[0]
+                .get_named::<i64>("value")
+                .expect("decode writer-lock fixture"),
+            7
+        );
+        drop(observer);
+        assert_child_observes_busy(&db_path);
         assert_eq!(
             exact_diagnostic_parent_snapshot(directory.path()),
             before,
-            "read-only observers must not checkpoint or rewrite a valid live WAL family"
+            "fd-free read-only preflight must preserve both bytes and the parent's writer lock"
         );
-        drop(writer);
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent writer lock");
+        crate::close_db_conn(writer, "clean up writer-lock test fixture");
     }
 
     #[test]
