@@ -18879,6 +18879,7 @@ mod tests {
         assert!(second.is_none(), "should skip since backup is fresh");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn proactive_backup_refresh_is_portable_and_preserves_prior_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -18934,6 +18935,104 @@ mod tests {
             .find(|path| sqlite_marker_value(path).as_deref() == Some("generation-one"))
             .expect("the previous verified backup generation must be preserved");
         assert!(preserved.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ordinary_backup_refresh_preserves_rotated_verified_snapshot_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("verified-refresh.sqlite3");
+        let canonical = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
+            .expect("open canonical fixture");
+        canonical
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize mailbox schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                     VALUES (1, 'snapshot-project', '/snapshot-project', 1);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, task_description,
+                      inception_ts, last_active_ts, attachments_policy, contact_policy,
+                      reaper_exempt, registration_token)
+                     VALUES
+                     (1, 1, 'BlueLake', 'codex-cli', 'test', '', 1, 1,
+                      'auto', 'auto', 0, NULL);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, importance,
+                      ack_required, created_ts, recipients_json, attachments)
+                     VALUES
+                     (1, 1, 1, 'verified', 'generation one', 'normal', 0, 1, '{}', '[]');",
+            )
+            .expect("seed verified generation");
+        canonical
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint verified generation");
+        drop(canonical);
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .expect("open pool");
+
+        let verified = pool
+            .create_verified_snapshot()
+            .expect("create verified snapshot")
+            .expect("healthy mailbox produces metadata");
+        assert_eq!(verified.row_counts.get("messages"), Some(&1));
+
+        let writer = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
+            .expect("open next-generation writer");
+        writer
+            .execute_raw(
+                "INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, importance,
+                      ack_required, created_ts, recipients_json, attachments)
+                     VALUES
+                     (2, 1, 1, 'unverified', 'generation two', 'normal', 0, 2, '{}', '[]');",
+            )
+            .expect("seed unverified generation");
+        writer
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint unverified generation");
+        drop(writer);
+
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("ordinary backup refresh");
+
+        assert_eq!(
+            crate::snapshot::latest_verified_snapshot(&db_path),
+            Some(verified.clone()),
+            "ordinary refresh must keep the prior verified hash discoverable"
+        );
+        let selected = crate::snapshot::verified_snapshot_source_path(&db_path)
+            .expect("rotated verified source");
+        assert_ne!(selected, crate::snapshot::snapshot_bak_path(&db_path));
+        assert!(
+            selected.file_name().is_some_and(|name| {
+                mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(
+                    db_path.file_name().unwrap(),
+                    name,
+                )
+                .is_some_and(|candidate| {
+                    candidate.kind()
+                        == mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
+                })
+            }),
+            "selected source must be the strict timestamped rotation"
+        );
+
+        std::fs::write(&db_path, b"corrupt live generation").expect("corrupt primary");
+        let restored = crate::snapshot::restore_from_verified_snapshot(&db_path, dir.path())
+            .expect("restore rotated verified generation")
+            .expect("verified generation remains available");
+        assert_eq!(restored, verified);
+        let restored = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
+            .expect("open restored mailbox");
+        let rows = restored
+            .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+            .expect("count restored messages");
+        assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
     }
 
     #[test]

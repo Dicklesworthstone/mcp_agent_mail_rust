@@ -883,7 +883,11 @@ mod tests {
             .join("some-other.sqlite3.bak")
             .to_string_lossy()
             .into_owned();
-        write_snapshot_metadata(&primary, &meta).unwrap();
+        std::fs::write(
+            snapshot_meta_path(&primary),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
 
         assert!(
             latest_verified_snapshot(&primary).is_none(),
@@ -899,9 +903,32 @@ mod tests {
         std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
         let mut meta = record_snapshot_metadata(&primary, 42).unwrap();
         meta.schema = SNAPSHOT_METADATA_SCHEMA + 1;
-        write_snapshot_metadata(&primary, &meta).unwrap();
+        let meta_path = snapshot_meta_path(&primary);
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+        let before = std::fs::read(&meta_path).unwrap();
 
         assert!(latest_verified_snapshot(&primary).is_none());
+        let error = record_snapshot_metadata(&primary, 43)
+            .expect_err("future metadata authority must never be overwritten");
+        assert!(error.to_string().contains("future authority"));
+        assert_eq!(std::fs::read(&meta_path).unwrap(), before);
+    }
+
+    #[test]
+    fn regular_metadata_sentinel_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta_path = snapshot_meta_path(&primary);
+        let sentinel = b"operator evidence, not snapshot metadata";
+        std::fs::write(&meta_path, sentinel).unwrap();
+
+        let error = record_snapshot_metadata(&primary, 42)
+            .expect_err("unrecognized regular metadata must fail closed");
+
+        assert!(error.to_string().contains("unrecognized regular file"));
+        assert_eq!(std::fs::read(&meta_path).unwrap(), sentinel);
     }
 
     #[test]

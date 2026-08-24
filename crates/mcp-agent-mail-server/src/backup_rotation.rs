@@ -417,6 +417,21 @@ mod tests {
             Some(BackupKind::ManualBackup)
         );
         assert_eq!(
+            classify_backup_file("storage.sqlite3.bak.meta.json"),
+            None,
+            "the canonical verified-snapshot authority is active control state, not disposable backup material"
+        );
+        assert_eq!(
+            classify_backup_file("storage.sqlite3.bak.20260326_153504.meta.json"),
+            None,
+            "metadata-like companions must never be rotated independently of a generation"
+        );
+        assert_eq!(
+            classify_backup_file("storage.sqlite3.bak.stage.tmp"),
+            None,
+            "malformed backup lookalikes are not retention-owned"
+        );
+        assert_eq!(
             classify_backup_file("storage.sqlite3.bak-something"),
             Some(BackupKind::ManualBackup)
         );
