@@ -1896,11 +1896,39 @@ fn materialize_live_franken_salvage(path: &Path) -> DbResult<MaterializedLiveSal
 /// This entry point must never receive a live FrankenSQLite primary. Live
 /// callers use [`reconstruct_from_archive_with_live_franken_salvage`] so the
 /// source inode is materialized through guarded same-engine access first.
+///
+/// # Errors
+///
+/// Returns an error when the private salvage source cannot be validated or
+/// merged, or when archive reconstruction fails.
 pub fn reconstruct_from_archive_with_private_salvage(
     db_path: &Path,
     storage_root: &Path,
     private_salvage_db_path: &Path,
 ) -> DbResult<ReconstructStats> {
+    let metadata = std::fs::symlink_metadata(private_salvage_db_path).map_err(|error| {
+        DbError::Sqlite(format!(
+            "reconstruct private salvage: cannot inspect source {}: {error}",
+            private_salvage_db_path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct private salvage: source {} is not a regular file",
+            private_salvage_db_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct private salvage: source {} has {} hard links and cannot be proven process-exclusive",
+                private_salvage_db_path.display(),
+                metadata.nlink()
+            )));
+        }
+    }
     reconstruct_from_archive_with_salvage(
         db_path,
         storage_root,
@@ -1917,6 +1945,11 @@ pub fn reconstruct_from_archive_with_private_salvage(
 /// integrity and merge probes. Namespace-admission, lock, permission, and
 /// other non-corruption failures refuse rather than falling back to a raw or
 /// canonical open of the live source.
+///
+/// # Errors
+///
+/// Returns an error when guarded live-source admission or materialization
+/// fails for a non-corruption reason, or when archive reconstruction fails.
 pub fn reconstruct_from_archive_with_live_franken_salvage(
     db_path: &Path,
     storage_root: &Path,
@@ -1940,7 +1973,7 @@ pub fn reconstruct_from_archive_with_live_franken_salvage(
             )));
         }
     };
-    reconstruct_from_archive_with_salvage(db_path, storage_root, Some(&materialized.path))
+    reconstruct_from_archive_with_private_salvage(db_path, storage_root, &materialized.path)
 }
 
 /// Reconstruct the database from the Git archive and merge any additional
@@ -5894,6 +5927,23 @@ fn extract_id_from_rows(rows: &[sqlmodel_core::Row]) -> Option<i64> {
 mod tests {
     use super::*;
 
+    fn exact_test_directory_files(
+        directory: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(directory)
+            .expect("read test directory")
+            .map(|entry| {
+                let entry = entry.expect("read test directory entry");
+                let file_type = entry.file_type().expect("inspect test directory entry");
+                assert!(file_type.is_file(), "test directory must contain only files");
+                (
+                    entry.file_name(),
+                    std::fs::read(entry.path()).expect("read exact test file bytes"),
+                )
+            })
+            .collect()
+    }
+
     fn message_one_recipients_json(conn: &DbConn) -> serde_json::Value {
         let rows = conn
             .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
@@ -7040,6 +7090,215 @@ body
             .get_named::<String>("human_key")
             .expect("human_key text");
         assert_eq!(human_key, "/test-project");
+    }
+
+    #[test]
+    fn live_franken_salvage_materialization_preserves_wal_rows_and_source_bytes() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = source_dir.path().join("live.sqlite3");
+        let writer = crate::DbConn::open_file(source_path.to_string_lossy().as_ref())
+            .expect("open live Franken salvage source");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable WAL mode");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable automatic WAL checkpoints");
+        writer
+            .execute_raw("CREATE TABLE salvage_witness(value INTEGER NOT NULL);")
+            .expect("create salvage witness table");
+        writer
+            .execute_raw("INSERT INTO salvage_witness(value) VALUES (41);")
+            .expect("commit WAL-only salvage witness");
+        assert!(
+            crate::pool::sqlite_sidecar_path(&source_path, "-wal").is_file(),
+            "fixture must retain a WAL sidecar"
+        );
+        assert!(
+            crate::pool::sqlite_sidecar_path(&source_path, "-shm").is_file(),
+            "fixture must retain a SHM sidecar"
+        );
+        let source_before = exact_test_directory_files(source_dir.path());
+
+        let materialized = materialize_live_franken_salvage(&source_path)
+            .expect("materialize guarded live salvage source");
+        let private = open_read_only_salvage_db(&materialized.path)
+            .expect("open private materialized salvage");
+        let rows = private
+            .query_sync("SELECT value FROM salvage_witness", &[])
+            .expect("query WAL witness from private materialization");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 41);
+        drop(private);
+
+        assert_eq!(
+            exact_test_directory_files(source_dir.path()),
+            source_before,
+            "guarded materialization must preserve every live source-family byte"
+        );
+        crate::close_db_conn(writer, "clean up WAL salvage materialization fixture");
+    }
+
+    #[test]
+    fn live_franken_salvage_refuses_sidecarless_source_without_archive_fallback() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_path = source_dir.path().join("sidecarless.sqlite3");
+        let source = SqliteDbConn::open_file(source_path.to_str().unwrap())
+            .expect("open canonical sidecarless source");
+        source
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use standalone canonical source");
+        source
+            .execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY);")
+            .expect("create source table");
+        drop(source);
+        let source_before = exact_test_directory_files(source_dir.path());
+        assert!(
+            !crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-gate").exists()
+        );
+        assert!(
+            !crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-use").exists()
+        );
+
+        let archive_dir = tempfile::tempdir().expect("archive tempdir");
+        let storage_root = archive_dir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("archive-project"))
+            .expect("create authoritative archive fixture");
+        let target_path = archive_dir.path().join("reconstructed.sqlite3");
+        let error = reconstruct_from_archive_with_live_franken_salvage(
+            &target_path,
+            &storage_root,
+            &source_path,
+        )
+        .expect_err("sidecarless live source must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("complete pre-existing namespace sidecar pair is required"),
+            "unexpected namespace refusal: {error}"
+        );
+        assert!(
+            !target_path.exists(),
+            "namespace refusal must not silently build an archive-only target"
+        );
+        assert_eq!(
+            exact_test_directory_files(source_dir.path()),
+            source_before,
+            "namespace refusal must not create or rewrite source-family state"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_franken_salvage_materialization_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RECONSTRUCT_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "reconstruct::tests::live_franken_salvage_materialization_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "live-salvage-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let config = sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let competitor = crate::CanonicalDbConn::open(&config)
+                .expect("child opens competing canonical connection");
+            competitor
+                .query_sync("SELECT value FROM salvage_witness", &[])
+                .expect("child proves it opened the intended readable database");
+            assert!(
+                competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
+                "separate process must not acquire the parent's reserved writer lock"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal lock probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source_path = directory.path().join("writer-lock.sqlite3");
+        let storage_root = directory.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("lock-project"))
+            .expect("create lock-test archive fixture");
+        let writer = crate::DbConn::open_file(source_path.to_string_lossy().as_ref())
+            .expect("open Franken writer-lock fixture");
+        writer
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use rollback-journal locking");
+        writer
+            .execute_raw("CREATE TABLE salvage_witness(value INTEGER NOT NULL);")
+            .expect("create writer-lock witness table");
+        writer
+            .execute_raw("INSERT INTO salvage_witness(value) VALUES (73);")
+            .expect("insert writer-lock witness");
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent reserved writer lock");
+
+        assert_child_observes_busy(&source_path);
+        let materialized = materialize_live_franken_salvage(&source_path)
+            .expect("materialize live source without touching parent writer lock");
+        let private = open_read_only_salvage_db(&materialized.path)
+            .expect("open private materialized salvage");
+        assert_eq!(
+            private
+                .query_sync("SELECT value FROM salvage_witness", &[])
+                .expect("query private writer-lock witness")[0]
+                .get_named::<i64>("value")
+                .unwrap(),
+            73
+        );
+        drop(private);
+        assert_child_observes_busy(&source_path);
+
+        let alias_path = directory.path().join("writer-lock-alias.sqlite3");
+        std::fs::hard_link(&source_path, &alias_path)
+            .expect("create live-primary hard-link alias");
+        let alias_target = directory.path().join("alias-reconstructed.sqlite3");
+        let alias_error = reconstruct_from_archive_with_private_salvage(
+            &alias_target,
+            &storage_root,
+            &alias_path,
+        )
+        .expect_err("hard-link alias cannot be classified as private salvage");
+        assert!(
+            alias_error.to_string().contains("hard links"),
+            "unexpected hard-link refusal: {alias_error}"
+        );
+        assert!(
+            !alias_target.exists(),
+            "hard-link refusal must happen before reconstruction"
+        );
+        assert_child_observes_busy(&source_path);
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent writer lock");
+        crate::close_db_conn(writer, "clean up salvage writer-lock fixture");
     }
 
     #[test]

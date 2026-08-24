@@ -56150,7 +56150,6 @@ startup_timeout_sec = 42
                         .detail
                         .contains("guarded private snapshot of live database")
                 );
-                assert!(artifact._snapshot_source.is_some());
                 let probe = mcp_agent_mail_db::CanonicalDbConn::open_file(
                     artifact.db_path.to_str().expect("private snapshot UTF-8"),
                 )
@@ -76202,6 +76201,26 @@ fn attempt_readable_sqlite_salvage_source(
     let readable_path = snapshot_source
         .as_ref()
         .map_or(sqlite_path, CanonicalSnapshotSource::actual_path);
+    #[cfg(unix)]
+    if source_kind == DoctorSalvageSourceKind::PrivateCanonical {
+        use std::os::unix::fs::MetadataExt as _;
+        match std::fs::symlink_metadata(readable_path) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 => {}
+            Ok(metadata) => {
+                return DoctorSalvageAttempt::Failed(format!(
+                    "{label} {} has {} hard links or is not a regular file and cannot be proven private",
+                    readable_path.display(),
+                    metadata.nlink()
+                ));
+            }
+            Err(error) => {
+                return DoctorSalvageAttempt::Failed(format!(
+                    "{label} {} could not be inspected before private canonical salvage: {error}",
+                    readable_path.display()
+                ));
+            }
+        }
+    }
     let Some(readable_path_text) = readable_path.to_str() else {
         return DoctorSalvageAttempt::Failed(format!(
             "{label} {} cannot be represented as an exact UTF-8 SQLite path",
@@ -76209,14 +76228,14 @@ fn attempt_readable_sqlite_salvage_source(
         ));
     };
     let conn = match mcp_agent_mail_db::CanonicalDbConn::open_file(readable_path_text) {
-            Ok(conn) => conn,
-            Err(error) => {
-                return DoctorSalvageAttempt::Failed(format!(
-                    "{label} {} could not be opened for private canonical salvage read: {error}",
-                    readable_path.display()
-                ));
-            }
-        };
+        Ok(conn) => conn,
+        Err(error) => {
+            return DoctorSalvageAttempt::Failed(format!(
+                "{label} {} could not be opened for private canonical salvage read: {error}",
+                readable_path.display()
+            ));
+        }
+    };
     if let Err(error) = conn.query_sync("SELECT COUNT(*) AS cnt FROM sqlite_master", &[]) {
         return DoctorSalvageAttempt::Failed(format!(
             "{label} {} failed a private canonical salvage probe: {error}",

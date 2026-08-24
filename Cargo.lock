@@ -5593,6 +5593,7 @@ dependencies = [
  "frankensearch-fusion",
  "frankensearch-index",
  "fs2",
+ "fsqlite",
  "half",
  "hex",
  "indexmap",
