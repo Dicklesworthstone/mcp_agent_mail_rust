@@ -20,7 +20,7 @@ use mcp_agent_mail_core::{
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
@@ -829,28 +829,29 @@ pub fn recovery_admission() -> &'static RecoveryAdmissionController {
 }
 
 std::thread_local! {
-    static RECOVERY_ADMISSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static RECOVERY_ADMISSION_PATHS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
-struct RecoveryAdmissionDepthGuard;
+struct RecoveryAdmissionDepthGuard {
+    path: PathBuf,
+}
 
 impl RecoveryAdmissionDepthGuard {
-    fn enter() -> Self {
-        RECOVERY_ADMISSION_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_add(1));
-        });
-        Self
+    fn enter(path: PathBuf) -> Self {
+        RECOVERY_ADMISSION_PATHS.with(|paths| paths.borrow_mut().push(path.clone()));
+        Self { path }
     }
 
-    fn is_active() -> bool {
-        RECOVERY_ADMISSION_DEPTH.with(|depth| depth.get() > 0)
+    fn active_path() -> Option<PathBuf> {
+        RECOVERY_ADMISSION_PATHS.with(|paths| paths.borrow().last().cloned())
     }
 }
 
 impl Drop for RecoveryAdmissionDepthGuard {
     fn drop(&mut self) {
-        RECOVERY_ADMISSION_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_sub(1));
+        RECOVERY_ADMISSION_PATHS.with(|paths| {
+            let popped = paths.borrow_mut().pop();
+            debug_assert_eq!(popped.as_deref(), Some(self.path.as_path()));
         });
     }
 }
@@ -954,6 +955,30 @@ where
     ))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryAdmissionOutcomePolicy {
+    RecordRecoveryOutcome,
+    GuardMutationOnly,
+}
+
+#[allow(clippy::result_large_err)]
+fn with_recovery_mutation_admission<T, F>(
+    primary_path: &Path,
+    action: &'static str,
+    operation: F,
+) -> Result<T, SqlError>
+where
+    F: FnOnce() -> Result<T, SqlError>,
+{
+    flatten_automatic_recovery_result(with_automatic_recovery_admission_using_clock(
+        primary_path,
+        action,
+        operation,
+        recovery_breaker_now_unix,
+        RecoveryAdmissionOutcomePolicy::GuardMutationOnly,
+    ))
+}
+
 /// Wrap an entire automatic recovery attempt, including any forensic capture
 /// or candidate construction performed by `operation`, in the durable breaker
 /// election. Nested recovery primitives on the same thread pass through via
@@ -973,6 +998,7 @@ where
         action,
         operation,
         recovery_breaker_now_unix,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
     )
 }
 
@@ -1012,6 +1038,7 @@ where
         action,
         operation,
         now_unix,
+        RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome,
     ))
 }
 
@@ -1021,19 +1048,30 @@ fn with_automatic_recovery_admission_using_clock<T, E, F, C>(
     action: &'static str,
     operation: F,
     mut now_unix: C,
+    outcome_policy: RecoveryAdmissionOutcomePolicy,
 ) -> Result<T, AutomaticRecoveryRunError<E>>
 where
     E: std::fmt::Display,
     F: FnOnce() -> Result<T, E>,
     C: FnMut() -> i64,
 {
-    if RecoveryAdmissionDepthGuard::is_active() {
-        return operation().map_err(AutomaticRecoveryRunError::Operation);
-    }
-
     validate_sqlite_target_path(primary_path, "recovery admission target").map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
+    let normalized_primary = normalize_sqlite_identity_path_lossless(primary_path);
+    if let Some(active_path) = RecoveryAdmissionDepthGuard::active_path() {
+        if active_path == normalized_primary {
+            return operation().map_err(AutomaticRecoveryRunError::Operation);
+        }
+        return Err(AutomaticRecoveryRunError::admission(
+            AutomaticRecoveryAdmissionFailureKind::Other,
+            SqlError::Custom(format!(
+                "{action} for {} was refused because this thread already holds recovery admission for {}; nested recovery may only target the same normalized SQLite path",
+                primary_path.display(),
+                active_path.display()
+            )),
+        ));
+    }
     let _breaker_file_lock = crate::recovery_breaker::try_acquire_file_lock(primary_path)
         .map_err(|error| {
             AutomaticRecoveryRunError::admission(
@@ -1127,8 +1165,10 @@ where
             recovery_admission_blocked_error(primary_path, action),
         ));
     };
-    let _depth_guard = RecoveryAdmissionDepthGuard::enter();
-    if !breaker_bypass {
+    let _depth_guard = RecoveryAdmissionDepthGuard::enter(normalized_primary);
+    if !breaker_bypass
+        && outcome_policy == RecoveryAdmissionOutcomePolicy::RecordRecoveryOutcome
+    {
         // Arm the durable state before entering code that may panic, abort, or
         // lose power. The terminal write below replaces this provisional
         // reason without incrementing the attempt twice. A crashed half-open
@@ -1152,7 +1192,11 @@ where
         })?;
     }
 
-    match operation() {
+    let operation_result = operation();
+    if outcome_policy == RecoveryAdmissionOutcomePolicy::GuardMutationOnly {
+        return operation_result.map_err(AutomaticRecoveryRunError::Operation);
+    }
+    match operation_result {
         Ok(value) => {
             recovery_admission().report_success(primary_path);
             let cleared = crate::recovery_breaker::cleared_state(
@@ -3698,30 +3742,39 @@ impl DbPool {
             )));
         }
         if let Err(error) = rename_noreplace_preserving_source(&staged_backup, &bak_path) {
-            let rollback_error = rotated_backup
-                .as_ref()
-                .and_then(|rotated| rename_noreplace_preserving_source(rotated, &bak_path).err());
+            let rollback = rollback_rotated_proactive_backup_with(
+                rotated_backup.as_deref(),
+                &bak_path,
+                sync_recovery_parent,
+            );
             let preserved_stage = staged_directory.preserve();
-            return Err(DbError::Sqlite(
-                match (rotated_backup.as_ref(), rollback_error) {
-                    (Some(_), None) => format!(
-                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored",
-                        preserved_stage.display(),
-                        bak_path.display()
-                    ),
-                    (Some(rotated), Some(rollback_error)) => format!(
-                        "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup remains at {} because rollback also failed: {rollback_error}",
-                        preserved_stage.display(),
-                        bak_path.display(),
-                        rotated.display()
-                    ),
-                    (None, _) => format!(
-                        "proactive backup failed to publish staged backup from {} to unused destination {} without replacement: {error}; no prior backup existed",
-                        preserved_stage.display(),
-                        bak_path.display()
-                    ),
-                },
-            ));
+            return Err(DbError::Sqlite(match rollback {
+                ProactiveBackupRollbackOutcome::RestoredDurably => format!(
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored",
+                    preserved_stage.display(),
+                    bak_path.display()
+                ),
+                ProactiveBackupRollbackOutcome::RestoreMoveFailed(rollback_error) => format!(
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup remains at {} because its rollback move failed: {rollback_error}",
+                    preserved_stage.display(),
+                    bak_path.display(),
+                    rotated_backup.as_ref().map_or_else(
+                        || "<unknown>".to_string(),
+                        |rotated| rotated.display().to_string()
+                    )
+                ),
+                ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(sync_error) => format!(
+                    "proactive backup failed to publish staged backup from {} to {} without replacement: {error}; the previous backup was restored at {}, but crash durability is uncertain because the parent sync failed: {sync_error}",
+                    preserved_stage.display(),
+                    bak_path.display(),
+                    bak_path.display()
+                ),
+                ProactiveBackupRollbackOutcome::NotNeeded => format!(
+                    "proactive backup failed to publish staged backup from {} to unused destination {} without replacement: {error}; no prior backup existed",
+                    preserved_stage.display(),
+                    bak_path.display()
+                ),
+            }));
         }
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
             return Err(DbError::Sqlite(format!(
@@ -4222,6 +4275,25 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
     normalized
 }
 
+/// Normalize a filesystem identity without converting its platform-native
+/// name through UTF-8. Recovery admission uses this lossless form because two
+/// distinct Unix paths containing different invalid bytes can have the same
+/// `to_string_lossy()` rendering; treating them as one path would let a nested
+/// operation bypass the second database's durable breaker election.
+#[must_use]
+fn normalize_sqlite_identity_path_lossless(path: &Path) -> PathBuf {
+    if path == Path::new(":memory:") {
+        return path.to_path_buf();
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+        }
+    })
+}
+
 #[must_use]
 fn pool_cache_key(config: &DbPoolConfig) -> String {
     let sqlite_path = config.sqlite_path().map_or_else(
@@ -4446,12 +4518,7 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
-    // Clean up corrupt WAL sidecars before opening any connections. A non-empty
-    // WAL with no committed frames (1..=32 bytes) can trigger "WAL file too
-    // small for header during rebuild"; a 0-byte WAL is a valid idle/checkpoint
-    // state and is left attached.
     if sqlite_path != ":memory:" {
-        cleanup_empty_wal_sidecar(Path::new(sqlite_path));
         let version_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
             Ok(conn) => conn,
             Err(err) => {
@@ -5702,6 +5769,16 @@ async fn initialize_sqlite_file_once(
     storage_root: &Path,
 ) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
+    // Classify before any engine open or archive inventory. The public cleanup
+    // helper enters the durable breaker only when damaged sidecars actually
+    // require mutation, then reclassifies before moving them. A malformed or
+    // tripped breaker therefore refuses pool initialization without changing
+    // the live family.
+    if sqlite_path != ":memory:"
+        && let Err(error) = cleanup_truncated_wal_sidecar(path)
+    {
+        return Outcome::Err(error);
+    }
     // Reconcile archive-backed state before first init so every entrypoint,
     // not just the server startup probe, preserves durable message IDs when a
     // DB is missing or stale relative to the archive.
@@ -6317,15 +6394,159 @@ pub const fn sqlite_wal_is_header_only_or_truncated(wal_len: u64) -> bool {
 /// WAL on the next write. We also quarantine SHM artifacts whose companion WAL
 /// was moved, since the SHM is meaningless without a WAL.
 ///
-/// Public alias for [`cleanup_empty_wal_sidecar`] so callers outside this crate
-/// (e.g. CLI startup self-heal) can run the same WAL cleanup _before_ opening
-/// any connection.  Issue #119: if a force-killed daemon left a header-only
-/// (<=32-byte) WAL sidecar, opening the DB to run orphan-recipient repair fails
-/// with "WAL file too small for header during rebuild".  This entry point lets
-/// the doctor self-heal cleanup truncated WALs first so subsequent open and
-/// integrity probes do not wedge.  Idempotent and safe to call repeatedly.
-pub fn cleanup_truncated_wal_sidecar(sqlite_path: &Path) {
-    cleanup_empty_wal_sidecar(sqlite_path);
+/// Observable result from an admitted SQLite-family cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteFamilyCleanupOutcome {
+    /// No damaged WAL or empty/orphaned SHM required quarantine.
+    NotNeeded,
+    /// One or both sidecars were durably moved out of the live family.
+    Quarantined { wal: bool, shm: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteFamilyCleanupPlan {
+    quarantine_wal: bool,
+    quarantine_shm: bool,
+}
+
+impl SqliteFamilyCleanupPlan {
+    const fn is_empty(self) -> bool {
+        !self.quarantine_wal && !self.quarantine_shm
+    }
+}
+
+/// Classify the complete mutable SQLite sidecar family without opening a
+/// database connection or changing a namespace entry.
+///
+/// Classification intentionally rejects non-regular primary/recovery-family
+/// objects before planning any rename. That keeps a truncated WAL plus a
+/// symlinked/directory SHM from becoming a partial cleanup: the whole family is
+/// accepted or refused before the durable admission boundary is entered.
+#[allow(clippy::result_large_err)]
+fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyCleanupPlan, SqlError> {
+    if let Ok(metadata) = std::fs::symlink_metadata(sqlite_path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(SqlError::Custom(format!(
+            "refusing SQLite-family cleanup for {} because the primary is not a regular file",
+            sqlite_path.display()
+        )));
+    }
+
+    let mut sidecar_metadata = HashMap::new();
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let path = sqlite_sidecar_path(sqlite_path, suffix);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                sidecar_metadata.insert(suffix, metadata);
+            }
+            Ok(_) => {
+                return Err(SqlError::Custom(format!(
+                    "refusing SQLite-family cleanup for {} because {} sidecar {} is not a regular file",
+                    sqlite_path.display(),
+                    sqlite_recovery_sidecar_label(suffix),
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to classify {} sidecar {} before SQLite-family cleanup: {error}",
+                    sqlite_recovery_sidecar_label(suffix),
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    let wal_path = sqlite_sidecar_path(sqlite_path, "-wal");
+    let quarantine_wal = sidecar_metadata.contains_key("-wal")
+        && crate::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path);
+    let quarantine_shm = sidecar_metadata
+        .get("-shm")
+        .is_some_and(|metadata| quarantine_wal || metadata.len() == 0);
+    Ok(SqliteFamilyCleanupPlan {
+        quarantine_wal,
+        quarantine_shm,
+    })
+}
+
+/// Quarantine a damaged WAL/SHM family only after durable recovery admission.
+///
+/// The outer classification is pure and avoids writing breaker state for a
+/// healthy family. When cleanup is needed, the function acquires the durable
+/// breaker/election, reclassifies under that admission to close the ordinary
+/// classify-then-act window, and uses atomic no-replace moves. A malformed or
+/// tripped breaker therefore preserves the exact live sidecar names and bytes.
+#[allow(clippy::result_large_err)]
+pub fn cleanup_truncated_wal_sidecar(
+    sqlite_path: &Path,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    cleanup_truncated_wal_sidecar_with_timeout(
+        sqlite_path,
+        crate::write_barrier::writer_drain_timeout(),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn cleanup_truncated_wal_sidecar_with_timeout(
+    sqlite_path: &Path,
+    writer_drain_timeout: Duration,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    validate_sqlite_target_path(sqlite_path, "SQLite-family cleanup target")?;
+    if classify_sqlite_family_cleanup(sqlite_path)?.is_empty() {
+        return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
+    }
+
+    with_recovery_mutation_admission(sqlite_path, "automatic SQLite-family cleanup", || {
+        // Recovery admission must precede writer drain: a malformed or tripped
+        // durable breaker is authoritative and should refuse immediately rather
+        // than parking healthy writers behind an operation that cannot run.
+        // Once admitted, quiesce this process's write paths and refuse any
+        // external mailbox or foreign file holder before changing a sidecar
+        // namespace entry.
+        let _promotion_barrier = acquire_recovery_promotion_barrier(
+            sqlite_path,
+            "automatic SQLite-family cleanup",
+            writer_drain_timeout,
+        )?;
+        refuse_sqlite_family_cleanup_while_owned(sqlite_path)?;
+        apply_classified_sqlite_family_cleanup(sqlite_path)
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn refuse_sqlite_family_cleanup_while_owned(sqlite_path: &Path) -> Result<(), SqlError> {
+    let inferred_storage_root = sqlite_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let ownership = inspect_mailbox_ownership(sqlite_path, inferred_storage_root);
+    if ownership.blocks_mutation() {
+        return Err(SqlError::Custom(format!(
+            "automatic SQLite-family cleanup refused for {} because another mailbox owner is active: {}",
+            sqlite_path.display(),
+            ownership.detail
+        )));
+    }
+    let foreign_holders = foreign_db_file_holders(sqlite_path);
+    if !foreign_holders.is_empty() {
+        let holders = foreign_holders
+            .iter()
+            .map(|holder| {
+                holder.command.as_deref().map_or_else(
+                    || holder.pid.to_string(),
+                    |command| format!("{} ({command})", holder.pid),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SqlError::Custom(format!(
+            "automatic SQLite-family cleanup refused for {} because foreign process holder(s) remain: {holders}",
+            sqlite_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn sqlite_sidecar_cleanup_nonce() -> String {
@@ -6335,18 +6556,14 @@ fn sqlite_sidecar_cleanup_nonce() -> String {
     format!("{}-{millis}", std::process::id())
 }
 
-fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str) -> PathBuf {
+fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str, collision: u32) -> PathBuf {
     let mut candidate_os = sidecar_path.as_os_str().to_os_string();
-    candidate_os.push(format!(".cleanup-quarantine-{nonce}"));
-    let mut candidate = PathBuf::from(candidate_os);
-    let mut suffix = 1_u32;
-    while sqlite_candidate_artifact_conflicts(&candidate) {
-        let mut candidate_os = sidecar_path.as_os_str().to_os_string();
-        candidate_os.push(format!(".cleanup-quarantine-{nonce}-{suffix:02}"));
-        candidate = PathBuf::from(candidate_os);
-        suffix = suffix.saturating_add(1);
+    if collision == 0 {
+        candidate_os.push(format!(".cleanup-quarantine-{nonce}"));
+    } else {
+        candidate_os.push(format!(".cleanup-quarantine-{nonce}-{collision:02}"));
     }
-    candidate
+    PathBuf::from(candidate_os)
 }
 
 fn cleanup_quarantine_nonce(nonce: &mut Option<String>) -> &str {
@@ -6359,87 +6576,76 @@ fn quarantine_sqlite_cleanup_sidecar(
     sidecar_path: &Path,
     nonce: &mut Option<String>,
     reason: &str,
-) -> bool {
-    let quarantine = sqlite_cleanup_quarantine_path(sidecar_path, cleanup_quarantine_nonce(nonce));
-    match rename_noreplace_preserving_source(sidecar_path, &quarantine) {
-        Ok(()) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                quarantine = %quarantine.display(),
-                reason,
-                "quarantined sqlite sidecar before opening database"
-            );
-            true
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                quarantine = %quarantine.display(),
-                reason,
-                error = %e,
-                "failed to quarantine sqlite sidecar before opening database"
-            );
-            false
+) -> Result<PathBuf, SqlError> {
+    let nonce = cleanup_quarantine_nonce(nonce).to_string();
+    for collision in 0..=9_999 {
+        let quarantine = sqlite_cleanup_quarantine_path(sidecar_path, &nonce, collision);
+        match rename_noreplace_preserving_source(sidecar_path, &quarantine) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    quarantine = %quarantine.display(),
+                    reason,
+                    "quarantined sqlite sidecar before opening database"
+                );
+                return Ok(quarantine);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to quarantine SQLite sidecar {} at {} without replacement ({reason}): {error}",
+                    sidecar_path.display(),
+                    quarantine.display()
+                )));
+            }
         }
     }
+    Err(SqlError::Custom(format!(
+        "failed to quarantine SQLite sidecar {} because 10000 collision-safe destinations were occupied",
+        sidecar_path.display()
+    )))
 }
 
-fn cleanup_empty_wal_sidecar(db_path: &Path) {
-    if !db_path.exists() {
-        return;
+#[allow(clippy::result_large_err)]
+fn apply_classified_sqlite_family_cleanup(
+    db_path: &Path,
+) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    let plan = classify_sqlite_family_cleanup(db_path)?;
+    if plan.is_empty() {
+        return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
     }
 
-    let mut wal_quarantined = false;
     let mut quarantine_nonce = None;
-
-    // Check WAL first.
-    {
-        let mut wal_os = db_path.as_os_str().to_os_string();
-        wal_os.push("-wal");
-        let wal_path = PathBuf::from(wal_os);
-        match std::fs::symlink_metadata(&wal_path) {
-            // Quarantine WAL files that are a genuine truncation/corruption
-            // artifact: a sub-header (1..=31 byte) WAL, or a 32-byte header whose
-            // magic is INVALID.
-            // GH#99/#119: an all-zeros (invalid-magic) 32-byte WAL sidecar tripped
-            // "WAL file too small for header during rebuild" on checkpoint, which
-            // the verdict engine escalated to Broken/corrupt. Moving it out of the
-            // live DB family prevents that cycle without losing forensic evidence.
-            // A VALID 32-byte header (a frameless idle WAL) is left attached: the
-            // engine opens it as-is, and quarantining it false-failed health and
-            // churned this self-heal on every restart (ts1/css, 2026-06-17).
-            Ok(meta)
-                if meta.file_type().is_file()
-                    && crate::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path) =>
-            {
-                wal_quarantined = quarantine_sqlite_cleanup_sidecar(
-                    &wal_path,
-                    &mut quarantine_nonce,
-                    "header-only/truncated WAL sidecar",
-                );
-            }
-            _ => {}
-        }
+    // Move SHM first. If the process crashes before the WAL move, the durable
+    // WAL remains available and SQLite can rebuild SHM; the reverse ordering
+    // would leave a meaningless live SHM after detaching its WAL.
+    if plan.quarantine_shm {
+        let shm_path = sqlite_sidecar_path(db_path, "-shm");
+        let reason = if plan.quarantine_wal {
+            "companion WAL is classified for quarantine"
+        } else {
+            "empty SHM sidecar"
+        };
+        quarantine_sqlite_cleanup_sidecar(&shm_path, &mut quarantine_nonce, reason)?;
     }
-
-    // Quarantine SHM when it's empty OR when we just quarantined the WAL (the
-    // SHM is meaningless without a companion WAL).
-    {
-        let mut shm_os = db_path.as_os_str().to_os_string();
-        shm_os.push("-shm");
-        let shm_path = PathBuf::from(shm_os);
-        match std::fs::symlink_metadata(&shm_path) {
-            Ok(meta) if wal_quarantined || (meta.file_type().is_file() && meta.len() == 0) => {
-                let reason = if wal_quarantined {
-                    "companion WAL quarantined"
-                } else {
-                    "empty SHM sidecar"
-                };
-                let _ = quarantine_sqlite_cleanup_sidecar(&shm_path, &mut quarantine_nonce, reason);
-            }
-            _ => {}
-        }
+    if plan.quarantine_wal {
+        let wal_path = sqlite_sidecar_path(db_path, "-wal");
+        quarantine_sqlite_cleanup_sidecar(
+            &wal_path,
+            &mut quarantine_nonce,
+            "header-only/truncated WAL sidecar",
+        )?;
     }
+    sync_recovery_parent(db_path)?;
+    Ok(SqliteFamilyCleanupOutcome::Quarantined {
+        wal: plan.quarantine_wal,
+        shm: plan.quarantine_shm,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn cleanup_empty_wal_sidecar(db_path: &Path) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+    cleanup_truncated_wal_sidecar(db_path)
 }
 
 #[must_use]
@@ -6695,6 +6901,88 @@ fn os_str_starts_with(value: &OsStr, prefix: &OsStr) -> bool {
     }
 }
 
+pub(crate) struct SqliteHealthProbeSource {
+    _directory: CanonicalSnapshotTempDir,
+    path: PathBuf,
+}
+
+impl SqliteHealthProbeSource {
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn stage_sqlite_family_for_health_probe_once(
+    source: &Path,
+) -> std::io::Result<Option<SqliteHealthProbeSource>> {
+    match std::fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    // Always inspect a private family copy, even when the source currently has
+    // no sidecars. A normal writable SQLite open can create WAL/SHM merely by
+    // probing a cold live database; the health API promises source-byte
+    // neutrality and must never perform that open against the authority path.
+    let directory = CanonicalSnapshotTempDir::new(".mcp-agent-mail-health-probe-")?;
+    let staged_path = directory.path().join("health-probe.sqlite3");
+    copy_file_without_overwrite(source, &staged_path)?;
+
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let source_sidecar = sqlite_sidecar_path(source, suffix);
+        match std::fs::symlink_metadata(&source_sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                copy_file_without_overwrite(
+                    &source_sidecar,
+                    &sqlite_sidecar_path(&staged_path, suffix),
+                )?;
+            }
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(Some(SqliteHealthProbeSource {
+        _directory: directory,
+        path: staged_path,
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn stage_sqlite_family_for_health_probe(
+    source: &Path,
+) -> Result<Option<SqliteHealthProbeSource>, SqlError> {
+    validate_sqlite_target_path(source, "SQLite health-probe source")?;
+    let mut last_not_found = None;
+    for _ in 0..3 {
+        match stage_sqlite_family_for_health_probe_once(source) {
+            Ok(staged) => return Ok(staged),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // WAL/SHM files can legitimately appear or disappear between
+                // metadata classification and a no-follow open. Retry the
+                // complete private copy instead of treating that race as
+                // corruption or falling back to a writable live open.
+                last_not_found = Some(error);
+            }
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to stage source-byte-neutral SQLite health probe for {}: {error}",
+                    source.display()
+                )));
+            }
+        }
+    }
+    Err(SqlError::Custom(format!(
+        "failed to stage source-byte-neutral SQLite health probe for {} because its family changed repeatedly: {}",
+        source.display(),
+        last_not_found.map_or_else(|| "unknown race".to_string(), |error| error.to_string())
+    )))
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
     let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path)?)?;
@@ -6762,7 +7050,7 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
-pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
+fn sqlite_primary_read_path_is_healthy_direct(path: &Path) -> Result<bool, SqlError> {
     if !path.exists() {
         return Ok(false);
     }
@@ -6793,7 +7081,7 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
                 return Ok(false);
             }
             if is_sqlite_recovery_error_message(&msg) {
-                cleanup_empty_wal_sidecar(path);
+                let _ = apply_classified_sqlite_family_cleanup(path)?;
                 match open_sqlite_file_with_lock_retry(path_str) {
                     Ok(conn) => conn,
                     Err(retry_err) => {
@@ -6878,7 +7166,28 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
     Ok(true)
 }
 
+/// Run the FrankenSQLite read-path checks against a private copy of the whole
+/// SQLite family. The live primary and every adjacent sidecar remain byte- and
+/// name-identical even if the engine replays a journal or resets WAL/SHM while
+/// opening the staged copy.
 #[allow(clippy::result_large_err)]
+pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    sqlite_primary_read_path_is_healthy_direct(&staged.path)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_file_is_healthy_staged(path: &Path) -> Result<bool, SqlError> {
+    if !sqlite_primary_read_path_is_healthy_direct(path)? {
+        return Ok(false);
+    }
+    normalize_compatibility_probe_result(path, sqlite_file_is_healthy_canonical(path))
+}
+
+#[allow(clippy::result_large_err)]
+#[cfg(test)]
 fn sqlite_file_is_healthy_with_compat_probe<F>(
     path: &Path,
     mut compatibility_probe: F,
@@ -6928,15 +7237,42 @@ fn normalize_compatibility_probe_result(
 
 #[allow(clippy::result_large_err)]
 pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
-    if !path.exists() {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
         return Ok(false);
-    }
-    normalize_compatibility_probe_result(path, sqlite_file_is_healthy_canonical(path))
+    };
+    normalize_compatibility_probe_result(
+        &staged.path,
+        sqlite_file_is_healthy_canonical(&staged.path),
+    )
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
-    sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
+pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    sqlite_file_is_healthy_staged(&staged.path)
+}
+
+/// Prove that the current SQLite family is healthy without first detaching a
+/// damaged WAL or SHM sidecar.
+///
+/// This is stricter than [`sqlite_file_is_healthy`]. The ordinary health probe
+/// may quarantine a truncation artifact on its private staged copy before
+/// checking the primary, which is useful when deciding whether recovery can
+/// repair a family. A caller whose durable recovery breaker is already open
+/// must instead prove that the exact staged family is directly usable without
+/// that cleanup; otherwise allowing startup would only defer the same breaker
+/// refusal to the runtime's first database open.
+#[allow(clippy::result_large_err)]
+pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool, SqlError> {
+    let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
+        return Ok(false);
+    };
+    if !classify_sqlite_family_cleanup(&staged.path)?.is_empty() {
+        return Ok(false);
+    }
+    sqlite_file_is_healthy_staged(&staged.path)
 }
 
 #[allow(clippy::result_large_err)]
@@ -7006,16 +7342,11 @@ fn quarantine_sqlite_sidecars_after_checkpoint(primary_path: &Path) -> Result<()
         let sidecar_path = sqlite_path_with_suffix(primary_path, suffix);
         match std::fs::symlink_metadata(&sidecar_path) {
             Ok(_) => {
-                if !quarantine_sqlite_cleanup_sidecar(
+                let _ = quarantine_sqlite_cleanup_sidecar(
                     &sidecar_path,
                     &mut quarantine_nonce,
                     "residual sidecar after successful checkpoint",
-                ) {
-                    return Err(SqlError::Custom(format!(
-                        "failed to quarantine residual sqlite sidecar {} after checkpoint",
-                        sidecar_path.display()
-                    )));
-                }
+                )?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -7026,6 +7357,7 @@ fn quarantine_sqlite_sidecars_after_checkpoint(primary_path: &Path) -> Result<()
             }
         }
     }
+    sync_recovery_parent(primary_path)?;
     Ok(())
 }
 
@@ -8847,6 +9179,36 @@ fn proactive_backup_rotation_path(backup_path: &Path, timestamp: &str, collision
     )
 }
 
+#[derive(Debug)]
+enum ProactiveBackupRollbackOutcome {
+    NotNeeded,
+    RestoredDurably,
+    RestoreMoveFailed(String),
+    RestoredButParentSyncFailed(String),
+}
+
+fn rollback_rotated_proactive_backup_with<F>(
+    rotated_backup: Option<&Path>,
+    backup_path: &Path,
+    sync_parent: F,
+) -> ProactiveBackupRollbackOutcome
+where
+    F: FnOnce(&Path) -> Result<(), SqlError>,
+{
+    let Some(rotated) = rotated_backup else {
+        return ProactiveBackupRollbackOutcome::NotNeeded;
+    };
+    if let Err(error) = rename_noreplace_preserving_source(rotated, backup_path) {
+        return ProactiveBackupRollbackOutcome::RestoreMoveFailed(error.to_string());
+    }
+    match sync_parent(backup_path) {
+        Ok(()) => ProactiveBackupRollbackOutcome::RestoredDurably,
+        Err(error) => {
+            ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(error.to_string())
+        }
+    }
+}
+
 fn rotate_existing_proactive_backup(backup_path: &Path) -> DbResult<PathBuf> {
     if !is_real_file(backup_path) || !sqlite_recovery_candidate_is_standalone(backup_path) {
         return Err(DbError::Sqlite(format!(
@@ -9023,7 +9385,7 @@ fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
         "rejected-{}",
         chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
     );
-    let quarantine = sqlite_cleanup_quarantine_path(candidate, &nonce);
+    let quarantine = sqlite_cleanup_quarantine_path(candidate, &nonce, 0);
     match rename_noreplace_preserving_source(candidate, &quarantine) {
         Ok(()) => tracing::warn!(
             path = %candidate.display(),
@@ -10144,7 +10506,7 @@ fn restore_quarantined_sidecar(
             "rollback-conflict-{}",
             chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
         );
-        let conflict_quarantine = sqlite_cleanup_quarantine_path(&live_path, &nonce);
+        let conflict_quarantine = sqlite_cleanup_quarantine_path(&live_path, &nonce, 0);
         rename_noreplace_preserving_source(&live_path, &conflict_quarantine).map_err(
             |error| {
                 SqlError::Custom(format!(
@@ -10621,7 +10983,12 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     crate::forensics::verify_recovery_receipt_state(recovery_receipt_root, primary_path)?;
     let exists = primary_path.exists();
     if exists {
-        cleanup_empty_wal_sidecar(primary_path);
+        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+            return with_recovery_admission(primary_path, "automatic sqlite recovery", || {
+                ensure_sqlite_file_healthy_inner(primary_path)
+            });
+        }
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
             return Ok(());
         }
@@ -10639,7 +11006,7 @@ fn ensure_sqlite_file_healthy_inner(primary_path: &Path) -> Result<(), SqlError>
     validate_sqlite_target_path(primary_path, "sqlite recovery target")?;
     let exists = primary_path.exists();
     if exists {
-        cleanup_empty_wal_sidecar(primary_path);
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
     }
     if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
@@ -10722,7 +11089,14 @@ pub fn ensure_sqlite_file_healthy_with_archive(
 
     let had_primary = primary_path.exists();
     if had_primary {
-        cleanup_empty_wal_sidecar(primary_path);
+        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+            return with_recovery_admission(
+                primary_path,
+                "automatic sqlite archive recovery",
+                || ensure_sqlite_file_healthy_with_archive_inner(primary_path, storage_root),
+            );
+        }
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
             let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
             return Ok(());
@@ -10770,7 +11144,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
 
     let had_primary = primary_path.exists();
     if had_primary {
-        cleanup_empty_wal_sidecar(primary_path);
+        let _ = cleanup_empty_wal_sidecar(primary_path)?;
     }
     if had_primary && sqlite_file_is_healthy(primary_path)? {
         let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
@@ -13508,7 +13882,7 @@ mod tests {
             .expect_err("inventory must reject a non-UTF-8 engine path");
         assert!(inventory_error.to_string().contains("not valid UTF-8"));
 
-        cleanup_truncated_wal_sidecar(&invalid_path);
+        cleanup_truncated_wal_sidecar(&invalid_path).expect("admitted exact-path WAL cleanup");
         assert!(
             !invalid_wal.exists(),
             "the exact raw-name WAL was quarantined"
@@ -18010,6 +18384,90 @@ mod tests {
     }
 
     #[test]
+    fn nested_recovery_admission_allows_same_path_and_refuses_different_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sqlite3");
+        let second = dir.path().join("second.sqlite3");
+        std::fs::write(&first, b"first generation").unwrap();
+        std::fs::write(&second, b"second generation").unwrap();
+        let same_path_calls = std::cell::Cell::new(0_u8);
+        let different_path_calls = std::cell::Cell::new(0_u8);
+
+        recovery_admission().reset();
+        with_recovery_admission(&first, "outer recovery", || {
+            with_recovery_admission(&first, "same-path nested recovery", || {
+                same_path_calls.set(same_path_calls.get().saturating_add(1));
+                Ok(())
+            })?;
+            let error = with_recovery_admission(&second, "different-path nested recovery", || {
+                different_path_calls.set(different_path_calls.get().saturating_add(1));
+                Ok(())
+            })
+            .expect_err("a nested recovery must not inherit admission for another database");
+            assert!(
+                error
+                    .to_string()
+                    .contains("nested recovery may only target")
+            );
+            Ok(())
+        })
+        .expect("outer and same-path nested recovery should succeed");
+
+        assert_eq!(same_path_calls.get(), 1);
+        assert_eq!(different_path_calls.get(), 0);
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&second))
+                .is_err(),
+            "different-path refusal must happen before creating breaker authority"
+        );
+        recovery_admission().reset();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_recovery_admission_distinguishes_lossy_colliding_unix_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x80.sqlite3".to_vec()));
+        let second = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x81.sqlite3".to_vec()));
+        assert_eq!(
+            first.to_string_lossy(),
+            second.to_string_lossy(),
+            "fixture must collide under lossy UTF-8 conversion"
+        );
+        std::fs::write(&first, b"first generation").unwrap();
+        std::fs::write(&second, b"second generation").unwrap();
+        let second_operation_called = std::cell::Cell::new(false);
+
+        recovery_admission().reset();
+        with_recovery_admission(&first, "outer non-UTF8 recovery", || {
+            let error = with_recovery_admission(&second, "nested non-UTF8 recovery", || {
+                second_operation_called.set(true);
+                Ok(())
+            })
+            .expect_err("lossy-colliding path must not inherit another database's admission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("nested recovery may only target")
+            );
+            Ok(())
+        })
+        .expect("outer recovery should retain its own lossless identity");
+
+        assert!(!second_operation_called.get());
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&second))
+                .is_err(),
+            "path-B refusal must occur before creating its breaker authority"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
     fn automatic_recovery_refuses_malformed_breaker_authority_before_operation() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("storage.sqlite3");
@@ -18939,6 +19397,34 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn proactive_backup_rollback_distinguishes_restored_but_unsynced_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let rotated = dir.path().join("storage.sqlite3.bak.20260824_120000");
+        std::fs::write(&rotated, b"prior verified generation").unwrap();
+
+        let outcome = rollback_rotated_proactive_backup_with(Some(&rotated), &backup, |_| {
+            Err(SqlError::Custom("injected parent sync failure".to_string()))
+        });
+
+        assert!(matches!(
+            outcome,
+            ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(ref detail)
+                if detail.contains("injected parent sync failure")
+        ));
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"prior verified generation",
+            "the namespace is restored even though its crash durability is uncertain"
+        );
+        assert!(
+            std::fs::symlink_metadata(&rotated).is_err(),
+            "state-honest reporting must not claim the generation remains rotated"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn ordinary_backup_refresh_preserves_rotated_verified_snapshot_authority() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("verified-refresh.sqlite3");
@@ -19405,6 +19891,209 @@ mod tests {
     }
 
     #[test]
+    fn malformed_breaker_preserves_exact_truncated_sqlite_family_before_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("malformed-breaker.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"primary authority").unwrap();
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        std::fs::write(&breaker_path, b"malformed breaker authority").unwrap();
+
+        recovery_admission().reset();
+        let error = ensure_sqlite_file_healthy(&db_path)
+            .expect_err("malformed breaker must refuse before sidecar cleanup");
+        assert!(error.to_string().contains("could not be trusted"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(
+            std::fs::read(&breaker_path).unwrap(),
+            b"malformed breaker authority"
+        );
+        assert!(sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-wal").is_empty());
+        assert!(sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-shm").is_empty());
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn tripped_breaker_preserves_exact_truncated_sqlite_family_before_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-breaker.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"primary authority").unwrap();
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+        let config = crate::recovery_breaker::config_from_env();
+        let state = crate::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: config.max_consecutive_failures,
+            last_failure_unix: recovery_breaker_now_unix(),
+            last_failure_reason: "fixture tripped".to_string(),
+            tripped: true,
+        };
+        crate::recovery_breaker::store(&db_path, &state).unwrap();
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).unwrap();
+
+        recovery_admission().reset();
+        let error = ensure_sqlite_file_healthy(&db_path)
+            .expect_err("tripped breaker must refuse before sidecar cleanup");
+        assert!(error.to_string().contains("circuit-broken"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        assert!(sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-wal").is_empty());
+        assert!(sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-shm").is_empty());
+        recovery_admission().reset();
+    }
+
+    fn assert_pool_init_breaker_preserves_truncated_family(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&db_path, b"pool-init-primary-authority").expect("write primary fixture");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list pool-init fixture before acquire")
+            .map(|entry| entry.expect("read pool-init fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let cx = Cx::for_testing();
+
+        recovery_admission().reset();
+        let error = match runtime.block_on(pool.acquire(&cx)) {
+            Outcome::Err(error) => error,
+            Outcome::Ok(_) => panic!("breaker authority must refuse pool initialization"),
+            Outcome::Cancelled(reason) => panic!("pool initialization was cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                panic!("pool initialization panicked: {}", payload.message())
+            }
+        };
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected pool-init refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            b"pool-init-primary-authority"
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list pool-init fixture after refusal")
+            .map(|entry| entry.expect("read pool-init fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn pool_init_preserves_truncated_family_behind_malformed_breaker() {
+        assert_pool_init_breaker_preserves_truncated_family(
+            "pool-init-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn pool_init_preserves_truncated_family_behind_tripped_breaker() {
+        assert_pool_init_breaker_preserves_truncated_family(
+            "pool-init-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "pool init fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state).expect("store tripped breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn health_probes_settle_private_copy_without_mutating_source_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source-neutral-health.sqlite3");
+        {
+            let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create source database");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("force standalone primary");
+            conn.execute_raw("CREATE TABLE t (value INTEGER);")
+                .expect("create table");
+            conn.execute_raw("INSERT INTO t VALUES (1);")
+                .expect("seed table");
+        }
+        let main_bytes = std::fs::read(&db_path).unwrap();
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").unwrap();
+        std::fs::write(&shm_path, b"coordination-shm").unwrap();
+
+        assert!(
+            !sqlite_file_is_healthy_without_family_cleanup(&db_path)
+                .expect("strict source-neutral health probe"),
+            "a private probe that requires WAL cleanup is not proof that a breaker-blocked runtime can open the exact live family"
+        );
+        assert!(
+            sqlite_primary_read_path_is_healthy(&db_path).expect("primary staged health probe")
+        );
+        assert!(sqlite_file_is_healthy(&db_path).expect("layered staged health probe"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), main_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-wal").is_empty()
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "source-neutral-health.sqlite3-shm").is_empty()
+        );
+    }
+
+    #[test]
     fn cleanup_empty_wal_sidecar_preserves_zero_byte_wal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup_test.db");
@@ -19420,7 +20109,7 @@ mod tests {
         assert!(wal_path.exists());
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
 
-        cleanup_empty_wal_sidecar(&db_path);
+        cleanup_empty_wal_sidecar(&db_path).expect("classify benign empty WAL");
 
         assert!(
             wal_path.exists(),
@@ -19432,6 +20121,188 @@ mod tests {
             0,
             "0-byte WAL should not create a cleanup quarantine artifact"
         );
+    }
+
+    #[test]
+    fn sqlite_family_cleanup_refuses_before_mutation_while_writer_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("writer-held-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list family before refusal")
+            .map(|entry| entry.expect("read family entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let writer = crate::write_barrier::begin_write_activity();
+
+        let error = cleanup_truncated_wal_sidecar_with_timeout(&db_path, Duration::from_millis(1))
+            .expect_err("an active writer must block automatic sidecar cleanup");
+
+        assert!(error.to_string().contains("did not drain"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list family after refusal")
+            .map(|entry| entry.expect("read family entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+        drop(writer);
+    }
+
+    #[test]
+    fn tripped_breaker_preempts_writer_drain_for_sidecar_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-writer-held-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let config = crate::recovery_breaker::config_from_env();
+        let state = crate::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: config.max_consecutive_failures,
+            last_failure_unix: recovery_breaker_now_unix(),
+            last_failure_reason: "fixture tripped before writer drain".to_string(),
+            tripped: true,
+        };
+        crate::recovery_breaker::store(&db_path, &state).expect("store tripped breaker");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read tripped breaker");
+        let writer = crate::write_barrier::begin_write_activity();
+
+        recovery_admission().reset();
+        let error = cleanup_truncated_wal_sidecar_with_timeout(&db_path, Duration::ZERO)
+            .expect_err("tripped breaker must refuse before attempting writer drain");
+
+        assert!(
+            error.to_string().contains("circuit-broken"),
+            "authoritative breaker refusal must preempt the zero-timeout writer-drain error: {error}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"primary authority");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        assert!(
+            sqlite_cleanup_quarantines(
+                dir.path(),
+                "tripped-writer-held-cleanup.sqlite3-wal"
+            )
+            .is_empty()
+        );
+        assert!(
+            sqlite_cleanup_quarantines(
+                dir.path(),
+                "tripped-writer-held-cleanup.sqlite3-shm"
+            )
+            .is_empty()
+        );
+        drop(writer);
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn successful_sidecar_cleanup_does_not_clear_prior_recovery_failure_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("breaker-history-cleanup.sqlite3");
+        std::fs::write(&db_path, b"primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        let config = crate::recovery_breaker::RecoveryBreakerConfig {
+            max_consecutive_failures: 3,
+            cooldown_secs: 21_600,
+        };
+        let fingerprint = crate::recovery_breaker::fingerprint_db(&db_path);
+        let prior = crate::recovery_breaker::record_failure(
+            None,
+            &fingerprint,
+            "prior whole-recovery failure",
+            config,
+            1_000,
+        );
+        crate::recovery_breaker::store(&db_path, &prior).expect("store prior breaker state");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes_before =
+            std::fs::read(&breaker_path).expect("read breaker before sidecar cleanup");
+
+        let outcome = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "3")],
+            || cleanup_truncated_wal_sidecar(&db_path),
+        )
+        .expect("admitted sidecar cleanup");
+
+        assert_eq!(
+            outcome,
+            SqliteFamilyCleanupOutcome::Quarantined {
+                wal: true,
+                shm: false,
+            }
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after sidecar cleanup"),
+            breaker_bytes_before,
+            "a sidecar-only mutation is not proof that whole-database recovery succeeded"
+        );
+    }
+
+    #[test]
+    fn nested_sidecar_cleanup_preserves_outer_recovery_failure_lineage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("outer-failure-cleanup.sqlite3");
+        std::fs::write(&db_path, b"corrupt primary authority").expect("write primary fixture");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        let config = crate::recovery_breaker::RecoveryBreakerConfig {
+            max_consecutive_failures: 3,
+            cooldown_secs: 21_600,
+        };
+        let fingerprint = crate::recovery_breaker::fingerprint_db(&db_path);
+        let prior = crate::recovery_breaker::record_failure(
+            None,
+            &fingerprint,
+            "first whole-recovery failure",
+            config,
+            1_000,
+        );
+        crate::recovery_breaker::store(&db_path, &prior).expect("store prior breaker state");
+
+        recovery_admission().reset();
+        let error = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "3")],
+            || {
+                with_recovery_admission(&db_path, "whole recovery fixture", || {
+                    cleanup_truncated_wal_sidecar(&db_path)?;
+                    Err::<(), SqlError>(SqlError::Custom(
+                        "terminal whole-recovery failure".to_string(),
+                    ))
+                })
+            },
+        )
+        .expect_err("outer recovery fixture must fail after admitted cleanup");
+        assert!(error.to_string().contains("terminal whole-recovery failure"));
+
+        let terminal = crate::recovery_breaker::load(&db_path)
+            .expect("load terminal breaker")
+            .expect("terminal breaker state");
+        assert_eq!(terminal.consecutive_failures, 2);
+        assert_eq!(
+            terminal.last_failure_reason,
+            "terminal whole-recovery failure"
+        );
+        assert!(
+            !wal_path.exists(),
+            "nested cleanup must run so the test is mutation-sensitive"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "outer-failure-cleanup.sqlite3-wal").len(),
+            1
+        );
+        recovery_admission().reset();
     }
 
     #[test]
@@ -19451,7 +20322,7 @@ mod tests {
         std::fs::write(&wal_path, [0xAA; 64]).expect("create wal");
         assert!(wal_path.exists());
 
-        cleanup_empty_wal_sidecar(&db_path);
+        cleanup_empty_wal_sidecar(&db_path).expect("classify framed WAL");
 
         assert!(wal_path.exists(), "WAL > 32 bytes should be preserved");
     }
@@ -19476,7 +20347,7 @@ mod tests {
         let shm_path = dir.path().join("header_only_test.db-shm");
         std::fs::write(&shm_path, b"stale-shm").expect("create companion shm");
 
-        cleanup_empty_wal_sidecar(&db_path);
+        cleanup_empty_wal_sidecar(&db_path).expect("quarantine damaged WAL family");
 
         assert!(
             !wal_path.exists(),
@@ -19545,7 +20416,7 @@ mod tests {
         std::fs::write(&wal_path, header).expect("write valid 32-byte header");
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
 
-        cleanup_empty_wal_sidecar(&db_path);
+        cleanup_empty_wal_sidecar(&db_path).expect("classify valid header-only WAL");
 
         assert!(
             wal_path.exists(),
@@ -19613,6 +20484,11 @@ mod tests {
             wal.exists(),
             "empty wal stub should exist before health check"
         );
+        assert!(
+            sqlite_file_is_healthy_without_family_cleanup(&primary)
+                .expect("strict health check with benign empty WAL"),
+            "the strict fail-open probe must not reject a directly usable zero-byte WAL family"
+        );
 
         ensure_sqlite_file_healthy(&primary).expect("healthy db with empty wal should pass");
 
@@ -19621,8 +20497,13 @@ mod tests {
             "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
-            "health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
+            wal.exists(),
+            "source-neutral health must retain the empty WAL name"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).expect("stat retained WAL").len(),
+            0,
+            "source-neutral health must retain the empty WAL bytes"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal.db-wal").len(),
@@ -19658,8 +20539,13 @@ mod tests {
             "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
-            "archive-aware health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
+            wal.exists(),
+            "archive-aware source-neutral health must retain the empty WAL name"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).expect("stat retained WAL").len(),
+            0,
+            "archive-aware source-neutral health must retain the empty WAL bytes"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal-archive.db-wal").len(),
