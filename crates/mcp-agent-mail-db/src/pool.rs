@@ -15353,6 +15353,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_integrity_allows_healthy_family_with_nonclean_breaker_authority() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("healthy-breaker-{breaker_kind}.sqlite3"));
+            {
+                let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create healthy startup fixture");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("force standalone primary");
+                conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                    .expect("create fixture table");
+            }
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "healthy-family fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state)
+                    .expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let election_path = crate::recovery_breaker::breaker_lock_path(&db_path);
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(dir.path().join("storage")),
+                ..Default::default()
+            })
+            .expect("construct lazy pool");
+
+            let result = pool
+                .run_startup_integrity_check()
+                .expect("healthy exact family does not require recovery admission");
+
+            assert!(result.ok);
+            assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+            assert!(
+                std::fs::symlink_metadata(&election_path).is_err(),
+                "a healthy exact family must not create a recovery-election artifact"
+            );
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .expect("list healthy startup fixture")
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .all(|name| !name.contains("cleanup-quarantine")
+                        && !name.contains(".corrupt-")
+                        && !name.contains(".recovery")),
+                "healthy startup must not publish recovery artifacts"
+            );
+        }
+    }
+
     /// Verify `run_full_integrity_check` passes on a healthy file-backed DB.
     #[test]
     fn full_integrity_check_healthy_db() {
