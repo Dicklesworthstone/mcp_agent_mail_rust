@@ -1021,6 +1021,34 @@ fn recovery_breaker_now_unix() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+fn automatic_recovery_breaker_refusal<E>(
+    primary_path: &Path,
+    action: &str,
+    verdict: &crate::recovery_breaker::BreakerVerdict,
+) -> Option<AutomaticRecoveryRunError<E>> {
+    let crate::recovery_breaker::BreakerVerdict::Refuse {
+        consecutive_failures,
+        retry_after_secs,
+        last_failure_reason,
+    } = verdict
+    else {
+        return None;
+    };
+    Some(AutomaticRecoveryRunError::admission(
+        AutomaticRecoveryAdmissionFailureKind::CircuitOpen,
+        SqlError::Custom(format!(
+            "{action} for {} is circuit-broken: {consecutive_failures} consecutive automatic \
+             recovery attempts failed on this same database content (last error: \
+             {last_failure_reason}). Refusing to re-attempt (and re-capture forensics) for \
+             another {retry_after_secs}s. Operator paths are exempt: run `am doctor repair` \
+             or `am doctor reconstruct` to intervene now, or quarantine the file (move \
+             {}* aside) to rebuild from the Git archive.",
+            primary_path.display(),
+            primary_path.display(),
+        )),
+    ))
+}
+
 #[allow(clippy::result_large_err)]
 #[cfg(test)]
 fn with_recovery_admission_using_clock<T, F, C>(
@@ -1072,6 +1100,41 @@ where
             )),
         ));
     }
+
+    // Refusing already-malformed or currently tripped authority is a pure
+    // read decision. Do it before opening the persistent election file so a
+    // rejected attempt leaves the directory namespace exactly unchanged.
+    // Every allowed path still locks and reloads/re-evaluates below, closing
+    // the preflight-to-lock race before any operation can run.
+    let breaker_config = crate::recovery_breaker::config_from_env();
+    let breaker_bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active();
+    let preflight_attempt_started_unix = if breaker_bypass {
+        None
+    } else {
+        let preflight_fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
+        let preflight_prior = crate::recovery_breaker::load(primary_path).map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                SqlError::Custom(format!(
+                    "{action} for {} was refused because durable recovery-breaker state could not be trusted: {error}. Run `am doctor repair` or `am doctor reconstruct` for an operator-supervised bypass",
+                    primary_path.display()
+                )),
+            )
+        })?;
+        let attempt_started_unix = now_unix();
+        let preflight_verdict = crate::recovery_breaker::evaluate(
+            preflight_prior.as_ref(),
+            &preflight_fingerprint,
+            breaker_config,
+            attempt_started_unix,
+        );
+        if let Some(error) =
+            automatic_recovery_breaker_refusal(primary_path, action, &preflight_verdict)
+        {
+            return Err(error);
+        }
+        Some(attempt_started_unix)
+    };
     let _breaker_file_lock = crate::recovery_breaker::try_acquire_file_lock(primary_path)
         .map_err(|error| {
             AutomaticRecoveryRunError::admission(
