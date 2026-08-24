@@ -13,6 +13,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Bytes per MiB.
 const MIB: u64 = 1024 * 1024;
 
+/// Return whether `path` is one of macOS's protected compatibility aliases.
+///
+/// macOS presents `/var`, `/tmp`, and `/etc` as root-owned symlinks into
+/// `/private`. Security-sensitive path walkers should continue rejecting every
+/// user-controlled symlink, but treating these exact operating-system aliases
+/// as hostile makes ordinary temp-backed operations unusable. Both the alias
+/// spelling and its canonical destination are verified, so this exception does
+/// not extend to arbitrary symlinks.
+#[must_use]
+pub fn is_trusted_system_directory_alias(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let expected = if path == Path::new("/var") {
+            Some(Path::new("/private/var"))
+        } else if path == Path::new("/tmp") {
+            Some(Path::new("/private/tmp"))
+        } else if path == Path::new("/etc") {
+            Some(Path::new("/private/etc"))
+        } else {
+            None
+        };
+
+        return expected.is_some_and(|expected| {
+            std::fs::canonicalize(path).is_ok_and(|resolved| resolved == expected)
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskPressure {
     Ok,

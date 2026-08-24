@@ -832,6 +832,11 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
             std::path::Component::Normal(segment) => {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && crate::disk::is_trusted_system_directory_alias(&current) =>
+                    {
+                    }
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
@@ -874,7 +879,12 @@ fn path_has_symlinked_parent(path: &Path) -> std::io::Result<bool> {
             std::path::Component::Normal(segment) => {
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && !crate::disk::is_trusted_system_directory_alias(&current) =>
+                    {
+                        return Ok(true);
+                    }
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                     Err(error) => return Err(error),

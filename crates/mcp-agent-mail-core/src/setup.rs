@@ -1635,6 +1635,11 @@ fn ensure_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupErro
                 current.push(segment);
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) => {
+                        if metadata.file_type().is_symlink()
+                            && crate::disk::is_trusted_system_directory_alias(&current)
+                        {
+                            continue;
+                        }
                         if metadata.file_type().is_symlink() {
                             return Err(invalid_setup_path(
                                 label,
