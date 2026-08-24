@@ -3337,26 +3337,28 @@ mod tests {
     }
 
     #[test]
-    fn probe_database_uses_absolute_candidate_for_missing_relative_database_url() {
+    fn probe_database_does_not_hijack_missing_relative_target_with_absolute_decoy() {
         let temp = tempfile::tempdir().expect("tempdir");
         let absolute_db = temp.path().join("probe-absolute.sqlite3");
-        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+        let decoy_bytes = b"absolute preflight decoy";
+        std::fs::write(&absolute_db, decoy_bytes).expect("create absolute decoy");
 
         let relative_path =
             std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_path.exists(),
-            "relative shadow path should be absent so absolute candidate fallback is exercised"
+            "fixture requires a missing configured relative target"
         );
 
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", relative_path.display());
 
         let result = probe_database(&config);
-        assert!(
-            matches!(result, ProbeResult::Ok { name: "database" }),
-            "probe_database should accept the resolved absolute candidate: {result:?}"
-        );
+        let ProbeResult::Fail(failure) = result else {
+            panic!("missing relative parent should fail without using the decoy: {result:?}");
+        };
+        assert!(failure.problem.contains("does not exist"));
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }
 
     #[test]

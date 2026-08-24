@@ -3162,6 +3162,17 @@ pub(crate) fn open_observability_sync_db_connection(
         archive_storage_root_is_authoritative_for_sqlite_path(storage_root, &resolved_path)
             && archive_inventory_has_state(storage_root);
 
+    // Observability must not initialize a configured fresh-start target merely
+    // to render counts. If durable archive state exists, derive a private
+    // snapshot from it; otherwise report that no read source is available.
+    if !resolved_path.exists() {
+        return if archive_has_state {
+            ObservabilitySyncDb::archive_snapshot(storage_root, None, context).map(Some)
+        } else {
+            Ok(None)
+        };
+    }
+
     match open_best_effort_sync_db_connection(&sqlite_path) {
         Ok(conn) => match inspect_archive_db_drift(storage_root, &resolved_path, &conn) {
             Ok(Some(drift)) => {
@@ -17627,6 +17638,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shutdown_cleanup_production_resolver_preserves_absolute_decoy_for_missing_relative_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = dir.path().join("shutdown-absolute-decoy.sqlite3");
+        let absolute_wal = absolute_db.with_file_name("shutdown-absolute-decoy.sqlite3-wal");
+        let absolute_shm = absolute_db.with_file_name("shutdown-absolute-decoy.sqlite3-shm");
+        let primary_bytes = b"absolute decoy primary";
+        let wal_bytes = b"truncated-decoy-wal";
+        let shm_bytes = b"absolute decoy shm";
+        std::fs::write(&absolute_db, primary_bytes).expect("write absolute decoy primary");
+        std::fs::write(&absolute_wal, wal_bytes).expect("write absolute decoy WAL");
+        std::fs::write(&absolute_shm, shm_bytes).expect("write absolute decoy SHM");
+
+        let relative_db =
+            PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
+        assert!(
+            !relative_db.exists(),
+            "fixture requires a missing configured relative target"
+        );
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", relative_db.display());
+        let runtime_authority = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(
+            &config.database_url,
+        )
+        .expect("resolve DB runtime authority");
+        assert_eq!(runtime_authority.canonical_path, relative_db.to_string_lossy());
+        assert_eq!(
+            resolve_server_database_url_sqlite_path(&config.database_url),
+            Some(relative_db)
+        );
+
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), primary_bytes);
+        assert_eq!(std::fs::read(&absolute_wal).unwrap(), wal_bytes);
+        assert_eq!(std::fs::read(&absolute_shm).unwrap(), shm_bytes);
+        let decoy_quarantines = std::fs::read_dir(dir.path())
+            .expect("list absolute decoy family")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".cleanup-quarantine-"))
+            .collect::<Vec<_>>();
+        assert!(
+            decoy_quarantines.is_empty(),
+            "cleanup must not quarantine an unrelated absolute family: {decoy_quarantines:?}"
+        );
+    }
+
     struct NoopTool;
 
     impl fastmcp::ToolHandler for NoopTool {
@@ -18827,39 +18886,31 @@ mod tests {
     }
 
     #[test]
-    fn readiness_check_uses_absolute_candidate_for_mailbox_activity_lock() {
+    fn readiness_path_matches_runtime_for_missing_relative_target() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let storage_root = temp.path().join("storage");
-        std::fs::create_dir_all(&storage_root).expect("create storage root");
         let absolute_db = temp.path().join("readiness-absolute.sqlite3");
-        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+        let decoy_bytes = b"absolute readiness decoy";
+        std::fs::write(&absolute_db, decoy_bytes).expect("create absolute decoy");
 
         let relative_path =
             std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_path.exists(),
-            "relative shadow path should be absent so absolute candidate fallback is exercised"
+            "fixture requires a missing configured relative target"
         );
 
-        let config = mcp_agent_mail_core::Config {
-            database_url: format!("sqlite:///{}", relative_path.display()),
-            storage_root,
-            integrity_check_on_startup: false,
-            ..mcp_agent_mail_core::Config::default()
-        };
+        let database_url = format!("sqlite:///{}", relative_path.display());
+        let server_path = resolve_server_database_url_sqlite_path(&database_url)
+            .expect("resolve server runtime authority");
+        let runtime_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&database_url)
+            .expect("resolve DB runtime authority");
 
-        let _sqlite_lock = acquire_mailbox_activity_lock_for_sqlite_path(
-            &absolute_db,
-            MailboxActivityLockMode::Exclusive,
-        )
-        .expect("acquire exclusive sqlite mailbox lock on absolute candidate");
-
-        let error = readiness_check_quick(&config)
-            .expect_err("resolved absolute candidate lock should block readiness");
-        assert!(
-            error.contains("mailbox activity lock is busy") || error.contains("temporarily busy"),
-            "busy readiness error should mention mailbox contention on the resolved absolute candidate: {error}"
+        assert_eq!(server_path, PathBuf::from(&runtime_path.canonical_path));
+        assert_eq!(
+            server_path, relative_path,
+            "readiness locks must retain the same missing relative authority that DbPool will initialize"
         );
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }
 
     #[test]
@@ -28628,7 +28679,7 @@ first body
     }
 
     #[test]
-    fn dashboard_open_connection_uses_absolute_candidate_for_missing_relative_database_url() {
+    fn dashboard_does_not_hijack_absolute_candidate_for_missing_relative_database_url() {
         let dir = tempfile::tempdir().expect("tempdir");
         let absolute_db = dir.path().join("dashboard-fallback.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
@@ -28644,26 +28695,28 @@ first body
         }
         assert!(
             !relative_path.exists(),
-            "relative fallback fixture should be absent so dashboard opens the absolute candidate"
+            "fixture requires a missing configured relative target"
         );
 
         let database_url = format!("sqlite://{}", relative_path.display());
-        let conn = dashboard_open_connection(&database_url, dir.path())
-            .expect("open dashboard fallback db");
+        let conn = dashboard_open_connection(&database_url, dir.path());
+        assert!(
+            conn.is_none(),
+            "observability must not open an unrelated absolute decoy or initialize a missing runtime target"
+        );
+
+        assert!(
+            !relative_path.exists(),
+            "dashboard observation must not create the missing relative SQLite target"
+        );
+        let conn = DbConn::open_file(&absolute_db_str).expect("reopen absolute decoy");
         let rows = conn
-            .conn()
             .query_sync(
                 "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
                 &[],
             )
-            .expect("query sqlite_master");
+            .expect("query untouched absolute decoy");
         assert_eq!(rows[0].get_named::<i64>("count").unwrap_or(0), 1);
-        drop(conn);
-
-        assert!(
-            !relative_path.exists(),
-            "dashboard fallback should not create a stray relative sqlite file"
-        );
     }
 
     #[test]
