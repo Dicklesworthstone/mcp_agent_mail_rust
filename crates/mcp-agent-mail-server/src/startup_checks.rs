@@ -2371,9 +2371,12 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         }
     }
 
+    let database_file_missing = resolved_db_path
+        .as_ref()
+        .is_some_and(|path| !path.exists());
+
     // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
-    if let Some(path) = resolved_db_path
-        && !path.exists()
+    if database_file_missing
         && !path_is_real_directory(&std::path::Path::new(&config.storage_root).join("projects"))
     {
         return ProbeResult::Ok { name: "integrity" };
@@ -2418,6 +2421,20 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         }
     };
 
+    // `run_startup_integrity_check` owns recovery for a database it can open,
+    // but deliberately reports a missing primary as `IntegrityCorruption` so
+    // its caller can decide whether durable archive state should be rebuilt.
+    // Preserve that one caller-owned recovery before constructing the probe
+    // pool; every error returned by the integrity check below is terminal and
+    // must not trigger another attempt.
+    if database_file_missing {
+        tracing::warn!(
+            database_url = %config.database_url,
+            "startup integrity probe found a missing SQLite primary with archive state; attempting one admitted recovery"
+        );
+        return attempt_probe_recovery(config);
+    }
+
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
         storage_root: Some(config.storage_root.clone()),
@@ -2437,55 +2454,31 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     let is_snapshot_conflict =
         |msg: &str| -> bool { mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(msg) };
 
-    // Helper: attempt WAL quarantine + pool retry, falling back to full recovery.
-    let try_wal_cleanup_and_retry = |pool_config: &DbPoolConfig, config: &Config| -> ProbeResult {
-        if let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) {
-            if try_quarantine_corrupt_wal(&db_path) {
-                tracing::info!(
-                    path = %db_path.display(),
-                    "quarantined corrupt/stale WAL/SHM sidecars; retrying pool open"
-                );
-                if let Ok(p) = mcp_agent_mail_db::DbPool::new(pool_config) {
-                    tracing::info!("pool open succeeded after WAL quarantine");
-                    match p.run_startup_integrity_check() {
-                        Ok(_) => return ProbeResult::Ok { name: "integrity" },
-                        Err(ref e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "integrity check failed after WAL quarantine; falling back to recovery"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        attempt_probe_recovery(config)
-    };
-
     let pool = match mcp_agent_mail_db::DbPool::new(&pool_config) {
         Ok(p) => p,
         Err(e) => {
             let err_str = e.to_string();
 
-            // Snapshot conflicts (stale WAL) are recoverable — remove the WAL
-            // and retry before giving up.  Must check BEFORE the generic
-            // is_lock_error test because snapshot conflicts match both.
+            // Snapshot conflicts (stale WAL) are recoverable, but detaching a
+            // WAL/SHM family is itself a recovery mutation. Check this before
+            // the generic lock classification because snapshot conflicts
+            // match both, then delegate to the admitted DB health entrypoint.
             if is_snapshot_conflict(&err_str) {
                 tracing::warn!(
                     error = %err_str,
-                    "pool open hit snapshot conflict; attempting WAL cleanup"
+                    "pool open hit snapshot conflict; attempting admitted database-health recovery"
                 );
-                return try_wal_cleanup_and_retry(&pool_config, config);
+                return admitted_recovery_then_retry_integrity(&pool_config, config);
             }
 
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
 
-            // Corruption (malformed schema, WAL too small, etc.) — try WAL
-            // cleanup first, fall back to full archive reconstruction.
+            // Corruption (malformed schema, WAL too small, etc.) follows the
+            // same admitted health/recovery path.
             if mcp_agent_mail_db::is_corruption_error_message(&err_str) {
-                return try_wal_cleanup_and_retry(&pool_config, config);
+                return admitted_recovery_then_retry_integrity(&pool_config, config);
             }
 
             return ProbeResult::Fail(ProbeFailure {
@@ -2545,102 +2538,119 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             }
             ProbeResult::Ok { name: "integrity" }
         }
-        Err(ref e) => {
+        Err(e) => {
             let err_str = e.to_string();
-
-            // Snapshot conflict during integrity check — same recovery as above.
-            if is_snapshot_conflict(&err_str) {
-                tracing::warn!(
-                    error = %err_str,
-                    "integrity check hit snapshot conflict; attempting WAL cleanup"
-                );
-                return try_wal_cleanup_and_retry(&pool_config, config);
-            }
 
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
 
+            // `DbPool::run_startup_integrity_check` owns the complete
+            // integrity recovery attempt, including post-recovery reopen and
+            // verification. An error here is therefore terminal evidence from
+            // that attempt. Calling `attempt_probe_recovery` again would start
+            // a second recovery against the same generation, double-account
+            // its failure, and potentially trip the durable breaker during a
+            // single startup probe.
+            let db_target = resolve_server_database_url_sqlite_path(&config.database_url)
+                .map_or_else(
+                    || config.database_url.clone(),
+                    |path| path.display().to_string(),
+                );
             tracing::warn!(
                 error = %err_str,
-                "startup integrity check failed; attempting automatic recovery"
+                database = %db_target,
+                "database-owned startup integrity recovery failed; refusing a second recovery attempt"
             );
-            attempt_probe_recovery(config)
+            ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!(
+                    "Startup integrity recovery failed for {db_target}: {}",
+                    classify_recovery_failure_root_cause(&err_str)
+                ),
+                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
+                    .into(),
+            })
         }
     }
 }
 
-/// Try to quarantine corrupt WAL/SHM sidecars so SQLite can fall back to the
-/// main database file. Returns `true` if at least one sidecar was quarantined.
-fn try_quarantine_corrupt_wal(db_path: &std::path::Path) -> bool {
-    let mut quarantined_any = false;
-    let nonce = startup_sidecar_quarantine_nonce();
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar_os = db_path.as_os_str().to_os_string();
-        sidecar_os.push(suffix);
-        let sidecar = std::path::PathBuf::from(sidecar_os);
-        let metadata = match std::fs::symlink_metadata(&sidecar) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                tracing::warn!(
-                    path = %sidecar.display(),
-                    error = %error,
-                    "failed to inspect corrupt/stale WAL/SHM sidecar during startup recovery"
-                );
-                continue;
-            }
-        };
-        if !metadata.file_type().is_file() {
+/// Sidecar cleanup is recovery: it changes which SQLite generation will be
+/// opened next. Delegate it to the common DB health entrypoint so the durable
+/// recovery breaker is loaded and admission is won before any WAL/SHM rename
+/// or checkpoint. Retain the explicit pool/integrity retry as a postcondition
+/// check after admitted recovery succeeds.
+fn admitted_recovery_then_retry_integrity(
+    pool_config: &DbPoolConfig,
+    config: &Config,
+) -> ProbeResult {
+    match attempt_probe_recovery(config) {
+        ProbeResult::Ok { .. } => {}
+        failure => return failure,
+    }
+
+    let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
+        || config.database_url.clone(),
+        |path| path.display().to_string(),
+    );
+    tracing::info!(
+        database = %db_target,
+        "admitted database-health recovery completed; retrying pool open"
+    );
+
+    let retry_pool = match mcp_agent_mail_db::DbPool::new(pool_config) {
+        Ok(pool) => pool,
+        Err(error) => {
+            let detail = error.to_string();
             tracing::warn!(
-                path = %sidecar.display(),
-                "skipping non-file WAL/SHM sidecar during startup recovery"
+                database = %db_target,
+                error = %detail,
+                "pool open still failed after admitted database-health recovery"
             );
-            continue;
+            if mcp_agent_mail_db::is_lock_error(&detail) {
+                return integrity_busy_probe_failure(config, &detail);
+            }
+            return ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!(
+                    "Admitted database-health recovery completed for {db_target}, but the startup pool retry still failed: {}",
+                    classify_integrity_open_root_cause(&detail)
+                ),
+                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unavailable, run `am doctor reconstruct --yes`."
+                    .into(),
+            });
         }
+    };
 
-        let quarantine = startup_sidecar_quarantine_path(&sidecar, &nonce);
-        match std::fs::rename(&sidecar, &quarantine) {
-            Ok(()) => {
-                tracing::warn!(
-                    path = %sidecar.display(),
-                    quarantine = %quarantine.display(),
-                    "quarantined corrupt/stale WAL/SHM sidecar during startup recovery"
-                );
-                quarantined_any = true;
+    match retry_pool.run_startup_integrity_check() {
+        Ok(_) => {
+            tracing::info!(
+                database = %db_target,
+                "pool open and integrity retry succeeded after admitted database-health recovery"
+            );
+            ProbeResult::Ok { name: "integrity" }
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            tracing::warn!(
+                database = %db_target,
+                error = %detail,
+                "integrity retry still failed after admitted database-health recovery"
+            );
+            if mcp_agent_mail_db::is_lock_error(&detail) {
+                return integrity_busy_probe_failure(config, &detail);
             }
-            Err(error) => {
-                tracing::warn!(
-                    path = %sidecar.display(),
-                    quarantine = %quarantine.display(),
-                    error = %error,
-                    "failed to quarantine corrupt/stale WAL/SHM sidecar during startup recovery"
-                );
-            }
+            ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!(
+                    "Admitted database-health recovery completed for {db_target}, but the startup integrity retry still failed: {}",
+                    classify_recovery_failure_root_cause(&detail)
+                ),
+                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
+                    .into(),
+            })
         }
     }
-    quarantined_any
-}
-
-fn startup_sidecar_quarantine_nonce() -> String {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    format!("{}-{millis}", std::process::id())
-}
-
-fn startup_sidecar_quarantine_path(sidecar: &std::path::Path, nonce: &str) -> std::path::PathBuf {
-    let mut candidate_os = sidecar.as_os_str().to_os_string();
-    candidate_os.push(format!(".startup-quarantine-{nonce}"));
-    let mut candidate = std::path::PathBuf::from(candidate_os);
-    let mut suffix = 1_u32;
-    while candidate.exists() {
-        let mut candidate_os = sidecar.as_os_str().to_os_string();
-        candidate_os.push(format!(".startup-quarantine-{nonce}-{suffix:02}"));
-        candidate = std::path::PathBuf::from(candidate_os);
-        suffix = suffix.saturating_add(1);
-    }
-    candidate
 }
 
 fn compact_probe_detail(detail: &str) -> String {
@@ -2744,6 +2754,21 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
     })
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static PROBE_RECOVERY_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_probe_recovery_attempt_count() {
+    PROBE_RECOVERY_ATTEMPTS.set(0);
+}
+
+#[cfg(test)]
+fn probe_recovery_attempt_count() -> u32 {
+    PROBE_RECOVERY_ATTEMPTS.get()
+}
+
 /// Attempt file-level recovery when the integrity probe detects corruption.
 ///
 /// Uses the archive-aware recovery path which tries, in order:
@@ -2755,6 +2780,9 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
 /// 3. Reinitialize an empty database (last resort)
 #[allow(dead_code)]
 fn attempt_probe_recovery(config: &Config) -> ProbeResult {
+    #[cfg(test)]
+    PROBE_RECOVERY_ATTEMPTS.set(PROBE_RECOVERY_ATTEMPTS.get().saturating_add(1));
+
     let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         return ProbeResult::Fail(ProbeFailure {
             name: "integrity",
@@ -3348,6 +3376,60 @@ mod tests {
             matches!(result, ProbeResult::Ok { name: "integrity" }),
             "fresh startup with a missing DB should not surface IntegrityCorruption: {result:?}"
         );
+    }
+
+    #[test]
+    fn integrity_probe_missing_db_with_archive_runs_one_caller_owned_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("missing-with-archive.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("test-proj");
+        let agent_dir = project_dir.join("agents").join("SwiftFox");
+        let message_dir = project_dir.join("messages").join("2026").join("01");
+        std::fs::create_dir_all(&agent_dir).expect("create agent archive directory");
+        std::fs::create_dir_all(&message_dir).expect("create message archive directory");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-proj","human_key":"/tmp/test-proj"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"SwiftFox","program":"coder","model":"test","inception_ts":"2026-01-15T10:00:00Z","last_active_ts":"2026-01-15T10:00:01Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-01-15T10-05-00Z__test__7.md"),
+            "---json\n{\"id\":7,\"from\":\"SwiftFox\",\"to\":[\"CalmLake\"],\"subject\":\"Test\",\"thread_id\":\"t1\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-01-15T10:05:00Z\",\"attachments\":[]}\n---\n\nTest body\n",
+        )
+        .expect("write archived message");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+
+        reset_probe_recovery_attempt_count();
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { name: "integrity" }),
+            "missing DB with durable archive state should recover: {result:?}"
+        );
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            1,
+            "a missing primary with archive state needs exactly one caller-owned recovery"
+        );
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open reconstructed database");
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .expect("query reconstructed messages");
+        assert_eq!(rows[0].get_named::<i64>("count").expect("message count"), 1);
+        assert_eq!(rows[0].get_named::<i64>("max_id").expect("max id"), 7);
     }
 
     #[test]
@@ -4647,6 +4729,61 @@ mod tests {
     }
 
     #[test]
+    fn probe_integrity_does_not_retry_database_owned_recovery_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("single_recovery_attempt.db");
+        std::fs::write(&db_path, b"not-a-sqlite-db").expect("write corrupt db");
+
+        // The DB-owned recovery gets far enough to arm its durable breaker,
+        // then fails deterministically while creating the forensic bundle.
+        // A second server-owned attempt would replace the original terminal
+        // error with `Automatic recovery failed for ...` and charge this one
+        // startup probe against recovery admission twice.
+        std::fs::write(dir.path().join("doctor"), b"blocks doctor directory")
+            .expect("block forensic bundle directory");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("missing-storage-root");
+
+        reset_probe_recovery_attempt_count();
+        let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("failed DB-owned recovery must fail startup: {result:?}");
+        };
+        assert!(
+            failure.problem.starts_with("Startup integrity recovery failed for "),
+            "the original DB-owned recovery failure must be retained: {}",
+            failure.problem
+        );
+        assert!(
+            failure
+                .problem
+                .contains("failed to create mailbox forensic bundle"),
+            "the terminal failure must retain the first recovery attempt's root cause: {}",
+            failure.problem
+        );
+        assert!(
+            !failure.problem.starts_with("Automatic recovery failed for "),
+            "the server must not replace the terminal DB-owned failure with a second recovery result: {}",
+            failure.problem
+        );
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            0,
+            "a terminal DB-owned recovery failure must not invoke the server recovery entrypoint"
+        );
+
+        let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
+            .expect("load recovery breaker")
+            .expect("failed recovery must persist breaker state");
+        assert_eq!(
+            breaker.consecutive_failures, 1,
+            "one startup integrity probe must account exactly one failed recovery attempt"
+        );
+    }
+
+    #[test]
     fn probe_integrity_passes_healthy_db() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("healthy.db");
@@ -4668,66 +4805,71 @@ mod tests {
     }
 
     #[test]
-    fn try_quarantine_corrupt_wal_preserves_sidecars() {
+    fn probe_integrity_preserves_sqlite_family_when_breaker_is_malformed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let wal_path = db_path.with_file_name("storage.sqlite3-wal");
         let shm_path = db_path.with_file_name("storage.sqlite3-shm");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let db_bytes = b"not-a-sqlite-database";
         let wal_bytes = vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize];
+        let shm_bytes = b"stale-shm";
+        std::fs::write(&db_path, db_bytes).expect("write corrupt db");
         std::fs::write(&wal_path, &wal_bytes).expect("write wal");
-        std::fs::write(&shm_path, b"stale-shm").expect("write shm");
+        std::fs::write(&shm_path, shm_bytes).expect("write shm");
+        std::fs::write(&breaker_path, b"malformed breaker authority")
+            .expect("write malformed breaker");
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before startup");
 
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("storage");
+
+        let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("malformed breaker authority must fail startup closed: {result:?}");
+        };
         assert!(
-            try_quarantine_corrupt_wal(&db_path),
-            "helper should quarantine at least one sidecar"
+            failure
+                .problem
+                .contains("durable recovery-breaker state could not be trusted"),
+            "startup should surface the durable admission refusal: {}",
+            failure.problem
         );
-        assert!(
-            !wal_path.exists(),
-            "live WAL sidecar should move out of the way"
+        assert_eq!(
+            std::fs::read(&db_path).expect("read db after refused recovery"),
+            db_bytes.to_vec(),
+            "refused startup recovery must preserve the primary bytes"
         );
-        assert!(
-            !shm_path.exists(),
-            "live SHM sidecar should move out of the way"
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read wal after refused recovery"),
+            wal_bytes,
+            "refused startup recovery must preserve the WAL bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read shm after refused recovery"),
+            shm_bytes.to_vec(),
+            "refused startup recovery must preserve the SHM bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after refused recovery"),
+            breaker_bytes,
+            "startup must not rewrite malformed breaker authority"
         );
 
-        let wal_quarantines = std::fs::read_dir(dir.path())
+        let renamed_family_members = std::fs::read_dir(dir.path())
             .expect("read temp dir")
             .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("storage.sqlite3-wal.startup-quarantine-"))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name.starts_with("storage.sqlite3.corrupt-")
+                    || name.starts_with("storage.sqlite3-wal.")
+                    || name.starts_with("storage.sqlite3-shm.")
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            wal_quarantines.len(),
-            1,
-            "startup recovery should preserve the suspicious WAL sidecar as evidence"
-        );
-        assert_eq!(
-            std::fs::read(&wal_quarantines[0]).expect("read quarantined wal"),
-            wal_bytes
-        );
-
-        let shm_quarantines = std::fs::read_dir(dir.path())
-            .expect("read temp dir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("storage.sqlite3-shm.startup-quarantine-"))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            shm_quarantines.len(),
-            1,
-            "startup recovery should preserve the suspicious SHM sidecar as evidence"
-        );
-        assert_eq!(
-            std::fs::read(&shm_quarantines[0]).expect("read quarantined shm"),
-            b"stale-shm"
+        assert!(
+            renamed_family_members.is_empty(),
+            "refused startup recovery must not create renamed family members: {renamed_family_members:?}"
         );
     }
 

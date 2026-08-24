@@ -944,35 +944,43 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
 }
 
 fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
+    cleanup_shutdown_sqlite_sidecars_with_resolver(
+        config,
+        resolve_server_database_url_sqlite_path,
+    );
+}
+
+fn cleanup_shutdown_sqlite_sidecars_with_resolver<F>(
+    config: &mcp_agent_mail_core::Config,
+    resolve_database_url: F,
+) where
+    F: FnOnce(&str) -> Option<std::path::PathBuf>,
+{
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         return;
     }
 
-    let db_path = match (DbPoolConfig {
-        database_url: config.database_url.clone(),
-        ..Default::default()
-    })
-    .sqlite_path()
-    {
-        Ok(path) if path != ":memory:" => PathBuf::from(path),
-        Ok(_) => return,
-        Err(error) => {
+    let Some(db_path) = resolve_database_url(&config.database_url) else {
+        if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
             tracing::warn!(
-                error = %error,
                 "skipping shutdown WAL cleanup because database URL could not be resolved"
             );
-            return;
         }
+        return;
     };
 
-    if let Err(error) = mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path) {
+    // Do not checkpoint here before durable recovery admission: checkpointing
+    // mutates the SQLite family and would destroy the exact WAL/SHM evidence
+    // that a tripped or malformed breaker is meant to preserve. The central DB
+    // helper classifies the family, wins durable admission before any needed
+    // quarantine, then reclassifies under the gate to close the race window.
+    if let Err(error) = mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path) {
         tracing::warn!(
             path = %db_path.display(),
             error = %error,
-            "shutdown SQLite WAL checkpoint failed; continuing with frame-free sidecar cleanup"
+            "shutdown SQLite sidecar cleanup was refused; preserving the exact database family"
         );
     }
-    mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
 }
 
 static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -17395,6 +17403,255 @@ mod tests {
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn shutdown_cleanup_preserves_sqlite_family_when_recovery_breaker_is_tripped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shutdown-breaker.sqlite3");
+        let wal_path = db_path.with_file_name("shutdown-breaker.sqlite3-wal");
+        let shm_path = db_path.with_file_name("shutdown-breaker.sqlite3-shm");
+        let db_bytes = b"database-family-primary";
+        let wal_bytes = vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize];
+        let shm_bytes = b"database-family-shm";
+        std::fs::write(&db_path, db_bytes).expect("write primary");
+        std::fs::write(&wal_path, &wal_bytes).expect("write truncated WAL");
+        std::fs::write(&shm_path, shm_bytes).expect("write SHM");
+
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures:
+                mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            // A future timestamp is valid control state and evaluates as zero
+            // elapsed, making this refusal independent of test duration.
+            last_failure_unix: i64::MAX,
+            last_failure_reason: "synthetic repeated recovery failure".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before cleanup");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("read primary after cleanup refusal"),
+            db_bytes.to_vec(),
+            "tripped breaker must preserve primary bytes"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read WAL after cleanup refusal"),
+            wal_bytes,
+            "tripped breaker must preserve the exact WAL bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read SHM after cleanup refusal"),
+            shm_bytes.to_vec(),
+            "tripped breaker must preserve the exact SHM bytes and name"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after cleanup refusal"),
+            breaker_bytes,
+            "shutdown cleanup must not rewrite tripped breaker authority"
+        );
+
+        let renamed_family_members = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name.starts_with("shutdown-breaker.sqlite3.corrupt-")
+                    || name.starts_with("shutdown-breaker.sqlite3-wal.")
+                    || name.starts_with("shutdown-breaker.sqlite3-shm.")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            renamed_family_members.is_empty(),
+            "tripped breaker must not create renamed family members: {renamed_family_members:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_cleanup_does_not_checkpoint_framed_wal_before_recovery_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shutdown-framed-wal.sqlite3");
+        let sqlite_path = db_path.to_string_lossy();
+        let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.as_ref())
+            .expect("open sqlite database");
+        conn.execute_raw(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE checkpoint_probe(value TEXT); \
+             INSERT INTO checkpoint_probe(value) VALUES ('committed-in-wal');",
+        )
+        .expect("seed committed WAL frames");
+
+        let wal_path = db_path.with_file_name("shutdown-framed-wal.sqlite3-wal");
+        let shm_path = db_path.with_file_name("shutdown-framed-wal.sqlite3-shm");
+        let db_before = std::fs::read(&db_path).expect("read primary before shutdown cleanup");
+        let wal_before = std::fs::read(&wal_path).expect("read framed WAL before shutdown cleanup");
+        let shm_before = std::fs::read(&shm_path).expect("read SHM before shutdown cleanup");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "test setup must retain at least one committed WAL frame"
+        );
+
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures:
+                mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            last_failure_unix: i64::MAX,
+            last_failure_reason: "synthetic repeated recovery failure".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_before = std::fs::read(&breaker_path).expect("read breaker before cleanup");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        cleanup_shutdown_sqlite_sidecars(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("read primary after shutdown cleanup"),
+            db_before,
+            "shutdown cleanup must not checkpoint framed WAL bytes into the primary before admission"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read framed WAL after shutdown cleanup"),
+            wal_before,
+            "shutdown cleanup must not truncate or rewrite framed WAL before admission"
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read SHM after shutdown cleanup"),
+            shm_before,
+            "shutdown cleanup must preserve the exact SHM bytes"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after shutdown cleanup"),
+            breaker_before,
+            "shutdown cleanup must not rewrite tripped breaker authority"
+        );
+
+        drop(conn);
+    }
+
+    #[test]
+    fn shutdown_cleanup_targets_resolved_authority_not_raw_relative_shadow() {
+        let current_dir = std::env::current_dir().expect("current working directory");
+        let relative_root = tempfile::tempdir_in(&current_dir).expect("relative-family tempdir");
+        let relative_db_absolute = relative_root.path().join("mailbox.sqlite3");
+        let relative_db = relative_db_absolute
+            .strip_prefix(&current_dir)
+            .expect("tempdir must be beneath current directory")
+            .to_path_buf();
+        assert!(
+            relative_db.is_relative(),
+            "fixture must expose a genuinely relative database URL"
+        );
+
+        let authoritative_root = tempfile::tempdir().expect("authoritative-family tempdir");
+        let authoritative_db = authoritative_root.path().join("mailbox.sqlite3");
+        let authoritative_wal = authoritative_db.with_file_name("mailbox.sqlite3-wal");
+        let authoritative_shm = authoritative_db.with_file_name("mailbox.sqlite3-shm");
+        let authoritative_primary_bytes = b"authoritative primary bytes";
+        let authoritative_wal_bytes = b"truncated-authority-wal";
+        let authoritative_shm_bytes = b"authoritative-shm-bytes";
+        std::fs::write(&authoritative_db, authoritative_primary_bytes)
+            .expect("write authoritative primary");
+        std::fs::write(&authoritative_wal, authoritative_wal_bytes)
+            .expect("write authoritative truncated WAL");
+        std::fs::write(&authoritative_shm, authoritative_shm_bytes)
+            .expect("write authoritative SHM");
+        assert!(
+            authoritative_wal_bytes.len()
+                < mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "authoritative WAL fixture must require cleanup"
+        );
+
+        let relative_wal = relative_db_absolute.with_file_name("mailbox.sqlite3-wal");
+        let relative_shm = relative_db_absolute.with_file_name("mailbox.sqlite3-shm");
+        let relative_primary_bytes = b"relative shadow primary bytes";
+        let relative_wal_bytes = b"relative-shadow-wal";
+        let relative_shm_bytes = b"relative-shadow-shm";
+        std::fs::write(&relative_db_absolute, relative_primary_bytes)
+            .expect("write relative shadow primary");
+        std::fs::write(&relative_wal, relative_wal_bytes).expect("write relative shadow WAL");
+        std::fs::write(&relative_shm, relative_shm_bytes).expect("write relative shadow SHM");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite://{}", relative_db.display());
+        cleanup_shutdown_sqlite_sidecars_with_resolver(&config, |database_url| {
+            assert_eq!(database_url, config.database_url.as_str());
+            Some(authoritative_db.clone())
+        });
+
+        assert_eq!(
+            std::fs::read(&authoritative_db).expect("read authoritative primary after cleanup"),
+            authoritative_primary_bytes,
+            "sidecar cleanup must preserve exact authoritative primary bytes"
+        );
+        assert!(
+            !authoritative_wal.exists() && !authoritative_shm.exists(),
+            "the resolved authoritative sidecars must leave the live family"
+        );
+
+        let mut quarantined_wal = Vec::new();
+        let mut quarantined_shm = Vec::new();
+        for entry in std::fs::read_dir(authoritative_root.path())
+            .expect("list authoritative family after cleanup")
+        {
+            let entry = entry.expect("read authoritative family entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("mailbox.sqlite3-wal.cleanup-quarantine-") {
+                quarantined_wal.push(entry.path());
+            } else if name.starts_with("mailbox.sqlite3-shm.cleanup-quarantine-") {
+                quarantined_shm.push(entry.path());
+            }
+        }
+        assert_eq!(quarantined_wal.len(), 1, "one WAL quarantine expected");
+        assert_eq!(quarantined_shm.len(), 1, "one SHM quarantine expected");
+        assert_eq!(
+            std::fs::read(&quarantined_wal[0]).expect("read quarantined authoritative WAL"),
+            authoritative_wal_bytes,
+            "WAL quarantine must retain the exact authoritative bytes"
+        );
+        assert_eq!(
+            std::fs::read(&quarantined_shm[0]).expect("read quarantined authoritative SHM"),
+            authoritative_shm_bytes,
+            "SHM quarantine must retain the exact authoritative bytes"
+        );
+
+        assert_eq!(
+            std::fs::read(&relative_db_absolute).expect("read relative shadow primary"),
+            relative_primary_bytes,
+            "cleanup must not rewrite the raw relative primary"
+        );
+        assert_eq!(
+            std::fs::read(&relative_wal).expect("read relative shadow WAL"),
+            relative_wal_bytes,
+            "cleanup must not move or rewrite the raw relative WAL"
+        );
+        assert_eq!(
+            std::fs::read(&relative_shm).expect("read relative shadow SHM"),
+            relative_shm_bytes,
+            "cleanup must not move or rewrite the raw relative SHM"
+        );
+        let relative_quarantines = std::fs::read_dir(relative_root.path())
+            .expect("list relative shadow family")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".cleanup-quarantine-"))
+            .collect::<Vec<_>>();
+        assert!(
+            relative_quarantines.is_empty(),
+            "raw relative family must not gain cleanup artifacts: {relative_quarantines:?}"
+        );
+    }
 
     struct NoopTool;
 

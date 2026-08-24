@@ -5048,17 +5048,19 @@ fn auto_clear_db_blockers_with_takeover(config: &Config, takeover: bool) -> CliR
     };
 
     if !db_path.exists() {
-        // Even if the main DB doesn't exist, clean up stale lock/WAL artifacts.
-        cleanup_stale_db_artifacts(&db_path)?;
+        // Even if the main DB doesn't exist, stale activity locks can be
+        // detached without touching the SQLite family. WAL/SHM recovery is
+        // deliberately deferred to the durable-admission self-heal below.
+        cleanup_stale_db_activity_locks(&db_path)?;
         return Ok(());
     }
 
     let am_pids = agent_mail_pids_holding_file(&db_path);
     if am_pids.is_empty() {
-        // No Agent Mail processes holding the DB, but still clean up stale
-        // lock files and corrupt WAL sidecars that previous crashes may have
-        // left behind.
-        cleanup_stale_db_artifacts(&db_path)?;
+        // No Agent Mail process holds the DB. Clean only stale activity locks
+        // here; the immediately-following self-heal owns all automatic
+        // SQLite-family mutation behind durable recovery admission.
+        cleanup_stale_db_activity_locks(&db_path)?;
         return Ok(());
     }
 
@@ -5166,9 +5168,10 @@ fn auto_clear_db_blockers_with_takeover(config: &Config, takeover: bool) -> CliR
     let am_still = agent_mail_pids_holding_file(&db_path);
 
     if !am_still.is_empty() {
-        // Attempt cleanup anyway — the integrity probe may still succeed
-        // after lock files are cleaned.
-        cleanup_stale_db_artifacts(&db_path)?;
+        // Attempt lock cleanup anyway. Never checkpoint or quarantine the
+        // SQLite family while a holder is still present, and never do so
+        // before the durable recovery admission check.
+        cleanup_stale_db_activity_locks(&db_path)?;
         return Err(CliError::Other(format!(
             "Failed to stop Agent Mail process(es) holding {}: PIDs {:?}",
             db_path.display(),
@@ -5184,16 +5187,18 @@ fn auto_clear_db_blockers_with_takeover(config: &Config, takeover: bool) -> CliR
         );
     }
 
-    // Always clean up stale artifacts after killing old processes.
-    cleanup_stale_db_artifacts(&db_path)?;
+    // Always clean stale activity locks after killing old processes. SQLite
+    // WAL/SHM cleanup is recovery work and is deferred to admitted self-heal.
+    cleanup_stale_db_activity_locks(&db_path)?;
     Ok(())
 }
 
-/// Quarantine stale lock files and corrupt WAL/SHM sidecars that prevent startup.
+/// Quarantine stale activity-lock artifacts without inspecting or mutating the
+/// SQLite database family.
 ///
-/// This is called after killing old Agent Mail processes (or when none are
-/// running) to ensure the integrity probe and pool open succeed cleanly.
-fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
+/// This is the only database-blocker cleanup this startup phase may run before
+/// durable recovery admission.
+fn cleanup_stale_db_activity_locks(db_path: &Path) -> CliResult<()> {
     // Quarantine stale .activity.lock files.  The flock-based lock logic will
     // re-create a fresh lock file when it acquires the lock.
     let mut lock_os = db_path.as_os_str().to_os_string();
@@ -5222,6 +5227,17 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+/// Quarantine stale lock files and corrupt WAL/SHM sidecars that prevent startup.
+///
+/// Production callers must already hold durable recovery admission (or be an
+/// explicit operator repair path) before invoking this broader helper.
+/// Automatic startup preflight uses [`cleanup_stale_db_activity_locks`] instead.
+fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
+    cleanup_stale_db_activity_locks(db_path)?;
 
     // Detach truncated/corrupt WAL and orphaned SHM sidecars from the live DB.
     //
@@ -7152,9 +7168,11 @@ fn handle_serve_http(
         break;
     }
     // Clear remaining stale Agent Mail processes holding the database file and
-    // clean up stale lock/WAL artifacts, then run doctor-grade startup self-heal
-    // before boot. Under the default (no --takeover), a LIVE peer serving this
-    // storage root is NOT killed — startup refuses instead (issue #145).
+    // clean up only stale activity locks, then run doctor-grade startup
+    // self-heal. All automatic WAL/SHM mutation belongs to that self-heal's
+    // durable recovery-admission envelope. Under the default (no --takeover), a
+    // LIVE peer serving this storage root is NOT killed — startup refuses
+    // instead (issue #145).
     prepare_runtime_server_startup_with_takeover(&config, takeover)?;
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
@@ -7236,6 +7254,33 @@ fn startup_database_self_heal_action_read_only(
             }
         },
     )
+}
+
+fn require_healthy_existing_database_for_startup_fail_open(db_path: &Path) -> CliResult<()> {
+    if !path_is_real_file(db_path) {
+        return Err(CliError::Other(format!(
+            "startup recovery cannot fail open because {} is not an existing regular file",
+            db_path.display()
+        )));
+    }
+
+    let directly_usable =
+        mcp_agent_mail_db::pool::sqlite_file_is_healthy_without_family_cleanup(db_path).map_err(
+            |error| {
+                CliError::Other(format!(
+                    "source-byte-neutral SQLite fail-open check failed for {}: {error}",
+                    db_path.display()
+                ))
+            },
+        )?;
+    if directly_usable {
+        Ok(())
+    } else {
+        Err(CliError::Other(format!(
+            "startup recovery cannot fail open because the existing SQLite family at {} is not healthy without recovery cleanup",
+            db_path.display()
+        )))
+    }
 }
 
 fn run_startup_database_self_heal_with<F, G>(
@@ -7322,14 +7367,23 @@ where
     match attempt {
         Ok(()) => Ok(()),
         Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error))
-            if is_reconstruct_promotion_refusal(&error) && recovery_db_path.is_file() =>
+            if is_reconstruct_promotion_refusal(&error) =>
         {
+            require_healthy_existing_database_for_startup_fail_open(&recovery_db_path).map_err(
+                |health_error| {
+                    CliError::Other(format!(
+                        "{error}; promotion refusal preserved the live path, but startup cannot continue without a healthy live database: {health_error}"
+                    ))
+                },
+            )?;
             // br-r6awv: a refused promotion means the live DB still holds
-            // coordination keys the archive candidate would drop. Record the
-            // failed attempt in the breaker, then keep the live file and boot.
+            // coordination keys the archive candidate would drop. The failed
+            // attempt is already recorded in the breaker. Boot only after a
+            // source-byte-neutral whole-family probe proves the preserved live
+            // database remains healthy; a regular pathname alone is not proof.
             output::warn(&format!(
                 "Automatic mailbox reconstruction refused promotion \
-                 (live database kept): {error}"
+                 (healthy live database kept): {error}"
             ));
             Ok(())
         }
@@ -7337,11 +7391,18 @@ where
         Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission {
             kind: mcp_agent_mail_db::pool::AutomaticRecoveryAdmissionFailureKind::CircuitOpen,
             error,
-        }) if recovery_db_path.is_file() => {
+        }) => {
+            require_healthy_existing_database_for_startup_fail_open(&recovery_db_path).map_err(
+                |health_error| {
+                    CliError::Other(format!(
+                        "automatic mailbox recovery remains parked by its durable circuit breaker ({error}); startup cannot continue without a healthy live database: {health_error}"
+                    ))
+                },
+            )?;
             output::warn(&format!(
                 "Automatic mailbox recovery remains parked by its durable circuit breaker; \
-                 the existing live database was kept and startup will continue without another \
-                 repair, reconstruction, or forensic capture: {error}"
+                 the existing live database passed source-byte-neutral health checks and startup \
+                 will continue without another repair, reconstruction, or forensic capture: {error}"
             ));
             Ok(())
         }
@@ -7352,9 +7413,23 @@ where
 }
 
 fn cleanup_database_sidecars_after_startup_use(database_url: &str) -> CliResult<()> {
-    if let Some(db_path) = sqlite_file_path_from_database_url(database_url) {
-        cleanup_stale_db_artifacts(&db_path)?;
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url)
+        || sqlite_file_path_from_database_url(database_url).is_none()
+    {
+        return Ok(());
     }
+    // Use the same relative/absolute authority resolution as startup's
+    // mailbox lock and recovery admission. Cleaning the raw URL spelling can
+    // otherwise mutate a shadow family while the runtime used `/...`.
+    let db_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+    cleanup_stale_db_activity_locks(&db_path)?;
+    let _outcome =
+        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path).map_err(|error| {
+            CliError::Other(format!(
+                "SQLite sidecar cleanup for {} failed or was refused: {error}",
+                db_path.display()
+            ))
+        })?;
     Ok(())
 }
 
@@ -12087,6 +12162,7 @@ fn sqlite_recovery_candidate_is_healthy_canonical(path: &Path) -> CliResult<bool
     }
 }
 
+#[cfg(test)]
 fn handle_sqlite_compatibility_probe_result(
     path: &Path,
     result: CliResult<bool>,
@@ -12106,6 +12182,7 @@ fn handle_sqlite_compatibility_probe_result(
     }
 }
 
+#[cfg(test)]
 fn sqlite_file_is_healthy_with_compat_probe<F>(
     path: &Path,
     mut compatibility_probe: F,
@@ -12148,19 +12225,19 @@ where
 }
 
 fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
-    sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
-}
-
-fn sqlite_file_is_healthy_read_only(path: &Path) -> CliResult<bool> {
     if !path.exists() {
         return Ok(true);
     }
+    mcp_agent_mail_db::pool::sqlite_file_is_healthy(path).map_err(|error| {
+        CliError::Other(format!(
+            "source-byte-neutral SQLite health check failed for {}: {error}",
+            path.display()
+        ))
+    })
+}
 
-    let conn = doctor_open_canonical_readonly_db_for_diagnostic(path, "health_check")?;
-    if !sqlite_conn_quick_check_ok_canonical(&conn)? {
-        return Ok(false);
-    }
-    sqlite_conn_incremental_check_ok_canonical(&conn)
+fn sqlite_file_is_healthy_read_only(path: &Path) -> CliResult<bool> {
+    sqlite_file_is_healthy(path)
 }
 
 fn sqlite_doctor_sanity_with_health_probe<F>(
@@ -28863,6 +28940,18 @@ fn doctor_database_fix_strategy_read_only(
     ))
 }
 
+fn doctor_database_fix_strategy_for_fix(
+    dry_run: bool,
+    database_url: &str,
+    storage_root: &Path,
+) -> CliResult<DoctorDatabaseFixStrategy> {
+    if dry_run {
+        doctor_database_fix_strategy_read_only(database_url, storage_root)
+    } else {
+        doctor_database_fix_strategy(database_url, storage_root)
+    }
+}
+
 fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
     let mut wal_os = sqlite_path.as_os_str().to_os_string();
     wal_os.push("-wal");
@@ -29594,7 +29683,13 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     // callers report repairable non-empty sidecars instead of quarantining
     // them.
     if cleanup_truncated_wal {
-        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved);
+        let _outcome =
+            mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved).map_err(|error| {
+                CliError::Other(format!(
+                    "SQLite WAL cleanup for {} failed or was refused: {error}",
+                    resolved.display()
+                ))
+            })?;
     } else if let Some(detail) = doctor_truncated_wal_sidecar_detail(resolved) {
         return Ok(DoctorDatabaseFixStrategy::Repair(format!(
             "{detail}; run `am doctor repair` to quarantine it before opening the database"
@@ -33407,7 +33502,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 
     // Fix 6: Database reconstruction/repair for missing, corrupt, or logically inconsistent DBs.
     {
-        match doctor_database_fix_strategy(database_url, storage_root) {
+        match doctor_database_fix_strategy_for_fix(dry_run, database_url, storage_root) {
             Ok(DoctorDatabaseFixStrategy::None(detail)) => {
                 results.push(serde_json::json!({
                     "check": "database_repair",
@@ -52009,6 +52104,48 @@ startup_timeout_sec = 42
         );
     }
 
+    #[test]
+    fn doctor_fix_dry_run_selects_read_only_strategy_before_wal_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("doctor-fix-dry-run.sqlite3");
+        seed_project_only_db(&db_path, "doctor-fix-dry-run", "/doctor-fix-dry-run");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        let wal_bytes = b"truncated-wal";
+        let shm_bytes = b"coordination-shm";
+        std::fs::write(&wal_path, wal_bytes).expect("plant truncated WAL");
+        std::fs::write(&shm_path, shm_bytes).expect("plant SHM evidence");
+        let entries_before = std::fs::read_dir(dir.path())
+            .expect("list fixture directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let strategy = doctor_database_fix_strategy_for_fix(true, &db_url, dir.path())
+            .expect("doctor fix dry-run strategy");
+
+        assert!(
+            matches!(strategy, DoctorDatabaseFixStrategy::Repair(_)),
+            "truncated WAL should be reported as a repair plan without applying it: {strategy:?}"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read untouched WAL"),
+            wal_bytes
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read untouched SHM"),
+            shm_bytes
+        );
+        let entries_after = std::fs::read_dir(dir.path())
+            .expect("re-list fixture directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            entries_after, entries_before,
+            "doctor --dry-run --fix must not rename SQLite sidecars or create recovery artifacts"
+        );
+    }
+
     // --- br-bvq1x.1.6: canonical integrity_check confirmation gate ---
 
     #[test]
@@ -52716,7 +52853,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn startup_database_self_heal_keeps_live_db_when_reconstruct_promotion_refuses() {
+    fn startup_database_self_heal_refuses_to_boot_corrupt_db_after_promotion_refusal() {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_archive_mailbox_project(dir.path());
         let db_path = dir.path().join("live.sqlite3");
@@ -52739,7 +52876,7 @@ startup_timeout_sec = 42
                 ("AM_RECOVERY_BREAKER_COOLDOWN_SECS", "86400"),
             ],
             || {
-                run_startup_database_self_heal_with(
+                let first_error = run_startup_database_self_heal_with(
                     &db_url,
                     dir.path(),
                     || panic!("promotion-refusal fixture should not repair"),
@@ -52748,10 +52885,16 @@ startup_timeout_sec = 42
                         refusal()
                     },
                 )
-                .expect("promotion refusal must keep the live DB and continue startup");
+                .expect_err("promotion refusal must not boot an unhealthy live DB");
+                assert!(
+                    first_error
+                        .to_string()
+                        .contains("startup cannot continue without a healthy live database"),
+                    "unhealthy promotion refusal must explain why fail-open was denied: {first_error}"
+                );
                 assert!(
                     db_path.is_file(),
-                    "fail-open must not remove the live database it claimed to keep"
+                    "health-gated refusal must preserve the live database for forensics"
                 );
 
                 let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
@@ -52766,7 +52909,7 @@ startup_timeout_sec = 42
                     .map(|entry| entry.expect("directory entry").file_name())
                     .collect::<std::collections::BTreeSet<_>>();
 
-                run_startup_database_self_heal_with(
+                let second_error = run_startup_database_self_heal_with(
                     &db_url,
                     dir.path(),
                     || panic!("open breaker must skip repair"),
@@ -52775,7 +52918,13 @@ startup_timeout_sec = 42
                         refusal()
                     },
                 )
-                .expect("an open breaker with a live DB must park recovery and boot");
+                .expect_err("an open breaker must not boot an unhealthy live DB");
+                assert!(
+                    second_error
+                        .to_string()
+                        .contains("startup cannot continue without a healthy live database"),
+                    "unhealthy circuit-open refusal must explain why fail-open was denied: {second_error}"
+                );
 
                 let entries_after = std::fs::read_dir(dir.path())
                     .expect("re-list recovery directory")
@@ -52798,7 +52947,91 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn startup_open_breaker_never_quarantines_truncated_wal_or_shm() {
+    fn startup_database_self_heal_boots_healthy_db_after_promotion_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message_dir = seed_archive_mailbox_project(dir.path());
+        write_archive_mailbox_message(
+            &message_dir,
+            "2026-03-22T12-00-00Z__archive-ahead__1.md",
+            1,
+            "Alice",
+            "Archive ahead",
+            "normal",
+            "2026-03-22T12:00:00Z",
+            "archive message absent from the healthy live DB",
+        );
+        let db_path = dir.path().join("live.sqlite3");
+        seed_project_only_db(&db_path, "ahead-project", "/ahead-project");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_bytes = std::fs::read(&db_path).expect("snapshot healthy live DB");
+        let reconstruct_calls = std::cell::Cell::new(0_u32);
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_RECOVERY_BREAKER_MAX_CONSECUTIVE_FAILURES", "1"),
+                ("AM_RECOVERY_BREAKER_COOLDOWN_SECS", "86400"),
+            ],
+            || {
+                let refuse_promotion = |_: &Path| {
+                    reconstruct_calls.set(reconstruct_calls.get() + 1);
+                    Err(CliError::Other(
+                        "reconstruction succeeded but final database promotion failed: \
+                         recovery candidate would lose stable coordination keys"
+                            .to_string(),
+                    ))
+                };
+
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    dir.path(),
+                    || panic!("archive-ahead fixture should not repair"),
+                    refuse_promotion,
+                )
+                .expect("promotion refusal may boot a source-neutrally proven healthy live DB");
+
+                let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
+                    .expect("load durable breaker")
+                    .expect("failed promotion must persist breaker authority");
+                assert!(breaker.tripped);
+                assert_eq!(breaker.consecutive_failures, 1);
+                let breaker_path =
+                    mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+                let breaker_bytes =
+                    std::fs::read(&breaker_path).expect("snapshot breaker authority");
+
+                run_startup_database_self_heal_with(
+                    &db_url,
+                    dir.path(),
+                    || panic!("open breaker must skip repair"),
+                    |_| {
+                        reconstruct_calls.set(reconstruct_calls.get() + 1);
+                        panic!("open breaker must skip reconstruction")
+                    },
+                )
+                .expect("open breaker may park recovery when the live family is healthy");
+
+                assert_eq!(
+                    std::fs::read(&breaker_path).expect("re-read breaker authority"),
+                    breaker_bytes,
+                    "health-gated fail-open must not rewrite breaker authority"
+                );
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("re-read healthy live DB"),
+            db_bytes,
+            "source-byte-neutral fail-open probing must preserve live DB bytes"
+        );
+        assert_eq!(
+            reconstruct_calls.get(),
+            1,
+            "the open breaker must prevent a duplicate reconstruction attempt"
+        );
+    }
+
+    #[test]
+    fn startup_open_breaker_refuses_truncated_wal_without_mutating_family() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("live.sqlite3");
         seed_project_only_db(&db_path, "live-project", "/live-project");
@@ -52835,7 +53068,7 @@ startup_timeout_sec = 42
         let repair_calls = std::cell::Cell::new(0_u32);
         let reconstruct_calls = std::cell::Cell::new(0_u32);
 
-        run_startup_database_self_heal_with(
+        let error = run_startup_database_self_heal_with(
             &db_url,
             dir.path(),
             || {
@@ -52847,10 +53080,16 @@ startup_timeout_sec = 42
                 Ok(())
             },
         )
-        .expect("tripped startup keeps the live DB and boots");
+        .expect_err("a breaker-blocked cleanup must not be mistaken for a bootable live family");
 
         assert_eq!(repair_calls.get(), 0);
         assert_eq!(reconstruct_calls.get(), 0);
+        assert!(
+            error
+                .to_string()
+                .contains("is not healthy without recovery cleanup"),
+            "unexpected fail-closed error: {error}"
+        );
         assert_eq!(std::fs::read(&wal).expect("read untouched WAL"), wal_bytes);
         assert_eq!(std::fs::read(&shm).expect("read untouched SHM"), shm_bytes);
         let entries_after = std::fs::read_dir(dir.path())
@@ -52861,6 +53100,97 @@ startup_timeout_sec = 42
             entries_after, entries_before,
             "breaker refusal must occur before cleanup quarantine or forensic capture"
         );
+    }
+
+    #[test]
+    fn post_server_cleanup_preserves_sqlite_family_when_breaker_refuses() {
+        for breaker_kind in ["tripped", "malformed"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("post-server-{breaker_kind}.sqlite3"));
+            seed_project_only_db(&db_path, breaker_kind, &format!("/{breaker_kind}"));
+            let db_url = format!("sqlite:///{}", db_path.display());
+            let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+            let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+            let db_bytes = std::fs::read(&db_path).expect("snapshot primary DB");
+            let wal_bytes = b"truncated-wal";
+            let shm_bytes = b"coordination-shm";
+            std::fs::write(&wal_path, wal_bytes).expect("plant truncated WAL");
+            std::fs::write(&shm_path, shm_bytes).expect("plant SHM evidence");
+
+            let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "tripped" {
+                let now_unix = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock after epoch")
+                        .as_secs(),
+                )
+                .expect("test time fits i64");
+                mcp_agent_mail_db::recovery_breaker::store(
+                    &db_path,
+                    &mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                        schema: 1,
+                        db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(
+                            &db_path,
+                        ),
+                        consecutive_failures: 1,
+                        last_failure_unix: now_unix,
+                        last_failure_reason: "parked recovery".to_string(),
+                        tripped: true,
+                    },
+                )
+                .expect("plant tripped breaker authority");
+            } else {
+                std::fs::write(&breaker_path, b"{malformed-breaker")
+                    .expect("plant malformed breaker authority");
+            }
+            let breaker_bytes =
+                std::fs::read(&breaker_path).expect("snapshot breaker authority bytes");
+
+            let error = cleanup_database_sidecars_after_startup_use(&db_url)
+                .expect_err("durable breaker must refuse post-server SQLite cleanup");
+            let error_text = error.to_string();
+            assert!(
+                error_text.contains("circuit-broken")
+                    || error_text.contains("could not be trusted"),
+                "unexpected {breaker_kind} breaker refusal: {error_text}"
+            );
+            assert_eq!(
+                std::fs::read(&db_path).expect("re-read primary DB"),
+                db_bytes,
+                "{breaker_kind} breaker refusal must preserve primary bytes"
+            );
+            assert_eq!(
+                std::fs::read(&wal_path).expect("read untouched WAL"),
+                wal_bytes,
+                "{breaker_kind} breaker refusal must preserve WAL bytes"
+            );
+            assert_eq!(
+                std::fs::read(&shm_path).expect("read untouched SHM"),
+                shm_bytes,
+                "{breaker_kind} breaker refusal must preserve SHM bytes"
+            );
+            assert_eq!(
+                std::fs::read(&breaker_path).expect("re-read breaker authority"),
+                breaker_bytes,
+                "{breaker_kind} refusal must not rewrite breaker authority"
+            );
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .expect("list fixture artifacts")
+                    .flatten()
+                    .all(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        !name.contains(".cleanup-quarantine-")
+                            && !name.contains(".startup-quarantine-")
+                            && !name.contains(".corrupt-")
+                            && !name.contains(".reconstruct-failed-")
+                    }),
+                "{breaker_kind} refusal must not create cleanup or recovery artifacts"
+            );
+        }
     }
 
     #[test]
@@ -56035,7 +56365,8 @@ startup_timeout_sec = 42
         handle_migrate_with_database_url(&db_url).expect("migrate scoped-label fixture");
         mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
             .expect("checkpoint scoped-label fixture");
-        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
+        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path)
+            .expect("cleanup scoped-label fixture sidecars");
 
         let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
         let result =
@@ -56116,7 +56447,8 @@ startup_timeout_sec = 42
         handle_migrate_with_database_url(&db_url).expect("migrate malformed-page fixture");
         mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
             .expect("checkpoint malformed-page fixture");
-        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
+        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path)
+            .expect("cleanup malformed-page fixture sidecars");
 
         let mut bytes = std::fs::read(&db_path).expect("read malformed-page fixture");
         let page_size = 4096;
@@ -59557,7 +59889,8 @@ startup_timeout_sec = 42
                 handle_migrate_with_database_url(&db_url).expect("migrate");
                 mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
                     .expect("checkpoint fresh DB fixture before doctor check");
-                mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
+                mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path)
+                    .expect("cleanup fresh DB fixture sidecars");
 
                 // Doctor check should succeed on a fresh DB
                 let capture = ftui_runtime::StdioCapture::install().unwrap();
@@ -65739,6 +66072,72 @@ startup_timeout_sec = 42
         assert_eq!(
             resolved, absolute_db,
             "auto-clear should target the resolved absolute candidate"
+        );
+    }
+
+    #[test]
+    fn auto_clear_missing_primary_preserves_sidecars_before_self_heal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("auto-clear-admission.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        let wal_bytes = b"truncated-wal";
+        let shm_bytes = b"coordination-shm";
+        std::fs::write(&wal_path, wal_bytes).expect("plant truncated WAL");
+        std::fs::write(&shm_path, shm_bytes).expect("plant SHM evidence");
+
+        let now_unix = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+        )
+        .expect("test time fits i64");
+        mcp_agent_mail_db::recovery_breaker::store(
+            &db_path,
+            &mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                schema: 1,
+                db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+                consecutive_failures: 1,
+                last_failure_unix: now_unix,
+                last_failure_reason: "parked recovery".to_string(),
+                tripped: true,
+            },
+        )
+        .expect("plant tripped breaker authority");
+        let entries_before = std::fs::read_dir(dir.path())
+            .expect("list fixture directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let config = Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        auto_clear_db_blockers_with_takeover(&config, false)
+            .expect("missing-primary auto-clear should only inspect activity locks");
+
+        assert!(
+            !db_path.exists(),
+            "auto-clear must not materialize a missing primary database"
+        );
+
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read untouched WAL"),
+            wal_bytes
+        );
+        assert_eq!(
+            std::fs::read(&shm_path).expect("read untouched SHM"),
+            shm_bytes
+        );
+        let entries_after = std::fs::read_dir(dir.path())
+            .expect("re-list fixture directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            entries_after, entries_before,
+            "auto-clear must leave SQLite-family names and recovery evidence untouched before admitted self-heal"
         );
     }
 

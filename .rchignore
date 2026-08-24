@@ -2,6 +2,8 @@
 .beads/
 .codex-target/
 .doctor/
+.cargo-home-release-prep/
+**/.fastembed_cache/
 target/
 .rch-target/
 beads_compliance_audit/
