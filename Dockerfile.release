@@ -1,0 +1,156 @@
+# syntax=docker/dockerfile:1.7
+#
+# Release-artifact Dockerfile for MCP Agent Mail (Rust).
+#
+# Why this exists (GH#256)
+# ------------------------
+# The sibling-clone builder in ./Dockerfile compiles the whole workspace from
+# source inside the image. That is the reproducible-from-git path, but it is
+# also the path that kept the GHCR image pinned at v0.3.13: a source build must
+# reconstruct every out-of-tree `path` dependency, and any drift in that list
+# fails the build for both architectures at once. Building linux/arm64 that way
+# additionally means a full Rust workspace compile under QEMU, which is hours.
+#
+# This file takes the other route: it packages the *exact binaries that ship in
+# the GitHub release* — the ones dsr already cross-builds and signs — into the
+# same runtime image. Two consequences worth stating plainly:
+#
+#   * The image and the release tarballs are bit-identical binaries. A user who
+#     pulls the container and a user who curl|bash-installs run the same code.
+#   * A genuine multi-arch (amd64 + arm64) index takes minutes, not hours, so
+#     the image can actually keep pace with the binary releases.
+#
+# ./Dockerfile remains the from-source path and is still the right tool for
+# building an image from an arbitrary commit.
+#
+# Expected build context
+# ----------------------
+#   dist/amd64/mcp-agent-mail   dist/amd64/am     (x86_64-unknown-linux-gnu)
+#   dist/arm64/mcp-agent-mail   dist/arm64/am     (aarch64-unknown-linux-gnu)
+#
+# Usage
+# -----
+#   docker buildx build -f Dockerfile.release \
+#       --platform linux/amd64,linux/arm64 \
+#       --build-arg AM_VERSION=0.3.31 \
+#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:0.3.31 \
+#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest \
+#       --push .
+#
+# Runtime
+# -------
+# Identical to ./Dockerfile's runtime stage: two binaries sharing a /data
+# volume, headless by default.
+#   * mcp-agent-mail (the server, ENTRYPOINT)
+#   * am             (the operator CLI)
+
+FROM debian:bookworm-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime needs:
+#   * ca-certificates — outbound HTTPS (e.g. share-link uploads)
+#   * curl            — HEALTHCHECK
+#   * git             — `am` shells out for repo introspection
+#   * libsqlite3-0    — frankensqlite ships its own engine but SQLite system
+#                       libs are needed for some integration paths
+#   * tini            — PID 1 reaper so signal handling and zombie reaping
+#                       work correctly when running under Docker/Kubernetes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        libsqlite3-0 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --system --group --home /home/appuser --uid 10001 appuser \
+    && mkdir -p /data/mailbox \
+    && chown -R appuser:appuser /data /home/appuser \
+    # Bind-mounted /data volumes inherit the host's uid/gid, which is rarely
+    # 10001:10001 — without `safe.directory` git refuses to run with "dubious
+    # ownership" the first time `am` touches a project's git repo. Configure
+    # both system-wide and per-user so it works regardless of who runs git.
+    && git config --system --add safe.directory '*' \
+    && install -d -o appuser -g appuser /home/appuser/.config/git \
+    && printf '[safe]\n\tdirectory = *\n' \
+        > /home/appuser/.config/git/config \
+    && chown appuser:appuser /home/appuser/.config/git/config
+
+# TARGETARCH is supplied by buildx per platform: "amd64" or "arm64". It selects
+# which pre-built release binary lands in this architecture's layer, which is
+# what makes a single `--platform linux/amd64,linux/arm64` invocation produce a
+# correct multi-arch index instead of two copies of the host architecture.
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/mcp-agent-mail /usr/local/bin/mcp-agent-mail
+COPY dist/${TARGETARCH}/am             /usr/local/bin/am
+RUN chmod 0755 /usr/local/bin/mcp-agent-mail /usr/local/bin/am
+
+# Surface verification: refuse to ship if the two binaries got swapped, if
+# either is missing its expected CLI surface, or if a cross-built binary cannot
+# actually execute on this architecture. Running them here means a wrong-arch
+# COPY fails the build rather than shipping an image that dies on first start.
+# Same checks as ./Dockerfile and dist.yml.
+RUN /usr/local/bin/mcp-agent-mail --help > /tmp/server.help \
+    && /usr/local/bin/am --help          > /tmp/cli.help \
+    && grep -qE '^Usage: mcp-agent-mail ' /tmp/server.help \
+    && grep -qE '(^|[[:space:]])serve([[:space:]]|$)' /tmp/server.help \
+    && grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' /tmp/cli.help \
+    && rm -f /tmp/server.help /tmp/cli.help
+
+# Pin the packaged release version into the image so `docker inspect` and the
+# GHCR page agree with `am --version` without starting a container.
+ARG AM_VERSION
+RUN test -n "${AM_VERSION}" \
+    && /usr/local/bin/am --version | grep -qF "${AM_VERSION}" \
+    || { echo "am --version does not report ${AM_VERSION}" >&2; exit 1; }
+
+# Environment defaults
+#   HTTP_HOST=0.0.0.0  — bind all interfaces (the in-container default of
+#                        127.0.0.1 is unreachable from outside).
+#   HTTP_PORT=8765     — matches dist.yml + Python image conventions.
+#   HTTP_PATH=/mcp/    — server default; surfaced here for visibility.
+#   STORAGE_ROOT=/data/mailbox — single mounted volume keeps DB + archives
+#                                co-located for backups.
+#   TUI_ENABLED=false  — containers are headless. Override + run with -it
+#                        to use the operator console.
+#   AM_INTERFACE_MODE=mcp — explicit default (matches code default).
+ENV HTTP_HOST=0.0.0.0 \
+    HTTP_PORT=8765 \
+    HTTP_PATH=/mcp/ \
+    STORAGE_ROOT=/data/mailbox \
+    TUI_ENABLED=false \
+    AM_INTERFACE_MODE=mcp \
+    RUST_LOG=info
+
+EXPOSE 8765
+VOLUME ["/data"]
+
+USER appuser
+WORKDIR /home/appuser
+
+# Liveness probe hits the unauthenticated health endpoint. The 20s start
+# period + 5 retries (matching the Python sibling image's HEALTHCHECK) keeps
+# Docker from flapping the container during the initial DB migration on first
+# boot, especially on slow ARM hosts or under QEMU emulation where the Rust
+# binary's startup can take noticeably longer than on amd64.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+    CMD curl -fsS "http://127.0.0.1:${HTTP_PORT}/health/liveness" || exit 1
+
+# tini handles signal forwarding + zombie reaping. The server itself ignores
+# SIGPIPE by default, but tini ensures SIGTERM from `docker stop` reaches it
+# promptly without the 10s grace timeout.
+ENTRYPOINT ["/usr/bin/tini", "--", "mcp-agent-mail"]
+CMD ["serve", "--no-tui"]
+
+# OCI labels — discoverable via `docker inspect` and shown on the GHCR page.
+# version/revision are filled from the same build args the binaries were
+# selected by, so `docker inspect` agrees with `am --version` and with the
+# git tag the release was cut from.
+ARG AM_REVISION=unknown
+LABEL org.opencontainers.image.title="MCP Agent Mail (Rust)" \
+      org.opencontainers.image.description="Multi-agent coordination via MCP — Rust rewrite. Ships mcp-agent-mail (server) and am (operator CLI)." \
+      org.opencontainers.image.source="https://github.com/Dicklesworthstone/mcp_agent_mail_rust" \
+      org.opencontainers.image.licenses="LicenseRef-MIT-Rider" \
+      org.opencontainers.image.vendor="Jeff Emanuel" \
+      org.opencontainers.image.version="${AM_VERSION}" \
+      org.opencontainers.image.revision="${AM_REVISION}"
