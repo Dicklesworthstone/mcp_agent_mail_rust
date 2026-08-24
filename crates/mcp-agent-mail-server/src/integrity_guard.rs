@@ -857,7 +857,8 @@ mod tests {
                 .map(|entry| {
                     let entry = entry.expect("read cross-count fixture entry");
                     let name = entry.file_name();
-                    let bytes = std::fs::read(entry.path()).expect("read cross-count fixture bytes");
+                    let bytes =
+                        std::fs::read(entry.path()).expect("read cross-count fixture bytes");
                     (name, bytes)
                 })
                 .collect()
@@ -868,10 +869,9 @@ mod tests {
             let path = dir
                 .path()
                 .join(format!("cross-count-{breaker_kind}.sqlite3"));
-            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
-                path.to_string_lossy().as_ref(),
-            )
-            .expect("create healthy cross-count primary");
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+                    .expect("create healthy cross-count primary");
             conn.execute_raw("PRAGMA journal_mode = DELETE;")
                 .expect("detach cross-count fixture WAL mode");
             conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
@@ -892,8 +892,7 @@ mod tests {
             ));
             std::fs::write(&wal_path, b"truncated-cross-count-wal")
                 .expect("write damaged cross-count WAL");
-            std::fs::write(&shm_path, b"cross-count-shm")
-                .expect("write cross-count SHM");
+            std::fs::write(&shm_path, b"cross-count-shm").expect("write cross-count SHM");
             assert!(
                 mcp_agent_mail_db::wal_classify::classify_wal_sidecar(&path)
                     .state
@@ -914,8 +913,7 @@ mod tests {
                 "tripped" => {
                     let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
                         schema: 1,
-                        db_fingerprint:
-                            mcp_agent_mail_db::recovery_breaker::fingerprint_db(&path),
+                        db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&path),
                         consecutive_failures:
                             mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
                         last_failure_unix: i64::MAX,
@@ -1088,7 +1086,11 @@ mod tests {
         );
 
         assert!(!followed_up);
-        assert_eq!(full_calls.get(), 1, "a due full check must run exactly once");
+        assert_eq!(
+            full_calls.get(),
+            1,
+            "a due full check must run exactly once"
+        );
         assert_eq!(
             maintenance_calls.get(),
             0,
@@ -1110,7 +1112,11 @@ mod tests {
             },
             || maintenance_calls.set(maintenance_calls.get() + 1),
         ));
-        assert_eq!(full_calls.get(), 0, "a non-due full check must stay skipped");
+        assert_eq!(
+            full_calls.get(),
+            0,
+            "a non-due full check must stay skipped"
+        );
         assert_eq!(maintenance_calls.get(), 1);
 
         assert!(run_integrity_followups(

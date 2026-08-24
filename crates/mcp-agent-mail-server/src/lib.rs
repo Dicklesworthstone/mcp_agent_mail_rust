@@ -28784,8 +28784,8 @@ first body
             .map(|entry| {
                 let entry = entry.expect("read server SQLite fixture entry");
                 let path = entry.path();
-                let metadata = std::fs::symlink_metadata(&path)
-                    .expect("inspect server SQLite fixture entry");
+                let metadata =
+                    std::fs::symlink_metadata(&path).expect("inspect server SQLite fixture entry");
                 let bytes = metadata
                     .file_type()
                     .is_file()
@@ -28859,9 +28859,7 @@ first body
                     .execute_raw("PRAGMA journal_mode = DELETE;")
                     .expect("settle replacement primary generation");
                 replacement
-                    .execute_raw(
-                        "CREATE TABLE server_namespace_fixture(value INTEGER NOT NULL);",
-                    )
+                    .execute_raw("CREATE TABLE server_namespace_fixture(value INTEGER NOT NULL);")
                     .expect("create replacement primary schema");
                 replacement
                     .execute_raw("INSERT INTO server_namespace_fixture(value) VALUES (13);")
@@ -28869,10 +28867,9 @@ first body
                 drop(replacement);
             }
 
-            let namespace_use_path =
-                server_namespace_sidecar_path(&db_path, "-fsqlite-ns-use");
-            let sentinel = std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_secs(1_700_000_000);
+            let namespace_use_path = server_namespace_sidecar_path(&db_path, "-fsqlite-ns-use");
+            let sentinel =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
             std::fs::File::options()
                 .write(true)
                 .open(&namespace_use_path)
@@ -29042,16 +29039,23 @@ first body
                 let db_path = dir
                     .path()
                     .join(format!("{surface}-{family_kind}-{breaker_kind}.sqlite3"));
+                let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                    db_path.to_string_lossy().as_ref(),
+                )
+                .expect("create healthy live-open primary fixture");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("detach live-open fixture WAL mode");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("initialize live-open fixture schema");
+                drop(conn);
+                let admitted = DbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("admit live-open fixture through FrankenSQLite");
+                admitted
+                    .query_sync("SELECT 1", &[])
+                    .expect("query admitted live-open fixture");
+                mcp_agent_mail_db::close_db_conn(admitted, "seed suspect live-open fixture");
+
                 if family_kind == "damaged-wal" {
-                    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
-                        db_path.to_string_lossy().as_ref(),
-                    )
-                    .expect("create healthy primary fixture");
-                    conn.execute_raw("PRAGMA journal_mode = DELETE;")
-                        .expect("detach fixture WAL mode");
-                    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-                        .expect("initialize fixture schema");
-                    drop(conn);
                     std::fs::write(
                         db_path.with_file_name(format!(
                             "{}-wal",
@@ -29102,6 +29106,7 @@ first body
                 assert!(
                     error.contains("refusing raw live SQLite engine open")
                         || error.contains("refusing live read-only SQLite engine open")
+                        || error.contains("refusing live read-only FrankenSQLite open")
                         || error.contains("strict query-only open refused"),
                     "unexpected {surface}/{family_kind}/{breaker_kind} refusal: {error}"
                 );
@@ -29150,8 +29155,9 @@ first body
         );
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
     #[test]
-    fn live_open_guards_allow_healthy_admitted_family_with_nonclean_breaker() {
+    fn live_open_guards_apply_nonclean_breaker_policy_without_mutation() {
         for breaker_kind in ["malformed", "tripped"] {
             let dir = tempfile::tempdir().expect("tempdir");
             let storage_root = dir.path().join("storage");
@@ -29159,10 +29165,9 @@ first body
             let db_path = dir
                 .path()
                 .join(format!("healthy-live-open-{breaker_kind}.sqlite3"));
-            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
-                db_path.to_string_lossy().as_ref(),
-            )
-            .expect("create healthy live-open fixture");
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create healthy live-open fixture");
             conn.execute_raw("PRAGMA journal_mode = DELETE;")
                 .expect("detach fixture WAL mode");
             conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
@@ -29177,11 +29182,31 @@ first body
             let breaker_path = install_live_open_breaker_fixture(&db_path, breaker_kind);
             let breaker_bytes =
                 std::fs::read(&breaker_path).expect("read nonclean breaker fixture");
+            let family_before = exact_server_sqlite_parent_snapshot(dir.path());
 
-            let health =
-                open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref())
-                    .expect("healthy exact family remains available to health reads");
-            drop(health);
+            let health_error =
+                match open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref()) {
+                    Ok(conn) => {
+                        drop(conn);
+                        panic!("guarded health read must refuse nonclean breaker authority");
+                    }
+                    Err(error) => error,
+                };
+            assert!(
+                health_error
+                    .to_string()
+                    .contains("durable recovery authority"),
+                "unexpected health refusal for {breaker_kind}: {health_error}"
+            );
+            assert_eq!(
+                exact_server_sqlite_parent_snapshot(dir.path()),
+                family_before,
+                "guarded health refusal must preserve the exact admitted family"
+            );
+
+            // The writable observability surface retains its source-neutral
+            // exact-family proof and may admit this independently healthy
+            // family without consuming durable breaker authority.
             let observed = open_observability_sync_db_connection(
                 &format!("sqlite:///{}", db_path.display()),
                 &storage_root,

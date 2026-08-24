@@ -190,8 +190,7 @@ fn metrics_loop(config: &Config) {
                     );
                     conn = None;
                 }
-                if conn.is_none()
-                    && (current_epoch != conn_epoch || tick_index.is_multiple_of(12))
+                if conn.is_none() && (current_epoch != conn_epoch || tick_index.is_multiple_of(12))
                 {
                     conn = open_metrics_connection(&config.database_url);
                     if let Some(db) = conn.as_ref() {

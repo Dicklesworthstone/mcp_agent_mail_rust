@@ -6466,7 +6466,7 @@ fn preflight_banner_stats(database_url: &str) -> PreflightBannerStats {
     // Keep startup stats on the fastest possible path: banner counts are purely
     // cosmetic, so do not trigger fallback probing or sqlite auto-recovery here.
     // The real readiness/server startup path still performs full recovery checks.
-    let Ok((conn, _opened_path)) = open_sqlite_read_only_with_fallback(&sqlite_path) else {
+    let Ok((conn, _opened_path)) = open_live_sqlite_read_only(&sqlite_path) else {
         return PreflightBannerStats::default();
     };
     query_preflight_banner_stats_batched(&conn).unwrap_or_default()
@@ -12637,8 +12637,8 @@ fn with_salvage_readonly_copy<T>(
             let _ = std::fs::copy(&sidecar, sqlite_sidecar_path(&copy, suffix));
         }
     }
-    match open_sqlite_read_only_with_fallback(&copy.to_string_lossy()) {
-        Ok((conn, _opened)) => on_conn(&conn),
+    match open_private_sqlite_read_only(&copy, "salvage loss-count copy") {
+        Ok(conn) => on_conn(&conn),
         Err(e) => on_error(e.to_string()),
     }
 }
@@ -13197,7 +13197,7 @@ fn cli_sqlite_family_requires_preopen_admission(path: &Path) -> CliResult<bool> 
             path.display()
         ))
     })?;
-    let Ok((conn, _opened_path)) = open_sqlite_read_only_preflight(path_text) else {
+    let Ok((conn, _opened_path)) = open_live_sqlite_read_only(path_text) else {
         return Ok(true);
     };
     let requires_init = sqlite_conn_requires_canonical_init(&conn);
@@ -13214,9 +13214,7 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
     open_sqlite_with_fallback_and_storage_root(path, None)
 }
 
-fn open_sqlite_read_only_preflight(
-    path: &str,
-) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+fn open_live_sqlite_read_only(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let conn = if path == ":memory:" {
         let conn = mcp_agent_mail_db::DbConn::open_memory()
             .map_err(|error| CliError::Other(format!("cannot open in-memory DB: {error}")))?;
@@ -13244,6 +13242,41 @@ fn open_sqlite_read_only_preflight(
         conn
     };
     Ok((conn, path.to_string()))
+}
+
+/// Open a disposable SQLite materialization that is owned by this CLI call.
+///
+/// Unlike [`open_live_sqlite_read_only`], this helper may let FrankenSQLite
+/// establish private namespace state beside the file. It must therefore never
+/// receive the live mailbox path. The caller-owned tempdir/snapshot keeps any
+/// engine side effects isolated from the source family.
+fn open_private_sqlite_read_only(
+    path: &Path,
+    context: &str,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
+    require_read_only_sqlite_family_source(path)?;
+    let path_text = path.to_str().ok_or_else(|| {
+        CliError::Other(format!(
+            "{context} refuses non-UTF-8 private SQLite path {}",
+            path.display()
+        ))
+    })?;
+    let conn = mcp_agent_mail_db::DbConn::open_file_read_only(path_text.to_string()).map_err(
+        |error| {
+            CliError::Other(format!(
+                "{context} cannot open private SQLite materialization {} read-only: {error}",
+                path.display()
+            ))
+        },
+    )?;
+    conn.execute_raw("PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;")
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context} cannot configure private SQLite materialization {} read-only: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(conn)
 }
 
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
@@ -13827,7 +13860,7 @@ fn open_db_sync_read_only_with_database_url_and_path(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    open_sqlite_read_only_with_fallback(&path)
+    open_live_sqlite_read_only(&path)
 }
 
 fn open_db_sync_read_only_with_database_url(
@@ -13975,6 +14008,19 @@ impl CanonicalSnapshotSource {
         matches!(self.kind, CanonicalSnapshotSourceKind::ArchiveSnapshot)
     }
 
+    fn open_read_only(&self, context: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
+        match self.kind {
+            CanonicalSnapshotSourceKind::LiveSqlite => {
+                open_live_sqlite_read_only(self.actual_path.to_string_lossy().as_ref())
+                    .map(|(conn, _opened_path)| conn)
+            }
+            CanonicalSnapshotSourceKind::LiveSnapshot
+            | CanonicalSnapshotSourceKind::ArchiveSnapshot => {
+                open_private_sqlite_read_only(&self.actual_path, context)
+            }
+        }
+    }
+
     fn materialize_for_async_read_pool(self, context: &str) -> CliResult<Self> {
         if matches!(
             self.kind,
@@ -14066,7 +14112,7 @@ fn resolve_canonical_snapshot_source_path(
         )));
     }
 
-    match open_sqlite_read_only_with_fallback(&candidate_display) {
+    match open_live_sqlite_read_only(&candidate_display) {
         Ok((conn, opened_path)) => {
             let opened_path = PathBuf::from(opened_path);
             let db_inventory = collect_doctor_db_inventory(&conn);
@@ -14231,8 +14277,7 @@ fn open_db_sync_canonical_read_with_database_url(
         storage_root_is_explicit,
         context,
     )?;
-    let source_path = source.actual_path().display().to_string();
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let conn = source.open_read_only(context)?;
     Ok(CanonicalReadDb {
         conn,
         _source: source,
@@ -14274,8 +14319,7 @@ fn open_db_sync_async_canonical_read_with_database_url(
             storage_root_override,
             context,
         )?;
-    let source_path = source.actual_path().display().to_string();
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
@@ -14305,8 +14349,7 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
         storage_root_is_explicit,
         context,
     )?;
-    let source_path = source.actual_path().display().to_string();
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
@@ -14354,8 +14397,7 @@ fn open_atc_simulate_read_pool_with_database_url(
         let snapshot_sidecar = source.actual_path().with_file_name("atc.sqlite3");
         vacuum_into_sqlite_snapshot(&live_sidecar, &snapshot_sidecar, "ATC simulate sidecar")?;
     }
-    let source_path = source.actual_path().display().to_string();
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let conn = source.open_read_only("ATC simulate snapshot")?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
@@ -14384,8 +14426,7 @@ fn open_atc_explain_read_db_with_database_url(database_url: &str) -> CliResult<C
         &opened_path,
         "ATC explain",
     )?;
-    let source_path = source.actual_path().display().to_string();
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let conn = source.open_read_only("ATC explain snapshot")?;
     Ok(CanonicalReadDb {
         conn,
         _source: source,
@@ -14436,7 +14477,7 @@ fn open_db_sync_robot_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)?;
+    let (conn, _opened_path) = open_live_sqlite_read_only(&path)?;
     if sqlite_conn_supports_robot_reads(&conn)? {
         return Ok(conn);
     }
@@ -14456,7 +14497,7 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)?;
+    let (conn, _opened_path) = open_live_sqlite_read_only(&path)?;
     if sqlite_conn_supports_robot_attachment_reads(&conn)? {
         return Ok(conn);
     }
