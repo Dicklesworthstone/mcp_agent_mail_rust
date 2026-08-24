@@ -5196,7 +5196,10 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn = open_sqlite_file_with_lock_retry(sqlite_path_as_utf8(primary_path)?)?;
+    let conn = open_guarded_read_only_sqlite_file(
+        primary_path,
+        "mailbox database inventory",
+    )?;
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
