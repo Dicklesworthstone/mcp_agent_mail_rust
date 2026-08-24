@@ -21229,6 +21229,277 @@ mod tests {
         );
     }
 
+    fn assert_missing_primary_pool_init_breaker_refusal(
+        db_name: &str,
+        expected_error_fragment: &str,
+        install_breaker: impl FnOnce(&Path),
+    ) {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(db_name);
+        let storage_root = dir.path().join("storage");
+        assert!(!db_path.exists(), "fixture primary must start absent");
+        install_breaker(&db_path);
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list missing-primary fixture before acquire")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let cx = Cx::for_testing();
+
+        recovery_admission().reset();
+        let error = match runtime.block_on(pool.acquire(&cx)) {
+            Outcome::Err(error) => error,
+            Outcome::Ok(_) => {
+                panic!("breaker authority must refuse missing-primary pool init")
+            }
+            Outcome::Cancelled(reason) => {
+                panic!("pool initialization was cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("pool initialization panicked: {}", payload.message())
+            }
+        };
+
+        assert!(
+            error.to_string().contains(expected_error_fragment),
+            "unexpected missing-primary pool-init refusal: {error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "refused pool init must not create even a zero-byte primary body"
+        );
+        assert_eq!(
+            std::fs::read(&breaker_path).expect("read breaker after refusal"),
+            breaker_bytes,
+            "refused pool init must preserve exact breaker authority bytes"
+        );
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .iter()
+            .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+        {
+            assert!(
+                !sqlite_sidecar_path(&db_path, suffix).exists(),
+                "refused pool init must not create {suffix} beside the absent primary"
+            );
+        }
+        assert!(
+            !crate::recovery_breaker::breaker_lock_path(&db_path).exists(),
+            "pure breaker refusal must precede persistent election-file creation"
+        );
+        assert!(
+            !sqlite_sidecar_path(&db_path, ".recovery.lock").exists(),
+            "refused pool init must not create a recovery lock"
+        );
+        assert!(
+            !storage_root.join("doctor").join("forensics").exists(),
+            "refused pool init must not capture forensics"
+        );
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list missing-primary fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "refused pool init must preserve the exact directory namespace"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn pool_init_missing_primary_refuses_malformed_breaker_without_artifacts() {
+        assert_missing_primary_pool_init_breaker_refusal(
+            "pool-missing-malformed.sqlite3",
+            "could not be trusted",
+            |db_path| {
+                std::fs::write(
+                    crate::recovery_breaker::breaker_sidecar_path(db_path),
+                    b"malformed missing-primary breaker authority",
+                )
+                .expect("write malformed breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn pool_init_missing_primary_refuses_tripped_breaker_without_artifacts() {
+        assert_missing_primary_pool_init_breaker_refusal(
+            "pool-missing-tripped.sqlite3",
+            "circuit-broken",
+            |db_path| {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "missing-primary pool init fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(db_path, &state)
+                    .expect("store tripped missing-primary breaker");
+            },
+        );
+    }
+
+    #[test]
+    fn pool_init_missing_primary_without_breaker_creates_fresh_database() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pool-missing-clean.sqlite3");
+        let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+        assert!(!db_path.exists());
+        assert!(!breaker_path.exists());
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct lazy pool");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let cx = Cx::for_testing();
+
+        recovery_admission().reset();
+        let connection = match runtime.block_on(pool.acquire(&cx)) {
+            Outcome::Ok(connection) => connection,
+            Outcome::Err(error) => panic!("clean missing-primary init failed: {error}"),
+            Outcome::Cancelled(reason) => {
+                panic!("pool initialization was cancelled: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                panic!("pool initialization panicked: {}", payload.message())
+            }
+        };
+        let projects_table = connection
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+                &[],
+            )
+            .expect("query initialized schema");
+        assert_eq!(projects_table.len(), 1, "fresh init must install schema");
+        drop(connection);
+
+        assert!(is_real_file(&db_path), "fresh init must create the primary");
+        assert!(
+            std::fs::metadata(&db_path)
+                .expect("stat fresh primary")
+                .len()
+                > 0,
+            "fresh init must create a nonempty SQLite body"
+        );
+        assert!(
+            !breaker_path.exists(),
+            "clean fresh start must not invent recovery-breaker state"
+        );
+        assert!(
+            !crate::recovery_breaker::breaker_lock_path(&db_path).exists(),
+            "pure clean preflight must not create a breaker election file"
+        );
+        recovery_admission().reset();
+    }
+
+    #[test]
+    fn pool_init_existing_healthy_family_allows_nonclean_breaker_authority() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("pool-healthy-{breaker_kind}.sqlite3"));
+            {
+                let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("create healthy pool-init fixture");
+                conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("force standalone primary");
+                conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                    .expect("create fixture table");
+            }
+            let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+            if breaker_kind == "malformed" {
+                std::fs::write(&breaker_path, b"malformed breaker authority")
+                    .expect("write malformed breaker");
+            } else {
+                let config = crate::recovery_breaker::config_from_env();
+                let state = crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                    consecutive_failures: config.max_consecutive_failures,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "healthy pool-init fixture tripped".to_string(),
+                    tripped: true,
+                };
+                crate::recovery_breaker::store(&db_path, &state)
+                    .expect("store tripped breaker");
+            }
+            let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker fixture");
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(dir.path().join("storage")),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("construct lazy pool");
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build current-thread runtime");
+            let cx = Cx::for_testing();
+
+            recovery_admission().reset();
+            let connection = match runtime.block_on(pool.acquire(&cx)) {
+                Outcome::Ok(connection) => connection,
+                Outcome::Err(error) => {
+                    panic!("healthy {breaker_kind} pool init failed: {error}")
+                }
+                Outcome::Cancelled(reason) => {
+                    panic!("pool initialization was cancelled: {reason:?}")
+                }
+                Outcome::Panicked(payload) => {
+                    panic!("pool initialization panicked: {}", payload.message())
+                }
+            };
+            connection
+                .query_sync("SELECT COUNT(*) AS count FROM fixture", &[])
+                .expect("query healthy fixture after pool init");
+            drop(connection);
+
+            assert_eq!(
+                std::fs::read(&breaker_path).expect("read breaker after healthy init"),
+                breaker_bytes,
+                "healthy exact family must not clear historical breaker authority"
+            );
+            assert!(
+                !crate::recovery_breaker::breaker_lock_path(&db_path).exists(),
+                "healthy exact family must not enter recovery election"
+            );
+            recovery_admission().reset();
+        }
+    }
+
     #[test]
     fn pool_init_breakers_preserve_corrupt_primary_before_engine_open() {
         use asupersync::runtime::RuntimeBuilder;
