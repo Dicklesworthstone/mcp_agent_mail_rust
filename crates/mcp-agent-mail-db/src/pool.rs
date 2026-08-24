@@ -25,6 +25,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -9491,6 +9493,13 @@ fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError
             "strict query-only open refused: {sqlite_path} is not a regular file"
         )));
     }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} has {} hard links; canonical diagnostics cannot prove that no Franken namespace authority exists beside an alias of the same inode",
+            metadata.nlink()
+        )));
+    }
     if metadata.len() == 0 {
         return Err(SqlError::Custom(format!(
             "strict query-only open refused: {sqlite_path} is an empty, unmaterialized database file"
@@ -9770,6 +9779,14 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
         return Err(SqlError::Custom(format!(
             "{context}: refusing live read-only FrankenSQLite open for {} because the admitted target is not a materialized SQLite file",
             stable_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing live read-only FrankenSQLite open for {} because its main inode has {} hard links and therefore cannot have one authoritative namespace pathname",
+            stable_path.display(),
+            metadata.nlink()
         )));
     }
 
@@ -14540,29 +14557,95 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn guarded_read_only_helpers_preserve_valid_live_wal_byte_identically() {
+        const WAL_CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_WAL_WRITER_PATH";
+        const WAL_CHILD_TEST_NAME: &str =
+            "pool::tests::guarded_read_only_helpers_preserve_valid_live_wal_byte_identically";
+        const WAL_CHILD_READY: &str = "guarded-read-only-wal-writer-ready";
+
+        if let Some(path) = std::env::var_os(WAL_CHILD_PATH_ENV) {
+            use std::io::{BufRead as _, Write as _};
+
+            let writer = crate::CanonicalDbConn::open_file(
+                PathBuf::from(path).to_string_lossy().as_ref(),
+            )
+            .expect("child opens canonical live WAL writer");
+            writer
+                .execute_raw("PRAGMA journal_mode = WAL;")
+                .expect("child enables canonical live WAL mode");
+            writer
+                .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+                .expect("child disables canonical automatic WAL checkpoints");
+            writer
+                .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
+                .expect("child commits canonical uncheckpointed live WAL row");
+            println!("{WAL_CHILD_READY}");
+            std::io::stdout().flush().expect("flush child ready witness");
+            let mut release = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut release)
+                .expect("read parent release signal");
+            assert_eq!(release.trim(), "release");
+            drop(writer);
+            return;
+        }
+
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Stdio;
+
         let canonical_directory = tempfile::tempdir().expect("canonical tempdir");
         let canonical_db_path = canonical_directory.path().join("canonical-live-wal.sqlite3");
         seed_settled_diagnostic_database(&canonical_db_path);
-        let canonical_writer =
-            crate::CanonicalDbConn::open_file(canonical_db_path.to_string_lossy().as_ref())
-                .expect("open canonical live WAL writer");
-        canonical_writer
-            .execute_raw("PRAGMA journal_mode = WAL;")
-            .expect("enable canonical live WAL mode");
-        canonical_writer
-            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
-            .expect("disable canonical automatic WAL checkpoints");
-        canonical_writer
-            .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (8);")
-            .expect("commit canonical uncheckpointed live WAL row");
+        let mut canonical_writer = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(WAL_CHILD_TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_CHILD_PATH_ENV, &canonical_db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn canonical live WAL writer child");
+        let mut child_stdout = std::io::BufReader::new(
+            canonical_writer
+                .stdout
+                .take()
+                .expect("capture canonical writer stdout"),
+        );
+        let mut ready = false;
+        loop {
+            let mut line = String::new();
+            if child_stdout
+                .read_line(&mut line)
+                .expect("read canonical writer witness")
+                == 0
+            {
+                break;
+            }
+            if line.contains(WAL_CHILD_READY) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "canonical writer child exited before publishing readiness");
         assert!(
             std::fs::metadata(sqlite_sidecar_path(&canonical_db_path, "-wal"))
                 .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
             "canonical fixture must retain at least one committed WAL frame"
         );
-        assert!(sqlite_sidecar_path(&canonical_db_path, "-shm").is_file());
+        let canonical_shm = sqlite_sidecar_path(&canonical_db_path, "-shm");
+        assert!(canonical_shm.is_file());
+        let mut shm_permissions = std::fs::metadata(&canonical_shm)
+            .expect("inspect canonical SHM permissions")
+            .permissions();
+        shm_permissions.set_mode(0o444);
+        std::fs::set_permissions(&canonical_shm, shm_permissions)
+            .expect("make canonical SHM read-only for mutation-sensitive URI proof");
         let canonical_before =
             exact_diagnostic_parent_snapshot(canonical_directory.path());
 
@@ -14585,7 +14668,19 @@ mod tests {
             canonical_before,
             "canonical read-only observer must not checkpoint or rewrite a valid live WAL family"
         );
-        drop(canonical_writer);
+        canonical_writer
+            .stdin
+            .as_mut()
+            .expect("canonical writer stdin")
+            .write_all(b"release\n")
+            .expect("release canonical writer child");
+        assert!(
+            canonical_writer
+                .wait()
+                .expect("wait for canonical writer child")
+                .success(),
+            "canonical writer child must exit cleanly"
+        );
 
         let franken_directory = tempfile::tempdir().expect("Franken tempdir");
         let franken_db_path = franken_directory.path().join("franken-live-wal.sqlite3");

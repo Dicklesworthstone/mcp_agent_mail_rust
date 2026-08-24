@@ -13223,8 +13223,9 @@ fn open_live_sqlite_read_only(
     context: &str,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let conn = if path == ":memory:" {
-        let conn = mcp_agent_mail_db::DbConn::open_memory()
-            .map_err(|error| CliError::Other(format!("{context}: cannot open in-memory DB: {error}")))?;
+        let conn = mcp_agent_mail_db::DbConn::open_memory().map_err(|error| {
+            CliError::Other(format!("{context}: cannot open in-memory DB: {error}"))
+        })?;
         conn.execute_raw("PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;")
             .map_err(|error| {
                 CliError::Other(format!(
@@ -13311,7 +13312,7 @@ fn require_existing_regular_sqlite_path_metadata(path: &Path, context: &str) -> 
 
     if !metadata.file_type().is_file() {
         return Err(CliError::Other(format!(
-            "{context} live snapshot source must be a regular SQLite file; refusing {}",
+            "{context} source must be a regular SQLite file; refusing {}",
             path.display()
         )));
     }
@@ -13355,7 +13356,7 @@ fn require_existing_regular_private_sqlite_source(
     })?;
     if !open_metadata.file_type().is_file() {
         return Err(CliError::Other(format!(
-            "{context} opened live snapshot source must be a regular SQLite file; refusing {}",
+            "{context} opened SQLite source must be a regular file; refusing {}",
             path.display()
         )));
     }

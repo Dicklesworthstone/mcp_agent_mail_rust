@@ -202,11 +202,20 @@ const KNOWN_TABLES: &[KnownTable] = &[
     },
 ];
 
-/// Create a snapshot of the source SQLite database at `destination`.
+/// Create a snapshot of a live FrankenSQLite database at `destination`.
 ///
-/// 1. Opens source DB with FrankenSQLite (runtime driver).
-/// 2. If `checkpoint` is true, runs `PRAGMA wal_checkpoint(TRUNCATE)`.
-/// 3. Transfers schema + data to a fresh destination file.
+/// The source must already be admitted by FrankenSQLite and retain its complete
+/// namespace sidecar pair. It is opened through the guarded, engine-enforced
+/// read-only seam and copied inside one read transaction, so committed rows in
+/// the primary file and WAL are observed as one consistent database snapshot.
+/// The live source is never checkpointed or otherwise mutated. `checkpoint`
+/// is retained for callers that share this signature with private canonical
+/// snapshots, but has no effect for this live-source API.
+///
+/// Use [`create_private_canonical_sqlite_snapshot`] for a caller-owned,
+/// engine-exclusive canonical SQLite artifact. There is intentionally no
+/// namespace-absent fallback here: missing, incomplete, malformed, or stale
+/// FrankenSQLite namespace authority fails closed.
 ///
 /// Returns the destination path on success.
 ///
@@ -227,6 +236,32 @@ pub fn create_sqlite_snapshot(
         destination,
         checkpoint,
         SnapshotSourceProfile::Runtime,
+        SnapshotDestinationProfile::Default,
+    )
+}
+
+/// Create a snapshot from a private, engine-exclusive canonical SQLite file.
+///
+/// This API may open the source with canonical SQLite and therefore must never
+/// receive a live FrankenSQLite-managed mailbox path. It is intended for
+/// caller-owned archive reconstructions and already-materialized snapshots.
+/// When `checkpoint` is true, the private source is checkpointed through the
+/// same canonical connection before its consistent read transaction begins.
+///
+/// # Errors
+///
+/// Returns [`ShareError`] when source validation, canonical SQLite access,
+/// transfer, or publication fails.
+pub fn create_private_canonical_sqlite_snapshot(
+    source: &Path,
+    destination: &Path,
+    checkpoint: bool,
+) -> Result<PathBuf, ShareError> {
+    rebuild_sqlite_snapshot_with_profiles(
+        source,
+        destination,
+        checkpoint,
+        SnapshotSourceProfile::CanonicalExport,
         SnapshotDestinationProfile::Default,
     )
 }
@@ -299,17 +334,6 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
             .unwrap_or("mailbox.sqlite3"),
     );
 
-    if checkpoint {
-        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&source).map_err(|e| {
-            ShareError::Sqlite {
-                message: format!(
-                    "cannot checkpoint source DB {} before snapshot: {e}",
-                    source.display()
-                ),
-            }
-        })?;
-    }
-
     let source_str = source.display().to_string();
 
     // Page size must be chosen before page 1 is initialized, so configure the
@@ -328,27 +352,49 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
 
     match source_profile {
         SnapshotSourceProfile::Runtime => {
-            let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-                message: format!("cannot open runtime source DB {source_str}: {e}"),
-            })?;
-            transfer_tables(&src, &dst_conn)?;
+            let src =
+                mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                    &source,
+                    "share live SQLite snapshot",
+                )
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!(
+                        "cannot open live runtime source DB {} read-only: {e}",
+                        source.display()
+                    ),
+                })?;
+            transfer_tables_in_consistent_read(&src, &dst_conn)?;
+            // A true read-only observer must use ordinary Drop. Checkpointing
+            // close helpers are writer teardown and may mutate a live WAL.
+            drop(src);
         }
         SnapshotSourceProfile::CanonicalExport => {
             let src = CanonicalDbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
                 message: format!("cannot open canonical export source DB {source_str}: {e}"),
             })?;
-            transfer_tables(&src, &dst_conn)?;
+            if checkpoint {
+                src.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .map_err(|e| ShareError::Sqlite {
+                        message: format!(
+                            "cannot checkpoint private canonical source DB {source_str}: {e}"
+                        ),
+                    })?;
+            }
+            transfer_tables_in_consistent_read(&src, &dst_conn)?;
         }
     }
-    drop(dst_conn);
-    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&staged_dest).map_err(|e| {
-        ShareError::Sqlite {
+    // Use the existing canonical staging connection for any destination
+    // checkpoint. Opening the same inode with a second engine is unnecessary
+    // and can invalidate process-wide classic fcntl locks on Unix.
+    dst_conn
+        .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+        .map_err(|e| ShareError::Sqlite {
             message: format!(
                 "cannot checkpoint destination DB {} before publishing snapshot: {e}",
                 staged_dest.display()
             ),
-        }
-    })?;
+        })?;
+    drop(dst_conn);
     // Staging ran with synchronous=OFF (br-gi4z3), so force the finished image
     // to disk once, here, before the rename publishes it.
     std::fs::File::open(&staged_dest)
@@ -516,6 +562,12 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
 }
 
 trait SnapshotSource {
+    // Mirrors `DbConn::execute_raw`'s signature. Snapshot reads use an
+    // explicit transaction so every table and pagination page observes one
+    // primary-plus-WAL state.
+    #[allow(clippy::result_large_err)]
+    fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error>;
+
     // Mirrors `DbConn::query_sync`'s signature; `sqlmodel_core::Error`'s size
     // is upstream's choice and boxing here would diverge from that API.
     #[allow(clippy::result_large_err)]
@@ -527,6 +579,10 @@ trait SnapshotSource {
 }
 
 impl SnapshotSource for DbConn {
+    fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+        self.execute_raw(sql)
+    }
+
     fn query_snapshot(
         &self,
         sql: &str,
@@ -537,12 +593,55 @@ impl SnapshotSource for DbConn {
 }
 
 impl SnapshotSource for CanonicalDbConn {
+    fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+        self.execute_raw(sql)
+    }
+
     fn query_snapshot(
         &self,
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
         self.query_sync(sql, params)
+    }
+}
+
+/// Copy every known table while one source read transaction pins the database
+/// snapshot. In WAL mode, separate queries without this transaction can each
+/// observe a different commit and produce a cross-table or cross-page state
+/// that never existed in the source.
+fn transfer_tables_in_consistent_read<S: SnapshotSource>(
+    src: &S,
+    dst: &CanonicalDbConn,
+) -> Result<(), ShareError> {
+    src.execute_snapshot("BEGIN")
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("cannot begin consistent source snapshot read: {e}"),
+        })?;
+
+    match transfer_tables(src, dst) {
+        Ok(()) => match src.execute_snapshot("COMMIT") {
+            Ok(()) => Ok(()),
+            Err(commit_error) => {
+                let rollback_result = src.execute_snapshot("ROLLBACK");
+                let rollback_suffix = rollback_result.err().map_or_else(String::new, |error| {
+                    format!("; rollback after commit failure also failed: {error}")
+                });
+                Err(ShareError::Sqlite {
+                    message: format!(
+                        "cannot commit consistent source snapshot read: {commit_error}{rollback_suffix}"
+                    ),
+                })
+            }
+        },
+        Err(transfer_error) => match src.execute_snapshot("ROLLBACK") {
+            Ok(()) => Err(transfer_error),
+            Err(rollback_error) => Err(ShareError::Sqlite {
+                message: format!(
+                    "snapshot transfer failed ({transfer_error}); source read transaction rollback also failed: {rollback_error}"
+                ),
+            }),
+        },
     }
 }
 
