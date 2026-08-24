@@ -638,6 +638,14 @@ fn validate_reconstruction(
 }
 
 fn live_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, String> {
+    mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        path,
+        "archive-read live database probe",
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn private_snapshot_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, String> {
     let conn = mcp_agent_mail_db::DbConn::open_file_read_only(path.to_string_lossy().into_owned())
         .map_err(|error| error.to_string())?;
     conn.execute_raw("PRAGMA query_only = ON;")
@@ -662,10 +670,6 @@ fn snapshot_required(
             {
                 return Ok(true);
             }
-            let conn = mcp_agent_mail_db::guard_db_conn(
-                conn,
-                "archive_read::snapshot_required inventory probe",
-            );
             crate::tool_util::read_archive_is_ahead(
                 &scope.storage_root,
                 &scope.sqlite_path,
@@ -726,7 +730,7 @@ fn build_snapshot(
     .map_err(AcquireError::failed)?;
     validate_reconstruction(inventory, &stats)?;
 
-    let probe = live_probe(&snapshot_path).map_err(AcquireError::Failed)?;
+    let probe = private_snapshot_probe(&snapshot_path).map_err(AcquireError::Failed)?;
     let quick_check = probe
         .query_sync("PRAGMA quick_check", &[])
         .map_err(AcquireError::failed)?;

@@ -16173,7 +16173,10 @@ fn fetch_health_live_counts(database_url: &str) -> Option<(u64, u64)> {
     let projects = health_count(&conn, "SELECT COUNT(*) AS c FROM projects");
     let messages = health_count(&conn, "SELECT COUNT(*) AS c FROM messages");
     let counts = projects.zip(messages);
-    mcp_agent_mail_db::close_db_conn(conn, "health count probe");
+    // The guarded read-only opener retains FrankenSQLite's namespace binding
+    // through connection teardown. Let its ordinary Drop path release that
+    // binding; the writable close helper is intentionally not used here.
+    drop(conn);
     counts
 }
 
@@ -28764,6 +28767,191 @@ first body
         );
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn server_namespace_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+        db_path.with_file_name(format!(
+            "{}{suffix}",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn exact_server_sqlite_parent_snapshot(
+        directory: &Path,
+    ) -> std::collections::BTreeMap<std::ffi::OsString, (bool, Vec<u8>)> {
+        std::fs::read_dir(directory)
+            .expect("read server SQLite fixture directory")
+            .map(|entry| {
+                let entry = entry.expect("read server SQLite fixture entry");
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .expect("inspect server SQLite fixture entry");
+                let bytes = metadata
+                    .file_type()
+                    .is_file()
+                    .then(|| std::fs::read(&path).expect("read server SQLite fixture file"))
+                    .unwrap_or_default();
+                (entry.file_name(), (metadata.file_type().is_file(), bytes))
+            })
+            .collect()
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    fn seed_server_franken_namespace_database(db_path: &Path, value: i64) {
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open canonical server namespace fixture");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("settle canonical server namespace fixture");
+        canonical
+            .execute_raw("CREATE TABLE server_namespace_fixture(value INTEGER NOT NULL);")
+            .expect("create server namespace fixture table");
+        canonical
+            .execute_raw(&format!(
+                "INSERT INTO server_namespace_fixture(value) VALUES ({value});"
+            ))
+            .expect("populate server namespace fixture table");
+        drop(canonical);
+
+        let admitted = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("admit server namespace fixture through FrankenSQLite");
+        admitted
+            .query_sync("SELECT value FROM server_namespace_fixture", &[])
+            .expect("query admitted server namespace fixture");
+        mcp_agent_mail_db::close_db_conn(admitted, "seed server namespace fixture");
+
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            assert!(
+                server_namespace_sidecar_path(db_path, suffix).is_file(),
+                "FrankenSQLite admission must publish regular {suffix} authority"
+            );
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn read_only_sync_db_connection_refuses_copied_and_stale_namespace_without_rewriting() {
+        for namespace_kind in ["copied-family", "replaced-primary"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("{namespace_kind}.sqlite3"));
+
+            if namespace_kind == "copied-family" {
+                let source_path = dir.path().join("source.sqlite3");
+                seed_server_franken_namespace_database(&source_path, 7);
+                std::fs::copy(&source_path, &db_path).expect("copy namespace fixture primary");
+                for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                    std::fs::copy(
+                        server_namespace_sidecar_path(&source_path, suffix),
+                        server_namespace_sidecar_path(&db_path, suffix),
+                    )
+                    .expect("copy namespace fixture authority");
+                }
+            } else {
+                seed_server_franken_namespace_database(&db_path, 11);
+                std::fs::rename(&db_path, dir.path().join("displaced-primary.sqlite3"))
+                    .expect("displace namespace-recorded primary");
+                let replacement = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                    db_path.to_string_lossy().as_ref(),
+                )
+                .expect("create replacement primary generation");
+                replacement
+                    .execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("settle replacement primary generation");
+                replacement
+                    .execute_raw(
+                        "CREATE TABLE server_namespace_fixture(value INTEGER NOT NULL);",
+                    )
+                    .expect("create replacement primary schema");
+                replacement
+                    .execute_raw("INSERT INTO server_namespace_fixture(value) VALUES (13);")
+                    .expect("populate replacement primary generation");
+                drop(replacement);
+            }
+
+            let namespace_use_path =
+                server_namespace_sidecar_path(&db_path, "-fsqlite-ns-use");
+            let sentinel = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000);
+            std::fs::File::options()
+                .write(true)
+                .open(&namespace_use_path)
+                .expect("open namespace use authority for timestamp sentinel")
+                .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+                .expect("set namespace use timestamp sentinel");
+            let namespace_use_modified_before = std::fs::metadata(&namespace_use_path)
+                .expect("inspect namespace use authority before refusal")
+                .modified()
+                .ok();
+            let family_before = exact_server_sqlite_parent_snapshot(dir.path());
+
+            let error = match open_read_only_sync_db_connection_with_busy_timeout(
+                db_path.to_string_lossy().as_ref(),
+                HEALTH_SYNC_DB_BUSY_TIMEOUT_MS,
+                "server stale namespace refusal test",
+            ) {
+                Ok(conn) => {
+                    drop(conn);
+                    panic!("copied or stale namespace authority must be refused");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("namespace"),
+                "unexpected {namespace_kind} refusal: {error}"
+            );
+            assert_eq!(
+                exact_server_sqlite_parent_snapshot(dir.path()),
+                family_before,
+                "{namespace_kind} refusal must preserve every family name and byte"
+            );
+            assert_eq!(
+                std::fs::metadata(&namespace_use_path)
+                    .expect("inspect namespace use authority after refusal")
+                    .modified()
+                    .ok(),
+                namespace_use_modified_before,
+                "{namespace_kind} refusal must not rewrite namespace metadata"
+            );
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn read_only_sync_db_connection_accepts_healthy_admitted_namespace_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("healthy-admitted.sqlite3");
+        seed_server_franken_namespace_database(&db_path, 17);
+        let family_before = exact_server_sqlite_parent_snapshot(dir.path());
+
+        let conn = open_read_only_sync_db_connection_with_busy_timeout(
+            db_path.to_string_lossy().as_ref(),
+            BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+            "server healthy namespace admission test",
+        )
+        .expect("healthy admitted namespace must remain readable");
+        assert_eq!(
+            conn.query_sync("SELECT value FROM server_namespace_fixture", &[])
+                .expect("query healthy admitted namespace")[0]
+                .get_named::<i64>("value")
+                .expect("decode healthy admitted namespace value"),
+            17
+        );
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("query healthy read-only busy timeout")[0]
+            .get_as::<i64>(0)
+            .expect("decode healthy read-only busy timeout");
+        assert_eq!(configured, i64::from(BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS));
+        drop(conn);
+
+        assert_eq!(
+            exact_server_sqlite_parent_snapshot(dir.path()),
+            family_before,
+            "healthy read-only admission must preserve every family name and byte"
+        );
+    }
+
     #[test]
     fn open_health_probe_sync_db_connection_uses_short_busy_timeout_and_query_only() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28771,7 +28959,7 @@ first body
         let seed = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open seed db");
         seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
-        drop(seed);
+        mcp_agent_mail_db::close_db_conn(seed, "seed health busy-timeout fixture");
 
         let conn =
             open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref()).expect("open");
@@ -28811,7 +28999,7 @@ first body
         );
     }
 
-    fn install_raw_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {
+    fn install_live_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {
         let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path);
         match breaker_kind {
             "absent" => {}
@@ -28826,18 +29014,18 @@ first body
                     consecutive_failures:
                         mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
                     last_failure_unix: i64::MAX,
-                    last_failure_reason: "raw-open fixture is circuit-broken".to_string(),
+                    last_failure_reason: "live-open fixture is circuit-broken".to_string(),
                     tripped: true,
                 };
                 mcp_agent_mail_db::recovery_breaker::store(db_path, &state)
                     .expect("store tripped breaker authority");
             }
-            other => panic!("unknown raw-open breaker fixture kind: {other}"),
+            other => panic!("unknown live-open breaker fixture kind: {other}"),
         }
         breaker_path
     }
 
-    fn assert_raw_live_open_preserves_suspect_family(
+    fn assert_live_open_guards_preserve_suspect_family(
         surface: &str,
         mut open: impl FnMut(&Path, &Path) -> Result<(), String>,
     ) {
@@ -28893,7 +29081,7 @@ first body
                     "{}-shm",
                     db_path.file_name().unwrap_or_default().to_string_lossy()
                 ));
-                let breaker_path = install_raw_open_breaker_fixture(&db_path, breaker_kind);
+                let breaker_path = install_live_open_breaker_fixture(&db_path, breaker_kind);
                 let family_paths = [db_path.clone(), wal_path, shm_path, breaker_path];
                 drop(
                     acquire_mailbox_activity_lock_for_sqlite_path(
@@ -28905,14 +29093,16 @@ first body
                 let family_bytes_before =
                     family_paths.each_ref().map(|path| std::fs::read(path).ok());
                 let names_before = std::fs::read_dir(dir.path())
-                    .expect("list raw-open fixture before refusal")
-                    .map(|entry| entry.expect("read raw-open fixture entry").file_name())
+                    .expect("list live-open fixture before refusal")
+                    .map(|entry| entry.expect("read live-open fixture entry").file_name())
                     .collect::<std::collections::BTreeSet<_>>();
 
                 let error = open(&db_path, &storage_root)
-                    .expect_err("pre-open guard must refuse the suspect raw live open");
+                    .expect_err("pre-open guard must refuse the suspect live open");
                 assert!(
-                    error.contains("refusing raw live SQLite engine open"),
+                    error.contains("refusing raw live SQLite engine open")
+                        || error.contains("refusing live read-only SQLite engine open")
+                        || error.contains("strict query-only open refused"),
                     "unexpected {surface}/{family_kind}/{breaker_kind} refusal: {error}"
                 );
                 assert_eq!(
@@ -28921,8 +29111,8 @@ first body
                     "{surface} refusal must preserve every SQLite-family byte"
                 );
                 let names_after = std::fs::read_dir(dir.path())
-                    .expect("list raw-open fixture after refusal")
-                    .map(|entry| entry.expect("read raw-open fixture entry").file_name())
+                    .expect("list live-open fixture after refusal")
+                    .map(|entry| entry.expect("read live-open fixture entry").file_name())
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(
                     names_after, names_before,
@@ -28933,8 +29123,8 @@ first body
     }
 
     #[test]
-    fn health_raw_open_refuses_suspect_family_before_live_engine_open() {
-        assert_raw_live_open_preserves_suspect_family("health", |db_path, storage_root| {
+    fn health_guarded_read_only_open_refuses_suspect_family_before_live_engine_open() {
+        assert_live_open_guards_preserve_suspect_family("health", |db_path, storage_root| {
             let mut config = mcp_agent_mail_core::Config::default();
             config.database_url = format!("sqlite:///{}", db_path.display());
             config.storage_root = storage_root.to_path_buf();
@@ -28944,7 +29134,7 @@ first body
 
     #[test]
     fn tui_observability_raw_open_refuses_suspect_family_before_live_engine_open() {
-        assert_raw_live_open_preserves_suspect_family(
+        assert_live_open_guards_preserve_suspect_family(
             "tui-observability",
             |db_path, storage_root| {
                 open_observability_sync_db_connection(
@@ -28961,24 +29151,30 @@ first body
     }
 
     #[test]
-    fn raw_live_open_guard_allows_healthy_exact_family_with_nonclean_breaker() {
+    fn live_open_guards_allow_healthy_admitted_family_with_nonclean_breaker() {
         for breaker_kind in ["malformed", "tripped"] {
             let dir = tempfile::tempdir().expect("tempdir");
             let storage_root = dir.path().join("storage");
             std::fs::create_dir_all(&storage_root).expect("create empty storage root");
             let db_path = dir
                 .path()
-                .join(format!("healthy-raw-open-{breaker_kind}.sqlite3"));
+                .join(format!("healthy-live-open-{breaker_kind}.sqlite3"));
             let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
                 db_path.to_string_lossy().as_ref(),
             )
-            .expect("create healthy raw-open fixture");
+            .expect("create healthy live-open fixture");
             conn.execute_raw("PRAGMA journal_mode = DELETE;")
                 .expect("detach fixture WAL mode");
             conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
                 .expect("initialize healthy fixture schema");
             drop(conn);
-            let breaker_path = install_raw_open_breaker_fixture(&db_path, breaker_kind);
+            let admitted = DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("admit healthy live-open fixture through FrankenSQLite");
+            admitted
+                .query_sync("SELECT 1", &[])
+                .expect("query healthy admitted live-open fixture");
+            mcp_agent_mail_db::close_db_conn(admitted, "seed healthy live-open fixture");
+            let breaker_path = install_live_open_breaker_fixture(&db_path, breaker_kind);
             let breaker_bytes =
                 std::fs::read(&breaker_path).expect("read nonclean breaker fixture");
 
@@ -28998,7 +29194,7 @@ first body
             assert_eq!(
                 std::fs::read(&breaker_path).expect("read breaker after healthy opens"),
                 breaker_bytes,
-                "raw reads must not consume or clear durable recovery authority"
+                "live reads must not consume or clear durable recovery authority"
             );
         }
     }
