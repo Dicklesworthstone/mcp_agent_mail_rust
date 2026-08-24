@@ -299,10 +299,12 @@ pub fn try_acquire_promotion_barrier_if_idle() -> Option<PromotionBarrierGuard> 
     Some(PromotionBarrierGuard::new_held())
 }
 
-/// Acquire the promotion barrier for corruption recovery: block new writers
-/// immediately, wait up to `timeout` for every in-flight writer to drain,
-/// then return [`DrainOutcome::TimedOut`] if any remain. A timed-out guard must
-/// only be used to fail closed; it does not authorize promotion.
+/// Acquire the promotion barrier for corruption recovery.
+///
+/// Blocks new writers immediately, waits up to `timeout` for every in-flight
+/// writer to drain, then returns [`DrainOutcome::TimedOut`] if any remain. A
+/// timed-out guard must only be used to fail closed; it does not authorize
+/// promotion.
 pub fn acquire_promotion_barrier_draining(
     timeout: Duration,
 ) -> (PromotionBarrierGuard, DrainOutcome) {

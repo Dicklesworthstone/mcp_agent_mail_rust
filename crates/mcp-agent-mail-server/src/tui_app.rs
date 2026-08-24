@@ -2228,6 +2228,10 @@ impl MailAppModel {
             return;
         }
 
+        // Hold the promotion lease from before the raw live fd is opened until
+        // the UPDATE has completed. Otherwise a recovery rename in between can
+        // redirect this operator mutation into the quarantined old generation.
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let snapshot = self.state.config_snapshot();
         let cfg = DbPoolConfig {
             database_url: snapshot.raw_database_url,

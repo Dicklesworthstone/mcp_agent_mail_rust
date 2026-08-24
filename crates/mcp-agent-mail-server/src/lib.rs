@@ -5277,7 +5277,7 @@ fn dispatch_compose_envelope(
     // completion/error, otherwise compose can write into the quarantined old
     // generation after a promotion races the open.
     let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-    let Some(conn) = tui_poller::open_sync_connection_pub(database_url) else {
+    let Some(conn) = tui_poller::open_sync_write_connection_pub(database_url) else {
         tracing::warn!("compose: cannot open DB for send");
         tui_state.push_console_log(
             "\u{274c} Compose: could not open database — message not sent".to_string(),
@@ -17478,6 +17478,7 @@ mod tests {
     static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static COMPOSE_WRITE_BARRIER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     #[test]
@@ -32385,6 +32386,110 @@ first body
             .and_then(|row| row.get_named::<i64>("c").ok())
             .unwrap_or_default();
         assert_eq!(new_recips, 1, "compose should add exactly one recipient");
+    }
+
+    #[test]
+    fn dispatch_compose_envelope_holds_write_lease_through_transaction_completion() {
+        let _serial = COMPOSE_WRITE_BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("compose_dispatch_write_lease.sqlite3");
+        setup_compose_dispatch_test_db(&db_path);
+
+        // Keep the actual compose transaction parked after it acquires the
+        // process write lease. This makes the lease observable at the real
+        // dispatch boundary without a test-only production hook.
+        let lock_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open compose lock connection");
+        lock_conn
+            .execute_sync("BEGIN EXCLUSIVE", &[])
+            .expect("hold compose fixture write lock");
+
+        let config = mcp_agent_mail_core::Config::default();
+        let tui_state = tui_bridge::TuiSharedState::new(&config);
+        let envelope = tui_compose::ComposeEnvelope {
+            sender_name: tui_compose::OVERSEER_AGENT_NAME.to_string(),
+            to: vec!["BlueLake".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "compose write lease".to_string(),
+            body_md: "compose write lease body".to_string(),
+            importance: "normal".to_string(),
+            thread_id: Some("compose-write-lease".to_string()),
+        };
+        let database_url = format!("sqlite://{}", db_path.display());
+        let baseline_writers = mcp_agent_mail_db::write_barrier::active_writer_count();
+        let dispatch = std::thread::spawn(move || {
+            dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+        });
+
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while mcp_agent_mail_db::write_barrier::active_writer_count() <= baseline_writers {
+            assert!(
+                !dispatch.is_finished(),
+                "compose returned before its write lease became observable"
+            );
+            assert!(
+                Instant::now() < wait_deadline,
+                "compose did not acquire its write lease before the test deadline"
+            );
+            std::thread::yield_now();
+        }
+
+        let (barrier, outcome) =
+            mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(Duration::ZERO);
+        assert!(
+            matches!(
+                outcome,
+                mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut {
+                    remaining_writers
+                } if remaining_writers > baseline_writers
+            ),
+            "promotion must time out while the actual compose dispatch owns its lease: {outcome:?}"
+        );
+        let messages_before_release = lock_conn
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("count messages while compose is parked")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            messages_before_release, 0,
+            "the blocked compose transaction must not have committed early"
+        );
+
+        lock_conn
+            .execute_sync("ROLLBACK", &[])
+            .expect("release compose fixture write lock");
+        dispatch.join().expect("compose dispatch thread");
+        let messages_after_release = lock_conn
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("count messages after compose completes")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            messages_after_release, 1,
+            "compose must commit after the database lock is released"
+        );
+        drop(barrier);
+
+        let (post_dispatch_barrier, post_dispatch_outcome) =
+            mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
+                Duration::from_secs(5),
+            );
+        assert!(
+            matches!(
+                post_dispatch_outcome,
+                mcp_agent_mail_db::write_barrier::DrainOutcome::Idle
+                    | mcp_agent_mail_db::write_barrier::DrainOutcome::Drained { .. }
+            ),
+            "promotion must become admissible after compose drops its lease: {post_dispatch_outcome:?}"
+        );
+        drop(post_dispatch_barrier);
     }
 
     #[test]

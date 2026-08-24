@@ -216,7 +216,7 @@ fn snapshot_file_identity_from_reader(
 ) -> DbResult<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).map_err(|error| {
             DbError::Sqlite(format!(

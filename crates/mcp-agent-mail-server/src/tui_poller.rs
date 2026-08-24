@@ -1071,10 +1071,32 @@ fn reservation_snapshot_gap_requires_refresh(
         >= i64::try_from(RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL.as_micros()).unwrap_or(i64::MAX)
 }
 
-/// Open a sync `SQLite` connection from a database URL (public for compose dispatch).
+/// Open a sync live-write `SQLite` connection from a database URL.
+///
+/// The compose dispatcher holds the process write-activity lease before it
+/// calls this function and through transaction completion. Keep this path
+/// separate from the best-effort observability opener: that reader may run a
+/// guarded fresh-schema bootstrap, which would otherwise nest a second writer
+/// acquisition after recovery has started draining the outer compose lease.
 #[must_use]
-pub fn open_sync_connection_pub(database_url: &str) -> Option<DbConn> {
-    open_sync_connection(database_url)
+pub fn open_sync_write_connection_pub(database_url: &str) -> Option<DbConn> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = crate::resolve_server_sync_sqlite_path(&cfg.sqlite_path().ok()?);
+    if path == ":memory:" {
+        return None;
+    }
+    crate::open_sync_db_connection_with_busy_timeout(
+        &path,
+        crate::BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+        "TUI compose dispatch",
+    )
+    .ok()
 }
 
 /// Open a sync `SQLite` connection from a database URL.

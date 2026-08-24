@@ -901,9 +901,11 @@ fn recovery_admission_blocked_error(primary_path: &Path, action: &str) -> SqlErr
 }
 
 /// Why an end-to-end automatic recovery envelope refused before or after the
-/// caller's operation. `CircuitOpen` is kept distinct so startup can park an
-/// automatic repair while still serving an existing live database, without
-/// confusing the refusal with an operation that actually ran and failed.
+/// caller's operation.
+///
+/// `CircuitOpen` is kept distinct so startup can park an automatic repair
+/// while still serving an existing live database, without confusing the
+/// refusal with an operation that actually ran and failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutomaticRecoveryAdmissionFailureKind {
     CircuitOpen,
@@ -979,10 +981,12 @@ where
     ))
 }
 
-/// Wrap an entire automatic recovery attempt, including any forensic capture
-/// or candidate construction performed by `operation`, in the durable breaker
-/// election. Nested recovery primitives on the same thread pass through via
-/// `RecoveryAdmissionDepthGuard` and cannot self-contend on the file lock.
+/// Wrap an entire automatic recovery attempt in the durable breaker election.
+///
+/// The envelope covers any forensic capture or candidate construction
+/// performed by `operation`. Nested recovery primitives on the same thread
+/// pass through via `RecoveryAdmissionDepthGuard` and cannot self-contend on
+/// the file lock.
 #[allow(clippy::result_large_err)]
 pub fn with_automatic_recovery_admission<T, E, F>(
     primary_path: &Path,
@@ -1007,8 +1011,8 @@ fn flatten_automatic_recovery_result<T>(
 ) -> Result<T, SqlError> {
     match result {
         Ok(value) => Ok(value),
-        Err(AutomaticRecoveryRunError::Admission { error, .. })
-        | Err(AutomaticRecoveryRunError::Operation(error)) => Err(error),
+        Err(AutomaticRecoveryRunError::Admission { error, .. }
+        | AutomaticRecoveryRunError::Operation(error)) => Err(error),
     }
 }
 

@@ -234,7 +234,7 @@ fn breaker_authority_link_count(file: &std::fs::File) -> std::io::Result<u64> {
     {
         use std::os::unix::fs::MetadataExt as _;
 
-        return Ok(file.metadata()?.nlink());
+        Ok(file.metadata()?.nlink())
     }
 
     #[cfg(windows)]
@@ -244,7 +244,7 @@ fn breaker_authority_link_count(file: &std::fs::File) -> std::io::Result<u64> {
         // add a safe stable wrapper before this platform can reject hard links
         // as strictly as Unix does.
         let _ = file;
-        return Ok(1);
+        Ok(1)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -389,11 +389,13 @@ fn open_breaker_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Content fingerprint of the database file: `len:sha256(bytes)`. A missing
-/// file fingerprints as `missing`; an unreadable one as `unreadable` (both
-/// stable, so failures on them still accumulate). Recovery is exceptional and
-/// correctness matters more than the cost of hashing the complete generation:
-/// a same-length repair beyond the first SQLite page must reset the breaker.
+/// Content fingerprint of the database file: `len:sha256(bytes)`.
+///
+/// A missing file fingerprints as `missing`; an unreadable one as
+/// `unreadable` (both stable, so failures on them still accumulate). Recovery
+/// is exceptional and correctness matters more than the cost of hashing the
+/// complete generation: a same-length repair beyond the first SQLite page must
+/// reset the breaker.
 #[must_use]
 pub fn fingerprint_db(db_path: &Path) -> String {
     let mut file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(db_path) {
@@ -405,7 +407,7 @@ pub fn fingerprint_db(db_path: &Path) -> String {
     };
     let len = file.metadata().map_or(0, |meta| meta.len());
     let mut hasher = sha2::Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         match file.read(&mut buffer) {
             Ok(0) => break,
