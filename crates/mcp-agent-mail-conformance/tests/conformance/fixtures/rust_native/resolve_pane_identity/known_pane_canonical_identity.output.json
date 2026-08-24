@@ -1,5 +1,6 @@
 {
   "agent_name": "BlueLake",
   "pane_id": "main:0:2",
-  "identity_path": "__CANONICAL_IDENTITY_PATH__"
+  "identity_path": "__CANONICAL_IDENTITY_PATH__",
+  "binding": "legacy-unverified"
 }

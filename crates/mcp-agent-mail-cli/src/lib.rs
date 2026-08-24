@@ -35739,10 +35739,10 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             let resolved = candidate_keys.iter().find_map(|key| {
-                mcp_agent_mail_core::resolve_identity_with_path(key, &effective_pane)
+                mcp_agent_mail_core::resolve_identity_with_binding(key, &effective_pane)
             });
 
-            let Some((agent_name, resolved_path)) = resolved else {
+            let Some((agent_name, resolved_path, binding)) = resolved else {
                 return Err(CliError::InvalidArgument(format!(
                     "no identity registered for pane '{effective_pane}' in project \
                      '{project_key}'; register one with `am agents register -p {project_key} \
@@ -35751,14 +35751,17 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             };
 
             // GH#240 contract: report the source category, never the identity
-            // file path or contents.
+            // file path or contents. GH#252 adds the binding status
+            // (verified-live / adopted-dead / legacy-unverified) alongside it.
             let source = mcp_agent_mail_core::identity_source_category(&resolved_path);
+            let binding = binding.as_str();
             let data = serde_json::json!({
                 "schema_version": "am.agents.resolve-pane.v1",
                 "agent_name": agent_name,
                 "pane_id": effective_pane,
                 "project_key": project_key,
                 "source": source,
+                "binding": binding,
             });
             output::emit_output(&data, fmt, || {
                 output::section("Pane Identity");
@@ -35766,6 +35769,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 output::kv("Pane", &effective_pane);
                 output::kv("Project", &project_key);
                 output::kv("Source", source);
+                output::kv("Binding", binding);
             });
             Ok(())
         }

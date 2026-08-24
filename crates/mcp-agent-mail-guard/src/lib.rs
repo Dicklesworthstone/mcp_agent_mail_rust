@@ -1668,6 +1668,12 @@ pub fn is_bypass_active() -> bool {
 /// An explicit `AGENT_NAME` remains authoritative. When it is absent, use the
 /// caller's current tmux-pane identity, which is the canonical identity
 /// handoff used by Agent Mail's session startup flows.
+///
+/// GH#252: the pane lookup runs the identity liveness predicate. When the
+/// pane's identity file is a binding verifiably live in a *different* pane,
+/// the resolver refuses to hand out that name and returns `None`; callers
+/// surface that as [`GuardError::MissingAgentName`] (never a panic), the same
+/// outcome as an unregistered pane.
 fn resolve_guard_agent_name(repo_root: &Path) -> Option<String> {
     if let Ok(explicit) = std::env::var("AGENT_NAME") {
         let explicit = explicit.trim();

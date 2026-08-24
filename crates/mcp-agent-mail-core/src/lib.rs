@@ -194,9 +194,11 @@ pub use models::{
     looks_like_program_name, looks_like_unix_username,
 };
 pub use pane_identity::{
-    canonical_identity_path, cleanup_all_stale_identities, cleanup_stale_identities,
-    get_composite_tmux_pane_id, identity_source_category, list_identities,
-    list_identities_with_paths, resolve_identity, resolve_identity_current_pane,
+    PaneBindingLiveness, PaneBindingStatus, PaneIdentityRecord, binding_liveness,
+    binding_liveness_with, canonical_identity_path, cleanup_all_stale_identities,
+    cleanup_stale_identities, get_composite_tmux_pane_id, identity_source_category,
+    is_agent_pane_command, list_identities, list_identities_with_paths, read_identity_record,
+    resolve_identity, resolve_identity_current_pane, resolve_identity_with_binding,
     resolve_identity_with_optional_pane, resolve_identity_with_path, write_identity,
     write_identity_current_pane, write_identity_with_optional_pane,
 };

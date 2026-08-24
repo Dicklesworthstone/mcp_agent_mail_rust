@@ -2713,9 +2713,13 @@ pub async fn whois(
 fn resolve_identity_from_project_keys(
     project_keys: &[String],
     pane_id: &str,
-) -> Option<(String, std::path::PathBuf)> {
+) -> Option<(
+    String,
+    std::path::PathBuf,
+    mcp_agent_mail_core::PaneBindingStatus,
+)> {
     project_keys.iter().find_map(|project_key| {
-        mcp_agent_mail_core::resolve_identity_with_path(project_key, pane_id)
+        mcp_agent_mail_core::resolve_identity_with_binding(project_key, pane_id)
     })
 }
 
@@ -2731,7 +2735,7 @@ fn resolve_identity_from_project_keys(
 /// # Conformance
 /// Rust-native.
 #[tool(
-    description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path }"
+    description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nEach candidate passes the GH#252 liveness predicate before it is returned: a binding verifiably live in a DIFFERENT pane is never handed out (the lookup reports not-found so the caller mints a fresh identity), a dead binding is adopted and rewritten with the caller pane's facts, and legacy bare-name files resolve under a conservative compatibility rule. The response's `binding` field reports which case applied: \"verified-live\", \"adopted-dead\", or \"legacy-unverified\".\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path, binding }"
 )]
 pub async fn resolve_pane_identity(
     ctx: &McpContext,
@@ -2783,11 +2787,12 @@ pub async fn resolve_pane_identity(
                 }),
             ))
         },
-        |(agent_name, resolved_path)| {
+        |(agent_name, resolved_path, binding)| {
             let response = json!({
                 "agent_name": agent_name,
                 "pane_id": effective_pane,
                 "identity_path": resolved_path.to_string_lossy(),
+                "binding": binding.as_str(),
             });
             serde_json::to_string(&response)
                 .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))

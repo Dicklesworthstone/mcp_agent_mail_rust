@@ -10,7 +10,15 @@
 //! - **Path**: `~/.config/agent-mail/identity/<project_hash>/<pane_key>`
 //! - **Pane key**: Composite `session_name:window_index:pane_index` via
 //!   `tmux display-message`, falling back to bare `$TMUX_PANE` (see #41).
-//! - **Content**: Plain text file containing the agent name (trimmed, single line)
+//! - **Content**: JSON [`PaneIdentityRecord`] carrying the agent name plus the
+//!   tmux binding facts (`session_name`, `pane_id`, `pane_pid`, `socket_path`,
+//!   `written_at`) needed to verify liveness (GH#252). Legacy bare-name files
+//!   (plain text, single line) parse as a record with only `name` set.
+//! - **Liveness**: A recorded binding is live iff the tmux server at the
+//!   recorded `socket_path` reports the recorded pane in the recorded session
+//!   with the recorded root `pane_pid` and a non-shell foreground command
+//!   (see [`binding_liveness`]). Resolution never hands a live binding's name
+//!   to a different pane; dead bindings are adopted in place (GH#252).
 //! - **Fallback**: Reads from legacy bare-pane-ID files and older paths for
 //!   backwards compatibility
 //! - **Cleanup**: Stale identity files (panes that no longer exist) can be pruned
@@ -32,6 +40,24 @@ const IDENTITY_DIR_NAME: &str = "agent-mail/identity";
 /// How many hex chars of the project hash to use in the directory name.
 const PROJECT_HASH_LEN: usize = 12;
 
+/// tmux format used to probe a recorded binding's liveness on its own server.
+const LIVENESS_PROBE_FORMAT: &str = "#{session_name}\t#{pane_pid}\t#{pane_current_command}";
+
+/// tmux format used to gather the binding facts of the pane a caller is
+/// writing or resolving (the reuse-seed pane named by the identity key).
+const TARGET_FACTS_FORMAT: &str =
+    "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{socket_path}";
+
+/// Plain interactive shells. A pane whose foreground command is one of these
+/// (or empty) has no agent running in it — the agent exited back to its shell —
+/// so it fails liveness check (c). Runtime wrappers (`node`, `bun`, `python`,
+/// ...) intentionally do NOT appear here: agents commonly run under them, and
+/// treating an unknown command as live is the conservative choice (it blocks
+/// name theft rather than enabling it).
+const SHELL_COMMANDS: &[&str] = &[
+    "ash", "bash", "csh", "dash", "fish", "ksh", "login", "nu", "pwsh", "sh", "tcsh", "zsh",
+];
+
 #[cfg(test)]
 static TEST_CONFIG_BASE_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
@@ -43,6 +69,252 @@ static TEST_LIVE_TMUX_PANES: std::sync::LazyLock<std::sync::Mutex<Option<Vec<Str
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Structured pane-identity record stored in identity files (GH#252).
+///
+/// The `name` is the agent name (the only field a legacy bare-name file
+/// carries). The remaining fields are the tmux binding facts recorded at write
+/// time so later resolutions can verify whether the binding is still live:
+///
+/// - `session_name`: `#{session_name}` of the bound pane
+/// - `pane_id`: bare tmux pane id (e.g. `%25`) — stable for the pane's lifetime
+/// - `pane_pid`: `#{pane_pid}`, the root process tmux spawned in the pane
+/// - `socket_path`: the tmux server socket the pane lives on
+/// - `written_at`: RFC 3339 timestamp of the write (informational)
+///
+/// Records written outside tmux carry only `name` and are unverifiable, which
+/// preserves the pre-GH#252 trust-the-file behavior for non-tmux callers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaneIdentityRecord {
+    /// Agent name bound to the pane (e.g. `BlueLake`).
+    pub name: String,
+    /// tmux `#{session_name}` recorded at write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// Bare tmux pane id (e.g. `%25`) recorded at write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    /// tmux `#{pane_pid}` recorded at write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_pid: Option<u32>,
+    /// tmux server socket path recorded at write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<String>,
+    /// RFC 3339 timestamp of the write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at: Option<String>,
+}
+
+impl PaneIdentityRecord {
+    /// Build a record carrying only the agent name (legacy-equivalent).
+    #[must_use]
+    pub fn bare(name: &str) -> Self {
+        Self {
+            name: name.trim().to_string(),
+            session_name: None,
+            pane_id: None,
+            pane_pid: None,
+            socket_path: None,
+            written_at: None,
+        }
+    }
+
+    /// Whether the record carries every fact the liveness predicate needs.
+    #[must_use]
+    pub const fn is_verifiable(&self) -> bool {
+        self.session_name.is_some()
+            && self.pane_id.is_some()
+            && self.pane_pid.is_some()
+            && self.socket_path.is_some()
+    }
+}
+
+/// Outcome of the GH#252 liveness predicate for a recorded pane binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneBindingLiveness {
+    /// All three checks passed: the recorded pane exists in the recorded
+    /// session on the recorded socket, its root pid matches, and an agent
+    /// (non-shell) command is running in it.
+    Live,
+    /// Any check failed: tmux answered and the recorded pane/session/pid/
+    /// command no longer hold, the server at the recorded socket is gone, or
+    /// the socket file itself no longer exists.
+    Dead,
+    /// The predicate could not be run: the record does not carry the facts
+    /// it needs (legacy bare-name file, or a record written outside tmux),
+    /// or the `tmux` binary cannot be executed by this process. The latter
+    /// is deliberately NOT `Dead`: a daemon whose `PATH` lacks tmux must not
+    /// see every structured record as adoptable/purgeable.
+    Unverifiable,
+}
+
+/// How a resolved pane identity relates to the liveness contract (GH#252).
+///
+/// Extends the GH#240 source-category surface: tool/CLI output reports this
+/// alongside [`identity_source_category`] (which keeps its existing variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneBindingStatus {
+    /// The record's binding passed the liveness predicate and the resolving
+    /// pane is the recorded holder.
+    VerifiedLive,
+    /// The record's binding was dead; the resolving pane adopted the name
+    /// (the record was rewritten with the adopter's binding facts when they
+    /// were available).
+    AdoptedDead,
+    /// The record was unverifiable (legacy bare-name or written outside
+    /// tmux) and was returned under the conservative compatibility rule.
+    LegacyUnverified,
+}
+
+impl PaneBindingStatus {
+    /// Stable string form surfaced in tool/CLI output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedLive => "verified-live",
+            Self::AdoptedDead => "adopted-dead",
+            Self::LegacyUnverified => "legacy-unverified",
+        }
+    }
+}
+
+/// Classify whether a tmux `#{pane_current_command}` value looks like a
+/// running agent process (liveness check (c) of GH#252).
+///
+/// An empty command means the pane's process is gone; a plain interactive
+/// shell means the agent exited back to its shell. Anything else — including
+/// runtime wrappers like `node`, `bun`, or `python` that agents commonly run
+/// under — counts as an agent, which is the conservative direction: unknown
+/// commands block adoption rather than enabling name theft.
+#[must_use]
+pub fn is_agent_pane_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    let base = first.rsplit('/').next().unwrap_or(first);
+    // Login shells report as e.g. `-bash`.
+    let base = base.strip_prefix('-').unwrap_or(base);
+    !SHELL_COMMANDS.contains(&base)
+}
+
+/// Run the GH#252 liveness predicate for a recorded binding against the tmux
+/// server at the recorded `socket_path`.
+///
+/// A binding is [`PaneBindingLiveness::Live`] iff:
+///
+/// 1. `tmux -S <socket> display-message -t <pane_id> -p '#{session_name}'`
+///    succeeds and equals the recorded `session_name`;
+/// 2. that pane's `#{pane_pid}` equals the recorded `pane_pid` (compared
+///    against what tmux reports — never `kill -0` on a host pid);
+/// 3. `#{pane_current_command}` is non-empty and not a plain shell
+///    (see [`is_agent_pane_command`]).
+///
+/// Any failing check — including a missing socket or an unreachable server —
+/// yields [`PaneBindingLiveness::Dead`]. Records without binding facts, and
+/// records that cannot be checked because `tmux` itself cannot be executed
+/// by this process, yield [`PaneBindingLiveness::Unverifiable`].
+#[must_use]
+pub fn binding_liveness(record: &PaneIdentityRecord) -> PaneBindingLiveness {
+    if !record.is_verifiable() {
+        return PaneBindingLiveness::Unverifiable;
+    }
+    if let Some(socket) = record.socket_path.as_deref()
+        && !Path::new(socket).exists()
+    {
+        return PaneBindingLiveness::Dead;
+    }
+    // Distinguish "tmux ran and said no" (Dead) from "tmux could not be
+    // spawned at all" (Unverifiable). Only the former is evidence about the
+    // binding; the latter says nothing and must not enable adoption or
+    // cleanup purges.
+    let mut tmux_unavailable = false;
+    let outcome = binding_liveness_with(record, |args| match run_tmux_capture(args) {
+        Ok(stdout) => stdout,
+        Err(_) => {
+            tmux_unavailable = true;
+            None
+        }
+    });
+    if tmux_unavailable {
+        return PaneBindingLiveness::Unverifiable;
+    }
+    outcome
+}
+
+/// Pure form of [`binding_liveness`]: the tmux invocation is supplied by the
+/// caller so tests can fake server responses without shelling out.
+///
+/// `run_tmux` receives the full tmux argument vector (starting with `-S
+/// <socket>`) and returns the command's stdout on success, or `None` when the
+/// command fails. This variant does not check that the socket exists on disk;
+/// [`binding_liveness`] does that before delegating here.
+pub fn binding_liveness_with<F>(record: &PaneIdentityRecord, mut run_tmux: F) -> PaneBindingLiveness
+where
+    F: FnMut(&[&str]) -> Option<String>,
+{
+    let (Some(session_name), Some(recorded_pane), Some(recorded_pid), Some(socket_path)) = (
+        record.session_name.as_deref(),
+        record.pane_id.as_deref(),
+        record.pane_pid,
+        record.socket_path.as_deref(),
+    ) else {
+        return PaneBindingLiveness::Unverifiable;
+    };
+
+    let Some(output) = run_tmux(&[
+        "-S",
+        socket_path,
+        "display-message",
+        "-t",
+        recorded_pane,
+        "-p",
+        LIVENESS_PROBE_FORMAT,
+    ]) else {
+        return PaneBindingLiveness::Dead;
+    };
+
+    let Some(line) = output.lines().next() else {
+        return PaneBindingLiveness::Dead;
+    };
+    let mut fields = line.split('\t');
+    let (Some(reported_session), Some(reported_pid), Some(reported_command)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return PaneBindingLiveness::Dead;
+    };
+
+    if reported_session.trim() != session_name {
+        return PaneBindingLiveness::Dead;
+    }
+    if reported_pid.trim().parse::<u32>() != Ok(recorded_pid) {
+        return PaneBindingLiveness::Dead;
+    }
+    if !is_agent_pane_command(reported_command) {
+        return PaneBindingLiveness::Dead;
+    }
+    PaneBindingLiveness::Live
+}
+
+/// Read and parse the identity record at `path`.
+///
+/// Applies the same symlink hardening as the name-only reader. A legacy
+/// bare-name file parses as a record with only `name` set; a JSON file parses
+/// as the full [`PaneIdentityRecord`]. Returns `None` for missing, empty, or
+/// malformed files.
+#[must_use]
+pub fn read_identity_record(path: &Path) -> Option<PaneIdentityRecord> {
+    if path_has_symlinked_parent(path).ok()? {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let content = read_identity_file_no_follow(path).ok()?;
+    parse_identity_record(&content)
+}
 
 /// Compute the canonical identity file path for a given project and tmux pane.
 ///
@@ -63,10 +335,27 @@ pub fn canonical_identity_path(project_key: &str, pane_id: &str) -> PathBuf {
 /// Creates parent directories as needed. Returns the path written to on
 /// success, or an IO error on failure.
 ///
+/// The file content is a structured [`PaneIdentityRecord`] (GH#252): when the
+/// target pane can be queried via tmux, the record carries the pane's binding
+/// facts (`session_name`, `pane_id`, `pane_pid`, `socket_path`, `written_at`)
+/// so later resolutions can verify liveness. Outside tmux the record carries
+/// only the name, preserving the previous unverifiable behavior.
+///
+/// When the existing record at the path is a verifiably LIVE binding held by
+/// a *different* pane than the one being written, the write is refused
+/// (GH#252 adoption rule: never steal a live holder's slot silently). Callers
+/// treat identity-file writes as best-effort, so a refusal degrades to their
+/// existing warn-and-continue paths.
+///
 /// # Arguments
 /// - `project_key`: Absolute path to the project directory (used for hashing)
 /// - `pane_id`: Tmux pane identifier (e.g., `%0`)
 /// - `agent_name`: The agent name to write (e.g., `BlueLake`)
+///
+/// # Errors
+/// Returns an IO error when directories cannot be created, when the path or a
+/// parent is symlinked, when the existing record is a live binding held by a
+/// different pane, or when the write itself fails.
 pub fn write_identity(
     project_key: &str,
     pane_id: &str,
@@ -85,7 +374,33 @@ pub fn write_identity(
             ),
         ));
     }
-    write_identity_file_no_follow(&path, format!("{}\n", agent_name.trim()).as_bytes())?;
+
+    let facts = query_target_pane_facts(pane_id);
+
+    // GH#252: never overwrite a verifiably live binding held by another pane.
+    if let Some(existing) = read_identity_record(&path)
+        && existing.is_verifiable()
+        && binding_liveness(&existing) == PaneBindingLiveness::Live
+    {
+        let same_holder = facts.as_ref().is_some_and(|f| {
+            existing.pane_id.as_deref() == Some(f.pane_id.as_str())
+                && existing.socket_path.as_deref() == Some(f.socket_path.as_str())
+        });
+        if !same_holder {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to overwrite live pane identity binding '{}' at {}: \
+                     the recorded pane is still running an agent",
+                    existing.name,
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    let record = record_from_facts(agent_name, facts.as_ref());
+    write_record_content_no_follow(&path, &record)?;
     Ok(path)
 }
 
@@ -112,12 +427,51 @@ pub fn resolve_identity(project_key: &str, pane_id: &str) -> Option<String> {
 /// When `pane_id` is a composite key (contains `:`), also tries a legacy
 /// lookup using the bare `$TMUX_PANE` value to ensure backwards compatibility
 /// with identity files written before the composite key migration.
+///
+/// Every candidate found by the lookup passes through the GH#252 liveness
+/// predicate before being returned; see [`resolve_identity_with_binding`] for
+/// the adoption semantics (this wrapper simply discards the binding status).
 #[must_use]
 pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(String, PathBuf)> {
+    resolve_identity_with_binding(project_key, pane_id).map(|(name, path, _)| (name, path))
+}
+
+/// Resolve the agent name, identity file path, and GH#252 binding status.
+///
+/// Follows the exact lookup order of [`resolve_identity_with_path`] (key
+/// formats and lookup order are unchanged by GH#252 — the positional key is
+/// the reuse *seed*, not the trust anchor). Each candidate record found is
+/// classified with the liveness predicate before being returned:
+///
+/// - **live** binding held by the resolving pane → returned as
+///   [`PaneBindingStatus::VerifiedLive`];
+/// - **live** binding held by a *different* pane → the candidate is skipped
+///   (never hand a live agent's name to a second process) and the lookup
+///   continues; when no candidate survives, `None` is returned so the caller
+///   mints a fresh identity;
+/// - **dead** binding → adopted: the name is returned as
+///   [`PaneBindingStatus::AdoptedDead`] and the record is atomically
+///   rewritten (best-effort) with the resolving pane's own binding facts;
+/// - **unverifiable** record (legacy bare-name, written outside tmux, or a
+///   structured record this process cannot check because `tmux` is not
+///   executable here):
+///   conservative compatibility — if the pane named by the file's key exists
+///   and is running an agent, the record is returned untouched as
+///   [`PaneBindingStatus::LegacyUnverified`]; if the pane is gone or idles in
+///   a plain shell, the name is adopted (upgrading the file to a structured
+///   record) as [`PaneBindingStatus::AdoptedDead`]; without any tmux context
+///   the name is returned untouched, preserving pre-GH#252 behavior.
+#[must_use]
+pub fn resolve_identity_with_binding(
+    project_key: &str,
+    pane_id: &str,
+) -> Option<(String, PathBuf, PaneBindingStatus)> {
+    let mut resolver = PaneBindingResolver::new(pane_id);
+
     // 1. Canonical path (composite or bare)
     let canonical = canonical_identity_path(project_key, pane_id);
-    if let Some(name) = read_identity_file(&canonical) {
-        return Some((name, canonical));
+    if let Some(hit) = resolver.consider(canonical) {
+        return Some(hit);
     }
 
     // 1b. If pane_id is a composite key, try legacy bare $TMUX_PANE canonical path.
@@ -130,8 +484,8 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
         let bare = bare.trim().to_string();
         if !bare.is_empty() {
             let legacy_canonical = canonical_identity_path(project_key, &bare);
-            if let Some(name) = read_identity_file(&legacy_canonical) {
-                return Some((name, legacy_canonical));
+            if let Some(hit) = resolver.consider(legacy_canonical) {
+                return Some(hit);
             }
         }
     }
@@ -147,8 +501,8 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
         && composite != pane_id
     {
         let composite_canonical = canonical_identity_path(project_key, &composite);
-        if let Some(name) = read_identity_file(&composite_canonical) {
-            return Some((name, composite_canonical));
+        if let Some(hit) = resolver.consider(composite_canonical) {
+            return Some(hit);
         }
     }
 
@@ -159,8 +513,8 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
             .join(".claude")
             .join("agent-mail")
             .join(format!("identity.{sanitized}"));
-        if let Some(name) = read_identity_file(&legacy_claude) {
-            return Some((name, legacy_claude));
+        if let Some(hit) = resolver.consider(legacy_claude) {
+            return Some(hit);
         }
 
         // 2b. If composite key, also try bare pane ID for legacy Claude Code path
@@ -173,8 +527,8 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
                     .join(".claude")
                     .join("agent-mail")
                     .join(format!("identity.{bare_sanitized}"));
-                if let Some(name) = read_identity_file(&legacy_claude_bare) {
-                    return Some((name, legacy_claude_bare));
+                if let Some(hit) = resolver.consider(legacy_claude_bare) {
+                    return Some(hit);
                 }
             }
         }
@@ -184,8 +538,8 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
     let hash = project_hash(project_key);
     let sanitized = sanitize_pane_id(pane_id);
     let legacy_ntm = PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{sanitized}"));
-    if let Some(name) = read_identity_file(&legacy_ntm) {
-        return Some((name, legacy_ntm));
+    if let Some(hit) = resolver.consider(legacy_ntm) {
+        return Some(hit);
     }
 
     // 3b. If composite key, also try bare pane ID for legacy NTM path
@@ -196,8 +550,8 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
         if bare_sanitized != sanitized {
             let legacy_ntm_bare =
                 PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{bare_sanitized}"));
-            if let Some(name) = read_identity_file(&legacy_ntm_bare) {
-                return Some((name, legacy_ntm_bare));
+            if let Some(hit) = resolver.consider(legacy_ntm_bare) {
+                return Some(hit);
             }
         }
     }
@@ -216,6 +570,11 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
 /// - `legacy-claude`: `~/.claude/agent-mail/identity.<pane_id>`
 /// - `legacy-ntm`: `/tmp/agent-mail-name.<project_hash>.<pane_id>`
 /// - `compatible`: any other path a fallback rule matched
+///
+/// GH#252 extends this surface with the binding status of the resolution
+/// (`verified-live` / `adopted-dead` / `legacy-unverified`); callers obtain it
+/// from [`resolve_identity_with_binding`] via [`PaneBindingStatus::as_str`]
+/// and report it alongside this category (existing variants are unchanged).
 #[must_use]
 pub fn identity_source_category(path: &Path) -> &'static str {
     let canonical_root = config_base_dir().join(IDENTITY_DIR_NAME);
@@ -293,9 +652,16 @@ pub fn write_identity_with_optional_pane(
 
 /// Remove stale identity files for panes that no longer exist.
 ///
-/// Queries tmux for active composite pane keys and bare pane IDs, then removes
-/// any identity files under the given project hash directory whose names do
-/// not correspond to a live pane.
+/// Structured records (GH#252) are judged by the liveness predicate against
+/// their recorded socket: a record that passes is never removed; a record
+/// whose binding is dead is purged, including one whose socket no longer
+/// exists — provided tmux reports at least one live pane on this host (with
+/// no local panes at all, socket-gone records are retained; see
+/// `identity_entry_is_stale`). Legacy/unverifiable files, and structured
+/// records that cannot be checked because tmux is not executable here, keep
+/// the historical behavior: they are matched against tmux's live
+/// composite/bare pane keys, and left untouched when tmux is not running
+/// (to avoid accidentally removing everything).
 ///
 /// Returns the list of removed file paths.
 #[must_use]
@@ -316,15 +682,7 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
     };
 
     for entry in entries.flatten() {
-        let file_name = entry.file_name();
-
-        // If tmux is not running (empty live_panes list), skip cleanup
-        // to avoid accidentally removing everything.
-        if live_panes.is_empty() {
-            break;
-        }
-
-        if !file_name_matches_live_pane(&file_name, &live_panes) {
+        if identity_entry_is_stale(&entry, &live_panes) {
             let path = entry.path();
             if dir_entry_is_real_file(&entry) && std::fs::remove_file(&path).is_ok() {
                 removed.push(path);
@@ -338,7 +696,8 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
 /// Clean up stale identities across all project hash directories.
 ///
 /// Iterates over every `<project_hash>/` directory under the identity root
-/// and prunes files for dead panes. Returns all removed file paths.
+/// and prunes files for dead panes using the same per-record rules as
+/// [`cleanup_stale_identities`]. Returns all removed file paths.
 #[must_use]
 pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
     let mut removed = Vec::new();
@@ -350,10 +709,6 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
     }
 
     let live_panes = list_live_tmux_panes();
-    if live_panes.is_empty() {
-        // tmux not running or no panes — skip to avoid wiping everything
-        return removed;
-    }
 
     let Ok(entries) = std::fs::read_dir(&identity_root) else {
         return removed;
@@ -368,8 +723,7 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
             continue;
         };
         for file_entry in files.flatten() {
-            let file_name = file_entry.file_name();
-            if !file_name_matches_live_pane(&file_name, &live_panes) {
+            if identity_entry_is_stale(&file_entry, &live_panes) {
                 let path = file_entry.path();
                 if dir_entry_is_real_file(&file_entry) && std::fs::remove_file(&path).is_ok() {
                     removed.push(path);
@@ -562,23 +916,284 @@ fn sanitize_pane_id(pane_id: &str) -> String {
     }
 }
 
-/// Read and trim the contents of an identity file. Returns `None` if the
-/// file doesn't exist or is empty.
+/// Read the agent name from an identity file (structured record or legacy
+/// bare-name). Returns `None` if the file doesn't exist, is empty, or holds
+/// a malformed record.
 fn read_identity_file(path: &Path) -> Option<String> {
-    if path_has_symlinked_parent(path).ok()? {
-        return None;
-    }
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if !metadata.file_type().is_file() {
-        return None;
-    }
-    let content = read_identity_file_no_follow(path).ok()?;
-    let trimmed = content.trim().to_string();
+    read_identity_record(path).map(|record| record.name)
+}
+
+/// Parse identity-file content: a JSON [`PaneIdentityRecord`], or a legacy
+/// bare-name line which becomes a record with only `name` set.
+fn parse_identity_record(content: &str) -> Option<PaneIdentityRecord> {
+    let trimmed = content.trim();
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
+        return None;
     }
+    if trimmed.starts_with('{') {
+        let record = serde_json::from_str::<PaneIdentityRecord>(trimmed).ok()?;
+        let name = record.name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if name == record.name {
+            return Some(record);
+        }
+        return Some(PaneIdentityRecord {
+            name: name.to_string(),
+            ..record
+        });
+    }
+    Some(PaneIdentityRecord::bare(trimmed))
+}
+
+/// Serialize a record and write it through the symlink-hardened writer.
+fn write_record_content_no_follow(path: &Path, record: &PaneIdentityRecord) -> std::io::Result<()> {
+    let json = serde_json::to_string(record)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_identity_file_no_follow(path, format!("{json}\n").as_bytes())
+}
+
+/// Binding facts of the pane a caller is writing or resolving, gathered from
+/// the tmux server reachable in the caller's environment.
+#[derive(Debug, Clone)]
+struct TargetPaneFacts {
+    session_name: String,
+    pane_id: String,
+    pane_pid: u32,
+    current_command: String,
+    socket_path: String,
+}
+
+/// Convert an identity pane key into a tmux target specifier.
+///
+/// Bare pane ids (`%3`) are already valid targets. Composite keys
+/// (`session:window:pane`) become tmux's `session:window.pane` target form.
+fn pane_target_for(pane_id: &str) -> Option<String> {
+    let pane = pane_id.trim();
+    if pane.is_empty() {
+        return None;
+    }
+    if !pane.contains(':') {
+        return Some(pane.to_string());
+    }
+    let mut parts = pane.rsplitn(3, ':');
+    let pane_index = parts.next()?;
+    let window_index = parts.next()?;
+    parts.next().map_or_else(
+        || Some(pane.to_string()),
+        |session| Some(format!("{session}:{window_index}.{pane_index}")),
+    )
+}
+
+/// Query tmux (in the caller's environment) for the binding facts of the pane
+/// named by `pane_id`. Returns `None` when tmux is unavailable or the pane
+/// does not exist — the caller then behaves as it did before GH#252.
+fn query_target_pane_facts(pane_id: &str) -> Option<TargetPaneFacts> {
+    let target = pane_target_for(pane_id)?;
+    let output = tmux_command()
+        .args(["display-message", "-t", &target, "-p", TARGET_FACTS_FORMAT])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_target_facts_line(stdout.lines().next()?)
+}
+
+/// Parse one `TARGET_FACTS_FORMAT` line into [`TargetPaneFacts`].
+fn parse_target_facts_line(line: &str) -> Option<TargetPaneFacts> {
+    let mut fields = line.split('\t');
+    let session_name = fields.next()?.trim().to_string();
+    let pane = fields.next()?.trim().to_string();
+    let root_pid = fields.next()?.trim().parse::<u32>().ok()?;
+    let current_command = fields.next()?.trim().to_string();
+    let socket_path = fields.next()?.trim().to_string();
+    if session_name.is_empty() || pane.is_empty() {
+        return None;
+    }
+    let socket_path = if socket_path.is_empty() {
+        tmux_env_socket_path().unwrap_or_default()
+    } else {
+        socket_path
+    };
+    Some(TargetPaneFacts {
+        session_name,
+        pane_id: pane,
+        pane_pid: root_pid,
+        current_command,
+        socket_path,
+    })
+}
+
+/// Socket path from `$TMUX` (`socket_path,server_pid,session_index`).
+fn tmux_env_socket_path() -> Option<String> {
+    crate::config::process_env_value("TMUX").and_then(|value| {
+        let first = value.split(',').next()?.trim().to_string();
+        if first.is_empty() { None } else { Some(first) }
+    })
+}
+
+/// Build a structured record for `name` from optional target-pane facts.
+fn record_from_facts(name: &str, facts: Option<&TargetPaneFacts>) -> PaneIdentityRecord {
+    facts.map_or_else(
+        || PaneIdentityRecord::bare(name),
+        |f| PaneIdentityRecord {
+            name: name.trim().to_string(),
+            session_name: Some(f.session_name.clone()),
+            pane_id: Some(f.pane_id.clone()),
+            pane_pid: Some(f.pane_pid),
+            socket_path: if f.socket_path.is_empty() {
+                None
+            } else {
+                Some(f.socket_path.clone())
+            },
+            written_at: Some(chrono::Utc::now().to_rfc3339()),
+        },
+    )
+}
+
+/// Best-effort adoption rewrite: bind `name` to the adopter's pane facts at
+/// the identity file that produced the candidate (upgrading legacy files to
+/// structured records in place). IO failures are ignored — adoption must not
+/// break resolution.
+fn adopt_record_at(path: &Path, name: &str, facts: &TargetPaneFacts) {
+    if path_has_symlinked_parent(path).unwrap_or(true) {
+        return;
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return;
+    }
+    let record = record_from_facts(name, Some(facts));
+    let _ = write_record_content_no_follow(path, &record);
+}
+
+/// Per-resolution classifier implementing the GH#252 adoption rule.
+///
+/// Lazily gathers the target pane's facts once (the pane named by the
+/// caller's `pane_id` argument — the reuse-seed slot every candidate key in
+/// the lookup order describes) and classifies each candidate record found.
+struct PaneBindingResolver {
+    pane_arg: String,
+    facts_queried: bool,
+    facts: Option<TargetPaneFacts>,
+}
+
+impl PaneBindingResolver {
+    fn new(pane_id: &str) -> Self {
+        Self {
+            pane_arg: pane_id.to_string(),
+            facts_queried: false,
+            facts: None,
+        }
+    }
+
+    fn target_facts(&mut self) -> Option<&TargetPaneFacts> {
+        if !self.facts_queried {
+            self.facts = query_target_pane_facts(&self.pane_arg);
+            self.facts_queried = true;
+        }
+        self.facts.as_ref()
+    }
+
+    /// Classify the candidate at `path`. Returns `Some` when the candidate is
+    /// returnable (verified-live for this pane, adopted-dead, or legacy
+    /// compatibility), `None` when there is no usable record — or when the
+    /// record is a LIVE binding held by a different pane, in which case the
+    /// lookup continues and ultimately mints a fresh identity.
+    fn consider(&mut self, path: PathBuf) -> Option<(String, PathBuf, PaneBindingStatus)> {
+        let record = read_identity_record(&path)?;
+        match binding_liveness(&record) {
+            PaneBindingLiveness::Live => {
+                let holder_matches = self.target_facts().is_some_and(|f| {
+                    record.pane_id.as_deref() == Some(f.pane_id.as_str())
+                        && record.socket_path.as_deref() == Some(f.socket_path.as_str())
+                });
+                if holder_matches {
+                    return Some((record.name, path, PaneBindingStatus::VerifiedLive));
+                }
+                // Live holder elsewhere: never adopt, never return.
+                None
+            }
+            PaneBindingLiveness::Dead => {
+                if let Some(facts) = self.target_facts().cloned() {
+                    adopt_record_at(&path, &record.name, &facts);
+                }
+                Some((record.name, path, PaneBindingStatus::AdoptedDead))
+            }
+            PaneBindingLiveness::Unverifiable => {
+                // Legacy bare-name record, a record written outside tmux, or
+                // a structured record this process cannot check because tmux
+                // is not executable here: verify what is checkable. If the
+                // pane named by the file's key exists and runs an agent, treat
+                // as live (conservative — blocks theft, and the resolver at
+                // this key is that pane); if it idles in a shell, adopt,
+                // upgrading the file to a structured record; with no tmux
+                // context at all, return the name untouched (pre-GH#252
+                // behavior).
+                match self.target_facts().cloned() {
+                    Some(facts) if is_agent_pane_command(&facts.current_command) => {
+                        Some((record.name, path, PaneBindingStatus::LegacyUnverified))
+                    }
+                    Some(facts) => {
+                        adopt_record_at(&path, &record.name, &facts);
+                        Some((record.name, path, PaneBindingStatus::AdoptedDead))
+                    }
+                    None => Some((record.name, path, PaneBindingStatus::LegacyUnverified)),
+                }
+            }
+        }
+    }
+}
+
+/// Decide whether a cleanup candidate file is stale (GH#252).
+///
+/// Structured records use the liveness predicate: a live binding is never
+/// removed; a dead one — including a record whose socket is gone — is stale.
+/// Legacy files, and structured records this process cannot check (tmux not
+/// executable), keep the historical rule: stale when their file name matches
+/// no live tmux pane key, and never stale while tmux reports no panes at all
+/// (so a stopped or unreachable tmux cannot wipe identities).
+///
+/// Conservative retention: a record whose socket is gone is purged only when
+/// tmux reports at least one live pane on this host. With no local panes at
+/// all we cannot tell "that server was killed" from "these records were
+/// written on another host sharing this config directory" (cross-host panes
+/// are out of scope for GH#252 but must not be destroyed); the records are
+/// harmless to keep and become adoptable/purgeable once a local server runs.
+fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> bool {
+    let path = entry.path();
+    let record = read_identity_record(&path);
+    match record.as_ref().map(binding_liveness) {
+        Some(PaneBindingLiveness::Live) => false,
+        Some(PaneBindingLiveness::Dead) => {
+            let socket_gone = record
+                .as_ref()
+                .and_then(|r| r.socket_path.as_deref())
+                .is_some_and(|socket| !Path::new(socket).exists());
+            !(socket_gone && live_panes.is_empty())
+        }
+        Some(PaneBindingLiveness::Unverifiable) | None => {
+            if live_panes.is_empty() {
+                return false;
+            }
+            !file_name_matches_live_pane(&entry.file_name(), live_panes)
+        }
+    }
+}
+
+/// Run tmux with `args`.
+///
+/// `Err` means tmux could not be executed at all (binary missing, not
+/// executable, ...); `Ok(None)` means tmux ran but exited non-zero;
+/// `Ok(Some(stdout))` is a successful invocation.
+fn run_tmux_capture(args: &[&str]) -> std::io::Result<Option<String>> {
+    let output = tmux_command().args(args).output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
 #[cfg(unix)]
@@ -683,14 +1298,22 @@ fn tmux_pane_env() -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn tmux_command() -> std::process::Command {
-    #[cfg(test)]
-    if let Some(path) = crate::config::process_env_value("AM_TEST_TMUX_BIN")
+    // Unit tests are hermetic: they must never consult a real tmux server.
+    // Tests that want tmux behavior install a stub via AM_TEST_TMUX_BIN;
+    // everything else gets a command that cannot execute, so shell-outs fail
+    // deterministically regardless of the developer's tmux environment.
+    crate::config::process_env_value("AM_TEST_TMUX_BIN")
         .filter(|value| !value.trim().is_empty())
-    {
-        return std::process::Command::new(path);
-    }
+        .map_or_else(
+            || std::process::Command::new("/nonexistent/am-test-tmux-disabled"),
+            std::process::Command::new,
+        )
+}
 
+#[cfg(not(test))]
+fn tmux_command() -> std::process::Command {
     std::process::Command::new("tmux")
 }
 
@@ -1591,5 +2214,887 @@ mod tests {
         assert_eq!(resolved.1, legacy_ntm);
 
         let _ = std::fs::remove_file(&resolved.1);
+    }
+
+    // -- GH#252: structured records, liveness predicate, adoption rule -------
+
+    /// Write an executable tmux stub and return its path as a string.
+    #[cfg(unix)]
+    fn write_tmux_stub(dir: &Path, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("tmux");
+        std::fs::write(&path, script).expect("write tmux stub");
+        let mut perms = std::fs::metadata(&path)
+            .expect("tmux stub metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod tmux stub");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Build a tmux stub that answers the record-side liveness probe (invoked
+    /// with `-S <socket>`) with `liveness_body` and the target-facts query
+    /// (no `-S`) with `target_body`. Bodies are raw `sh` snippets; use
+    /// `stub_print(line)` for a success response and `"exit 1"` for failure.
+    #[cfg(unix)]
+    fn liveness_stub_script(liveness_body: &str, target_body: &str) -> String {
+        format!(
+            "#!/bin/sh\n\
+             sock=\"\"; tgt=\"\"; prev=\"\"\n\
+             for a in \"$@\"; do\n\
+             if [ \"$prev\" = \"-S\" ]; then sock=\"$a\"; fi\n\
+             if [ \"$prev\" = \"-t\" ]; then tgt=\"$a\"; fi\n\
+             prev=\"$a\"\n\
+             done\n\
+             if [ -n \"$sock\" ]; then\n{liveness_body}\nelse\n{target_body}\nfi\n"
+        )
+    }
+
+    /// `sh` snippet printing `line` and succeeding.
+    #[cfg(unix)]
+    fn stub_print(line: &str) -> String {
+        format!("printf '%s\\n' '{line}'; exit 0")
+    }
+
+    /// A structured record bound to `pane`/`root_pid` on `socket`.
+    fn verifiable_record(name: &str, pane: &str, root_pid: u32, socket: &str) -> String {
+        serde_json::to_string(&PaneIdentityRecord {
+            name: name.to_string(),
+            session_name: Some("alpha".to_string()),
+            pane_id: Some(pane.to_string()),
+            pane_pid: Some(root_pid),
+            socket_path: Some(socket.to_string()),
+            written_at: Some("2026-08-20T09:00:00Z".to_string()),
+        })
+        .expect("serialize record")
+    }
+
+    fn write_record_fixture(path: &Path, json: &str) {
+        std::fs::create_dir_all(path.parent().expect("record parent")).expect("create parent");
+        std::fs::write(path, format!("{json}\n")).expect("write record fixture");
+    }
+
+    #[test]
+    fn is_agent_pane_command_classifies_shells_and_wrappers() {
+        // Empty / whitespace: process gone.
+        assert!(!is_agent_pane_command(""));
+        assert!(!is_agent_pane_command("   "));
+        // Plain shells (including login-shell form): agent exited.
+        assert!(!is_agent_pane_command("bash"));
+        assert!(!is_agent_pane_command("zsh"));
+        assert!(!is_agent_pane_command("-bash"));
+        assert!(!is_agent_pane_command("fish"));
+        assert!(!is_agent_pane_command("/bin/sh"));
+        // Agents and runtime wrappers count as live (issue caveat: wrappers
+        // like bun/node report the wrapper, not the agent).
+        assert!(is_agent_pane_command("claude"));
+        assert!(is_agent_pane_command("codex"));
+        assert!(is_agent_pane_command("node"));
+        assert!(is_agent_pane_command("bun"));
+        assert!(is_agent_pane_command("python3"));
+    }
+
+    #[test]
+    fn pane_binding_status_strings_are_stable() {
+        assert_eq!(PaneBindingStatus::VerifiedLive.as_str(), "verified-live");
+        assert_eq!(PaneBindingStatus::AdoptedDead.as_str(), "adopted-dead");
+        assert_eq!(
+            PaneBindingStatus::LegacyUnverified.as_str(),
+            "legacy-unverified"
+        );
+    }
+
+    #[test]
+    fn parse_identity_record_handles_legacy_and_structured_content() {
+        let legacy = parse_identity_record("BlueLake\n").expect("legacy parses");
+        assert_eq!(legacy.name, "BlueLake");
+        assert!(!legacy.is_verifiable());
+
+        let structured =
+            parse_identity_record(&verifiable_record("AmberRabbit", "%25", 3_452_123, "/sock"))
+                .expect("structured parses");
+        assert_eq!(structured.name, "AmberRabbit");
+        assert_eq!(structured.session_name.as_deref(), Some("alpha"));
+        assert_eq!(structured.pane_id.as_deref(), Some("%25"));
+        assert_eq!(structured.pane_pid, Some(3_452_123));
+        assert_eq!(structured.socket_path.as_deref(), Some("/sock"));
+        assert!(structured.is_verifiable());
+
+        assert!(parse_identity_record("").is_none());
+        assert!(parse_identity_record("{\"name\":\"\"}").is_none());
+        assert!(parse_identity_record("{not json").is_none());
+    }
+
+    #[test]
+    fn pane_target_for_converts_composite_keys() {
+        assert_eq!(pane_target_for("%3").as_deref(), Some("%3"));
+        assert_eq!(pane_target_for("alpha:0:2").as_deref(), Some("alpha:0.2"));
+        assert_eq!(pane_target_for("  ").as_deref(), None);
+    }
+
+    // -- the pure liveness predicate ----------------------------------------
+
+    fn predicate_record() -> PaneIdentityRecord {
+        PaneIdentityRecord {
+            name: "AmberRabbit".to_string(),
+            session_name: Some("alpha".to_string()),
+            pane_id: Some("%25".to_string()),
+            pane_pid: Some(3_452_123),
+            socket_path: Some("/tmp/tmux-1000/default".to_string()),
+            written_at: None,
+        }
+    }
+
+    #[test]
+    fn binding_liveness_with_reports_live_when_all_checks_pass() {
+        let record = predicate_record();
+        let outcome = binding_liveness_with(&record, |args| {
+            // The probe must run against the recorded socket and pane.
+            assert_eq!(args[0], "-S");
+            assert_eq!(args[1], "/tmp/tmux-1000/default");
+            assert!(args.contains(&"%25"));
+            Some("alpha\t3452123\tclaude\n".to_string())
+        });
+        assert_eq!(outcome, PaneBindingLiveness::Live);
+    }
+
+    #[test]
+    fn binding_liveness_with_treats_runtime_wrapper_as_live() {
+        let record = predicate_record();
+        let outcome =
+            binding_liveness_with(&record, |_| Some("alpha\t3452123\tnode\n".to_string()));
+        assert_eq!(outcome, PaneBindingLiveness::Live);
+    }
+
+    #[test]
+    fn binding_liveness_with_dead_on_any_failed_check() {
+        let record = predicate_record();
+
+        // (a) recycled %N living in a different session.
+        assert_eq!(
+            binding_liveness_with(&record, |_| Some("beta\t3452123\tclaude\n".to_string())),
+            PaneBindingLiveness::Dead
+        );
+        // (b) pane root pid changed (server restart / respawn).
+        assert_eq!(
+            binding_liveness_with(&record, |_| Some("alpha\t999\tclaude\n".to_string())),
+            PaneBindingLiveness::Dead
+        );
+        // (c) agent exited back to its shell, or the process is gone.
+        assert_eq!(
+            binding_liveness_with(&record, |_| Some("alpha\t3452123\tzsh\n".to_string())),
+            PaneBindingLiveness::Dead
+        );
+        assert_eq!(
+            binding_liveness_with(&record, |_| Some("alpha\t3452123\t\n".to_string())),
+            PaneBindingLiveness::Dead
+        );
+        // tmux query failed entirely (server gone).
+        assert_eq!(
+            binding_liveness_with(&record, |_| None),
+            PaneBindingLiveness::Dead
+        );
+    }
+
+    #[test]
+    fn binding_liveness_unverifiable_without_facts_and_dead_without_socket() {
+        assert_eq!(
+            binding_liveness(&PaneIdentityRecord::bare("BlueLake")),
+            PaneBindingLiveness::Unverifiable
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut record = predicate_record();
+        record.socket_path = Some(
+            tmp.path()
+                .join("gone-socket")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert_eq!(binding_liveness(&record), PaneBindingLiveness::Dead);
+    }
+
+    /// A socket that exists but a `tmux` binary that cannot be executed is
+    /// no evidence about the binding: the predicate must report Unverifiable,
+    /// never Dead (which would make every structured record adoptable and
+    /// purgeable from a daemon whose PATH lacks tmux).
+    #[test]
+    fn binding_liveness_is_unverifiable_when_tmux_cannot_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock = tmp.path().join("present-socket");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let mut record = predicate_record();
+        record.socket_path = Some(sock.to_string_lossy().into_owned());
+        // No AM_TEST_TMUX_BIN: the hermetic tmux command cannot be spawned.
+        crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
+            assert_eq!(binding_liveness(&record), PaneBindingLiveness::Unverifiable);
+        });
+    }
+
+    // -- writers record binding facts ---------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_records_binding_facts_inside_tmux() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("record-write-project");
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            "exit 1",
+            &stub_print(&format!("alpha\t%7\t4242\tclaude\t{sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                let path = write_identity(&project, "alpha:0:1", "BlueLake")
+                    .expect("write structured identity");
+                let record = read_identity_record(&path).expect("read record");
+                assert_eq!(record.name, "BlueLake");
+                assert_eq!(record.session_name.as_deref(), Some("alpha"));
+                assert_eq!(record.pane_id.as_deref(), Some("%7"));
+                assert_eq!(record.pane_pid, Some(4242));
+                assert_eq!(record.socket_path.as_deref(), Some(sock_text.as_str()));
+                assert!(record.written_at.is_some(), "written_at must be stamped");
+            },
+        );
+        drop(config);
+    }
+
+    #[test]
+    fn write_identity_outside_tmux_writes_name_only_record() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("no-tmux-write-project");
+        // No AM_TEST_TMUX_BIN: the hermetic test tmux always fails, exactly
+        // like a host without tmux. The record must carry only the name.
+        let path = write_identity(&project, "%3", "BlueLake").expect("write identity");
+        let record = read_identity_record(&path).expect("read record");
+        assert_eq!(record.name, "BlueLake");
+        assert!(!record.is_verifiable());
+        assert_eq!(
+            resolve_identity(&project, "%3").as_deref(),
+            Some("BlueLake")
+        );
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_refuses_live_binding_held_by_other_pane() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("live-write-refusal-project");
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        write_record_fixture(
+            &path,
+            &verifiable_record("AmberRabbit", "%2", 42, &sock_text),
+        );
+
+        // Record's pane %2 is alive; the writer's pane is %3 (renumber shift).
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            &stub_print("alpha\t42\tclaude"),
+            &stub_print(&format!("alpha\t%3\t99\tclaude\t{sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                let err = write_identity(&project, "alpha:0:2", "GreenOwl")
+                    .expect_err("live binding held elsewhere must refuse the overwrite");
+                assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+                let record = read_identity_record(&path).expect("record survives");
+                assert_eq!(record.name, "AmberRabbit");
+                assert_eq!(record.pane_pid, Some(42));
+            },
+        );
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_allows_overwrite_by_live_holder_pane() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("live-write-same-holder-project");
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        write_record_fixture(
+            &path,
+            &verifiable_record("AmberRabbit", "%2", 42, &sock_text),
+        );
+
+        // The writer IS the recorded pane: same pane id, same socket.
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            &stub_print("alpha\t42\tclaude"),
+            &stub_print(&format!("alpha\t%2\t42\tclaude\t{sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                write_identity(&project, "alpha:0:2", "AmberRabbit")
+                    .expect("live holder may rewrite its own binding");
+                let record = read_identity_record(&path).expect("read record");
+                assert_eq!(record.name, "AmberRabbit");
+                assert_eq!(record.pane_id.as_deref(), Some("%2"));
+            },
+        );
+        drop(config);
+    }
+
+    // -- the adoption rule at resolution ------------------------------------
+
+    /// Acceptance (GH#252): a respawned session reuses its prior agent names.
+    /// The old holder's `pane_pid` no longer matches (the respawn got a new
+    /// root process), so the binding is dead and the new occupant of the same
+    /// positional key adopts the name — the roster grows by zero.
+    #[cfg(unix)]
+    #[test]
+    fn respawned_pane_adopts_dead_binding_and_rewrites_record() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("respawn-adopt-project");
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:1");
+        write_record_fixture(
+            &path,
+            &verifiable_record("AmberRabbit", "%5", 111, &sock_text),
+        );
+
+        // tmux says pane %5 now has root pid 222: the recorded binding is dead.
+        // The pane occupying the key (also %5 — recycled) carries pid 222.
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            &stub_print("alpha\t222\tclaude"),
+            &stub_print(&format!("alpha\t%5\t222\tclaude\t{sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "")],
+            || {
+                let (name, resolved_path, status) =
+                    resolve_identity_with_binding(&project, "alpha:0:1")
+                        .expect("dead binding must be adoptable");
+                assert_eq!(name, "AmberRabbit", "respawn must reuse the prior name");
+                assert_eq!(resolved_path, path);
+                assert_eq!(status, PaneBindingStatus::AdoptedDead);
+
+                // Adoption rewrote the record with the adopter's facts.
+                let record = read_identity_record(&path).expect("read adopted record");
+                assert_eq!(record.name, "AmberRabbit");
+                assert_eq!(record.pane_pid, Some(222));
+                assert_eq!(record.pane_id.as_deref(), Some("%5"));
+                assert_eq!(record.socket_path.as_deref(), Some(sock_text.as_str()));
+            },
+        );
+        drop(config);
+    }
+
+    /// Acceptance (GH#252): pane insertion renumbering cannot reassign a live
+    /// holder's name. The record is live (session + pid match, agent running)
+    /// but the pane now sitting at the composite key is a different pane, so
+    /// resolution refuses and the caller mints a fresh identity.
+    #[cfg(unix)]
+    #[test]
+    fn live_holder_in_other_pane_is_never_reassigned() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("live-holder-project");
+        let isolated_home = config.tempdir.path().join("home");
+        let home_text = isolated_home.to_string_lossy().into_owned();
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        write_record_fixture(
+            &path,
+            &verifiable_record("AmberRabbit", "%2", 42, &sock_text),
+        );
+
+        // Liveness: pane %2 is alive with the recorded pid, running an agent.
+        // Target: after `split-window`, the pane at alpha:0:2 is %3.
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            &stub_print("alpha\t42\tclaude"),
+            &stub_print(&format!("alpha\t%3\t99\tclaude\t{sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", tmux_bin.as_str()),
+                ("TMUX_PANE", ""),
+                ("HOME", home_text.as_str()),
+            ],
+            || {
+                assert_eq!(
+                    resolve_identity_with_binding(&project, "alpha:0:2"),
+                    None,
+                    "a live holder's name must never transfer to a different pane"
+                );
+                // The live holder's record is untouched.
+                let record = read_identity_record(&path).expect("record survives");
+                assert_eq!(record.name, "AmberRabbit");
+                assert_eq!(record.pane_pid, Some(42));
+            },
+        );
+        drop(config);
+    }
+
+    /// Acceptance (GH#252): a tmux server restart recycles `%N` with a new
+    /// `pane_pid`; the old socket is gone, so the binding is dead and the new
+    /// server's pane adopts cleanly with the new socket recorded.
+    #[cfg(unix)]
+    #[test]
+    fn server_restart_recycled_pane_adopts_with_new_socket() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("server-restart-project");
+        let old_sock = config.tempdir.path().join("old-sock");
+        let new_sock = config.tempdir.path().join("new-sock");
+        // Old socket intentionally missing (server killed); new one exists.
+        std::fs::write(&new_sock, b"").expect("create new socket placeholder");
+        let old_sock_text = old_sock.to_string_lossy().into_owned();
+        let new_sock_text = new_sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:1");
+        write_record_fixture(
+            &path,
+            &verifiable_record("AmberRabbit", "%1", 100, &old_sock_text),
+        );
+
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            "exit 1",
+            &stub_print(&format!("alpha\t%1\t555\tclaude\t{new_sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "")],
+            || {
+                let (name, _, status) = resolve_identity_with_binding(&project, "alpha:0:1")
+                    .expect("dead binding (socket gone) must be adoptable");
+                assert_eq!(name, "AmberRabbit");
+                assert_eq!(status, PaneBindingStatus::AdoptedDead);
+
+                let record = read_identity_record(&path).expect("read adopted record");
+                assert_eq!(record.pane_pid, Some(555));
+                assert_eq!(record.socket_path.as_deref(), Some(new_sock_text.as_str()));
+            },
+        );
+        drop(config);
+    }
+
+    /// Acceptance (GH#252): two parallel tmux servers with identical session
+    /// layouts must never cross-adopt. The recorded socket routes the check:
+    /// the record is live on server A, so a caller whose pane lives on server
+    /// B is refused even though pane id and layout coincide.
+    #[cfg(unix)]
+    #[test]
+    fn parallel_servers_route_liveness_by_socket() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("parallel-servers-project");
+        let isolated_home = config.tempdir.path().join("home");
+        let home_text = isolated_home.to_string_lossy().into_owned();
+        let live_sock = config.tempdir.path().join("sock-a");
+        let caller_sock = config.tempdir.path().join("sock-b");
+        std::fs::write(&live_sock, b"").expect("create socket a");
+        std::fs::write(&caller_sock, b"").expect("create socket b");
+        let live_sock_text = live_sock.to_string_lossy().into_owned();
+        let caller_sock_text = caller_sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        write_record_fixture(
+            &path,
+            &verifiable_record("AmberRabbit", "%2", 42, &live_sock_text),
+        );
+
+        // Liveness against socket A: alive. Caller's identically-numbered
+        // pane lives on socket B.
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let liveness_body = format!(
+            "if [ \"$sock\" = '{live_sock_text}' ]; then {}\nfi\nexit 1",
+            stub_print("alpha\t42\tclaude")
+        );
+        let script = liveness_stub_script(
+            &liveness_body,
+            &stub_print(&format!("alpha\t%2\t42\tclaude\t{caller_sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", tmux_bin.as_str()),
+                ("TMUX_PANE", ""),
+                ("HOME", home_text.as_str()),
+            ],
+            || {
+                assert_eq!(
+                    resolve_identity_with_binding(&project, "alpha:0:2"),
+                    None,
+                    "identical layouts on parallel servers must not cross-adopt a live name"
+                );
+                let record = read_identity_record(&path).expect("record survives");
+                assert_eq!(record.socket_path.as_deref(), Some(live_sock_text.as_str()));
+            },
+        );
+        drop(config);
+    }
+
+    /// GH#252 legacy compat: a bare-name file whose key pane exists and runs
+    /// an agent is conservatively treated as live — resolution returns the
+    /// name without rewriting the file (no theft, no upgrade).
+    #[cfg(unix)]
+    #[test]
+    fn legacy_file_with_agent_at_key_is_conservatively_live() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("legacy-live-project");
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(&path, "AmberRabbit\n").expect("write legacy bare-name file");
+
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            "exit 1",
+            &stub_print(&format!("alpha\t%2\t42\tclaude\t{sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "")],
+            || {
+                let (name, _, status) = resolve_identity_with_binding(&project, "alpha:0:2")
+                    .expect("legacy file must resolve under the compat rule");
+                assert_eq!(name, "AmberRabbit");
+                assert_eq!(status, PaneBindingStatus::LegacyUnverified);
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("read file"),
+                    "AmberRabbit\n",
+                    "a conservatively-live legacy file must not be rewritten"
+                );
+            },
+        );
+        drop(config);
+    }
+
+    /// GH#252 legacy compat: when the key pane idles in a plain shell (the
+    /// agent exited), the bare-name file is adoptable and the first adoption
+    /// upgrades it to a structured record carrying the adopter's facts.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_file_upgrades_to_structured_record_on_adoption() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("legacy-upgrade-project");
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(&path, "AmberRabbit\n").expect("write legacy bare-name file");
+
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let script = liveness_stub_script(
+            "exit 1",
+            &stub_print(&format!("alpha\t%2\t42\tzsh\t{sock_text}")),
+        );
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "")],
+            || {
+                let (name, _, status) = resolve_identity_with_binding(&project, "alpha:0:2")
+                    .expect("legacy file with idle shell must be adoptable");
+                assert_eq!(name, "AmberRabbit");
+                assert_eq!(status, PaneBindingStatus::AdoptedDead);
+
+                let record = read_identity_record(&path).expect("read upgraded record");
+                assert_eq!(record.name, "AmberRabbit");
+                assert_eq!(record.session_name.as_deref(), Some("alpha"));
+                assert_eq!(record.pane_id.as_deref(), Some("%2"));
+                assert_eq!(record.pane_pid, Some(42));
+                assert_eq!(record.socket_path.as_deref(), Some(sock_text.as_str()));
+            },
+        );
+        drop(config);
+    }
+
+    /// GH#252 out-of-scope preservation: with no tmux context at all, a
+    /// legacy file resolves exactly as before — name returned, file bytes
+    /// untouched, status reported as legacy-unverified.
+    #[test]
+    fn no_tmux_context_preserves_legacy_resolution_untouched() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("no-tmux-legacy-project");
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(&path, "AmberRabbit\n").expect("write legacy bare-name file");
+
+        // No AM_TEST_TMUX_BIN: every tmux shell-out fails, as on a tmux-less
+        // host. Resolution must behave exactly as before GH#252.
+        let (name, resolved_path, status) = resolve_identity_with_binding(&project, "alpha:0:2")
+            .expect("legacy resolution must be preserved without tmux");
+        assert_eq!(name, "AmberRabbit");
+        assert_eq!(resolved_path, path);
+        assert_eq!(status, PaneBindingStatus::LegacyUnverified);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read file"),
+            "AmberRabbit\n"
+        );
+        drop(config);
+    }
+
+    /// A structured record that this process cannot check (tmux not
+    /// executable) resolves under the compatibility rule exactly like a
+    /// legacy file: name returned, record untouched, never labelled adopted.
+    #[test]
+    fn structured_record_without_executable_tmux_resolves_as_legacy_unverified() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("no-tmux-structured-project");
+        let sock = config.tempdir.path().join("present-socket");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let path = canonical_identity_path(&project, "alpha:0:2");
+        let json = verifiable_record("AmberRabbit", "%2", 42, &sock_text);
+        write_record_fixture(&path, &json);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", ""), ("TMUX_PANE", "")],
+            || {
+                let (name, resolved_path, status) =
+                    resolve_identity_with_binding(&project, "alpha:0:2")
+                        .expect("unverifiable record must still resolve");
+                assert_eq!(name, "AmberRabbit");
+                assert_eq!(resolved_path, path);
+                assert_eq!(status, PaneBindingStatus::LegacyUnverified);
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("read file"),
+                    format!("{json}\n"),
+                    "an uncheckable record must not be rewritten"
+                );
+            },
+        );
+        drop(config);
+    }
+
+    // -- cleanup uses the predicate -----------------------------------------
+
+    /// Acceptance (GH#252): cleanup never removes a record whose binding
+    /// passes the predicate; dead structured records are purged; legacy files
+    /// keep the live-pane-list rule.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_keeps_live_structured_records_and_purges_dead_ones() {
+        let config = IsolatedConfigBaseDir::new();
+        let tmux = LiveTmuxPanesGuard::new(vec!["legacy-live-0-0".to_string()]);
+        let project = config.project_key("cleanup-predicate-project");
+        let sock = config.tempdir.path().join("tmux-sock");
+        std::fs::write(&sock, b"").expect("create socket placeholder");
+        let sock_text = sock.to_string_lossy().into_owned();
+
+        let live_path = canonical_identity_path(&project, "alpha:0:1");
+        write_record_fixture(
+            &live_path,
+            &verifiable_record("LiveAgent", "%1", 42, &sock_text),
+        );
+        let dead_path = canonical_identity_path(&project, "alpha:0:9");
+        write_record_fixture(
+            &dead_path,
+            &verifiable_record("DeadAgent", "%9", 43, &sock_text),
+        );
+        let legacy_live_path = canonical_identity_path(&project, "legacy-live:0:0");
+        std::fs::write(&legacy_live_path, "LegacyLive\n").expect("write legacy live");
+        let legacy_stale_path = canonical_identity_path(&project, "legacy-stale:0:0");
+        std::fs::write(&legacy_stale_path, "LegacyStale\n").expect("write legacy stale");
+
+        // Pane %1 passes the predicate; pane %9 is gone.
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let liveness_body = format!(
+            "if [ \"$tgt\" = '%1' ]; then {}\nfi\nexit 1",
+            stub_print("alpha\t42\tclaude")
+        );
+        let script = liveness_stub_script(&liveness_body, "exit 1");
+        let tmux_bin = write_tmux_stub(stub_dir.path(), &script);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str())],
+            || {
+                let removed = cleanup_stale_identities(&project);
+                assert!(
+                    removed.contains(&dead_path),
+                    "dead structured record must be purged: {removed:?}"
+                );
+                assert!(
+                    removed.contains(&legacy_stale_path),
+                    "stale legacy file must be purged: {removed:?}"
+                );
+                assert!(
+                    live_path.exists(),
+                    "cleanup must never remove a record whose binding passes the predicate"
+                );
+                assert!(
+                    legacy_live_path.exists(),
+                    "legacy file matching a live pane key must be kept"
+                );
+            },
+        );
+        drop(tmux);
+        drop(config);
+    }
+
+    /// GH#252: a structured record whose socket no longer exists is purged
+    /// once tmux reports live panes on this host (the server was restarted
+    /// or killed while others run), without needing a tmux shell-out; legacy
+    /// files keep the live-pane-list rule.
+    #[test]
+    fn cleanup_purges_record_with_missing_socket_when_local_panes_exist() {
+        let config = IsolatedConfigBaseDir::new();
+        let tmux = LiveTmuxPanesGuard::new(vec!["legacy-0-0".to_string()]);
+        let project = config.project_key("cleanup-gone-socket-project");
+        let gone_sock = config
+            .tempdir
+            .path()
+            .join("gone-sock")
+            .to_string_lossy()
+            .into_owned();
+
+        let dead_path = canonical_identity_path(&project, "alpha:0:9");
+        write_record_fixture(
+            &dead_path,
+            &verifiable_record("DeadAgent", "%9", 43, &gone_sock),
+        );
+        let legacy_path = canonical_identity_path(&project, "legacy:0:0");
+        std::fs::write(&legacy_path, "LegacyAgent\n").expect("write legacy");
+
+        crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
+            let removed = cleanup_stale_identities(&project);
+            assert!(
+                removed.contains(&dead_path),
+                "record with a gone socket must be purged: {removed:?}"
+            );
+            assert!(
+                legacy_path.exists(),
+                "legacy file matching a live pane key must be kept"
+            );
+        });
+        drop(tmux);
+        drop(config);
+    }
+
+    /// Conservative retention (GH#252 review): while tmux reports no panes on
+    /// this host, cleanup must not purge anything — neither socket-gone
+    /// records (indistinguishable from records written on another host that
+    /// shares this config dir) nor records with a present socket that cannot
+    /// be checked because tmux is not executable here. A stopped or
+    /// unreachable tmux must never mass-purge structured identities.
+    #[test]
+    fn cleanup_without_local_panes_retains_all_structured_records() {
+        let config = IsolatedConfigBaseDir::new();
+        let tmux = LiveTmuxPanesGuard::new(Vec::new());
+        let project = config.project_key("cleanup-no-panes-project");
+        let gone_sock = config
+            .tempdir
+            .path()
+            .join("gone-sock")
+            .to_string_lossy()
+            .into_owned();
+        let present_sock = config.tempdir.path().join("present-sock");
+        std::fs::write(&present_sock, b"").expect("create socket placeholder");
+        let present_sock_text = present_sock.to_string_lossy().into_owned();
+
+        let gone_socket_path = canonical_identity_path(&project, "alpha:0:9");
+        write_record_fixture(
+            &gone_socket_path,
+            &verifiable_record("GoneSocketAgent", "%9", 43, &gone_sock),
+        );
+        let uncheckable_path = canonical_identity_path(&project, "alpha:0:1");
+        write_record_fixture(
+            &uncheckable_path,
+            &verifiable_record("UncheckableAgent", "%1", 42, &present_sock_text),
+        );
+        let legacy_path = canonical_identity_path(&project, "legacy:0:0");
+        std::fs::write(&legacy_path, "LegacyAgent\n").expect("write legacy");
+
+        // No AM_TEST_TMUX_BIN: tmux cannot be executed at all.
+        crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
+            let removed = cleanup_stale_identities(&project);
+            assert!(
+                removed.is_empty(),
+                "cleanup with no local panes must retain everything: {removed:?}"
+            );
+            assert!(gone_socket_path.exists());
+            assert!(uncheckable_path.exists());
+            assert!(legacy_path.exists());
+
+            let removed_all = cleanup_all_stale_identities();
+            assert!(
+                removed_all.is_empty(),
+                "global cleanup with no local panes must retain everything: {removed_all:?}"
+            );
+        });
+        drop(tmux);
+        drop(config);
+    }
+
+    /// A record with a present socket that tmux cannot check (not executable)
+    /// is treated like a legacy file even when local panes exist: kept when
+    /// its file name matches a live pane key, purged otherwise.
+    #[test]
+    fn cleanup_applies_legacy_rule_to_uncheckable_structured_records() {
+        let config = IsolatedConfigBaseDir::new();
+        let tmux = LiveTmuxPanesGuard::new(vec!["alpha-0-1".to_string()]);
+        let project = config.project_key("cleanup-uncheckable-project");
+        let present_sock = config.tempdir.path().join("present-sock");
+        std::fs::write(&present_sock, b"").expect("create socket placeholder");
+        let present_sock_text = present_sock.to_string_lossy().into_owned();
+
+        let kept_path = canonical_identity_path(&project, "alpha:0:1");
+        write_record_fixture(
+            &kept_path,
+            &verifiable_record("KeptAgent", "%1", 42, &present_sock_text),
+        );
+        let stale_path = canonical_identity_path(&project, "alpha:0:7");
+        write_record_fixture(
+            &stale_path,
+            &verifiable_record("StaleAgent", "%7", 44, &present_sock_text),
+        );
+
+        crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
+            let removed = cleanup_stale_identities(&project);
+            assert!(
+                removed.contains(&stale_path),
+                "uncheckable record not matching a live pane key must be purged: {removed:?}"
+            );
+            assert!(
+                kept_path.exists(),
+                "uncheckable record matching a live pane key must be kept"
+            );
+        });
+        drop(tmux);
+        drop(config);
     }
 }

@@ -161,6 +161,12 @@ pub async fn macro_start_session(
     // end up with two identities pointing at the same logical pane. Look up
     // the pane identity first and reuse the pre-registered name when one is
     // available, so the macro is idempotent against the boot path.
+    //
+    // GH#252: this reuse read is an adoption decision. The resolver runs the
+    // liveness predicate on whatever record it finds: a binding verifiably
+    // live in a DIFFERENT pane is never reused (the lookup returns None and a
+    // fresh name is minted below), while a dead binding is adopted and its
+    // record rewritten with this caller's pane facts.
     let resolved_name = agent_name.or_else(|| {
         mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
             &project.human_key,
