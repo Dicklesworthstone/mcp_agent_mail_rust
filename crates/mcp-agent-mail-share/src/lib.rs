@@ -48,7 +48,10 @@ pub use planner::{PlanResult, format_plan_human, generate_plan, validate_inputs}
 pub use prompt::{WizardConfig, WizardOutcome, format_json_output, run_interactive_wizard};
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
 pub use scrub::{ScrubSummary, scan_for_secrets, scrub_snapshot};
-pub use snapshot::{SnapshotContext, create_snapshot_context, create_sqlite_snapshot};
+pub use snapshot::{
+    SnapshotContext, create_private_canonical_snapshot_context,
+    create_private_canonical_sqlite_snapshot, create_snapshot_context, create_sqlite_snapshot,
+};
 pub use static_render::{
     SearchIndexEntry, SitemapEntry, StaticRenderConfig, StaticRenderResult, render_static_site,
 };

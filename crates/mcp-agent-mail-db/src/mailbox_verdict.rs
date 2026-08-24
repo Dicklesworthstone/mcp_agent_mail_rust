@@ -1476,8 +1476,10 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         );
     }
 
-    let path_str = db_path.display().to_string();
-    let conn = match crate::DbConn::open_file(&path_str) {
+    let conn = match crate::pool::open_guarded_read_only_franken_existing_file(
+        db_path,
+        "mailbox schema-population diagnostic",
+    ) {
         Ok(conn) => conn,
         Err(error) => {
             return ProbeResult::error(
@@ -1486,8 +1488,6 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             );
         }
     };
-    let conn = crate::guard_db_conn(conn, "mailbox_verdict::probe_schema_populated");
-
     let table_count = match conn.query_sync(
         "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
         &[],
@@ -1498,7 +1498,6 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             .and_then(|count| usize::try_from(count).ok())
             .unwrap_or(0),
         Err(error) => {
-            crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
             return ProbeResult::error(
                 "schema_populated",
                 format!("Cannot query sqlite_master: {error}"),
@@ -1513,7 +1512,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         )
         .is_ok_and(|rows| !rows.is_empty());
 
-    let result = match (table_count, archive_presence, has_messages_table) {
+    match (table_count, archive_presence, has_messages_table) {
         (0, ArchiveStatePresence::Empty, _) => ProbeResult::ok(
             "schema_populated",
             "Database schema is empty and the archive is also empty",
@@ -1537,9 +1536,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             format!("Database schema populated with {tables} tables including 'messages'"),
         ),
         _ => ProbeResult::ok("schema_populated", "Schema state accepted"),
-    };
-    crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
-    result
+    }
 }
 
 // ============================================================================
@@ -2654,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_schema_populated_closes_health_probe_connection_explicitly() {
+    fn probe_schema_populated_uses_checkpoint_free_read_only_drop() {
         let capture = EventCapture::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("health-probe.sqlite3");
@@ -2677,7 +2674,7 @@ mod tests {
 
         assert!(
             !capture.saw_drop_close(),
-            "schema health probe must close its DB connection explicitly"
+            "schema health probe read-only drop must not enter the writer checkpoint path"
         );
     }
 

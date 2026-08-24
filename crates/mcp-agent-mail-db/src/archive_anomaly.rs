@@ -1770,20 +1770,19 @@ fn collect_archive_db_artifact_index(storage_root: &Path) -> ArchiveDbArtifactIn
     index
 }
 
-fn open_canonical_db_for_archive_verifier(db_path: &Path) -> Option<crate::CanonicalDbConn> {
+fn open_db_for_archive_verifier(db_path: &Path) -> Option<crate::DbConn> {
     if db_path.as_os_str() == ":memory:" {
         return None;
     }
-    crate::pool::validate_sqlite_target_path(db_path, "archive verifier sqlite target").ok()?;
-    let metadata = std::fs::symlink_metadata(db_path).ok()?;
-    if !metadata.file_type().is_file() {
-        return None;
-    }
-    crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).ok()
+    crate::pool::open_guarded_read_only_franken_existing_file(
+        db_path,
+        "archive verifier database diagnostic",
+    )
+    .ok()
 }
 
 fn query_db_message_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbMessageArtifactExpectation>, String> {
     let rows = conn
         .query_sync(
@@ -1820,7 +1819,7 @@ fn query_db_message_expectations(
 }
 
 fn query_db_mailbox_copy_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbMailboxCopyExpectation>, String> {
     let mut expectations = Vec::new();
 
@@ -1889,7 +1888,7 @@ fn query_db_mailbox_copy_expectations(
 }
 
 fn query_db_agent_profile_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbAgentProfileExpectation>, String> {
     let rows = conn
         .query_sync(
@@ -1925,7 +1924,7 @@ fn query_db_agent_profile_expectations(
 }
 
 fn query_db_reservation_expectations(
-    conn: &crate::CanonicalDbConn,
+    conn: &crate::DbConn,
 ) -> Result<Vec<DbReservationArtifactExpectation>, String> {
     let rows = conn
         .query_sync(
@@ -2047,7 +2046,7 @@ fn append_archive_db_artifact_cross_checks(
     storage_root: &Path,
     db_path: &Path,
 ) {
-    let Some(conn) = open_canonical_db_for_archive_verifier(db_path) else {
+    let Some(conn) = open_db_for_archive_verifier(db_path) else {
         return;
     };
     let index = collect_archive_db_artifact_index(storage_root);
@@ -2461,9 +2460,8 @@ mod tests {
         assert_eq!(reservation.tag(), "file_reservation_artifact_mismatch");
     }
 
-    fn init_archive_verifier_db(db_path: &Path) -> crate::CanonicalDbConn {
-        let conn =
-            crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+    fn init_archive_verifier_db(db_path: &Path) -> crate::DbConn {
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
         conn.execute_raw(&crate::schema::init_schema_sql_base())
             .expect("init schema");
         conn
@@ -2523,6 +2521,7 @@ mod tests {
              ) VALUES (23, 1, 12, 'src/lib.rs', 1, 'verify', 0, 999999999, NULL);",
         )
         .expect("seed db");
+        crate::close_db_conn(conn, "settle archive verifier test fixture");
 
         let project_dir = storage_root.join("projects").join("demo-project");
         std::fs::create_dir_all(&project_dir).expect("create project dir");

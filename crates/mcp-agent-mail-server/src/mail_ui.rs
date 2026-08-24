@@ -4027,6 +4027,10 @@ fn render_search(
 /// rendered from an archive-backed observability snapshot.
 fn load_recipes() -> Vec<RecipeView> {
     let config = Config::from_env();
+    // `list_recipes` self-heals its schema with idempotent DDL, so this
+    // apparently read-only route must hold the promotion lease from before the
+    // raw live fd is opened through completion of that schema/list operation.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     let Some(conn) = crate::open_live_metadata_sync_db_connection(&config.database_url) else {
         return Vec::new();
     };

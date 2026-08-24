@@ -194,43 +194,52 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             return;
         }
 
-        if skip_first_quick_cycle {
+        let quick_cycle_passed = if skip_first_quick_cycle {
             skip_first_quick_cycle = false;
             tracing::debug!(
                 "integrity guard: skipped immediate quick cycle (startup probe already executed)"
             );
+            true
         } else {
             run_quick_cycle(
                 &pool,
                 sqlite_path,
                 &storage_root,
                 &mut last_recovery_attempt,
-            );
-        }
+            )
+        };
 
-        if full_check_due(config, full_every, last_full_attempt) {
-            let attempted_at = Instant::now();
-            let _ = run_full_cycle(
-                &pool,
-                sqlite_path,
-                &storage_root,
-                &mut last_recovery_attempt,
-            );
-            last_full_attempt = Some(attempted_at);
-        }
-
-        // Bead K4: bounded SQLite maintenance (checkpoint / analyze / vacuum /
-        // journal_size_limit) on independent cadences, off the hot path.
-        run_db_maintenance_cycle(
-            &pool,
-            config,
-            sqlite_path,
-            Instant::now(),
-            &mut last_checkpoint,
-            &mut last_analyze,
-            &mut last_vacuum,
-            &mut last_atc_retention,
-            &mut last_doctor_retention,
+        let full_due = full_check_due(config, full_every, last_full_attempt);
+        run_integrity_followups(
+            quick_cycle_passed,
+            full_due,
+            || {
+                let attempted_at = Instant::now();
+                let passed = run_full_cycle(
+                    &pool,
+                    sqlite_path,
+                    &storage_root,
+                    &mut last_recovery_attempt,
+                );
+                last_full_attempt = Some(attempted_at);
+                passed
+            },
+            || {
+                // Bead K4: bounded SQLite maintenance (checkpoint / analyze /
+                // vacuum / journal_size_limit) on independent cadences, off
+                // the hot path. Never run it after a failed integrity verdict.
+                run_db_maintenance_cycle(
+                    &pool,
+                    config,
+                    sqlite_path,
+                    Instant::now(),
+                    &mut last_checkpoint,
+                    &mut last_analyze,
+                    &mut last_vacuum,
+                    &mut last_atc_retention,
+                    &mut last_doctor_retention,
+                );
+            },
         );
 
         // Sleep in short increments so shutdown reacts quickly.
@@ -247,19 +256,52 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     }
 }
 
+/// Run the full-check and maintenance followups only after the integrity
+/// verdicts that authorize them.
+///
+/// Keeping this sequencing in one small seam makes it impossible for a quick
+/// breaker refusal to fall through into a second live-family open, checkpoint,
+/// ANALYZE, or VACUUM. When a due full check fails, maintenance is likewise
+/// skipped for this iteration.
+fn run_integrity_followups<F, M>(
+    quick_cycle_passed: bool,
+    full_due: bool,
+    run_full: F,
+    run_maintenance: M,
+) -> bool
+where
+    F: FnOnce() -> bool,
+    M: FnOnce(),
+{
+    if !quick_cycle_passed {
+        tracing::warn!(
+            "integrity guard: skipping full check and database maintenance after failed quick cycle"
+        );
+        return false;
+    }
+    if full_due && !run_full() {
+        tracing::warn!(
+            "integrity guard: skipping database maintenance after failed full integrity cycle"
+        );
+        return false;
+    }
+    run_maintenance();
+    true
+}
+
 fn run_quick_cycle(
     pool: &DbPool,
     sqlite_path: &Path,
     storage_root: &Path,
     last_recovery_attempt: &mut Option<Instant>,
-) {
-    match pool.run_startup_integrity_check() {
+) -> bool {
+    match pool.run_periodic_integrity_check() {
         Ok(_) => {
             if take_deferred_proactive_backup() {
                 tracing::debug!(
                     "integrity guard: deferred proactive backup during startup quick cycle"
                 );
-                return;
+                return true;
             }
             if let Err(err) = pool.create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
             {
@@ -283,14 +325,18 @@ fn run_quick_cycle(
                     "integrity guard: archive drift reconcile attempt failed; will retry next cycle"
                 ),
             }
+            true
         }
-        Err(err) => handle_integrity_error(
-            "quick_check",
-            &err.to_string(),
-            sqlite_path,
-            storage_root,
-            last_recovery_attempt,
-        ),
+        Err(err) => {
+            handle_integrity_error(
+                "quick_check",
+                &err.to_string(),
+                sqlite_path,
+                storage_root,
+                last_recovery_attempt,
+            );
+            false
+        }
     }
 }
 
@@ -381,6 +427,18 @@ const CROSS_COUNT_TABLES: &[&str] = &[
     "file_reservations",
 ];
 
+/// Open the live family for the cross-count only after the database crate's
+/// guarded read-only family and namespace admission.
+fn open_index_table_cross_count_connection(
+    sqlite_path: &Path,
+) -> std::io::Result<mcp_agent_mail_db::DbConn> {
+    crate::open_read_only_sync_db_connection_with_busy_timeout(
+        sqlite_path.to_string_lossy().as_ref(),
+        crate::BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+        "integrity guard index/table cross-count",
+    )
+}
+
 /// Run the GH#214 index-vs-table cross-count against a read-only connection.
 ///
 /// Returns the first mismatch rendered as a corruption-classifiable message,
@@ -390,8 +448,7 @@ const CROSS_COUNT_TABLES: &[&str] = &[
 /// consistent database missing acknowledged rows (the GH#213 Windows silent
 /// class) is invisible to any server-side arithmetic.
 fn run_index_table_cross_count(sqlite_path: &Path) -> Option<String> {
-    let path = sqlite_path.display().to_string();
-    let conn = match mcp_agent_mail_db::DbConn::open_file_read_only(&path) {
+    let conn = match open_index_table_cross_count_connection(sqlite_path) {
         Ok(conn) => conn,
         Err(err) => {
             tracing::debug!(
@@ -402,7 +459,9 @@ fn run_index_table_cross_count(sqlite_path: &Path) -> Option<String> {
         }
     };
     let result = mcp_agent_mail_db::integrity::index_table_cross_count(&conn, CROSS_COUNT_TABLES);
-    mcp_agent_mail_db::close_db_conn(conn, "integrity-guard cross-count");
+    // This is a true read-only observer. Its ordinary Drop path preserves the
+    // live WAL/namespace family; the writable close helper may checkpoint it.
+    drop(conn);
     match result {
         Ok(mismatches) => {
             if mismatches.is_empty() {
@@ -729,6 +788,54 @@ mod tests {
         );
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn cross_count_read_only_drop_does_not_checkpoint_live_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cross-count-read-only-drop.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open cross-count WAL fixture");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize cross-count WAL fixture");
+        conn.execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable cross-count fixture WAL mode");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable cross-count fixture autocheckpoint");
+        conn.execute_raw("CREATE TABLE cross_count_drop_sentinel(value INTEGER NOT NULL);")
+            .expect("create cross-count checkpoint sentinel");
+        conn.execute_raw("INSERT INTO cross_count_drop_sentinel(value) VALUES (1);")
+            .expect("write cross-count checkpoint sentinel");
+        // Ordinary writer Drop deliberately leaves committed WAL frames for
+        // the read-only observer teardown below to preserve.
+        drop(conn);
+
+        let wal_path = path.with_file_name(format!(
+            "{}-wal",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let primary_before = std::fs::read(&path).expect("snapshot cross-count primary");
+        let wal_before = std::fs::read(&wal_path).expect("snapshot cross-count WAL");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "fixture must retain committed frames that a checkpointing close would consume"
+        );
+
+        assert!(
+            run_index_table_cross_count(&path).is_none(),
+            "healthy cross-count fixture must not report desync"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read cross-count primary after observer"),
+            primary_before,
+            "read-only cross-count teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read cross-count WAL after observer"),
+            wal_before,
+            "read-only cross-count teardown must not checkpoint or truncate the WAL"
+        );
+    }
+
     #[test]
     fn cross_count_missing_file_reports_none() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -737,6 +844,118 @@ mod tests {
             run_index_table_cross_count(&path).is_none(),
             "an unopenable database is a probe failure, not corruption evidence"
         );
+    }
+
+    #[test]
+    fn cross_count_guarded_read_only_open_refuses_damaged_family_under_nonclean_breaker_authority()
+    {
+        fn snapshot_namespace(
+            root: &Path,
+        ) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+            std::fs::read_dir(root)
+                .expect("list cross-count fixture namespace")
+                .map(|entry| {
+                    let entry = entry.expect("read cross-count fixture entry");
+                    let name = entry.file_name();
+                    let bytes =
+                        std::fs::read(entry.path()).expect("read cross-count fixture bytes");
+                    (name, bytes)
+                })
+                .collect()
+        }
+
+        for breaker_kind in ["malformed", "tripped"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir
+                .path()
+                .join(format!("cross-count-{breaker_kind}.sqlite3"));
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+                    .expect("create healthy cross-count primary");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("detach cross-count fixture WAL mode");
+            conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+                .expect("create cross-count fixture table");
+            conn.execute_raw("CREATE INDEX idx_agents_name ON agents(name)")
+                .expect("create cross-count fixture index");
+            conn.execute_raw("INSERT INTO agents (name) VALUES ('BlueLake')")
+                .expect("insert cross-count fixture row");
+            drop(conn);
+
+            let wal_path = path.with_file_name(format!(
+                "{}-wal",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let shm_path = path.with_file_name(format!(
+                "{}-shm",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            std::fs::write(&wal_path, b"truncated-cross-count-wal")
+                .expect("write damaged cross-count WAL");
+            std::fs::write(&shm_path, b"cross-count-shm").expect("write cross-count SHM");
+            assert!(
+                mcp_agent_mail_db::wal_classify::classify_wal_sidecar(&path)
+                    .state
+                    .is_damaged(),
+                "the cross-count fixture must exercise damaged-family admission"
+            );
+
+            let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&path);
+            match breaker_kind {
+                "malformed" => {
+                    std::fs::write(&breaker_path, b"malformed cross-count breaker authority")
+                        .expect("write malformed cross-count breaker");
+                    assert!(
+                        mcp_agent_mail_db::recovery_breaker::load(&path).is_err(),
+                        "malformed fixture must be rejected as durable authority"
+                    );
+                }
+                "tripped" => {
+                    let state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+                        schema: 1,
+                        db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&path),
+                        consecutive_failures:
+                            mcp_agent_mail_db::recovery_breaker::DEFAULT_MAX_CONSECUTIVE_FAILURES,
+                        last_failure_unix: i64::MAX,
+                        last_failure_reason: "cross-count fixture is circuit-broken".to_string(),
+                        tripped: true,
+                    };
+                    mcp_agent_mail_db::recovery_breaker::store(&path, &state)
+                        .expect("store tripped cross-count breaker");
+                    assert_eq!(
+                        mcp_agent_mail_db::recovery_breaker::load(&path)
+                            .expect("load tripped cross-count breaker"),
+                        Some(state),
+                        "tripped fixture must retain exact-primary breaker authority"
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            let namespace_before = snapshot_namespace(dir.path());
+            let error = match open_index_table_cross_count_connection(&path) {
+                Ok(conn) => {
+                    drop(conn);
+                    panic!("cross-count guarded read-only open must refuse the suspect family");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing live read-only SQLite engine open"),
+                "unexpected cross-count refusal for {breaker_kind}: {error}"
+            );
+            assert!(
+                run_index_table_cross_count(&path).is_none(),
+                "the aggregate must degrade rather than inspect a refused family"
+            );
+            assert_eq!(
+                snapshot_namespace(dir.path()),
+                namespace_before,
+                "cross-count refusal must preserve every exact family/breaker byte and name for {breaker_kind}"
+            );
+        }
     }
 
     #[test]
@@ -825,6 +1044,92 @@ mod tests {
             !full_check_due(&config, interval, Some(attempted_at)),
             "a recent failed attempt should still throttle the next full check"
         );
+    }
+
+    #[test]
+    fn failed_quick_cycle_skips_full_check_and_maintenance() {
+        let full_calls = std::cell::Cell::new(0_u8);
+        let maintenance_calls = std::cell::Cell::new(0_u8);
+
+        let followed_up = run_integrity_followups(
+            false,
+            true,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                true
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        );
+
+        assert!(!followed_up);
+        assert_eq!(full_calls.get(), 0, "failed quick verdict must be terminal");
+        assert_eq!(
+            maintenance_calls.get(),
+            0,
+            "failed quick verdict must block every mutating maintenance path"
+        );
+    }
+
+    #[test]
+    fn failed_due_full_cycle_skips_maintenance() {
+        let full_calls = std::cell::Cell::new(0_u8);
+        let maintenance_calls = std::cell::Cell::new(0_u8);
+
+        let followed_up = run_integrity_followups(
+            true,
+            true,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                false
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        );
+
+        assert!(!followed_up);
+        assert_eq!(
+            full_calls.get(),
+            1,
+            "a due full check must run exactly once"
+        );
+        assert_eq!(
+            maintenance_calls.get(),
+            0,
+            "failed full verdict must block mutating maintenance"
+        );
+    }
+
+    #[test]
+    fn passing_integrity_verdicts_run_only_due_followups() {
+        let full_calls = std::cell::Cell::new(0_u8);
+        let maintenance_calls = std::cell::Cell::new(0_u8);
+
+        assert!(run_integrity_followups(
+            true,
+            false,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                true
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        ));
+        assert_eq!(
+            full_calls.get(),
+            0,
+            "a non-due full check must stay skipped"
+        );
+        assert_eq!(maintenance_calls.get(), 1);
+
+        assert!(run_integrity_followups(
+            true,
+            true,
+            || {
+                full_calls.set(full_calls.get() + 1);
+                true
+            },
+            || maintenance_calls.set(maintenance_calls.get() + 1),
+        ));
+        assert_eq!(full_calls.get(), 1);
+        assert_eq!(maintenance_calls.get(), 2);
     }
 
     #[test]

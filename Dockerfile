@@ -76,9 +76,25 @@ ARG AM_REF=main
 ARG SIBLING_REF=main
 ARG SIBLING_FALLBACK_REF=main
 
-# Clone sibling dependencies first so they're cached separately from the
-# project source layer. frankensqlite uses a sparse checkout to skip the
-# multi-GB perf-fixture history.
+# Clone the sibling checkouts that /Cargo.toml still resolves through a `path`,
+# so they're cached separately from the project source layer.
+#
+# GH#256: this list must track the out-of-tree `path` entries in /Cargo.toml and
+# nothing else. It used to clone ten repos, which is how the image went stale at
+# v0.3.13 — most of that universe moved to crates.io (asupersync, the sqlmodel
+# and fsqlite families, fastmcp, ftui, franken-agent-detection, tru, rich_rust),
+# but the clone list kept trying to satisfy patches that no longer existed while
+# the two that *do* still need a sibling failed for unrelated reasons. As of the
+# 2026-08-22 registry adoption exactly two remain:
+#
+#   frankensearch  — [workspace.dependencies] path = "../frankensearch/..."
+#   beads_rust     — [patch.crates-io] path = "../beads_rust"
+#                    (registry 0.3.2 pins asupersync =0.4.4, unsatisfiable in
+#                     the =0.4.9 universe; drops out when 0.4.x publishes)
+#
+# The `sibling path deps` guard below fails the build the next time that
+# invariant breaks, naming the sibling, instead of letting cargo fail late with
+# a bare "No such file or directory (os error 2)".
 #
 # `git clone --depth 1 --branch <ref>` only accepts branch/tag names — passing
 # a commit SHA fails with "Remote branch <sha> not found in upstream origin".
@@ -128,23 +144,8 @@ RUN set -eu; \
         git clone --depth 1 --branch "$selected_ref" "$@" "$url" "$dest"; \
       fi; \
     }; \
-    clone_at https://github.com/Dicklesworthstone/frankensearch.git           "${SIBLING_REF}" /build/frankensearch; \
-    clone_at https://github.com/Dicklesworthstone/franken_agent_detection.git "${SIBLING_REF}" /build/franken_agent_detection; \
-    clone_at https://github.com/Dicklesworthstone/asupersync.git              "${SIBLING_REF}" /build/asupersync; \
-    clone_at https://github.com/Dicklesworthstone/sqlmodel_rust.git           "${SIBLING_REF}" /build/sqlmodel_rust; \
-    clone_at https://github.com/Dicklesworthstone/frankensqlite.git           "${SIBLING_REF}" /build/frankensqlite --sparse; \
-    (cd /build/frankensqlite \
-     && git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates); \
-    if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' \
-        /build/frankensqlite/crates/fsqlite-core/src/connection.rs; then \
-      echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2; \
-      exit 1; \
-    fi; \
-    clone_at https://github.com/Dicklesworthstone/frankentui.git    "${SIBLING_REF}" /build/frankentui; \
-    clone_at https://github.com/Dicklesworthstone/beads_rust.git    "${SIBLING_REF}" /build/beads_rust; \
-    clone_at https://github.com/Dicklesworthstone/fastmcp_rust.git  "${SIBLING_REF}" /build/fastmcp_rust; \
-    clone_at https://github.com/Dicklesworthstone/toon_rust.git     "${SIBLING_REF}" /build/toon_rust; \
-    clone_at https://github.com/Dicklesworthstone/rich_rust.git     "${SIBLING_REF}" /build/rich_rust
+    clone_at https://github.com/Dicklesworthstone/frankensearch.git "${SIBLING_REF}" /build/frankensearch; \
+    clone_at https://github.com/Dicklesworthstone/beads_rust.git    "${SIBLING_REF}" /build/beads_rust
 
 # Clone the project source at the requested ref. We clone (rather than COPY
 # the build context) so the image is reproducible from `docker build .` with
@@ -167,6 +168,40 @@ RUN set -eu; \
     fi
 
 WORKDIR /build/mcp_agent_mail_rust
+
+# GH#256 drift guard: every out-of-tree `path` in /Cargo.toml must have been
+# cloned above. Without this the failure mode is cargo dying deep into the build
+# with "failed to load source for dependency <x>: No such file or directory
+# (os error 2)", which is what kept the published image at v0.3.13 across five
+# tagged releases. Fail here instead, naming the missing sibling and the line
+# that wants it, so the fix is one clone_at away.
+#
+# Matches `path = "../..."` anywhere in the manifest (both
+# [workspace.dependencies] and [patch.crates-io] use the same spelling), then
+# resolves it against this WORKDIR exactly as cargo would.
+RUN set -eu; \
+    missing="$( \
+      grep -oE 'path *= *"\.\./[^"]*"' Cargo.toml \
+        | sed -E 's/.*"(.*)"/\1/' \
+        | sort -u \
+        | while IFS= read -r rel; do \
+            if [ -d "$rel" ]; then \
+              echo "+ sibling path dep present: $rel" >&2; \
+            else \
+              echo "$rel"; \
+            fi; \
+          done \
+    )"; \
+    if [ -n "$missing" ]; then \
+      echo "" >&2; \
+      echo "Cargo.toml declares out-of-tree path dependencies this image does not clone:" >&2; \
+      printf '%s\n' "$missing" | sed 's/^/  - /' >&2; \
+      echo "" >&2; \
+      echo "Add a matching clone_at line to the sibling-clone step above, or move the" >&2; \
+      echo "dependency to crates.io. See GH#256." >&2; \
+      exit 1; \
+    fi; \
+    echo "+ every out-of-tree path dependency is present"
 
 # Pre-install the pinned nightly toolchain so the build step's diagnostics
 # don't interleave a toolchain download with cargo output. `rustup show` is

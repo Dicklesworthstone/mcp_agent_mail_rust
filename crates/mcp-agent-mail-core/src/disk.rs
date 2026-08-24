@@ -42,9 +42,9 @@ pub fn is_trusted_system_directory_alias(path: &Path) -> bool {
             None
         };
 
-        return expected.is_some_and(|expected| {
+        expected.is_some_and(|expected| {
             std::fs::canonicalize(path).is_ok_and(|resolved| resolved == expected)
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]

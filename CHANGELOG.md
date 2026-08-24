@@ -10,6 +10,16 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-24 **[Release]**
+
+Durability-diagnostics release: the database layer learned to explain itself.
+A dedicated corruption-forensics engine, connection-pool lease tracking, and
+startup WAL preflight replace the previous "it is broken, good luck" failure
+mode with reports that name the page, the lease, and the checkpoint that went
+wrong. Also lands first-class Oh My Pi support and verifiable pane-identity
+bindings (GH#252), and unsticks the container image, which had been frozen at
+v0.3.13 and amd64-only since June (GH#256).
+
 ### Added
 
 - **First-class Oh My Pi (OMP) support.** Agent detection now recognizes the
@@ -54,6 +64,68 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   `tmux` treats structured records as unverifiable, and socket-gone records
   are purged only when tmux reports live panes on this host, so a stopped
   or unreachable tmux can never mass-purge identities.
+
+- **Database corruption forensics engine.**
+  `crates/mcp-agent-mail-db/src/forensics.rs` performs corruption detection and
+  WAL inspection and writes structured reports under
+  `<storage_root>/doctor/forensics/`, which `am doctor` surfaces by path so an
+  operator (or an agent) can attach the evidence to a bug report instead of
+  reconstructing it from logs.
+
+- **Connection-pool lease tracking and acquisition metrics.** The pool now
+  records per-lease ownership and timeout recovery, so a connection leak
+  reports which lease outlived its budget rather than presenting as a generic
+  acquisition timeout. Doctor diagnostics and the pool health check read the
+  same counters.
+
+- **Startup preflight WAL integrity checks.** Server startup validates WAL
+  state before accepting traffic, and the health endpoints expose the result.
+
+- **Backup rotation retention and atomic snapshot export.** Retention pruning
+  is validated before it prunes, and snapshot export is atomic with boundary
+  metadata recorded alongside the snapshot.
+
+### Fixed
+
+- **The published container image is unstuck (GH#256).** `ghcr.io` had served
+  nothing newer than `v0.3.13` since June, and the `latest` index carried a
+  single amd64 manifest — arm64 hosts had no image at all. The Dockerfile was
+  cloning ten sibling repositories to satisfy `[patch.crates-io]` entries that
+  the 2026-08-22 registry adoption had already removed; only two out-of-tree
+  `path` dependencies remain (`frankensearch`, `beads_rust`) and the clone list
+  now matches them exactly. A drift guard runs after the source clone: it reads
+  every `path = "../…"` out of `Cargo.toml` and fails the build naming any
+  sibling that was not cloned, so the next time that invariant breaks it breaks
+  loudly instead of surfacing as `No such file or directory (os error 2)` deep
+  into a cargo build.
+
+- **Installer shares one bearer token across all setup phases**, instead of
+  minting a fresh token per phase and leaving earlier phases pointing at a
+  credential the server no longer honors.
+
+- **OMP config discovery hardening**: symlink handling and header
+  reconciliation no longer follow symlinked or invalid profile directories.
+
+- **Trusted macOS system directory aliases** are accepted in real-directory
+  checks, fixing spurious failures on `/tmp` → `/private/tmp` style aliases.
+
+### Changed
+
+- **`Dockerfile.release` is the new path for published images.** It packages
+  the exact binaries that ship in the GitHub release — the ones `dsr`
+  cross-builds — into the same runtime stage, so the container and the release
+  tarballs are the same bytes, and a genuine amd64 + arm64 index takes minutes
+  instead of an hours-long QEMU compile. It self-verifies: both binaries are
+  executed inside the image (a wrong-architecture copy fails the build rather
+  than shipping a container that dies on first start) and `am --version` must
+  match the packaged version. `Dockerfile` remains the build-from-source path
+  for building an image from an arbitrary commit.
+
+- Dependency refresh: 48 crates advanced within their existing semver ranges
+  (predominantly the `gix` family behind `vergen-gix`, which is build-time
+  only). The `asupersync = 0.4.9` / `sqlmodel = 0.4.0` / `fsqlite 0.3.8`
+  universe pinned on 2026-08-22 is deliberately unchanged.
+
 
 ## [v0.3.30](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.30) — 2026-08-23 **[Release]**
 

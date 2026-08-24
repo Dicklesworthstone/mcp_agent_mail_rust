@@ -13,7 +13,6 @@
 
 use mcp_agent_mail_core::{Config, kpi_record_sample};
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::guard_db_conn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::now_micros;
@@ -108,15 +107,21 @@ pub fn shutdown() {
 fn metrics_loop(config: &Config) {
     let interval = std::time::Duration::from_secs(config.tool_metrics_emit_interval_seconds.max(5));
     let startup_delay = interval.min(std::time::Duration::from_secs(8));
-    let mut conn = open_metrics_connection(&config.database_url);
-    if let Some(db) = conn.as_ref() {
-        ensure_metrics_schema(db);
-    }
+    let (mut conn, mut conn_epoch) = {
+        // The lease must begin before the raw fd is opened, not merely before
+        // the first DDL statement: promotion is a live-file rename.
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+        let epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
+        let conn = open_metrics_connection(&config.database_url);
+        if let Some(db) = conn.as_ref() {
+            ensure_metrics_schema(db);
+        }
+        (conn, epoch)
+    };
     // #219: a recovery promotion replaces the live file by rename; a raw
     // long-lived fd silently follows the old inode into quarantine and every
     // subsequent write lands in the forensic artifact. Track the promotion
     // epoch and reopen when it moves.
-    let mut conn_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
     let mut tick_index: u64 = 0;
 
     info!(
@@ -171,33 +176,38 @@ fn metrics_loop(config: &Config) {
                 }
             }
 
-            let current_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
-            if conn.is_some() && current_epoch != conn_epoch {
-                info!(
-                    target: "tool.metrics",
-                    "reopening metrics connection after a database recovery promotion"
-                );
-                conn = None;
-            }
-            if conn.is_none() && (current_epoch != conn_epoch || tick_index.is_multiple_of(12)) {
-                conn = open_metrics_connection(&config.database_url);
-                if let Some(db) = conn.as_ref() {
-                    ensure_metrics_schema(db);
-                }
-                conn_epoch = current_epoch;
-            }
-            if let Some(db) = conn.as_ref() {
-                // #219: hold the write lease so a promotion cannot rename the
-                // live file out from under this INSERT/DELETE batch.
+            {
+                // Read the epoch, reopen if needed, and persist under one
+                // continuous lease. Checking the epoch before acquiring the
+                // lease leaves a TOCTOU window in which promotion can rename
+                // the file and the subsequent INSERT targets the old inode.
                 let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-                if let Err(err) = persist_snapshot_rows(db, collected_ts, &snapshot) {
-                    warn!(
+                let current_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
+                if conn.is_some() && current_epoch != conn_epoch {
+                    info!(
                         target: "tool.metrics",
-                        error = %err,
-                        "failed persisting tool metrics snapshot"
+                        "reopening metrics connection after a database recovery promotion"
                     );
-                } else if tick_index.is_multiple_of(PRUNE_INTERVAL_TICKS) {
-                    prune_old_snapshot_rows(db, collected_ts);
+                    conn = None;
+                }
+                if conn.is_none() && (current_epoch != conn_epoch || tick_index.is_multiple_of(12))
+                {
+                    conn = open_metrics_connection(&config.database_url);
+                    if let Some(db) = conn.as_ref() {
+                        ensure_metrics_schema(db);
+                    }
+                    conn_epoch = current_epoch;
+                }
+                if let Some(db) = conn.as_ref() {
+                    if let Err(err) = persist_snapshot_rows(db, collected_ts, &snapshot) {
+                        warn!(
+                            target: "tool.metrics",
+                            error = %err,
+                            "failed persisting tool metrics snapshot"
+                        );
+                    } else if tick_index.is_multiple_of(PRUNE_INTERVAL_TICKS) {
+                        prune_old_snapshot_rows(db, collected_ts);
+                    }
                 }
             }
 
@@ -262,11 +272,33 @@ fn open_metrics_connection(database_url: &str) -> Option<DbConn> {
     };
     let path = cfg.sqlite_path().ok()?;
     let path = crate::resolve_server_sync_sqlite_path(&path);
-    let conn = DbConn::open_file(&path).ok()?;
-    let _ = conn.execute_raw(&format!(
-        "PRAGMA busy_timeout = {METRICS_DB_BUSY_TIMEOUT_MS};"
-    ));
-    Some(conn)
+    crate::open_sync_db_connection_with_busy_timeout(
+        &path,
+        u32::try_from(METRICS_DB_BUSY_TIMEOUT_MS).unwrap_or(u32::MAX),
+        "tool metrics background worker",
+    )
+    .ok()
+}
+
+// Callers must let the returned true read-only connection use ordinary Drop.
+// `DbConnGuard`/`close_db_conn` are writable close paths and may checkpoint a
+// live WAL even though these observers only issue SELECTs.
+fn open_metrics_read_connection(database_url: &str) -> Option<DbConn> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg.sqlite_path().ok()?;
+    let path = crate::resolve_server_sync_sqlite_path(&path);
+    crate::open_read_only_sync_db_connection_with_busy_timeout(
+        &path,
+        u32::try_from(METRICS_DB_BUSY_TIMEOUT_MS).unwrap_or(u32::MAX),
+        "tool metrics read-only observer",
+    )
+    .ok()
 }
 
 fn ensure_metrics_schema(conn: &DbConn) {
@@ -434,10 +466,9 @@ fn is_missing_metrics_table_error(err: &impl std::fmt::Display) -> bool {
 
 #[must_use]
 pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<PersistedToolMetric> {
-    let Some(conn) = open_metrics_connection(database_url) else {
+    let Some(conn) = open_metrics_read_connection(database_url) else {
         return Vec::new();
     };
-    let conn = guard_db_conn(conn, "tool_metrics::load_latest_persisted_metrics");
     let limit_i64 = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);
     let sql = "SELECT s.tool_name, s.calls, s.errors, s.cluster, s.complexity, \
                       s.latency_avg_ms, s.latency_p50_ms, s.latency_p95_ms, s.latency_p99_ms, \
@@ -462,10 +493,9 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe
 
 #[must_use]
 pub fn persisted_metric_store_size(database_url: &str) -> u64 {
-    let Some(conn) = open_metrics_connection(database_url) else {
+    let Some(conn) = open_metrics_read_connection(database_url) else {
         return 0;
     };
-    let conn = guard_db_conn(conn, "tool_metrics::persisted_metric_store_size");
     let sql = format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}");
     let rows = match conn.query_sync(&sql, &[]) {
         Ok(rows) => rows,
@@ -1024,6 +1054,100 @@ mod tests {
         assert_eq!(
             configured,
             i64::try_from(METRICS_DB_BUSY_TIMEOUT_MS).unwrap_or(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn metrics_observer_connection_is_engine_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("read_only_metrics_observer.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let seed = open_metrics_connection(&database_url).expect("open seed metrics database");
+        seed.execute_raw("CREATE TABLE marker(id INTEGER PRIMARY KEY)")
+            .expect("create seed marker");
+        drop(seed);
+
+        let observer =
+            open_metrics_read_connection(&database_url).expect("open read-only metrics observer");
+        let write_result = observer.execute_raw("CREATE TABLE forbidden_write(id INTEGER)");
+        assert!(
+            write_result.is_err(),
+            "metrics observer must be engine-enforced read-only"
+        );
+        let marker_count = observer
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'marker'",
+                &[],
+            )
+            .expect("query marker through read-only observer")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(marker_count, 1);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn persisted_metric_readers_do_not_checkpoint_live_wal_on_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("read_only_metrics_drop.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_metrics_connection(&database_url).expect("open metrics WAL fixture");
+        ensure_metrics_schema(&conn);
+        conn.execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable metrics fixture WAL mode");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable metrics fixture autocheckpoint");
+        conn.execute_raw(
+            "INSERT INTO tool_metrics_snapshots (\
+                 collected_ts, tool_name, calls, errors, cluster, capabilities_json, complexity, \
+                 latency_is_slow\
+             ) VALUES (123, 'checkpoint_sentinel', 1, 0, 'test', '[]', 'low', 0);",
+        )
+        .expect("write metrics checkpoint sentinel");
+        // Ordinary writer Drop deliberately leaves committed WAL frames for
+        // both public read-only observer teardowns below to preserve.
+        drop(conn);
+
+        let wal_path = db_path.with_file_name(format!(
+            "{}-wal",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let primary_before = std::fs::read(&db_path).expect("snapshot metrics primary");
+        let wal_before = std::fs::read(&wal_path).expect("snapshot metrics WAL");
+        assert!(
+            wal_before.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize,
+            "fixture must retain committed frames that a checkpointing close would consume"
+        );
+
+        let rows = load_latest_persisted_metrics(&database_url, 50);
+        assert!(
+            rows.iter()
+                .any(|row| row.tool_name == "checkpoint_sentinel"),
+            "read-only metric loader must observe the committed WAL row"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read metrics primary after loader"),
+            primary_before,
+            "metric-loader teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read metrics WAL after loader"),
+            wal_before,
+            "metric-loader teardown must not checkpoint or truncate the WAL"
+        );
+
+        assert_eq!(persisted_metric_store_size(&database_url), 1);
+        assert_eq!(
+            std::fs::read(&db_path).expect("read metrics primary after store-size observer"),
+            primary_before,
+            "store-size teardown must not checkpoint frames into the primary"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).expect("read metrics WAL after store-size observer"),
+            wal_before,
+            "store-size teardown must not checkpoint or truncate the WAL"
         );
     }
 

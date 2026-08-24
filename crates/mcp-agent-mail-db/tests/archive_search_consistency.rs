@@ -21,7 +21,7 @@ use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::search_service::{LexicalBackfillHealth, lexical_backfill_health};
 use mcp_agent_mail_db::{
     DbConn, DbError, DbPool, DbPoolConfig, ReconstructStats, check_schema_invariants_conn, queries,
-    reconstruct_from_archive_with_salvage, scan_archive_message_inventory,
+    reconstruct_from_archive_with_private_salvage, scan_archive_message_inventory,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -178,9 +178,12 @@ fn setup_consistency_fixture() -> CorpusFixture {
     build_archive_fixture(&storage_root);
     build_salvage_fixture(&salvage_db_path);
 
-    let reconstruct_stats =
-        reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-            .expect("reconstruct from archive with product/contact salvage");
+    let reconstruct_stats = reconstruct_from_archive_with_private_salvage(
+        &db_path,
+        &storage_root,
+        &salvage_db_path,
+    )
+    .expect("reconstruct from archive with private product/contact salvage");
 
     let pool = DbPool::new(&DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),

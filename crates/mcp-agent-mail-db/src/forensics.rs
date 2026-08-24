@@ -780,6 +780,7 @@ fn recovery_receipt_error(context: &str, path: &Path, error: impl std::fmt::Disp
 }
 
 /// Append a canonical SQLite sidecar suffix to a database path.
+#[cfg(test)]
 fn sqlite_family_sidecar(db_path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut os = db_path.as_os_str().to_os_string();
     os.push(suffix);

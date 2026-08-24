@@ -2371,9 +2371,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         }
     }
 
-    let database_file_missing = resolved_db_path
-        .as_ref()
-        .is_some_and(|path| !path.exists());
+    let database_file_missing = resolved_db_path.as_ref().is_some_and(|path| !path.exists());
 
     // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
     if database_file_missing
@@ -2445,46 +2443,19 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         ..DbPoolConfig::default()
     };
 
-    // Helper: returns true when the error looks like a stale WAL / snapshot
-    // conflict that can be fixed by quarantining WAL+SHM sidecars. These are NOT
-    // genuine "another process is busy" situations — they mean the DB file has
-    // a WAL that is inconsistent with the main file (e.g. after a crash or
-    // SIGKILL). Treating them as hard "busy" failures causes `am` to refuse
-    // to start when `doctor repair --yes` would succeed immediately.
-    let is_snapshot_conflict =
-        |msg: &str| -> bool { mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(msg) };
-
     let pool = match mcp_agent_mail_db::DbPool::new(&pool_config) {
         Ok(p) => p,
         Err(e) => {
             let err_str = e.to_string();
-
-            // Snapshot conflicts (stale WAL) are recoverable, but detaching a
-            // WAL/SHM family is itself a recovery mutation. Check this before
-            // the generic lock classification because snapshot conflicts
-            // match both, then delegate to the admitted DB health entrypoint.
-            if is_snapshot_conflict(&err_str) {
-                tracing::warn!(
-                    error = %err_str,
-                    "pool open hit snapshot conflict; attempting admitted database-health recovery"
-                );
-                return admitted_recovery_then_retry_integrity(&pool_config, config);
-            }
-
-            if mcp_agent_mail_db::is_lock_error(&err_str) {
-                return integrity_busy_probe_failure(config, &err_str);
-            }
-
-            // Corruption (malformed schema, WAL too small, etc.) follows the
-            // same admitted health/recovery path.
-            if mcp_agent_mail_db::is_corruption_error_message(&err_str) {
-                return admitted_recovery_then_retry_integrity(&pool_config, config);
-            }
-
+            // `DbPool::new` is deliberately lazy: it validates configuration
+            // and constructs the in-memory pool, but it does not open SQLite.
+            // Live lock, WAL, and corruption failures therefore cannot occur
+            // here. They are classified by `run_startup_integrity_check`,
+            // whose single recovery path owns durable admission and retry.
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
                 problem: format!(
-                    "Integrity probe could not open mailbox {}: {}",
+                    "Integrity probe could not initialize the mailbox pool for {}: {}",
                     pool_config.database_url,
                     classify_integrity_open_root_cause(&err_str)
                 ),
@@ -2567,84 +2538,6 @@ fn probe_integrity(config: &Config) -> ProbeResult {
                 problem: format!(
                     "Startup integrity recovery failed for {db_target}: {}",
                     classify_recovery_failure_root_cause(&err_str)
-                ),
-                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
-                    .into(),
-            })
-        }
-    }
-}
-
-/// Sidecar cleanup is recovery: it changes which SQLite generation will be
-/// opened next. Delegate it to the common DB health entrypoint so the durable
-/// recovery breaker is loaded and admission is won before any WAL/SHM rename
-/// or checkpoint. Retain the explicit pool/integrity retry as a postcondition
-/// check after admitted recovery succeeds.
-fn admitted_recovery_then_retry_integrity(
-    pool_config: &DbPoolConfig,
-    config: &Config,
-) -> ProbeResult {
-    match attempt_probe_recovery(config) {
-        ProbeResult::Ok { .. } => {}
-        failure => return failure,
-    }
-
-    let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
-        || config.database_url.clone(),
-        |path| path.display().to_string(),
-    );
-    tracing::info!(
-        database = %db_target,
-        "admitted database-health recovery completed; retrying pool open"
-    );
-
-    let retry_pool = match mcp_agent_mail_db::DbPool::new(pool_config) {
-        Ok(pool) => pool,
-        Err(error) => {
-            let detail = error.to_string();
-            tracing::warn!(
-                database = %db_target,
-                error = %detail,
-                "pool open still failed after admitted database-health recovery"
-            );
-            if mcp_agent_mail_db::is_lock_error(&detail) {
-                return integrity_busy_probe_failure(config, &detail);
-            }
-            return ProbeResult::Fail(ProbeFailure {
-                name: "integrity",
-                problem: format!(
-                    "Admitted database-health recovery completed for {db_target}, but the startup pool retry still failed: {}",
-                    classify_integrity_open_root_cause(&detail)
-                ),
-                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unavailable, run `am doctor reconstruct --yes`."
-                    .into(),
-            });
-        }
-    };
-
-    match retry_pool.run_startup_integrity_check() {
-        Ok(_) => {
-            tracing::info!(
-                database = %db_target,
-                "pool open and integrity retry succeeded after admitted database-health recovery"
-            );
-            ProbeResult::Ok { name: "integrity" }
-        }
-        Err(error) => {
-            let detail = error.to_string();
-            tracing::warn!(
-                database = %db_target,
-                error = %detail,
-                "integrity retry still failed after admitted database-health recovery"
-            );
-            if mcp_agent_mail_db::is_lock_error(&detail) {
-                return integrity_busy_probe_failure(config, &detail);
-            }
-            ProbeResult::Fail(ProbeFailure {
-                name: "integrity",
-                problem: format!(
-                    "Admitted database-health recovery completed for {db_target}, but the startup integrity retry still failed: {}",
-                    classify_recovery_failure_root_cause(&detail)
                 ),
                 fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
                     .into(),
@@ -3339,26 +3232,28 @@ mod tests {
     }
 
     #[test]
-    fn probe_database_uses_absolute_candidate_for_missing_relative_database_url() {
+    fn probe_database_does_not_hijack_missing_relative_target_with_absolute_decoy() {
         let temp = tempfile::tempdir().expect("tempdir");
         let absolute_db = temp.path().join("probe-absolute.sqlite3");
-        std::fs::write(&absolute_db, b"placeholder").expect("create absolute db");
+        let decoy_bytes = b"absolute preflight decoy";
+        std::fs::write(&absolute_db, decoy_bytes).expect("create absolute decoy");
 
         let relative_path =
             std::path::PathBuf::from(absolute_db.to_string_lossy().trim_start_matches('/'));
         assert!(
             !relative_path.exists(),
-            "relative shadow path should be absent so absolute candidate fallback is exercised"
+            "fixture requires a missing configured relative target"
         );
 
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", relative_path.display());
 
         let result = probe_database(&config);
-        assert!(
-            matches!(result, ProbeResult::Ok { name: "database" }),
-            "probe_database should accept the resolved absolute candidate: {result:?}"
-        );
+        let ProbeResult::Fail(failure) = result else {
+            panic!("missing relative parent should fail without using the decoy: {result:?}");
+        };
+        assert!(failure.problem.contains("does not exist"));
+        assert_eq!(std::fs::read(&absolute_db).unwrap(), decoy_bytes);
     }
 
     #[test]
@@ -4752,7 +4647,9 @@ mod tests {
             panic!("failed DB-owned recovery must fail startup: {result:?}");
         };
         assert!(
-            failure.problem.starts_with("Startup integrity recovery failed for "),
+            failure
+                .problem
+                .starts_with("Startup integrity recovery failed for "),
             "the original DB-owned recovery failure must be retained: {}",
             failure.problem
         );
@@ -4764,7 +4661,9 @@ mod tests {
             failure.problem
         );
         assert!(
-            !failure.problem.starts_with("Automatic recovery failed for "),
+            !failure
+                .problem
+                .starts_with("Automatic recovery failed for "),
             "the server must not replace the terminal DB-owned failure with a second recovery result: {}",
             failure.problem
         );
@@ -4805,7 +4704,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_preserves_sqlite_family_when_breaker_is_malformed() {
+    fn stdio_startup_probes_preserve_sqlite_family_when_breaker_is_malformed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let wal_path = db_path.with_file_name("storage.sqlite3-wal");
@@ -4820,15 +4719,24 @@ mod tests {
         std::fs::write(&breaker_path, b"malformed breaker authority")
             .expect("write malformed breaker");
         let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before startup");
+        let breaker_lock_path = mcp_agent_mail_db::recovery_breaker::breaker_lock_path(&db_path);
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "fixture must begin without a breaker-election artifact"
+        );
 
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", db_path.display());
         config.storage_root = dir.path().join("storage");
 
-        let result = probe_integrity(&config);
-        let ProbeResult::Fail(failure) = result else {
-            panic!("malformed breaker authority must fail startup closed: {result:?}");
-        };
+        let report = run_stdio_startup_probes(&config);
+        let failure = report
+            .failures()
+            .into_iter()
+            .find(|failure| failure.name == "integrity")
+            .unwrap_or_else(|| {
+                panic!("malformed breaker authority must fail startup closed: {report:?}")
+            });
         assert!(
             failure
                 .problem
@@ -4856,6 +4764,10 @@ mod tests {
             breaker_bytes,
             "startup must not rewrite malformed breaker authority"
         );
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "authoritative refusal must not create a breaker-election artifact"
+        );
 
         let renamed_family_members = std::fs::read_dir(dir.path())
             .expect("read temp dir")
@@ -4871,6 +4783,97 @@ mod tests {
             renamed_family_members.is_empty(),
             "refused startup recovery must not create renamed family members: {renamed_family_members:?}"
         );
+    }
+
+    #[test]
+    fn stdio_startup_probes_refuse_tripped_breaker_before_opening_damaged_wal_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("tripped-before-open.sqlite3");
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("create healthy primary");
+            conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("detach fixture WAL mode");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize primary schema");
+        }
+        let db_bytes = std::fs::read(&db_path).expect("read primary before startup");
+        let wal_path = db_path.with_file_name("tripped-before-open.sqlite3-wal");
+        let shm_path = db_path.with_file_name("tripped-before-open.sqlite3-shm");
+        std::fs::write(&wal_path, b"truncated-wal").expect("write truncated WAL");
+        std::fs::write(&shm_path, b"coordination-shm").expect("write SHM fixture");
+        let breaker_config = mcp_agent_mail_db::recovery_breaker::config_from_env();
+        let breaker_state = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+            consecutive_failures: breaker_config.max_consecutive_failures,
+            last_failure_unix: i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock after epoch")
+                    .as_secs(),
+            )
+            .unwrap_or(i64::MAX),
+            last_failure_reason: "startup fixture is circuit-broken".to_string(),
+            tripped: true,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &breaker_state)
+            .expect("store tripped breaker");
+        let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+        let breaker_lock_path = mcp_agent_mail_db::recovery_breaker::breaker_lock_path(&db_path);
+        let breaker_bytes = std::fs::read(&breaker_path).expect("read breaker before startup");
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "fixture must begin without a breaker-election artifact"
+        );
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("storage");
+
+        mcp_agent_mail_db::pool::recovery_admission().reset();
+        reset_probe_recovery_attempt_count();
+        let report = run_stdio_startup_probes(&config);
+        let failure = report
+            .failures()
+            .into_iter()
+            .find(|failure| failure.name == "integrity")
+            .unwrap_or_else(|| {
+                panic!("tripped breaker must fail startup before SQLite opens: {report:?}")
+            });
+        assert!(
+            failure.problem.contains("circuit-broken"),
+            "startup should surface the durable circuit refusal: {}",
+            failure.problem
+        );
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            0,
+            "the server recovery entrypoint must not run after DB admission refuses"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), db_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
+        assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
+        assert!(
+            std::fs::symlink_metadata(&breaker_lock_path).is_err(),
+            "authoritative refusal must not create a breaker-election artifact"
+        );
+        let renamed_family_members = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                name.starts_with("tripped-before-open.sqlite3.corrupt-")
+                    || name.starts_with("tripped-before-open.sqlite3-wal.")
+                    || name.starts_with("tripped-before-open.sqlite3-shm.")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            renamed_family_members.is_empty(),
+            "refused startup must not publish family or forensic artifacts: {renamed_family_members:?}"
+        );
+        mcp_agent_mail_db::pool::recovery_admission().reset();
     }
 
     #[test]
