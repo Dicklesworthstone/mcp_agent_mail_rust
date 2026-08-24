@@ -1514,6 +1514,10 @@ impl MessageBrowserScreen {
         project_slug: &str,
         state: Option<&TuiSharedState>,
     ) -> Result<(), String> {
+        // This helper can create/update both the live agent row and its archive
+        // profile. Freeze recovery promotion before opening the raw live fd and
+        // retain the lease until both durable representations are complete.
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let conn = Self::open_live_mutation_db_connection(state)?;
         let project_id = if let Some(project_id) = synthetic_project_id(project_slug) {
             ensure_synthetic_project_row(&conn, project_id, project_slug)?

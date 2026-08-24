@@ -108,16 +108,21 @@ pub fn shutdown() {
 fn metrics_loop(config: &Config) {
     let interval = std::time::Duration::from_secs(config.tool_metrics_emit_interval_seconds.max(5));
     let startup_delay = interval.min(std::time::Duration::from_secs(8));
-    let mut conn = open_metrics_connection(&config.database_url);
-    if let Some(db) = conn.as_ref() {
+    let (mut conn, mut conn_epoch) = {
+        // The lease must begin before the raw fd is opened, not merely before
+        // the first DDL statement: promotion is a live-file rename.
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-        ensure_metrics_schema(db);
-    }
+        let epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
+        let conn = open_metrics_connection(&config.database_url);
+        if let Some(db) = conn.as_ref() {
+            ensure_metrics_schema(db);
+        }
+        (conn, epoch)
+    };
     // #219: a recovery promotion replaces the live file by rename; a raw
     // long-lived fd silently follows the old inode into quarantine and every
     // subsequent write lands in the forensic artifact. Track the promotion
     // epoch and reopen when it moves.
-    let mut conn_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
     let mut tick_index: u64 = 0;
 
     info!(
@@ -172,34 +177,39 @@ fn metrics_loop(config: &Config) {
                 }
             }
 
-            let current_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
-            if conn.is_some() && current_epoch != conn_epoch {
-                info!(
-                    target: "tool.metrics",
-                    "reopening metrics connection after a database recovery promotion"
-                );
-                conn = None;
-            }
-            if conn.is_none() && (current_epoch != conn_epoch || tick_index.is_multiple_of(12)) {
-                conn = open_metrics_connection(&config.database_url);
-                if let Some(db) = conn.as_ref() {
-                    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-                    ensure_metrics_schema(db);
-                }
-                conn_epoch = current_epoch;
-            }
-            if let Some(db) = conn.as_ref() {
-                // #219: hold the write lease so a promotion cannot rename the
-                // live file out from under this INSERT/DELETE batch.
+            {
+                // Read the epoch, reopen if needed, and persist under one
+                // continuous lease. Checking the epoch before acquiring the
+                // lease leaves a TOCTOU window in which promotion can rename
+                // the file and the subsequent INSERT targets the old inode.
                 let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-                if let Err(err) = persist_snapshot_rows(db, collected_ts, &snapshot) {
-                    warn!(
+                let current_epoch = mcp_agent_mail_db::write_barrier::promotion_epoch();
+                if conn.is_some() && current_epoch != conn_epoch {
+                    info!(
                         target: "tool.metrics",
-                        error = %err,
-                        "failed persisting tool metrics snapshot"
+                        "reopening metrics connection after a database recovery promotion"
                     );
-                } else if tick_index.is_multiple_of(PRUNE_INTERVAL_TICKS) {
-                    prune_old_snapshot_rows(db, collected_ts);
+                    conn = None;
+                }
+                if conn.is_none()
+                    && (current_epoch != conn_epoch || tick_index.is_multiple_of(12))
+                {
+                    conn = open_metrics_connection(&config.database_url);
+                    if let Some(db) = conn.as_ref() {
+                        ensure_metrics_schema(db);
+                    }
+                    conn_epoch = current_epoch;
+                }
+                if let Some(db) = conn.as_ref() {
+                    if let Err(err) = persist_snapshot_rows(db, collected_ts, &snapshot) {
+                        warn!(
+                            target: "tool.metrics",
+                            error = %err,
+                            "failed persisting tool metrics snapshot"
+                        );
+                    } else if tick_index.is_multiple_of(PRUNE_INTERVAL_TICKS) {
+                        prune_old_snapshot_rows(db, collected_ts);
+                    }
                 }
             }
 

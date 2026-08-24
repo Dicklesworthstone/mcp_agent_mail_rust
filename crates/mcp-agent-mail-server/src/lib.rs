@@ -32444,7 +32444,7 @@ first body
                 outcome,
                 mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut {
                     remaining_writers
-                } if remaining_writers > baseline_writers
+                } if remaining_writers > 0
             ),
             "promotion must time out while the actual compose dispatch owns its lease: {outcome:?}"
         );

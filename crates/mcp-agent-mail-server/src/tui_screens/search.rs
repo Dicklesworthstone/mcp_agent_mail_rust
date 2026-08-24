@@ -2573,6 +2573,10 @@ impl SearchCockpitScreen {
         if self.recipes_loaded {
             return;
         }
+        // The nominal list helpers self-heal their tables with DDL. Treat the
+        // entire open + schema/list sequence as a write so a recovery
+        // promotion cannot swap the live generation underneath the raw fd.
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let Ok(conn) = self.open_live_metadata_operation_db_connection() else {
             return;
         };
@@ -2616,6 +2620,7 @@ impl SearchCockpitScreen {
             executed_ts: now_micros(),
             ..Default::default()
         };
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         if let Ok(conn) = self.open_live_metadata_operation_db_connection() {
             let _ = insert_history(&conn, &entry);
             self.metadata_db_conn = Some(conn);
@@ -2644,6 +2649,7 @@ impl SearchCockpitScreen {
             thread_filter: self.thread_filter.clone(),
             ..Default::default()
         };
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         if let Ok(conn) = self.open_live_metadata_operation_db_connection()
             && let Ok(id) = insert_recipe(&conn, &recipe)
         {
@@ -2688,11 +2694,12 @@ impl SearchCockpitScreen {
         self.debounce_remaining = 0;
 
         // Touch the recipe's use count
-        if let Some(id) = recipe.id
-            && let Ok(conn) = self.open_live_metadata_operation_db_connection()
-        {
-            let _ = touch_recipe(&conn, id);
-            self.metadata_db_conn = Some(conn);
+        if let Some(id) = recipe.id {
+            let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+            if let Ok(conn) = self.open_live_metadata_operation_db_connection() {
+                let _ = touch_recipe(&conn, id);
+                self.metadata_db_conn = Some(conn);
+            }
         }
     }
 
