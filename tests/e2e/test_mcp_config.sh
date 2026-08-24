@@ -36,6 +36,7 @@ CLI_BIN="${CARGO_TARGET_DIR}/debug/am"
 
 # Sandboxed HOME so we don't touch real configs
 WORK="$(e2e_mktemp "e2e_mcp_config")"
+WORK="$(cd "${WORK}" && pwd -P)"
 FAKE_HOME="${WORK}/home"
 FAKE_PROJECT="${WORK}/project"
 FAKE_DEST="${FAKE_HOME}/.local/bin"
@@ -522,7 +523,8 @@ cat > "$OMP_PROJECT_CONFIG" <<'EOF'
       "command": "node",
       "args": ["server.js"]
     }
-  }
+  },
+  "disabledServers": ["keep-disabled", "mcp-agent-mail"]
 }
 EOF
 
@@ -549,7 +551,7 @@ fi
 e2e_save_artifact "case_13_omp_project.json" "$OMP_PROJECT"
 e2e_save_artifact "case_13_omp_user.json" "$OMP_USER"
 
-if json_get "$OMP_PROJECT" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789'"; then
+if json_get "$OMP_PROJECT" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789' and entry['enabled'] is True; assert d['disabledServers']==['keep-disabled']"; then
     e2e_pass "OMP project config uses native authenticated HTTP shape"
 else
     e2e_fail "OMP project config shape" "native authenticated HTTP entry" "missing or malformed"
@@ -561,7 +563,7 @@ else
     e2e_fail "OMP sibling server preservation" "unchanged" "modified or missing"
 fi
 
-if json_get "$OMP_USER" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789'"; then
+if json_get "$OMP_USER" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789' and entry['enabled'] is True"; then
     e2e_pass "OMP default-profile user config uses native HTTP shape"
 else
     e2e_fail "OMP user config shape" "native authenticated HTTP entry" "missing or malformed"

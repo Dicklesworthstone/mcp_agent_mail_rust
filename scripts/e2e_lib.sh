@@ -219,6 +219,14 @@ _E2E_CASE_ARTIFACTS_FILE=""
 
 # Temp dirs to clean up
 _E2E_TMP_DIRS=()
+# `e2e_mktemp` is normally invoked through command substitution, which runs
+# the function in a subshell. Array mutations made there cannot reach this
+# parent shell, so use a per-suite registry as the cross-subshell handoff.
+# Canonicalizing the root also keeps symlink-hardened production writers from
+# rejecting macOS' `/var` -> `/private/var` compatibility path in E2E fixtures.
+E2E_REAL_TMPDIR="$(cd "${TMPDIR}" && pwd -P)"
+_E2E_TMP_REGISTRY="$(mktemp "${E2E_REAL_TMPDIR}/.mcp-agent-mail-e2e-tmp.$$.registry.XXXXXX")"
+export E2E_REAL_TMPDIR
 
 # ---------------------------------------------------------------------------
 # Deterministic helpers (br-3vwi.10.19)
@@ -493,25 +501,53 @@ e2e_assert_exit_code() {
 e2e_mktemp() {
     local prefix="${1:-e2e}"
     local td
-    td="$(mktemp -d "${TMPDIR%/}/${prefix}.XXXXXX")"
+    case "$prefix" in
+        "" | "." | ".." | *[!A-Za-z0-9._-]*)
+            e2e_log "Refusing unsafe temporary-directory prefix: $prefix"
+            return 2
+            ;;
+    esac
+    td="$(mktemp -d "${E2E_REAL_TMPDIR%/}/${prefix}.XXXXXX")"
     _E2E_TMP_DIRS+=("$td")
+    printf '%s\n' "$td" >> "$_E2E_TMP_REGISTRY"
     echo "$td"
 }
 
 # Cleanup function: remove temp dirs unless AM_E2E_KEEP_TMP=1
 _e2e_cleanup() {
+    local -a temp_dirs=("${_E2E_TMP_DIRS[@]}")
+    local d
+    if [ -f "$_E2E_TMP_REGISTRY" ]; then
+        while IFS= read -r d; do
+            [ -n "$d" ] && temp_dirs+=("$d")
+        done < "$_E2E_TMP_REGISTRY"
+    fi
+
     if [ "$AM_E2E_KEEP_TMP" = "1" ] || [ "$AM_E2E_KEEP_TMP" = "true" ]; then
-        if [ ${#_E2E_TMP_DIRS[@]} -gt 0 ]; then
+        if [ ${#temp_dirs[@]} -gt 0 ]; then
             e2e_log "Keeping temp dirs (AM_E2E_KEEP_TMP=1):"
-            for d in "${_E2E_TMP_DIRS[@]}"; do
+            for d in "${temp_dirs[@]}"; do
                 e2e_log "  $d"
             done
         fi
         return
     fi
-    for d in "${_E2E_TMP_DIRS[@]}"; do
-        rm -rf "$d" 2>/dev/null || true
+    for d in "${temp_dirs[@]}"; do
+        # Registry contents are visible to subprocesses, so validate the exact
+        # shape emitted by e2e_mktemp before reaching the existing recursive
+        # cleanup. In particular, reject `root/../victim` and replaced symlinks.
+        if [ "${d%/*}" != "${E2E_REAL_TMPDIR%/}" ] || [ -L "$d" ]; then
+            e2e_log "Refusing to clean untrusted temp path: $d"
+            continue
+        fi
+        case "${d##*/}" in
+            *.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9])
+                rm -rf -- "$d" 2>/dev/null || true
+                ;;
+            *) e2e_log "Refusing to clean malformed temp path: $d" ;;
+        esac
     done
+    rm -f -- "$_E2E_TMP_REGISTRY" 2>/dev/null || true
 }
 
 trap _e2e_cleanup EXIT

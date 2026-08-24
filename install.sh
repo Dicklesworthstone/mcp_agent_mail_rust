@@ -3654,20 +3654,152 @@ setup_single_standard_http_json_config() {
   result=$(python3 - "$tool" "$config_path" "$desired_url" "$desired_auth_header" <<'PY'
 import json
 import os
-import re
-import shutil
+import stat
 import sys
+import time
 from datetime import datetime, timezone
 
 tool, config_path, desired_url, desired_auth_header = sys.argv[1:5]
 
 
-def load_text(path: str) -> str:
+def path_has_symlink_component(path: str) -> bool:
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return True
+    return False
+
+
+def ensure_real_directory_tree(path: str) -> None:
+    _, raw_tail = os.path.splitdrive(path)
+    if any(component == ".." for component in raw_tail.split(os.sep)):
+        raise OSError(f"refusing parent traversal in config directory: {path}")
+    absolute = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(absolute)
+    current = drive + os.sep
+    for component in tail.split(os.sep):
+        if not component or component == ".":
+            continue
+        current = os.path.join(current, component)
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                # Another process may have created the component after the
+                # lstat. Re-inspect it instead of assuming it is a directory.
+                pass
+            metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError(f"refusing symlinked config parent: {current}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError(f"config parent component is not a directory: {current}")
+
+
+def load_config(path: str):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
+        # O_NONBLOCK prevents a hostile or accidental FIFO target from
+        # hanging the installer before we can reject its file type.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
     except FileNotFoundError:
-        return ""
+        return b"", None
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(fd)
+        raise ValueError("config target is not a regular file")
+    with os.fdopen(fd, "rb") as handle:
+        raw = handle.read()
+        mode = stat.S_IMODE(metadata.st_mode)
+    return raw, mode
+
+
+def sync_parent_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    parent = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_backup(path: str, raw: bytes, mode: int) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    for attempt in range(1024):
+        suffix = time.time_ns()
+        backup = f"{path}.{stamp}.{suffix}.{attempt}.bak"
+        try:
+            fd = os.open(
+                backup,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        sync_parent_directory(backup)
+        return backup
+    raise OSError(f"could not create a unique backup for {path}")
+
+
+def write_config_atomic(path: str, text: str, mode: int) -> None:
+    parent = os.path.dirname(path) or "."
+    ensure_real_directory_tree(parent)
+
+    basename = os.path.basename(path)
+    temp_path = ""
+    for attempt in range(1024):
+        candidate = os.path.join(
+            parent,
+            f".{basename}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp",
+        )
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+            )
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        break
+    if not temp_path:
+        raise OSError(f"could not create a unique temporary config next to {path}")
+
+    try:
+        target_metadata = os.lstat(path)
+    except FileNotFoundError:
+        target_metadata = None
+    if target_metadata is not None and not stat.S_ISREG(target_metadata.st_mode):
+        raise OSError(f"refusing non-regular config target: {path}")
+    if path_has_symlink_component(parent):
+        raise OSError(f"refusing symlinked config parent: {parent}")
+    os.replace(temp_path, path)
+    sync_parent_directory(path)
 
 
 def parse_json(text: str):
@@ -3675,21 +3807,35 @@ def parse_json(text: str):
         text = text[1:]
     if not text.strip():
         return {}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        cleaned = re.sub(r"//.*?\n", "\n", text)
-        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        return json.loads(cleaned)
+    return json.loads(text)
 
 
 def dump_json(doc) -> str:
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
-text = load_text(config_path)
-doc = parse_json(text)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+
+try:
+    raw, existing_mode = load_config(config_path)
+except ValueError:
+    print("ERROR:non_regular_target")
+    raise SystemExit(0)
+except OSError as error:
+    print(f"ERROR:read_failed_{error.errno}")
+    raise SystemExit(0)
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    print("ERROR:not_utf8")
+    raise SystemExit(0)
+try:
+    doc = parse_json(text)
+except json.JSONDecodeError:
+    print("ERROR:invalid_json")
+    raise SystemExit(0)
 if not isinstance(doc, dict):
     print("ERROR:not_object")
     raise SystemExit(0)
@@ -3744,15 +3890,19 @@ new_entry = {
     if key not in {
         "command",
         "args",
+        "cwd",
         "environment",
         "env",
         "transport",
         "httpUrl",
+        "http_headers",
         "bearer_token_env_var",
     }
 }
 new_entry["type"] = "http"
 new_entry["url"] = desired_url
+if tool == "omp":
+    new_entry["enabled"] = True
 
 headers = new_entry.get("headers")
 if headers is not None and not isinstance(headers, dict):
@@ -3783,22 +3933,40 @@ if tool == "omp":
             continue
         legacy_container.pop("mcp-agent-mail", None)
         legacy_container.pop("mcp_agent_mail", None)
+    disabled_servers = doc.get("disabledServers")
+    if disabled_servers is not None and not isinstance(disabled_servers, list):
+        print("ERROR:disabled_servers_not_array")
+        raise SystemExit(0)
+    if isinstance(disabled_servers, list):
+        doc["disabledServers"] = [
+            name
+            for name in disabled_servers
+            if name not in ("mcp-agent-mail", "mcp_agent_mail")
+        ]
 new_text = dump_json(doc)
-if new_text == dump_json(parse_json(text)):
+effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
+permissions_need_tightening = (
+    existing_mode is not None and effective_mode != existing_mode
+)
+if new_text == dump_json(parse_json(text)) and not permissions_need_tightening:
     print("SKIP:unchanged")
     raise SystemExit(0)
 
 parent_dir = os.path.dirname(config_path)
 if parent_dir:
-    os.makedirs(parent_dir, exist_ok=True)
-if os.path.exists(config_path):
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    backup = f"{config_path}.{stamp}.bak"
-    shutil.copy2(config_path, backup)
+    try:
+        ensure_real_directory_tree(parent_dir)
+    except OSError:
+        print("ERROR:unsafe_parent")
+        raise SystemExit(0)
+if path_has_symlink_component(config_path):
+    print("ERROR:symlink_path")
+    raise SystemExit(0)
+if existing_mode is not None:
+    backup = write_backup(config_path, raw, effective_mode)
 else:
     backup = ""
-with open(config_path, "w", encoding="utf-8") as handle:
-    handle.write(new_text)
+write_config_atomic(config_path, new_text, effective_mode)
 
 if backup:
     print(f"OK:updated backup={backup}")

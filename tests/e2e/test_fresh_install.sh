@@ -30,6 +30,7 @@ CLI_BIN="${CARGO_TARGET_DIR}/debug/am"
 
 # Create an isolated HOME to simulate a clean system
 FAKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/fresh_install_home.XXXXXX")"
+FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 FAKE_DEST="${FAKE_HOME}/.local/bin"
 mkdir -p "$FAKE_DEST"
 
@@ -598,10 +599,12 @@ else
   "mcpServers": {
     "sibling": {"type": "http", "url": "http://sibling.invalid/mcp"}
   },
+  "disabledServers": ["sibling", "mcp_agent_mail", "mcp-agent-mail"],
   "servers": {
     "mcp_agent_mail": {
       "command": "legacy-agent-mail",
       "args": [],
+      "cwd": "/stale/stdio/root",
       "env": {"HTTP_BEARER_TOKEN": "stale-token"},
       "headers": {
         "authorization": "Bearer stale-token",
@@ -619,6 +622,13 @@ EOF
   if [ ! -s "${OMP_WRITER_LIBRARY}" ]; then
     e2e_fail "extract OMP installer writer" "function body" "missing"
   else
+    if grep -Fq 'os.makedirs(' "${OMP_WRITER_LIBRARY}"; then
+      e2e_fail "OMP installer writer avoids unchecked recursive parent creation" \
+        "component-wise validated creation" "os.makedirs"
+    else
+      e2e_pass "OMP installer writer avoids unchecked recursive parent creation"
+    fi
+
     set +e
     (
       # These stubs are invoked by the sourced installer helper.
@@ -646,16 +656,19 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 entry = doc["mcpServers"]["mcp-agent-mail"]
 assert entry["type"] == "http"
 assert entry["url"] == "http://127.0.0.1:8765/mcp/"
+assert entry["enabled"] is True
 assert entry["headers"] == {"X-Trace": "preserve-me"}
-assert "command" not in entry and "args" not in entry and "env" not in entry
+assert "command" not in entry and "args" not in entry and "cwd" not in entry and "env" not in entry
 assert "mcp_agent_mail" not in doc["servers"]
 assert doc["servers"]["other"]["command"] == "other-server"
 assert doc["mcpServers"]["sibling"]["url"] == "http://sibling.invalid/mcp"
+assert doc["disabledServers"] == ["sibling"]
 print("valid")
 PY
-)"
+    )"
     e2e_assert_eq "OMP installer writer emits one clean native HTTP entry" "valid" "${OMP_WRITER_ASSERTIONS}"
 
+    chmod 0644 "${OMP_CONFIG}"
     set +e
     (
       # These stubs are invoked by the sourced installer helper.
@@ -671,7 +684,78 @@ PY
     )
     OMP_WRITER_SECOND_RC=$?
     set -e
-    e2e_assert_exit_code "OMP installer writer is idempotent" "1" "${OMP_WRITER_SECOND_RC}"
+    e2e_assert_exit_code "OMP installer writer repairs broad config permissions" \
+      "0" "${OMP_WRITER_SECOND_RC}"
+    if stat -f '%Lp' "${OMP_CONFIG}" >/dev/null 2>&1; then
+      OMP_CONFIG_MODE="$(stat -f '%Lp' "${OMP_CONFIG}")"
+    else
+      OMP_CONFIG_MODE="$(stat -c '%a' "${OMP_CONFIG}")"
+    fi
+    e2e_assert_eq "OMP installer writer tightens config mode" "600" "${OMP_CONFIG_MODE}"
+
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      # shellcheck disable=SC1090
+      source "${OMP_WRITER_LIBRARY}"
+      setup_single_standard_http_json_config omp "${OMP_CONFIG}"
+    )
+    OMP_WRITER_THIRD_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer is byte-and-mode idempotent" \
+      "1" "${OMP_WRITER_THIRD_RC}"
+
+    OMP_SYMLINK_TARGET="${OMP_INSTALLER_DIR}/symlink-target.json"
+    OMP_SYMLINK_CONFIG="${OMP_INSTALLER_DIR}/symlinked-mcp.json"
+    printf '%s\n' '{"sentinel":"must-not-change"}' > "${OMP_SYMLINK_TARGET}"
+    ln -s "${OMP_SYMLINK_TARGET}" "${OMP_SYMLINK_CONFIG}"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      # shellcheck disable=SC1090
+      source "${OMP_WRITER_LIBRARY}"
+      setup_single_standard_http_json_config omp "${OMP_SYMLINK_CONFIG}"
+    )
+    OMP_SYMLINK_WRITER_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer refuses symlinked config targets" \
+      "2" "${OMP_SYMLINK_WRITER_RC}"
+    OMP_SYMLINK_TARGET_CONTENT="$(cat "${OMP_SYMLINK_TARGET}")"
+    e2e_assert_eq "OMP installer writer leaves symlink target untouched" \
+      '{"sentinel":"must-not-change"}' "${OMP_SYMLINK_TARGET_CONTENT}"
+
+    OMP_TRAVERSAL_CONFIG="${OMP_INSTALLER_DIR}/missing/../escaped-mcp.json"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      # shellcheck disable=SC1090
+      source "${OMP_WRITER_LIBRARY}"
+      setup_single_standard_http_json_config omp "${OMP_TRAVERSAL_CONFIG}"
+    )
+    OMP_TRAVERSAL_WRITER_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer refuses parent traversal" \
+      "2" "${OMP_TRAVERSAL_WRITER_RC}"
+    if [ -e "${OMP_INSTALLER_DIR}/escaped-mcp.json" ]; then
+      e2e_fail "OMP traversal refusal leaves destination absent" "absent" "created"
+    else
+      e2e_pass "OMP traversal refusal leaves destination absent"
+    fi
   fi
 
   OMP_DETECT_LIBRARY="${OMP_INSTALLER_DIR}/detect-function.sh"
