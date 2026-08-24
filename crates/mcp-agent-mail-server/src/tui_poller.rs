@@ -1100,6 +1100,7 @@ pub fn open_sync_write_connection_pub(database_url: &str) -> Option<DbConn> {
 }
 
 /// Open a sync `SQLite` connection from a database URL.
+#[cfg(test)]
 fn open_sync_connection(database_url: &str) -> Option<DbConn> {
     open_sync_connection_with_path(database_url).map(|(conn, _)| conn)
 }
@@ -1123,6 +1124,7 @@ fn open_sync_connection_with_path_and_storage_root(
     }
 }
 
+#[cfg(test)]
 fn open_sync_connection_with_path(database_url: &str) -> Option<(DbConn, String)> {
     // `:memory:` URLs would create a brand-new private DB per poll cycle,
     // which diverges from the server pool and yields misleading empty

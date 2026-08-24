@@ -2685,6 +2685,13 @@ pub struct DbPool {
     /// path does not reparse process configuration for every experience.
     atc_experience_max_rows: i64,
     init_sql: Arc<String>,
+    /// Desired connection-local `journal_size_limit` for this shared pool.
+    ///
+    /// FrankenSQLite implements this PRAGMA per connection. The value is
+    /// therefore installed in `init_sql` for the normal case and shared
+    /// atomically so an explicit runtime retune reaches newly opened and
+    /// subsequently checked-out pooled connections.
+    journal_size_limit_state: Arc<AtomicU64>,
     run_migrations: bool,
     skip_startup_init: bool,
     open_mode: DbPoolOpenMode,
@@ -2723,6 +2730,13 @@ static MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<usize, MessageIdAllocatorEn
     OnceLock::new();
 static NEXT_POOL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+type JournalSizeLimitEntry = (Weak<Pool<DbConn>>, Arc<AtomicU64>);
+
+static JOURNAL_SIZE_LIMITS: OnceLock<Mutex<HashMap<usize, JournalSizeLimitEntry>>> =
+    OnceLock::new();
+
+const JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE: u64 = 1 << 63;
+
 fn shared_message_id_allocator(
     pool: &Arc<Pool<DbConn>>,
 ) -> (Arc<crate::id_floor::MessageIdAllocator>, u64) {
@@ -2742,8 +2756,72 @@ fn shared_message_id_allocator(
     (allocator, generation)
 }
 
+fn shared_journal_size_limit(
+    pool: &Arc<Pool<DbConn>>,
+    configured_bytes: u64,
+) -> Arc<AtomicU64> {
+    let registry = JOURNAL_SIZE_LIMITS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    let key = Arc::as_ptr(pool) as usize;
+    if let Some((_, state)) = guard.get(&key) {
+        return state.clone();
+    }
+    let state = Arc::new(AtomicU64::new(configured_bytes));
+    guard.insert(key, (Arc::downgrade(pool), state.clone()));
+    drop(guard);
+    state
+}
+
+const fn journal_size_limit_bytes(state: u64) -> u64 {
+    state & !JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE
+}
+
+const fn journal_size_limit_has_runtime_override(state: u64) -> bool {
+    state & JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE != 0
+}
+
+fn checked_journal_size_limit(bytes: u64) -> DbResult<i64> {
+    i64::try_from(bytes).map_err(|_| DbError::InvalidArgument {
+        field: "journal_size_limit_bytes",
+        message: format!("{bytes} exceeds SQLite's signed 64-bit PRAGMA range"),
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_journal_size_limit(conn: &DbConn, bytes: u64) -> Result<(), SqlError> {
+    let value = i64::try_from(bytes).map_err(|_| {
+        SqlError::Custom(format!(
+            "journal_size_limit value {bytes} exceeds SQLite's signed 64-bit PRAGMA range"
+        ))
+    })?;
+    conn.execute_raw(&format!("PRAGMA journal_size_limit = {value};"))
+}
+
 impl DbPool {
-    fn connection_init_sql(config: &DbPoolConfig, query_only: bool) -> Arc<String> {
+    fn live_maintenance_connection(
+        &self,
+        context: &'static str,
+        busy_timeout_ms: u64,
+    ) -> DbResult<crate::DbConnGuard> {
+        let conn = crate::guard_db_conn(
+            open_sqlite_file_with_lock_retry(&self.sqlite_path)
+                .map_err(|error| DbError::Sqlite(format!("{context}: open failed: {error}")))?,
+            context,
+        );
+        conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
+            .map_err(|error| DbError::Sqlite(format!("{context}: busy_timeout: {error}")))?;
+        let state = self.journal_size_limit_state.load(Ordering::Acquire);
+        apply_journal_size_limit(&conn, journal_size_limit_bytes(state))
+            .map_err(|error| DbError::Sqlite(format!("{context}: journal_size_limit: {error}")))?;
+        Ok(conn)
+    }
+
+    fn connection_init_sql(
+        config: &DbPoolConfig,
+        query_only: bool,
+        journal_size_limit_bytes: i64,
+    ) -> Arc<String> {
         let mut sql = String::new();
         if query_only {
             sql.push_str("PRAGMA query_only = ON;\n");
@@ -2751,6 +2829,12 @@ impl DbPool {
         sql.push_str(&schema::build_conn_pragmas(
             config.max_connections,
             config.cache_budget_kb,
+        ));
+        // `build_conn_pragmas` carries the historical default. Append the
+        // operator value so the last assignment is authoritative without
+        // widening this pool-only change into schema helpers used elsewhere.
+        sql.push_str(&format!(
+            "PRAGMA journal_size_limit = {journal_size_limit_bytes};\n"
         ));
         Arc::new(sql)
     }
@@ -2762,9 +2846,18 @@ impl DbPool {
     ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
-        let atc_experience_max_rows =
-            mcp_agent_mail_core::Config::from_env().atc_experience_max_rows;
-        let init_sql = Self::connection_init_sql(config, false);
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        let atc_experience_max_rows = core_config.atc_experience_max_rows;
+        checked_journal_size_limit(core_config.db_journal_size_limit_bytes)?;
+        let journal_size_limit_state =
+            shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
+        let journal_size_limit =
+            journal_size_limit_bytes(journal_size_limit_state.load(Ordering::Acquire));
+        let init_sql = Self::connection_init_sql(
+            config,
+            false,
+            checked_journal_size_limit(journal_size_limit)?,
+        );
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
         let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
 
@@ -2775,6 +2868,7 @@ impl DbPool {
             storage_root,
             atc_experience_max_rows,
             init_sql,
+            journal_size_limit_state,
             run_migrations: config.run_migrations,
             skip_startup_init,
             open_mode: DbPoolOpenMode::Recovering,
@@ -2794,9 +2888,10 @@ impl DbPool {
     ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
-        let atc_experience_max_rows =
-            mcp_agent_mail_core::Config::from_env().atc_experience_max_rows;
-        let init_sql = Self::connection_init_sql(config, query_only);
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        let atc_experience_max_rows = core_config.atc_experience_max_rows;
+        let configured_journal_size_limit =
+            checked_journal_size_limit(core_config.db_journal_size_limit_bytes)?;
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
         let pool_config = PoolConfig::new(config.max_connections)
@@ -2808,6 +2903,10 @@ impl DbPool {
             .test_on_return(false);
 
         let pool = Arc::new(Pool::new(pool_config));
+        let journal_size_limit_state =
+            shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
+        let init_sql =
+            Self::connection_init_sql(config, query_only, configured_journal_size_limit);
         let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
 
         Ok(Self {
@@ -2817,6 +2916,7 @@ impl DbPool {
             storage_root,
             atc_experience_max_rows,
             init_sql,
+            journal_size_limit_state,
             run_migrations: config.run_migrations,
             skip_startup_init,
             open_mode: if query_only {
@@ -3146,6 +3246,26 @@ impl DbPool {
                 }
             })
             .await;
+
+        let journal_size_limit_state = self.journal_size_limit_state.load(Ordering::Acquire);
+        let out = match out {
+            Outcome::Ok(conn)
+                if journal_size_limit_has_runtime_override(journal_size_limit_state) =>
+            {
+                let bytes = journal_size_limit_bytes(journal_size_limit_state);
+                match apply_journal_size_limit(&conn, bytes) {
+                    Ok(()) => Outcome::Ok(conn),
+                    Err(error) => {
+                        crate::close_db_conn(
+                            conn.detach(),
+                            "pool journal_size_limit retune failed",
+                        );
+                        Outcome::Err(error)
+                    }
+                }
+            }
+            other => other,
+        };
 
         let dur_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
             .unwrap_or(u64::MAX);
@@ -3792,7 +3912,14 @@ impl DbPool {
     /// SQLite reports that the TRUNCATE checkpoint was busy or incomplete.
     /// No-ops silently for `:memory:` databases.
     pub fn wal_checkpoint(&self) -> DbResult<u64> {
-        wal_checkpoint_truncate_path(Path::new(&self.sqlite_path))
+        if self.sqlite_path == ":memory:" {
+            return Ok(0);
+        }
+        let conn = self.live_maintenance_connection("live wal checkpoint", 60_000)?;
+        let rows = conn
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .map_err(|error| DbError::Sqlite(format!("live wal checkpoint: {error}")))?;
+        parse_wal_checkpoint_rows(&rows, "live wal checkpoint", true)
     }
 
     /// Run a **passive** WAL checkpoint that never blocks writers.
@@ -4022,20 +4149,17 @@ impl DbPool {
     /// Run `ANALYZE` to refresh the query planner's table/index statistics.
     ///
     /// Intended for the periodic maintenance worker (bead K4) running off the
-    /// latency-sensitive request path. Uses the canonical SQLite engine — the
-    /// same path `am doctor repair` uses for VACUUM/ANALYZE — and a bounded
-    /// `busy_timeout` so it backs off under write contention instead of erroring
-    /// immediately. No-ops for `:memory:` databases.
+    /// latency-sensitive request path. Uses a FrankenSQLite connection so the
+    /// live mailbox stays inside the runtime engine's transaction/maintenance
+    /// fence. A bounded `busy_timeout` makes it back off under write contention.
+    /// No-ops for `:memory:` databases.
     pub fn analyze(&self) -> DbResult<()> {
         if self.sqlite_path == ":memory:" {
             return Ok(());
         }
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("analyze: open failed: {e}")))?;
-        conn.execute_raw("PRAGMA busy_timeout = 5000;")
-            .map_err(|e| DbError::Sqlite(format!("analyze: busy_timeout: {e}")))?;
+        let conn = self.live_maintenance_connection("analyze", 5_000)?;
         conn.execute_raw("ANALYZE;")
-            .map_err(|e| DbError::Sqlite(format!("analyze: {e}")))?;
+            .map_err(|error| DbError::Sqlite(format!("analyze: {error}")))?;
         Ok(())
     }
 
@@ -4043,19 +4167,17 @@ impl DbPool {
     ///
     /// This rewrites the whole database, so it is a scheduled, infrequent,
     /// off-hot-path operation (see the integrity guard's maintenance cycle, bead
-    /// K4). Uses the canonical SQLite engine and a generous `busy_timeout` so a
-    /// busy period defers the vacuum rather than failing the file. No-ops for
-    /// `:memory:` databases.
+    /// K4). Uses a FrankenSQLite connection so the live mailbox stays inside
+    /// the runtime engine's exclusive-maintenance fence. A generous
+    /// `busy_timeout` lets a busy period defer the vacuum. No-ops for `:memory:`
+    /// databases.
     pub fn vacuum(&self) -> DbResult<()> {
         if self.sqlite_path == ":memory:" {
             return Ok(());
         }
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("vacuum: open failed: {e}")))?;
-        conn.execute_raw("PRAGMA busy_timeout = 30000;")
-            .map_err(|e| DbError::Sqlite(format!("vacuum: busy_timeout: {e}")))?;
+        let conn = self.live_maintenance_connection("vacuum", 30_000)?;
         conn.execute_raw("VACUUM;")
-            .map_err(|e| DbError::Sqlite(format!("vacuum: {e}")))?;
+            .map_err(|error| DbError::Sqlite(format!("vacuum: {error}")))?;
         Ok(())
     }
 
@@ -4088,19 +4210,27 @@ impl DbPool {
     /// Apply a `journal_size_limit` (bytes) so the WAL is truncated back to the
     /// configured cap after a checkpoint, bounding unbounded WAL growth.
     ///
-    /// The schema already applies a default limit to every pooled connection;
-    /// the maintenance worker re-applies the operator-configured value on its
-    /// own connection each cycle (bead K4) so the cap is tunable via config
-    /// without threading it through the hot per-connection init path. No-ops for
-    /// `:memory:` databases.
+    /// FrankenSQLite implements this PRAGMA per connection. The configured
+    /// value is part of new-connection initialization; a runtime change clears
+    /// idle handles and is re-applied on every later checkout so handles that
+    /// were active during the change cannot silently retain the old value.
+    /// No-ops for `:memory:` databases.
     pub fn set_journal_size_limit(&self, bytes: u64) -> DbResult<()> {
         if self.sqlite_path == ":memory:" {
             return Ok(());
         }
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
-            .map_err(|e| DbError::Sqlite(format!("journal_size_limit: open failed: {e}")))?;
-        conn.execute_raw(&format!("PRAGMA journal_size_limit = {bytes};"))
-            .map_err(|e| DbError::Sqlite(format!("journal_size_limit: {e}")))?;
+        checked_journal_size_limit(bytes)?;
+        let current_state = self.journal_size_limit_state.load(Ordering::Acquire);
+        if journal_size_limit_bytes(current_state) == bytes {
+            return Ok(());
+        }
+        self.journal_size_limit_state.store(
+            bytes | JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE,
+            Ordering::Release,
+        );
+        // Idle connections still carry the old connection-local value. Retire
+        // them now; checked-out handles are corrected on their next checkout.
+        self.pool.clear_idle();
         Ok(())
     }
 
@@ -5916,25 +6046,18 @@ fn read_pragma_i64(conn: &DbConn, sql: &str, column: &str) -> Result<i64, SqlErr
 }
 
 #[allow(clippy::result_large_err)]
-fn read_canonical_journal_mode(sqlite_path: &str) -> Result<String, SqlError> {
-    if sqlite_path == ":memory:" {
-        return Err(SqlError::Custom(
-            "canonical journal_mode probe is unavailable for in-memory databases".to_string(),
-        ));
-    }
-
-    let conn = open_sqlite_file_with_lock_retry_canonical(sqlite_path)?;
+fn read_runtime_journal_mode(conn: &DbConn, sqlite_path: &str) -> Result<String, SqlError> {
     let rows = conn.query_sync("PRAGMA journal_mode;", &[])?;
     let row = rows.first().ok_or_else(|| {
         SqlError::Custom(format!(
-            "canonical PRAGMA journal_mode returned no rows for {sqlite_path}"
+            "runtime PRAGMA journal_mode returned no rows for {sqlite_path}"
         ))
     })?;
     row.get_named::<String>("journal_mode")
         .or_else(|_| row.get_as(0))
         .map_err(|err| {
             SqlError::Custom(format!(
-                "canonical PRAGMA journal_mode did not expose a string value for {sqlite_path}: {err}"
+                "runtime PRAGMA journal_mode did not expose a string value for {sqlite_path}: {err}"
             ))
         })
 }
@@ -5948,7 +6071,10 @@ fn assert_required_startup_pragmas(conn: &DbConn, sqlite_path: &str) -> Result<(
         ));
     }
 
-    let journal_mode = read_canonical_journal_mode(sqlite_path)?;
+    // Probe the already-open runtime handle. Opening canonical SQLite here
+    // would mix engines on the live main file and, on Linux, closing that
+    // second fd could release this process's classic fcntl writer locks.
+    let journal_mode = read_runtime_journal_mode(conn, sqlite_path)?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
         return Err(SqlError::Custom(format!(
             "sqlite startup invariant failed for {sqlite_path}: journal_mode='{journal_mode}', expected 'wal'; WAL mode is required for Agent Mail concurrency"
@@ -8296,10 +8422,13 @@ fn parse_wal_checkpoint_rows(
     Ok(u64::try_from(checkpointed.max(0)).unwrap_or(0))
 }
 
-/// Run a strict `TRUNCATE` checkpoint against a SQLite path.
+/// Run a strict canonical-SQLite `TRUNCATE` checkpoint against a private or
+/// process-exclusive SQLite path.
 ///
 /// Returns an error if SQLite reports that the checkpoint was busy or
 /// incomplete, even when the pragma itself executed successfully.
+/// Live mailbox pools must use [`DbPool::wal_checkpoint`] so maintenance stays
+/// inside FrankenSQLite's same-engine transaction fence.
 pub fn wal_checkpoint_truncate_path(db_path: &Path) -> DbResult<u64> {
     if db_path.as_os_str() == ":memory:" {
         return Ok(0);
@@ -14778,6 +14907,69 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn maintenance_lock_probe_child_branch(path_env: &str, witness: &str) -> bool {
+        let Some(path) = std::env::var_os(path_env) else {
+            return false;
+        };
+        let config = sqlmodel_sqlite::SqliteConfig::file(
+            PathBuf::from(path).to_string_lossy().into_owned(),
+        )
+        .flags(sqlmodel_sqlite::OpenFlags::read_write())
+        .busy_timeout(10);
+        let competitor = crate::CanonicalDbConn::open(&config)
+            .expect("child opens competing canonical connection");
+        assert!(
+            competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
+            "separate process must observe the parent's reserved writer lock"
+        );
+        println!("{witness}");
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_maintenance_child_observes_busy(
+        test_name: &str,
+        path_env: &str,
+        witness: &str,
+        path: &Path,
+    ) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(path_env, path)
+        .output()
+        .expect("run competing child lock probe");
+        assert!(
+            output.status.success(),
+            "child lock probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(witness),
+            "child filter ran no causal lock probe: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn maintenance_test_pool(db_path: &Path) -> DbPool {
+        DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: db_path.parent().map(|parent| parent.join("archive")),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create live-maintenance test pool")
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn guarded_read_only_franken_preflight_preserves_same_process_writer_lock() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_LOCK_PROBE_PATH";
@@ -14910,6 +15102,290 @@ mod tests {
             aliased_expected,
             "guarded observations and hard-link refusals must preserve every family name and byte"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ANALYZE_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback";
+        const CHILD_WITNESS: &str = "live-analyze-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("live-analyze-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken analyze fixture"),
+            "clean up live analyze lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 CREATE TABLE analyze_probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL); \
+                 CREATE INDEX analyze_probe_value_idx ON analyze_probe(value); \
+                 WITH RECURSIVE seq(n) AS ( \
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 128 \
+                 ) INSERT INTO analyze_probe(value) SELECT n % 7 FROM seq;",
+            )
+            .expect("seed analyze fixture");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent analyze writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = pool
+            .analyze()
+            .expect_err("ANALYZE must respect the active same-engine transaction fence");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "fenced ANALYZE should report lock/busy contention: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent analyze writer lock");
+        pool.analyze()
+            .expect("ANALYZE should succeed after the writer rolls back");
+        let verify = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open analyze semantic verifier"),
+            "clean up analyze semantic verifier",
+        );
+        let rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM sqlite_stat1 WHERE tbl = 'analyze_probe'",
+                &[],
+            )
+            .expect("query ANALYZE statistics");
+        assert!(
+            rows[0]
+                .get_named::<i64>("count")
+                .expect("decode statistics count")
+                > 0,
+            "successful ANALYZE must materialize planner statistics"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_vacuum_preserves_writer_lock_and_reclaims_pages_after_rollback() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_VACUUM_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::live_vacuum_preserves_writer_lock_and_reclaims_pages_after_rollback";
+        const CHILD_WITNESS: &str = "live-vacuum-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("live-vacuum-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken vacuum fixture"),
+            "clean up live vacuum lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 CREATE TABLE vacuum_probe(id INTEGER PRIMARY KEY, payload BLOB NOT NULL); \
+                 WITH RECURSIVE seq(n) AS ( \
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 384 \
+                 ) INSERT INTO vacuum_probe(payload) SELECT randomblob(2048) FROM seq; \
+                 DELETE FROM vacuum_probe;",
+            )
+            .expect("seed deleted pages for vacuum fixture");
+        let free_before = read_pragma_i64(&writer, "PRAGMA freelist_count;", "freelist_count")
+            .expect("read freelist before VACUUM");
+        assert!(free_before > 0, "fixture must contain reclaimable pages");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent vacuum writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = pool
+            .vacuum()
+            .expect_err("VACUUM must respect the active same-engine maintenance fence");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "fenced VACUUM should report lock/busy contention: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent vacuum writer lock");
+        pool.vacuum()
+            .expect("VACUUM should succeed after the writer rolls back");
+        let verify = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open vacuum semantic verifier"),
+            "clean up vacuum semantic verifier",
+        );
+        let free_after = read_pragma_i64(&verify, "PRAGMA freelist_count;", "freelist_count")
+            .expect("read freelist after VACUUM");
+        assert_eq!(free_after, 0, "successful VACUUM must empty the freelist");
+        assert!(free_after < free_before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_checkpoint_preserves_writer_lock_and_checkpoints_frames_after_rollback() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_CHECKPOINT_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::live_checkpoint_preserves_writer_lock_and_checkpoints_frames_after_rollback";
+        const CHILD_WITNESS: &str = "live-checkpoint-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("live-checkpoint-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken checkpoint fixture"),
+            "clean up live checkpoint lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 CREATE TABLE checkpoint_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .expect("seed checkpoint fixture");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent checkpoint writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        if let Ok(checkpointed) = pool.wal_checkpoint() {
+            assert_eq!(
+                checkpointed, 0,
+                "a checkpoint fenced by a DELETE-mode writer may only succeed as a no-WAL no-op"
+            );
+        }
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent checkpoint writer lock");
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = WAL; \
+                 PRAGMA wal_autocheckpoint = 0; \
+                 INSERT INTO checkpoint_probe(value) VALUES ('alpha'), ('beta'), ('gamma');",
+            )
+            .expect("create committed WAL frames");
+        let checkpointed = pool
+            .wal_checkpoint()
+            .expect("TRUNCATE checkpoint should succeed after rollback");
+        assert!(
+            checkpointed > 0,
+            "semantic checkpoint fixture must move at least one committed WAL frame"
+        );
+        let rows = writer
+            .query_sync("SELECT COUNT(*) AS count FROM checkpoint_probe", &[])
+            .expect("query data after checkpoint");
+        assert_eq!(
+            rows[0].get_named::<i64>("count").expect("decode row count"),
+            3,
+            "checkpoint must preserve committed rows"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_runtime_pragma_probe_preserves_writer_lock_and_checks_live_handle() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_STARTUP_PRAGMA_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::startup_runtime_pragma_probe_preserves_writer_lock_and_checks_live_handle";
+        const CHILD_WITNESS: &str = "startup-pragma-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("startup-pragma-lock.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 database path");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path_str).expect("open Franken startup probe fixture"),
+            "clean up startup pragma lock fixture",
+        );
+        writer
+            .execute_raw(&format!(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA busy_timeout = {REQUIRED_STARTUP_BUSY_TIMEOUT_MS}; \
+                 CREATE TABLE startup_probe(id INTEGER PRIMARY KEY);"
+            ))
+            .expect("seed startup probe fixture");
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent startup-probe writer lock");
+
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = assert_required_startup_pragmas(&writer, db_path_str)
+            .expect_err("DELETE mode must fail the startup WAL invariant");
+        assert!(
+            error.to_string().contains("journal_mode='delete'"),
+            "startup probe must report the live handle's mode: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK; PRAGMA journal_mode = WAL;")
+            .expect("release writer and enable WAL");
+        assert_required_startup_pragmas(&writer, db_path_str)
+            .expect("startup probe should accept WAL on the same runtime handle");
     }
 
     #[test]
@@ -15544,6 +16020,111 @@ mod tests {
         assert!(
             sql.contains("cache_size = -8192"),
             "0 conns should fallback to 8MB: {sql}"
+        );
+    }
+
+    #[test]
+    fn pooled_connections_observe_configured_and_runtime_journal_size_limits() {
+        const CONFIGURED_LIMIT: i64 = 1_048_577;
+        const RETUNED_LIMIT: i64 = 2_097_153;
+
+        let configured_limit = CONFIGURED_LIMIT.to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DB_JOURNAL_SIZE_LIMIT_BYTES", configured_limit.as_str())],
+            || {
+                let directory = tempfile::tempdir().expect("tempdir");
+                let db_path = directory.path().join("journal-limit.sqlite3");
+                let pool = DbPool::new_without_startup_init(&DbPoolConfig {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    storage_root: Some(directory.path().join("archive")),
+                    min_connections: 0,
+                    max_connections: 2,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("create journal-limit pool");
+                let final_pragma =
+                    format!("PRAGMA journal_size_limit = {CONFIGURED_LIMIT};");
+                assert!(
+                    pool.init_sql.trim_end().ends_with(final_pragma.as_str()),
+                    "operator limit must be the authoritative final connection-init assignment: {}",
+                    pool.init_sql
+                );
+
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                runtime.block_on(async {
+                    let original = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire initially configured connection");
+                    assert_eq!(
+                        read_pragma_i64(
+                            &original,
+                            "PRAGMA journal_size_limit;",
+                            "journal_size_limit",
+                        )
+                        .expect("read configured journal_size_limit"),
+                        CONFIGURED_LIMIT
+                    );
+
+                    pool.set_journal_size_limit(RETUNED_LIMIT.unsigned_abs())
+                        .expect("retune pool journal_size_limit");
+                    let newly_opened = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire newly opened connection after retune");
+                    assert_eq!(
+                        read_pragma_i64(
+                            &newly_opened,
+                            "PRAGMA journal_size_limit;",
+                            "journal_size_limit",
+                        )
+                        .expect("read retuned limit on new connection"),
+                        RETUNED_LIMIT
+                    );
+
+                    // The only idle handle is the connection that was active
+                    // during the retune, so this acquisition causally proves
+                    // checkout repairs that stale connection-local setting.
+                    drop(original);
+                    let recycled_original = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("reacquire connection that spanned retune");
+                    assert_eq!(
+                        read_pragma_i64(
+                            &recycled_original,
+                            "PRAGMA journal_size_limit;",
+                            "journal_size_limit",
+                        )
+                        .expect("read retuned limit on recycled connection"),
+                        RETUNED_LIMIT
+                    );
+                    drop(recycled_original);
+                    drop(newly_opened);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn journal_size_limit_rejects_values_outside_sqlite_integer_range() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pool = maintenance_test_pool(&directory.path().join("journal-limit-range.sqlite3"));
+        let invalid = i64::MAX.unsigned_abs() + 1;
+        let error = pool
+            .set_journal_size_limit(invalid)
+            .expect_err("SQLite PRAGMA integers cannot represent u64 values above i64::MAX");
+        assert!(
+            error.to_string().contains("signed 64-bit PRAGMA range"),
+            "unexpected range error: {error}"
         );
     }
 

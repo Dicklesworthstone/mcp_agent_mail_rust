@@ -7438,23 +7438,28 @@ fn cleanup_database_sidecars_after_startup_use(database_url: &str) -> CliResult<
 /// Resolve diagnostic index witnesses to the distinct tables whose complete
 /// index sets must be rebuilt. The integrity checker only names a witness; it
 /// does not promise to enumerate every damaged sibling index on that table.
-fn doctor_index_owner_tables_for_damage(
-    conn: &mcp_agent_mail_db::CanonicalDbConn,
+fn doctor_index_owner_tables_for_damage_from_query<F>(
     damaged_indexes: &[String],
-) -> CliResult<Vec<String>> {
+    mut query: F,
+) -> CliResult<Vec<String>>
+where
+    F: FnMut(
+        &str,
+        &[mcp_agent_mail_db::sqlmodel_core::Value],
+    ) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, String>,
+{
     let mut tables = BTreeSet::new();
     for index in damaged_indexes {
-        let rows = conn
-            .query_sync(
-                "SELECT tbl_name FROM sqlite_master \
-                 WHERE type = 'index' AND name = ? LIMIT 1",
-                &[mcp_agent_mail_db::sqlmodel_core::Value::Text(index.clone())],
-            )
-            .map_err(|error| {
-                CliError::Other(format!(
-                    "could not resolve damaged index {index} to its owner table: {error}"
-                ))
-            })?;
+        let rows = query(
+            "SELECT tbl_name FROM sqlite_master \
+             WHERE type = 'index' AND name = ? LIMIT 1",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(index.clone())],
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "could not resolve damaged index {index} to its owner table: {error}"
+            ))
+        })?;
         let row = rows.first().ok_or_else(|| {
             CliError::Other(format!(
                 "damaged index {index} was not present in sqlite_master"
@@ -7480,74 +7485,259 @@ fn doctor_index_owner_tables_for_damage(
     Ok(tables.into_iter().collect())
 }
 
+fn doctor_index_owner_tables_for_damage(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    damaged_indexes: &[String],
+) -> CliResult<Vec<String>> {
+    doctor_index_owner_tables_for_damage_from_query(damaged_indexes, |sql, params| {
+        conn.query_sync(sql, params).map_err(|error| error.to_string())
+    })
+}
+
+fn doctor_index_owner_tables_for_damage_franken(
+    conn: &mcp_agent_mail_db::DbConn,
+    damaged_indexes: &[String],
+) -> CliResult<Vec<String>> {
+    doctor_index_owner_tables_for_damage_from_query(damaged_indexes, |sql, params| {
+        conn.query_sync(sql, params).map_err(|error| error.to_string())
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorIndexRepairEngine {
+    LiveFranken,
+    OfflineCanonical,
+}
+
+struct DoctorIndexRepairPlan {
+    engine: DoctorIndexRepairEngine,
+    damaged_indexes: Vec<String>,
+    affected_tables: Vec<String>,
+}
+
+fn doctor_index_only_damage_from_rows(
+    rows: &[mcp_agent_mail_db::sqlmodel_core::Row],
+) -> Option<Vec<String>> {
+    let details = mcp_agent_mail_db::integrity::extract_check_details(
+        rows,
+        mcp_agent_mail_db::CheckKind::Full,
+    );
+    if mcp_agent_mail_db::integrity::details_indicate_ok(&details) {
+        return None;
+    }
+    mcp_agent_mail_db::integrity::index_only_corruption_index_names(&details)
+}
+
+fn doctor_index_owner_tables_or_global_fallback(
+    db_path: &Path,
+    result: CliResult<Vec<String>>,
+) -> Vec<String> {
+    match result {
+        Ok(tables) => tables,
+        Err(error) => {
+            // The global fallback below is still safe for the strictly
+            // index-only class. Keeping this diagnostic makes a future
+            // schema/catalog problem observable instead of silently
+            // narrowing the repair back to the reported index names.
+            tracing::warn!(
+                db = %db_path.display(),
+                %error,
+                "index-only REINDEX fast path could not resolve all damaged index owner tables; global fallback will be required"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn doctor_classify_index_only_repair(db_path: &Path) -> Option<DoctorIndexRepairPlan> {
+    match mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        db_path,
+        "index-only REINDEX live classifier",
+    ) {
+        Ok(conn) => {
+            let conn = mcp_agent_mail_db::guard_db_conn(
+                conn,
+                "index-only REINDEX live classifier connection",
+            );
+            let rows = sqlite_query_check_rows(
+                |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+                mcp_agent_mail_db::CheckKind::Full,
+            )
+            .ok()?;
+            let damaged_indexes = doctor_index_only_damage_from_rows(&rows)?;
+            if !doctor_foreign_key_violations(&conn).ok()?.is_empty()
+                || !doctor_required_tables(&conn).ok()?.is_empty()
+            {
+                return None;
+            }
+            let affected_tables = doctor_index_owner_tables_or_global_fallback(
+                db_path,
+                doctor_index_owner_tables_for_damage_franken(&conn, &damaged_indexes),
+            );
+            Some(DoctorIndexRepairPlan {
+                engine: DoctorIndexRepairEngine::LiveFranken,
+                damaged_indexes,
+                affected_tables,
+            })
+        }
+        Err(live_error) => {
+            // The canonical helper refuses every Franken namespace, partial
+            // namespace, hard link, and ambiguous live family. Reaching this
+            // branch therefore proves engine-exclusive/offline authority; it
+            // is not a fallback that can cross engines on the live inode.
+            let conn = match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+                db_path,
+                "index-only REINDEX offline classifier",
+            ) {
+                Ok(conn) => conn,
+                Err(offline_error) => {
+                    tracing::warn!(
+                        db = %db_path.display(),
+                        live_error = %live_error,
+                        offline_error = %offline_error,
+                        "index-only REINDEX classification could not establish live-Franken or offline-canonical authority"
+                    );
+                    return None;
+                }
+            };
+            let rows = sqlite_query_check_rows(
+                |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+                mcp_agent_mail_db::CheckKind::Full,
+            )
+            .ok()?;
+            let damaged_indexes = doctor_index_only_damage_from_rows(&rows)?;
+            if !doctor_foreign_key_violations_canonical(&conn)
+                .ok()?
+                .is_empty()
+                || !doctor_required_tables_canonical(&conn).ok()?.is_empty()
+            {
+                return None;
+            }
+            let affected_tables = doctor_index_owner_tables_or_global_fallback(
+                db_path,
+                doctor_index_owner_tables_for_damage(&conn, &damaged_indexes),
+            );
+            Some(DoctorIndexRepairPlan {
+                engine: DoctorIndexRepairEngine::OfflineCanonical,
+                damaged_indexes,
+                affected_tables,
+            })
+        }
+    }
+}
+
+fn doctor_run_reindex_statements<F>(
+    db_path: &Path,
+    affected_tables: &[String],
+    mut execute: F,
+) -> Option<bool>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    let mut use_global = affected_tables.is_empty();
+    for table in affected_tables {
+        let escaped = table.replace('"', "\"\"");
+        if let Err(error) = execute(&format!("REINDEX \"{escaped}\"")) {
+            tracing::warn!(
+                db = %db_path.display(),
+                table = %table,
+                %error,
+                "table-wide index-only REINDEX failed; trying global REINDEX fallback"
+            );
+            use_global = true;
+            break;
+        }
+    }
+    if use_global && let Err(error) = execute("REINDEX") {
+        tracing::warn!(
+            db = %db_path.display(),
+            %error,
+            "index-only REINDEX fast path failed; escalating to repair/reconstruct"
+        );
+        return None;
+    }
+    Some(use_global)
+}
+
+fn doctor_legacy_fts_reads_ok_franken(conn: &mcp_agent_mail_db::DbConn) -> bool {
+    doctor_legacy_fts_tables_from_query(|sql| {
+        conn.query_sync(sql, &[]).map_err(|error| error.to_string())
+    })
+    .into_iter()
+    .all(|table| {
+        let quoted = table.replace('"', "\"\"");
+        conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+            .is_ok()
+    })
+}
+
+fn doctor_index_repair_live_franken_is_healthy(db_path: &Path) -> bool {
+    let Ok(conn) = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        db_path,
+        "index-only REINDEX live verification",
+    ) else {
+        return false;
+    };
+    let conn = mcp_agent_mail_db::guard_db_conn(
+        conn,
+        "index-only REINDEX live verification connection",
+    );
+    matches!(
+        sqlite_conn_check_ok(&conn, mcp_agent_mail_db::CheckKind::Full),
+        Ok(true)
+    ) && doctor_foreign_key_violations(&conn).is_ok_and(|rows| rows.is_empty())
+        && doctor_required_tables(&conn).is_ok_and(|tables| tables.is_empty())
+        && doctor_legacy_fts_reads_ok_franken(&conn)
+}
+
+fn doctor_index_repair_offline_canonical_is_healthy(db_path: &Path) -> bool {
+    let Ok(conn) = mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+        db_path,
+        "index-only REINDEX offline verification",
+    ) else {
+        return false;
+    };
+    matches!(
+        sqlite_conn_check_ok_canonical(&conn, mcp_agent_mail_db::CheckKind::Full),
+        Ok(true)
+    ) && doctor_foreign_key_violations_canonical(&conn).is_ok_and(|rows| rows.is_empty())
+        && doctor_required_tables_canonical(&conn).is_ok_and(|tables| tables.is_empty())
+        && doctor_legacy_fts_tables_canonical(&conn)
+            .into_iter()
+            .all(|table| {
+                let quoted = table.replace('"', "\"\"");
+                conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+                    .is_ok()
+            })
+}
+
 /// br-mdfpz: attempt the cheap, non-lossy REINDEX fast path before archive
 /// reconstruction.
 ///
-/// When the FULL canonical `integrity_check` shows only index-level damage
-/// with a clean `foreign_key_check`, table b-trees are intact. Rebuild every
-/// index on each owner table named by an index-class diagnostic witness: the
-/// checker need not enumerate every damaged sibling index. The database and
-/// sidecars are byte-copied into `backup_dir` before any write, and only the
-/// canonical double-probe battery can declare the result healed.
+/// When the matching engine's physical FULL `integrity_check` shows only
+/// index-level damage with clean relational/schema probes, table b-trees are
+/// intact. Rebuild every index on each owner table named by an index-class
+/// diagnostic witness: the checker need not enumerate every damaged sibling
+/// index. The database and sidecars are byte-copied into `backup_dir` before
+/// any write, and the same engine must verify the physical live/offline source
+/// before the result can be declared healed.
 fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Option<String> {
     if db_path.as_os_str() == ":memory:" || !db_path.exists() {
         return None;
     }
 
-    // Classify only an explicitly offline canonical source. A private logical
-    // rebuild can normalize damaged indexes, so it is neither a faithful
-    // index-damage classifier nor authority to mutate the live family.
-    let (damaged_indexes, affected_tables) = {
-        let opened =
-            match doctor_open_canonical_source_for_diagnostic(db_path, "index_only_reindex") {
-                Ok(opened) => opened,
-                Err(_) => return None,
-            };
-        if opened.is_live_logical_snapshot() {
-            tracing::warn!(
-                db = %db_path.display(),
-                "index-only REINDEX fast path declined: a private logical snapshot cannot classify physical index damage on the live FrankenSQLite family"
-            );
-            return None;
-        }
-        let conn = &opened.conn;
-        let rows = sqlite_query_check_rows(
-            |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
-            mcp_agent_mail_db::CheckKind::Full,
-        )
-        .ok()?;
-        let details = mcp_agent_mail_db::integrity::extract_check_details(
-            &rows,
-            mcp_agent_mail_db::CheckKind::Full,
-        );
-        if mcp_agent_mail_db::integrity::details_indicate_ok(&details) {
-            return None;
-        }
-        let damaged = mcp_agent_mail_db::integrity::index_only_corruption_index_names(&details)?;
-        // Any foreign-key violation means the damage is not index-only.
-        match doctor_foreign_key_violations_canonical(conn) {
-            Ok(violations) if violations.is_empty() => {}
-            _ => return None,
-        }
-        let tables = match doctor_index_owner_tables_for_damage(conn, &damaged) {
-            Ok(tables) => tables,
-            Err(error) => {
-                // The global fallback below is still safe for the strictly
-                // index-only class. Keeping this diagnostic makes a future
-                // schema/catalog problem observable instead of silently
-                // narrowing the repair back to the reported index names.
-                tracing::warn!(
-                    db = %db_path.display(),
-                    %error,
-                    "index-only REINDEX fast path could not resolve all damaged index owner tables; global fallback will be required"
-                );
-                Vec::new()
-            }
-        };
-        (damaged, tables)
-    };
+    // A logical VACUUM image can normalize precisely the damaged secondary
+    // index this path must classify. Choose guarded authority on the physical
+    // source instead and keep that engine identity through mutation + proof.
+    let plan = doctor_classify_index_only_repair(db_path)?;
+    let damaged_indexes = &plan.damaged_indexes;
+    let affected_tables = &plan.affected_tables;
 
     // Never reindex without a byte-exact backup of the current generation.
+    // br-r6psd tracks the residual hazard in this legacy raw-family copy: it is
+    // not yet generation-bound. Preserve the established backup semantics in
+    // this narrow engine-authority repair rather than pretending that hazard is
+    // solved here.
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let file_name = db_path.file_name().map_or_else(
         || "storage.sqlite3".to_string(),
@@ -7581,57 +7771,52 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
     // emitted by integrity_check. The diagnostic names are witnesses; sibling
     // indexes can be damaged without being named. If catalog resolution or a
     // table-level reindex fails, retain the existing global REINDEX fallback.
-    let used_global_reindex = {
-        let conn =
-            match mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string()) {
-                Ok(conn) => conn,
-                Err(_) => return None,
-            };
-        let mut use_global = affected_tables.is_empty();
-        for table in &affected_tables {
-            let escaped = table.replace('"', "\"\"");
-            if let Err(error) = conn.execute_raw(&format!("REINDEX \"{escaped}\"")) {
-                tracing::warn!(
-                    db = %db_path.display(),
-                    table = %table,
-                    %error,
-                    "table-wide index-only REINDEX failed; trying global REINDEX fallback"
-                );
-                use_global = true;
-                break;
-            }
-        }
-        if use_global && let Err(error) = conn.execute_raw("REINDEX") {
-            tracing::warn!(
-                db = %db_path.display(),
-                %error,
-                "index-only REINDEX fast path failed; escalating to repair/reconstruct"
+    let used_global_reindex = match plan.engine {
+        DoctorIndexRepairEngine::LiveFranken => {
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).ok()?;
+            let conn = mcp_agent_mail_db::guard_db_conn(
+                conn,
+                "index-only REINDEX live mutation connection",
             );
-            return None;
+            doctor_run_reindex_statements(db_path, affected_tables, |sql| {
+                conn.execute_raw(sql).map_err(|error| error.to_string())
+            })?
         }
-        use_global
+        DoctorIndexRepairEngine::OfflineCanonical => {
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string()).ok()?;
+            doctor_run_reindex_statements(db_path, affected_tables, |sql| {
+                conn.execute_raw(sql).map_err(|error| error.to_string())
+            })?
+        }
     };
 
-    // Only a full canonical battery pass counts as healed.
-    match doctor_canonical_double_probe(db_path) {
-        DoctorCanonicalCrossCheck::Healthy => {
-            let scope = if used_global_reindex {
-                "global REINDEX fallback".to_string()
-            } else {
-                format!(
-                    "all indexes on {} affected table(s): {}",
-                    affected_tables.len(),
-                    affected_tables.join(", ")
-                )
-            };
-            Some(format!(
-                "reindexed {scope} from {} named index witness(es): {}; pre-reindex backup at {}",
-                damaged_indexes.len(),
-                damaged_indexes.join(", "),
-                backup_path.display()
-            ))
+    let healed = match plan.engine {
+        DoctorIndexRepairEngine::LiveFranken => {
+            doctor_index_repair_live_franken_is_healthy(db_path)
         }
-        _ => None,
+        DoctorIndexRepairEngine::OfflineCanonical => {
+            doctor_index_repair_offline_canonical_is_healthy(db_path)
+        }
+    };
+    if healed {
+        let scope = if used_global_reindex {
+            "global REINDEX fallback".to_string()
+        } else {
+            format!(
+                "all indexes on {} affected table(s): {}",
+                affected_tables.len(),
+                affected_tables.join(", ")
+            )
+        };
+        Some(format!(
+            "reindexed {scope} from {} named index witness(es): {}; pre-reindex backup at {}",
+            damaged_indexes.len(),
+            damaged_indexes.join(", "),
+            backup_path.display()
+        ))
+    } else {
+        None
     }
 }
 
@@ -23895,7 +24080,7 @@ struct DoctorOpenContext {
 struct DoctorReadOnlyOpenContext {
     conn: mcp_agent_mail_db::CanonicalDbConn,
     // Retain a private logical snapshot for as long as `conn` can read it.
-    // `None` means `conn` owns an explicitly offline canonical source.
+    // `None` means an explicitly offline canonical or in-memory source.
     _snapshot_source: Option<CanonicalSnapshotSource>,
     source_kind: DoctorCanonicalDiagnosticSourceKind,
     configured_path: String,
@@ -25168,6 +25353,32 @@ impl DoctorCanonicalDiagnosticOpen {
     }
 }
 
+#[derive(Debug)]
+struct DoctorCanonicalDiagnosticOpenFailure {
+    detail: String,
+    // Present only when the explicitly offline canonical authority itself
+    // inspected/refused the source. A prior live-export failure is never
+    // canonical evidence.
+    offline_authority_error: Option<String>,
+}
+
+impl DoctorCanonicalDiagnosticOpenFailure {
+    fn offline_corruption_detail(&self) -> Option<&str> {
+        let detail = self.offline_authority_error.as_deref()?;
+        matches!(
+            mcp_agent_mail_db::classify_db_error_message(detail).class,
+            mcp_agent_mail_db::DbErrorClass::MainDbBtreeCorruption
+        )
+        .then_some(detail)
+    }
+}
+
+impl std::fmt::Display for DoctorCanonicalDiagnosticOpenFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
 /// Open a canonical connection only on an engine-exclusive private snapshot.
 ///
 /// `immutable=1` deliberately skips SQLite locking and change detection. It is
@@ -25204,11 +25415,14 @@ fn doctor_open_private_immutable_canonical_snapshot(
 fn doctor_open_canonical_source_for_diagnostic(
     db_path: &Path,
     operation: &str,
-) -> CliResult<DoctorCanonicalDiagnosticOpen> {
+) -> Result<DoctorCanonicalDiagnosticOpen, DoctorCanonicalDiagnosticOpenFailure> {
     if db_path.as_os_str() == ":memory:" {
-        return Err(CliError::Other(format!(
-            "{operation} canonical diagnostic source is unavailable for in-memory databases"
-        )));
+        return Err(DoctorCanonicalDiagnosticOpenFailure {
+            detail: format!(
+                "{operation} canonical diagnostic source is unavailable for in-memory databases"
+            ),
+            offline_authority_error: None,
+        });
     }
 
     let live_error = match CanonicalSnapshotSource::live_full_sqlite_snapshot(
@@ -25220,7 +25434,11 @@ fn doctor_open_canonical_source_for_diagnostic(
             let conn = doctor_open_private_immutable_canonical_snapshot(
                 snapshot_source.actual_path(),
                 operation,
-            )?;
+            )
+            .map_err(|error| DoctorCanonicalDiagnosticOpenFailure {
+                detail: error.to_string(),
+                offline_authority_error: None,
+            })?;
             return Ok(DoctorCanonicalDiagnosticOpen {
                 conn,
                 _snapshot_source: Some(snapshot_source),
@@ -25238,11 +25456,17 @@ fn doctor_open_canonical_source_for_diagnostic(
             _snapshot_source: None,
             kind: DoctorCanonicalDiagnosticSourceKind::OfflineCanonical,
         }),
-        Err(offline_error) => Err(CliError::Other(format!(
-            "cannot open {} for canonical {operation}: guarded live snapshot failed: {}; guarded offline canonical open failed: {offline_error}",
-            db_path.display(),
-            truncate_doctor_command(&live_error.to_string())
-        ))),
+        Err(offline_error) => {
+            let offline_authority_error = offline_error.to_string();
+            Err(DoctorCanonicalDiagnosticOpenFailure {
+                detail: format!(
+                    "cannot open {} for canonical {operation}: guarded live snapshot failed: {}; guarded offline canonical open failed: {offline_authority_error}",
+                    db_path.display(),
+                    truncate_doctor_command(&live_error.to_string())
+                ),
+                offline_authority_error: Some(offline_authority_error),
+            })
+        }
     }
 }
 
@@ -29549,7 +29773,13 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
         Err(error) => {
             // The selector can fail while materializing the guarded Franken
             // source, before canonical SQLite has observed any private bytes.
-            // Never relabel that source-engine error as canonical confirmation.
+            // Only an independently classified corruption error from the
+            // explicitly offline canonical authority may confirm damage.
+            if let Some(detail) = error.offline_corruption_detail() {
+                return DoctorCanonicalCrossCheck::ConfirmsCorruption(format!(
+                    "guarded offline canonical open reported corruption: {detail}"
+                ));
+            }
             return DoctorCanonicalCrossCheck::Inconclusive(format!(
                 "canonical read-only source selection failed: {error}"
             ));
@@ -37720,8 +37950,7 @@ fn server_inbox_payload_to_cli_json(
 mod mail_server_cli_bridge_tests {
     use super::{
         CliError, PENDING_SEND_SCHEMA_VERSION, PENDING_SEND_UNSENT_STATUS, PendingMailSendEnvelope,
-        ServerToolCall, acquire_doctor_mailbox_activity_lock_for_database_url,
-        acquire_doctor_mailbox_activity_lock_for_sqlite_path,
+        ServerToolCall, acquire_doctor_mailbox_activity_lock_for_sqlite_path,
         acquire_doctor_mailbox_activity_lock_for_storage_root,
         build_server_create_agent_identity_arguments, build_server_fetch_inbox_product_arguments,
         build_server_list_agents_arguments, build_server_macro_start_session_arguments,
@@ -37738,11 +37967,13 @@ mod mail_server_cli_bridge_tests {
         persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
         post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
         reject_local_fallback_with_ownership_probe, reject_local_registration_when_gate,
+        resolve_mailbox_activity_sqlite_path,
         resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
         validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
     };
     use mcp_agent_mail_core::config::Config;
+    use std::path::PathBuf;
 
     #[test]
     fn send_message_server_arguments_omit_absent_optional_fields() {
@@ -46321,21 +46552,27 @@ http_headers = { Authorization = "Bearer secret" }
 
         let candidates = doctor_salvage_artifact_candidates(&db_path);
         assert!(
-            candidates
-                .iter()
-                .any(|(label, path)| label == "backup candidate" && path == &backup),
+            candidates.iter().any(|(label, path, source_kind)| {
+                label == "backup candidate"
+                    && path == &backup
+                    && *source_kind == DoctorSalvageSourceKind::PrivateCanonical
+            }),
             "expected backup candidate in {candidates:?}"
         );
         assert!(
-            candidates.iter().any(
-                |(label, path)| label == "quarantined corrupt artifact" && path == &quarantined
-            ),
+            candidates.iter().any(|(label, path, source_kind)| {
+                label == "quarantined corrupt artifact"
+                    && path == &quarantined
+                    && *source_kind == DoctorSalvageSourceKind::PrivateCanonical
+            }),
             "expected quarantined artifact in {candidates:?}"
         );
         assert!(
-            candidates
-                .iter()
-                .any(|(label, path)| label == "standalone salvage artifact" && path == &salvage),
+            candidates.iter().any(|(label, path, source_kind)| {
+                label == "standalone salvage artifact"
+                    && path == &salvage
+                    && *source_kind == DoctorSalvageSourceKind::PrivateCanonical
+            }),
             "expected salvage artifact in {candidates:?}"
         );
     }
@@ -46365,7 +46602,7 @@ http_headers = { Authorization = "Bearer secret" }
 
         let paths: Vec<PathBuf> = doctor_salvage_artifact_candidates(&db_path)
             .into_iter()
-            .map(|(_, path)| path)
+            .map(|(_, path, _)| path)
             .collect();
 
         assert!(paths.contains(&corrupt_one), "missing {corrupt_one:?}");
@@ -46393,7 +46630,7 @@ http_headers = { Authorization = "Bearer secret" }
 
         let paths: Vec<PathBuf> = doctor_salvage_artifact_candidates(&db_path)
             .into_iter()
-            .map(|(_, path)| path)
+            .map(|(_, path, _)| path)
             .collect();
 
         assert!(paths.contains(&quarantined));
@@ -47531,6 +47768,8 @@ http_headers = { Authorization = "Bearer secret" }
 
     #[test]
     fn archive_save_list_restore_roundtrip_smoke() {
+        use std::io::Read as _;
+
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -48102,7 +48341,6 @@ http_headers = { Authorization = "Bearer secret" }
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        use std::io::Read;
 
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
@@ -52726,6 +52964,36 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_canonical_double_probe_does_not_promote_live_source_open_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("live-source-error.sqlite3");
+        init_schema_sqlite_canonical(&db_path.display().to_string())
+            .expect("seed healthy database");
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("publish Franken namespace authority");
+        admitted
+            .query_sync("SELECT 1 AS one", &[])
+            .expect("prove admitted fixture readable before corruption");
+        drop(admitted);
+
+        // Preserve the inode/namespace identity while making the source
+        // unreadable. The guarded materializer now fails before canonical
+        // SQLite has observed a private image; that source-engine error must
+        // never masquerade as canonical confirmation.
+        std::fs::write(&db_path, b"not-a-sqlite-database")
+            .expect("corrupt admitted primary in place");
+        match doctor_canonical_double_probe(&db_path) {
+            DoctorCanonicalCrossCheck::Inconclusive(detail) => assert!(
+                detail.contains("source selection failed"),
+                "source-selection failure must retain its non-authoritative class: {detail}"
+            ),
+            other => panic!(
+                "canonical never opened a private image, so it cannot confirm live corruption: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn doctor_canonical_double_probe_confirms_non_database_file() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("garbage.sqlite3");
@@ -54062,6 +54330,95 @@ startup_timeout_sec = 42
             !backups.is_empty(),
             "REINDEX fast path must capture a pre-reindex backup"
         );
+    }
+
+    #[test]
+    fn read_only_live_logical_snapshot_cannot_hide_primary_index_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_archive_mailbox_project(dir.path());
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_index_only_corrupt_mailbox(&db_path);
+
+        // Admit the existing generation through FrankenSQLite so the doctor
+        // must use its live-family path. A table scan remains readable even
+        // though the physical secondary-index b-tree is damaged.
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("admit corrupt-index fixture through FrankenSQLite");
+        let rows = admitted
+            .query_sync("SELECT COUNT(*) AS count FROM agents", &[])
+            .expect("table b-tree remains readable");
+        assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 50);
+        mcp_agent_mail_db::close_db_conn(
+            admitted,
+            "settle live Franken index-corruption fixture",
+        );
+
+        let opened = open_db_for_doctor_check_read_only_with_context(&db_url)
+            .expect("materialize guarded live logical snapshot");
+        assert_eq!(
+            opened.source_kind,
+            DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot
+        );
+        assert!(
+            sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
+                .expect("check rebuilt logical image"),
+            "VACUUM rebuild should normalize the damaged secondary index in the private image"
+        );
+        assert!(
+            !doctor_read_only_physical_integrity_check(
+                &opened,
+                mcp_agent_mail_db::CheckKind::Full
+            )
+            .expect("run admitted live physical check"),
+            "the live physical index defect must remain authoritative"
+        );
+        drop(opened);
+
+        match doctor_database_fix_strategy_read_only(&db_url, dir.path())
+            .expect("classify live physical index corruption")
+        {
+            DoctorDatabaseFixStrategy::Repair(_)
+            | DoctorDatabaseFixStrategy::Reconstruct(_) => {}
+            DoctorDatabaseFixStrategy::None(detail) => panic!(
+                "a clean logical snapshot must not make startup skip the admitted physical re-probe: {detail}"
+            ),
+        }
+        let repair_plan = doctor_classify_index_only_repair(&db_path)
+            .expect("classify the live physical index defect");
+        assert_eq!(repair_plan.engine, DoctorIndexRepairEngine::LiveFranken);
+        assert_eq!(
+            repair_plan.damaged_indexes,
+            vec!["idx_agents_project_name"]
+        );
+
+        let repair_called = std::cell::Cell::new(false);
+        let reconstruct_called = std::cell::Cell::new(false);
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || {
+                repair_called.set(true);
+                Ok(())
+            },
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("live Franken index damage should heal through matching-engine REINDEX");
+        assert!(
+            !repair_called.get() && !reconstruct_called.get(),
+            "matching-engine REINDEX must complete before either lossy recovery callback"
+        );
+        assert!(
+            doctor_index_repair_live_franken_is_healthy(&db_path),
+            "the live Franken physical family must pass full relational/schema verification"
+        );
+        match doctor_database_fix_strategy(&db_url, dir.path()).expect("post-REINDEX strategy") {
+            DoctorDatabaseFixStrategy::None(_) => {}
+            other => panic!("matching-engine REINDEX must leave a healthy/None verdict: {other:?}"),
+        }
     }
 
     #[test]
@@ -67808,7 +68165,10 @@ startup_timeout_sec = 42
                     .expect_err("read-only probe connection must reject writes");
                 drop(conn);
             } else {
-                opened.expect_err("unadmitted or malformed live family must fail closed");
+                assert!(
+                    opened.is_err(),
+                    "unadmitted or malformed live family must fail closed"
+                );
             }
 
             assert_eq!(
@@ -67999,11 +68359,23 @@ startup_timeout_sec = 42
             read_only._snapshot_source.is_some(),
             "live read-only doctor diagnostics must retain their private snapshot"
         );
+        assert_eq!(
+            read_only.source_kind,
+            DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot
+        );
         let rows = read_only
             .conn
             .query_sync("SELECT COUNT(*) AS count FROM diagnostic_witness", &[])
             .expect("query retained private doctor snapshot");
         assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 1);
+        assert!(
+            doctor_read_only_physical_integrity_check(
+                &read_only,
+                mcp_agent_mail_db::CheckKind::Full
+            )
+            .expect("run live physical integrity probe while writer lock is held"),
+            "healthy live physical b-tree should pass the admitted full check"
+        );
         assert_child_observes_busy(&db_path);
         drop(read_only);
         assert_child_observes_busy(&db_path);
@@ -68061,11 +68433,13 @@ startup_timeout_sec = 42
             let held_admission = mcp_agent_mail_db::pool::recovery_admission()
                 .try_acquire(&db_path)
                 .expect("occupy recovery admission controller");
-            let error = open_db_sync_with_database_url_and_storage_root(
+            let error = match open_db_sync_with_database_url_and_storage_root(
                 &db_url,
                 Some(dir.path()),
-            )
-            .expect_err("occupied admission must refuse unhealthy normal CLI open");
+            ) {
+                Ok(_) => panic!("occupied admission must refuse unhealthy normal CLI open"),
+                Err(error) => error,
+            };
             assert!(
                 error.to_string().contains("already in progress"),
                 "unexpected no-breaker {family_kind} refusal: {error}"
@@ -68163,11 +68537,15 @@ startup_timeout_sec = 42
                 let breaker_before =
                     std::fs::read(&breaker_path).expect("snapshot breaker authority");
 
-                let error = open_db_sync_with_database_url_and_storage_root(
+                let error = match open_db_sync_with_database_url_and_storage_root(
                     &db_url,
                     Some(dir.path()),
-                )
-                .expect_err("durable breaker must refuse an unhealthy or missing live family");
+                ) {
+                    Ok(_) => panic!(
+                        "durable breaker must refuse an unhealthy or missing live family"
+                    ),
+                    Err(error) => error,
+                };
                 let error_text = error.to_string();
                 assert!(
                     error_text.contains("circuit-broken")
