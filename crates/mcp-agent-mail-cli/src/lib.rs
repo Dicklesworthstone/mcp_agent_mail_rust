@@ -45885,6 +45885,23 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hardened_directory_walkers_accept_macos_system_temp_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(
+            dir.path().starts_with("/var") || dir.path().starts_with("/private/var"),
+            "fixture should exercise the macOS system temp hierarchy: {}",
+            dir.path().display()
+        );
+        validate_real_existing_directory(dir.path(), "macOS temp fixture")
+            .expect("existing-directory validation should accept the protected /var alias");
+        ensure_real_directory_tree(&dir.path().join("nested"), "macOS temp fixture")
+            .expect("directory creation should accept the protected /var alias");
+        assert!(dir.path().join("nested").is_dir());
+    }
+
     #[test]
     fn copy_sqlite_backup_consistently_rejects_unhealthy_source_without_artifacts() {
         let dir = tempfile::tempdir().expect("tempdir");

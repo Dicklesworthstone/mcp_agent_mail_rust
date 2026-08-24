@@ -106,14 +106,28 @@ fn canonicalize_json(v: &Value) -> Value {
 
 fn normalize_json(v: Value, tmp_root: &Path) -> Value {
     let tmp = tmp_root.to_string_lossy().to_string();
+    let canonical_tmp = std::fs::canonicalize(tmp_root)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+    let mut tmp_roots = canonical_tmp
+        .iter()
+        .filter(|canonical| *canonical != &tmp)
+        .cloned()
+        .collect::<Vec<_>>();
+    tmp_roots.push(tmp);
     // Slugify the FULL doctor-repo path with the product's own slug function:
     // deriving it from the tempdir basename alone assumed tempdirs live at
     // /tmp-style roots, but rch workers point TMPDIR inside the synced repo
     // checkout (br-yceqd) and the slug then carries the repo-path prefix
     // (`data-projects-...-rch-tmp-...`), leaving un-normalized residue.
-    let tmp_slug = Some(mcp_agent_mail_core::slugify(
-        &tmp_root.join("doctor_repo").to_string_lossy(),
-    ));
+    let mut tmp_slugs = tmp_roots
+        .iter()
+        .map(|root| {
+            mcp_agent_mail_core::slugify(&Path::new(root).join("doctor_repo").to_string_lossy())
+        })
+        .collect::<Vec<_>>();
+    tmp_slugs.sort_by_key(|slug| std::cmp::Reverse(slug.len()));
+    tmp_slugs.dedup();
     let search_index_root = std::env::temp_dir()
         .join("mcp-agent-mail-search-index")
         .to_string_lossy()
@@ -121,12 +135,15 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
 
     fn normalize_string(
         s: String,
-        tmp: &str,
-        tmp_slug: Option<&str>,
+        tmp_roots: &[String],
+        tmp_slugs: &[String],
         search_index_root: &str,
     ) -> String {
-        let mut normalized = s.replace(tmp, "<TMP_ROOT>");
-        if let Some(slug) = tmp_slug {
+        let mut normalized = s;
+        for tmp in tmp_roots {
+            normalized = normalized.replace(tmp, "<TMP_ROOT>");
+        }
+        for slug in tmp_slugs {
             normalized = normalized.replace(slug, "<TMP_DOCTOR_PROJECT_SLUG>");
         }
         while let Some(start) = normalized.find("tmp-tmp") {
@@ -163,20 +180,25 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
         (scope.is_empty() || scope.starts_with('-')).then_some(hash)
     }
 
-    fn walk(v: Value, tmp: &str, tmp_slug: Option<&str>, search_index_root: &str) -> Value {
+    fn walk(
+        v: Value,
+        tmp_roots: &[String],
+        tmp_slugs: &[String],
+        search_index_root: &str,
+    ) -> Value {
         match v {
             Value::String(s) => {
-                Value::String(normalize_string(s, tmp, tmp_slug, search_index_root))
+                Value::String(normalize_string(s, tmp_roots, tmp_slugs, search_index_root))
             }
             Value::Array(arr) => Value::Array(
                 arr.into_iter()
-                    .map(|x| walk(x, tmp, tmp_slug, search_index_root))
+                    .map(|x| walk(x, tmp_roots, tmp_slugs, search_index_root))
                     .collect(),
             ),
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, val) in map {
-                    out.insert(k, walk(val, tmp, tmp_slug, search_index_root));
+                    out.insert(k, walk(val, tmp_roots, tmp_slugs, search_index_root));
                 }
                 if let Some(check_name) = out.get("check").and_then(Value::as_str) {
                     match check_name {
@@ -338,8 +360,8 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
 
     walk(
         canonicalize_json(&v),
-        &tmp,
-        tmp_slug.as_deref(),
+        &tmp_roots,
+        &tmp_slugs,
         &search_index_root,
     )
 }
