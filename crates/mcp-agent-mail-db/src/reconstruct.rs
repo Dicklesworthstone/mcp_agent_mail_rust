@@ -1929,11 +1929,7 @@ pub fn reconstruct_from_archive_with_private_salvage(
             )));
         }
     }
-    reconstruct_from_archive_with_salvage(
-        db_path,
-        storage_root,
-        Some(private_salvage_db_path),
-    )
+    reconstruct_from_archive_with_salvage(db_path, storage_root, Some(private_salvage_db_path))
 }
 
 /// Reconstruct from the Git archive while salvaging a live FrankenSQLite
@@ -2076,7 +2072,7 @@ fn reconstruct_from_archive_with_salvage(
     Ok(stats)
 }
 
-pub(crate) fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
+fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
     crate::pool::validate_sqlite_target_path(path, "reconstruct salvage source")
         .map_err(|error| DbError::Sqlite(format!("reconstruct salvage: {error}")))?;
     if !is_real_file(path) {
@@ -5935,7 +5931,10 @@ mod tests {
             .map(|entry| {
                 let entry = entry.expect("read test directory entry");
                 let file_type = entry.file_type().expect("inspect test directory entry");
-                assert!(file_type.is_file(), "test directory must contain only files");
+                assert!(
+                    file_type.is_file(),
+                    "test directory must contain only files"
+                );
                 (
                     entry.file_name(),
                     std::fs::read(entry.path()).expect("read exact test file bytes"),
@@ -7153,12 +7152,8 @@ body
             .expect("create source table");
         drop(source);
         let source_before = exact_test_directory_files(source_dir.path());
-        assert!(
-            !crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-gate").exists()
-        );
-        assert!(
-            !crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-use").exists()
-        );
+        assert!(!crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-gate").exists());
+        assert!(!crate::pool::sqlite_sidecar_path(&source_path, "-fsqlite-ns-use").exists());
 
         let archive_dir = tempfile::tempdir().expect("archive tempdir");
         let storage_root = archive_dir.path().join("storage");
@@ -7192,8 +7187,7 @@ body
     #[test]
     fn live_franken_salvage_materialization_preserves_same_process_writer_lock() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RECONSTRUCT_LOCK_PROBE_PATH";
-        const CHILD_TEST_NAME: &str =
-            "reconstruct::tests::live_franken_salvage_materialization_preserves_same_process_writer_lock";
+        const CHILD_TEST_NAME: &str = "reconstruct::tests::live_franken_salvage_materialization_preserves_same_process_writer_lock";
         const CHILD_WITNESS: &str = "live-salvage-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
@@ -7276,8 +7270,7 @@ body
         assert_child_observes_busy(&source_path);
 
         let alias_path = directory.path().join("writer-lock-alias.sqlite3");
-        std::fs::hard_link(&source_path, &alias_path)
-            .expect("create live-primary hard-link alias");
+        std::fs::hard_link(&source_path, &alias_path).expect("create live-primary hard-link alias");
         let alias_target = directory.path().join("alias-reconstructed.sqlite3");
         let alias_error = reconstruct_from_archive_with_private_salvage(
             &alias_target,

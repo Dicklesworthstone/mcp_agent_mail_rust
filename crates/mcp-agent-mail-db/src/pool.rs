@@ -11854,13 +11854,8 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     // canonical probe; probing the live inode here would reintroduce the
     // process-wide fcntl lock-erasure hazard this recovery path is avoiding.
     let live_salvage_db_path = salvage_existing.then_some(primary_path);
-    reconstruct_archive_into_candidate(
-        primary_path,
-        storage_root,
-        live_salvage_db_path,
-        &timestamp,
-    )
-    .map_err(|failure| failure.error)
+    reconstruct_archive_into_candidate(primary_path, storage_root, live_salvage_db_path, &timestamp)
+        .map_err(|failure| failure.error)
 }
 
 /// Coalescing window for back-to-back archive-salvage reconstructions.

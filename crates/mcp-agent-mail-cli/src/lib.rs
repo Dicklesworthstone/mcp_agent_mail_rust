@@ -12973,11 +12973,11 @@ fn recover_sqlite_file_with_storage_root_admitted(
                 "No backup found. Reconstructing database from archive at {}...",
                 storage_root.display()
             );
-            // Attempt best-effort salvage from the original DB and nearby
-            // doctor artifacts while the live file is still in place. A prior
-            // quarantine can contain cleaner DB-only state than the current
-            // malformed file, so keep startup recovery aligned with the manual
-            // `am doctor reconstruct` salvage candidate order.
+            // Attempt best-effort salvage through a guarded private snapshot
+            // of the original DB, then try nearby offline doctor artifacts. A
+            // prior quarantine can contain cleaner DB-only state than the
+            // current malformed file, so keep startup recovery aligned with
+            // the manual `am doctor reconstruct` salvage candidate order.
             let salvage_attempt = attempt_best_doctor_salvage_artifact(path);
             let salvage_db_path = match &salvage_attempt {
                 DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
@@ -76227,7 +76227,9 @@ fn attempt_readable_sqlite_salvage_source(
             sqlite_path.display()
         ));
     };
-    let conn = match mcp_agent_mail_db::CanonicalDbConn::open_file(readable_path_text) {
+    let config = sqlmodel_sqlite::SqliteConfig::file(readable_path_text.to_string())
+        .flags(sqlmodel_sqlite::OpenFlags::read_only());
+    let conn = match mcp_agent_mail_db::CanonicalDbConn::open(&config) {
         Ok(conn) => conn,
         Err(error) => {
             return DoctorSalvageAttempt::Failed(format!(
@@ -76236,6 +76238,12 @@ fn attempt_readable_sqlite_salvage_source(
             ));
         }
     };
+    if let Err(error) = conn.execute_raw("PRAGMA query_only = ON;") {
+        return DoctorSalvageAttempt::Failed(format!(
+            "{label} {} could not enforce private canonical query-only mode: {error}",
+            readable_path.display()
+        ));
+    }
     if let Err(error) = conn.query_sync("SELECT COUNT(*) AS cnt FROM sqlite_master", &[]) {
         return DoctorSalvageAttempt::Failed(format!(
             "{label} {} failed a private canonical salvage probe: {error}",
@@ -76706,8 +76714,9 @@ fn handle_doctor_reconstruct_with(
         temp_db_path.display()
     );
 
-    // Attempt salvage from the original DB *in place* (no rename yet), or from
-    // nearby doctor artifacts when an operator already moved the primary aside.
+    // Attempt salvage through a guarded private snapshot of the original DB
+    // (no rename yet), or from nearby offline doctor artifacts when an
+    // operator already moved the primary aside.
     let salvage_candidates = doctor_salvage_artifact_candidates(&db_path);
     let salvage_attempt = if salvage_candidates.is_empty() {
         None
