@@ -15456,6 +15456,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn full_integrity_breakers_preserve_suspect_family_before_engine_open() {
+        for family_kind in ["damaged-wal", "corrupt-primary"] {
+            for breaker_kind in ["malformed", "tripped"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let db_path = dir.path().join(format!(
+                    "full-{family_kind}-{breaker_kind}.sqlite3"
+                ));
+                if family_kind == "damaged-wal" {
+                    let conn =
+                        crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                            .expect("create healthy primary fixture");
+                    conn.execute_raw("PRAGMA journal_mode = DELETE;")
+                        .expect("force standalone primary");
+                    conn.execute_raw("CREATE TABLE fixture (value INTEGER);")
+                        .expect("create fixture table");
+                    drop(conn);
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                        .expect("write damaged WAL");
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"coordination-shm")
+                        .expect("write SHM fixture");
+                } else {
+                    std::fs::write(&db_path, b"corrupt main-only family")
+                        .expect("write corrupt primary fixture");
+                }
+
+                let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
+                if breaker_kind == "malformed" {
+                    std::fs::write(&breaker_path, b"malformed breaker authority")
+                        .expect("write malformed breaker");
+                } else {
+                    let config = crate::recovery_breaker::config_from_env();
+                    let state = crate::recovery_breaker::RecoveryBreakerState {
+                        schema: 1,
+                        db_fingerprint: crate::recovery_breaker::fingerprint_db(&db_path),
+                        consecutive_failures: config.max_consecutive_failures,
+                        last_failure_unix: recovery_breaker_now_unix(),
+                        last_failure_reason: "full-integrity fixture tripped".to_string(),
+                        tripped: true,
+                    };
+                    crate::recovery_breaker::store(&db_path, &state)
+                        .expect("store tripped breaker");
+                }
+
+                let family_paths = [
+                    db_path.clone(),
+                    sqlite_sidecar_path(&db_path, "-wal"),
+                    sqlite_sidecar_path(&db_path, "-shm"),
+                    breaker_path.clone(),
+                ];
+                let family_bytes_before =
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok());
+                let names_before = std::fs::read_dir(dir.path())
+                    .expect("list full-integrity fixture before probe")
+                    .map(|entry| entry.expect("read fixture entry").file_name())
+                    .collect::<BTreeSet<_>>();
+                let pool = DbPool::new(&DbPoolConfig {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    storage_root: Some(dir.path().join("storage")),
+                    ..Default::default()
+                })
+                .expect("construct lazy pool");
+
+                recovery_admission().reset();
+                let error = pool
+                    .run_full_integrity_check()
+                    .expect_err("breaker authority must refuse the full-cycle live open");
+                let expected = if breaker_kind == "malformed" {
+                    "could not be trusted"
+                } else {
+                    "circuit-broken"
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "unexpected {family_kind}/{breaker_kind} full-cycle refusal: {error}"
+                );
+                assert_eq!(
+                    family_paths.each_ref().map(|path| std::fs::read(path).ok()),
+                    family_bytes_before,
+                    "refused full-cycle open must preserve every family byte"
+                );
+                let names_after = std::fs::read_dir(dir.path())
+                    .expect("list full-integrity fixture after refusal")
+                    .map(|entry| entry.expect("read fixture entry").file_name())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    names_after, names_before,
+                    "refused full-cycle open must not create election, cleanup, recovery, or forensic artifacts"
+                );
+                recovery_admission().reset();
+            }
+        }
+    }
+
     /// Verify `run_full_integrity_check` passes on a healthy file-backed DB.
     #[test]
     fn full_integrity_check_healthy_db() {
