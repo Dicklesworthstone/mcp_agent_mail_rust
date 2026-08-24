@@ -19793,10 +19793,11 @@ fn handle_migrate_cmd(
         }
     }
 
-    // Step 2: Capture pre-conversion row counts.
-    // Reopen without schema-init side effects: fallback path intentionally avoids
-    // unstable schema DDL and should proceed directly to timestamp conversion.
-    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&resolved_path)?;
+    // Step 2: Capture pre-conversion row counts. This connection is also used
+    // for the timestamp conversion below, so it must be writable. The mailbox
+    // mutation locks are already held, and this fallback path deliberately
+    // avoids schema-init side effects before conversion.
+    let (conn, _opened_path) = open_sqlite_with_fallback(&resolved_path)?;
     let before_counts = collect_table_row_counts(&conn);
 
     if !needs_conversion_attempt {

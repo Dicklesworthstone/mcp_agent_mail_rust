@@ -2699,6 +2699,12 @@ pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Optio
 }
 
 pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    // Although every downstream user treats this as an observability
+    // connection, a genuinely fresh zero-object database may need the base
+    // schema bootstrap below. Hold the promotion lease before opening the fd
+    // so that bootstrap can never land on a generation concurrently renamed
+    // into recovery quarantine.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     let conn = open_sync_db_connection_with_busy_timeout(
         path,
         BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
@@ -5266,6 +5272,11 @@ fn dispatch_compose_envelope(
     tui_state: &tui_bridge::TuiSharedState,
     envelope: &tui_compose::ComposeEnvelope,
 ) {
+    // A recovery promotion replaces the live primary by rename. Acquire the
+    // write lease before opening the raw fd and retain it through transaction
+    // completion/error, otherwise compose can write into the quarantined old
+    // generation after a promotion races the open.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     let Some(conn) = tui_poller::open_sync_connection_pub(database_url) else {
         tracing::warn!("compose: cannot open DB for send");
         tui_state.push_console_log(

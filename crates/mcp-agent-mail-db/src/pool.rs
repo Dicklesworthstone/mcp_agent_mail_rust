@@ -6982,7 +6982,12 @@ fn rollback_drifted_sqlite_cleanup_move(
             quarantine_path.display()
         ))
     })?;
-    sync_recovery_parent(source_path)?;
+    if let Err(sync_error) = sync_recovery_parent(source_path) {
+        return Err(SqlError::Custom(format!(
+            "{drift_error}; the raced sidecar was restored to {}, but syncing its parent failed: {sync_error}",
+            source_path.display()
+        )));
+    }
     Err(SqlError::Custom(format!(
         "{drift_error}; the raced sidecar was restored to {} and no cleanup was committed",
         source_path.display()
@@ -21614,12 +21619,28 @@ mod tests {
         // frame data, since those frames may be durable writes not yet
         // checkpointed into the main DB.
         let wal_path = dir.path().join("preserve_test.db-wal");
+        let wal_cert_path = dir.path().join("preserve_test.db-wal-cert");
+        let wal_cert_head_path = dir.path().join("preserve_test.db-wal-cert-head");
         std::fs::write(&wal_path, [0xAA; 64]).expect("create wal");
+        std::fs::write(&wal_cert_path, b"live-wal-cert").expect("create WAL certificate");
+        std::fs::write(&wal_cert_head_path, b"live-wal-cert-head")
+            .expect("create WAL certificate head");
         assert!(wal_path.exists());
 
         cleanup_empty_wal_sidecar(&db_path).expect("classify framed WAL");
 
         assert!(wal_path.exists(), "WAL > 32 bytes should be preserved");
+        assert_eq!(std::fs::read(&wal_cert_path).unwrap(), b"live-wal-cert");
+        assert_eq!(
+            std::fs::read(&wal_cert_head_path).unwrap(),
+            b"live-wal-cert-head"
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert").is_empty()
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "preserve_test.db-wal-cert-head").is_empty()
+        );
     }
 
     #[test]
