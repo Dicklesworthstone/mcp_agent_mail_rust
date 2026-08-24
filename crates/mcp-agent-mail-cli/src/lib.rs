@@ -7372,14 +7372,13 @@ where
 fn cleanup_database_sidecars_after_startup_use(database_url: &str) -> CliResult<()> {
     if let Some(db_path) = sqlite_file_path_from_database_url(database_url) {
         cleanup_stale_db_activity_locks(&db_path)?;
-        let _outcome = mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path).map_err(
-            |error| {
+        let _outcome =
+            mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path).map_err(|error| {
                 CliError::Other(format!(
                     "SQLite sidecar cleanup for {} failed or was refused: {error}",
                     db_path.display()
                 ))
-            },
-        )?;
+            })?;
     }
     Ok(())
 }
@@ -29634,14 +29633,13 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     // callers report repairable non-empty sidecars instead of quarantining
     // them.
     if cleanup_truncated_wal {
-        let _outcome = mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved).map_err(
-            |error| {
+        let _outcome =
+            mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved).map_err(|error| {
                 CliError::Other(format!(
                     "SQLite WAL cleanup for {} failed or was refused: {error}",
                     resolved.display()
                 ))
-            },
-        )?;
+            })?;
     } else if let Some(detail) = doctor_truncated_wal_sidecar_detail(resolved) {
         return Ok(DoctorDatabaseFixStrategy::Repair(format!(
             "{detail}; run `am doctor repair` to quarantine it before opening the database"
@@ -52969,8 +52967,7 @@ startup_timeout_sec = 42
             std::fs::write(&wal_path, wal_bytes).expect("plant truncated WAL");
             std::fs::write(&shm_path, shm_bytes).expect("plant SHM evidence");
 
-            let breaker_path =
-                mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+            let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
             if breaker_kind == "tripped" {
                 let now_unix = i64::try_from(
                     std::time::SystemTime::now()
@@ -52983,7 +52980,9 @@ startup_timeout_sec = 42
                     &db_path,
                     &mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
                         schema: 1,
-                        db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path),
+                        db_fingerprint: mcp_agent_mail_db::recovery_breaker::fingerprint_db(
+                            &db_path,
+                        ),
                         consecutive_failures: 1,
                         last_failure_unix: now_unix,
                         last_failure_reason: "parked recovery".to_string(),

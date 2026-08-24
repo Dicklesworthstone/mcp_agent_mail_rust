@@ -275,14 +275,14 @@ pub fn set_private_writable_file_permissions(file: &std::fs::File) -> io::Result
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        return file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
     }
 
     #[cfg(windows)]
     {
         let mut permissions = file.metadata()?.permissions();
         permissions.set_readonly(false);
-        return file.set_permissions(permissions);
+        file.set_permissions(permissions)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -371,6 +371,11 @@ pub fn create_new_private_file_no_follow(path: &Path) -> io::Result<std::fs::Fil
 /// The size is checked both before and during the bounded read, so a file that
 /// grows concurrently cannot force an unbounded allocation.
 pub fn read_regular_file_no_follow_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    // Control files are intentionally small. Avoid turning a caller-supplied
+    // large limit into a speculative allocation even when the current file is
+    // sparse or its metadata races with the bounded read below.
+    const MAX_INITIAL_ALLOCATION: u64 = 64 * 1024;
+
     let mut file = open_regular_file_no_follow(path)?;
     let metadata_len = file.metadata()?.len();
     if metadata_len > max_bytes {
@@ -382,10 +387,6 @@ pub fn read_regular_file_no_follow_bounded(path: &Path, max_bytes: u64) -> io::R
             ),
         ));
     }
-    // Control files are intentionally small. Avoid turning a caller-supplied
-    // large limit into a speculative allocation even when the current file is
-    // sparse or its metadata races with the bounded read below.
-    const MAX_INITIAL_ALLOCATION: u64 = 64 * 1024;
     let allocation = usize::try_from(metadata_len.min(max_bytes).min(MAX_INITIAL_ALLOCATION))
         .unwrap_or(64 * 1024);
     let mut bytes = Vec::with_capacity(allocation);
@@ -506,7 +507,7 @@ fn sqlite_candidate_ascii_suffix(primary: &OsStr, candidate: &OsStr) -> Option<S
     {
         use std::os::unix::ffi::OsStrExt as _;
         let suffix = candidate.as_bytes().strip_prefix(primary.as_bytes())?;
-        return std::str::from_utf8(suffix).ok().map(str::to_owned);
+        std::str::from_utf8(suffix).ok().map(str::to_owned)
     }
 
     #[cfg(windows)]
@@ -515,7 +516,7 @@ fn sqlite_candidate_ascii_suffix(primary: &OsStr, candidate: &OsStr) -> Option<S
         let candidate = candidate.encode_wide().collect::<Vec<_>>();
         let primary = primary.encode_wide().collect::<Vec<_>>();
         let suffix = candidate.strip_prefix(primary.as_slice())?;
-        return String::from_utf16(suffix).ok();
+        String::from_utf16(suffix).ok()
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -580,7 +581,8 @@ pub fn classify_sqlite_recovery_candidate_name(
             Some(generation_micros),
             collision_sequence,
         )
-    } else if let Some(timestamp) = suffix.strip_prefix(".backup-") {
+    } else {
+        let timestamp = suffix.strip_prefix(".backup-")?;
         let (generation_micros, collision_sequence) =
             sqlite_backup_generation(timestamp, "%Y%m%d-%H%M%S")?;
         (
@@ -588,8 +590,6 @@ pub fn classify_sqlite_recovery_candidate_name(
             Some(generation_micros),
             collision_sequence,
         )
-    } else {
-        return None;
     };
 
     Some(SqliteRecoveryCandidateName {

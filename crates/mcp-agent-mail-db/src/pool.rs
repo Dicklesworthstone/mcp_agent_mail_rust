@@ -6350,10 +6350,7 @@ pub enum SqliteFamilyCleanupOutcome {
     /// No damaged WAL or empty/orphaned SHM required quarantine.
     NotNeeded,
     /// One or both sidecars were durably moved out of the live family.
-    Quarantined {
-        wal: bool,
-        shm: bool,
-    },
+    Quarantined { wal: bool, shm: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6376,9 +6373,7 @@ impl SqliteFamilyCleanupPlan {
 /// symlinked/directory SHM from becoming a partial cleanup: the whole family is
 /// accepted or refused before the durable admission boundary is entered.
 #[allow(clippy::result_large_err)]
-fn classify_sqlite_family_cleanup(
-    sqlite_path: &Path,
-) -> Result<SqliteFamilyCleanupPlan, SqlError> {
+fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyCleanupPlan, SqlError> {
     if let Ok(metadata) = std::fs::symlink_metadata(sqlite_path)
         && !metadata.file_type().is_file()
     {
@@ -6454,11 +6449,7 @@ fn sqlite_sidecar_cleanup_nonce() -> String {
     format!("{}-{millis}", std::process::id())
 }
 
-fn sqlite_cleanup_quarantine_path(
-    sidecar_path: &Path,
-    nonce: &str,
-    collision: u32,
-) -> PathBuf {
+fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str, collision: u32) -> PathBuf {
     let mut candidate_os = sidecar_path.as_os_str().to_os_string();
     if collision == 0 {
         candidate_os.push(format!(".cleanup-quarantine-{nonce}"));
@@ -6546,9 +6537,7 @@ fn apply_classified_sqlite_family_cleanup(
 }
 
 #[allow(clippy::result_large_err)]
-fn cleanup_empty_wal_sidecar(
-    db_path: &Path,
-) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
+fn cleanup_empty_wal_sidecar(db_path: &Path) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
     cleanup_truncated_wal_sidecar(db_path)
 }
 
@@ -18268,7 +18257,11 @@ mod tests {
                 Ok(())
             })
             .expect_err("a nested recovery must not inherit admission for another database");
-            assert!(error.to_string().contains("nested recovery may only target"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("nested recovery may only target")
+            );
             Ok(())
         })
         .expect("outer and same-path nested recovery should succeed");
@@ -19729,12 +19722,8 @@ mod tests {
             std::fs::read(&breaker_path).unwrap(),
             b"malformed breaker authority"
         );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-wal").is_empty()
-        );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-shm").is_empty()
-        );
+        assert!(sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-wal").is_empty());
+        assert!(sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-shm").is_empty());
         recovery_admission().reset();
     }
 
@@ -19768,12 +19757,8 @@ mod tests {
         assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
         assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
         assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-wal").is_empty()
-        );
-        assert!(
-            sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-shm").is_empty()
-        );
+        assert!(sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-wal").is_empty());
+        assert!(sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-shm").is_empty());
         recovery_admission().reset();
     }
 
