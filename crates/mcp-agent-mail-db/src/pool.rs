@@ -14728,7 +14728,7 @@ mod tests {
         crate::close_db_conn(franken_writer, "clean up live-WAL test writer");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn guarded_read_only_franken_preflight_preserves_same_process_writer_lock() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_LOCK_PROBE_PATH";
@@ -14813,6 +14813,39 @@ mod tests {
             exact_diagnostic_parent_snapshot(directory.path()),
             before,
             "fd-free read-only preflight must preserve both bytes and the parent's writer lock"
+        );
+
+        // A pathname-only namespace check is insufficient when another name
+        // reaches the same inode: the alias has no adjacent Franken namespace
+        // records, yet opening and closing it through canonical SQLite would
+        // release this process's classic fcntl locks on the original pathname.
+        // Both guarded seams therefore fail closed once the main inode has
+        // more than one link, before either engine opens it.
+        let alias_path = directory.path().join("writer-lock-alias.sqlite3");
+        std::fs::hard_link(&db_path, &alias_path)
+            .expect("create hard-link alias of live writer database");
+        let aliased_before = exact_diagnostic_parent_snapshot(directory.path());
+        assert!(
+            open_guarded_read_only_canonical_sqlite_file(
+                &alias_path,
+                "hard-link alias canonical refusal",
+            )
+            .is_err(),
+            "canonical diagnostics must refuse an alias of a Franken-locked inode"
+        );
+        assert!(
+            open_guarded_read_only_franken_existing_file(
+                &db_path,
+                "hard-linked Franken main refusal",
+            )
+            .is_err(),
+            "Franken diagnostics must require one authoritative main pathname"
+        );
+        assert_child_observes_busy(&db_path);
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            aliased_before,
+            "hard-link refusals must preserve every family name and byte"
         );
 
         writer

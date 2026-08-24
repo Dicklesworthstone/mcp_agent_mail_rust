@@ -352,17 +352,16 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
 
     match source_profile {
         SnapshotSourceProfile::Runtime => {
-            let src =
-                mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
-                    &source,
-                    "share live SQLite snapshot",
-                )
-                .map_err(|e| ShareError::Sqlite {
-                    message: format!(
-                        "cannot open live runtime source DB {} read-only: {e}",
-                        source.display()
-                    ),
-                })?;
+            let src = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+                &source,
+                "share live SQLite snapshot",
+            )
+            .map_err(|e| ShareError::Sqlite {
+                message: format!(
+                    "cannot open live runtime source DB {} read-only: {e}",
+                    source.display()
+                ),
+            })?;
             transfer_tables_in_consistent_read(&src, &dst_conn)?;
             // A true read-only observer must use ordinary Drop. Checkpointing
             // close helpers are writer teardown and may mutate a live WAL.
@@ -841,12 +840,16 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
     column.ends_with("_ts") || column.ends_with("_at")
 }
 
-/// Full snapshot preparation pipeline.
+/// Full snapshot preparation pipeline for a live FrankenSQLite mailbox.
 ///
 /// 1. Create snapshot
 /// 2. Apply project scope
 /// 3. Scrub data
 /// 4. Finalize (FTS, materialized views, performance indexes, VACUUM)
+///
+/// The source assumptions are the same as [`create_sqlite_snapshot`]: a
+/// complete, valid FrankenSQLite namespace pair is mandatory and the source
+/// is opened only through the guarded read-only seam.
 pub fn create_snapshot_context(
     source: &Path,
     snapshot_path: &Path,
@@ -854,6 +857,34 @@ pub fn create_snapshot_context(
     scrub_preset: crate::ScrubPreset,
 ) -> Result<SnapshotContext, ShareError> {
     create_sqlite_snapshot(source, snapshot_path, true)?;
+    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+}
+
+/// Full snapshot preparation pipeline for a private canonical SQLite source.
+///
+/// The source must be a caller-owned, engine-exclusive archive reconstruction
+/// or materialized snapshot. Never pass a live FrankenSQLite mailbox path;
+/// use [`create_snapshot_context`] for that case.
+///
+/// # Errors
+///
+/// Returns [`ShareError`] when snapshot creation, project scoping, scrubbing,
+/// or finalization fails.
+pub fn create_private_canonical_snapshot_context(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+) -> Result<SnapshotContext, ShareError> {
+    create_private_canonical_sqlite_snapshot(source, snapshot_path, true)?;
+    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+}
+
+fn finish_snapshot_context(
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+) -> Result<SnapshotContext, ShareError> {
     let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
     let scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
     if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
@@ -881,6 +912,42 @@ pub struct SnapshotContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct InterleavingSnapshotSource {
+        inner: DbConn,
+        writer_trigger: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        writer_done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SnapshotSource for InterleavingSnapshotSource {
+        fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.inner.execute_raw(sql)
+        }
+
+        fn query_snapshot(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+            let rows = self.inner.query_sync(sql, params)?;
+            if sql.contains("FROM \"projects\"") {
+                let trigger = self
+                    .writer_trigger
+                    .lock()
+                    .expect("lock snapshot test writer trigger")
+                    .take();
+                if let Some(trigger) = trigger {
+                    trigger.send(()).expect("release concurrent WAL writer");
+                    self.writer_done
+                        .lock()
+                        .expect("lock snapshot test writer completion")
+                        .recv()
+                        .expect("concurrent WAL writer commits");
+                }
+            }
+            Ok(rows)
+        }
+    }
 
     // GH#230: the firmlink allowance itself is a pure predicate over
     // synthetic paths (real firmlinks cannot be fabricated at `/` inside a
@@ -1016,6 +1083,206 @@ mod tests {
         let rows = copy_conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
         let result: String = rows[0].get_named("integrity_check").unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn private_canonical_snapshot_is_explicit_and_live_api_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("private-canonical.sqlite3");
+        let private_dest = dir.path().join("private-copy.sqlite3");
+        let refused_live_dest = dir.path().join("refused-live-copy.sqlite3");
+
+        let conn = CanonicalDbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'private', '/private', 0)")
+            .unwrap();
+        drop(conn);
+
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            assert!(
+                !PathBuf::from(format!("{}{suffix}", source.display())).exists(),
+                "canonical fixture must not accidentally gain FrankenSQLite namespace authority"
+            );
+        }
+
+        create_private_canonical_sqlite_snapshot(&source, &private_dest, true)
+            .expect("explicit private canonical snapshot succeeds");
+        let copy = CanonicalDbConn::open_file(private_dest.display().to_string()).unwrap();
+        let rows = copy
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "private");
+
+        let error = create_sqlite_snapshot(&source, &refused_live_dest, false)
+            .expect_err("live API must not fall back for a namespace-less source");
+        assert!(
+            error
+                .to_string()
+                .contains("complete pre-existing namespace sidecar pair"),
+            "unexpected live-source refusal: {error}"
+        );
+        assert!(!refused_live_dest.exists());
+    }
+
+    #[test]
+    fn snapshot_pins_one_primary_and_wal_state_across_all_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("live-wal.sqlite3");
+        let destination = dir.path().join("consistent-copy.sqlite3");
+
+        let seed = DbConn::open_file(source.display().to_string()).unwrap();
+        seed.execute_raw("PRAGMA journal_mode = WAL").unwrap();
+        seed.execute_raw("PRAGMA wal_autocheckpoint = 0").unwrap();
+        seed.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        seed.execute_raw(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, product_uid TEXT, name TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        seed.execute_raw("INSERT INTO projects VALUES (1, 'before', '/before', 0)")
+            .unwrap();
+        drop(seed);
+
+        let reader = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+            &source,
+            "consistent snapshot test",
+        )
+        .unwrap();
+        let destination_conn =
+            CanonicalDbConn::open_file(destination.display().to_string()).unwrap();
+        let (writer_trigger_tx, writer_trigger_rx) = std::sync::mpsc::sync_channel(0);
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_path = source.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = DbConn::open_file(writer_path.display().to_string()).unwrap();
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 0").unwrap();
+            writer_trigger_rx.recv().unwrap();
+            conn.execute_raw("INSERT INTO products VALUES (1, 'later', 'Later', 1)")
+                .unwrap();
+            writer_done_tx.send(()).unwrap();
+        });
+        let interleaving_reader = InterleavingSnapshotSource {
+            inner: reader,
+            writer_trigger: std::sync::Mutex::new(Some(writer_trigger_tx)),
+            writer_done: std::sync::Mutex::new(writer_done_rx),
+        };
+
+        transfer_tables_in_consistent_read(&interleaving_reader, &destination_conn)
+            .expect("snapshot transfer stays on one source read transaction");
+        writer.join().unwrap();
+
+        let projects = destination_conn
+            .query_sync("SELECT count(*) AS count FROM projects", &[])
+            .unwrap();
+        let products = destination_conn
+            .query_sync("SELECT count(*) AS count FROM products", &[])
+            .unwrap();
+        assert_eq!(projects[0].get_named::<i64>("count").unwrap(), 1);
+        assert_eq!(
+            products[0].get_named::<i64>("count").unwrap(),
+            0,
+            "a product committed after the first source read must not leak into the snapshot"
+        );
+        assert_eq!(
+            interleaving_reader
+                .inner
+                .query_sync("SELECT count(*) AS count FROM products", &[])
+                .unwrap()[0]
+                .get_named::<i64>("count")
+                .unwrap(),
+            1,
+            "the concurrent WAL commit must really have completed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_snapshot_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_SHARE_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "snapshot::tests::live_snapshot_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "share-snapshot-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let contender = CanonicalDbConn::open_file(PathBuf::from(path).display().to_string())
+                .expect("child opens competing canonical connection");
+            contender
+                .execute_raw("PRAGMA busy_timeout = 0")
+                .expect("child disables busy retry");
+            let error = contender
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect_err("separate process must not acquire the parent's reserved lock");
+            let error = error.to_string().to_ascii_lowercase();
+            assert!(
+                error.contains("busy") || error.contains("locked"),
+                "child must observe a lock refusal, not an unrelated error: {error}"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+                "child filter ran no causal lock probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("writer-lock.sqlite3");
+        let destination = dir.path().join("writer-lock-copy.sqlite3");
+        let seed = DbConn::open_file(source.display().to_string()).unwrap();
+        seed.execute_raw("PRAGMA journal_mode = DELETE").unwrap();
+        seed.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        seed.execute_raw("INSERT INTO projects VALUES (1, 'locked', '/locked', 0)")
+            .unwrap();
+        drop(seed);
+
+        let writer = DbConn::open_file(source.display().to_string()).unwrap();
+        writer.execute_raw("PRAGMA busy_timeout = 0").unwrap();
+        writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+        let journal = PathBuf::from(format!("{}-journal", source.display()));
+        assert!(
+            !journal.exists(),
+            "BEGIN IMMEDIATE without a write must not create a rollback journal"
+        );
+
+        assert_child_observes_busy(&source);
+        create_sqlite_snapshot(&source, &destination, true)
+            .expect("guarded live snapshot coexists with a reserved writer");
+        assert_child_observes_busy(&source);
+
+        writer.execute_raw("ROLLBACK").unwrap();
+        let copy = CanonicalDbConn::open_file(destination.display().to_string()).unwrap();
+        let rows = copy
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "locked");
     }
 
     #[test]
