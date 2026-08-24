@@ -3172,6 +3172,49 @@ impl DbPool {
         self.run_integrity_check(false)
     }
 
+    /// Classify whether opening the live SQLite family for an integrity cycle
+    /// must first pass through durable recovery admission.
+    ///
+    /// Damaged WAL/SHM cleanup is itself admission-controlled. A private copy
+    /// of the exact family is additionally required on cold startup and when
+    /// durable breaker history is unreadable or applies to these primary
+    /// bytes. Returning `true` means the live engine must not be opened until
+    /// the caller has entered an admission envelope.
+    fn integrity_family_requires_preopen_admission(
+        &self,
+        require_source_neutral_preopen_proof: bool,
+        cycle: &str,
+    ) -> DbResult<bool> {
+        let sqlite_path = Path::new(&self.sqlite_path);
+        cleanup_truncated_wal_sidecar(sqlite_path).map_err(|error| {
+            DbError::Sqlite(format!(
+                "{cycle}: pre-open SQLite-family cleanup failed: {error}"
+            ))
+        })?;
+
+        let breaker_requires_source_neutral_proof =
+            match crate::recovery_breaker::load(sqlite_path) {
+                Err(_) => true,
+                Ok(Some(state)) => {
+                    state.consecutive_failures > 0
+                        && state.db_fingerprint
+                            == crate::recovery_breaker::fingerprint_db(sqlite_path)
+                }
+                Ok(None) => false,
+            };
+        if !require_source_neutral_preopen_proof && !breaker_requires_source_neutral_proof {
+            return Ok(false);
+        }
+
+        sqlite_file_is_healthy_without_family_cleanup(sqlite_path)
+            .map(|healthy| !healthy)
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "{cycle}: source-neutral pre-open probe failed: {error}"
+                ))
+            })
+    }
+
     fn run_integrity_check(
         &self,
         require_source_neutral_preopen_proof: bool,
@@ -3200,12 +3243,6 @@ impl DbPool {
         // before that open. In particular, malformed or tripped breaker
         // authority must refuse here while the primary/WAL/SHM namespace is
         // still byte-for-byte untouched.
-        cleanup_truncated_wal_sidecar(Path::new(&self.sqlite_path)).map_err(|error| {
-            DbError::Sqlite(format!(
-                "startup integrity check: pre-open SQLite-family cleanup failed: {error}"
-            ))
-        })?;
-
         // A cold startup must prove a private copy of the exact family before
         // any live engine open: merely opening SQLite can replay or rewrite
         // WAL/SHM state. Once the runtime is already live, periodic cycles may
@@ -3215,28 +3252,10 @@ impl DbPool {
         // exact family may continue serving without recovery, while an
         // unhealthy family flows into admission and refuses before opening
         // either the election file or SQLite itself.
-        let sqlite_path = Path::new(&self.sqlite_path);
-        let breaker_requires_source_neutral_proof =
-            match crate::recovery_breaker::load(sqlite_path) {
-                Err(_) => true,
-                Ok(Some(state)) => {
-                    state.consecutive_failures > 0
-                        && state.db_fingerprint
-                            == crate::recovery_breaker::fingerprint_db(sqlite_path)
-                }
-                Ok(None) => false,
-            };
-        let live_family_can_open_without_admission = if require_source_neutral_preopen_proof
-            || breaker_requires_source_neutral_proof
-        {
-            sqlite_file_is_healthy_without_family_cleanup(sqlite_path).map_err(|error| {
-                DbError::Sqlite(format!(
-                    "startup integrity check: source-neutral pre-open probe failed: {error}"
-                ))
-            })?
-        } else {
-            true
-        };
+        let requires_preopen_admission = self.integrity_family_requires_preopen_admission(
+            require_source_neutral_preopen_proof,
+            "startup integrity check",
+        )?;
         let run_live_check = || -> DbResult<integrity::IntegrityCheckResult> {
             let conn = crate::guard_db_conn(
                 match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
@@ -3347,7 +3366,7 @@ impl DbPool {
             }
         };
 
-        if live_family_can_open_without_admission {
+        if !requires_preopen_admission {
             return run_live_check();
         }
 
@@ -3482,7 +3501,27 @@ impl DbPool {
             });
         }
 
-        let conn = crate::guard_db_conn(
+        // The periodic quick cycle normally runs immediately before this
+        // hourly full check, but a failed quick cycle must not make the full
+        // path a second, unguarded way to open the same suspect family. Reuse
+        // the exact pre-open classifier here. When the family requires
+        // admission, guard only the live engine open; any resulting integrity
+        // error is returned to the integrity guard, whose recovery handler
+        // enters the outcome-recording recovery envelope exactly once.
+        let requires_preopen_admission = self
+            .integrity_family_requires_preopen_admission(false, "full integrity check")?;
+        let raw_conn = if requires_preopen_admission {
+            with_recovery_mutation_admission(
+                Path::new(&self.sqlite_path),
+                "full integrity pre-open",
+                || open_sqlite_file_with_lock_retry(&self.sqlite_path),
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "full integrity check: admitted pre-open failed: {error}"
+                ))
+            })?
+        } else {
             match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -3509,9 +3548,9 @@ impl DbPool {
                         ))
                     })?
                 }
-            },
-            "full integrity check connection",
-        );
+            }
+        };
+        let conn = crate::guard_db_conn(raw_conn, "full integrity check connection");
 
         reconcile_with_canonical(
             integrity::full_check(&conn),

@@ -194,43 +194,52 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             return;
         }
 
-        if skip_first_quick_cycle {
+        let quick_cycle_passed = if skip_first_quick_cycle {
             skip_first_quick_cycle = false;
             tracing::debug!(
                 "integrity guard: skipped immediate quick cycle (startup probe already executed)"
             );
+            true
         } else {
             run_quick_cycle(
                 &pool,
                 sqlite_path,
                 &storage_root,
                 &mut last_recovery_attempt,
-            );
-        }
+            )
+        };
 
-        if full_check_due(config, full_every, last_full_attempt) {
-            let attempted_at = Instant::now();
-            let _ = run_full_cycle(
-                &pool,
-                sqlite_path,
-                &storage_root,
-                &mut last_recovery_attempt,
-            );
-            last_full_attempt = Some(attempted_at);
-        }
-
-        // Bead K4: bounded SQLite maintenance (checkpoint / analyze / vacuum /
-        // journal_size_limit) on independent cadences, off the hot path.
-        run_db_maintenance_cycle(
-            &pool,
-            config,
-            sqlite_path,
-            Instant::now(),
-            &mut last_checkpoint,
-            &mut last_analyze,
-            &mut last_vacuum,
-            &mut last_atc_retention,
-            &mut last_doctor_retention,
+        let full_due = full_check_due(config, full_every, last_full_attempt);
+        run_integrity_followups(
+            quick_cycle_passed,
+            full_due,
+            || {
+                let attempted_at = Instant::now();
+                let passed = run_full_cycle(
+                    &pool,
+                    sqlite_path,
+                    &storage_root,
+                    &mut last_recovery_attempt,
+                );
+                last_full_attempt = Some(attempted_at);
+                passed
+            },
+            || {
+                // Bead K4: bounded SQLite maintenance (checkpoint / analyze /
+                // vacuum / journal_size_limit) on independent cadences, off
+                // the hot path. Never run it after a failed integrity verdict.
+                run_db_maintenance_cycle(
+                    &pool,
+                    config,
+                    sqlite_path,
+                    Instant::now(),
+                    &mut last_checkpoint,
+                    &mut last_analyze,
+                    &mut last_vacuum,
+                    &mut last_atc_retention,
+                    &mut last_doctor_retention,
+                );
+            },
         );
 
         // Sleep in short increments so shutdown reacts quickly.
@@ -247,19 +256,52 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     }
 }
 
+/// Run the full-check and maintenance followups only after the integrity
+/// verdicts that authorize them.
+///
+/// Keeping this sequencing in one small seam makes it impossible for a quick
+/// breaker refusal to fall through into a second live-family open, checkpoint,
+/// ANALYZE, or VACUUM. When a due full check fails, maintenance is likewise
+/// skipped for this iteration.
+fn run_integrity_followups<F, M>(
+    quick_cycle_passed: bool,
+    full_due: bool,
+    run_full: F,
+    run_maintenance: M,
+) -> bool
+where
+    F: FnOnce() -> bool,
+    M: FnOnce(),
+{
+    if !quick_cycle_passed {
+        tracing::warn!(
+            "integrity guard: skipping full check and database maintenance after failed quick cycle"
+        );
+        return false;
+    }
+    if full_due && !run_full() {
+        tracing::warn!(
+            "integrity guard: skipping database maintenance after failed full integrity cycle"
+        );
+        return false;
+    }
+    run_maintenance();
+    true
+}
+
 fn run_quick_cycle(
     pool: &DbPool,
     sqlite_path: &Path,
     storage_root: &Path,
     last_recovery_attempt: &mut Option<Instant>,
-) {
+) -> bool {
     match pool.run_periodic_integrity_check() {
         Ok(_) => {
             if take_deferred_proactive_backup() {
                 tracing::debug!(
                     "integrity guard: deferred proactive backup during startup quick cycle"
                 );
-                return;
+                return true;
             }
             if let Err(err) = pool.create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
             {
@@ -283,14 +325,18 @@ fn run_quick_cycle(
                     "integrity guard: archive drift reconcile attempt failed; will retry next cycle"
                 ),
             }
+            true
         }
-        Err(err) => handle_integrity_error(
-            "quick_check",
-            &err.to_string(),
-            sqlite_path,
-            storage_root,
-            last_recovery_attempt,
-        ),
+        Err(err) => {
+            handle_integrity_error(
+                "quick_check",
+                &err.to_string(),
+                sqlite_path,
+                storage_root,
+                last_recovery_attempt,
+            );
+            false
+        }
     }
 }
 
