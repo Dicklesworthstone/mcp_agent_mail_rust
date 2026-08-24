@@ -190,23 +190,165 @@ pub(crate) fn sqlite_immutable_uri(db_path: &std::path::Path) -> String {
     uri
 }
 
-/// Open a SQLite database for detector-only inspection without creating
-/// sidecars, replaying WAL/journals, taking writer locks, or creating a
-/// missing file.
+/// How a detector's canonical connection obtained its stable read authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorDbReadSourceKind {
+    /// A live FrankenSQLite family exported through guarded `VACUUM INTO`.
+    LiveLogicalSnapshot,
+    /// A caller-designated engine-exclusive/offline SQLite family.
+    ExplicitOffline,
+    /// Source selection failed before a canonical connection was available.
+    Unavailable,
+}
+
+/// A typed detector source that keeps the repair target distinct from the
+/// inode canonical SQLite is allowed to open.
 ///
-/// SQLite's plain read-only mode can still create or require `-shm` files for
-/// WAL databases. The URI `immutable=1` flag tells SQLite the file cannot
-/// change under this connection, which is the contract doctor detectors need:
-/// observe bytes and schema, never perturb the state being diagnosed.
-#[allow(clippy::result_large_err)]
-pub(crate) fn open_immutable_sqlite(
-    db_path: &std::path::Path,
-) -> sqlmodel_core::Result<sqlmodel_sqlite::SqliteConnection> {
-    let uri = sqlite_immutable_uri(db_path);
-    let mut flags = sqlmodel_sqlite::OpenFlags::read_only();
-    flags.uri = true;
-    let config = sqlmodel_sqlite::SqliteConfig::file(uri).flags(flags);
-    sqlmodel_sqlite::SqliteConnection::open(&config)
+/// Live FrankenSQLite mailboxes are materialized to one retained private
+/// logical snapshot before any fixer detector runs. Explicitly offline
+/// families use the guarded WAL-aware canonical opener directly. The
+/// connection and any backing tempdir live for this value's entire lifetime,
+/// so aggregate detection observes one coherent source rather than reopening
+/// the live primary once per failure mode.
+pub(crate) struct DoctorDbReadCandidate {
+    target_path: std::path::PathBuf,
+    connection: Option<mcp_agent_mail_db::CanonicalDbConn>,
+    retained_snapshot: Option<crate::CanonicalSnapshotSource>,
+    source_kind: DoctorDbReadSourceKind,
+    open_error: Option<String>,
+}
+
+impl DoctorDbReadCandidate {
+    fn unavailable(target_path: &std::path::Path, error: impl Into<String>) -> Self {
+        Self {
+            target_path: target_path.to_path_buf(),
+            connection: None,
+            retained_snapshot: None,
+            source_kind: DoctorDbReadSourceKind::Unavailable,
+            open_error: Some(error.into()),
+        }
+    }
+
+    /// Select a safe production source. A Franken-admitted live family is
+    /// exported through the same engine; only a family accepted by the
+    /// explicit offline canonical guard may bypass that export.
+    pub(crate) fn open_live_or_explicit_offline(
+        target_path: &std::path::Path,
+        operation: &str,
+    ) -> Self {
+        match crate::doctor_open_canonical_source_for_diagnostic(target_path, operation) {
+            Ok(opened) => {
+                let source_kind = match opened.kind {
+                    crate::DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot => {
+                        DoctorDbReadSourceKind::LiveLogicalSnapshot
+                    }
+                    crate::DoctorCanonicalDiagnosticSourceKind::OfflineCanonical => {
+                        DoctorDbReadSourceKind::ExplicitOffline
+                    }
+                    crate::DoctorCanonicalDiagnosticSourceKind::InMemory => {
+                        return Self::unavailable(
+                            target_path,
+                            "file-backed doctor fixer unexpectedly selected an in-memory source",
+                        );
+                    }
+                };
+                Self {
+                    target_path: target_path.to_path_buf(),
+                    connection: Some(opened.conn),
+                    retained_snapshot: opened._snapshot_source,
+                    source_kind,
+                    open_error: None,
+                }
+            }
+            Err(error) => Self::unavailable(target_path, error.to_string()),
+        }
+    }
+
+    /// Open a caller-designated offline family without ever falling back to a
+    /// live FrankenSQLite primary. This is the explicit source used by unit
+    /// fixtures and genuinely offline maintenance callers.
+    pub(crate) fn open_explicit_offline(
+        target_path: &std::path::Path,
+        operation: &str,
+    ) -> Self {
+        match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+            target_path,
+            operation,
+        ) {
+            Ok(connection) => Self {
+                target_path: target_path.to_path_buf(),
+                connection: Some(connection),
+                retained_snapshot: None,
+                source_kind: DoctorDbReadSourceKind::ExplicitOffline,
+                open_error: None,
+            },
+            Err(error) => Self::unavailable(target_path, error.to_string()),
+        }
+    }
+
+    pub(crate) fn target_path(&self) -> &std::path::Path {
+        &self.target_path
+    }
+
+    pub(crate) fn connection(&self) -> Option<&sqlmodel_sqlite::SqliteConnection> {
+        self.connection.as_ref()
+    }
+
+    pub(crate) fn open_error(&self) -> Option<&str> {
+        self.open_error.as_deref()
+    }
+
+    /// Re-observe the decisive database invariants immediately before a
+    /// mutating fixer acts. Live sources must remain live; explicit-offline
+    /// sources must remain accepted by the offline guard.
+    pub(crate) fn refresh(&self, operation: &str) -> Self {
+        match self.source_kind {
+            DoctorDbReadSourceKind::LiveLogicalSnapshot => {
+                let refreshed = Self::open_live_or_explicit_offline(&self.target_path, operation);
+                if refreshed.source_kind == DoctorDbReadSourceKind::LiveLogicalSnapshot {
+                    refreshed
+                } else {
+                    Self::unavailable(
+                        &self.target_path,
+                        refreshed.open_error.unwrap_or_else(|| {
+                            "live doctor fixer source lost FrankenSQLite admission".to_string()
+                        }),
+                    )
+                }
+            }
+            DoctorDbReadSourceKind::ExplicitOffline => {
+                Self::open_explicit_offline(&self.target_path, operation)
+            }
+            DoctorDbReadSourceKind::Unavailable => {
+                Self::unavailable(
+                    &self.target_path,
+                    self.open_error
+                        .clone()
+                        .unwrap_or_else(|| "doctor fixer source is unavailable".to_string()),
+                )
+            }
+        }
+    }
+}
+
+fn prepare_doctor_db_read_candidates(
+    db_paths: &[std::path::PathBuf],
+    operation: &str,
+) -> Vec<DoctorDbReadCandidate> {
+    db_paths
+        .iter()
+        .map(|path| DoctorDbReadCandidate::open_live_or_explicit_offline(path, operation))
+        .collect()
+}
+
+pub(crate) fn explicit_offline_db_read_candidates(
+    db_paths: &[std::path::PathBuf],
+    operation: &str,
+) -> Vec<DoctorDbReadCandidate> {
+    db_paths
+        .iter()
+        .map(|path| DoctorDbReadCandidate::open_explicit_offline(path, operation))
+        .collect()
 }
 
 #[cfg(unix)]
