@@ -2020,9 +2020,9 @@ dependencies = [
 
 [[package]]
 name = "franken-agent-detection"
-version = "0.1.10"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be20443e8870b8126fd736f3dbf4cb410021452e84ec6a4a89870d4bbb32c7a5"
+checksum = "4b8e80a92cd67fa8cad05071c36947c0ecc45382eaa0823126467960d66d980a"
 dependencies = [
  "chrono",
  "dirs",
