@@ -7911,11 +7911,16 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
     let Some(staged) = stage_sqlite_family_for_health_probe(path)? else {
         return Ok(false);
     };
+    let staged_wal = crate::wal_classify::classify_wal_sidecar(&staged.path);
+    let staged_sidecars = inspect_mailbox_sidecar_state(&staged.path);
     // A rollback journal may require recovery merely to observe the database.
     // The no-cleanup contract must not accept a staged open that succeeded by
     // replaying or resetting that journal, because the corresponding live
     // read-only observer has no authority to trigger recovery.
-    if path_is_occupied(&sqlite_sidecar_path(&staged.path, "-journal")) {
+    if path_is_occupied(&sqlite_sidecar_path(&staged.path, "-journal"))
+        || staged_wal.state.is_damaged()
+        || (staged_sidecars.shm_exists && !staged_sidecars.wal_exists)
+    {
         return Ok(false);
     }
     if !classify_sqlite_family_cleanup(&staged.path)?.is_empty() {
@@ -9517,6 +9522,22 @@ fn preflight_guarded_read_only_sqlite_family<'path>(
     sqlite_path: &'path Path,
     context: &str,
 ) -> Result<&'path str, SqlError> {
+    preflight_guarded_read_only_sqlite_family_with_probe(
+        sqlite_path,
+        context,
+        sqlite_file_is_healthy_without_family_cleanup,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn preflight_guarded_read_only_sqlite_family_with_probe<'path, F>(
+    sqlite_path: &'path Path,
+    context: &str,
+    mut exact_family_probe: F,
+) -> Result<&'path str, SqlError>
+where
+    F: FnMut(&Path) -> Result<bool, SqlError>,
+{
     validate_sqlite_target_path(sqlite_path, context)?;
     let sqlite_path_str = sqlite_path_as_utf8(sqlite_path)?;
     strict_target_precheck(sqlite_path_str)?;
@@ -9576,7 +9597,7 @@ fn preflight_guarded_read_only_sqlite_family<'path>(
     };
 
     if let Some(reason) = nonclean_authority.or(suspicious_family) {
-        match sqlite_file_is_healthy_without_family_cleanup(sqlite_path) {
+        match exact_family_probe(sqlite_path) {
             Ok(true) => {
                 tracing::warn!(
                     operation = context,
@@ -13598,6 +13619,74 @@ mod tests {
             },
         )
         .expect("store tripped diagnostic breaker");
+    }
+
+    #[test]
+    fn guarded_read_only_breaker_authority_causally_controls_exact_family_proof() {
+        for breaker_kind in ["malformed", "tripped"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("breaker-causal-{breaker_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            install_diagnostic_breaker(&db_path, breaker_kind);
+            let probe_calls = std::cell::Cell::new(0_u32);
+
+            preflight_guarded_read_only_sqlite_family_with_probe(
+                &db_path,
+                "breaker-causal diagnostic test",
+                |_| {
+                    probe_calls.set(probe_calls.get().saturating_add(1));
+                    Ok(false)
+                },
+            )
+            .expect_err("nonclean exact breaker authority must require and honor the proof");
+            assert_eq!(
+                probe_calls.get(),
+                1,
+                "{breaker_kind} authority must causally invoke one exact-family proof"
+            );
+        }
+
+        for authority_kind in ["clean", "stale-fingerprint"] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let db_path = directory
+                .path()
+                .join(format!("breaker-noncausal-{authority_kind}.sqlite3"));
+            seed_settled_diagnostic_database(&db_path);
+            let state = if authority_kind == "clean" {
+                crate::recovery_breaker::cleared_state(
+                    &crate::recovery_breaker::fingerprint_db(&db_path),
+                )
+            } else {
+                crate::recovery_breaker::RecoveryBreakerState {
+                    schema: 1,
+                    db_fingerprint: "missing".to_string(),
+                    consecutive_failures: 99,
+                    last_failure_unix: recovery_breaker_now_unix(),
+                    last_failure_reason: "failure on stale bytes".to_string(),
+                    tripped: true,
+                }
+            };
+            crate::recovery_breaker::store(&db_path, &state)
+                .expect("store irrelevant diagnostic breaker authority");
+            let probe_calls = std::cell::Cell::new(0_u32);
+
+            preflight_guarded_read_only_sqlite_family_with_probe(
+                &db_path,
+                "irrelevant-breaker diagnostic test",
+                |_| {
+                    probe_calls.set(probe_calls.get().saturating_add(1));
+                    Ok(false)
+                },
+            )
+            .expect("clean or stale-fingerprint authority must not demand recovery proof");
+            assert_eq!(
+                probe_calls.get(),
+                0,
+                "{authority_kind} authority must not invoke exact-family proof"
+            );
+        }
     }
 
     #[test]
