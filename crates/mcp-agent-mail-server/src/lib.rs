@@ -2678,6 +2678,14 @@ pub(crate) fn open_read_only_sync_db_connection_with_busy_timeout(
                 "configure read-only sqlite busy_timeout={busy_timeout_ms} on {path}: {err}"
             ))
         })?;
+    // `open_file_read_only` is engine-enforced for disk databases. The memory
+    // branch has no read-only open mode, so apply the same contract explicitly
+    // after all connection-local setup that is allowed to write pragmas.
+    conn.execute_raw("PRAGMA query_only = ON;").map_err(|err| {
+        std::io::Error::other(format!(
+            "configure sqlite query_only read-only connection on {path}: {err}"
+        ))
+    })?;
     Ok(conn)
 }
 
@@ -2699,17 +2707,11 @@ pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result
 }
 
 pub(crate) fn open_health_probe_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    let conn = open_sync_db_connection_with_busy_timeout(
+    open_read_only_sync_db_connection_with_busy_timeout(
         path,
         HEALTH_SYNC_DB_BUSY_TIMEOUT_MS,
         "HTTP readiness health probe",
-    )?;
-    conn.execute_raw("PRAGMA query_only = ON;").map_err(|err| {
-        std::io::Error::other(format!(
-            "configure sqlite query_only health probe on {path}: {err}"
-        ))
-    })?;
-    Ok(conn)
+    )
 }
 
 pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Option<DbConn> {
@@ -28733,6 +28735,34 @@ first body
     }
 
     #[test]
+    fn read_only_sync_db_connection_enforces_query_only_for_memory_database() {
+        let conn = open_read_only_sync_db_connection_with_busy_timeout(
+            ":memory:",
+            BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS,
+            "read-only memory contract test",
+        )
+        .expect("open read-only memory connection");
+
+        let query_only = conn
+            .query_sync("PRAGMA query_only", &[])
+            .expect("query query_only pragma")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("query_only")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(query_only, 1);
+        assert!(
+            conn.execute_raw("CREATE TABLE forbidden_write(id INTEGER)")
+                .is_err(),
+            "the generic read-only helper must remain read-only for its in-memory branch"
+        );
+    }
+
+    #[test]
     fn open_health_probe_sync_db_connection_uses_short_busy_timeout_and_query_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("health-busy-timeout.db");
@@ -28769,6 +28799,14 @@ first body
             })
             .unwrap_or_default();
         assert_eq!(query_only, 1);
+
+        conn.execute_raw("PRAGMA query_only = OFF;")
+            .expect("disable connection-local query_only for engine-level proof");
+        assert!(
+            conn.execute_raw("CREATE TABLE forbidden_health_write(id INTEGER)")
+                .is_err(),
+            "health probes must be engine-opened read-only, not merely switched to query_only after a writable live-family open"
+        );
     }
 
     fn install_raw_open_breaker_fixture(db_path: &Path, breaker_kind: &str) -> PathBuf {

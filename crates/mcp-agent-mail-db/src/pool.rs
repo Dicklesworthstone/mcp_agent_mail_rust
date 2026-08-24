@@ -21003,6 +21003,10 @@ mod tests {
         std::fs::write(&shm_path, b"coordination-shm").unwrap();
         let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
         std::fs::write(&breaker_path, b"malformed breaker authority").unwrap();
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list malformed ensure fixture before refusal")
+            .map(|entry| entry.expect("read malformed ensure fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
 
         recovery_admission().reset();
         let error = ensure_sqlite_file_healthy(&db_path)
@@ -21015,8 +21019,17 @@ mod tests {
             std::fs::read(&breaker_path).unwrap(),
             b"malformed breaker authority"
         );
-        assert!(sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-wal").is_empty());
-        assert!(sqlite_cleanup_quarantines(dir.path(), "malformed-breaker.sqlite3-shm").is_empty());
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list malformed ensure fixture after refusal")
+            .map(|entry| entry.expect("read malformed ensure fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "malformed-breaker refusal must not create election, cleanup, recovery, candidate, or forensic artifacts"
+        );
+        assert!(!crate::recovery_breaker::breaker_lock_path(&db_path).exists());
+        assert!(!sqlite_sidecar_path(&db_path, ".recovery.lock").exists());
+        assert!(!dir.path().join("doctor").join("forensics").exists());
         recovery_admission().reset();
     }
 
@@ -21041,6 +21054,10 @@ mod tests {
         crate::recovery_breaker::store(&db_path, &state).unwrap();
         let breaker_path = crate::recovery_breaker::breaker_sidecar_path(&db_path);
         let breaker_bytes = std::fs::read(&breaker_path).unwrap();
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list tripped ensure fixture before refusal")
+            .map(|entry| entry.expect("read tripped ensure fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
 
         recovery_admission().reset();
         let error = ensure_sqlite_file_healthy(&db_path)
@@ -21050,8 +21067,17 @@ mod tests {
         assert_eq!(std::fs::read(&wal_path).unwrap(), b"truncated-wal");
         assert_eq!(std::fs::read(&shm_path).unwrap(), b"coordination-shm");
         assert_eq!(std::fs::read(&breaker_path).unwrap(), breaker_bytes);
-        assert!(sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-wal").is_empty());
-        assert!(sqlite_cleanup_quarantines(dir.path(), "tripped-breaker.sqlite3-shm").is_empty());
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list tripped ensure fixture after refusal")
+            .map(|entry| entry.expect("read tripped ensure fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names_after, names_before,
+            "tripped-breaker refusal must not create election, cleanup, recovery, candidate, or forensic artifacts"
+        );
+        assert!(!crate::recovery_breaker::breaker_lock_path(&db_path).exists());
+        assert!(!sqlite_sidecar_path(&db_path, ".recovery.lock").exists());
+        assert!(!dir.path().join("doctor").join("forensics").exists());
         recovery_admission().reset();
     }
 
