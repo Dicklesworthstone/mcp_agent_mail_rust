@@ -67412,6 +67412,89 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn open_db_sync_no_breaker_unhealthy_family_enters_admission_before_writable_open() {
+        for family_kind in ["corrupt-primary", "truncated-wal"] {
+            mcp_agent_mail_db::pool::recovery_admission().reset();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("no-breaker-{family_kind}.sqlite3"));
+            let db_url = format!("sqlite:///{}", db_path.display());
+            init_schema_sqlite_canonical(&db_path.display().to_string())
+                .expect("seed healthy primary");
+            let backup_path = PathBuf::from(format!("{}.bak", db_path.display()));
+            std::fs::copy(&db_path, &backup_path).expect("create tempting backup");
+            match family_kind {
+                "corrupt-primary" => {
+                    std::fs::write(&db_path, b"not a sqlite database")
+                        .expect("corrupt primary");
+                }
+                "truncated-wal" => {
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                        .expect("plant truncated WAL");
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-shm"), b"coordination-shm")
+                        .expect("plant SHM evidence");
+                }
+                other => panic!("unknown no-breaker fixture kind: {other}"),
+            }
+            let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+            assert!(!breaker_path.exists(), "fixture must have no durable breaker state");
+            let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+            let entries_before = directory_entry_names_for_cli_open_test(dir.path());
+
+            // Occupy only the in-process admission controller. If the normal
+            // CLI path attempts a writable live open before its preflight
+            // admission, that open can consume/rewrite the planted family. The
+            // fixed path is refused first and leaves exact bytes/names intact.
+            let held_admission = mcp_agent_mail_db::pool::recovery_admission()
+                .try_acquire(&db_path)
+                .expect("occupy recovery admission controller");
+            let error = open_db_sync_with_database_url_and_storage_root(
+                &db_url,
+                Some(dir.path()),
+            )
+            .expect_err("occupied admission must refuse unhealthy normal CLI open");
+            assert!(
+                error.to_string().contains("already in progress"),
+                "unexpected no-breaker {family_kind} refusal: {error}"
+            );
+            drop(held_admission);
+
+            assert_eq!(
+                sqlite_family_bytes_for_cli_open_test(&db_path),
+                family_before,
+                "no-breaker {family_kind} refusal must precede every writable live-family open"
+            );
+            assert!(
+                !breaker_path.exists(),
+                "controller refusal must not arm durable breaker state"
+            );
+            let entries_after = directory_entry_names_for_cli_open_test(dir.path());
+            let allowed_new_entries = BTreeSet::from([
+                std::ffi::OsString::from(".mailbox.activity.lock"),
+                std::ffi::OsString::from(format!(
+                    "{}.activity.lock",
+                    db_path.file_name().expect("database filename").to_string_lossy()
+                )),
+                mcp_agent_mail_db::recovery_breaker::breaker_lock_path(&db_path)
+                    .file_name()
+                    .expect("breaker lock filename")
+                    .to_os_string(),
+            ]);
+            let unexpected_new_entries = entries_after
+                .difference(&entries_before)
+                .filter(|entry| !allowed_new_entries.contains(*entry))
+                .collect::<Vec<_>>();
+            assert!(
+                unexpected_new_entries.is_empty(),
+                "no-breaker {family_kind} refusal created staging/forensic artifacts: {unexpected_new_entries:?}"
+            );
+            assert!(entries_before.is_subset(&entries_after));
+            mcp_agent_mail_db::pool::recovery_admission().reset();
+        }
+    }
+
+    #[test]
     fn open_db_sync_breaker_refusal_precedes_live_open_and_recovery_artifacts() {
         for family_kind in ["corrupt-primary", "truncated-wal", "missing-primary"] {
             for breaker_kind in ["malformed", "tripped"] {
@@ -67584,6 +67667,11 @@ startup_timeout_sec = 42
                     .expect("query marker");
                 let marker: String = rows.first().unwrap().get_named("value").unwrap();
                 assert_eq!(marker, "from-backup", "should restore from .bak backup");
+                let breaker = mcp_agent_mail_db::recovery_breaker::load(&db_path)
+                    .expect("load post-recovery breaker state")
+                    .expect("allowed recovery must publish cleared breaker authority");
+                assert_eq!(breaker.consecutive_failures, 0);
+                assert!(!breaker.tripped);
             },
         );
     }

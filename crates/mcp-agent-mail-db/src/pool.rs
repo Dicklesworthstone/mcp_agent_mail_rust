@@ -21928,6 +21928,41 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_sidecar_cleanup_refuses_nonempty_journal_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("checkpoint-live-journal.db");
+        let journal = sqlite_sidecar_path(&primary, "-journal");
+        let shm = sqlite_sidecar_path(&primary, "-shm");
+        std::fs::write(&primary, b"primary authority").expect("write primary");
+        std::fs::write(&journal, b"possible live transaction")
+            .expect("write rollback journal fixture");
+        std::fs::write(&shm, b"coordination-shm").expect("write SHM fixture");
+        let names_before = std::fs::read_dir(dir.path())
+            .expect("list fixture before refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let error = quarantine_sqlite_sidecars_after_checkpoint(&primary)
+            .expect_err("checkpoint cleanup must not detach a nonempty rollback journal");
+
+        assert!(
+            error.to_string().contains("non-empty rollback journal"),
+            "unexpected journal refusal: {error}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"primary authority");
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            b"possible live transaction"
+        );
+        assert_eq!(std::fs::read(&shm).unwrap(), b"coordination-shm");
+        let names_after = std::fs::read_dir(dir.path())
+            .expect("list fixture after refusal")
+            .map(|entry| entry.expect("read fixture entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names_after, names_before);
+    }
+
+    #[test]
     fn checkpoint_sidecar_cleanup_refuses_raced_in_wal_generation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("checkpoint-race.db");
