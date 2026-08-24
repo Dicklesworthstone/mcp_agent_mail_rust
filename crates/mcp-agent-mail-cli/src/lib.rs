@@ -1191,7 +1191,8 @@ pub enum SetupCommand {
     /// Auto-detect agents and write MCP config files (default subcommand).
     #[command(name = "run")]
     Run {
-        /// Target specific agents (comma-separated: claude,codex,cursor,gemini,omp).
+        /// Target agents as comma-separated canonical slugs (for example:
+        /// claude,codex,cursor,gemini,omp; `setup status` lists every platform).
         #[arg(long)]
         agent: Option<String>,
         /// Preview changes without writing files.
@@ -1237,7 +1238,8 @@ pub enum SetupCommand {
         /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Target specific agents (comma-separated: claude,codex,cursor,gemini,omp).
+        /// Target agents as comma-separated canonical slugs (for example:
+        /// claude,codex,cursor,gemini,omp; `setup status` lists every platform).
         #[arg(long)]
         agent: Option<String>,
         /// Expected bearer token for header drift checks.
@@ -7764,6 +7766,8 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         token: resolved_token.clone(),
         project_dir: project_dir.clone(),
         home_dir_override: None,
+        omp_user_config_path_override: setup::omp_config_paths_from_env()
+            .map(|paths| paths.user_mcp_config),
         agents: Some(target_agents.clone()),
         dry_run: false,
         skip_user_config: existing_cache
@@ -14437,6 +14441,8 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 token: resolved_token.clone(),
                 project_dir: pdir.clone(),
                 home_dir_override: None,
+                omp_user_config_path_override: setup::omp_config_paths_from_env()
+                    .map(|paths| paths.user_mcp_config),
                 agents: Some(target_agents),
                 dry_run,
                 skip_user_config: no_user_config,
@@ -14522,6 +14528,8 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 project_dir: pdir,
                 token: resolved_token,
                 agents,
+                omp_user_config_path_override: setup::omp_config_paths_from_env()
+                    .map(|paths| paths.user_mcp_config),
                 skip_user_config: no_user_config,
                 skip_hooks: no_hooks,
                 ..Default::default()

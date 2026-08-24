@@ -2700,6 +2700,12 @@ detect_mcp_configs() {
   local path
   local key
   local exists_flag
+  local omp_config_name
+  local omp_config_root
+  local omp_profile
+  local omp_profile_base
+  local profile_dir
+  local profile_name
   local -a candidates=()
 
   if [ -n "$home_dir" ]; then
@@ -2726,10 +2732,50 @@ detect_mcp_configs() {
     candidates+=("gemini|${home_dir}/.gemini/settings.json")
     candidates+=("gemini|${home_dir}/.gemini/mcp.json")
 
-    # Oh My Pi (OMP), default profile. Named profiles use project-local
-    # `.omp/mcp.json`, which applies across every profile.
-    candidates+=("omp|${home_dir}/.omp/agent/mcp.json")
-    candidates+=("omp|${home_dir}/.omp/agent/.mcp.json")
+    # Oh My Pi (OMP). Match its v18 directory resolver: OMP_PROFILE wins over
+    # PI_PROFILE, PI_CONFIG_DIR replaces `.omp`, and PI_CODING_AGENT_DIR only
+    # applies to the default profile. Also inspect every existing named profile
+    # so an installer run repairs configs that are not currently active.
+    omp_config_name="${PI_CONFIG_DIR:-.omp}"
+    while [ "${omp_config_name#/}" != "$omp_config_name" ]; do
+      omp_config_name="${omp_config_name#/}"
+    done
+    omp_config_root="${home_dir}/${omp_config_name}"
+    omp_profile=""
+    if [ "${OMP_PROFILE+x}" = "x" ]; then
+      omp_profile="${OMP_PROFILE}"
+    elif [ "${PI_PROFILE+x}" = "x" ]; then
+      omp_profile="${PI_PROFILE}"
+    fi
+    omp_profile="${omp_profile#"${omp_profile%%[![:space:]]*}"}"
+    omp_profile="${omp_profile%"${omp_profile##*[![:space:]]}"}"
+    omp_profile_base="${omp_profile%%.*}"
+    if [ -n "$omp_profile" ] \
+      && [ "$omp_profile" != "default" ] \
+      && printf '%s\n' "$omp_profile" | LC_ALL=C grep -Eq '^[[:alnum:]][[:alnum:]._-]{0,63}$' \
+      && ! printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' \
+      && [ "${omp_profile%.}" = "$omp_profile" ]; then
+      candidates+=("omp|${omp_config_root}/profiles/${omp_profile}/agent/mcp.json")
+      candidates+=("omp|${omp_config_root}/profiles/${omp_profile}/agent/.mcp.json")
+    elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+      candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
+      candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
+    fi
+    candidates+=("omp|${omp_config_root}/agent/mcp.json")
+    candidates+=("omp|${omp_config_root}/agent/.mcp.json")
+    for profile_dir in "${omp_config_root}/profiles"/*; do
+      if [ ! -d "$profile_dir" ] || [ -L "$profile_dir" ]; then
+        continue
+      fi
+      profile_name="${profile_dir##*/}"
+      [ "$profile_name" != "default" ] || continue
+      omp_profile_base="${profile_name%%.*}"
+      printf '%s\n' "$profile_name" | LC_ALL=C grep -Eq '^[[:alnum:]][[:alnum:]._-]{0,63}$' || continue
+      printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' && continue
+      [ "${profile_name%.}" = "$profile_name" ] || continue
+      candidates+=("omp|${profile_dir}/agent/mcp.json")
+      candidates+=("omp|${profile_dir}/agent/.mcp.json")
+    done
 
     # GitHub Copilot / VS Code settings
     candidates+=("github-copilot|${home_dir}/.config/Code/User/settings.json")
@@ -2763,6 +2809,15 @@ detect_mcp_configs() {
   if [ -d "${project_dir}/.omp" ]; then
     candidates+=("omp|${project_dir}/.omp/mcp.json")
     candidates+=("omp|${project_dir}/.omp/.mcp.json")
+  fi
+  # OMP also imports standalone project-root fallbacks. Only advertise them
+  # when already present so the installer's fresh-config heuristic cannot
+  # create a generic `mcp.json` in an unrelated checkout.
+  if [ -e "${project_dir}/mcp.json" ]; then
+    candidates+=("omp|${project_dir}/mcp.json")
+  fi
+  if [ -e "${project_dir}/.mcp.json" ]; then
+    candidates+=("omp|${project_dir}/.mcp.json")
   fi
   candidates+=("github-copilot|${project_dir}/.vscode/mcp.json")
   candidates+=("windsurf|${project_dir}/windsurf.mcp.json")
@@ -3565,7 +3620,7 @@ TOMLEOF
   return 0
 }
 
-setup_single_codex_json_config() {
+setup_single_standard_http_json_config() {
   local tool="$1"
   local config_path="$2"
   local desired_url
@@ -3579,7 +3634,7 @@ setup_single_codex_json_config() {
   fi
 
   if ! command -v python3 >/dev/null 2>&1; then
-    verbose "setup_codex_json:skip_no_python3 tool=${tool} path=${config_path}"
+    verbose "setup_standard_http_json:skip_no_python3 tool=${tool} path=${config_path}"
     return 2
   fi
 
@@ -3698,19 +3753,19 @@ PY
 
   case "$result" in
     SKIP:unchanged)
-      verbose "setup_codex_json:unchanged tool=${tool} path=${config_path}"
+      verbose "setup_standard_http_json:unchanged tool=${tool} path=${config_path}"
       return 1
       ;;
     OK:*)
-      verbose "setup_codex_json:configured tool=${tool} path=${config_path} ${result}"
+      verbose "setup_standard_http_json:configured tool=${tool} path=${config_path} ${result}"
       return 0
       ;;
     ERROR:*)
-      verbose "setup_codex_json:error tool=${tool} path=${config_path} ${result}"
+      verbose "setup_standard_http_json:error tool=${tool} path=${config_path} ${result}"
       return 2
       ;;
     *)
-      verbose "setup_codex_json:unknown_result tool=${tool} path=${config_path} ${result}"
+      verbose "setup_standard_http_json:unknown_result tool=${tool} path=${config_path} ${result}"
       return 2
       ;;
   esac
@@ -3900,10 +3955,14 @@ setup_single_mcp_config() {
       ;;
   esac
 
-  if [ "$tool" = "codex" ]; then
-    setup_single_codex_json_config "$tool" "$config_path"
-    return $?
-  fi
+  case "$tool" in
+    codex|omp)
+      # Both clients consume the standard `mcpServers` HTTP shape. OMP cannot
+      # use the legacy stdio entry emitted by the generic fallback below.
+      setup_single_standard_http_json_config "$tool" "$config_path"
+      return $?
+      ;;
+  esac
 
   if [ "$tool" = "opencode" ]; then
     setup_single_opencode_json_config "$tool" "$config_path"
@@ -4139,10 +4198,15 @@ setup_mcp_configs() {
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" != "1" ] && continue
 
-    # Skip if we already configured this tool
-    case "|${configured_tools}|" in
-      *"|${tool}|"*) continue ;;
-    esac
+    # Most tools have one authoritative config, but OMP can have multiple
+    # existing named-profile configs. Refresh every existing OMP file; the
+    # second pass still sees `omp` in configured_tools and will not proliferate
+    # new files across inactive profiles.
+    if [ "$tool" != "omp" ]; then
+      case "|${configured_tools}|" in
+        *"|${tool}|"*) continue ;;
+      esac
+    fi
 
     if setup_single_mcp_config "$tool" "$path" "$binary_path" "$bearer_token" "$storage_root"; then
       ok "[$tool] Configured MCP entry in $path"

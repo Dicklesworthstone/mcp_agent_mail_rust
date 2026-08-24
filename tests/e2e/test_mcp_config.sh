@@ -534,8 +534,18 @@ set -e
 
 e2e_assert_exit_code "OMP setup exits cleanly" "0" "$OMP_RC"
 
-OMP_PROJECT="$(cat "$OMP_PROJECT_CONFIG")"
-OMP_USER="$(cat "$OMP_USER_CONFIG")"
+if [ -f "$OMP_PROJECT_CONFIG" ]; then
+    OMP_PROJECT="$(cat "$OMP_PROJECT_CONFIG")"
+else
+    e2e_fail "OMP project config creation" "$OMP_PROJECT_CONFIG" "missing"
+    OMP_PROJECT='{}'
+fi
+if [ -f "$OMP_USER_CONFIG" ]; then
+    OMP_USER="$(cat "$OMP_USER_CONFIG")"
+else
+    e2e_fail "OMP user config creation" "$OMP_USER_CONFIG" "missing"
+    OMP_USER='{}'
+fi
 e2e_save_artifact "case_13_omp_project.json" "$OMP_PROJECT"
 e2e_save_artifact "case_13_omp_user.json" "$OMP_USER"
 
@@ -551,7 +561,7 @@ else
     e2e_fail "OMP sibling server preservation" "unchanged" "modified or missing"
 fi
 
-if json_get "$OMP_USER" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['headers']['Authorization']=='Bearer omp-token-789'"; then
+if json_get "$OMP_USER" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-token-789'"; then
     e2e_pass "OMP default-profile user config uses native HTTP shape"
 else
     e2e_fail "OMP user config shape" "native authenticated HTTP entry" "missing or malformed"
@@ -561,6 +571,34 @@ if grep -Fxq '.omp/mcp.json' "${FAKE_PROJECT}/.gitignore"; then
     e2e_pass "OMP project config is protected by .gitignore"
 else
     e2e_fail "OMP project config gitignore" ".omp/mcp.json" "missing"
+fi
+
+# ===========================================================================
+# Case 14: OMP active named profile and custom config root
+# ===========================================================================
+e2e_case_banner "OMP active named profile and custom config root"
+
+OMP_PROFILE_CONFIG="${FAKE_HOME}/custom-omp/profiles/Work/agent/mcp.json"
+set +e
+OMP_PROFILE=Work PI_CONFIG_DIR=custom-omp \
+    run_am setup run --agent omp --yes --no-hooks --project-dir "$FAKE_PROJECT" \
+    --token omp-profile-token >/dev/null 2>&1
+OMP_PROFILE_RC=$?
+set -e
+
+e2e_assert_exit_code "OMP named-profile setup exits cleanly" "0" "$OMP_PROFILE_RC"
+if [ -f "$OMP_PROFILE_CONFIG" ]; then
+    OMP_PROFILE_DOC="$(cat "$OMP_PROFILE_CONFIG")"
+else
+    e2e_fail "OMP active profile config creation" "$OMP_PROFILE_CONFIG" "missing"
+    OMP_PROFILE_DOC='{}'
+fi
+e2e_save_artifact "case_14_omp_named_profile.json" "$OMP_PROFILE_DOC"
+
+if json_get "$OMP_PROFILE_DOC" "entry=d['mcpServers']['mcp-agent-mail']; assert entry['type']=='http' and entry['url']=='http://127.0.0.1:8765/mcp/' and entry['headers']['Authorization']=='Bearer omp-profile-token'"; then
+    e2e_pass "OMP setup targets the active named profile under PI_CONFIG_DIR"
+else
+    e2e_fail "OMP named-profile config shape" "native authenticated HTTP entry" "missing or malformed"
 fi
 
 # ===========================================================================

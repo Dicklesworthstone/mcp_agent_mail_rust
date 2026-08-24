@@ -63,6 +63,10 @@ pub struct McpConfigDetectParams {
     pub project_dir: Option<PathBuf>,
     /// `%APPDATA%`-style directory for Windows layouts.
     pub app_data_dir: Option<PathBuf>,
+    /// OMP config root selected by `PI_CONFIG_DIR` (normally `~/.omp`).
+    pub omp_config_root: Option<PathBuf>,
+    /// Active OMP profile's user-level `mcp.json` path.
+    pub omp_user_mcp_config: Option<PathBuf>,
 }
 
 /// Detect known MCP config locations across supported coding-agent tools.
@@ -81,7 +85,17 @@ pub fn detect_mcp_config_locations(params: &McpConfigDetectParams) -> Vec<McpCon
     let mut seen: HashSet<(McpConfigTool, PathBuf)> = HashSet::new();
 
     if let Some(home) = home_dir.as_ref() {
-        add_home_candidates(&mut candidates, &mut seen, home);
+        let default_omp_root = home.join(".omp");
+        let omp_root = params
+            .omp_config_root
+            .as_deref()
+            .unwrap_or(&default_omp_root);
+        let default_omp_user_config = omp_root.join("agent").join("mcp.json");
+        let omp_user_config = params
+            .omp_user_mcp_config
+            .as_deref()
+            .unwrap_or(&default_omp_user_config);
+        add_home_candidates(&mut candidates, &mut seen, home, omp_root, omp_user_config);
     }
 
     if let Some(app_data) = params.app_data_dir.as_ref() {
@@ -110,8 +124,11 @@ pub fn detect_mcp_config_locations(params: &McpConfigDetectParams) -> Vec<McpCon
 /// Detect known MCP config locations using ambient runtime paths.
 #[must_use]
 pub fn detect_mcp_config_locations_default() -> Vec<McpConfigLocation> {
+    let omp_paths = crate::setup::omp_config_paths_from_env();
     let params = McpConfigDetectParams {
         app_data_dir: std::env::var_os("APPDATA").map(PathBuf::from),
+        omp_config_root: omp_paths.as_ref().map(|paths| paths.config_root.clone()),
+        omp_user_mcp_config: omp_paths.map(|paths| paths.user_mcp_config),
         ..McpConfigDetectParams::default()
     };
     detect_mcp_config_locations(&params)
@@ -520,12 +537,14 @@ fn add_home_candidates(
     out: &mut Vec<(McpConfigTool, PathBuf)>,
     seen: &mut HashSet<(McpConfigTool, PathBuf)>,
     home: &Path,
+    omp_config_root: &Path,
+    omp_user_config: &Path,
 ) {
     add_home_claude_candidates(out, seen, home);
     add_home_codex_candidates(out, seen, home);
     add_home_cursor_candidates(out, seen, home);
     add_home_gemini_candidates(out, seen, home);
-    add_home_omp_candidates(out, seen, home);
+    add_home_omp_candidates(out, seen, omp_config_root, omp_user_config);
     add_home_github_copilot_candidates(out, seen, home);
     add_home_other_tool_candidates(out, seen, home);
 }
@@ -644,11 +663,45 @@ fn add_home_gemini_candidates(
 fn add_home_omp_candidates(
     out: &mut Vec<(McpConfigTool, PathBuf)>,
     seen: &mut HashSet<(McpConfigTool, PathBuf)>,
-    home: &Path,
+    config_root: &Path,
+    active_user_config: &Path,
 ) {
-    let agent_dir = home.join(".omp").join("agent");
-    push_candidate(out, seen, McpConfigTool::Omp, agent_dir.join("mcp.json"));
-    push_candidate(out, seen, McpConfigTool::Omp, agent_dir.join(".mcp.json"));
+    add_omp_agent_candidates(out, seen, active_user_config);
+    add_omp_agent_candidates(out, seen, &config_root.join("agent").join("mcp.json"));
+
+    let profiles_root = config_root.join("profiles");
+    let mut profile_dirs = std::fs::read_dir(&profiles_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(crate::setup::normalize_omp_profile_name)
+                .is_some()
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    profile_dirs.sort();
+    for profile_dir in profile_dirs {
+        add_omp_agent_candidates(out, seen, &profile_dir.join("agent").join("mcp.json"));
+    }
+}
+
+fn add_omp_agent_candidates(
+    out: &mut Vec<(McpConfigTool, PathBuf)>,
+    seen: &mut HashSet<(McpConfigTool, PathBuf)>,
+    primary_config: &Path,
+) {
+    push_candidate(out, seen, McpConfigTool::Omp, primary_config.to_path_buf());
+    push_candidate(
+        out,
+        seen,
+        McpConfigTool::Omp,
+        primary_config.with_file_name(".mcp.json"),
+    );
 }
 
 fn add_home_github_copilot_candidates(
@@ -795,6 +848,8 @@ fn add_project_candidates(
         McpConfigTool::Omp,
         project_dir.join(".omp").join(".mcp.json"),
     );
+    push_candidate(out, seen, McpConfigTool::Omp, project_dir.join("mcp.json"));
+    push_candidate(out, seen, McpConfigTool::Omp, project_dir.join(".mcp.json"));
     push_candidate(
         out,
         seen,
@@ -1049,11 +1104,14 @@ mod tests {
         std::fs::create_dir_all(&home).expect("create home");
         std::fs::create_dir_all(&project).expect("create project");
         std::fs::create_dir_all(&appdata).expect("create appdata");
+        std::fs::create_dir_all(home.join(".omp/profiles/work/agent"))
+            .expect("create named OMP profile");
 
         let locations = detect_mcp_config_locations(&McpConfigDetectParams {
             home_dir: Some(home.clone()),
             project_dir: Some(project.clone()),
             app_data_dir: Some(appdata.clone()),
+            ..McpConfigDetectParams::default()
         });
 
         assert!(
@@ -1138,6 +1196,18 @@ mod tests {
         assert!(
             contains_location(
                 &locations,
+                McpConfigTool::Omp,
+                &home.join(".omp/profiles/work/agent/mcp.json")
+            ),
+            "expected OMP named-profile config path"
+        );
+        assert!(
+            contains_location(&locations, McpConfigTool::Omp, &project.join("mcp.json")),
+            "expected OMP project-root fallback config path"
+        );
+        assert!(
+            contains_location(
+                &locations,
                 McpConfigTool::GithubCopilot,
                 &project.join(".vscode").join("mcp.json")
             ),
@@ -1159,6 +1229,7 @@ mod tests {
             home_dir: Some(home.clone()),
             project_dir: Some(project),
             app_data_dir: None,
+            ..McpConfigDetectParams::default()
         });
 
         let codex = locations
@@ -1187,6 +1258,46 @@ mod tests {
     }
 
     #[test]
+    fn detect_locations_honor_resolved_omp_root_and_active_profile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let omp_root = home.join("custom-omp");
+        let active_config = omp_root.join("profiles/Work/agent/mcp.json");
+        std::fs::create_dir_all(active_config.parent().expect("active profile parent"))
+            .expect("create active profile");
+        std::fs::write(&active_config, "{}").expect("write active profile config");
+
+        let locations = detect_mcp_config_locations(&McpConfigDetectParams {
+            home_dir: Some(home),
+            project_dir: Some(project),
+            omp_config_root: Some(omp_root.clone()),
+            omp_user_mcp_config: Some(active_config.clone()),
+            ..McpConfigDetectParams::default()
+        });
+
+        assert!(contains_location(
+            &locations,
+            McpConfigTool::Omp,
+            &active_config
+        ));
+        assert!(contains_location(
+            &locations,
+            McpConfigTool::Omp,
+            &omp_root.join("agent/mcp.json")
+        ));
+        assert!(
+            locations
+                .iter()
+                .find(|entry| {
+                    entry.tool == McpConfigTool::Omp && entry.config_path == active_config
+                })
+                .is_some_and(|entry| entry.exists),
+            "the active OMP profile candidate should report its live existence"
+        );
+    }
+
+    #[test]
     fn detect_locations_deduplicate_same_tool_and_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
@@ -1198,6 +1309,7 @@ mod tests {
             home_dir: Some(home.clone()),
             project_dir: Some(tmp.path().join("project")),
             app_data_dir: Some(appdata),
+            ..McpConfigDetectParams::default()
         });
 
         let target = home

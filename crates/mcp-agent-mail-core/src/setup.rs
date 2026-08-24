@@ -181,6 +181,110 @@ pub fn parse_agent_list(input: &str) -> Result<Vec<AgentPlatform>, SetupError> {
     Ok(out)
 }
 
+/// OMP configuration roots resolved with the same profile and directory
+/// precedence as the OMP v18 runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmpConfigPaths {
+    /// Root selected by `PI_CONFIG_DIR` (normally `~/.omp`).
+    pub config_root: PathBuf,
+    /// Active profile's user-level `mcp.json` path.
+    pub user_mcp_config: PathBuf,
+}
+
+/// Resolve the active OMP user config path from the live process environment.
+///
+/// OMP gives `OMP_PROFILE` precedence over the legacy `PI_PROFILE`, ignores
+/// `PI_CODING_AGENT_DIR` for named profiles, and roots `PI_CONFIG_DIR` beneath
+/// the user's home directory. Invalid profile names fall back to the default
+/// profile, matching OMP's guarded module-load behavior.
+#[must_use]
+pub fn omp_config_paths_from_env() -> Option<OmpConfigPaths> {
+    let home = dirs::home_dir()?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let omp_profile =
+        std::env::var_os("OMP_PROFILE").map(|value| value.to_string_lossy().into_owned());
+    let pi_profile =
+        std::env::var_os("PI_PROFILE").map(|value| value.to_string_lossy().into_owned());
+    let config_dir =
+        std::env::var_os("PI_CONFIG_DIR").map(|value| value.to_string_lossy().into_owned());
+    let agent_dir =
+        std::env::var_os("PI_CODING_AGENT_DIR").map(|value| value.to_string_lossy().into_owned());
+
+    Some(resolve_omp_config_paths(
+        &home,
+        &cwd,
+        omp_profile.as_deref(),
+        pi_profile.as_deref(),
+        config_dir.as_deref(),
+        agent_dir.as_deref(),
+    ))
+}
+
+fn resolve_omp_config_paths(
+    home: &Path,
+    cwd: &Path,
+    omp_profile: Option<&str>,
+    pi_profile: Option<&str>,
+    config_dir: Option<&str>,
+    agent_dir_override: Option<&str>,
+) -> OmpConfigPaths {
+    let profile = match omp_profile {
+        Some(value) => normalize_omp_profile_name(value),
+        None => pi_profile.and_then(normalize_omp_profile_name),
+    };
+    let config_dir = config_dir
+        .filter(|value| !value.is_empty())
+        .unwrap_or(".omp")
+        .trim_start_matches(std::path::is_separator);
+    let config_root = home.join(config_dir);
+
+    let agent_dir = if let Some(profile) = profile {
+        config_root.join("profiles").join(profile).join("agent")
+    } else if let Some(override_path) = agent_dir_override.filter(|value| !value.is_empty()) {
+        let override_path = PathBuf::from(override_path);
+        if override_path.is_absolute() {
+            override_path
+        } else {
+            cwd.join(override_path)
+        }
+    } else {
+        config_root.join("agent")
+    };
+
+    OmpConfigPaths {
+        config_root,
+        user_mcp_config: agent_dir.join("mcp.json"),
+    }
+}
+
+pub(crate) fn normalize_omp_profile_name(profile: &str) -> Option<&str> {
+    let profile = profile.trim();
+    if profile.is_empty()
+        || profile == "default"
+        || profile == "."
+        || profile == ".."
+        || profile.ends_with('.')
+        || profile.len() > 64
+        || !profile
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        || !profile
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return None;
+    }
+
+    let base = profile.split('.').next().unwrap_or(profile);
+    let upper = base.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit());
+    (!reserved).then_some(profile)
+}
+
 // ---------------------------------------------------------------------------
 // Config types
 // ---------------------------------------------------------------------------
@@ -235,6 +339,10 @@ pub struct SetupParams {
     pub token: String,
     pub project_dir: PathBuf,
     pub home_dir_override: Option<PathBuf>,
+    /// Explicit OMP user `mcp.json` path. Production callers populate this
+    /// from [`omp_config_paths_from_env`] so named profiles and OMP directory
+    /// overrides target the same file the runtime loads.
+    pub omp_user_config_path_override: Option<PathBuf>,
     pub agents: Option<Vec<AgentPlatform>>,
     pub dry_run: bool,
     pub skip_user_config: bool,
@@ -252,6 +360,7 @@ impl Default for SetupParams {
             token: String::new(),
             project_dir: PathBuf::from("."),
             home_dir_override: None,
+            omp_user_config_path_override: None,
             agents: None,
             dry_run: false,
             skip_user_config: false,
@@ -1204,9 +1313,9 @@ impl AgentPlatform {
 
     /// OMP-native MCP config actions.
     ///
-    /// OMP loads project `.omp/mcp.json` before the active profile's user
+    /// OMP loads both project `.omp/mcp.json` and the active profile's user
     /// config. The project file is therefore the profile-independent setup
-    /// surface; the default-profile user file is also refreshed unless the
+    /// surface; the active-profile user file is also refreshed unless the
     /// caller requests project-local configuration only.
     fn omp_actions(
         self,
@@ -1227,8 +1336,11 @@ impl AgentPlatform {
         if !params.skip_user_config {
             actions.push(ConfigAction {
                 platform: self,
-                file_path: home.join(".omp").join("agent").join("mcp.json"),
-                description: "Oh My Pi (OMP) default-profile MCP config".into(),
+                file_path: params
+                    .omp_user_config_path_override
+                    .clone()
+                    .unwrap_or_else(|| home.join(".omp").join("agent").join("mcp.json")),
+                description: "Oh My Pi (OMP) active-profile MCP config".into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
@@ -3161,6 +3273,94 @@ mod tests {
     }
 
     #[test]
+    fn config_actions_omp_honors_resolved_active_profile_path() {
+        let active_profile_config =
+            PathBuf::from("/tmp/omp-home/.omp/profiles/Work/agent/mcp.json");
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            home_dir_override: Some(PathBuf::from("/tmp/omp-home")),
+            omp_user_config_path_override: Some(active_profile_config.clone()),
+            skip_user_config: false,
+            ..Default::default()
+        };
+
+        let actions = AgentPlatform::Omp.config_actions(&params);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[1].file_path, active_profile_config);
+        assert!(actions[1].description.contains("active-profile"));
+    }
+
+    #[test]
+    fn resolve_omp_config_paths_matches_v18_profile_precedence() {
+        let home = Path::new("/home/alice");
+        let cwd = Path::new("/work/repo");
+
+        let named = resolve_omp_config_paths(
+            home,
+            cwd,
+            Some(" Work "),
+            Some("legacy"),
+            Some(".custom-omp"),
+            Some("ignored-for-named-profile"),
+        );
+        assert_eq!(named.config_root, PathBuf::from("/home/alice/.custom-omp"));
+        assert_eq!(
+            named.user_mcp_config,
+            PathBuf::from("/home/alice/.custom-omp/profiles/Work/agent/mcp.json")
+        );
+
+        let explicit_default = resolve_omp_config_paths(
+            home,
+            cwd,
+            Some(""),
+            Some("legacy"),
+            None,
+            Some("relative-agent-dir"),
+        );
+        assert_eq!(
+            explicit_default.user_mcp_config,
+            PathBuf::from("/work/repo/relative-agent-dir/mcp.json"),
+            "an explicitly empty OMP_PROFILE selects default and must not fall through to PI_PROFILE"
+        );
+
+        let legacy = resolve_omp_config_paths(
+            home,
+            cwd,
+            None,
+            Some("legacy"),
+            None,
+            Some("ignored-for-named-profile"),
+        );
+        assert_eq!(
+            legacy.user_mcp_config,
+            PathBuf::from("/home/alice/.omp/profiles/legacy/agent/mcp.json")
+        );
+    }
+
+    #[test]
+    fn resolve_omp_config_paths_rejects_invalid_profiles_like_runtime_boot() {
+        let home = Path::new("/home/alice");
+        let cwd = Path::new("/work/repo");
+        for invalid in [
+            "default",
+            ".",
+            "..",
+            "bad profile",
+            "CON",
+            "LPT9.txt",
+            "bad.",
+        ] {
+            let paths = resolve_omp_config_paths(home, cwd, Some(invalid), None, None, None);
+            assert_eq!(
+                paths.user_mcp_config,
+                PathBuf::from("/home/alice/.omp/agent/mcp.json"),
+                "invalid profile {invalid:?} should fall back to default"
+            );
+        }
+    }
+
+    #[test]
     fn config_actions_antigravity_uses_http_url_and_gemini_config_path() {
         // bd-47kjh.7.2: agy reads ~/.gemini/config/mcp_config.json (verified by
         // stracing the live agy 1.0.7 binary), NOT ~/.gemini/settings.json.
@@ -3944,6 +4144,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert_eq!(params.token, "");
         assert_eq!(params.project_dir, PathBuf::from("."));
         assert!(params.home_dir_override.is_none());
+        assert!(params.omp_user_config_path_override.is_none());
         assert!(!params.dry_run);
         assert!(!params.skip_user_config);
         assert!(!params.skip_hooks);

@@ -1380,6 +1380,14 @@ fn default_mcp_config_candidates() -> Vec<PathBuf> {
         v.push(home.join(".factory.mcp.json"));
         v.push(home.join(".cline.mcp.json"));
     }
+    v.extend(
+        mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default()
+            .into_iter()
+            .filter(|location| location.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
+            .map(|location| location.config_path),
+    );
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|path| seen.insert(path.clone()));
     v
 }
 
@@ -3132,6 +3140,23 @@ mod tests {
         assert!(s.contains(".doctor"));
         // Storage root is conditional; XDG paths are conditional. Just assert
         // the per-repo scopes are always present.
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_include_omp_native_paths() {
+        let candidates = default_mcp_config_candidates();
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path.ends_with(".omp/agent/mcp.json")),
+            "doctor MCP failure modes must inspect OMP's default-profile config"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path.ends_with(".omp/mcp.json")),
+            "doctor MCP failure modes must inspect OMP's project-native config"
+        );
     }
 
     #[test]
