@@ -21531,7 +21531,14 @@ mod tests {
                 data,
             } => {
                 assert_eq!(resource_type, "identity");
-                assert_eq!(data["human_key"], project_ref.to_string_lossy().as_ref());
+                assert_eq!(
+                    data["human_key"],
+                    project_ref
+                        .canonicalize()
+                        .expect("canonicalize identity project")
+                        .to_string_lossy()
+                        .as_ref()
+                );
                 assert!(data["slug"].is_string());
             }
             other => panic!("unexpected identity result: {other:?}"),

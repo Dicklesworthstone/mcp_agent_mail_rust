@@ -9630,28 +9630,7 @@ fn path_is_real_directory(path: &Path) -> bool {
 /// alias name and its canonical destination so this exception cannot broaden
 /// to an arbitrary symlink.
 pub(crate) fn is_trusted_system_directory_alias(path: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let expected = if path == Path::new("/var") {
-            Some(Path::new("/private/var"))
-        } else if path == Path::new("/tmp") {
-            Some(Path::new("/private/tmp"))
-        } else if path == Path::new("/etc") {
-            Some(Path::new("/private/etc"))
-        } else {
-            None
-        };
-
-        return expected.is_some_and(|expected| {
-            std::fs::canonicalize(path).is_ok_and(|resolved| resolved == expected)
-        });
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        false
-    }
+    mcp_agent_mail_core::disk::is_trusted_system_directory_alias(path)
 }
 
 fn project_identity_matches_requested_path(
@@ -18786,13 +18765,24 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
         .is_some_and(|name| name == ".beads")
         && start.is_dir()
     {
-        return Ok(start);
+        return std::fs::canonicalize(&start).map_err(|e| {
+            CliError::InvalidArgument(format!(
+                "cannot resolve beads directory {}: {e}",
+                start.display()
+            ))
+        });
     }
 
-    beads_rust::config::discover_beads_dir(Some(&start)).map_err(|e| {
+    let beads_dir = beads_rust::config::discover_beads_dir(Some(&start)).map_err(|e| {
         CliError::InvalidArgument(format!(
             "no beads directory found from {}: {e}",
             start.display()
+        ))
+    })?;
+    std::fs::canonicalize(&beads_dir).map_err(|e| {
+        CliError::InvalidArgument(format!(
+            "cannot resolve beads directory {}: {e}",
+            beads_dir.display()
         ))
     })
 }
@@ -45500,7 +45490,7 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(backups[1], older);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn list_db_backups_supports_non_utf8_database_names() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -45552,7 +45542,7 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(candidates, vec![timestamped_bak]);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn doctor_salvage_artifact_candidates_support_non_utf8_database_names() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -45598,7 +45588,7 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn doctor_salvage_artifact_candidates_dedupe_preserves_distinct_non_utf8_paths() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -54631,7 +54621,14 @@ startup_timeout_sec = 42
         )
         .unwrap();
         assert_eq!(metadata["slug"], project_slug);
-        assert_eq!(metadata["human_key"], live_project.display().to_string());
+        assert_eq!(
+            metadata["human_key"],
+            live_project
+                .canonicalize()
+                .expect("canonicalize live project")
+                .display()
+                .to_string()
+        );
         assert!(
             metadata.get("human_key_source").is_none(),
             "exact filesystem recovery should not be tagged as synthetic"
@@ -56454,7 +56451,7 @@ startup_timeout_sec = 42
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn next_sqlite_quarantine_path_preserves_non_utf8_basename_and_skips_sidecar_collisions() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -63812,7 +63809,8 @@ startup_timeout_sec = 42
         )
         .expect("symlinked tempdir should resolve to its canonical directory");
 
-        assert_eq!(snapshot.path().parent(), Some(real_tmpdir.as_path()));
+        let canonical_tmpdir = real_tmpdir.canonicalize().expect("canonicalize tempdir");
+        assert_eq!(snapshot.path().parent(), Some(canonical_tmpdir.as_path()));
         assert!(snapshot.path().is_dir());
     }
 
@@ -64407,6 +64405,13 @@ startup_timeout_sec = 42
             .join("caserepo")
             .display()
             .to_string();
+
+        if std::fs::canonicalize(&lookup_key).ok().as_deref() == Some(project_path.as_path()) {
+            // This check is meaningful only on a case-sensitive filesystem.
+            // Default macOS volumes resolve both spellings to the same object,
+            // so they are correctly the same project identity.
+            return;
+        }
 
         let identity = resolve_project_identity(&project_key);
         let lookup_identity = resolve_project_identity(&lookup_key);
@@ -84469,7 +84474,7 @@ fn resolve_deploy_tooling_repo_root_uses_bundle_ancestors_instead_of_cwd() {
     std::fs::write(dir.path().join(".git"), "not a gitfile\n").unwrap();
 
     let resolved = resolve_deploy_tooling_repo_root(&bundle).unwrap();
-    assert_eq!(resolved, repo_root);
+    assert_eq!(resolved, repo_root.canonicalize().unwrap());
 }
 #[test]
 fn resolve_deploy_tooling_repo_root_does_not_fall_back_to_unrelated_cwd_repo() {
@@ -84521,7 +84526,7 @@ fn resolve_deploy_tooling_repo_root_does_not_fall_back_to_unrelated_cwd_repo() {
 
     let _cwd = LocalCwdGuard::chdir(cwd_repo.path());
     let resolved = resolve_deploy_tooling_repo_root(&bundle).unwrap();
-    assert_eq!(resolved, bundle_parent);
+    assert_eq!(resolved, bundle_parent.canonicalize().unwrap());
 }
 
 #[test]
