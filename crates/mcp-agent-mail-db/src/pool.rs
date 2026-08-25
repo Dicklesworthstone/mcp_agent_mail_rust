@@ -16828,6 +16828,20 @@ mod tests {
                 ..Default::default()
             })
             .expect("freeze missing-leaf SQLite authority");
+            let unopened_storage_root = alias.with_file_name("archive-unopened");
+            let storage_authority_db = alias.with_file_name("storage-authority.sqlite3");
+            assert!(!unopened_storage_root.exists());
+            assert!(!storage_authority_db.exists());
+            let unopened_storage_pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", storage_authority_db.display()),
+                storage_root: Some(unopened_storage_root.clone()),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("freeze missing-leaf storage-root authority");
 
             let pool_a = get_or_create_pool(&config).expect("construct symlink-to-A pool");
             let identity_a = std::fs::canonicalize(&db_a).expect("canonical database A");
@@ -16871,6 +16885,26 @@ mod tests {
                         .contains("refusing to cross database authority")
                 }),
                 "a symlink inserted after construction must fail closed before the lazy open"
+            );
+            symlink(
+                db_b.parent().expect("database B has a parent"),
+                &unopened_storage_root,
+            )
+            .expect("replace missing storage root with foreign symlink");
+            let late_storage_open = runtime.block_on(async {
+                unopened_storage_pool.acquire(&cx).await.into_result()
+            });
+            assert!(
+                late_storage_open.is_err_and(|error| {
+                    error
+                        .to_string()
+                        .contains("refusing to cross archive authority")
+                }),
+                "a storage-root symlink inserted after construction must fail before pool init"
+            );
+            assert!(
+                !storage_authority_db.exists(),
+                "storage authority rejection must precede SQLite creation and archive init"
             );
 
             retire_cached_runtime_state_after_recovery(&identity_b, "symlink authority test");
