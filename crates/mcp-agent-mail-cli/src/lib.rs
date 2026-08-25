@@ -8269,13 +8269,18 @@ fn collect_setup_self_heal_file_fingerprints(
 ) -> Vec<SetupSelfHealFileFingerprint> {
     use mcp_agent_mail_core::setup::ConfigContent;
 
-    let mut paths = std::collections::BTreeSet::new();
+    // Preserve precedence order. In particular, sorting `PI_CONFIG_FILES`
+    // overlays would let the same path/byte set full-match after an order swap
+    // even though OMP's last-overlay-wins result changed.
+    let mut paths = Vec::new();
     for platform in target_agents {
         for action in platform.config_actions(params) {
             if matches!(action.content, ConfigContent::HooksMerge { .. }) {
                 continue;
             }
-            paths.insert(action.file_path);
+            if !paths.contains(&action.file_path) {
+                paths.push(action.file_path);
+            }
         }
     }
     if params.skip_user_config
@@ -8285,12 +8290,15 @@ fn collect_setup_self_heal_file_fingerprints(
         // but OMP's global disabledServers list still governs project entries.
         // Fingerprint that read-only authority so the cache cannot bypass a
         // status check after it changes.
-        paths.insert(mcp_agent_mail_core::setup::omp_active_user_config_path(
-            params,
-        ));
-        paths.extend(mcp_agent_mail_core::setup::omp_settings_authority_paths(
-            params,
-        ));
+        let user_config = mcp_agent_mail_core::setup::omp_active_user_config_path(params);
+        if !paths.contains(&user_config) {
+            paths.push(user_config);
+        }
+        for settings_path in mcp_agent_mail_core::setup::omp_settings_authority_paths(params) {
+            if !paths.contains(&settings_path) {
+                paths.push(settings_path);
+            }
+        }
     }
 
     paths
@@ -43907,6 +43915,64 @@ http_headers = { Authorization = "Bearer secret" }
         second_user.modified_micros = first_user.modified_micros;
         assert_ne!(first_user.content_sha256, second_user.content_sha256);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn setup_self_heal_fingerprint_preserves_omp_overlay_precedence_order() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, ConfigDriftReason, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let home_dir = temp.path().join("home");
+        let project_mcp = project_dir.join(".omp/mcp.json");
+        let first_overlay = temp.path().join("first.yml");
+        let second_overlay = temp.path().join("second.yml");
+        std::fs::create_dir_all(project_mcp.parent().expect("project MCP parent"))
+            .expect("create project MCP parent");
+        std::fs::create_dir_all(&home_dir).expect("create home fixture");
+        std::fs::write(
+            &project_mcp,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","enabled":true}}}"#,
+        )
+        .expect("write project MCP config");
+        std::fs::write(&first_overlay, "mcp:\n  enableProjectConfig: false\n")
+            .expect("write disabling overlay");
+        std::fs::write(&second_overlay, "mcp:\n  enableProjectConfig: true\n")
+            .expect("write enabling overlay");
+        let mut params = SetupParams {
+            project_dir,
+            home_dir_override: Some(home_dir),
+            omp_settings_overlay_paths: vec![first_overlay.clone(), second_overlay.clone()],
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+
+        let healthy_status = mcp_agent_mail_core::setup::check_status(&params);
+        assert!(setup_status_drift_summaries(&healthy_status, None).is_empty());
+        let healthy = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+
+        params.omp_settings_overlay_paths = vec![second_overlay, first_overlay];
+        let disabled_status = mcp_agent_mail_core::setup::check_status(&params);
+        assert_eq!(
+            disabled_status[0].config_files[0].primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled
+        );
+        let disabled = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+
+        let mut healthy_sorted = healthy.clone();
+        healthy_sorted.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut disabled_sorted = disabled.clone();
+        disabled_sorted.sort_by(|left, right| left.path.cmp(&right.path));
+        assert_eq!(
+            healthy_sorted, disabled_sorted,
+            "the path and byte set is deliberately unchanged"
+        );
+        assert_ne!(
+            healthy, disabled,
+            "ordered fingerprints must invalidate a healthy cache after overlay precedence flips"
+        );
     }
 
     #[test]

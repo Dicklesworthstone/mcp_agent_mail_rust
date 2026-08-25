@@ -1346,7 +1346,8 @@ pub fn omp_active_user_config_path(params: &SetupParams) -> PathBuf {
 }
 
 fn omp_active_user_settings_paths(params: &SetupParams) -> (PathBuf, PathBuf) {
-    let agent_dir = omp_active_user_config_path(params)
+    let user_config = omp_active_user_config_path(params);
+    let agent_dir = user_config
         .parent()
         .unwrap_or_else(|| Path::new("."));
     (agent_dir.join("config.yml"), agent_dir.join("config.yaml"))
