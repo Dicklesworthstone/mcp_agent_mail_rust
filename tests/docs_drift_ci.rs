@@ -251,3 +251,272 @@ mod container_release_contract {
         );
     }
 }
+
+mod dist_release_contract {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const CHECKOUT_ACTION: &str =
+        "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
+    const TOOLCHAIN_ACTION: &str =
+        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
+    const UPLOAD_ACTION: &str =
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
+    const DOWNLOAD_ACTION: &str =
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
+    const COSIGN_ACTION: &str =
+        "sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad";
+    const RELEASE_ACTION: &str =
+        "softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe";
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("conformance crate should have a workspace root")
+            .to_path_buf()
+    }
+
+    fn read_workflow() -> String {
+        let path = workspace_root().join(".github/workflows/dist.yml");
+        fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    }
+
+    fn require_exactly(text: &str, needle: &str, expected: usize) -> Result<(), String> {
+        let actual = text.matches(needle).count();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected {expected} occurrences of {needle:?}, found {actual}"
+            ))
+        }
+    }
+
+    fn require_once(text: &str, needle: &str) -> Result<(), String> {
+        require_exactly(text, needle, 1)
+    }
+
+    fn validate_action_pins(workflow: &str) -> Result<(), String> {
+        let mut action_count = 0;
+        for (line_index, line) in workflow.lines().enumerate() {
+            let trimmed = line.trim();
+            let Some(uses) = trimmed
+                .strip_prefix("- uses: ")
+                .or_else(|| trimmed.strip_prefix("uses: "))
+            else {
+                continue;
+            };
+            action_count += 1;
+            let Some((action, comment)) = uses.split_once(" # ") else {
+                return Err(format!(
+                    "action on line {} lacks a human-readable pin comment",
+                    line_index + 1
+                ));
+            };
+            let Some((_, revision)) = action.rsplit_once('@') else {
+                return Err(format!("action on line {} lacks a revision", line_index + 1));
+            };
+            if revision.len() != 40
+                || !revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(format!(
+                    "action on line {} is not pinned to a lowercase 40-hex commit",
+                    line_index + 1
+                ));
+            }
+            if comment.trim().is_empty() {
+                return Err(format!("action on line {} has an empty pin comment", line_index + 1));
+            }
+        }
+        if action_count != 12 {
+            return Err(format!("expected 12 pinned actions, found {action_count}"));
+        }
+        Ok(())
+    }
+
+    fn validate(workflow: &str) -> Result<(), String> {
+        validate_action_pins(workflow)?;
+
+        if workflow.contains("workflow_dispatch") {
+            return Err("dist publication must not be dispatchable from a branch".to_string());
+        }
+        if workflow.contains("continue-on-error") {
+            return Err("release gates must not continue after errors".to_string());
+        }
+
+        for (action, expected) in [
+            (CHECKOUT_ACTION, 5),
+            (TOOLCHAIN_ACTION, 3),
+            (UPLOAD_ACTION, 1),
+            (DOWNLOAD_ACTION, 1),
+            (COSIGN_ACTION, 1),
+            (RELEASE_ACTION, 1),
+        ] {
+            require_exactly(workflow, action, expected)?;
+        }
+
+        let required_once = [
+            "permissions:\n  contents: read",
+            "release_tag_pattern='^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'",
+            "[ \"$GITHUB_REF_VALUE\" != \"refs/tags/${REF_NAME}\" ]",
+            "git ls-remote origin \"refs/tags/${REF_NAME}^{}\"",
+            "[ \"$remote_revision\" != \"$revision\" ]",
+            "manifest[\"workspace\"][\"package\"][\"version\"]",
+            "toolchain[\"toolchain\"][\"channel\"]",
+            "tag_version=\"${REF_NAME#v}\"",
+            "[ \"$tag_version\" != \"$manifest_version\" ]",
+            "if [[ \"$tag_version\" == *-* ]]; then",
+            "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
+            "cargo check --locked --workspace --all-targets",
+            "cargo clippy --locked --workspace --all-targets -- -D warnings",
+            "cargo test --locked --workspace",
+            "cargo build --locked --release --target ${{ matrix.target }}",
+            "cli_version=\"$(staging/am --version)\"",
+            "server_version=\"$(staging/mcp-agent-mail --version)\"",
+            "$cliVersion -ne \"am $env:EXPECTED_VERSION\"",
+            "$serverVersion -ne \"mcp-agent-mail $env:EXPECTED_VERSION\"",
+            "mapfile -t sidecar_lines < \"${artifact}.sha256\"",
+            "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
+            "[ \"$sidecar_name\" != \"$artifact\" ]",
+            "[ \"${#sums_hashes[@]}\" -ne 1 ]",
+            "names != [\"am\", \"mcp-agent-mail\"]",
+            "names != [\"am.exe\", \"mcp-agent-mail.exe\"]",
+            "expected_bundle_files=(SHA256SUMS)",
+            "tag_name: ${{ needs.release_contract.outputs.tag }}",
+            "prerelease: ${{ needs.release_contract.outputs.prerelease }}",
+            "fail_on_unmatched_files: true",
+            "Release tag moved after preflight; refusing publication",
+        ];
+        for needle in required_once {
+            require_once(workflow, needle)?;
+        }
+
+        require_exactly(workflow, "contents: write", 1)?;
+        require_exactly(workflow, "id-token: write", 1)?;
+        require_exactly(
+            workflow,
+            "ref: ${{ needs.release_contract.outputs.revision }}",
+            4,
+        )?;
+        require_exactly(
+            workflow,
+            "toolchain: ${{ needs.release_contract.outputs.toolchain }}",
+            3,
+        )?;
+        require_exactly(workflow, "rustc --version --verbose", 3)?;
+        require_exactly(workflow, "cargo --version --verbose", 3)?;
+
+        for line in workflow.lines().map(str::trim) {
+            if ["cargo check ", "cargo clippy ", "cargo test ", "cargo build "]
+                .iter()
+                .any(|command| line.contains(command))
+                && !line.contains("--locked")
+            {
+                return Err(format!("release Cargo command is not locked: {line}"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mutate(workflow: &str, from: &str, to: &str) -> String {
+        let mutation = workflow.replacen(from, to, 1);
+        assert_ne!(mutation, workflow, "mutation source was absent: {from}");
+        mutation
+    }
+
+    #[test]
+    fn dist_workflow_is_tag_version_toolchain_and_artifact_bound() {
+        let workflow = read_workflow();
+        validate(&workflow).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn dist_contract_guard_rejects_causal_mutations() {
+        let workflow = read_workflow();
+        let mutations = [
+            mutate(&workflow, "on:\n  push:", "on:\n  workflow_dispatch:\n  push:"),
+            mutate(
+                &workflow,
+                "[ \"$GITHUB_REF_VALUE\" != \"refs/tags/${REF_NAME}\" ]",
+                "[ \"$GITHUB_REF_VALUE\" != \"refs/heads/${REF_NAME}\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$remote_revision\" != \"$revision\" ]",
+                "[ -z \"$remote_revision\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$tag_version\" != \"$manifest_version\" ]",
+                "[ -z \"$manifest_version\" ]",
+            ),
+            mutate(
+                &workflow,
+                "prerelease: ${{ needs.release_contract.outputs.prerelease }}",
+                "prerelease: false",
+            ),
+            mutate(
+                &workflow,
+                "cli_version=\"$(staging/am --version)\"",
+                "cli_version=\"$(staging/am --help)\"",
+            ),
+            mutate(
+                &workflow,
+                CHECKOUT_ACTION,
+                "actions/checkout@v4",
+            ),
+            mutate(
+                &workflow,
+                TOOLCHAIN_ACTION,
+                "dtolnay/rust-toolchain@nightly",
+            ),
+            mutate(
+                &workflow,
+                "cargo check --locked --workspace --all-targets",
+                "cargo check --workspace --all-targets",
+            ),
+            mutate(&workflow, "contents: read", "contents: write"),
+            mutate(
+                &workflow,
+                "[ \"$sidecar_name\" != \"$artifact\" ]",
+                "[ -z \"$sidecar_name\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
+                "[ \"${#sidecar_lines[@]}\" -eq 0 ]",
+            ),
+            mutate(
+                &workflow,
+                "names != [\"am\", \"mcp-agent-mail\"]",
+                "names != [\"mcp-agent-mail\"]",
+            ),
+            mutate(
+                &workflow,
+                "ref: ${{ needs.release_contract.outputs.revision }}",
+                "ref: ${{ github.sha }}",
+            ),
+            mutate(
+                &workflow,
+                "Release tag moved after preflight; refusing publication",
+                "Release tag check was skipped",
+            ),
+            mutate(
+                &workflow,
+                "tag_name: ${{ needs.release_contract.outputs.tag }}",
+                "tag_name: ${{ github.ref_name }}",
+            ),
+        ];
+        for mutation in mutations {
+            assert!(
+                validate(&mutation).is_err(),
+                "dist workflow contract mutation unexpectedly passed"
+            );
+        }
+    }
+}

@@ -14,12 +14,12 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --no-easy          Do not auto-update PATH, even for piped installs
-#   --verify           Run self-test after install
+#   --verify           Run an additional self-test after install
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --verbose          Enable detailed installer diagnostics
 #   --no-gum           Disable gum formatting even if available
-#   --no-verify        Skip checksum + signature verification (for testing only)
+#   --no-verify        UNSAFE: skip pre-extraction checksum + signature verification
 #   --offline          Skip network preflight checks
 #   --force            Force reinstall even if already at version
 #   --migrate          Force Python->Rust migration/displacement when Python install detected
@@ -50,13 +50,13 @@ FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
-COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/dist.yml@refs/tags/.*$}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+COSIGN_IDENTITY_RE='^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
+COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
 SYSTEM=0
 NO_GUM=0
-NO_CHECKSUM=0
+NO_VERIFY=0
 FORCE_INSTALL=0
 FORCE_MIGRATE=0
 FORCE_NO_MIGRATE=0
@@ -5956,7 +5956,8 @@ ensure_rust() {
   rustup component add rustfmt clippy || true
 }
 
-# Verify SHA256 checksum of a file
+# Verify the SHA256 checksum of a file. Verification is fail-closed: callers
+# must use --no-verify explicitly if this host cannot compute SHA256.
 verify_checksum() {
   local file="$1"
   local expected="$2"
@@ -5970,16 +5971,37 @@ verify_checksum() {
     return 1
   fi
 
-  if command -v sha256sum &>/dev/null; then
-    actual=$(sha256sum "$file" | cut -d' ' -f1)
-  elif command -v shasum &>/dev/null; then
-    actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
-  else
-    warn "No SHA256 tool found (sha256sum or shasum), skipping verification"
-    return 0
+  if ! [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    err "Invalid SHA256 checksum witness: expected exactly 64 hexadecimal characters."
+    err "Re-download the release checksum, or use --no-verify only for a trusted local artifact."
+    return 1
   fi
 
-  if [ "$actual" != "$expected" ]; then
+  if command -v sha256sum &>/dev/null; then
+    if ! actual=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1); then
+      err "sha256sum failed while hashing $file"
+      return 1
+    fi
+  elif command -v shasum &>/dev/null; then
+    if ! actual=$(shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1); then
+      err "shasum failed while hashing $file"
+      return 1
+    fi
+  else
+    err "No SHA256 implementation found (requires sha256sum or shasum)."
+    err "Install a SHA256 tool, or use --no-verify only for a trusted local artifact."
+    return 1
+  fi
+
+  if ! [[ "$actual" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    err "SHA256 implementation returned an invalid digest for $file"
+    return 1
+  fi
+
+  local expected_normalized actual_normalized
+  expected_normalized=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+  actual_normalized=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  if [ "$actual_normalized" != "$expected_normalized" ]; then
     verbose "verify_checksum:failed actual=${actual}"
     err "Checksum verification FAILED!"
     err "Expected: $expected"
@@ -5998,15 +6020,78 @@ verify_checksum() {
   return 0
 }
 
-# Verify Sigstore/cosign bundle for a file (best-effort)
+# Resolve an archive checksum witness and verify it before any extraction.
+resolve_and_verify_archive_checksum() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+  local expected_checksum="$CHECKSUM"
+  local checksum_file="$TMP/checksum.sha256"
+  local checksum_resolved=0
+
+  if [ -n "$expected_checksum" ]; then
+    checksum_resolved=1
+    verbose "checksum:using_explicit_value"
+  fi
+
+  # Strategy 1: an explicit checksum URL supplied by the caller.
+  if [ "$checksum_resolved" -eq 0 ] && [ -n "$CHECKSUM_URL" ]; then
+    info "Fetching checksum from ${CHECKSUM_URL}"
+    if download_to_file "$CHECKSUM_URL" "$checksum_file" "checksum-download" && [ -s "$checksum_file" ]; then
+      expected_checksum=$(awk '{print $1; exit}' "$checksum_file")
+      [ -n "$expected_checksum" ] && checksum_resolved=1
+    fi
+  fi
+
+  # Strategy 2: the consolidated release manifest.
+  if [ "$checksum_resolved" -eq 0 ]; then
+    local sha256sums_url sha256sums_file
+    sha256sums_url="$(dirname "$artifact_url")/SHA256SUMS"
+    sha256sums_file="$TMP/SHA256SUMS"
+    verbose "checksum:trying_sha256sums url=${sha256sums_url}"
+    info "Fetching checksum manifest from ${sha256sums_url}"
+    if download_to_file "$sha256sums_url" "$sha256sums_file" "sha256sums-download" && [ -s "$sha256sums_file" ]; then
+      expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")
+      if [ -n "$expected_checksum" ]; then
+        checksum_resolved=1
+      else
+        err "SHA256SUMS has no entry for ${artifact_name}."
+      fi
+    fi
+  fi
+
+  # Strategy 3: the per-archive sidecar retained by older/manual releases.
+  if [ "$checksum_resolved" -eq 0 ] && [ -z "$CHECKSUM_URL" ]; then
+    local sidecar_url="${artifact_url}.sha256"
+    verbose "checksum:trying_sidecar url=${sidecar_url}"
+    info "Trying per-artifact checksum sidecar ${sidecar_url}"
+    if download_to_file "$sidecar_url" "$checksum_file" "checksum-download" && [ -s "$checksum_file" ]; then
+      expected_checksum=$(awk '{print $1; exit}' "$checksum_file")
+      [ -n "$expected_checksum" ] && checksum_resolved=1
+    fi
+  fi
+
+  if [ "$checksum_resolved" -eq 0 ]; then
+    err "No SHA256 checksum witness is available for ${artifact_name}."
+    err "Release archives are not extracted without a checksum unless --no-verify is explicit."
+    return 1
+  fi
+
+  verify_checksum "$archive_file" "$expected_checksum"
+}
+
+# Verify the standardized Sigstore bundle for a file. cosign is the parser and
+# verifier for the bundle, certificate identity, issuer, and transparency proof;
+# any missing dependency or invalid evidence is fatal before extraction.
 verify_sigstore_bundle() {
   local file="$1"
   local artifact_url="$2"
   verbose "verify_sigstore_bundle:start file=${file} artifact_url=${artifact_url}"
 
   if ! command -v cosign &>/dev/null; then
-    warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
-    return 0
+    err "cosign is required to verify release archive authenticity but was not found."
+    err "Install cosign, or use --no-verify only for a trusted local artifact."
+    return 1
   fi
 
   local bundle_url="$SIGSTORE_BUNDLE_URL"
@@ -6015,24 +6100,25 @@ verify_sigstore_bundle() {
   fi
 
   local bundle_file
-  bundle_file="$TMP/$(basename "$bundle_url")"
+  bundle_file="$TMP/release.sigstore.json"
   info "Fetching sigstore bundle from ${bundle_url}"
   if ! download_to_file "$bundle_url" "$bundle_file" "sigstore-bundle"; then
-    warn "Sigstore bundle not found; skipping signature verification"
+    err "Sigstore bundle not found at ${bundle_url}."
+    err "Release archives are not extracted without a signature unless --no-verify is explicit."
     verbose "verify_sigstore_bundle:bundle_missing url=${bundle_url}"
-    return 0
+    return 1
   fi
 
   # Guard: verify the bundle file actually exists and is non-empty after download
   if [ ! -f "$bundle_file" ]; then
-    warn "Sigstore bundle file missing after download; skipping signature verification"
+    err "Sigstore bundle file is missing after download: ${bundle_file}"
     verbose "verify_sigstore_bundle:file_missing_after_download path=${bundle_file}"
-    return 0
+    return 1
   fi
   if [ ! -s "$bundle_file" ]; then
-    warn "Sigstore bundle file is empty; skipping signature verification"
+    err "Sigstore bundle file is empty: ${bundle_file}"
     verbose "verify_sigstore_bundle:file_empty path=${bundle_file}"
-    return 0
+    return 1
   fi
 
   # Our releases ship the new standardized Sigstore protobuf bundle
@@ -6066,11 +6152,23 @@ verify_sigstore_bundle() {
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
     verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=${nbf_flag:-off}"
+    err "Sigstore verification failed for ${file}."
+    err "The bundle must be valid and signed by ${COSIGN_IDENTITY_RE} via ${COSIGN_OIDC_ISSUER}."
     return 1
   fi
 
   ok "Signature verified (cosign)"
   verbose "verify_sigstore_bundle:ok bundle=${bundle_file}"
+  return 0
+}
+
+verify_release_archive() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+
+  resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+  verify_sigstore_bundle "$archive_file" "$artifact_url" || return 1
   return 0
 }
 
@@ -6318,13 +6416,15 @@ Options:
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
   --no-easy          Do not auto-update PATH in shell rc files
-  --verify           Run self-test after install
+  --verify           Run an additional self-test after install
+                     (archive verification is already required by default)
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
   --verbose          Enable detailed installer diagnostics
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-verify        Skip checksum + signature verification (for testing only)
+  --no-verify        UNSAFE: skip pre-extraction checksum + Sigstore verification
+                     (only for a trusted local artifact)
   --force            Force reinstall even if same version is installed
   --migrate          Force Python->Rust migration/displacement when Python install is detected
   --no-migrate       Skip and remember Python->Rust migration/displacement
@@ -6395,7 +6495,7 @@ while [ $# -gt 0 ]; do
     --verbose) VERBOSE=1; shift;;
     --offline) OFFLINE=1; shift;;
     --no-gum) NO_GUM=1; shift;;
-    --no-verify) NO_CHECKSUM=1; shift;;
+    --no-verify) NO_VERIFY=1; shift;;
     --force) FORCE_INSTALL=1; shift;;
     --migrate) FORCE_MIGRATE=1; shift;;
     --no-migrate) FORCE_NO_MIGRATE=1; shift;;
@@ -6420,7 +6520,7 @@ if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
   exit 2
 fi
 
-verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} NO_SERVICE=${NO_SERVICE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
+verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} NO_VERIFY=${NO_VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} NO_SERVICE=${NO_SERVICE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
 
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall
@@ -6496,6 +6596,11 @@ print_install_plan() {
   else
     echo "  Method:     Download pre-built binary"
     [ -n "${URL:-}" ] && echo "  URL:        $URL"
+    if [ "$NO_VERIFY" -eq 1 ]; then
+      echo "  Integrity:  UNSAFE verification bypass (--no-verify)"
+    else
+      echo "  Integrity:  required SHA256 + Sigstore/cosign before extraction"
+    fi
   fi
   echo ""
 
@@ -6822,77 +6927,14 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   exit 0
 fi
 
-# Checksum verification (can be skipped with --no-verify for testing)
-if [ "$NO_CHECKSUM" -eq 1 ]; then
-  warn "Verification skipped (--no-verify)"
+# Release archive verification is mandatory unless the caller explicitly accepts
+# the risk with --no-verify. This gate always runs before the first tar command.
+if [ "$NO_VERIFY" -eq 1 ]; then
+  warn "UNSAFE: archive checksum and Sigstore verification skipped (--no-verify)"
 else
-  if [ -z "$CHECKSUM" ]; then
-    CHECKSUM_FILE="$TMP/checksum.sha256"
-    CHECKSUM_RESOLVED=0
-
-    # Strategy 1: explicit checksum URL when the caller supplied one.
-    if [ -n "$CHECKSUM_URL" ]; then
-      info "Fetching checksum from ${CHECKSUM_URL}"
-      if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
-        CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-        if [ -n "$CHECKSUM" ]; then
-          CHECKSUM_RESOLVED=1
-          verbose "checksum:resolved_via_explicit_url sha256=${CHECKSUM}"
-        fi
-      fi
-    fi
-
-    # Strategy 2: consolidated SHA256SUMS file from release (default path).
-    if [ "$CHECKSUM_RESOLVED" -eq 0 ]; then
-      SHA256SUMS_URL="$(dirname "$URL")/SHA256SUMS"
-      SHA256SUMS_FILE="$TMP/SHA256SUMS"
-      verbose "checksum:trying_sha256sums url=${SHA256SUMS_URL}"
-      info "Fetching checksum manifest from ${SHA256SUMS_URL}"
-      if download_to_file "$SHA256SUMS_URL" "$SHA256SUMS_FILE" "sha256sums-download" && [ -f "$SHA256SUMS_FILE" ]; then
-        CHECKSUM=$(awk -v artifact="$TAR" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$SHA256SUMS_FILE")
-        if [ -n "$CHECKSUM" ]; then
-          CHECKSUM_RESOLVED=1
-          verbose "checksum:resolved_via_SHA256SUMS sha256=${CHECKSUM}"
-        else
-          verbose "checksum:SHA256SUMS_no_match artifact=${TAR}"
-          warn "SHA256SUMS file found but no entry for ${TAR}"
-        fi
-      fi
-    fi
-
-    # Strategy 3: per-artifact .sha256 sidecar (older/manual release layouts).
-    if [ "$CHECKSUM_RESOLVED" -eq 0 ] && [ -z "$CHECKSUM_URL" ]; then
-      CHECKSUM_URL="${URL}.sha256"
-      verbose "checksum:trying_sidecar url=${CHECKSUM_URL}"
-      info "Trying per-artifact checksum sidecar ${CHECKSUM_URL}"
-      if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
-        CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-        if [ -n "$CHECKSUM" ]; then
-          CHECKSUM_RESOLVED=1
-          verbose "checksum:resolved_via_sidecar sha256=${CHECKSUM}"
-        fi
-      fi
-    fi
-
-    if [ "$CHECKSUM_RESOLVED" -eq 0 ]; then
-      warn "Checksum file not available; skipping verification"
-      warn "Use --checksum <hex> to provide one manually"
-      CHECKSUM=""
-    fi
-  fi
-
-  if [ -n "$CHECKSUM" ]; then
-    if ! verify_checksum "$TMP/$TAR" "$CHECKSUM"; then
-      err "Installation aborted due to checksum failure"
-      err "Re-run the installer to fetch a fresh artifact and checksum."
-      exit 1
-    fi
-  fi
-
-  if ! verify_sigstore_bundle "$TMP/$TAR" "$URL"; then
-    err "Signature verification failed"
-    err "The downloaded file may be corrupted or tampered with."
-    err "Retry with a fresh download, or use --no-verify only for trusted local testing."
+  if ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then
+    err "Archive verification failed; aborting before extraction or installation."
+    err "Retry with a fresh release, install the required verification tools, or use --no-verify only for a trusted local artifact."
     error_support_hint
     exit 1
   fi

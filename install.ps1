@@ -8,8 +8,8 @@
     -Version vX.Y.Z   Install a specific release tag (default: latest)
     -Dest PATH        Install directory (default: %LOCALAPPDATA%\Programs\mcp-agent-mail)
     -Force            Reinstall even if the same version is already present
-    -NoVerify         Skip checksum verification (not recommended)
-    -Verify           Force checksum verification (default behavior)
+    -NoVerify         UNSAFE: skip pre-extraction checksum + Sigstore verification
+    -Verify           Explicitly require archive verification (already the default)
 #>
 
 [CmdletBinding()]
@@ -31,6 +31,8 @@ $AssetName = "mcp-agent-mail-$Target.zip"
 $DefaultDest = Join-Path $env:LOCALAPPDATA "Programs\mcp-agent-mail"
 $IssuesUrl = "https://github.com/$Owner/$Repo/issues"
 $ReleasesUrl = "https://github.com/$Owner/$Repo/releases"
+$CosignIdentityRegex = '^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
+$CosignOidcIssuer = 'https://token.actions.githubusercontent.com'
 
 if ([string]::IsNullOrWhiteSpace($Dest)) {
     $Dest = $DefaultDest
@@ -45,7 +47,7 @@ if ($Verify -and $NoVerify) {
     throw "Cannot combine -Verify and -NoVerify. Choose one, or omit both to use default verification behavior."
 }
 
-$ShouldVerifyChecksum = if ($NoVerify) { $false } else { $true }
+$ShouldVerifyArchive = if ($NoVerify) { $false } else { $true }
 
 if ([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12) {
     # no-op: TLS 1.2 already enabled
@@ -182,6 +184,9 @@ function Get-Sha256Hex {
     if (-not (Test-Path -LiteralPath $FilePath)) {
         throw "SHA256 source file not found: $FilePath. Re-run installer to re-download artifacts, or verify the custom path exists."
     }
+    if ($null -eq (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+        throw "No SHA256 implementation is available (Get-FileHash was not found). Install a PowerShell version with Get-FileHash, or use -NoVerify only for a trusted local artifact."
+    }
     return (Get-FileHash -LiteralPath $FilePath -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
@@ -236,6 +241,56 @@ function Verify-ChecksumFile {
         throw "Checksum verification failed. Expected $expected but got $actual. Re-run installer to fetch fresh artifacts; if using a manual checksum, verify it matches the release asset."
     }
     Write-Ok "Checksum verified ($($actual.Substring(0, 16))...)"
+}
+
+function Verify-SigstoreBundle {
+    param(
+        [string]$FilePath,
+        [string]$AssetUrl,
+        [string]$WorkDir
+    )
+
+    $cosignCommand = Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $cosignCommand) {
+        throw "cosign is required to verify release archive authenticity but was not found. Install cosign, or use -NoVerify only for a trusted local artifact."
+    }
+
+    $bundleUrl = "$AssetUrl.sigstore.json"
+    $bundlePath = Join-Path $WorkDir "release.sigstore.json"
+    Write-Info "Downloading Sigstore bundle $bundleUrl"
+    try {
+        Download-File -Url $bundleUrl -OutFile $bundlePath
+    } catch {
+        throw "Sigstore bundle download failed at $bundleUrl. Release archives are not extracted without a signature unless -NoVerify is explicit. Root error: $($_.Exception.Message)"
+    }
+
+    if (-not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
+        throw "Sigstore bundle is missing after download: $bundlePath"
+    }
+    $bundleText = Get-Content -LiteralPath $bundlePath -Raw
+    if ([string]::IsNullOrWhiteSpace($bundleText)) {
+        throw "Sigstore bundle is empty: $bundlePath"
+    }
+    try {
+        $null = $bundleText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Sigstore bundle is malformed JSON: $bundlePath. Root error: $($_.Exception.Message)"
+    }
+
+    $cosignArgs = @(
+        "verify-blob",
+        "--bundle", $bundlePath,
+        "--certificate-identity-regexp", $CosignIdentityRegex,
+        "--certificate-oidc-issuer", $CosignOidcIssuer,
+        $FilePath
+    )
+    $cosignOutput = @(& $cosignCommand.Source @cosignArgs 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $detail = ($cosignOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+        throw "Sigstore verification failed. The bundle must be valid and signed by $CosignIdentityRegex via $CosignOidcIssuer. cosign output: $detail"
+    }
+
+    Write-Ok "Signature verified (cosign)"
 }
 
 function Install-BinariesAtomically {
@@ -534,11 +589,12 @@ try {
     Write-Info "Downloading $assetUrl"
     Download-File -Url $assetUrl -OutFile $zipPath
 
-    if ($ShouldVerifyChecksum) {
+    if ($ShouldVerifyArchive) {
         $checksumText = Resolve-ChecksumText -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir
         Verify-ChecksumFile -FilePath $zipPath -ExpectedChecksum $checksumText
+        Verify-SigstoreBundle -FilePath $zipPath -AssetUrl $assetUrl -WorkDir $workDir
     } else {
-        Write-WarnText "Checksum verification skipped (-NoVerify)"
+        Write-WarnText "UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)"
     }
 
     Write-Info "Extracting archive"
