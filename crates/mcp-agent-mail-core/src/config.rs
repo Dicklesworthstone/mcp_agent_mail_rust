@@ -3696,12 +3696,36 @@ fn load_user_env_values_from_with_reader(
     xdg_config_dir: Option<&Path>,
     mut read_candidate: impl FnMut(&Path) -> io::Result<Option<Vec<u8>>>,
 ) -> UserEnvLoad {
-    for path in user_env_file_candidates(home, xdg_config_dir) {
-        let bytes = match read_candidate(&path) {
+    let candidates = user_env_file_candidates(home, xdg_config_dir);
+    for (index, path) in candidates.iter().enumerate() {
+        let bytes = match read_candidate(path) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => continue,
-            Err(error) => return UserEnvLoad::rejected(&path, &error),
+            Err(error) => return UserEnvLoad::rejected(path, &error),
         };
+
+        // Absence is not a durable observation across independently opened
+        // candidate paths. Before accepting a lower-precedence file, re-probe
+        // every higher-precedence authority and fail closed if one appeared or
+        // became unreadable while this selection was in flight.
+        for higher_path in &candidates[..index] {
+            match read_candidate(higher_path) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    let error = io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} became present while evaluating lower-precedence {}",
+                            higher_path.display(),
+                            path.display()
+                        ),
+                    );
+                    return UserEnvLoad::rejected(higher_path, &error);
+                }
+                Err(error) => return UserEnvLoad::rejected(higher_path, &error),
+            }
+        }
+
         let contents = match String::from_utf8(bytes) {
             Ok(contents) => contents,
             Err(error) => {
@@ -5605,6 +5629,42 @@ mod tests {
             Some("xdg-mirror")
         );
         assert!(load.authority_error.is_none());
+    }
+
+    #[test]
+    fn user_env_load_rejects_higher_candidate_appearing_before_lower_acceptance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-xdg").join(XDG_APP_DIR);
+        let higher = xdg.join("config.env");
+        let lower = xdg.join(".env");
+        let mut higher_reads = 0_u8;
+
+        let load = load_user_env_values_from_with_reader(
+            Some(tmp.path()),
+            Some(&xdg),
+            |path| {
+                if path == higher {
+                    higher_reads += 1;
+                    return if higher_reads == 1 {
+                        Ok(None)
+                    } else {
+                        Ok(Some(b"FOO=higher\n".to_vec()))
+                    };
+                }
+                if path == lower {
+                    return Ok(Some(b"FOO=lower\n".to_vec()));
+                }
+                Ok(None)
+            },
+        );
+
+        assert_eq!(higher_reads, 2, "higher authority must be re-probed");
+        assert!(load.values.is_empty());
+        assert!(
+            load.authority_error
+                .as_deref()
+                .is_some_and(|error| error.contains("became present"))
+        );
     }
 
     #[test]

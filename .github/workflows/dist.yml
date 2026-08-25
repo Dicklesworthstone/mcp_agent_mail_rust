@@ -414,7 +414,11 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/mcp-agent-mail.exe","target/${{ matrix.target }}/release/am.exe" -DestinationPath "dist/$zipName"
           cd dist
           $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
-          "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
+          [System.IO.File]::WriteAllText(
+            "${zipName}.sha256",
+            "$hash  $zipName`n",
+            [System.Text.Encoding]::ASCII
+          )
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

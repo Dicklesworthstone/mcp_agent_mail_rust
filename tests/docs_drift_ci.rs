@@ -406,6 +406,8 @@ mod dist_release_contract {
             "server_version=\"$(staging/mcp-agent-mail --version)\"",
             "$cliVersion -ne \"am $env:EXPECTED_VERSION\"",
             "$serverVersion -ne \"mcp-agent-mail $env:EXPECTED_VERSION\"",
+            "[System.IO.File]::WriteAllText(",
+            "\"$hash  $zipName`n\"",
             "cosign-release: v3.1.3",
             "expected_download_entries+=(\"$artifact\" \"${artifact}.sha256\")",
             "mapfile -t actual_download_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
@@ -551,6 +553,11 @@ mod dist_release_contract {
                 &workflow,
                 "server_version=\"$(staging/mcp-agent-mail --version)\"",
                 "server_version=\"$(staging/mcp-agent-mail --help)\"",
+            ),
+            mutate(
+                &workflow,
+                "[System.IO.File]::WriteAllText(\n            \"${zipName}.sha256\",\n            \"$hash  $zipName`n\",\n            [System.Text.Encoding]::ASCII\n          )",
+                "\"$hash  $zipName\" | Out-File -Encoding ASCII \"${zipName}.sha256\"",
             ),
             mutate(&workflow, CHECKOUT_ACTION, "actions/checkout@v4"),
             mutate(
