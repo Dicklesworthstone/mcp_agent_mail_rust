@@ -333,6 +333,17 @@ set -e
 [ -z "$relative_agent_targets" ] \
     || fail "production detector emitted a cwd-relative OMP target"
 
+absolute_agent_dir="$relative_agent_home/absolute-agent"
+mkdir -p "$absolute_agent_dir"
+printf '%s\n' '{}' >"$absolute_agent_dir/mcp.json"
+absolute_agent_targets="$(
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" PI_CODING_AGENT_DIR="$absolute_agent_dir" \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+[ "$absolute_agent_targets" = "omp" ] \
+    || fail "production detector rejected an absolute PI_CODING_AGENT_DIR authority"
+
 symlink_config_home="$tmp/symlink-config-home"
 symlink_config_target="$tmp/symlink-config-target"
 mkdir -p "$symlink_config_home" "$symlink_config_target/nested/agent"
@@ -363,6 +374,17 @@ set -e
     || fail "parent-traversing PI_CONFIG_DIR returned $traversal_config_rc instead of 2"
 [ -z "$traversal_config_targets" ] \
     || fail "production detector emitted an OMP target through PI_CONFIG_DIR traversal"
+
+safe_config_home="$tmp/safe-config-home"
+mkdir -p "$safe_config_home/custom-root/nested/agent"
+printf '%s\n' '{}' >"$safe_config_home/custom-root/nested/agent/mcp.json"
+safe_config_targets="$(
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$safe_config_home" PI_CONFIG_DIR=custom-root/nested \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+[ "$safe_config_targets" = "omp" ] \
+    || fail "production detector rejected a safe HOME-relative PI_CONFIG_DIR authority"
 
 step "scenario J: OMP-only targets activate healthy and unhealthy readiness lanes"
 omp_only_config="$tmp/omp-only-mcp.json"
