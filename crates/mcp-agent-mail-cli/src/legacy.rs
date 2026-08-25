@@ -3478,6 +3478,14 @@ mod tests {
                         max_generation, generation,
                         "snapshot must contain every row committed through its generation"
                     );
+                    if let Some(committed_before_capture) = before {
+                        assert!(
+                            generation
+                                >= i64::try_from(committed_before_capture)
+                                    .expect("published generation fits SQLite INTEGER"),
+                            "snapshot must not fall back behind the last generation committed before capture"
+                        );
+                    }
                     coherent_snapshots = coherent_snapshots.saturating_add(1);
                 }
                 Err(error) => fail_closed_errors.push(error.to_string()),

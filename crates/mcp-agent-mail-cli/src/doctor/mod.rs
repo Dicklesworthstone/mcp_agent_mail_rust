@@ -3248,15 +3248,10 @@ mod tests {
         .expect("acquire cross-process shared SQLite activity lock")
         .expect("file-backed SQLite lock guard");
         std::fs::write(&ready_path, b"ready").expect("publish shared-lock readiness");
-        let released = (0..3_000).any(|_| {
-            if release_path.exists() {
-                true
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }
-        });
-        assert!(released, "parent did not release shared-lock child in time");
+        assert!(
+            fixers::wait_for_cross_process_release(&release_path),
+            "parent did not release shared-lock child in time"
+        );
         println!("{FIX_ONLY_LOCK_HOLDER_WITNESS}");
     }
 
@@ -3300,17 +3295,11 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn shared SQLite lock holder");
-        let holder_ready = (0..1_000).any(|_| {
-            if ready_path.exists() {
-                true
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }
-        });
-        if !holder_ready {
-            std::fs::write(&release_path, b"release").expect("release unready holder");
-            let output = holder.wait_with_output().expect("collect unready holder");
+        let holder = fixers::CrossProcessTestChild::new(holder, release_path);
+        if !fixers::wait_for_cross_process_signal(&ready_path) {
+            let output = holder
+                .release_and_wait()
+                .expect("collect unready holder");
             panic!(
                 "shared-lock holder never became ready: stdout={} stderr={}",
                 String::from_utf8_lossy(&output.stdout),
@@ -3340,9 +3329,8 @@ mod tests {
             invocations.push((fm_id, output));
         }
 
-        std::fs::write(&release_path, b"release").expect("release shared-lock holder");
         let holder_output = holder
-            .wait_with_output()
+            .release_and_wait()
             .expect("collect shared-lock holder");
         assert!(
             holder_output.status.success(),

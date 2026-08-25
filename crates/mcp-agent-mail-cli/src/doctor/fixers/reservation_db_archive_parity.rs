@@ -695,7 +695,7 @@ mod tests {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn cross-process reservation WAL writer");
-        let child = super::super::CrossProcessWalChild::new(child, release_path);
+        let child = super::super::CrossProcessTestChild::new(child, release_path);
         if !super::super::wait_for_cross_process_signal(&ready_path) {
             let output = child
                 .release_and_wait()

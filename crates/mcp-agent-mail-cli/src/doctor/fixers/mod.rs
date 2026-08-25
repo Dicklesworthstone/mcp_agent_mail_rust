@@ -190,20 +190,24 @@ pub(crate) fn sqlite_immutable_uri(db_path: &std::path::Path) -> String {
     uri
 }
 
-/// Test-only owner for a subprocess that holds decisive SQLite truth in WAL.
+/// Test-only owner for a subprocess that holds decisive cross-process state.
 ///
 /// The release sentinel is written and the child reaped even while the parent
 /// test is unwinding, so a failed assertion cannot leave a writer behind.
 #[cfg(test)]
-pub(crate) struct CrossProcessWalChild {
+pub(crate) struct CrossProcessTestChild {
     child: Option<std::process::Child>,
     release_path: std::path::PathBuf,
     released: bool,
 }
 
 #[cfg(test)]
-impl CrossProcessWalChild {
-    pub(crate) fn new(child: std::process::Child, release_path: std::path::PathBuf) -> Self {
+impl CrossProcessTestChild {
+    #[must_use]
+    pub(crate) const fn new(
+        child: std::process::Child,
+        release_path: std::path::PathBuf,
+    ) -> Self {
         Self {
             child: Some(child),
             release_path,
@@ -223,13 +227,13 @@ impl CrossProcessWalChild {
         self.release()?;
         self.child
             .take()
-            .expect("cross-process WAL child is present")
+            .expect("cross-process test child is present")
             .wait_with_output()
     }
 }
 
 #[cfg(test)]
-impl Drop for CrossProcessWalChild {
+impl Drop for CrossProcessTestChild {
     fn drop(&mut self) {
         let _ = self.release();
         if let Some(mut child) = self.child.take() {
@@ -239,6 +243,7 @@ impl Drop for CrossProcessWalChild {
 }
 
 #[cfg(test)]
+#[must_use]
 pub(crate) fn wait_for_cross_process_signal(path: &std::path::Path) -> bool {
     (0..1_000).any(|_| {
         if path.exists() {
@@ -251,6 +256,7 @@ pub(crate) fn wait_for_cross_process_signal(path: &std::path::Path) -> bool {
 }
 
 #[cfg(test)]
+#[must_use]
 pub(crate) fn wait_for_cross_process_release(path: &std::path::Path) -> bool {
     (0..3_000).any(|_| {
         if path.exists() {

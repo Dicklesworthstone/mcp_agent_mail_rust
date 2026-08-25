@@ -300,15 +300,10 @@ mod tests {
             .expect("commit schema version only to WAL");
         std::fs::write(&ready_path, b"ready").expect("publish schema WAL writer readiness");
         println!("{WAL_WRITER_WITNESS}");
-        let released = (0..3_000).any(|_| {
-            if release_path.exists() {
-                true
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }
-        });
-        assert!(released, "parent did not release schema WAL writer in time");
+        assert!(
+            super::super::wait_for_cross_process_release(&release_path),
+            "parent did not release schema WAL writer in time"
+        );
         drop(writer);
     }
 
@@ -350,18 +345,10 @@ mod tests {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn cross-process schema WAL writer");
-        let writer_ready = (0..1_000).any(|_| {
-            if ready_path.exists() {
-                true
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }
-        });
-        if !writer_ready {
-            std::fs::write(&release_path, b"release").expect("release unready schema WAL writer");
+        let writer = super::super::CrossProcessTestChild::new(writer, release_path);
+        if !super::super::wait_for_cross_process_signal(&ready_path) {
             let output = writer
-                .wait_with_output()
+                .release_and_wait()
                 .expect("collect unready schema WAL writer");
             panic!(
                 "schema WAL writer never became ready: stdout={} stderr={}",
@@ -379,9 +366,8 @@ mod tests {
         );
         let findings = detect_prepared(std::slice::from_ref(&candidate));
 
-        std::fs::write(&release_path, b"release").expect("release schema WAL writer");
         let output = writer
-            .wait_with_output()
+            .release_and_wait()
             .expect("collect schema WAL writer");
         assert!(
             output.status.success(),
