@@ -3416,7 +3416,7 @@ fn read_open_user_env_file_bounded(
     }
 
     let allocation = usize::try_from(metadata.len().min(USER_ENV_FILE_MAX_BYTES))
-        .unwrap_or(USER_ENV_FILE_MAX_BYTES as usize);
+        .unwrap_or(1024 * 1024);
     let mut bytes = Vec::with_capacity(allocation);
     file.by_ref()
         .take(USER_ENV_FILE_MAX_BYTES + 1)
@@ -3481,6 +3481,46 @@ fn read_user_env_candidate_with_hooks(
 }
 
 #[cfg(not(all(unix, not(target_os = "redox"))))]
+fn user_env_parent_metadata_is_safe(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+
+        let file_type = metadata.file_type();
+        file_type.is_dir()
+            && !file_type.is_symlink()
+            && !file_type.is_symlink_dir()
+            && !file_type.is_symlink_file()
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "redox"))))]
+fn revalidate_user_env_parent(
+    parent: &Path,
+    expected: &same_file::Handle,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(parent)?;
+    if !user_env_parent_metadata_is_safe(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory authority during read", parent.display()),
+        ));
+    }
+    let observed = same_file::Handle::from_path(parent)?;
+    if expected != &observed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory identity during read", parent.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(all(unix, not(target_os = "redox"))))]
 fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
@@ -3497,7 +3537,7 @@ fn read_user_env_candidate_with_hooks(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+    if !user_env_parent_metadata_is_safe(&parent_metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular directory authority", parent.display()),
@@ -3512,27 +3552,15 @@ fn read_user_env_candidate_with_hooks(
     after_parent_open();
     let file = match crate::disk::open_regular_file_no_follow(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            revalidate_user_env_parent(parent, &parent_before)?;
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     after_file_open();
     let bytes = read_open_user_env_file_bounded(file, path)?;
-    let parent_after_metadata = fs::symlink_metadata(parent)?;
-    if !parent_after_metadata.file_type().is_dir()
-        || parent_after_metadata.file_type().is_symlink()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} changed directory authority during read", parent.display()),
-        ));
-    }
-    let parent_after = same_file::Handle::from_path(parent)?;
-    if parent_before != parent_after {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} changed directory identity during read", parent.display()),
-        ));
-    }
+    revalidate_user_env_parent(parent, &parent_before)?;
     Ok(Some(bytes))
 }
 
@@ -3593,6 +3621,7 @@ pub fn full_env_value(key: &str) -> Option<String> {
     env_value(key)
 }
 
+#[cfg(test)]
 fn layered_env_value(
     process_value: Option<String>,
     user_envfile_value: Option<String>,
@@ -3622,6 +3651,10 @@ pub fn process_env_value(key: &str) -> Option<String> {
 
 /// Read a value from the real environment first, then the user-global env file,
 /// then the working-directory `.env`.
+///
+/// Once a higher-priority user env-file candidate is rejected, the project
+/// `.env` tier is suppressed rather than becoming an accidental credential or
+/// infrastructure fallback.
 #[must_use]
 pub fn env_value(key: &str) -> Option<String> {
     if let Some(value) = process_env_value(key) {
@@ -5614,6 +5647,35 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("exceeding"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_env_load_rejects_unreadable_file_without_legacy_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-xdg").join(XDG_APP_DIR);
+        let legacy = tmp.path().join(".mcp_agent_mail");
+        let candidate = xdg.join("config.env");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(&candidate, "FOO=canonical\n").unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+        let original_permissions = std::fs::metadata(&candidate).unwrap().permissions();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0)).unwrap();
+
+        // A privileged test runner may retain read access despite mode 000. In
+        // that environment the kernel cannot provide the unreadable control;
+        // all ordinary non-root runners exercise the rejection below.
+        if std::fs::File::open(&candidate).is_ok() {
+            std::fs::set_permissions(&candidate, original_permissions).unwrap();
+            return;
+        }
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        std::fs::set_permissions(&candidate, original_permissions).unwrap();
+        assert!(load.values.is_empty());
+        assert!(load.authority_error.is_some());
     }
 
     #[cfg(all(unix, not(target_os = "redox")))]

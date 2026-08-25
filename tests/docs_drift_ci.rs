@@ -398,6 +398,8 @@ mod dist_release_contract {
             "mapfile -t sidecar_lines < \"${artifact}.sha256\"",
             "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
             "[ \"$sidecar_name\" != \"$artifact\" ]",
+            "[ \"${#sums_lines[@]}\" -ne \"${#expected_archives[@]}\" ]",
+            "'$2 == artifact && NF == 2 {print $1}'",
             "[ \"${#sums_hashes[@]}\" -ne 1 ]",
             "names = sorted(member.name for member in members)",
             "names != [\"am\", \"mcp-agent-mail\"]",
@@ -540,6 +542,16 @@ mod dist_release_contract {
                 &workflow,
                 "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
                 "[ \"${#sidecar_lines[@]}\" -eq 0 ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"${#sums_lines[@]}\" -ne \"${#expected_archives[@]}\" ]",
+                "[ \"${#sums_lines[@]}\" -eq 0 ]",
+            ),
+            mutate(
+                &workflow,
+                "'$2 == artifact && NF == 2 {print $1}'",
+                "'$2 == artifact || $2 == (\"./\" artifact) {print $1}'",
             ),
             mutate(
                 &workflow,

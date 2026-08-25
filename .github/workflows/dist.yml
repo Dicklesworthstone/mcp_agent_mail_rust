@@ -497,6 +497,11 @@ jobs:
             exit 1
           fi
           test -s SHA256SUMS
+          mapfile -t sums_lines < SHA256SUMS
+          if [ "${#sums_lines[@]}" -ne "${#expected_archives[@]}" ]; then
+            echo "SHA256SUMS must contain exactly ${#expected_archives[@]} lines" >&2
+            exit 1
+          fi
           for artifact in "${expected_archives[@]}"; do
             test -s "$artifact"
             test -s "${artifact}.sha256"
@@ -516,7 +521,7 @@ jobs:
 
             mapfile -t sums_hashes < <(
               awk -v artifact="$artifact" \
-                '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1}' \
+                '$2 == artifact && NF == 2 {print $1}' \
                 SHA256SUMS
             )
             if [ "${#sums_hashes[@]}" -ne 1 ]; then
