@@ -15101,9 +15101,22 @@ mod tests {
                 .busy_timeout(10);
         let competitor = crate::CanonicalDbConn::open(&config)
             .expect("child opens competing canonical connection");
+        let blocked = match competitor.execute_raw("BEGIN IMMEDIATE;") {
+            Err(_) => true,
+            Ok(()) => competitor
+                .execute_raw(
+                    "CREATE TABLE __mcp_agent_mail_lock_probe(\
+                         id INTEGER PRIMARY KEY\
+                     );",
+                )
+                .is_err(),
+        };
+        if !blocked {
+            let _ = competitor.execute_raw("ROLLBACK;");
+        }
         assert!(
-            competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
-            "separate process must observe the parent's reserved writer lock"
+            blocked,
+            "separate process must be unable to perform a conflicting write while the parent holds its writer lock"
         );
         println!("{witness}");
         true
@@ -16077,6 +16090,9 @@ mod tests {
         writer
             .execute_raw("BEGIN IMMEDIATE;")
             .expect("acquire parent id-floor writer lock");
+        writer
+            .execute_raw("INSERT INTO messages DEFAULT VALUES;")
+            .expect("materialize parent id-floor writer lock");
         assert_maintenance_child_observes_busy(
             CHILD_TEST_NAME,
             CHILD_PATH_ENV,
@@ -22993,6 +23009,9 @@ mod tests {
         writer
             .execute_raw("BEGIN IMMEDIATE;")
             .expect("acquire parent proactive-backup writer lock");
+        writer
+            .execute_raw("UPDATE backup_lock_probe SET value = 'uncommitted';")
+            .expect("materialize parent proactive-backup writer lock");
         assert_maintenance_child_observes_busy(
             CHILD_TEST_NAME,
             CHILD_PATH_ENV,
