@@ -1134,6 +1134,95 @@ mod tests {
         assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 100);
     }
 
+    #[test]
+    fn id_floor_admission_failure_preserves_caller_transaction() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("caller-owned-transaction.db");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 subject TEXT NOT NULL
+             );
+             CREATE TABLE caller_sentinel (value TEXT NOT NULL);
+             INSERT INTO messages (id, subject) VALUES (10, 'existing');
+             BEGIN IMMEDIATE;
+             INSERT INTO caller_sentinel (value) VALUES ('must-survive');",
+        )
+        .unwrap();
+
+        let error = advance_messages_id_floor(&conn, Some(25))
+            .expect_err("repair must not nest inside a caller-owned transaction");
+        assert!(
+            error.to_string().contains("begin allocator repair"),
+            "unexpected admission error: {error}"
+        );
+        conn.execute_raw("COMMIT;")
+            .expect("the caller must retain ownership of its transaction");
+
+        let observer = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
+        let rows = observer
+            .query_sync("SELECT value FROM caller_sentinel", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("value").unwrap(),
+            "must-survive"
+        );
+    }
+
+    #[test]
+    fn id_floor_mid_repair_failure_rolls_back_owned_transaction() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mid-repair-rollback.db");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 subject TEXT NOT NULL
+             );
+             INSERT INTO messages (id, subject) VALUES (10, 'existing');",
+        )
+        .unwrap();
+
+        let error = advance_messages_id_floor_with(
+            Some(25),
+            |sql, params| {
+                conn.query_sync(sql, params)
+                    .map_err(|error| error.to_string())
+            },
+            |sql| {
+                if sql.starts_with("UPDATE sqlite_sequence") {
+                    return conn
+                        .execute_raw(&format!(
+                            "{sql} INSERT INTO missing_repair_failure_table VALUES (1);"
+                        ))
+                        .map_err(|error| error.to_string());
+                }
+                conn.execute_raw(sql).map_err(|error| error.to_string())
+            },
+        )
+        .expect_err("injected mid-repair error must propagate");
+        assert!(
+            error
+                .to_string()
+                .contains("repair/advance sqlite_sequence"),
+            "unexpected repair error: {error}"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS row_count, MAX(seq) AS seq FROM sqlite_sequence \
+                 WHERE name = 'messages'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("row_count").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 10);
+        conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK;")
+            .expect("repair rollback must leave no transaction open");
+    }
+
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
