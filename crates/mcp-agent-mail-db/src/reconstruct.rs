@@ -1705,16 +1705,12 @@ fn reconstruct_from_archive_impl(
         // re-scans, keyed by (project, generation, archived id).
         let mut used_reservation_ids: HashSet<i64> = HashSet::new();
         let mut seen_reservations: HashSet<(i64, String, i64)> = HashSet::new();
-        // Identity-level dedup, GLOBAL: one reservation can surface under BOTH the
-        // legacy `id-<id>.json` name and the generation-stamped `id-<id>-g<gen>.json`
-        // name (plus mirrors). Those pass the (project, generation, id) key as
-        // distinct artifacts, and the id-collision fallback then re-inserts the
-        // second copy under a fresh id — producing byte-identical duplicate rows
-        // that the promotion receipt's stable-key collision check rightly refuses
-        // (observed live 2026-08-15: 14802 rows / 14797 unique keys). Content that
-        // matches an already-imported reservation identity exactly is one
-        // reservation and is imported once.
-        let mut seen_reservation_identities: HashSet<ReservationIdentity> = HashSet::new();
+        // Stable-identity dedup, GLOBAL: one reservation can surface under legacy
+        // and generation-stamped names, and later generations can carry renewed or
+        // released lifecycle state for that same lease. Track the imported row by
+        // stable identity so lifecycle variants merge in place instead of becoming
+        // phantom fresh-id rows that collide after live-DB salvage.
+        let mut seen_reservation_identities: HashMap<ReservationIdentity, i64> = HashMap::new();
 
         // Phase 1: Replay projects discovered before opening the target DB.
         for (slug, project_path) in &project_dirs {
@@ -2989,22 +2985,32 @@ fn insert_archived_file_reservation(
     agent_ids: &mut HashMap<(i64, String), i64>,
     used_reservation_ids: &mut HashSet<i64>,
     seen_reservations: &mut HashSet<(i64, String, i64)>,
-    seen_reservation_identities: &mut HashSet<ReservationIdentity>,
+    seen_reservation_identities: &mut HashMap<ReservationIdentity, i64>,
 ) -> DbResult<()> {
     let agent_id = ensure_agent_exists(conn, project_id, &reservation.agent_name, agent_ids)?;
 
-    // One reservation, one row: an identity that already imported (under any
-    // artifact naming generation) is the same lease, not a new one.
-    if !seen_reservation_identities.insert((
+    // Dedup the two on-disk artifacts of one reservation (id file + sha1 mirror)
+    // and exact re-scans before interpreting lifecycle variants across generations.
+    if let Some(id) = reservation.reservation_id {
+        let generation_key = reservation.generation.clone().unwrap_or_default();
+        if !seen_reservations.insert((project_id, generation_key, id)) {
+            return Ok(());
+        }
+    }
+
+    let stable_identity = (
         project_id,
         agent_id,
         reservation.path_pattern.clone(),
         i64::from(reservation.exclusive),
-        reservation.reason.clone(),
         reservation.created_ts,
-        reservation.expires_ts,
-        reservation.released_ts,
-    )) {
+    );
+
+    // One reservation, one row: renewal and release are lifecycle payload for the
+    // stable lease identity, not new leases. Merge later archive state onto the
+    // already-imported row instead of minting a fresh phantom id.
+    if let Some(existing_id) = seen_reservation_identities.get(&stable_identity).copied() {
+        merge_archived_file_reservation_lifecycle(conn, existing_id, reservation)?;
         return Ok(());
     }
 
@@ -3022,7 +3028,7 @@ fn insert_archived_file_reservation(
 
     // A fresh-id insert (no explicit id) — used for legacy no-id artifacts and for
     // any archived id already claimed by an earlier generation's reservation.
-    let insert_fresh = |conn: &DbConn| -> DbResult<()> {
+    let insert_fresh = |conn: &DbConn| -> DbResult<i64> {
         conn.execute_sync(
             &format!(
                 "INSERT INTO file_reservations ({columns_no_id}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -3034,22 +3040,17 @@ fn insert_archived_file_reservation(
                 "reconstruct: insert file reservation {}: {e}",
                 file_path.display()
             ))
-        })
-        .map(|_| ())
+        })?;
+        query_last_insert_rowid(conn)
     };
 
     let Some(id) = reservation.reservation_id else {
-        return insert_fresh(conn);
+        let inserted_id = insert_fresh(conn)?;
+        seen_reservation_identities.insert(stable_identity, inserted_id);
+        return Ok(());
     };
 
-    // Dedup the two on-disk artifacts of one reservation (id file + sha1 mirror)
-    // and exact re-scans: same (project, generation, id) is written once.
-    let generation_key = reservation.generation.clone().unwrap_or_default();
-    if !seen_reservations.insert((project_id, generation_key, id)) {
-        return Ok(());
-    }
-
-    if used_reservation_ids.insert(id) {
+    let inserted_id = if used_reservation_ids.insert(id) {
         // First artifact to claim this id — preserve it verbatim.
         conn.execute_sync(
             &format!(
@@ -3074,21 +3075,96 @@ fn insert_archived_file_reservation(
                 file_path.display()
             ))
         })?;
-        Ok(())
+        id
     } else {
         // The archived id is already taken by an earlier (different-generation or
         // different-project) reservation — re-key under a fresh id so this row is
         // preserved instead of overwriting the earlier one (br-n8qh6).
-        insert_fresh(conn)
-    }
+        insert_fresh(conn)?
+    };
+    seen_reservation_identities.insert(stable_identity, inserted_id);
+    Ok(())
 }
 
-/// Full identity of one archived file reservation, used to import identical
-/// content once no matter how many artifact namings (legacy `id-<id>.json`,
-/// generation-stamped `id-<id>-g<gen>.json`, sha1 mirrors) carry it:
-/// (project_id, agent_id, path_pattern, exclusive, reason, created_ts,
-/// expires_ts, released_ts).
-type ReservationIdentity = (i64, i64, String, i64, String, i64, i64, Option<i64>);
+fn merge_archived_file_reservation_lifecycle(
+    conn: &DbConn,
+    existing_id: i64,
+    incoming: &ArchivedFileReservation,
+) -> DbResult<()> {
+    let rows = conn
+        .query_sync(
+            "SELECT reason, expires_ts, released_ts FROM file_reservations WHERE id = ? LIMIT 1",
+            &[Value::BigInt(existing_id)],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct: read lifecycle for file reservation {existing_id}: {e}"
+            ))
+        })?;
+    let row = rows.first().ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "reconstruct: imported file reservation {existing_id} disappeared before lifecycle merge"
+        ))
+    })?;
+    let existing_reason = row.get_named::<String>("reason").unwrap_or_default();
+    let existing_expires = row.get_named::<i64>("expires_ts").map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct: decode expires_ts for file reservation {existing_id}: {e}"
+        ))
+    })?;
+    let existing_released = row.get_named::<Option<i64>>("released_ts").map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct: decode released_ts for file reservation {existing_id}: {e}"
+        ))
+    })?;
+
+    // Prefer the most advanced lifecycle artifact deterministically for free-text
+    // payload, while independently preserving the greatest expiry/release clocks.
+    let existing_rank = (
+        existing_released.is_some(),
+        existing_released.unwrap_or(existing_expires),
+        existing_expires,
+        existing_reason.as_str(),
+    );
+    let incoming_rank = (
+        incoming.released_ts.is_some(),
+        incoming.released_ts.unwrap_or(incoming.expires_ts),
+        incoming.expires_ts,
+        incoming.reason.as_str(),
+    );
+    let merged_reason = if incoming_rank > existing_rank {
+        incoming.reason.clone()
+    } else {
+        existing_reason
+    };
+    let merged_expires = existing_expires.max(incoming.expires_ts);
+    let merged_released = match (existing_released, incoming.released_ts) {
+        (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+        (Some(existing), None) => Some(existing),
+        (None, incoming) => incoming,
+    };
+
+    conn.execute_sync(
+        "UPDATE file_reservations SET reason = ?, expires_ts = ?, released_ts = ? WHERE id = ?",
+        &[
+            Value::Text(merged_reason),
+            Value::BigInt(merged_expires),
+            merged_released.map_or(Value::Null, Value::BigInt),
+            Value::BigInt(existing_id),
+        ],
+    )
+    .map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct: merge lifecycle for file reservation {existing_id}: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Stable identity of one archived file reservation. Renewal and release fields
+/// are lifecycle payload and merge onto this identity rather than creating a new
+/// row: (project_id, agent_id, path_pattern, exclusive, created_ts).
+type ReservationIdentity = (i64, i64, String, i64, i64);
 
 fn discover_file_reservations(
     conn: &DbConn,
@@ -3097,7 +3173,7 @@ fn discover_file_reservations(
     agent_ids: &mut HashMap<(i64, String), i64>,
     used_reservation_ids: &mut HashSet<i64>,
     seen_reservations: &mut HashSet<(i64, String, i64)>,
-    seen_reservation_identities: &mut HashSet<ReservationIdentity>,
+    seen_reservation_identities: &mut HashMap<ReservationIdentity, i64>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     for file_path in reservation_artifact_paths(reservations_dir) {
@@ -8994,6 +9070,64 @@ body
             1,
             "identical reservation identity across legacy and generation artifacts \
              must import exactly once (stable-key collision otherwise refuses promotion)"
+        );
+    }
+
+    #[test]
+    fn reconstruct_merges_reservation_lifecycle_artifacts_across_generations() {
+        // br-1texm: an older archive generation can show an active lease while a
+        // later generation shows that same lease released. Reconstructing both as
+        // rows lets salvage apply the release to the active copy and creates an
+        // exact stable-key collision under a phantom fresh id.
+        let storage_root = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = storage_root
+            .path()
+            .join("projects")
+            .join("lifecycle-project");
+        let agents_dir = project_dir.join("agents").join("CoralMarsh");
+        let reservations_dir = project_dir.join("file_reservations");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        std::fs::create_dir_all(&reservations_dir).expect("reservations dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"lifecycle-project","human_key":"/lifecycle-project","created_at":0}"#,
+        )
+        .expect("project meta");
+        std::fs::write(
+            agents_dir.join("profile.json"),
+            r#"{"name":"CoralMarsh","program":"codex-cli","model":"gpt-5","task_description":"","inception_ts":"2026-03-13T21:21:02Z","last_active_ts":"2026-03-13T21:21:02Z"}"#,
+        )
+        .expect("agent profile");
+
+        // Sort the released artifact first to prove that a later-read stale active
+        // generation cannot regress the terminal lifecycle state.
+        let released = r#"{"id":7,"db_generation":"aaaa1111","project":"/lifecycle-project","agent":"CoralMarsh","path_pattern":"src/same.rs","exclusive":true,"reason":"same lease","created_ts":"2026-03-13T21:36:47.221175Z","expires_ts":"2026-03-13T23:36:47.221175Z","released_ts":"2026-03-13T22:00:00Z"}"#;
+        let active = r#"{"id":7,"db_generation":"bbbb2222","project":"/lifecycle-project","agent":"CoralMarsh","path_pattern":"src/same.rs","exclusive":true,"reason":"same lease","created_ts":"2026-03-13T21:36:47.221175Z","expires_ts":"2026-03-13T23:36:47.221175Z","released_ts":null}"#;
+        std::fs::write(reservations_dir.join("id-7-gaaaa1111.json"), released)
+            .expect("released artifact");
+        std::fs::write(reservations_dir.join("id-7-gbbbb2222.json"), active)
+            .expect("active artifact");
+
+        let db_path = db_dir.path().join("lifecycle.sqlite3");
+        reconstruct_from_archive(&db_path, storage_root.path()).expect("reconstruct");
+
+        let conn = SqliteDbConn::open_file(db_path.display().to_string()).expect("open db");
+        let rows = conn
+            .query_sync(
+                "SELECT id, released_ts FROM file_reservations ORDER BY id ASC",
+                &[],
+            )
+            .expect("query reservations");
+        assert_eq!(rows.len(), 1, "one stable lease must produce one row");
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 7);
+        let expected_release = chrono::DateTime::parse_from_rfc3339("2026-03-13T22:00:00Z")
+            .unwrap()
+            .timestamp_micros();
+        assert_eq!(
+            rows[0].get_named::<Option<i64>>("released_ts").unwrap(),
+            Some(expected_release),
+            "released state must outrank an active artifact for the same lease"
         );
     }
 

@@ -7214,10 +7214,14 @@ fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyClea
         }
         _ => None,
     };
+    // FrankenSQLite does not use canonical SQLite's shared-memory index: a
+    // healthy live family may have no `-shm` pathname at all, or an empty
+    // compatibility placeholder. Rotate SHM only as a companion of a WAL
+    // that this classifier has independently proved damaged. Treating an
+    // empty SHM as standalone cleanup authority can rename a descriptor held
+    // by the live engine and leave a healthy framed WAL sidecarless.
     let shm = match sidecars.remove("-shm") {
-        Some(opened) if wal.is_some() || opened.len == 0 => {
-            Some(seal_sqlite_cleanup_sidecar(opened)?)
-        }
+        Some(opened) if wal.is_some() => Some(seal_sqlite_cleanup_sidecar(opened)?),
         _ => None,
     };
     // FrankenSQLite's WAL certificates describe the exact WAL/main generation.
@@ -9954,6 +9958,17 @@ where
             )),
         }
     });
+    // Canonical SQLite's WAL index lives in SHM. Unlike the bound Franken
+    // opener below, an offline canonical open has no namespace authority or
+    // engine-specific WAL certificate binding that can make a missing SHM
+    // unambiguous. Refuse before the exact-family probe can materialize a new
+    // SHM and accidentally turn a malformed source family into a green proof.
+    if sidecars.wal_exists && !sidecars.shm_exists {
+        return Err(SqlError::Custom(format!(
+            "{context}: refusing canonical read-only SQLite open for {} because a WAL sidecar exists without its required SHM companion",
+            sqlite_path.display()
+        )));
+    }
     let suspicious_family = if let Some(reason) = invalid_sidecar {
         Some(reason)
     } else if wal.state.is_damaged() {
@@ -9965,8 +9980,6 @@ where
         Some("the WAL pathname is occupied by an unreadable or non-regular object".to_string())
     } else if sidecars.shm_exists && sidecars.shm_bytes.is_none() {
         Some("the SHM pathname is occupied by an unreadable or non-regular object".to_string())
-    } else if sidecars.wal_exists && !sidecars.shm_exists {
-        Some("a WAL sidecar exists without its required SHM companion".to_string())
     } else if sidecars.shm_exists && !sidecars.wal_exists {
         Some("an orphan SHM sidecar exists without a WAL".to_string())
     // NOTE: a 0-byte SHM beside a WAL is NOT damage. A healthy, actively
@@ -10181,6 +10194,9 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
     });
     let wal = crate::wal_classify::classify_wal_sidecar(stable_path);
     let sidecars = inspect_mailbox_sidecar_state(stable_path);
+    let materialized_franken_wal_certificate =
+        std::fs::symlink_metadata(sqlite_sidecar_path(stable_path, "-wal-cert"))
+            .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0);
     let suspicious_family = if let Some(reason) = invalid_sidecar {
         Some(reason)
     } else if wal.state.is_damaged() {
@@ -10192,15 +10208,16 @@ fn preflight_bound_live_franken_family(stable_path: &Path, context: &str) -> Res
         Some("the WAL pathname is occupied by an unreadable or non-regular object".to_string())
     } else if sidecars.shm_exists && sidecars.shm_bytes.is_none() {
         Some("the SHM pathname is occupied by an unreadable or non-regular object".to_string())
-    } else if sidecars.wal_exists && !sidecars.shm_exists {
-        Some("a WAL sidecar exists without its required SHM companion".to_string())
+    } else if sidecars.wal_exists
+        && sidecars.shm_bytes.unwrap_or(0) == 0
+        && !materialized_franken_wal_certificate
+    {
+        Some("a SHM-less Franken WAL lacks a non-empty WAL certificate".to_string())
     } else if sidecars.shm_exists && !sidecars.wal_exists {
         Some("an orphan SHM sidecar exists without a WAL".to_string())
-    // NOTE: a 0-byte SHM beside a WAL is NOT damage — see the identical
-    // note in `preflight_guarded_offline_canonical_sqlite_family_with_probe`.
-    // Empirically a healthy live FrankenSQLite DB (WAL written milliseconds
-    // earlier) carries an empty `-shm`; refusing here broke every live
-    // read-only open with a spurious wal_sidecar_corruption classification.
+    // A zero-byte SHM is normal for a live FrankenSQLite WAL family, but only
+    // after the engine-specific WAL certificate above binds that SHM-less
+    // shape to an admitted Franken generation.
     } else if sidecars.journal_exists {
         Some("a rollback journal is attached to the live database family".to_string())
     } else {
@@ -14466,7 +14483,7 @@ mod tests {
     }
 
     #[test]
-    fn live_preflight_accepts_empty_shm_beside_populated_wal() {
+    fn live_preflight_accepts_certified_empty_shm_beside_populated_wal() {
         // Regression: a healthy, actively written FrankenSQLite database
         // routinely carries a 0-byte `-shm` beside a populated `-wal` (the
         // sidecar is created before its first mapping grows it). The strict
@@ -14498,6 +14515,12 @@ mod tests {
         let wal_bytes =
             std::fs::read(sqlite_sidecar_path(&db_path, "-wal")).expect("read fixture WAL bytes");
         assert!(!wal_bytes.is_empty(), "fixture WAL must carry frames");
+        let wal_cert_bytes = std::fs::read(sqlite_sidecar_path(&db_path, "-wal-cert"))
+            .expect("read fixture WAL certificate bytes");
+        assert!(
+            !wal_cert_bytes.is_empty(),
+            "fixture WAL certificate must bind the live Franken generation"
+        );
         drop(writer);
 
         let observed_directory = tempfile::tempdir().expect("observed tempdir");
@@ -14505,6 +14528,11 @@ mod tests {
         std::fs::write(&observed_db_path, &db_bytes).expect("write observed db");
         std::fs::write(sqlite_sidecar_path(&observed_db_path, "-wal"), &wal_bytes)
             .expect("write observed WAL");
+        std::fs::write(
+            sqlite_sidecar_path(&observed_db_path, "-wal-cert"),
+            &wal_cert_bytes,
+        )
+        .expect("write observed WAL certificate");
         let shm_path = sqlite_sidecar_path(&observed_db_path, "-shm");
         std::fs::write(&shm_path, b"").expect("write empty observed SHM");
         assert_eq!(std::fs::metadata(&shm_path).expect("shm metadata").len(), 0);
@@ -15097,7 +15125,15 @@ mod tests {
                 .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
             "Franken fixture must retain at least one committed WAL frame"
         );
-        assert!(sqlite_sidecar_path(&franken_db_path, "-shm").is_file());
+        assert!(
+            !sqlite_sidecar_path(&franken_db_path, "-shm").exists(),
+            "FrankenSQLite's healthy native WAL family does not require canonical SHM"
+        );
+        assert!(
+            std::fs::metadata(sqlite_sidecar_path(&franken_db_path, "-wal-cert"))
+                .is_ok_and(|metadata| metadata.len() > 0),
+            "SHM-less Franken WAL fixture must carry materialized WAL certificate authority"
+        );
         assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-gate").is_file());
         assert!(sqlite_sidecar_path(&franken_db_path, "-fsqlite-ns-use").is_file());
         let franken_before = exact_diagnostic_parent_snapshot(franken_directory.path());
@@ -24736,6 +24772,59 @@ mod tests {
             Vec::<PathBuf>::new(),
             "framed WAL classification must not quarantine its certificate head"
         );
+    }
+
+    #[test]
+    fn cleanup_preserves_franken_framed_wal_with_empty_shm_placeholder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("franken-empty-shm.sqlite3");
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open FrankenSQLite writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable WAL mode");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable automatic checkpoints");
+        writer
+            .execute_raw("CREATE TABLE live_value (value INTEGER NOT NULL);")
+            .expect("create live fixture table");
+        writer
+            .execute_raw("INSERT INTO live_value (value) VALUES (8);")
+            .expect("commit live WAL frame");
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        assert!(
+            std::fs::metadata(&wal_path)
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "fixture must retain a healthy framed WAL"
+        );
+        assert!(
+            !shm_path.exists(),
+            "FrankenSQLite's native WAL path should not require canonical SHM"
+        );
+        std::fs::write(&shm_path, []).expect("materialize empty compatibility SHM placeholder");
+        let family_before = exact_diagnostic_parent_snapshot(dir.path());
+
+        assert_eq!(
+            cleanup_truncated_wal_sidecar(&db_path).expect("classify healthy Franken family"),
+            SqliteFamilyCleanupOutcome::NotNeeded
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(dir.path()),
+            family_before,
+            "cleanup must not detach an empty SHM placeholder from a healthy Franken WAL family"
+        );
+        assert_eq!(
+            writer
+                .query_sync("SELECT value FROM live_value", &[])
+                .expect("query live value after cleanup classification")[0]
+                .get_named::<i64>("value")
+                .expect("decode live value"),
+            8
+        );
+        crate::close_db_conn(writer, "clean up empty-SHM regression writer");
     }
 
     #[test]
