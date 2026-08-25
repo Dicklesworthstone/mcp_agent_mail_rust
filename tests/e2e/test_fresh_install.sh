@@ -848,12 +848,16 @@ PY
     OMP_PROJECT_DIR="${OMP_INSTALLER_DIR}/project-defer"
     OMP_PROJECT_CONFIG="${OMP_PROJECT_DIR}/.omp/mcp.json"
     OMP_PROJECT_FAKE_CLI="${OMP_INSTALLER_DIR}/failing-am"
+    OMP_PROJECT_NATIVE_MARKER="${OMP_INSTALLER_DIR}/native-setup-invoked"
     mkdir -p "${OMP_PROJECT_DIR}/.omp"
     printf '%s\n' '{"mcpServers":{"sibling":{"command":"node"}}}' > "${OMP_PROJECT_CONFIG}"
     cat > "${OMP_PROJECT_FAKE_CLI}" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "setup" ] && [ "${2:-}" = "--help" ]; then
   exit 0
+fi
+if [ "${1:-}" = "setup" ] && [ "${2:-}" = "run" ]; then
+  printf '%s' "${HTTP_BEARER_TOKEN:-}" > "${OMP_PROJECT_NATIVE_MARKER:?}"
 fi
 exit 7
 EOF
@@ -887,6 +891,7 @@ EOF
       # shellcheck disable=SC1090
       source "${OMP_UPDATE_LIBRARY}"
       cd "${OMP_PROJECT_DIR}"
+      export OMP_PROJECT_NATIVE_MARKER
       setup_mcp_configs "/unused/mcp-agent-mail"
       update_mcp_configs "/unused/mcp-agent-mail" "${OMP_PROJECT_FAKE_CLI}"
       printf '%s' "${OMP_PROJECT_DIRECT_WRITES}"
@@ -898,6 +903,8 @@ EOF
       "$(cat "${OMP_PROJECT_CONFIG}")"
     e2e_assert_not_contains "failed native setup leaves no project bearer" \
       "$(cat "${OMP_PROJECT_CONFIG}")" "project-secret"
+    e2e_assert_eq "installer invoked native setup with the selected bearer" \
+      "project-secret" "$(cat "${OMP_PROJECT_NATIVE_MARKER}")"
     if [ -e "${OMP_PROJECT_DIR}/.gitignore" ]; then
       e2e_fail "failed native setup does not fake a secured project write" \
         "no .gitignore side effect" "created .gitignore"

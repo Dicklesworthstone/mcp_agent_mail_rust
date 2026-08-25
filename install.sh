@@ -4452,15 +4452,19 @@ setup_mcp_configs() {
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" != "1" ] && continue
 
-    # Project-local OMP configs can carry the generated bearer token. Leave
-    # them exclusively to the native `am setup` phase, which first secures
-    # `.omp/mcp.json` in the project `.gitignore`. If that later phase is
-    # unavailable or fails, the installer must not leave a new trackable
-    # credential behind.
+    # Project-local OMP configs can carry the generated bearer token. Native
+    # setup owns the higher-precedence `.omp/mcp.json` and secures it in the
+    # project `.gitignore` before writing. Portable fallback files may already
+    # be tracked or shared with another MCP client, so the installer leaves
+    # them untouched rather than injecting a literal credential.
     if [ "$tool" = "omp" ]; then
       case "$path" in
-        "$PWD/.omp/mcp.json"|"$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
+        "$PWD/.omp/mcp.json")
           verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
+          continue
+          ;;
+        "$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
+          verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
           continue
           ;;
       esac
@@ -4502,8 +4506,12 @@ setup_mcp_configs() {
 
     if [ "$tool" = "omp" ]; then
       case "$path" in
-        "$PWD/.omp/mcp.json"|"$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
+        "$PWD/.omp/mcp.json")
           verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
+          continue
+          ;;
+        "$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
+          verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
           continue
           ;;
       esac
