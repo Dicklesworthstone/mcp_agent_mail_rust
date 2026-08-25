@@ -33744,7 +33744,7 @@ fn fix_mcp_config_entry(
             &action,
             desired_bearer_token.is_some_and(|token| !token.is_empty()),
         )
-            .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
+        .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
         return Ok(format!(
             "Updated {} with an atomic backup",
             config_path.display()
@@ -52334,6 +52334,47 @@ http_headers = { Authorization = "Bearer secret" }
             mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
         )
         .expect_err("tracked OMP config must fail before receiving a bearer token");
+
+        assert!(error.contains("Git-tracked config"), "{error}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(!mcp_config_backup_candidate(&config, None).exists());
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_refuses_tracked_toml_before_writing_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".codex/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = r#"[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:9999/mcp/"
+"#;
+        std::fs::write(&config, original).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", "--", ".codex/config.toml"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = fix_mcp_config_entry(
+            &config,
+            "http://127.0.0.1:8765/mcp/",
+            Some("must-not-enter-index"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
+        )
+        .expect_err("tracked TOML config must fail before receiving a bearer token");
 
         assert!(error.contains("Git-tracked config"), "{error}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
