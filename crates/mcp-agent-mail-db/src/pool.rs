@@ -14490,21 +14490,27 @@ mod tests {
         writer
             .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (9);")
             .expect("commit WAL frame");
-        // Keep the writer OPEN: closing the last connection checkpoints and
-        // deletes the WAL, destroying exactly the live shape under test.
-        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
-        std::fs::write(&shm_path, b"").expect("truncate SHM to zero bytes");
-        assert_eq!(std::fs::metadata(&shm_path).expect("shm metadata").len(), 0);
-        assert!(
-            std::fs::metadata(sqlite_sidecar_path(&db_path, "-wal"))
-                .expect("wal metadata")
-                .len()
-                > 0
-        );
-
-        preflight_bound_live_franken_family(&db_path, "empty-shm regression")
-            .expect("live preflight must accept an empty SHM beside a populated WAL");
+        // Capture the family bytes while the writer is still open (closing the
+        // last connection would checkpoint and delete the WAL), then rebuild
+        // the shape at a second path with NO live engine attached: mutating a
+        // live-mapped -shm in place would SIGBUS the mapping holder.
+        let db_bytes = std::fs::read(&db_path).expect("read fixture db bytes");
+        let wal_bytes =
+            std::fs::read(sqlite_sidecar_path(&db_path, "-wal")).expect("read fixture WAL bytes");
+        assert!(!wal_bytes.is_empty(), "fixture WAL must carry frames");
         drop(writer);
+
+        let observed_directory = tempfile::tempdir().expect("observed tempdir");
+        let observed_db_path = observed_directory.path().join("empty-shm-observed.sqlite3");
+        std::fs::write(&observed_db_path, &db_bytes).expect("write observed db");
+        std::fs::write(sqlite_sidecar_path(&observed_db_path, "-wal"), &wal_bytes)
+            .expect("write observed WAL");
+        let shm_path = sqlite_sidecar_path(&observed_db_path, "-shm");
+        std::fs::write(&shm_path, b"").expect("write empty observed SHM");
+        assert_eq!(std::fs::metadata(&shm_path).expect("shm metadata").len(), 0);
+
+        preflight_bound_live_franken_family(&observed_db_path, "empty-shm regression")
+            .expect("live preflight must accept an empty SHM beside a populated WAL");
     }
 
     #[test]
