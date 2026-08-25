@@ -33666,6 +33666,8 @@ fn fix_mcp_config_entry(
     validate_real_file_target_path(config_path, "MCP config").map_err(|error| error.to_string())?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+    let secret_write = desired_bearer_token.is_some_and(|token| !token.is_empty())
+        || content.contains("Bearer ");
 
     if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
         let fixed = fix_mcp_config_toml_text(&content, desired_url, desired_bearer_token)
@@ -33675,7 +33677,7 @@ fn fix_mcp_config_entry(
                     config_path.display()
                 )
             })?;
-        if desired_bearer_token.is_some_and(|token| !token.is_empty()) {
+        if secret_write {
             mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
                 .map_err(|error| error.to_string())?;
         }
@@ -33725,7 +33727,7 @@ fn fix_mcp_config_entry(
     }
 
     if tool != mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
-        && desired_bearer_token.is_some_and(|token| !token.is_empty())
+        && secret_write
     {
         mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
             .map_err(|error| error.to_string())?;
@@ -33742,7 +33744,7 @@ fn fix_mcp_config_entry(
         };
         mcp_agent_mail_core::setup::write_config_atomic(
             &action,
-            desired_bearer_token.is_some_and(|token| !token.is_empty()),
+            secret_write,
         )
         .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
         return Ok(format!(

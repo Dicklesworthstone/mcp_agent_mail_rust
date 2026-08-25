@@ -667,6 +667,7 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
         return Ok(());
     }
 
+    ensure_secret_config_not_git_tracked(env_path)?;
     write_setup_file_atomic(env_path, content.as_bytes(), 0o600, "token env file")?;
     Ok(())
 }
@@ -1839,6 +1840,17 @@ fn write_setup_backup(
     Ok(())
 }
 
+fn escape_gitignore_literal(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if matches!(character, '\\' | '!' | '#' | '[' | ']' | '*' | '?' | ' ') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 /// Secure a literal-credential config before writing it in a Git worktree.
 ///
 /// Adding a path to `.gitignore` does not make an already tracked file safe:
@@ -1931,17 +1943,22 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
             ))
         })?;
         let relative = relative.replace('\\', "/");
-        let (directory, basename) = relative.rsplit_once('/').map_or(("", relative.as_str()), |parts| parts);
-        let prefix = if directory.is_empty() {
+        let (directory, basename) = relative
+            .rsplit_once('/')
+            .map_or(("", relative.as_str()), |parts| parts);
+        let escaped_directory = escape_gitignore_literal(directory);
+        let escaped_basename = escape_gitignore_literal(basename);
+        let escaped_relative = escape_gitignore_literal(&relative);
+        let prefix = if escaped_directory.is_empty() {
             "/".to_string()
         } else {
-            format!("/{directory}/")
+            format!("/{escaped_directory}/")
         };
         let entries = [
-            format!("/{relative}"),
-            format!("{prefix}.{basename}.*.tmp"),
-            format!("{prefix}.{basename}.*.bak"),
-            format!("/{relative}.bak*"),
+            format!("/{escaped_relative}"),
+            format!("{prefix}.{escaped_basename}.*.tmp"),
+            format!("{prefix}.{escaped_basename}.*.bak"),
+            format!("/{escaped_relative}.bak*"),
         ];
         let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
         ensure_gitignore_entries(&repo_root.join(".gitignore"), &entry_refs)?;
@@ -2031,7 +2048,10 @@ pub fn write_config_atomic(
         } => merge_toml_section(existing.as_deref(), section_header, key_values),
     };
 
-    if contains_literal_secret {
+    let existing_may_contain_literal_secret = existing
+        .as_deref()
+        .is_some_and(|content| content.contains("Bearer "));
+    if contains_literal_secret || existing_may_contain_literal_secret {
         ensure_secret_config_not_git_tracked(&action.file_path)?;
     }
 
