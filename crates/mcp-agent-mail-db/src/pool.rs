@@ -3830,6 +3830,7 @@ impl DbPool {
             "startup integrity check",
         )?;
         let run_live_check = || -> DbResult<integrity::IntegrityCheckResult> {
+            self.validated_sqlite_path("startup integrity live open")?;
             let conn = crate::guard_db_conn(
                 match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                     Ok(conn) => conn,
@@ -4030,6 +4031,7 @@ impl DbPool {
         conn: &DbConn,
         phase: &str,
     ) -> DbResult<integrity::IntegrityCheckResult> {
+        self.validated_sqlite_path("quick integrity canonical fallback")?;
         reconcile_with_canonical(
             integrity::quick_check(conn),
             integrity::CheckKind::Quick,
@@ -4347,6 +4349,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
         }
+        self.validated_sqlite_path("passive wal checkpoint")?;
         let conn = crate::guard_db_conn(
             open_sqlite_file_with_lock_retry(&self.sqlite_path)
                 .map_err(|e| DbError::Sqlite(format!("passive checkpoint: open failed: {e}")))?,
@@ -4381,7 +4384,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(None);
         }
-        let primary = Path::new(&self.sqlite_path);
+        let primary = self.validated_sqlite_path("proactive backup")?;
         if !primary.exists() {
             return Ok(None);
         }
@@ -4625,6 +4628,16 @@ impl DbPool {
         let Some(atc_path) = self.atc_sqlite_path() else {
             return Ok(());
         };
+        self.validated_sqlite_path("ATC sidecar vacuum")?;
+        validate_frozen_sqlite_open_authority(
+            &atc_path,
+            Some(Path::new(&atc_path)),
+            "ATC sidecar vacuum",
+        )
+        .map_err(|error| DbError::InvalidArgument {
+            field: "database_url",
+            message: error.to_string(),
+        })?;
         if !std::path::Path::new(&atc_path).exists() {
             return Ok(());
         }
@@ -4679,7 +4692,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(None);
         }
-        let primary = Path::new(&self.sqlite_path);
+        let primary = self.validated_sqlite_path("verified snapshot")?;
         let db = &mcp_agent_mail_core::global_metrics().db;
 
         // Verify the live DB is fully clean before trusting it as a snapshot.
@@ -4745,6 +4758,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(false);
         }
+        let primary_path = self.validated_sqlite_path("runtime corruption recovery")?;
         let storage_root = self.validated_storage_root("runtime corruption archive recovery")?;
 
         if RECOVERY_IN_PROGRESS
@@ -4770,7 +4784,6 @@ impl DbPool {
             "runtime corruption detected; attempting automatic recovery"
         );
 
-        let primary_path = Path::new(&self.sqlite_path);
         let on_disk_healthy = match sqlite_file_is_healthy(primary_path) {
             Ok(true) => {
                 // The query that triggered this recovery failed with a
@@ -16956,6 +16969,15 @@ mod tests {
                         .contains("refusing to cross database authority")
                 }),
                 "a symlink inserted after construction must fail closed before the lazy open"
+            );
+            let integrity_error = unopened_pool
+                .run_startup_integrity_check()
+                .expect_err("direct integrity I/O must reject a retargeted SQLite authority");
+            assert!(
+                integrity_error
+                    .to_string()
+                    .contains("refusing to cross database authority"),
+                "unexpected direct-method authority error: {integrity_error}"
             );
             symlink(
                 db_b.parent().expect("database B has a parent"),
