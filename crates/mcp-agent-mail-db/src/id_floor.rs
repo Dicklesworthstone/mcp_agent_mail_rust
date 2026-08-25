@@ -1070,7 +1070,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, Some(100));
+        assert_eq!(
+            result, None,
+            "the transaction must observe the newer allocator floor and leave it unchanged"
+        );
         let rows = conn
             .query_sync(
                 "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",

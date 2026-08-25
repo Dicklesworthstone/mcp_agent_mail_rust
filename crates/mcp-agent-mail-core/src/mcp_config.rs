@@ -127,7 +127,8 @@ pub fn detect_mcp_config_locations(params: &McpConfigDetectParams) -> Vec<McpCon
 /// files, but its own writer only targets the active profile's `mcp.json` and
 /// the project's `.omp/mcp.json`. Keep the broader read-only inventory in
 /// [`detect_mcp_config_locations`], while excluding OMP compatibility files
-/// from mutation authority here.
+/// from mutation authority here. A compatibility path is excluded by physical
+/// path even when another detector emits an alias with a different tool label.
 #[must_use]
 pub fn detect_mcp_config_mutation_locations(
     params: &McpConfigDetectParams,
@@ -1461,9 +1462,95 @@ mod tests {
             tmp.path().join("project/.mcp.json"),
         ] {
             assert!(
-                !contains_location(&mutation_locations, McpConfigTool::Omp, &fallback),
-                "OMP compatibility fallback must stay read-only: {}",
+                !mutation_locations
+                    .iter()
+                    .any(|location| location.config_path == fallback),
+                "OMP compatibility fallback must stay read-only under every tool alias: {}",
                 fallback.display()
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_locations_exclude_shared_omp_fallback_under_claude_alias() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(home.join(".omp/agent")).expect("create OMP agent directory");
+        std::fs::create_dir_all(project.join(".omp")).expect("create project OMP directory");
+
+        let params = McpConfigDetectParams {
+            home_dir: Some(home.clone()),
+            project_dir: Some(project.clone()),
+            ..McpConfigDetectParams::default()
+        };
+        let read_locations = detect_mcp_config_locations(&params);
+        let shared_fallback = project.join(".mcp.json");
+        assert!(contains_location(
+            &read_locations,
+            McpConfigTool::Claude,
+            &shared_fallback
+        ));
+        assert!(contains_location(
+            &read_locations,
+            McpConfigTool::Omp,
+            &shared_fallback
+        ));
+
+        let mutation_locations = detect_mcp_config_mutation_locations(&params);
+        assert!(
+            !mutation_locations
+                .iter()
+                .any(|location| location.config_path == shared_fallback),
+            "a read-only OMP fallback must not regain mutation authority through its Claude alias"
+        );
+        assert!(contains_location(
+            &mutation_locations,
+            McpConfigTool::Omp,
+            &home.join(".omp/agent/mcp.json")
+        ));
+        assert!(contains_location(
+            &mutation_locations,
+            McpConfigTool::Omp,
+            &project.join(".omp/mcp.json")
+        ));
+    }
+
+    #[test]
+    fn detect_locations_reject_parent_traversal_after_missing_omp_ancestor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&project).expect("create project");
+        let traversing_config = home
+            .join("missing-profile")
+            .join("..")
+            .join("outside")
+            .join("mcp.json");
+        assert!(
+            !home.join("missing-profile").exists(),
+            "the negative control requires a missing component before `..`"
+        );
+
+        let params = McpConfigDetectParams {
+            home_dir: Some(home),
+            project_dir: Some(project),
+            omp_user_mcp_config: Some(traversing_config.clone()),
+            ..McpConfigDetectParams::default()
+        };
+        for locations in [
+            detect_mcp_config_locations(&params),
+            detect_mcp_config_mutation_locations(&params),
+        ] {
+            assert!(
+                !locations.iter().any(|location| {
+                    location.tool == McpConfigTool::Omp
+                        && (location.config_path == traversing_config
+                            || location.config_path
+                                == traversing_config.with_file_name(".mcp.json"))
+                }),
+                "OMP authority containing parent traversal must fail closed even after a missing ancestor"
             );
         }
     }

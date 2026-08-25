@@ -337,6 +337,7 @@ absolute_agent_dir="$relative_agent_home/absolute-agent"
 mkdir -p "$absolute_agent_dir"
 printf '%s\n' '{}' >"$absolute_agent_dir/mcp.json"
 absolute_agent_targets="$(
+    cd "$relative_agent_root"
     unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
     HOME="$relative_agent_home" PI_CODING_AGENT_DIR="$absolute_agent_dir" \
         PATH="$relative_home_path" remote_http_client_target_tools
@@ -379,6 +380,7 @@ safe_config_home="$tmp/safe-config-home"
 mkdir -p "$safe_config_home/custom-root/nested/agent"
 printf '%s\n' '{}' >"$safe_config_home/custom-root/nested/agent/mcp.json"
 safe_config_targets="$(
+    cd "$relative_agent_root"
     unset APPDATA OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
     HOME="$safe_config_home" PI_CONFIG_DIR=custom-root/nested \
         PATH="$relative_home_path" remote_http_client_target_tools
