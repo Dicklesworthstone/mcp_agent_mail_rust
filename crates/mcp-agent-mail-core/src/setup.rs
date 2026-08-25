@@ -1839,13 +1839,13 @@ fn write_setup_backup(
     Ok(())
 }
 
-/// Refuse to place a literal credential in a Git-tracked config file.
+/// Secure a literal-credential config before writing it in a Git worktree.
 ///
 /// Adding a path to `.gitignore` does not make an already tracked file safe:
 /// the next `git diff` or commit would still expose the credential. This check
-/// deliberately asks Git about the exact path immediately before the write.
-/// If the path is inside an apparent worktree but Git cannot answer reliably,
-/// it fails closed.
+/// therefore refuses tracked targets, then atomically appends anchored ignore
+/// rules for the live file and every adjacent backup/temp name used by setup
+/// and doctor. If Git cannot answer reliably, it fails closed.
 pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -1859,7 +1859,7 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
     })?;
     let repo_probe = crate::git_cmd::GitCmd::new(&parent)
         .env("LC_ALL", "C")
-        .args(["rev-parse", "--is-inside-work-tree"])
+        .args(["rev-parse", "--show-toplevel"])
         .run()
         .map_err(|error| {
             SetupError::Other(format!(
@@ -1878,14 +1878,38 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
             stderr.trim()
         )));
     }
-    if String::from_utf8_lossy(&repo_probe.stdout).trim() != "true" {
-        return Ok(());
+    if std::env::var_os("GIT_INDEX_FILE").is_some() {
+        return Err(SetupError::Other(format!(
+            "cannot verify whether secret config {} is Git-tracked while GIT_INDEX_FILE selects an alternate index",
+            path.display()
+        )));
     }
 
-    let tracked_probe = crate::git_cmd::GitCmd::new(&parent)
+    let repo_root_output = String::from_utf8(repo_probe.stdout).map_err(|_| {
+        SetupError::Other(format!(
+            "cannot verify whether secret config {} is Git-tracked: repository root is not UTF-8",
+            path.display()
+        ))
+    })?;
+    let repo_root = std::fs::canonicalize(repo_root_output.trim()).map_err(|error| {
+        SetupError::Other(format!(
+            "cannot resolve Git worktree for secret config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let target = parent.join(file_name);
+    let relative = target.strip_prefix(&repo_root).map_err(|_| {
+        SetupError::Other(format!(
+            "secret config {} is outside the resolved Git worktree {}",
+            path.display(),
+            repo_root.display()
+        ))
+    })?;
+
+    let tracked_probe = crate::git_cmd::GitCmd::new(&repo_root)
         .env("LC_ALL", "C")
         .args(["ls-files", "--error-unmatch", "--"])
-        .arg(file_name)
+        .arg(relative.as_os_str())
         .run()
         .map_err(|error| {
             SetupError::Other(format!(
@@ -1900,6 +1924,27 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
         )));
     }
     if tracked_probe.status.code() == Some(1) {
+        let relative = relative.to_str().ok_or_else(|| {
+            SetupError::Other(format!(
+                "cannot protect non-UTF-8 secret config path {} with .gitignore",
+                path.display()
+            ))
+        })?;
+        let relative = relative.replace('\\', "/");
+        let (directory, basename) = relative.rsplit_once('/').map_or(("", relative.as_str()), |parts| parts);
+        let prefix = if directory.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{directory}/")
+        };
+        let entries = [
+            format!("/{relative}"),
+            format!("{prefix}.{basename}.*.tmp"),
+            format!("{prefix}.{basename}.*.bak"),
+            format!("/{relative}.bak*"),
+        ];
+        let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
+        ensure_gitignore_entries(&repo_root.join(".gitignore"), &entry_refs)?;
         return Ok(());
     }
     Err(SetupError::Other(format!(
@@ -3367,6 +3412,7 @@ fn normalize_status_url_path(path: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::process::Command;
 
     fn setup_real_tempdir() -> tempfile::TempDir {
         let temp_root =
@@ -3830,6 +3876,61 @@ mod tests {
                     .to_string_lossy()
                     .contains(".bak"))
         );
+    }
+
+    #[test]
+    fn run_setup_token_rotation_keeps_live_config_and_backup_out_of_git_status() {
+        let tmp = setup_real_tempdir();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut params = SetupParams {
+            token: "old-secret-token".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let first = run_setup(&params);
+        assert!(matches!(
+            first[0].actions[0].outcome,
+            ActionOutcome::Created
+        ));
+        params.token = "new-secret-token".into();
+        let second = run_setup(&params);
+        assert!(matches!(
+            second[0].actions[0].outcome,
+            ActionOutcome::Updated
+        ));
+
+        let backup = std::fs::read_dir(tmp.path().join(".omp"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .expect("token rotation must preserve the old config in a backup");
+        assert!(
+            std::fs::read_to_string(backup.path())
+                .unwrap()
+                .contains("Bearer old-secret-token")
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status = String::from_utf8(status.stdout).unwrap();
+        assert!(!status.contains(".omp/"), "secret artifacts leaked: {status}");
+        assert!(!status.contains(".bak"), "backup leaked: {status}");
     }
 
     #[test]
