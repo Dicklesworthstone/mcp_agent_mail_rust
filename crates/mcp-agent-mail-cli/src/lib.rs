@@ -8026,12 +8026,19 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     };
 
     let existing_cache = read_setup_self_heal_cache(config, &project_dir);
-    let omp_user_config_path_override = if target_agents.contains(&setup::AgentPlatform::Omp) {
+    let omp_is_targeted = target_agents.contains(&setup::AgentPlatform::Omp);
+    let omp_user_config_path_override = if omp_is_targeted {
         setup::omp_config_paths_from_env()
             .map_err(|error| CliError::Other(error.to_string()))?
             .map(|paths| paths.user_mcp_config)
     } else {
         None
+    };
+    let omp_settings_overlay_paths = if omp_is_targeted {
+        setup::omp_settings_overlay_paths_from_env(&project_dir)
+            .map_err(|error| CliError::Other(error.to_string()))?
+    } else {
+        Vec::new()
     };
 
     let params = setup::SetupParams {
@@ -8042,6 +8049,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         project_dir: project_dir.clone(),
         home_dir_override: None,
         omp_user_config_path_override,
+        omp_settings_overlay_paths,
         agents: Some(target_agents.clone()),
         dry_run: false,
         skip_user_config: existing_cache
@@ -8199,7 +8207,9 @@ fn project_only_omp_setup_drift(
             status
                 .config_files
                 .iter()
-                .filter(|file| file.omp_active_user_config_drift)
+                .filter(|file| {
+                    file.omp_active_user_config_drift || file.omp_settings_config_drift
+                })
                 .map(|file| setup_status_file_drift_summary(&status.slug, file))
         })
         .collect()
@@ -8276,6 +8286,9 @@ fn collect_setup_self_heal_file_fingerprints(
         // Fingerprint that read-only authority so the cache cannot bypass a
         // status check after it changes.
         paths.insert(mcp_agent_mail_core::setup::omp_active_user_config_path(
+            params,
+        ));
+        paths.extend(mcp_agent_mail_core::setup::omp_settings_authority_paths(
             params,
         ));
     }
@@ -15230,6 +15243,13 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 } else {
                     None
                 };
+            let omp_settings_overlay_paths =
+                if target_agents.contains(&setup::AgentPlatform::Omp) {
+                    setup::omp_settings_overlay_paths_from_env(&pdir)
+                        .map_err(|error| CliError::Other(error.to_string()))?
+                } else {
+                    Vec::new()
+                };
 
             let params = setup::SetupParams {
                 host,
@@ -15239,6 +15259,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 project_dir: pdir.clone(),
                 home_dir_override: None,
                 omp_user_config_path_override,
+                omp_settings_overlay_paths,
                 agents: Some(target_agents),
                 dry_run,
                 skip_user_config: no_user_config,
@@ -15350,6 +15371,15 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             } else {
                 None
             };
+            let omp_settings_overlay_paths = if agents
+                .as_ref()
+                .is_none_or(|agents| agents.contains(&setup::AgentPlatform::Omp))
+            {
+                setup::omp_settings_overlay_paths_from_env(&pdir)
+                    .map_err(|error| CliError::Other(error.to_string()))?
+            } else {
+                Vec::new()
+            };
 
             let params = setup::SetupParams {
                 host,
@@ -15359,6 +15389,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 token: resolved_token,
                 agents,
                 omp_user_config_path_override,
+                omp_settings_overlay_paths,
                 skip_user_config: no_user_config,
                 skip_hooks: no_hooks,
                 ..Default::default()

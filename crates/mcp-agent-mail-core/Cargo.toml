@@ -14,6 +14,7 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
 json5.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
@@ -26,6 +27,7 @@ shellexpand = "3"
 shlex = "2"
 sha1.workspace = true
 sha2.workspace = true
+hex.workspace = true
 fs2.workspace = true
 globset.workspace = true
 # `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`.

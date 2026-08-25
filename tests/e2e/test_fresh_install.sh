@@ -892,6 +892,7 @@ PY
     OMP_PROJECT_OVERRIDE_CONFIG="${OMP_PROJECT_DIR}/.omp/agent/mcp.json"
     OMP_PROJECT_CURSOR_CONFIG="${OMP_PROJECT_DIR}/cursor.mcp.json"
     OMP_PROJECT_CODEX_CONFIG="${OMP_PROJECT_DIR}/codex.mcp.json"
+    OMP_PROJECT_OUTSIDE_CONFIG="${OMP_INSTALLER_DIR}/outside-user-mcp.json"
     OMP_PROJECT_FAKE_CLI="${OMP_INSTALLER_DIR}/failing-am"
     OMP_PROJECT_NATIVE_MARKER="${OMP_INSTALLER_DIR}/native-setup-invoked"
     mkdir -p "${OMP_PROJECT_DIR}/.omp/agent"
@@ -899,6 +900,7 @@ PY
     printf '%s\n' '{"mcpServers":{"override-sibling":{"command":"node"}}}' > "${OMP_PROJECT_OVERRIDE_CONFIG}"
     printf '%s\n' '{"mcpServers":{"cursor-sibling":{"command":"node"}}}' > "${OMP_PROJECT_CURSOR_CONFIG}"
     printf '%s\n' '{"mcpServers":{"codex-sibling":{"command":"node"}}}' > "${OMP_PROJECT_CODEX_CONFIG}"
+    printf '%s\n' '{"mcpServers":{"outside-sibling":{"command":"node"}}}' > "${OMP_PROJECT_OUTSIDE_CONFIG}"
     cat > "${OMP_PROJECT_FAKE_CLI}" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "setup" ] && [ "${2:-}" = "--help" ]; then
@@ -914,13 +916,20 @@ EOF
     OMP_PROJECT_DEFER_CONTRACT="$(
       # shellcheck disable=SC2329
       detect_mcp_configs() {
-        printf 'omp\t%s\t1\nomp\t%s\t1\ncursor\t%s\t1\ncodex\t%s\t1\n' \
-          "${OMP_PROJECT_CONFIG}" '.omp/agent/mcp.json' 'cursor.mcp.json' 'codex.mcp.json'
+        printf 'omp\t%s\t1\nomp\t%s\t1\ncursor\t%s\t1\ncodex\t%s\t1\nopencode\t%s\t1\n' \
+          "${OMP_PROJECT_CONFIG}" '.omp/agent/mcp.json' 'cursor.mcp.json' 'codex.mcp.json' \
+          "${OMP_PROJECT_OUTSIDE_CONFIG}"
       }
       # shellcheck disable=SC2329
       resolve_setup_http_bearer_token() { printf '%s' 'project-secret'; }
       # shellcheck disable=SC2329
       generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
+      # shellcheck disable=SC2329
+      rust_config_env_path() { printf '%s' "${OMP_INSTALLER_DIR}/failure-xdg/mcp-agent-mail/config.env"; }
+      # shellcheck disable=SC2329
+      token_env_targets_outside_git_worktrees() { return 0; }
+      # shellcheck disable=SC2329
+      read_env_assignment_value() { return 0; }
       # shellcheck disable=SC2329
       OMP_PROJECT_DIRECT_WRITES=0
       setup_claude_code_mcp_via_cli() {
@@ -949,9 +958,7 @@ EOF
       cd "${OMP_PROJECT_DIR}"
       export HOME="${OMP_PROJECT_DIR}"
       export OMP_PROJECT_NATIVE_MARKER
-      setup_mcp_configs "/unused/mcp-agent-mail"
-      update_mcp_configs "/unused/mcp-agent-mail" "${OMP_PROJECT_FAKE_CLI}"
-      sync_codex_http_configs "/unused/mcp-agent-mail"
+      configure_mcp_clients "/unused/mcp-agent-mail" "${OMP_PROJECT_FAKE_CLI}" || true
       printf '%s' "${OMP_PROJECT_DIRECT_WRITES}"
     )"
     e2e_assert_eq "installer defers project OMP bearer writes when native setup fails" \
@@ -961,6 +968,11 @@ EOF
       "$(cat "${OMP_PROJECT_CONFIG}")"
     e2e_assert_not_contains "failed native setup leaves no project bearer" \
       "$(cat "${OMP_PROJECT_CONFIG}")" "project-secret"
+    e2e_assert_eq "failed native setup leaves outside client config byte-preserved" \
+      '{"mcpServers":{"outside-sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_OUTSIDE_CONFIG}")"
+    e2e_assert_not_contains "failed native setup publishes no bearer to outside clients" \
+      "$(cat "${OMP_PROJECT_OUTSIDE_CONFIG}")" "project-secret"
     e2e_assert_eq "installer leaves project-local OMP override byte-preserved" \
       '{"mcpServers":{"override-sibling":{"command":"node"}}}' \
       "$(cat "${OMP_PROJECT_OVERRIDE_CONFIG}")"
@@ -1018,7 +1030,7 @@ else
 
   sed -n '/^strip_wrapping_quotes() {/,/^python_db_format_needs_import() {/p' "${INSTALL_SH}" \
     | sed '$d' > "${LEGACY_ENV_LIBRARY}"
-  sed -n '/^git_worktree_root_for_path() {/,/^resolve_migrated_bearer_token() {/p' "${INSTALL_SH}" \
+  sed -n '/^git_authority_probe() (/,/^resolve_migrated_bearer_token() {/p' "${INSTALL_SH}" \
     | sed '$d' >> "${LEGACY_ENV_LIBRARY}"
   sed -n '/^path_resolves_within_directory() {/,/^mcp_config_must_skip_shell_write() {/p' "${INSTALL_SH}" \
     | sed '$d' >> "${LEGACY_ENV_LIBRARY}"
@@ -1046,6 +1058,7 @@ EOF
       source "${LEGACY_ENV_LIBRARY}"
       cd "${LEGACY_PROJECT_DIR}"
       export HOME="${LEGACY_PROJECT_DIR}"
+      unset XDG_CONFIG_HOME
       export PYTHON_CLONE_FOUND=0
       export PYTHON_CLONE_PATH=""
       export RUST_STORAGE_ROOT="${LEGACY_PROJECT_DIR}/mailbox"
@@ -1096,6 +1109,7 @@ EOF
       source "${LEGACY_ENV_LIBRARY}"
       cd "${LEGACY_PROJECT_DIR}"
       export HOME="${LEGACY_OTHER_PROJECT_DIR}"
+      unset XDG_CONFIG_HOME
       export PYTHON_CLONE_FOUND=0
       export PYTHON_CLONE_PATH=""
       export RUST_STORAGE_ROOT="${LEGACY_OTHER_PROJECT_DIR}/mailbox"
@@ -1145,6 +1159,7 @@ EOF
       source "${LEGACY_ENV_LIBRARY}"
       cd "${LEGACY_PROJECT_DIR}"
       export HOME="${LEGACY_OUTSIDE_HOME}"
+      unset XDG_CONFIG_HOME
       export PYTHON_CLONE_FOUND=0
       export PYTHON_CLONE_PATH=""
       export RUST_STORAGE_ROOT="${LEGACY_OUTSIDE_HOME}/mailbox"

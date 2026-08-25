@@ -80,6 +80,7 @@ mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 franken-agent-detection = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_norway = "0.9.42"
 toml = "1.1.2"
 toml_edit = "0.25"
 json5 = "1.3.1"

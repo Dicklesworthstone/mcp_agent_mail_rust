@@ -2897,7 +2897,7 @@ static MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<usize, MessageIdAllocatorEn
 /// disappear once no pool wrapper retains them. Recovery retires the old
 /// allocator and removes the identity before a replacement pool opens, so
 /// surviving old wrappers cannot diverge from the new generation.
-static FILE_MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<String, FileMessageIdAllocatorEntry>>> =
+static FILE_MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<PathBuf, FileMessageIdAllocatorEntry>>> =
     OnceLock::new();
 static NEXT_POOL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -2913,8 +2913,7 @@ fn shared_message_id_allocator(
     sqlite_path: &str,
     storage_root: &Path,
 ) -> DbResult<(Arc<crate::id_floor::MessageIdAllocator>, u64)> {
-    let file_identity = (sqlite_path != ":memory:")
-        .then(|| normalize_sqlite_identity_path(sqlite_path));
+    let file_identity = normalize_file_sqlite_identity(sqlite_path);
     let storage_root_identity = normalize_sqlite_identity_path_buf(storage_root);
     let per_pool_registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut per_pool_entries = per_pool_registry
@@ -2927,7 +2926,7 @@ fn shared_message_id_allocator(
     if let Some(entry) = per_pool_entries.get(&key) {
         if entry.storage_root_identity != storage_root_identity {
             return Err(message_id_storage_root_conflict(
-                file_identity.as_deref().unwrap_or(":memory:"),
+                file_identity.as_deref(),
                 entry.storage_root_identity.as_path(),
                 storage_root_identity.as_path(),
             ));
@@ -2952,7 +2951,7 @@ fn shared_message_id_allocator(
             if let Some((established_root, weak_allocator)) = existing {
                 if established_root != storage_root_identity {
                     return Err(message_id_storage_root_conflict(
-                        identity,
+                        Some(identity),
                         established_root.as_path(),
                         storage_root_identity.as_path(),
                     ));
@@ -2962,7 +2961,7 @@ fn shared_message_id_allocator(
                 } else {
                     let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
                     logical_entries.insert(
-                        identity.to_string(),
+                        identity.to_path_buf(),
                         FileMessageIdAllocatorEntry {
                             allocator: Arc::downgrade(&allocator),
                             storage_root_identity: storage_root_identity.clone(),
@@ -2973,7 +2972,7 @@ fn shared_message_id_allocator(
             } else {
                 let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
                 logical_entries.insert(
-                    identity.to_string(),
+                    identity.to_path_buf(),
                     FileMessageIdAllocatorEntry {
                         allocator: Arc::downgrade(&allocator),
                         storage_root_identity: storage_root_identity.clone(),
@@ -2998,10 +2997,14 @@ fn shared_message_id_allocator(
 }
 
 fn message_id_storage_root_conflict(
-    sqlite_identity: &str,
+    sqlite_identity: Option<&Path>,
     established_root: &Path,
     requested_root: &Path,
 ) -> DbError {
+    let sqlite_identity = sqlite_identity.map_or_else(
+        || ":memory:".to_string(),
+        |identity| identity.display().to_string(),
+    );
     DbError::InvalidArgument {
         field: "storage_root",
         message: format!(
@@ -3013,10 +3016,7 @@ fn message_id_storage_root_conflict(
     }
 }
 
-fn invalidate_file_message_id_allocator(normalized_identity: &str) -> bool {
-    if normalized_identity == ":memory:" {
-        return false;
-    }
+fn invalidate_file_message_id_allocator(normalized_identity: &Path) -> bool {
     let registry = FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry
         .lock()
@@ -4744,15 +4744,33 @@ impl DbPool {
     }
 }
 
-static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<String, Arc<SqliteInitGate>>>> =
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PoolCacheKey {
+    sqlite_identity: Option<PathBuf>,
+    storage_root_identity: PathBuf,
+    min_connections: usize,
+    max_connections: usize,
+    acquire_timeout_ms: u64,
+    max_lifetime_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SqliteInitGateKey {
+    sqlite_identity: Option<PathBuf>,
+    storage_root_identity: PathBuf,
+}
+
+static SQLITE_INIT_GATES: OnceLock<
+    OrderedRwLock<HashMap<SqliteInitGateKey, Arc<SqliteInitGate>>>,
+> = OnceLock::new();
+static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, Weak<Pool<DbConn>>>>> =
     OnceLock::new();
-static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<String, Weak<Pool<DbConn>>>>> = OnceLock::new();
-static SQLITE_IDENTITY_PATH_CACHE: OnceLock<Mutex<HashMap<String, SqliteIdentityPathCacheEntry>>> =
+static SQLITE_IDENTITY_PATH_CACHE: OnceLock<Mutex<HashMap<PathBuf, SqliteIdentityPathCacheEntry>>> =
     OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct SqliteIdentityPathCacheEntry {
-    normalized: String,
+    normalized: PathBuf,
     validated_at: Instant,
 }
 
@@ -4762,11 +4780,11 @@ const SQLITE_IDENTITY_PATH_CACHE_FRESHNESS: Duration = Duration::from_millis(25)
 #[cfg(not(test))]
 const SQLITE_IDENTITY_PATH_CACHE_FRESHNESS: Duration = Duration::from_secs(2);
 
-fn sqlite_identity_path_cache() -> &'static Mutex<HashMap<String, SqliteIdentityPathCacheEntry>> {
+fn sqlite_identity_path_cache() -> &'static Mutex<HashMap<PathBuf, SqliteIdentityPathCacheEntry>> {
     SQLITE_IDENTITY_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn sqlite_identity_path_cache_get(path: &str) -> Option<String> {
+fn sqlite_identity_path_cache_get(path: &Path) -> Option<PathBuf> {
     let mut cache = sqlite_identity_path_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4778,7 +4796,7 @@ fn sqlite_identity_path_cache_get(path: &str) -> Option<String> {
     None
 }
 
-fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
+fn sqlite_identity_path_cache_insert(path: &Path, normalized: &Path) {
     let mut cache = sqlite_identity_path_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4792,9 +4810,9 @@ fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
         cache.remove(&victim);
     }
     cache.insert(
-        path.to_string(),
+        path.to_path_buf(),
         SqliteIdentityPathCacheEntry {
-            normalized: normalized.to_string(),
+            normalized: normalized.to_path_buf(),
             validated_at: Instant::now(),
         },
     );
@@ -4809,15 +4827,14 @@ fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
 /// sized pools may point at the same file, and any surviving file descriptor
 /// could keep serving pre-recovery numeric ids.
 fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str) {
-    let identity = normalize_sqlite_identity_path(&primary_path.to_string_lossy());
-    let cache_prefix = format!("{identity}|");
+    let identity = normalize_sqlite_identity_path_buf(primary_path);
     let retired_pools = {
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
         let mut guard = cache.write();
         let matching_keys = guard
             .keys()
-            .filter(|key| key.starts_with(&cache_prefix))
+            .filter(|key| key.sqlite_identity.as_deref() == Some(identity.as_path()))
             .cloned()
             .collect::<Vec<_>>();
         let mut pools = Vec::new();
@@ -4850,36 +4867,36 @@ fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str
         pool.close();
     }
     for generation in &retired_generations {
-        crate::cache::read_cache().invalidate_scope(&format!("{identity}@{generation}"));
+        crate::cache::read_cache()
+            .invalidate_scope(&format!("{}@{generation}", identity.display()));
     }
 
-    let gate_prefix = format!("{identity}|storage_root=");
     let init_gates_cleared = {
         let gates = SQLITE_INIT_GATES
             .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
         let mut guard = gates.write();
         let before = guard.len();
-        guard.retain(|key, _| !key.starts_with(&gate_prefix));
+        guard.retain(|key, _| key.sqlite_identity.as_deref() != Some(identity.as_path()));
         before.saturating_sub(guard.len())
     };
 
     if let Some(cache) = RECENT_RECONSTRUCT_CACHE.get() {
         let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         guard.remove(primary_path);
-        guard.remove(Path::new(&identity));
+        guard.remove(&identity);
     }
     // #219: feed the archive-drift reconcile cooldown. Clearing the init
     // gates above re-arms the drift predicate on the very next pool
     // bootstrap; the recency record keeps that from cascading into
     // back-to-back rebuilds.
     crate::write_barrier::record_promotion(primary_path);
-    crate::write_barrier::record_promotion(Path::new(&identity));
+    crate::write_barrier::record_promotion(&identity);
     crate::search_service::invalidate_search_cache(
         crate::search_cache::InvalidationTrigger::IndexRebuild,
     );
 
     tracing::warn!(
-        path = %identity,
+        path = %identity.display(),
         trigger,
         retired_pools = retired_pools.len(),
         retired_generations = retired_generations.len(),
@@ -4889,19 +4906,22 @@ fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str
     );
 }
 
+#[cfg(test)]
 #[must_use]
 fn normalize_sqlite_identity_path(path: &str) -> String {
     if path == ":memory:" {
         return path.to_string();
     }
-    if let Some(cached) = sqlite_identity_path_cache_get(path) {
-        return cached;
-    }
-    let normalized = normalize_sqlite_identity_path_buf(Path::new(path))
+    normalize_sqlite_identity_path_buf(Path::new(path))
         .to_string_lossy()
-        .into_owned();
-    sqlite_identity_path_cache_insert(path, &normalized);
-    normalized
+        .into_owned()
+}
+
+/// Return the lossless normalized identity for a file-backed SQLite path.
+/// `None` is the in-memory sentinel, which must remain isolated by underlying
+/// pool identity rather than entering any file-backed registry.
+fn normalize_file_sqlite_identity(path: &str) -> Option<PathBuf> {
+    (path != ":memory:").then(|| normalize_sqlite_identity_path_buf(Path::new(path)))
 }
 
 /// Resolve aliases even before the SQLite leaf exists. Canonicalize the
@@ -4910,6 +4930,15 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
 /// prefix would change kernel semantics when the prefix contains a symlink
 /// (for example, `link/../missing.db`).
 fn normalize_sqlite_identity_path_buf(path: &Path) -> PathBuf {
+    if let Some(cached) = sqlite_identity_path_cache_get(path) {
+        return cached;
+    }
+    let normalized = normalize_sqlite_identity_path_buf_uncached(path);
+    sqlite_identity_path_cache_insert(path, &normalized);
+    normalized
+}
+
+fn normalize_sqlite_identity_path_buf_uncached(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else if let Ok(cwd) = std::env::current_dir() {
@@ -4976,7 +5005,7 @@ fn normalize_sqlite_identity_path_lossless(path: &Path) -> PathBuf {
 }
 
 #[must_use]
-fn pool_cache_key(config: &DbPoolConfig) -> String {
+fn pool_cache_key(config: &DbPoolConfig) -> PoolCacheKey {
     let sqlite_path = config.sqlite_path().map_or_else(
         |_| config.database_url.clone(),
         |parsed| resolve_sqlite_path_with_absolute_fallback(&parsed),
@@ -4999,21 +5028,23 @@ fn pool_cache_key_from_parts(
     max_connections: usize,
     acquire_timeout_ms: u64,
     max_lifetime_ms: u64,
-) -> String {
-    let identity = normalize_sqlite_identity_path(sqlite_path);
-    let storage_root_identity = normalize_sqlite_identity_path(&storage_root.to_string_lossy());
-    format!(
-        "{identity}|storage_root={storage_root_identity}|min={min_connections}|max={max_connections}|acquire_ms={acquire_timeout_ms}|lifetime_ms={max_lifetime_ms}"
-    )
+) -> PoolCacheKey {
+    PoolCacheKey {
+        sqlite_identity: normalize_file_sqlite_identity(sqlite_path),
+        storage_root_identity: normalize_sqlite_identity_path_buf(storage_root),
+        min_connections,
+        max_connections,
+        acquire_timeout_ms,
+        max_lifetime_ms,
+    }
 }
 
 #[must_use]
-fn sqlite_init_gate_key(sqlite_path: &str, storage_root: &Path) -> String {
-    format!(
-        "{}|storage_root={}",
-        normalize_sqlite_identity_path(sqlite_path),
-        normalize_sqlite_identity_path(&storage_root.to_string_lossy())
-    )
+fn sqlite_init_gate_key(sqlite_path: &str, storage_root: &Path) -> SqliteInitGateKey {
+    SqliteInitGateKey {
+        sqlite_identity: normalize_file_sqlite_identity(sqlite_path),
+        storage_root_identity: normalize_sqlite_identity_path_buf(storage_root),
+    }
 }
 
 /// How long a NON-initializing pool acquire may wait for another task's
@@ -5782,9 +5813,7 @@ fn pending_archive_drift() -> &'static Mutex<BTreeSet<PathBuf>> {
 }
 
 fn pending_archive_drift_key(primary_path: &Path) -> PathBuf {
-    PathBuf::from(normalize_sqlite_identity_path(
-        &primary_path.to_string_lossy(),
-    ))
+    normalize_sqlite_identity_path_buf(primary_path)
 }
 
 fn record_pending_archive_drift(primary_path: &Path) {
@@ -5966,12 +5995,10 @@ fn reconcile_archive_state_before_init(
         // Check both the caller's spelling and the normalized identity —
         // retire records both, but different pools can reach here with
         // different spellings of the same file (relative, symlinked parent).
-        let identity = normalize_sqlite_identity_path(&primary_path.to_string_lossy());
+        let identity = normalize_sqlite_identity_path_buf(primary_path);
         let promotion_age = crate::write_barrier::time_since_last_promotion(primary_path)
             .into_iter()
-            .chain(crate::write_barrier::time_since_last_promotion(Path::new(
-                &identity,
-            )))
+            .chain(crate::write_barrier::time_since_last_promotion(&identity))
             .min();
         if let Some(age) = promotion_age
             && age < cooldown
@@ -13090,15 +13117,14 @@ fn compatible_cached_memory_pool(config: &DbPoolConfig) -> DbResult<Option<Arc<P
     }
 
     let storage_root = config.resolved_storage_root();
-    let storage_root_identity = normalize_sqlite_identity_path(&storage_root.to_string_lossy());
-    let key_prefix = format!(":memory:|storage_root={storage_root_identity}|");
+    let storage_root_identity = normalize_sqlite_identity_path_buf(&storage_root);
     let cache =
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
     let guard = cache.read();
 
     let mut candidate: Option<Arc<Pool<DbConn>>> = None;
     for (key, weak) in guard.iter() {
-        if !key.starts_with(&key_prefix) {
+        if key.sqlite_identity.is_some() || key.storage_root_identity != storage_root_identity {
             continue;
         }
         let Some(shared_pool) = weak.upgrade() else {
@@ -14106,8 +14132,8 @@ mod tests {
             .clear();
 
         let first = normalize_sqlite_identity_path(&raw_path);
-        let cached = sqlite_identity_path_cache_get(&raw_path);
-        assert_eq!(cached.as_deref(), Some(first.as_str()));
+        let cached = sqlite_identity_path_cache_get(Path::new(&raw_path));
+        assert_eq!(cached.as_deref(), Some(Path::new(&first)));
 
         let second = normalize_sqlite_identity_path(&raw_path);
         assert_eq!(second, first);
@@ -14139,15 +14165,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
 
-        sqlite_identity_path_cache_insert(raw_path, normalized);
+        sqlite_identity_path_cache_insert(Path::new(raw_path), Path::new(normalized));
         assert_eq!(
-            sqlite_identity_path_cache_get(raw_path).as_deref(),
-            Some(normalized)
+            sqlite_identity_path_cache_get(Path::new(raw_path)).as_deref(),
+            Some(Path::new(normalized))
         );
 
         std::thread::sleep(SQLITE_IDENTITY_PATH_CACHE_FRESHNESS + Duration::from_millis(10));
         assert!(
-            sqlite_identity_path_cache_get(raw_path).is_none(),
+            sqlite_identity_path_cache_get(Path::new(raw_path)).is_none(),
             "expired entries should be evicted on read"
         );
     }
@@ -16571,7 +16597,7 @@ mod tests {
         };
         let old_pool = DbPool::new(&config).expect("create pre-recovery pool");
         let old_allocator = old_pool.message_id_allocator();
-        let identity = normalize_sqlite_identity_path(&db_path.to_string_lossy());
+        let identity = normalize_sqlite_identity_path_buf(&db_path);
         assert!(
             invalidate_file_message_id_allocator(&identity),
             "the live file identity must be present before invalidation"
@@ -19784,7 +19810,7 @@ mod tests {
 
         let base = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
-            storage_root: Some(storage_a),
+            storage_root: Some(storage_a.clone()),
             min_connections: 0,
             max_connections: 1,
             run_migrations: false,
@@ -19792,9 +19818,20 @@ mod tests {
             ..Default::default()
         };
         let conflicting = DbPoolConfig {
-            storage_root: Some(storage_b),
+            storage_root: Some(storage_b.clone()),
             ..base.clone()
         };
+        let sqlite_path = base.sqlite_path().expect("parse SQLite path");
+        assert_ne!(
+            pool_cache_key(&base),
+            pool_cache_key(&conflicting),
+            "pool reuse must not collide before allocator admission runs"
+        );
+        assert_ne!(
+            sqlite_init_gate_key(&sqlite_path, &storage_a),
+            sqlite_init_gate_key(&sqlite_path, &storage_b),
+            "a completed init gate for one byte-exact archive root must not skip another root's init"
+        );
         let established = DbPool::new(&base).expect("establish first archive authority");
         let Err(error) = DbPool::new(&conflicting) else {
             panic!("losslessly distinct roots must not reuse one archive authority")
@@ -19807,6 +19844,65 @@ mod tests {
             }
         ));
         assert!(!established.message_id_allocator().is_retired());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_byte_sqlite_targets_remain_distinct_allocator_identities() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_a = dir
+            .path()
+            .join(OsString::from_vec(b"database-parent-\xff".to_vec()));
+        let target_b = dir
+            .path()
+            .join(OsString::from_vec(b"database-parent-\xfe".to_vec()));
+        std::fs::create_dir_all(&target_a).expect("create first invalid-byte database parent");
+        std::fs::create_dir_all(&target_b).expect("create second invalid-byte database parent");
+        let alias_a = dir.path().join("database-alias-a");
+        let alias_b = dir.path().join("database-alias-b");
+        symlink(&target_a, &alias_a).expect("create first database parent alias");
+        symlink(&target_b, &alias_b).expect("create second database parent alias");
+        let db_a = alias_a.join("mail.sqlite3");
+        let db_b = alias_b.join("mail.sqlite3");
+        let db_a_string = db_a.to_str().expect("UTF-8 alias path");
+        let db_b_string = db_b.to_str().expect("UTF-8 alias path");
+
+        assert_eq!(
+            normalize_sqlite_identity_path(db_a_string),
+            normalize_sqlite_identity_path(db_b_string),
+            "fixture must collide under the former lossy String database identity"
+        );
+        assert_ne!(
+            normalize_file_sqlite_identity(db_a_string),
+            normalize_file_sqlite_identity(db_b_string),
+            "allocator authority must retain the canonical target's native bytes"
+        );
+
+        let storage_root = dir.path().join("shared-storage");
+        let config_a = DbPoolConfig {
+            database_url: format!("sqlite:///{db_a_string}"),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let config_b = DbPoolConfig {
+            database_url: format!("sqlite:///{db_b_string}"),
+            ..config_a.clone()
+        };
+        let pool_a = DbPool::new(&config_a).expect("create first database authority");
+        let pool_b = DbPool::new(&config_b).expect("create second database authority");
+        assert!(
+            !Arc::ptr_eq(
+                &pool_a.message_id_allocator(),
+                &pool_b.message_id_allocator()
+            ),
+            "byte-distinct SQLite files must never share one allocator"
+        );
     }
 
     #[test]

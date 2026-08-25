@@ -1121,6 +1121,17 @@ read_env_assignment_value() {
   parse_env_assignment_rhs "$value"
 }
 
+# Match the Rust CLI's canonical config.env resolution exactly. Keeping this
+# in one helper prevents the installer, migration, and launchd repair paths
+# from silently reading $HOME/.config while `am setup` writes under XDG.
+rust_config_env_path() {
+  local config_home="${XDG_CONFIG_HOME:-}"
+  if [ -z "$config_home" ]; then
+    config_home="${HOME}/.config"
+  fi
+  printf '%s' "${config_home}/mcp-agent-mail/config.env"
+}
+
 python_db_format_needs_import() {
   local format="$1"
   case "$format" in
@@ -1903,7 +1914,8 @@ resolve_database_path() {
 
   # If a Rust config already exists, prefer its DB/storage target so import
   # lands where `am` will actually read after installation.
-  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
   if [ -f "$rust_env" ]; then
     local cfg_db_url cfg_db_path cfg_storage_root
     cfg_db_url=$(read_env_assignment_value "$rust_env" "DATABASE_URL")
@@ -2228,7 +2240,7 @@ git_worktree_root_for_path() {
   return 1
 }
 
-legacy_env_targets_outside_git_worktrees() {
+token_env_targets_outside_git_worktrees() {
   local canonical_env="$1"
   local compatibility_env="$2"
   local target
@@ -2237,7 +2249,7 @@ legacy_env_targets_outside_git_worktrees() {
 
   for target in "$canonical_env" "$compatibility_env"; do
     if worktree_root=$(git_worktree_root_for_path "$target"); then
-      warn "Refusing to migrate a token-bearing env file inside a Git worktree: $target"
+      warn "Refusing to write a token-bearing env file inside a Git worktree: $target"
       warn "Destination worktree: $worktree_root"
       warn "Move HOME/config outside every checkout, then rerun the installer; no env migration bytes were written."
       return 1
@@ -2274,14 +2286,16 @@ migrate_env_config() {
   done
 
   # Rust config location
-  local rust_config_dir="$HOME/.config/mcp-agent-mail"
-  local rust_env="$rust_config_dir/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
+  local rust_config_dir
+  rust_config_dir="$(dirname "$rust_env")"
   local rust_env_compat="$rust_config_dir/.env"
   # This check precedes directory creation, backups, temp files, and both
   # final writes. Every artifact produced below is a sibling of one of these
   # two targets, so proving both outside every Git worktree keeps the entire
   # token-bearing generation outside Git. Unknown authority fails closed.
-  legacy_env_targets_outside_git_worktrees "$rust_env" "$rust_env_compat" || return 1
+  token_env_targets_outside_git_worktrees "$rust_env" "$rust_env_compat" || return 1
   mkdir -p "$rust_config_dir"
 
   backup_envfile_if_present() {
@@ -2437,7 +2451,8 @@ resolve_migrated_bearer_token() {
     return 0
   fi
 
-  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
   if [ -f "$rust_env" ]; then
     local token
     token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
@@ -3348,7 +3363,8 @@ repair_launchd_service_env_from_rust_config() {
   fi
   [ -f "$plist_path" ] || return 0
 
-  local rust_env="$HOME/.config/mcp-agent-mail/config.env"
+  local rust_env
+  rust_env="$(rust_config_env_path)"
   local storage_root database_url bearer_token host port http_path
   storage_root="${RUST_STORAGE_ROOT:-}"
   [ -z "$storage_root" ] && storage_root=$(read_env_assignment_value "$rust_env" "STORAGE_ROOT")
@@ -3358,6 +3374,14 @@ repair_launchd_service_env_from_rust_config() {
   [ -z "$database_url" ] && database_url="sqlite:///$storage_root/storage.sqlite3"
 
   bearer_token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
+  if [ -z "$bearer_token" ]; then
+    warn "Refusing to rewrite LaunchAgent without the durable bearer token from $rust_env"
+    return 1
+  fi
+  if [ -n "${HTTP_BEARER_TOKEN:-}" ] && [ "$bearer_token" != "$HTTP_BEARER_TOKEN" ]; then
+    warn "Refusing to rewrite LaunchAgent with a bearer token that differs from the installer-selected credential."
+    return 1
+  fi
   host=$(read_env_assignment_value "$rust_env" "HTTP_HOST")
   [ -z "$host" ] && host="$(desired_service_bind_host)"
   port=$(read_env_assignment_value "$rust_env" "HTTP_PORT")
@@ -3439,7 +3463,10 @@ ensure_remote_http_client_readiness() {
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "remote_http_readiness:service ${line}"
     done <<< "$service_output"
-    repair_launchd_service_env_from_rust_config
+    if ! repair_launchd_service_env_from_rust_config; then
+      err "LaunchAgent environment could not be bound to the durable installer credential."
+      return 1
+    fi
   else
     if service_setup_unavailable_failure "$service_output"; then
       warn "Automatic background service setup is not available in this environment."
@@ -4794,16 +4821,29 @@ update_mcp_configs() {
       verbose "update_mcp_configs:skip reason=no_am_cli"
       warn "Could not find 'am' CLI to update MCP configs."
       warn "Run 'am setup run' manually after installation."
-      return 0
+      return 1
     fi
   fi
 
   verbose "update_mcp_configs:start binary=${binary_path} cli=${am_cli}"
 
-  # Check that setup subcommand exists (graceful degradation for older builds)
+  # A native setup pass is the credential-persistence admission gate for all
+  # shell fallback writers. An older binary without this surface must not let
+  # the installer publish a bearer token only into client configs.
   if ! AM_INTERFACE_MODE=cli "$am_cli" setup --help >/dev/null 2>&1; then
     verbose "update_mcp_configs:skip reason=no_setup_subcommand"
-    return 0
+    warn "The installed 'am' binary has no setup subcommand; MCP client configs were not changed."
+    return 1
+  fi
+
+  local persisted_env
+  persisted_env="$(rust_config_env_path)"
+  # This must precede the native setup call: `am setup` writes the token before
+  # its config actions, so a project-contained XDG_CONFIG_HOME would otherwise
+  # create a credential artifact before the installer could validate it.
+  if ! token_env_targets_outside_git_worktrees "$persisted_env" "$persisted_env"; then
+    warn "Canonical token authority is not safely outside every Git worktree: $persisted_env"
+    return 1
   fi
 
   set +e
@@ -4824,6 +4864,38 @@ update_mcp_configs() {
   fi
 
   if [ "$setup_rc" -eq 0 ]; then
+    local persisted_token persisted_mode
+    if [ -L "$persisted_env" ] || [ ! -f "$persisted_env" ]; then
+      warn "Native MCP setup did not produce a regular canonical token file: $persisted_env"
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    persisted_token="$(read_env_assignment_value "$persisted_env" "HTTP_BEARER_TOKEN")"
+    if [ -z "$persisted_token" ]; then
+      warn "Native MCP setup returned success without a durable bearer token in $persisted_env"
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    if [ -n "$setup_token" ] && [ "$persisted_token" != "$setup_token" ]; then
+      warn "Native MCP setup persisted a different bearer token than the installer selected."
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    if stat -f '%Lp' "$persisted_env" >/dev/null 2>&1; then
+      persisted_mode="$(stat -f '%Lp' "$persisted_env")"
+    else
+      persisted_mode="$(stat -c '%a' "$persisted_env" 2>/dev/null || true)"
+    fi
+    if [ "$persisted_mode" != "600" ]; then
+      warn "Canonical token file must have mode 600, found ${persisted_mode:-unknown}: $persisted_env"
+      warn "No shell MCP fallback writers will run."
+      return 1
+    fi
+    # The CLI may have generated the token when no prior source existed.
+    # Publish only the exact durable value to subsequent fallback writers and
+    # service installation phases.
+    export HTTP_BEARER_TOKEN="$persisted_token"
+
     # Parse counts from output (e.g., "7 config files processed: 2 created, 1 updated, 4 unchanged")
     local counts_line created updated
     counts_line=$(echo "$setup_out" | command grep "config files processed" 2>/dev/null || true)
@@ -4844,7 +4916,21 @@ update_mcp_configs() {
   else
     warn "MCP config update returned exit code $setup_rc"
     warn "Run 'am setup run' manually to configure MCP integrations."
+    return 1
   fi
+  return 0
+}
+
+configure_mcp_clients() {
+  local binary_path="$1"
+  local am_cli="$2"
+
+  if ! update_mcp_configs "$binary_path" "$am_cli"; then
+    warn "Skipping shell MCP fallback writers because native setup did not prove durable token continuity."
+    return 1
+  fi
+  setup_mcp_configs "$binary_path"
+  sync_codex_http_configs "$binary_path"
 }
 
 record_uninstall_summary() {
@@ -6486,27 +6572,15 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
   done <<< "$MCP_CONFIG_SCAN"
 fi
 
-# Set up MCP configs for fresh installs (non-interactive, auto-detect).
-# Codex is written directly in HTTP URL mode here so the one-liner does not
-# depend on a particular released `am setup` implementation.
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  setup_mcp_configs "$DEST/$BIN_SERVER"
-fi
-
-# Update existing MCP configs via the newly-installed `am setup run`.
-# This still handles the broader non-Codex migration work:
+# First run native setup so its atomic, Git-aware token writer durably commits
+# the one credential every subsequent client and service phase will use.
+# This also handles the broader non-Codex migration work:
 #   - Python→Rust command rewriting
 #   - env var preservation (bearer token, storage root)
 #   - BOM/JSONC/trailing-comma tolerance
 #   - Backup before modification
 if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  update_mcp_configs "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"
-fi
-
-# Re-sync Codex last so an older released `am` cannot leave Codex in stdio or
-# mixed transport mode after the installer has already chosen HTTP.
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  sync_codex_http_configs "$DEST/$BIN_SERVER"
+  configure_mcp_clients "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI" || true
 fi
 
 collect_migration_counts() {

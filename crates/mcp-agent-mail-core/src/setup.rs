@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -228,6 +229,59 @@ pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError>
     .map(Some)
 }
 
+/// Resolve OMP's ordered `PI_CONFIG_FILES` settings overlays from the live
+/// environment.
+///
+/// OMP resolves relative entries against its launch working directory and
+/// expands a leading `~` against the active user's home directory. Empty path
+/// list entries are ignored, matching OMP's JavaScript loader.
+pub fn omp_settings_overlay_paths_from_env(
+    project_dir: &Path,
+) -> Result<Vec<PathBuf>, SetupError> {
+    resolve_omp_settings_overlay_paths(
+        std::env::var_os("PI_CONFIG_FILES").as_deref(),
+        project_dir,
+        dirs::home_dir().as_deref(),
+    )
+}
+
+fn resolve_omp_settings_overlay_paths(
+    raw: Option<&OsStr>,
+    project_dir: &Path,
+    home: Option<&Path>,
+) -> Result<Vec<PathBuf>, SetupError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    std::env::split_paths(raw)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| {
+            let expanded = if path == Path::new("~") {
+                home.map(Path::to_path_buf).ok_or_else(|| {
+                    SetupError::Other(
+                        "PI_CONFIG_FILES contains '~', but the OMP home directory is unavailable"
+                            .to_string(),
+                    )
+                })?
+            } else if let Ok(rest) = path.strip_prefix("~") {
+                home.map(|home| home.join(rest)).ok_or_else(|| {
+                    SetupError::Other(
+                        "PI_CONFIG_FILES contains a '~/' path, but the OMP home directory is unavailable"
+                            .to_string(),
+                    )
+                })?
+            } else {
+                path
+            };
+            Ok(if expanded.is_absolute() {
+                expanded
+            } else {
+                project_dir.join(expanded)
+            })
+        })
+        .collect()
+}
+
 fn resolve_omp_config_paths(
     home: &Path,
     cwd: &Path,
@@ -369,6 +423,10 @@ pub struct SetupParams {
     /// from [`omp_config_paths_from_env`] so named profiles and OMP directory
     /// overrides target the same file the runtime loads.
     pub omp_user_config_path_override: Option<PathBuf>,
+    /// Ordered OMP settings overlays selected through `PI_CONFIG_FILES`.
+    /// Production callers resolve these relative to `project_dir` with
+    /// [`omp_settings_overlay_paths_from_env`].
+    pub omp_settings_overlay_paths: Vec<PathBuf>,
     pub agents: Option<Vec<AgentPlatform>>,
     pub dry_run: bool,
     pub skip_user_config: bool,
@@ -387,6 +445,7 @@ impl Default for SetupParams {
             project_dir: PathBuf::from("."),
             home_dir_override: None,
             omp_user_config_path_override: None,
+            omp_settings_overlay_paths: Vec::new(),
             agents: None,
             dry_run: false,
             skip_user_config: false,
@@ -1284,6 +1343,33 @@ pub fn omp_active_user_config_path(params: &SetupParams) -> PathBuf {
         .omp_user_config_path_override
         .clone()
         .unwrap_or_else(|| home.join(".omp").join("agent").join("mcp.json"))
+}
+
+fn omp_active_user_settings_paths(params: &SetupParams) -> (PathBuf, PathBuf) {
+    let agent_dir = omp_active_user_config_path(params)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    (agent_dir.join("config.yml"), agent_dir.join("config.yaml"))
+}
+
+/// Return every settings file whose current bytes can decide whether OMP loads
+/// project MCP configuration for these setup parameters.
+///
+/// OMP prefers the active profile's `config.yml` over `config.yaml`; the
+/// fallback path is relevant only while the preferred path is absent. Project
+/// settings and ordered `PI_CONFIG_FILES` overlays follow it.
+#[must_use]
+pub fn omp_settings_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
+    let (user_yml, user_yaml) = omp_active_user_settings_paths(params);
+    let mut paths = vec![user_yml.clone()];
+    if user_yml.symlink_metadata().is_err_and(|error| {
+        error.kind() == std::io::ErrorKind::NotFound
+    }) {
+        paths.push(user_yaml);
+    }
+    paths.push(params.project_dir.join(".omp").join("config.yml"));
+    paths.extend(params.omp_settings_overlay_paths.iter().cloned());
+    paths
 }
 
 impl AgentPlatform {
@@ -2442,6 +2528,7 @@ pub enum ConfigDriftReason {
     WrongBearerHeader,
     WrongStartupTimeout,
     DisabledServer,
+    ProjectConfigDisabled,
     DuplicateServerEntries,
     UnsupportedConfig,
 }
@@ -2458,6 +2545,7 @@ impl ConfigDriftReason {
             Self::WrongBearerHeader => "wrong_bearer_header",
             Self::WrongStartupTimeout => "wrong_startup_timeout",
             Self::DisabledServer => "disabled_server",
+            Self::ProjectConfigDisabled => "project_config_disabled",
             Self::DuplicateServerEntries => "duplicate_server_entries",
             Self::UnsupportedConfig => "unsupported_config",
         }
@@ -2508,6 +2596,10 @@ pub struct ConfigFileStatus {
     /// reasons and remediation already describe the operator-facing result.
     #[serde(skip_serializing)]
     pub omp_active_user_config_drift: bool,
+    /// Whether OMP's effective settings authority either excludes project MCP
+    /// sources or could not be evaluated safely.
+    #[serde(skip_serializing)]
+    pub omp_settings_config_drift: bool,
     /// Exact file contents evaluated for this verdict. Startup self-heal uses
     /// these non-serialized observations to bind a healthy status result to
     /// the fingerprint it caches, including OMP's separate user authority.
@@ -2609,6 +2701,27 @@ struct OmpActiveUserConfigInspection {
     unsupported: bool,
 }
 
+struct OmpSettingsAuthorityInspection {
+    observations: Vec<ConfigStatusFileObservation>,
+    project_config_enabled: bool,
+    effective_source: Option<PathBuf>,
+    unsupported_path: Option<PathBuf>,
+}
+
+impl OmpSettingsAuthorityInspection {
+    fn has_drift(&self) -> bool {
+        self.unsupported_path.is_some() || !self.project_config_enabled
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OmpSettingsFileValue {
+    Missing,
+    Inherit,
+    Enabled(bool),
+    Unsupported,
+}
+
 fn config_status_file_observation(
     path: &Path,
     content: &Result<Option<(String, u32)>, SetupError>,
@@ -2619,7 +2732,7 @@ fn config_status_file_observation(
         Ok(Some((content, _))) => ConfigStatusFileObservation {
             path: path.display().to_string(),
             exists: true,
-            content_sha256: Some(format!("{:x}", Sha256::digest(content.as_bytes()))),
+            content_sha256: Some(hex::encode(Sha256::digest(content.as_bytes()))),
         },
         Ok(None) => ConfigStatusFileObservation {
             path: path.display().to_string(),
@@ -2655,6 +2768,16 @@ fn config_file_status_for_action(
     let omp_user_config_drift = omp_user_config_inspection
         .as_ref()
         .filter(|inspection| inspection.disabled || inspection.unsupported);
+    let omp_settings_inspection = if action.platform == AgentPlatform::Omp
+        && params.skip_user_config
+    {
+        Some(inspect_omp_settings_authority(params))
+    } else {
+        None
+    };
+    let omp_settings_drift = omp_settings_inspection
+        .as_ref()
+        .filter(|inspection| inspection.has_drift());
 
     let content = read_setup_file(&action.file_path, "config status file");
     let mut status_observations = vec![config_status_file_observation(
@@ -2664,14 +2787,21 @@ fn config_file_status_for_action(
     if let Some(inspection) = &omp_user_config_inspection {
         status_observations.push(inspection.observation.clone());
     }
+    if let Some(inspection) = &omp_settings_inspection {
+        status_observations.extend(inspection.observations.iter().cloned());
+    }
     if matches!(&content, Ok(None)) {
         let mut drift_reasons = vec![ConfigDriftReason::MissingFile];
         if let Some(drift) = &omp_user_config_drift {
             apply_omp_active_user_config_drift(&mut drift_reasons, drift);
         }
+        if let Some(drift) = omp_settings_drift {
+            apply_omp_settings_authority_drift(&mut drift_reasons, drift);
+        }
         return ConfigFileStatus {
             path: action.file_path.display().to_string(),
             omp_active_user_config_drift: omp_user_config_drift.is_some(),
+            omp_settings_config_drift: omp_settings_drift.is_some(),
             status_observations,
             redacted_path,
             exists: false,
@@ -2688,7 +2818,8 @@ fn config_file_status_for_action(
                 action,
                 params,
                 &drift_reasons,
-                omp_user_config_drift.as_ref(),
+                omp_user_config_drift,
+                omp_settings_drift,
             ),
             drift_reasons,
         };
@@ -2728,10 +2859,14 @@ fn config_file_status_for_action(
     if let Some(drift) = &omp_user_config_drift {
         apply_omp_active_user_config_drift(&mut analysis.drift_reasons, drift);
     }
+    if let Some(drift) = omp_settings_drift {
+        apply_omp_settings_authority_drift(&mut analysis.drift_reasons, drift);
+    }
 
     ConfigFileStatus {
         path: action.file_path.display().to_string(),
         omp_active_user_config_drift: omp_user_config_drift.is_some(),
+        omp_settings_config_drift: omp_settings_drift.is_some(),
         status_observations,
         redacted_path,
         exists: true,
@@ -2748,7 +2883,8 @@ fn config_file_status_for_action(
             action,
             params,
             &analysis.drift_reasons,
-            omp_user_config_drift.as_ref(),
+            omp_user_config_drift,
+            omp_settings_drift,
         ),
         drift_reasons: analysis.drift_reasons,
     }
@@ -3034,6 +3170,115 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
         observation,
         disabled,
         unsupported,
+    }
+}
+
+fn parse_omp_enable_project_config(content: &str) -> Result<Option<bool>, ()> {
+    let document = serde_norway::from_str::<Value>(content).map_err(|_| ())?;
+    let root = match document {
+        Value::Null => return Ok(None),
+        Value::Object(root) => root,
+        _ => return Err(()),
+    };
+    let Some(mcp) = root.get("mcp") else {
+        return Ok(None);
+    };
+    let Value::Object(mcp) = mcp else {
+        return Err(());
+    };
+    match mcp.get("enableProjectConfig") {
+        None => Ok(None),
+        Some(Value::Bool(enabled)) => Ok(Some(*enabled)),
+        Some(_) => Err(()),
+    }
+}
+
+fn inspect_omp_settings_file(
+    path: &Path,
+    required: bool,
+) -> (ConfigStatusFileObservation, OmpSettingsFileValue) {
+    let content = read_setup_file(path, "OMP settings authority");
+    let observation = config_status_file_observation(path, &content);
+    let value = match content {
+        Ok(None) if required => OmpSettingsFileValue::Unsupported,
+        Ok(None) => OmpSettingsFileValue::Missing,
+        Ok(Some((content, _))) => match parse_omp_enable_project_config(&content) {
+            Ok(None) => OmpSettingsFileValue::Inherit,
+            Ok(Some(enabled)) => OmpSettingsFileValue::Enabled(enabled),
+            Err(()) => OmpSettingsFileValue::Unsupported,
+        },
+        Err(_) => OmpSettingsFileValue::Unsupported,
+    };
+    (observation, value)
+}
+
+fn merge_omp_settings_file(
+    inspection: &mut OmpSettingsAuthorityInspection,
+    path: &Path,
+    required: bool,
+) -> OmpSettingsFileValue {
+    let (observation, value) = inspect_omp_settings_file(path, required);
+    inspection.observations.push(observation);
+    match value {
+        OmpSettingsFileValue::Enabled(enabled) => {
+            inspection.project_config_enabled = enabled;
+            inspection.effective_source = Some(path.to_path_buf());
+        }
+        OmpSettingsFileValue::Unsupported => {
+            inspection.unsupported_path = Some(path.to_path_buf());
+        }
+        OmpSettingsFileValue::Missing | OmpSettingsFileValue::Inherit => {}
+    }
+    value
+}
+
+fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityInspection {
+    let mut inspection = OmpSettingsAuthorityInspection {
+        observations: Vec::new(),
+        project_config_enabled: true,
+        effective_source: None,
+        unsupported_path: None,
+    };
+    let (user_yml, user_yaml) = omp_active_user_settings_paths(params);
+    let preferred = merge_omp_settings_file(&mut inspection, &user_yml, false);
+    if matches!(preferred, OmpSettingsFileValue::Unsupported) {
+        return inspection;
+    }
+    if matches!(preferred, OmpSettingsFileValue::Missing)
+        && matches!(
+            merge_omp_settings_file(&mut inspection, &user_yaml, false),
+            OmpSettingsFileValue::Unsupported
+        )
+    {
+        return inspection;
+    }
+
+    let project_settings = params.project_dir.join(".omp").join("config.yml");
+    if matches!(
+        merge_omp_settings_file(&mut inspection, &project_settings, false),
+        OmpSettingsFileValue::Unsupported
+    ) {
+        return inspection;
+    }
+    for overlay in &params.omp_settings_overlay_paths {
+        if matches!(
+            merge_omp_settings_file(&mut inspection, overlay, true),
+            OmpSettingsFileValue::Unsupported
+        ) {
+            break;
+        }
+    }
+    inspection
+}
+
+fn apply_omp_settings_authority_drift(
+    reasons: &mut Vec<ConfigDriftReason>,
+    drift: &OmpSettingsAuthorityInspection,
+) {
+    if drift.unsupported_path.is_some() {
+        push_drift_reason(reasons, ConfigDriftReason::UnsupportedConfig);
+    } else if !drift.project_config_enabled {
+        push_drift_reason(reasons, ConfigDriftReason::ProjectConfigDisabled);
     }
 }
 
@@ -3601,6 +3846,7 @@ fn push_drift_reason(reasons: &mut Vec<ConfigDriftReason>, reason: ConfigDriftRe
 fn primary_drift_reason(reasons: &[ConfigDriftReason]) -> ConfigDriftReason {
     const PRIORITY: &[ConfigDriftReason] = &[
         ConfigDriftReason::UnsupportedConfig,
+        ConfigDriftReason::ProjectConfigDisabled,
         ConfigDriftReason::MissingFile,
         ConfigDriftReason::MissingServerEntry,
         ConfigDriftReason::DuplicateServerEntries,
@@ -3722,19 +3968,55 @@ fn setup_status_remediation_for_action(
     params: &SetupParams,
     reasons: &[ConfigDriftReason],
     omp_user_config_drift: Option<&OmpActiveUserConfigInspection>,
+    omp_settings_drift: Option<&OmpSettingsAuthorityInspection>,
 ) -> String {
-    let Some(drift) = omp_user_config_drift else {
+    if omp_user_config_drift.is_none() && omp_settings_drift.is_none() {
         return setup_status_remediation(action, params, reasons);
-    };
+    }
     let home = params.home_dir_override.clone().or_else(dirs::home_dir);
-    let path = redact_path_for_status(&drift.path, home.as_deref());
     let args = setup_status_command_args(action, params, false);
     let dry_run = format!("am setup run --dry-run {args}");
     let fix = format!("am setup run --yes {args}");
-    if drift.unsupported {
-        return format!("inspect unsupported active OMP user config {path}, then {dry_run}; {fix}");
+
+    let mut unsupported = Vec::new();
+    if let Some(path) = omp_settings_drift.and_then(|drift| drift.unsupported_path.as_deref()) {
+        unsupported.push(format!(
+            "OMP settings authority {}",
+            redact_path_for_status(path, home.as_deref())
+        ));
     }
-    format!("active OMP user config {path} globally disables Agent Mail; {dry_run}; {fix}")
+    if let Some(drift) = omp_user_config_drift.filter(|drift| drift.unsupported) {
+        unsupported.push(format!(
+            "active OMP user config {}",
+            redact_path_for_status(&drift.path, home.as_deref())
+        ));
+    }
+    if !unsupported.is_empty() {
+        return format!(
+            "inspect unsupported {}, then {dry_run}; {fix}",
+            unsupported.join(" and ")
+        );
+    }
+
+    let mut authorities = Vec::new();
+    if let Some(drift) = omp_settings_drift
+        && !drift.project_config_enabled
+    {
+        let source = drift.effective_source.as_deref().map_or_else(
+            || "OMP's effective settings".to_string(),
+            |path| redact_path_for_status(path, home.as_deref()),
+        );
+        authorities.push(format!(
+            "effective OMP setting mcp.enableProjectConfig=false from {source} excludes every project MCP config"
+        ));
+    }
+    if let Some(drift) = omp_user_config_drift.filter(|drift| drift.disabled) {
+        authorities.push(format!(
+            "active OMP user config {} globally disables Agent Mail",
+            redact_path_for_status(&drift.path, home.as_deref())
+        ));
+    }
+    format!("{}; {dry_run}; {fix}", authorities.join("; "))
 }
 
 fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
