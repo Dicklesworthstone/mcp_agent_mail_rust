@@ -260,11 +260,9 @@ where
     );
     if let Err(error) = execute_raw(&repair_sql) {
         let rollback = execute_raw("ROLLBACK;");
-        let rollback_detail = rollback
-            .err()
-            .map_or_else(String::new, |rollback_error| {
-                format!("; rollback also failed: {rollback_error}")
-            });
+        let rollback_detail = rollback.err().map_or_else(String::new, |rollback_error| {
+            format!("; rollback also failed: {rollback_error}")
+        });
         return Err(DbError::Sqlite(format!(
             "id_floor: repair/advance sqlite_sequence: {error}{rollback_detail}"
         )));
@@ -543,7 +541,9 @@ mod tests {
 
     #[test]
     fn advance_messages_id_floor_consolidates_duplicate_sequence_rows() {
-        let conn = SqliteConnection::open_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("duplicate-floor.db");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
         conn.execute_raw(
             "CREATE TABLE messages (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
