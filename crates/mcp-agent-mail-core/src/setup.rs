@@ -4851,6 +4851,22 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        fn set(key: &str, value: impl Into<String>) -> Self {
+            let previous = TEST_ENV_OVERRIDES.with(|cell| {
+                let mut map = cell.borrow_mut();
+                let previous = map
+                    .get(key)
+                    .cloned()
+                    .map_or(EnvVarPrevious::Missing, EnvVarPrevious::Present);
+                map.insert(key.to_string(), Some(value.into()));
+                previous
+            });
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+
         fn unset(key: &str) -> Self {
             let previous = TEST_ENV_OVERRIDES.with(|cell| {
                 let mut map = cell.borrow_mut();
@@ -6026,6 +6042,27 @@ mod tests {
             assert!(!project.join(".omp").exists());
             assert!(!project.join(".gitignore").exists());
         }
+
+        drop(_missing_process_home);
+        let process_home = temp.path().join("process-home");
+        let _absolute_process_home = EnvVarGuard::set(
+            TEST_OMP_HOME_DIR_OVERRIDE_KEY,
+            process_home.display().to_string(),
+        );
+        let params = SetupParams {
+            project_dir: project.clone(),
+            agents: Some(vec![AgentPlatform::Omp]),
+            token: "ordinary-direct-setup".to_string(),
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        let results = run_setup(&params);
+        assert!(results[0]
+            .actions
+            .iter()
+            .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))));
+        assert!(project.join(".omp/mcp.json").is_file());
+        assert!(process_home.join(".omp/agent/mcp.json").is_file());
     }
 
     #[test]
