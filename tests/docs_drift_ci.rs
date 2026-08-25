@@ -361,6 +361,7 @@ mod dist_release_contract {
 
         let required_once = [
             "permissions:\n  contents: read",
+            "tags:\n      - 'v*'",
             "release_tag_pattern='^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'",
             "[ \"$GITHUB_REF_VALUE\" != \"refs/tags/${REF_NAME}\" ]",
             "git ls-remote origin \"refs/tags/${REF_NAME}^{}\"",
@@ -371,6 +372,7 @@ mod dist_release_contract {
             "[ \"$tag_version\" != \"$manifest_version\" ]",
             "if [[ \"$tag_version\" == *-* ]]; then",
             "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
+            "cargo metadata --locked --no-deps --format-version 1 >/dev/null",
             "cargo check --locked --workspace --all-targets",
             "cargo clippy --locked --workspace --all-targets -- -D warnings",
             "cargo test --locked --workspace",
@@ -389,6 +391,7 @@ mod dist_release_contract {
             "tag_name: ${{ needs.release_contract.outputs.tag }}",
             "prerelease: ${{ needs.release_contract.outputs.prerelease }}",
             "fail_on_unmatched_files: true",
+            "if [ \"$checked_out_revision\" != \"$EXPECTED_REVISION\" ] || [ \"$remote_revision\" != \"$EXPECTED_REVISION\" ]; then",
             "Release tag moved after preflight; refusing publication",
         ];
         for needle in required_once {
@@ -397,6 +400,7 @@ mod dist_release_contract {
 
         require_exactly(workflow, "contents: write", 1)?;
         require_exactly(workflow, "id-token: write", 1)?;
+        require_exactly(workflow, "persist-credentials: false", 5)?;
         require_exactly(
             workflow,
             "ref: ${{ needs.release_contract.outputs.revision }}",
@@ -411,7 +415,13 @@ mod dist_release_contract {
         require_exactly(workflow, "cargo --version --verbose", 3)?;
 
         for line in workflow.lines().map(str::trim) {
-            if ["cargo check ", "cargo clippy ", "cargo test ", "cargo build "]
+            if [
+                "cargo metadata ",
+                "cargo check ",
+                "cargo clippy ",
+                "cargo test ",
+                "cargo build ",
+            ]
                 .iter()
                 .any(|command| line.contains(command))
                 && !line.contains("--locked")
@@ -480,6 +490,11 @@ mod dist_release_contract {
                 "cargo check --locked --workspace --all-targets",
                 "cargo check --workspace --all-targets",
             ),
+            mutate(
+                &workflow,
+                "cargo metadata --locked --no-deps --format-version 1 >/dev/null",
+                "cargo metadata --no-deps --format-version 1 >/dev/null",
+            ),
             mutate(&workflow, "contents: read", "contents: write"),
             mutate(
                 &workflow,
@@ -503,8 +518,8 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "Release tag moved after preflight; refusing publication",
-                "Release tag check was skipped",
+                "if [ \"$checked_out_revision\" != \"$EXPECTED_REVISION\" ] || [ \"$remote_revision\" != \"$EXPECTED_REVISION\" ]; then",
+                "if [ -z \"$remote_revision\" ]; then",
             ),
             mutate(
                 &workflow,

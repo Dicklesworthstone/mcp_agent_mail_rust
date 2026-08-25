@@ -36,6 +36,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify release identity
         id: contract
@@ -112,6 +113,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
+          persist-credentials: false
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -162,6 +164,9 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
+      - name: Verify locked dependency graph
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -179,6 +184,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
+          persist-credentials: false
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -260,6 +266,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
+          persist-credentials: false
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -429,22 +436,7 @@ jobs:
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
           fetch-depth: 0
-
-      - name: Revalidate release tag before publication
-        env:
-          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
-          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
-        run: |
-          set -euo pipefail
-          checked_out_revision="$(git rev-parse HEAD)"
-          remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk 'NR == 1 {print $1}')"
-          if [ -z "$remote_revision" ]; then
-            remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 {print $1}')"
-          fi
-          if [ "$checked_out_revision" != "$EXPECTED_REVISION" ] || [ "$remote_revision" != "$EXPECTED_REVISION" ]; then
-            echo "Release tag moved after preflight; refusing publication" >&2
-            exit 1
-          fi
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -596,6 +588,22 @@ jobs:
         run: |
           cp install.sh dist/ 2>/dev/null || echo "No install.sh found"
           cp install.ps1 dist/ 2>/dev/null || echo "No install.ps1 found"
+
+      - name: Revalidate release tag immediately before publication
+        env:
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          checked_out_revision="$(git rev-parse HEAD)"
+          remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk 'NR == 1 {print $1}')"
+          if [ -z "$remote_revision" ]; then
+            remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 {print $1}')"
+          fi
+          if [ "$checked_out_revision" != "$EXPECTED_REVISION" ] || [ "$remote_revision" != "$EXPECTED_REVISION" ]; then
+            echo "Release tag moved after preflight; refusing publication" >&2
+            exit 1
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2

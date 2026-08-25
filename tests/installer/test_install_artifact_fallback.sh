@@ -10,9 +10,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
+INSTALL_PS1="$REPO_ROOT/install.ps1"
 
-if [ ! -f "$INSTALL_SH" ]; then
-    echo "FATAL: $INSTALL_SH not found" >&2
+if [ ! -f "$INSTALL_SH" ] || [ ! -f "$INSTALL_PS1" ]; then
+    echo "FATAL: installer source not found ($INSTALL_SH or $INSTALL_PS1)" >&2
     exit 2
 fi
 
@@ -48,8 +49,14 @@ extract_function() {
     echo 'HAS_GUM=0'
     echo 'NO_GUM=1'
     echo 'VERBOSE=0'
+    echo 'VERBOSE_DUMP_LINES=20'
+    echo 'LOG_FILE=/tmp/unused-installer-verification-test.log'
+    echo 'ISSUES_URL=https://example.invalid/issues'
     extract_function info
+    extract_function ok
     extract_function warn
+    extract_function err
+    extract_function error_support_hint
     echo 'verbose() { :; }'
     extract_function set_artifact_url
     extract_function artifact_url_for_target_ext
@@ -67,9 +74,13 @@ extract_function() {
     extract_function remove_installer_lock_dir
     extract_function check_network
     extract_function persist_installer_copy
+    extract_function verify_checksum
+    extract_function resolve_and_verify_archive_checksum
+    extract_function verify_sigstore_bundle
+    extract_function verify_release_archive
 } >"$extract"
 
-for required in set_artifact_url check_network select_linux_x86_64_gnu_artifact_if_available; do
+for required in set_artifact_url check_network select_linux_x86_64_gnu_artifact_if_available verify_release_archive; do
     if ! grep -q "^${required}()" "$extract"; then
         echo "FATAL: could not extract ${required} from install.sh" >&2
         exit 2
@@ -115,6 +126,20 @@ case "$url" in
 esac
 SHIM
 chmod +x "$tmp/bin/curl"
+
+cat >"$tmp/bin/cosign" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "version" ]; then
+    echo 'GitVersion: v3.0.0'
+    exit 0
+fi
+if [ -n "${COSIGN_LOG:-}" ]; then
+    printf '%s\n' "$@" >>"$COSIGN_LOG"
+fi
+exit "${COSIGN_VERIFY_RC:-0}"
+SHIM
+chmod +x "$tmp/bin/cosign"
 
 run_case() {
     local name="$1"
@@ -333,5 +358,204 @@ if [ "$(cat "$saved_installer")" != "known-good-installer" ]; then
     echo "FAIL: invalid successful response modified the existing saved copy" >&2
     exit 1
 fi
+
+step "scenario G: release archive verification is fail-closed and precedes extraction"
+verification_harness="$tmp/verification_harness.sh"
+cat >"$verification_harness" <<'HARNESS'
+#!/usr/bin/env bash
+set -euo pipefail
+source "${EXTRACT:?}"
+
+TMP="${CASE_TMP:?}"
+CHECKSUM="${CHECKSUM_OVERRIDE:-}"
+CHECKSUM_URL=""
+SIGSTORE_BUNDLE_URL=""
+COSIGN_IDENTITY_RE='^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
+COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+
+download_to_file() {
+    local _url="$1"
+    local destination="$2"
+    local label="$3"
+    case "$label" in
+        sha256sums-download)
+            [ "${WITNESS_MODE:-valid}" = "missing_checksum" ] && return 1
+            printf '%s  %s\n' "${ARCHIVE_SHA256:?}" "${ARTIFACT_NAME:?}" >"$destination"
+            ;;
+        checksum-download)
+            return 1
+            ;;
+        sigstore-bundle)
+            case "${WITNESS_MODE:-valid}" in
+                missing_bundle) return 1 ;;
+                empty_bundle) : >"$destination" ;;
+                malformed_bundle) printf '%s\n' '{' >"$destination" ;;
+                *) printf '%s\n' '{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"}' >"$destination" ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+case "${ACTION:-archive}" in
+    archive)
+        verify_release_archive "${ARCHIVE_FILE:?}" "${ARTIFACT_URL:?}" "${ARTIFACT_NAME:?}"
+        ;;
+    checksum_only)
+        verify_checksum "${ARCHIVE_FILE:?}" "${ARCHIVE_SHA256:?}"
+        ;;
+    sigstore_only)
+        verify_sigstore_bundle "${ARCHIVE_FILE:?}" "${ARTIFACT_URL:?}"
+        ;;
+    *)
+        echo "unknown verification action: ${ACTION}" >&2
+        exit 2
+        ;;
+esac
+HARNESS
+chmod +x "$verification_harness"
+
+archive_name="mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz"
+archive_file="$tmp/$archive_name"
+printf '%s\n' 'installer verification fixture' >"$archive_file"
+if command -v sha256sum >/dev/null 2>&1; then
+    archive_sha256=$(sha256sum "$archive_file" | awk '{print $1}')
+else
+    archive_sha256=$(shasum -a 256 "$archive_file" | awk '{print $1}')
+fi
+artifact_url="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/download/v9.9.9/$archive_name"
+
+run_verification_case() {
+    local name="$1"
+    shift
+    local case_tmp="$tmp/$name"
+    mkdir -p "$case_tmp"
+    EXTRACT="$extract" CASE_TMP="$case_tmp" ARCHIVE_FILE="$archive_file" \
+        ARCHIVE_SHA256="$archive_sha256" ARTIFACT_NAME="$archive_name" \
+        ARTIFACT_URL="$artifact_url" COSIGN_LOG="$tmp/$name.cosign.log" \
+        PATH="$tmp/bin:$PATH" "$@" "$verification_harness" \
+        >"$tmp/$name.out" 2>&1
+}
+
+if WITNESS_MODE=missing_checksum run_verification_case verify_missing_checksum bash; then
+    echo "FAIL: missing checksum witness must abort archive verification" >&2
+    exit 1
+fi
+if [ -s "$tmp/verify_missing_checksum.cosign.log" ]; then
+    echo "FAIL: signature verification ran after checksum witness failure" >&2
+    exit 1
+fi
+if ! grep -q 'No SHA256 checksum witness is available' "$tmp/verify_missing_checksum.out"; then
+    echo "FAIL: missing checksum failure was not actionable" >&2
+    cat "$tmp/verify_missing_checksum.out" >&2
+    exit 1
+fi
+
+mkdir -p "$tmp/no-tools" "$tmp/verify_no_sha"
+if EXTRACT="$extract" CASE_TMP="$tmp/verify_no_sha" ARCHIVE_FILE="$archive_file" \
+    ARCHIVE_SHA256="$archive_sha256" ARTIFACT_NAME="$archive_name" \
+    ARTIFACT_URL="$artifact_url" ACTION=checksum_only PATH="$tmp/no-tools" \
+    /bin/bash "$verification_harness" >"$tmp/verify_no_sha.out" 2>&1; then
+    echo "FAIL: missing SHA256 implementation must abort verification" >&2
+    exit 1
+fi
+if ! grep -q 'No SHA256 implementation found' "$tmp/verify_no_sha.out"; then
+    echo "FAIL: missing SHA256 implementation failure was not actionable" >&2
+    exit 1
+fi
+
+for bundle_mode in missing_bundle empty_bundle; do
+    if CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE="$bundle_mode" \
+        run_verification_case "verify_$bundle_mode" bash; then
+        echo "FAIL: $bundle_mode must abort archive verification" >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$tmp/verify_no_cosign"
+if EXTRACT="$extract" CASE_TMP="$tmp/verify_no_cosign" ARCHIVE_FILE="$archive_file" \
+    ARCHIVE_SHA256="$archive_sha256" ARTIFACT_NAME="$archive_name" \
+    ARTIFACT_URL="$artifact_url" ACTION=sigstore_only PATH="$tmp/no-tools" \
+    /bin/bash "$verification_harness" >"$tmp/verify_no_cosign.out" 2>&1; then
+    echo "FAIL: missing cosign must abort signature verification" >&2
+    exit 1
+fi
+if ! grep -q 'cosign is required' "$tmp/verify_no_cosign.out"; then
+    echo "FAIL: missing cosign failure was not actionable" >&2
+    exit 1
+fi
+
+for failure_mode in malformed_bundle invalid_signature; do
+    witness_mode=valid
+    [ "$failure_mode" = "malformed_bundle" ] && witness_mode=malformed_bundle
+    if CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE="$witness_mode" COSIGN_VERIFY_RC=41 \
+        run_verification_case "verify_$failure_mode" bash; then
+        echo "FAIL: $failure_mode must abort archive verification" >&2
+        exit 1
+    fi
+    if ! grep -q 'Sigstore verification failed' "$tmp/verify_$failure_mode.out"; then
+        echo "FAIL: $failure_mode did not surface the Sigstore verification failure" >&2
+        exit 1
+    fi
+done
+
+: >"$tmp/verify_success.cosign.log"
+CHECKSUM_OVERRIDE='' WITNESS_MODE=valid COSIGN_VERIFY_RC=0 run_verification_case verify_success bash
+expected_cosign_log="$tmp/verify_success.cosign.expected"
+printf '%s\n' \
+    'verify-blob' \
+    '--bundle' \
+    "$tmp/verify_success/release.sigstore.json" \
+    '--certificate-identity-regexp' \
+    '^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$' \
+    '--certificate-oidc-issuer' \
+    'https://token.actions.githubusercontent.com' \
+    "$archive_file" >"$expected_cosign_log"
+if ! cmp -s "$expected_cosign_log" "$tmp/verify_success.cosign.log"; then
+    echo "FAIL: cosign was not invoked with the exact release identity/issuer contract" >&2
+    diff -u "$expected_cosign_log" "$tmp/verify_success.cosign.log" >&2 || true
+    exit 1
+fi
+
+no_verify_line=$(grep -nF 'if [ "$NO_VERIFY" -eq 1 ]; then' "$INSTALL_SH" | tail -1 | cut -d: -f1)
+verify_call_line=$(grep -nF 'verify_release_archive "$TMP/$TAR" "$URL" "$TAR"' "$INSTALL_SH" | cut -d: -f1)
+extract_line=$(grep -nF 'tar -xf "$TMP/$TAR" -C "$TMP"' "$INSTALL_SH" | cut -d: -f1)
+if [ -z "$no_verify_line" ] || [ -z "$verify_call_line" ] || [ -z "$extract_line" ] || \
+    [ "$no_verify_line" -ge "$verify_call_line" ] || [ "$verify_call_line" -ge "$extract_line" ]; then
+    echo "FAIL: Unix verification/bypass gate must be explicit and precede extraction" >&2
+    exit 1
+fi
+
+step "scenario H: PowerShell installer statically enforces the same pre-extraction contract"
+identity_re='^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
+if ! grep -Fq "COSIGN_IDENTITY_RE='$identity_re'" "$INSTALL_SH" || \
+    ! grep -Fq "\$CosignIdentityRegex = '$identity_re'" "$INSTALL_PS1"; then
+    echo "FAIL: installers do not share the exact dist workflow identity regex" >&2
+    exit 1
+fi
+if ! grep -Fq "COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'" "$INSTALL_SH" || \
+    ! grep -Fq "\$CosignOidcIssuer = 'https://token.actions.githubusercontent.com'" "$INSTALL_PS1"; then
+    echo "FAIL: installers do not share the exact GitHub Actions OIDC issuer" >&2
+    exit 1
+fi
+
+ps_gate_line=$(grep -nF 'if ($ShouldVerifyArchive) {' "$INSTALL_PS1" | cut -d: -f1)
+ps_sigstore_line=$(grep -nF 'Verify-SigstoreBundle -FilePath $zipPath' "$INSTALL_PS1" | cut -d: -f1)
+ps_extract_line=$(grep -nF 'Expand-Archive -LiteralPath $zipPath' "$INSTALL_PS1" | cut -d: -f1)
+if [ -z "$ps_gate_line" ] || [ -z "$ps_sigstore_line" ] || [ -z "$ps_extract_line" ] || \
+    [ "$ps_gate_line" -ge "$ps_sigstore_line" ] || [ "$ps_sigstore_line" -ge "$ps_extract_line" ]; then
+    echo "FAIL: PowerShell checksum/Sigstore gate must precede Expand-Archive" >&2
+    exit 1
+fi
+for required_text in \
+    'Get-Command Get-FileHash -ErrorAction SilentlyContinue' \
+    'Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue' \
+    'ConvertFrom-Json -ErrorAction Stop' \
+    'UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)'; do
+    if ! grep -Fq "$required_text" "$INSTALL_PS1"; then
+        echo "FAIL: PowerShell fail-closed control missing: $required_text" >&2
+        exit 1
+    fi
+done
 
 step "ALL SCENARIOS PASSED"

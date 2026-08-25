@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -179,6 +179,14 @@ pub struct Config {
 
     // Application
     pub app_environment: AppEnvironment,
+    /// A rejected user-global env-file authority.
+    ///
+    /// When present, higher-level server entry points must refuse startup. A
+    /// missing or rejected bearer token cannot safely degrade to `None`,
+    /// because the loopback HTTP control plane intentionally permits a
+    /// no-auth local mode when neither bearer nor JWT authentication is
+    /// configured.
+    pub user_env_authority_error: Option<String>,
     pub worktrees_enabled: bool,
     pub project_identity_mode: ProjectIdentityMode,
     pub project_identity_remote: String,
@@ -1399,6 +1407,7 @@ impl Default for Config {
 
             // Application
             app_environment: AppEnvironment::Development,
+            user_env_authority_error: None,
             worktrees_enabled: false,
             project_identity_mode: ProjectIdentityMode::Dir,
             project_identity_remote: "origin".to_string(),
@@ -1804,6 +1813,7 @@ impl std::fmt::Debug for Config {
         // Redact secret fields to prevent accidental credential leakage in logs.
         f.debug_struct("Config")
             .field("app_environment", &self.app_environment)
+            .field("user_env_authority_error", &self.user_env_authority_error)
             .field("database_url", &redact_db_url(&self.database_url))
             .field("cache_profile", &self.cache_profile)
             .field("database_cache_budget_kb", &self.database_cache_budget_kb)
@@ -2863,6 +2873,7 @@ impl Config {
         // `AM_STRICT_HOME_STORAGE_GUARD=1` upgrades to panic for CI gating.
         // `AM_ALLOW_HOME_STORAGE_ROOT=1` bypasses both.
         // ────────────────────────────────────────────────────────────
+        config.user_env_authority_error = user_env_authority_error();
         guard_against_default_storage_root_in_test_mode(&config.storage_root);
 
         config
@@ -2890,6 +2901,20 @@ impl Config {
     /// between test cases.
     pub fn reset_cached() {
         global_config_cache_reset();
+    }
+
+    /// Reject use of a configuration whose user-global env-file authority
+    /// could not be read safely.
+    ///
+    /// Callers must perform this check before any server startup mutation. In
+    /// particular, silently treating an unsafe credential file as absent would
+    /// turn the default loopback HTTP listener into an unauthenticated control
+    /// plane.
+    pub fn validate_user_env_authority(&self) -> io::Result<()> {
+        match &self.user_env_authority_error {
+            Some(error) => Err(io::Error::new(io::ErrorKind::PermissionDenied, error.clone())),
+            None => Ok(()),
+        }
     }
 
     /// Returns whether running in production mode
@@ -3205,8 +3230,42 @@ pub fn detect_source(key: &str) -> ConfigSource {
 // Helper functions for environment variable parsing
 
 static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
-static USER_ENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
+static USER_ENV_LOAD: OnceLock<UserEnvLoad> = OnceLock::new();
 static PROCESS_ENV_OVERRIDES: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+
+const USER_ENV_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug)]
+struct UserEnvLoad {
+    values: HashMap<String, String>,
+    authority_error: Option<String>,
+}
+
+impl UserEnvLoad {
+    fn absent() -> Self {
+        Self {
+            values: HashMap::new(),
+            authority_error: None,
+        }
+    }
+
+    fn loaded(values: HashMap<String, String>) -> Self {
+        Self {
+            values,
+            authority_error: None,
+        }
+    }
+
+    fn rejected(path: &Path, error: &io::Error) -> Self {
+        Self {
+            values: HashMap::new(),
+            authority_error: Some(format!(
+                "refusing unsafe user configuration authority {}: {error}; repair the higher-priority config path before starting Agent Mail",
+                path.display()
+            )),
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {

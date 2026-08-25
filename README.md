@@ -295,9 +295,9 @@ The stress tests live in `crates/mcp-agent-mail-storage/tests/stress_pipeline.rs
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh?$(date +%s)" | bash
 ```
 
-Downloads the right binary for your platform, installs to `~/.local/bin`, optionally updates your `PATH`, and auto-configures detected Codex CLI configs for HTTP MCP URL mode. Supports `--verify` for checksum + Sigstore cosign verification.
+Downloads the right binary for your platform, installs to `~/.local/bin`, optionally updates your `PATH`, and auto-configures detected Codex CLI configs for HTTP MCP URL mode. Downloaded release archives are verified **before extraction by default**: the installer requires a SHA-256 witness plus a non-empty Sigstore bundle that `cosign` validates against the exact workflow identity `^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$` and OIDC issuer `https://token.actions.githubusercontent.com`. `cosign` must already be available on `PATH`; a missing checksum, SHA-256 implementation, bundle, or `cosign` executable—and any malformed or mismatched signature evidence—aborts the install.
 
-Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify`, `--easy-mode` (auto-update PATH), `--force`, `--no-service` (never install/modify/restart the background service; also implied automatically by a non-default `--dest`), `--uninstall`, `--yes`, `--purge`.
+Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify` (run an additional post-install self-test), `--no-verify` (**unsafe** explicit escape that skips both pre-extraction archive checks), `--easy-mode` (auto-update PATH), `--force`, `--no-service` (never install/modify/restart the background service; also implied automatically by a non-default `--dest`), `--uninstall`, `--yes`, `--purge`. Archive verification applies to downloaded release archives, not source builds. `--no-verify` does not disable the optional `--verify` post-install self-test.
 
 ### Windows One-Liner (PowerShell)
 
@@ -305,7 +305,7 @@ Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/b
 iwr -useb "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.ps1?$(Get-Random)" | iex
 ```
 
-PowerShell options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`.
+PowerShell enforces the same SHA-256, Sigstore identity, and issuer checks before `Expand-Archive`; it also requires `cosign` on `PATH`. Options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`, `-Verify` (explicitly request the already-default archive checks), and `-NoVerify` (the **unsafe** escape that skips both archive checks). The Windows post-install binary self-test still runs when `-NoVerify` is used.
 
 ### From Source
 
