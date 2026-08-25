@@ -230,6 +230,8 @@ mod tests {
 
     const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_SCHEMA_WAL_WRITER_PATH";
     const WAL_WRITER_VERSION_ENV: &str = "AM_DOCTOR_SCHEMA_WAL_WRITER_VERSION";
+    const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_SCHEMA_WAL_WRITER_READY";
+    const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_SCHEMA_WAL_WRITER_RELEASE";
     const WAL_WRITER_TEST: &str =
         "doctor::fixers::schema_version_mismatch::tests::schema_wal_writer_child";
     const WAL_WRITER_WITNESS: &str = "SCHEMA_WAL_WRITER_CHILD_RAN";
@@ -283,6 +285,12 @@ mod tests {
             .expect("schema WAL writer version")
             .parse::<i32>()
             .expect("schema WAL writer version must be an i32");
+        let ready_path = PathBuf::from(
+            std::env::var(WAL_WRITER_READY_ENV).expect("schema WAL writer ready path"),
+        );
+        let release_path = PathBuf::from(
+            std::env::var(WAL_WRITER_RELEASE_ENV).expect("schema WAL writer release path"),
+        );
         let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
             .expect("open cross-process schema WAL writer");
         writer
@@ -290,8 +298,18 @@ mod tests {
                 "PRAGMA wal_autocheckpoint = 0; PRAGMA user_version = {version};"
             ))
             .expect("commit schema version only to WAL");
-        drop(writer);
+        std::fs::write(&ready_path, b"ready").expect("publish schema WAL writer readiness");
         println!("{WAL_WRITER_WITNESS}");
+        let released = (0..3_000).any(|_| {
+            if release_path.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(released, "parent did not release schema WAL writer in time");
+        drop(writer);
     }
 
     #[test]
@@ -316,7 +334,9 @@ mod tests {
         } else {
             SCHEMA_VERSION + 1
         };
-        let output = std::process::Command::new(
+        let ready_path = td.path().join("schema-wal-writer.ready");
+        let release_path = td.path().join("schema-wal-writer.release");
+        let writer = std::process::Command::new(
             std::env::current_exe().expect("resolve schema-version test executable"),
         )
         .arg(WAL_WRITER_TEST)
@@ -324,8 +344,43 @@ mod tests {
         .arg("--nocapture")
         .env(WAL_WRITER_PATH_ENV, &db)
         .env(WAL_WRITER_VERSION_ENV, wal_version.to_string())
-        .output()
-        .expect("run cross-process schema WAL writer");
+        .env(WAL_WRITER_READY_ENV, &ready_path)
+        .env(WAL_WRITER_RELEASE_ENV, &release_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process schema WAL writer");
+        let writer_ready = (0..1_000).any(|_| {
+            if ready_path.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        if !writer_ready {
+            std::fs::write(&release_path, b"release").expect("release unready schema WAL writer");
+            let output = writer
+                .wait_with_output()
+                .expect("collect unready schema WAL writer");
+            panic!(
+                "schema WAL writer never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let main_after = std::fs::read(&db);
+        let wal_len = std::fs::metadata(PathBuf::from(format!("{}-wal", db.display())))
+            .map(|metadata| metadata.len());
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db,
+            "cross-process WAL-only schema-version truth test",
+        );
+        let findings = detect_prepared(std::slice::from_ref(&candidate));
+
+        std::fs::write(&release_path, b"release").expect("release schema WAL writer");
+        let output = writer.wait_with_output().expect("collect schema WAL writer");
         assert!(
             output.status.success(),
             "schema WAL writer failed: stdout={} stderr={}",
@@ -339,21 +394,14 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            std::fs::read(&db).expect("read WAL-only schema-version main"),
+            main_after.expect("read WAL-only schema-version main"),
             main_before,
             "fixture must keep the changed schema version out of the main image"
         );
-        let wal_path = PathBuf::from(format!("{}-wal", db.display()));
         assert!(
-            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
+            wal_len.is_ok_and(|len| len > 32),
             "fixture must retain committed schema-version WAL frames"
         );
-
-        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
-            &db,
-            "cross-process WAL-only schema-version truth test",
-        );
-        let findings = detect_prepared(std::slice::from_ref(&candidate));
         assert_eq!(findings.len(), 1, "WAL-only schema drift must be visible");
         assert_eq!(findings[0].on_disk_version, wal_version);
         assert_eq!(findings[0].compiled_version, SCHEMA_VERSION);

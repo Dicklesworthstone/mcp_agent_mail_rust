@@ -3266,10 +3266,13 @@ mod tests {
         let Ok(fm_id) = std::env::var(FIX_ONLY_LOCK_FM_ENV) else {
             return;
         };
-        let result = handle_fix_only(&fm_id, false, true, true);
+        let error = handle_fix_only(&fm_id, false, true, true)
+            .expect_err("mutating fixer must refuse shared SQLite authority");
+        let detail = error.to_string();
         assert!(
-            result.is_err(),
-            "mutating fixer {fm_id} must refuse while a shared SQLite authority lock is held"
+            detail.contains("Resource is temporarily busy")
+                && detail.contains("mailbox activity lock is busy"),
+            "mutating fixer {fm_id} failed for an unexpected reason: {detail}"
         );
         println!("{FIX_ONLY_LOCK_REFUSAL_WITNESS}:{fm_id}");
     }
@@ -3287,7 +3290,7 @@ mod tests {
         let release_path = td.path().join("holder.release");
         let test_exe = std::env::current_exe().expect("resolve doctor test executable");
 
-        let mut holder = std::process::Command::new(&test_exe)
+        let holder = std::process::Command::new(&test_exe)
             .arg(FIX_ONLY_LOCK_HOLDER_TEST)
             .arg("--exact")
             .arg("--nocapture")

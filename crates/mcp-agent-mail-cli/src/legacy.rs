@@ -3371,7 +3371,7 @@ mod tests {
                 if reset_completed {
                     fs::write(root.join("reset"), b"reset").expect("publish WAL reset witness");
                 }
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
 
             println!("{CHILD_WITNESS}");

@@ -13152,15 +13152,15 @@ fn recover_sqlite_file_with_storage_root_admitted(
         // Safety (issue #59): reconstruct into a temp file first, validate it,
         // then quarantine the original and swap in the new one. The original DB
         // is NOT moved/modified until the new DB is proven healthy.
-        let archive_inventory = collect_doctor_archive_inventory(&storage_root);
+        let archive_inventory = collect_doctor_archive_inventory(storage_root);
         let archive_has_state = archive_inventory.counts() != DoctorInventoryCounts::default();
         let storage_root_is_explicit =
-            mailbox_activity_storage_root_is_explicit(&storage_root, storage_root_override);
+            mailbox_activity_storage_root_is_explicit(storage_root, storage_root_override);
         let archive_reconstruct_available = storage_root.is_dir()
             && archive_has_state
             && doctor_archive_is_authoritative_for_sqlite_path(
                 path,
-                &storage_root,
+                storage_root,
                 storage_root_is_explicit,
             );
         if archive_reconstruct_available {
@@ -13187,11 +13187,11 @@ fn recover_sqlite_file_with_storage_root_admitted(
             // Reconstruct into a temp file so the original is untouched on failure.
             let temp_reconstruct = next_doctor_artifact_path(path, "reconstruct", "sqlite3");
             let reconstruct = salvage_db_path.map_or_else(
-                || mcp_agent_mail_db::reconstruct_from_archive(&temp_reconstruct, &storage_root),
+                || mcp_agent_mail_db::reconstruct_from_archive(&temp_reconstruct, storage_root),
                 |private_salvage_db_path| {
                     mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
                         &temp_reconstruct,
-                        &storage_root,
+                        storage_root,
                         private_salvage_db_path,
                     )
                 },
@@ -68175,7 +68175,7 @@ startup_timeout_sec = 42
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         assert!(
             std::fs::metadata(&wal_path).is_ok_and(|metadata| {
-                metadata.len() > u64::from(mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES)
+                metadata.len() > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
             }),
             "fixture must retain committed WAL frames"
         );

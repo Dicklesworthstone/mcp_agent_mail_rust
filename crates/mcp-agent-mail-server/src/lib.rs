@@ -28786,11 +28786,11 @@ first body
                 let path = entry.path();
                 let metadata =
                     std::fs::symlink_metadata(&path).expect("inspect server SQLite fixture entry");
-                let bytes = metadata
-                    .file_type()
-                    .is_file()
-                    .then(|| std::fs::read(&path).expect("read server SQLite fixture file"))
-                    .unwrap_or_default();
+                let bytes = if metadata.file_type().is_file() {
+                    std::fs::read(&path).expect("read server SQLite fixture file")
+                } else {
+                    Vec::new()
+                };
                 (entry.file_name(), (metadata.file_type().is_file(), bytes))
             })
             .collect()
