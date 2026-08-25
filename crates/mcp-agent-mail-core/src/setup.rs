@@ -2330,6 +2330,22 @@ fn apply_omp_config_contract(
         home,
         &OMP_SERVER_ALIASES,
     );
+    let legacy_entry_exists = ["servers", "mcp", "mcp_servers"].iter().any(|container| {
+        object
+            .get(*container)
+            .and_then(Value::as_object)
+            .is_some_and(|servers| {
+                OMP_SERVER_ALIASES
+                    .iter()
+                    .any(|name| servers.contains_key(*name))
+            })
+    });
+    if analysis.has_server_entry && legacy_entry_exists {
+        push_drift_reason(
+            &mut analysis.drift_reasons,
+            ConfigDriftReason::DuplicateServerEntries,
+        );
+    }
     apply_omp_disabled_servers_contract(object, analysis, &OMP_SERVER_ALIASES);
 }
 
@@ -2406,9 +2422,24 @@ fn apply_omp_native_entries_contract(
             "entry": redact_value_for_status((*entry).clone(), home),
         })
     });
+    analysis.entry_locations = native_entries
+        .iter()
+        .map(|(server_name, _)| format!("mcpServers.{server_name}"))
+        .collect();
     analysis
         .drift_reasons
         .retain(|reason| *reason == ConfigDriftReason::DuplicateServerEntries);
+    if native_entries.len() > 1 {
+        push_drift_reason(
+            &mut analysis.drift_reasons,
+            ConfigDriftReason::DuplicateServerEntries,
+        );
+    } else if native_entries[0].0 != "mcp-agent-mail" {
+        push_drift_reason(
+            &mut analysis.drift_reasons,
+            ConfigDriftReason::UnsupportedConfig,
+        );
+    }
 
     if !analysis.url_matches {
         if native_entries
@@ -5498,6 +5529,78 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(
             file.drift_reasons
                 .contains(&ConfigDriftReason::MissingServerEntry)
+        );
+    }
+
+    #[test]
+    fn check_status_requires_the_canonical_omp_native_server_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            r#"{
+  "mcpServers": {
+    "agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"},
+      "enabled": true
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let file = first_setup_status_file(&params);
+        assert!(file.has_server_entry && file.url_matches);
+        assert_eq!(file.entry_locations, vec!["mcpServers.agent-mail"]);
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig),
+            "historical alias must remain migration input, not healthy authority"
+        );
+    }
+
+    #[test]
+    fn check_status_reports_omp_native_and_legacy_alias_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"},
+      "enabled": true
+    },
+    "agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"},
+      "enabled": true
+    }
+  },
+  "servers": {
+    "agent-mail": {"command": "stale"}
+  }
+}"#,
+        )
+        .unwrap();
+
+        let file = first_setup_status_file(&params);
+        assert_eq!(
+            file.entry_locations,
+            vec!["mcpServers.mcp-agent-mail", "mcpServers.agent-mail"]
+        );
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::DuplicateServerEntries)
         );
     }
 
