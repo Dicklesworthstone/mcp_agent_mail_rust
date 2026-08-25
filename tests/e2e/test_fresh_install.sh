@@ -266,7 +266,7 @@ CURSOR_CONFIG="$FAKE_HOME/.cursor/mcp.json"
 printf '%s\n' '{}' > "$CURSOR_CONFIG"
 
 MCP_DETECT_LIBRARY="${FAKE_HOME}/detect-mcp-configs-function.sh"
-sed -n '/^detect_mcp_configs() {/,/^generate_bearer_token() {/p' "${INSTALL_SH}" \
+sed -n '/^trusted_system_directory_alias_target() {/,/^generate_bearer_token() {/p' "${INSTALL_SH}" \
   | sed '$d' > "${MCP_DETECT_LIBRARY}"
 if [ ! -s "${MCP_DETECT_LIBRARY}" ]; then
   e2e_fail "extract installer MCP detector" "function body" "missing"
