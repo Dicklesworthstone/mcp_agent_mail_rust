@@ -70,6 +70,101 @@ function Write-WarnText {
     Write-Host "!! $Message" -ForegroundColor Yellow
 }
 
+function Invoke-VersionProbeBounded {
+    param(
+        [string]$BinaryPath,
+        [ValidateSet("--version", "version")]
+        [string]$Argument,
+        [int]$TimeoutMilliseconds = 3000
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $BinaryPath
+    $startInfo.Arguments = $Argument
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+
+    try {
+        if (-not $process.Start()) {
+            throw "process start returned false"
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+                    $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+                    & $taskkill /PID $process.Id /T /F *> $null
+                } else {
+                    $process.Kill($true)
+                }
+            } catch {
+                try { $process.Kill() } catch { }
+            }
+            $null = $process.WaitForExit(5000)
+            throw "version probe timed out after $TimeoutMilliseconds ms"
+        }
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdoutTask.GetAwaiter().GetResult()
+            Stderr = $stderrTask.GetAwaiter().GetResult()
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Assert-SafeCosignVersion {
+    param([string[]]$VersionOutput)
+
+    $versions = @()
+    foreach ($line in $VersionOutput) {
+        $match = [regex]::Match(
+            [string]$line,
+            '^\s*GitVersion:\s*v?(?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)\s*$'
+        )
+        if ($match.Success) {
+            $versions += [version]::new(
+                [int]$match.Groups['major'].Value,
+                [int]$match.Groups['minor'].Value,
+                [int]$match.Groups['patch'].Value
+            )
+        }
+    }
+    if ($versions.Count -ne 1) {
+        throw "Could not parse exactly one stable GitVersion from cosign output. Release verification requires cosign >=3.1.3 and <4.0.0."
+    }
+    $version = $versions[0]
+    if ($version.Major -ne 3 -or $version -lt [version]"3.1.3") {
+        throw "Unsafe or unsupported cosign version v$version; require >=v3.1.3 and <v4.0.0."
+    }
+    return $version
+}
+
+function Get-SafeCosignPath {
+    $cosignCommand = Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $cosignCommand) {
+        throw "cosign is required to verify release archive authenticity but was not found. Install cosign >=v3.1.3 and <v4.0.0, or use -NoVerify only for a trusted local artifact."
+    }
+    try {
+        $probe = Invoke-VersionProbeBounded -BinaryPath $cosignCommand.Source -Argument "version"
+    } catch {
+        throw "Could not determine a bounded cosign version: $($_.Exception.Message)"
+    }
+    if ($probe.ExitCode -ne 0 -or -not [string]::IsNullOrEmpty($probe.Stderr)) {
+        throw "cosign version failed or wrote diagnostics; require a stable cosign >=v3.1.3 and <v4.0.0."
+    }
+    $versionLines = @($probe.Stdout -split "\r?\n" | Where-Object { $_ -ne "" })
+    $safeVersion = Assert-SafeCosignVersion -VersionOutput $versionLines
+    Write-Verbose "Using cosign v$safeVersion at $($cosignCommand.Source)"
+    return $cosignCommand.Source
+}
+
 function Get-ReleaseContract {
     param([string]$RawVersion)
     if ([string]::IsNullOrWhiteSpace($RawVersion)) {
@@ -236,10 +331,7 @@ function Verify-SigstoreBundle {
         [string]$WorkDir
     )
 
-    $cosignCommand = Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $cosignCommand) {
-        throw "cosign is required to verify release archive authenticity but was not found. Install cosign, or use -NoVerify only for a trusted local artifact."
-    }
+    $cosignPath = Get-SafeCosignPath
 
     $bundleUrl = "$AssetUrl.sigstore.json"
     $bundlePath = Join-Path $WorkDir "release.sigstore.json"
@@ -265,13 +357,31 @@ function Verify-SigstoreBundle {
 
     $cosignArgs = @(
         "verify-blob",
+        "--new-bundle-format",
         "--bundle", $bundlePath,
         "--certificate-identity", $CosignIdentity,
         "--certificate-oidc-issuer", $CosignOidcIssuer,
         $FilePath
     )
-    $cosignOutput = @(& $cosignCommand.Source @cosignArgs 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $trustEnvironmentNames = @(
+        "SIGSTORE_ROOT_FILE",
+        "SIGSTORE_REKOR_PUBLIC_KEY",
+        "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE"
+    )
+    $savedTrustEnvironment = @{}
+    foreach ($name in $trustEnvironmentNames) {
+        $savedTrustEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        [Environment]::SetEnvironmentVariable($name, $null, "Process")
+    }
+    try {
+        $cosignOutput = @(& $cosignPath @cosignArgs 2>&1)
+        $cosignExitCode = $LASTEXITCODE
+    } finally {
+        foreach ($name in $trustEnvironmentNames) {
+            [Environment]::SetEnvironmentVariable($name, $savedTrustEnvironment[$name], "Process")
+        }
+    }
+    if ($cosignExitCode -ne 0) {
         $detail = ($cosignOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
         throw "Sigstore verification failed. The bundle must be valid and signed by $CosignIdentity via $CosignOidcIssuer. cosign output: $detail"
     }
@@ -325,16 +435,25 @@ function Assert-ExactBinaryVersion {
     }
 
     try {
-        $versionLines = @(& $BinaryPath --version 2>&1)
-        $versionExit = $LASTEXITCODE
+        $probe = Invoke-VersionProbeBounded -BinaryPath $BinaryPath -Argument "--version"
     } catch {
         throw "$Phase version probe could not execute '$BinaryPath': $($_.Exception.Message)"
     }
 
-    $actual = ($versionLines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-    if ($versionExit -ne 0 -or $versionLines.Count -ne 1 -or $actual -cne $ExpectedOutput) {
+    $actual = [string]$probe.Stdout
+    if ($actual.EndsWith("`r`n", [StringComparison]::Ordinal)) {
+        $actual = $actual.Substring(0, $actual.Length - 2)
+    } elseif ($actual.EndsWith("`n", [StringComparison]::Ordinal)) {
+        $actual = $actual.Substring(0, $actual.Length - 1)
+    }
+    $hasExtraLines = $actual.Contains("`r") -or $actual.Contains("`n")
+    if ($probe.ExitCode -ne 0 -or -not [string]::IsNullOrEmpty($probe.Stderr) -or
+        $hasExtraLines -or $actual -cne $ExpectedOutput) {
         $displayActual = if ([string]::IsNullOrEmpty($actual)) { "<no version output>" } else { $actual }
-        throw "$Phase '$BinaryPath --version' reported '$displayActual' (exit $versionExit); expected exactly '$ExpectedOutput'."
+        if (-not [string]::IsNullOrEmpty($probe.Stderr)) {
+            $displayActual += " [stderr: $($probe.Stderr)]"
+        }
+        throw "$Phase '$BinaryPath --version' reported '$displayActual' (exit $($probe.ExitCode)); expected exactly '$ExpectedOutput'."
     }
 }
 

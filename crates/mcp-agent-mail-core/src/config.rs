@@ -3236,7 +3236,8 @@ static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
 static USER_ENV_LOAD: OnceLock<UserEnvLoad> = OnceLock::new();
 static PROCESS_ENV_OVERRIDES: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
 
-const USER_ENV_FILE_MAX_BYTES: u64 = 1024 * 1024;
+/// Maximum accepted size for one user credential/config authority.
+pub(crate) const USER_ENV_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 struct UserEnvLoad {

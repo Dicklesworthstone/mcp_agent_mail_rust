@@ -2827,10 +2827,12 @@ rollback_binary_install_target() {
       err "Rollback cannot restore $label because its destination is occupied: $dest"
       return 1
     fi
-    if [ ! -f "$backup" ] || [ -L "$backup" ]; then
-      err "Rollback backup for $label is missing or unsafe: $backup"
+    if [ ! -e "$backup" ] && [ ! -L "$backup" ]; then
+      err "Rollback backup for $label is missing: $backup"
       return 1
     fi
+    # mv operates on the directory entry itself, so restoring a raced symlink
+    # or other original entry does not dereference it.
     mv -f "$backup" "$dest" || return 1
   fi
 }
@@ -2874,6 +2876,7 @@ install_binary_pair_transactional() {
   local cli_backup="${cli_dest}.bak.preinstall-${nonce}"
   local server_hash="" cli_hash="" installed_server_hash="" installed_cli_hash=""
   local had_server=0 had_cli=0 installed_server=0 installed_cli=0
+  local source_path=""
 
   for source_path in "$server_src" "$cli_src"; do
     if [ ! -f "$source_path" ] || [ -L "$source_path" ] || \
@@ -2905,7 +2908,7 @@ install_binary_pair_transactional() {
   fi
   sync "$server_tmp" "$cli_tmp" 2>/dev/null || sync 2>/dev/null || true
 
-  if [ -e "$server_dest" ]; then
+  if [ -e "$server_dest" ] || [ -L "$server_dest" ]; then
     if ! mv "$server_dest" "$server_backup"; then
       rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
       err "Could not preserve the existing $BIN_SERVER binary."
@@ -2920,7 +2923,7 @@ install_binary_pair_transactional() {
       return 1
     fi
   fi
-  if [ -e "$cli_dest" ]; then
+  if [ -e "$cli_dest" ] || [ -L "$cli_dest" ]; then
     if ! mv "$cli_dest" "$cli_backup"; then
       rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
         "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
@@ -6911,7 +6914,10 @@ detect_platform
 set_artifact_url
 
 # Ensure the destination directory hierarchy exists before preflight checks
-mkdir -p "$DEST" 2>/dev/null || true
+if ! ensure_real_directory_tree "$DEST" "install destination"; then
+  err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
+  exit 1
+fi
 
 preflight_checks
 

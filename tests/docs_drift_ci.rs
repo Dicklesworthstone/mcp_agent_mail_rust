@@ -607,7 +607,6 @@ mod dist_release_contract {
                 &workflow,
                 "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
                 "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64",
-            ),
             mutate(
                 &workflow,
                 "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
