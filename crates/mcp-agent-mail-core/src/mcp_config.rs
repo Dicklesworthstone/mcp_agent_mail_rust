@@ -95,7 +95,7 @@ pub fn detect_mcp_config_locations(params: &McpConfigDetectParams) -> Vec<McpCon
             .omp_user_mcp_config
             .as_deref()
             .unwrap_or(&default_omp_user_config);
-        add_home_candidates(&mut candidates, &mut seen, home, omp_root, omp_user_config);
+        add_home_candidates(&mut candidates, &mut seen, home, omp_user_config);
     }
 
     if let Some(app_data) = params.app_data_dir.as_ref() {
@@ -121,6 +121,47 @@ pub fn detect_mcp_config_locations(params: &McpConfigDetectParams) -> Vec<McpCon
     locations
 }
 
+/// Detect MCP config files that an automated repair may mutate.
+///
+/// OMP reads compatibility fallbacks in addition to its canonical primary
+/// files, but its own writer only targets the active profile's `mcp.json` and
+/// the project's `.omp/mcp.json`. Keep the broader read-only inventory in
+/// [`detect_mcp_config_locations`], while excluding OMP compatibility files
+/// from mutation authority here.
+#[must_use]
+pub fn detect_mcp_config_mutation_locations(
+    params: &McpConfigDetectParams,
+) -> Vec<McpConfigLocation> {
+    let home_dir = params.home_dir.clone().or_else(dirs::home_dir);
+    let active_omp_user_config = home_dir.as_ref().map(|home| {
+        let default_omp_root = home.join(".omp");
+        let omp_root = params
+            .omp_config_root
+            .as_deref()
+            .unwrap_or(&default_omp_root);
+        params
+            .omp_user_mcp_config
+            .clone()
+            .unwrap_or_else(|| omp_root.join("agent").join("mcp.json"))
+    });
+    let project_dir = params
+        .project_dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let project_omp_primary = project_dir.join(".omp").join("mcp.json");
+
+    detect_mcp_config_locations(params)
+        .into_iter()
+        .filter(|location| {
+            location.tool != McpConfigTool::Omp
+                || (active_omp_user_config
+                    .as_ref()
+                    .is_some_and(|active| location.config_path == *active)
+                    || location.config_path == project_omp_primary)
+        })
+        .collect()
+}
+
 /// Detect known MCP config locations using ambient runtime paths.
 #[must_use]
 pub fn detect_mcp_config_locations_default() -> Vec<McpConfigLocation> {
@@ -139,6 +180,29 @@ pub fn detect_mcp_config_locations_default() -> Vec<McpConfigLocation> {
         // redirect it to the default config because doctor fixers consume
         // these candidates. Mutating setup and startup self-heal propagate the
         // precise validation error instead.
+        locations.retain(|location| location.tool != McpConfigTool::Omp);
+    }
+    locations
+}
+
+/// Detect ambient MCP config mutation targets.
+///
+/// This is the mutation-authority counterpart to
+/// [`detect_mcp_config_locations_default`]. An invalid explicit OMP profile
+/// has no writable fallback and therefore contributes no OMP target.
+#[must_use]
+pub fn detect_mcp_config_mutation_locations_default() -> Vec<McpConfigLocation> {
+    let omp_paths = crate::setup::omp_config_paths_from_env();
+    let invalid_omp_profile = omp_paths.is_err();
+    let omp_paths = omp_paths.ok().flatten();
+    let params = McpConfigDetectParams {
+        app_data_dir: std::env::var_os("APPDATA").map(PathBuf::from),
+        omp_config_root: omp_paths.as_ref().map(|paths| paths.config_root.clone()),
+        omp_user_mcp_config: omp_paths.map(|paths| paths.user_mcp_config),
+        ..McpConfigDetectParams::default()
+    };
+    let mut locations = detect_mcp_config_mutation_locations(&params);
+    if invalid_omp_profile {
         locations.retain(|location| location.tool != McpConfigTool::Omp);
     }
     locations
@@ -547,14 +611,13 @@ fn add_home_candidates(
     out: &mut Vec<(McpConfigTool, PathBuf)>,
     seen: &mut HashSet<(McpConfigTool, PathBuf)>,
     home: &Path,
-    omp_config_root: &Path,
     omp_user_config: &Path,
 ) {
     add_home_claude_candidates(out, seen, home);
     add_home_codex_candidates(out, seen, home);
     add_home_cursor_candidates(out, seen, home);
     add_home_gemini_candidates(out, seen, home);
-    add_home_omp_candidates(out, seen, omp_config_root, omp_user_config);
+    add_home_omp_candidates(out, seen, omp_user_config);
     add_home_github_copilot_candidates(out, seen, home);
     add_home_other_tool_candidates(out, seen, home);
 }
@@ -673,68 +736,50 @@ fn add_home_gemini_candidates(
 fn add_home_omp_candidates(
     out: &mut Vec<(McpConfigTool, PathBuf)>,
     seen: &mut HashSet<(McpConfigTool, PathBuf)>,
-    config_root: &Path,
     active_user_config: &Path,
 ) {
-    let profiles_root = config_root.join("profiles");
-    if !omp_profile_config_traverses_symlink(&profiles_root, active_user_config) {
-        add_omp_agent_candidates(out, seen, active_user_config);
-    }
-    add_omp_agent_candidates(out, seen, &config_root.join("agent").join("mcp.json"));
-
-    if std::fs::symlink_metadata(&profiles_root)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return;
-    }
-    let mut profile_dirs = std::fs::read_dir(&profiles_root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(crate::setup::normalize_omp_profile_name)
-                .is_some()
-        })
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    profile_dirs.sort();
-    for profile_dir in profile_dirs {
-        let primary_config = profile_dir.join("agent").join("mcp.json");
-        if !omp_profile_config_traverses_symlink(&profiles_root, &primary_config) {
-            add_omp_agent_candidates(out, seen, &primary_config);
-        }
-    }
+    add_omp_agent_candidates(out, seen, active_user_config);
 }
 
-fn omp_profile_config_traverses_symlink(profiles_root: &Path, config: &Path) -> bool {
-    let Ok(relative) = config.strip_prefix(profiles_root) else {
-        return false;
-    };
-    let mut current = profiles_root.to_path_buf();
-    if std::fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+fn omp_config_path_is_unsafe(config: &Path) -> bool {
+    if !config.is_absolute() {
         return true;
     }
-
-    let Some(parent) = relative.parent() else {
-        return false;
+    let Some(parent) = config.parent() else {
+        return true;
     };
+
+    let mut current = PathBuf::new();
     for component in parent.components() {
-        let std::path::Component::Normal(segment) = component else {
-            return true;
-        };
-        current.push(segment);
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
+            std::path::Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => return true,
+            std::path::Component::Normal(segment) => current.push(segment),
+        }
         match std::fs::symlink_metadata(&current) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && crate::disk::is_trusted_system_directory_alias(&current) => {}
             Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(metadata) if !metadata.file_type().is_dir() => return true,
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
             Err(_) => return true,
         }
     }
-    false
+
+    match std::fs::symlink_metadata(config) {
+        Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_file(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 fn add_omp_agent_candidates(
@@ -742,13 +787,14 @@ fn add_omp_agent_candidates(
     seen: &mut HashSet<(McpConfigTool, PathBuf)>,
     primary_config: &Path,
 ) {
-    push_candidate(out, seen, McpConfigTool::Omp, primary_config.to_path_buf());
-    push_candidate(
-        out,
-        seen,
-        McpConfigTool::Omp,
+    for config in [
+        primary_config.to_path_buf(),
         primary_config.with_file_name(".mcp.json"),
-    );
+    ] {
+        if !omp_config_path_is_unsafe(&config) {
+            push_candidate(out, seen, McpConfigTool::Omp, config);
+        }
+    }
 }
 
 fn add_home_github_copilot_candidates(
