@@ -3180,6 +3180,17 @@ mod tests {
     static DOCTOR_HEALTH_STDIO_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    const FIX_ONLY_LOCK_DB_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_DB";
+    const FIX_ONLY_LOCK_READY_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_READY";
+    const FIX_ONLY_LOCK_RELEASE_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_RELEASE";
+    const FIX_ONLY_LOCK_FM_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_FM";
+    const FIX_ONLY_LOCK_HOLDER_TEST: &str =
+        "doctor::tests::fix_only_shared_sqlite_lock_holder_child";
+    const FIX_ONLY_LOCK_INVOKER_TEST: &str =
+        "doctor::tests::fix_only_exclusive_lock_invoker_child";
+    const FIX_ONLY_LOCK_HOLDER_WITNESS: &str = "FIX_ONLY_SHARED_LOCK_HOLDER_RAN";
+    const FIX_ONLY_LOCK_REFUSAL_WITNESS: &str = "FIX_ONLY_EXCLUSIVE_LOCK_REFUSED";
+
     fn seed_healthy_live_mailbox(db_path: &std::path::Path) {
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
             .expect("open live db");
@@ -3218,6 +3229,145 @@ mod tests {
                 .any(|path| path.ends_with(".omp/mcp.json")),
             "doctor MCP failure modes must inspect OMP's project-native config"
         );
+    }
+
+    #[test]
+    fn fix_only_shared_sqlite_lock_holder_child() {
+        let Ok(db_path) = std::env::var(FIX_ONLY_LOCK_DB_ENV) else {
+            return;
+        };
+        let ready_path = PathBuf::from(
+            std::env::var(FIX_ONLY_LOCK_READY_ENV).expect("fix-only lock ready path"),
+        );
+        let release_path = PathBuf::from(
+            std::env::var(FIX_ONLY_LOCK_RELEASE_ENV).expect("fix-only lock release path"),
+        );
+        let _shared = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            Path::new(&db_path),
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("acquire cross-process shared SQLite activity lock")
+        .expect("file-backed SQLite lock guard");
+        std::fs::write(&ready_path, b"ready").expect("publish shared-lock readiness");
+        let released = (0..3_000).any(|_| {
+            if release_path.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(released, "parent did not release shared-lock child in time");
+        println!("{FIX_ONLY_LOCK_HOLDER_WITNESS}");
+    }
+
+    #[test]
+    fn fix_only_exclusive_lock_invoker_child() {
+        let Ok(fm_id) = std::env::var(FIX_ONLY_LOCK_FM_ENV) else {
+            return;
+        };
+        let result = handle_fix_only(&fm_id, false, true, true);
+        assert!(
+            result.is_err(),
+            "mutating fixer {fm_id} must refuse while a shared SQLite authority lock is held"
+        );
+        println!("{FIX_ONLY_LOCK_REFUSAL_WITNESS}:{fm_id}");
+    }
+
+    #[test]
+    fn every_logical_db_auto_fixer_refuses_cross_process_shared_authority() {
+        let td = tempfile::tempdir().expect("fix-only exclusive-lock tempdir");
+        let repo_root = td.path().join("repo");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_root).expect("create isolated repo root");
+        std::fs::create_dir_all(&storage_root).expect("create isolated storage root");
+        let db_path = storage_root.join("storage.sqlite3");
+        seed_healthy_live_mailbox(&db_path);
+        let ready_path = td.path().join("holder.ready");
+        let release_path = td.path().join("holder.release");
+        let test_exe = std::env::current_exe().expect("resolve doctor test executable");
+
+        let mut holder = std::process::Command::new(&test_exe)
+            .arg(FIX_ONLY_LOCK_HOLDER_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(FIX_ONLY_LOCK_DB_ENV, &db_path)
+            .env(FIX_ONLY_LOCK_READY_ENV, &ready_path)
+            .env(FIX_ONLY_LOCK_RELEASE_ENV, &release_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn shared SQLite lock holder");
+        let holder_ready = (0..1_000).any(|_| {
+            if ready_path.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        if !holder_ready {
+            std::fs::write(&release_path, b"release").expect("release unready holder");
+            let output = holder.wait_with_output().expect("collect unready holder");
+            panic!(
+                "shared-lock holder never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let mut invocations = Vec::new();
+        for fm_id in [
+            fixers::inbox_stats_divergence::FM_ID,
+            fixers::legacy_fts_residue::FM_ID,
+            fixers::orphan_foreign_key_rows::FM_ID,
+            fixers::reservation_db_archive_parity::FM_ID,
+            fixers::reservation_artifact_normalize::FM_ID,
+        ] {
+            let output = std::process::Command::new(&test_exe)
+                .arg(FIX_ONLY_LOCK_INVOKER_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .current_dir(&repo_root)
+                .env(FIX_ONLY_LOCK_FM_ENV, fm_id)
+                .env("DATABASE_URL", &database_url)
+                .env("STORAGE_ROOT", &storage_root)
+                .output()
+                .expect("run fix-only exclusive-lock invoker");
+            invocations.push((fm_id, output));
+        }
+
+        std::fs::write(&release_path, b"release").expect("release shared-lock holder");
+        let holder_output = holder.wait_with_output().expect("collect shared-lock holder");
+        assert!(
+            holder_output.status.success(),
+            "shared-lock holder failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&holder_output.stdout),
+            String::from_utf8_lossy(&holder_output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&holder_output.stdout)
+                .contains(FIX_ONLY_LOCK_HOLDER_WITNESS),
+            "shared-lock holder filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&holder_output.stdout),
+            String::from_utf8_lossy(&holder_output.stderr)
+        );
+        for (fm_id, output) in invocations {
+            assert!(
+                output.status.success(),
+                "fix-only invoker failed for {fm_id}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("{FIX_ONLY_LOCK_REFUSAL_WITNESS}:{fm_id}")),
+                "fix-only invoker filter was vacuous for {fm_id}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

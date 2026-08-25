@@ -77,7 +77,7 @@ mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
-franken-agent-detection = "0.2.1"
+franken-agent-detection = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1.1.2"
@@ -189,7 +189,7 @@ inherits = "release"     # Benchmarks use same optimizations as release
 # [workspace.dependencies] is satisfied ONLY through this patch).
 # Cleanup trigger: beads_rust 0.4.x published to crates.io.
 beads_rust = { path = "../beads_rust" }
-# ftui 0.5.0, franken-agent-detection 0.2.1, and tru 0.2.3 resolve from
+# ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3 resolve from
 # crates.io as of 2026-08-22 — the ../frankentui, ../franken_agent_detection,
 # and ../toon_rust path patches are gone. Path patches made builds depend on
 # whatever state each machine's sibling checkout happened to be in (a broken

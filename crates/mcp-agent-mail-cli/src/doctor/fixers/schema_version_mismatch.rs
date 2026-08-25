@@ -228,6 +228,12 @@ mod tests {
     use sqlmodel_sqlite::SqliteConnection;
     use tempfile::TempDir;
 
+    const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_SCHEMA_WAL_WRITER_PATH";
+    const WAL_WRITER_VERSION_ENV: &str = "AM_DOCTOR_SCHEMA_WAL_WRITER_VERSION";
+    const WAL_WRITER_TEST: &str =
+        "doctor::fixers::schema_version_mismatch::tests::schema_wal_writer_child";
+    const WAL_WRITER_WITNESS: &str = "SCHEMA_WAL_WRITER_CHILD_RAN";
+
     fn make_db_with_version(td: &TempDir, version: i32) -> PathBuf {
         let db = td.path().join("storage.sqlite3");
         let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
@@ -266,6 +272,91 @@ mod tests {
         assert_eq!(findings[0].direction, Direction::Newer);
         let g = findings[0].to_finding();
         assert_eq!(g.severity, "P1");
+    }
+
+    #[test]
+    fn schema_wal_writer_child() {
+        let Ok(db_path) = std::env::var(WAL_WRITER_PATH_ENV) else {
+            return;
+        };
+        let version = std::env::var(WAL_WRITER_VERSION_ENV)
+            .expect("schema WAL writer version")
+            .parse::<i32>()
+            .expect("schema WAL writer version must be an i32");
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
+            .expect("open cross-process schema WAL writer");
+        writer
+            .execute_raw(&format!(
+                "PRAGMA wal_autocheckpoint = 0; PRAGMA user_version = {version};"
+            ))
+            .expect("commit schema version only to WAL");
+        drop(writer);
+        println!("{WAL_WRITER_WITNESS}");
+    }
+
+    #[test]
+    fn production_detector_sees_cross_process_wal_only_schema_version() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let admitted = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
+            .expect("open live schema-version fixture");
+        admitted
+            .execute_raw(&format!(
+                "PRAGMA user_version = {SCHEMA_VERSION};
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            ))
+            .expect("settle matching schema-version baseline");
+        mcp_agent_mail_db::close_db_conn(admitted, "settle schema-version WAL baseline");
+        let main_before = std::fs::read(&db).expect("read settled schema-version main");
+
+        let wal_version = if SCHEMA_VERSION > 0 {
+            SCHEMA_VERSION - 1
+        } else {
+            SCHEMA_VERSION + 1
+        };
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve schema-version test executable"),
+        )
+        .arg(WAL_WRITER_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_WRITER_PATH_ENV, &db)
+        .env(WAL_WRITER_VERSION_ENV, wal_version.to_string())
+        .output()
+        .expect("run cross-process schema WAL writer");
+        assert!(
+            output.status.success(),
+            "schema WAL writer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(WAL_WRITER_WITNESS),
+            "schema WAL writer filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&db).expect("read WAL-only schema-version main"),
+            main_before,
+            "fixture must keep the changed schema version out of the main image"
+        );
+        let wal_path = PathBuf::from(format!("{}-wal", db.display()));
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
+            "fixture must retain committed schema-version WAL frames"
+        );
+
+        let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
+            &db,
+            "cross-process WAL-only schema-version truth test",
+        );
+        let findings = detect_prepared(std::slice::from_ref(&candidate));
+        assert_eq!(findings.len(), 1, "WAL-only schema drift must be visible");
+        assert_eq!(findings[0].on_disk_version, wal_version);
+        assert_eq!(findings[0].compiled_version, SCHEMA_VERSION);
     }
 
     #[test]

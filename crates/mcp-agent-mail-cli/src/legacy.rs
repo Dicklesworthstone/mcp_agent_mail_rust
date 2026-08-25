@@ -2212,6 +2212,88 @@ fn confirm_with_prompt(prompt: &str, default: bool) -> CliResult<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    struct LegacyTestChild {
+        child: Option<std::process::Child>,
+        stop_path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LegacyTestChild {
+        fn spawn(test_name: &str, env_key: &str, root: &Path) -> Self {
+            let child = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(env_key, root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn legacy source child fixture");
+            Self {
+                child: Some(child),
+                stop_path: root.join("stop"),
+            }
+        }
+
+        fn wait_for_marker(&mut self, marker: &Path, label: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if marker.exists() {
+                    return;
+                }
+                if let Some(status) = self
+                    .child
+                    .as_mut()
+                    .expect("child still present")
+                    .try_wait()
+                    .expect("probe child status")
+                {
+                    panic!("legacy source child exited before {label}: {status}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for legacy source child {label}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        fn finish(mut self, witness: &str) {
+            fs::write(&self.stop_path, b"stop").expect("signal legacy source child to stop");
+            let output = self
+                .child
+                .take()
+                .expect("child still present")
+                .wait_with_output()
+                .expect("wait for legacy source child");
+            assert!(
+                output.status.success(),
+                "legacy source child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(witness),
+                "legacy source child filter ran no causal fixture: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LegacyTestChild {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.stop_path, b"stop");
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
+
     fn sample_receipt(created_at: &str, target_db: &str) -> LegacyImportReceipt {
         let mut counts = BTreeMap::new();
         counts.insert("messages".to_string(), 1);
@@ -3215,6 +3297,321 @@ mod tests {
         );
 
         drop(writer);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_source_snapshot_is_coherent_during_cross_process_wal_family_races() {
+        const CHILD_ROOT_ENV: &str = "MCP_AGENT_MAIL_LEGACY_WAL_RACE_ROOT";
+        const CHILD_TEST_NAME: &str = "legacy::tests::legacy_source_snapshot_is_coherent_during_cross_process_wal_family_races";
+        const CHILD_WITNESS: &str = "legacy-wal-race-child-completed";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let source_db = root.join("source.sqlite3");
+            let writer = CanonicalDbConn::open_file(source_db.display().to_string())
+                .expect("open cross-process WAL writer");
+            writer
+                .query_sync("PRAGMA journal_mode=WAL", &[])
+                .expect("enable WAL mode in child");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint=0; \
+                     CREATE TABLE snapshot_generation(generation INTEGER NOT NULL); \
+                     CREATE TABLE snapshot_rows( \
+                         generation INTEGER PRIMARY KEY NOT NULL, \
+                         payload BLOB NOT NULL \
+                     ); \
+                     INSERT INTO snapshot_generation(generation) VALUES (128); \
+                     WITH RECURSIVE seq(value) AS ( \
+                         SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 128 \
+                     ) \
+                     INSERT INTO snapshot_rows(generation, payload) \
+                     SELECT value, zeroblob(65536) FROM seq;",
+                )
+                .expect("seed WAL-only schema and rows");
+            fs::write(root.join("progress"), b"128").expect("publish initial generation");
+            fs::write(root.join("ready"), b"ready").expect("publish child readiness");
+
+            while !root.join("start").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            let mut generation = 128_u64;
+            while !root.join("stop").exists() {
+                generation = generation
+                    .checked_add(1)
+                    .expect("generation remains bounded");
+                writer
+                    .execute_raw(&format!(
+                        "BEGIN IMMEDIATE; \
+                         UPDATE snapshot_generation SET generation = {generation}; \
+                         INSERT INTO snapshot_rows(generation, payload) \
+                         VALUES ({generation}, zeroblob(65536)); \
+                         COMMIT;"
+                    ))
+                    .expect("commit one complete WAL generation");
+                fs::write(root.join("progress"), generation.to_string())
+                    .expect("publish child generation");
+                fs::write(root.join("grew"), b"grew").expect("publish WAL growth witness");
+
+                writer
+                    .query_sync("PRAGMA wal_checkpoint(PASSIVE)", &[])
+                    .expect("run concurrent passive checkpoint");
+                fs::write(root.join("checkpointed"), b"checkpointed")
+                    .expect("publish checkpoint witness");
+
+                let rows = writer
+                    .query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .expect("attempt concurrent WAL reset");
+                let reset_completed = rows.first().is_some_and(|row| {
+                    row.get_named::<i64>("busy").ok() == Some(0)
+                        && row.get_named::<i64>("log").ok() == Some(0)
+                });
+                if reset_completed {
+                    fs::write(root.join("reset"), b"reset").expect("publish WAL reset witness");
+                }
+                std::thread::yield_now();
+            }
+
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn published_generation(path: &Path) -> Option<u64> {
+            fs::read_to_string(path).ok()?.parse().ok()
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let source_db = root.join("source.sqlite3");
+        let mut child = LegacyTestChild::spawn(CHILD_TEST_NAME, CHILD_ROOT_ENV, root);
+        child.wait_for_marker(&root.join("ready"), "WAL fixture readiness");
+
+        let wal_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_db, "-wal");
+        let shm_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_db, "-shm");
+        assert!(wal_path.exists(), "child must create a WAL sidecar");
+        assert!(shm_path.exists(), "child must create an SHM sidecar");
+        assert!(
+            fs::metadata(&wal_path).expect("inspect WAL").len() > 32,
+            "child must place committed content beyond the WAL header"
+        );
+
+        // An immutable main-only view deliberately ignores WAL. Its inability
+        // to see the fixture proves that the schema and rows exercised below
+        // are WAL-resident rather than accidentally checkpointed setup data.
+        let main_only_uri = format!(
+            "file:{}?immutable=1",
+            sqlite_uri_encode_path(source_db.as_path())
+        );
+        let main_only_flags = {
+            let mut flags = mcp_agent_mail_db::sqlmodel_sqlite::OpenFlags::read_only();
+            flags.uri = true;
+            flags
+        };
+        let main_only = CanonicalDbConn::open(
+            &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConfig::file(main_only_uri)
+                .flags(main_only_flags),
+        )
+        .expect("open main-only WAL control");
+        let rows = main_only
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master \
+                 WHERE type='table' AND name='snapshot_rows'",
+                &[],
+            )
+            .expect("query main-only schema control");
+        assert_eq!(
+            rows.first().and_then(|row| row.get_named::<i64>("c").ok()),
+            Some(0),
+            "main-only control must not see the WAL-resident schema"
+        );
+        drop(main_only);
+
+        fs::write(root.join("start"), b"start").expect("start WAL race");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let progress_path = root.join("progress");
+        let mut coherent_snapshots = 0_u32;
+        let mut observed_commit_during_capture = false;
+        let mut fail_closed_errors = Vec::new();
+
+        while std::time::Instant::now() < deadline {
+            let before = published_generation(&progress_path);
+            match LegacySourceSnapshot::capture(&source_db) {
+                Ok(snapshot) => {
+                    let conn = open_private_immutable_source_snapshot(&snapshot)
+                        .expect("open coherent retained snapshot");
+                    verify_canonical_quick_check(
+                        &conn,
+                        snapshot.snapshot_path(),
+                        "racing retained snapshot",
+                    )
+                    .expect("racing snapshot quick_check");
+                    let rows = conn
+                        .query_sync(
+                            "SELECT \
+                                 (SELECT generation FROM snapshot_generation) AS generation, \
+                                 COUNT(*) AS row_count, \
+                                 COALESCE(MAX(generation), 0) AS max_generation \
+                             FROM snapshot_rows",
+                            &[],
+                        )
+                        .expect("query cross-table generation invariant");
+                    let row = rows.first().expect("generation invariant row");
+                    let generation = row
+                        .get_named::<i64>("generation")
+                        .expect("snapshot generation");
+                    let row_count = row
+                        .get_named::<i64>("row_count")
+                        .expect("snapshot row count");
+                    let max_generation = row
+                        .get_named::<i64>("max_generation")
+                        .expect("snapshot max generation");
+                    assert_eq!(
+                        row_count, generation,
+                        "snapshot must not mix the generation row with a different WAL generation"
+                    );
+                    assert_eq!(
+                        max_generation, generation,
+                        "snapshot must contain every row committed through its generation"
+                    );
+                    coherent_snapshots = coherent_snapshots.saturating_add(1);
+                }
+                Err(error) => fail_closed_errors.push(error.to_string()),
+            }
+            let after = published_generation(&progress_path);
+            observed_commit_during_capture |= before
+                .zip(after)
+                .is_some_and(|(before, after)| after > before);
+
+            let exercised_family_races = root.join("grew").exists()
+                && root.join("checkpointed").exists()
+                && root.join("reset").exists();
+            if coherent_snapshots >= 2 && observed_commit_during_capture && exercised_family_races {
+                break;
+            }
+        }
+
+        assert!(
+            coherent_snapshots >= 2,
+            "expected at least two coherent snapshots while racing; fail-closed errors={fail_closed_errors:?}"
+        );
+        assert!(
+            observed_commit_during_capture,
+            "child must commit a new generation during at least one capture"
+        );
+        assert!(
+            root.join("grew").exists(),
+            "WAL growth branch not exercised"
+        );
+        assert!(
+            root.join("checkpointed").exists(),
+            "WAL checkpoint branch not exercised"
+        );
+        assert!(
+            root.join("reset").exists(),
+            "WAL reset branch not exercised"
+        );
+        child.finish(CHILD_WITNESS);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_import_fails_closed_on_wal_only_corruption_without_target_publication() {
+        const CHILD_ROOT_ENV: &str = "MCP_AGENT_MAIL_LEGACY_WAL_CORRUPTION_ROOT";
+        const CHILD_TEST_NAME: &str = "legacy::tests::legacy_import_fails_closed_on_wal_only_corruption_without_target_publication";
+        const CHILD_WITNESS: &str = "legacy-wal-corruption-child-completed";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let source_db = root.join("source.sqlite3");
+            let writer = CanonicalDbConn::open_file(source_db.display().to_string())
+                .expect("open WAL corruption fixture writer");
+            writer
+                .query_sync("PRAGMA journal_mode=WAL", &[])
+                .expect("enable WAL mode in corruption child");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint=0; \
+                     CREATE TABLE wal_only_corruption_witness(value INTEGER NOT NULL); \
+                     INSERT INTO wal_only_corruption_witness(value) VALUES (73);",
+                )
+                .expect("commit WAL-only corruption fixture");
+            fs::write(root.join("ready"), b"ready").expect("publish corruption readiness");
+            while !root.join("stop").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            drop(writer);
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        use std::io::{Seek, SeekFrom};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let source_db = root.join("source.sqlite3");
+        let source_storage = root.join("source-storage");
+        let target_db = root.join("target.sqlite3");
+        let target_storage = root.join("target-storage");
+        fs::create_dir_all(&source_storage).expect("create source storage");
+
+        let mut child = LegacyTestChild::spawn(CHILD_TEST_NAME, CHILD_ROOT_ENV, root);
+        child.wait_for_marker(&root.join("ready"), "WAL corruption fixture readiness");
+        let wal_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_db, "-wal");
+        let main_before = fs::read(&source_db).expect("read pristine main database");
+        let wal_before = fs::read(&wal_path).expect("read pristine WAL");
+        assert!(
+            wal_before.len() > 32,
+            "corruption fixture must contain committed WAL frames"
+        );
+
+        let mut wal = fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .expect("open WAL fixture for corruption plant");
+        wal.seek(SeekFrom::Start(0)).expect("seek WAL magic");
+        wal.write_all(&[wal_before[0] ^ 0xff])
+            .expect("corrupt WAL magic only");
+        wal.sync_all().expect("durably plant WAL corruption");
+        drop(wal);
+
+        assert_eq!(
+            fs::read(&source_db).expect("reread main database"),
+            main_before,
+            "WAL corruption plant must not modify the main database"
+        );
+        assert_ne!(
+            fs::read(&wal_path).expect("reread corrupted WAL"),
+            wal_before,
+            "WAL corruption plant must be mutation-sensitive"
+        );
+
+        let error = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(root.to_path_buf()),
+            db: Some(source_db.clone()),
+            storage_root: Some(source_storage),
+            target_db: Some(target_db.clone()),
+            target_storage_root: Some(target_storage.clone()),
+            dry_run: false,
+            yes: true,
+        })
+        .expect_err("WAL-only corruption must fail before import execution");
+        let error = error.to_string().to_ascii_lowercase();
+        assert!(
+            error.contains("wal") || error.contains("coherent") || error.contains("healthy"),
+            "failure must identify the refused source-family proof: {error}"
+        );
+        assert!(
+            !target_db.exists(),
+            "failed source capture must not publish a target database"
+        );
+        assert!(
+            !target_storage.exists(),
+            "failed source capture must not publish target storage"
+        );
+        child.finish(CHILD_WITNESS);
     }
 
     #[cfg(target_os = "linux")]
