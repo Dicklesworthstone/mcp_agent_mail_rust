@@ -6023,19 +6023,18 @@ pub async fn create_message(
     // rationale) and insert it explicitly, so it can never be re-issued even
     // when the live SQLite's durable AUTOINCREMENT fails to advance.
     let id_allocator = pool.message_id_allocator();
-    let archive_seed = if id_allocator.needs_archive_seed() {
-        id_allocator.mark_archive_seeded();
-        crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
-    } else {
-        0
-    };
     let db_floor = match read_messages_id_floor(cx, &tracked).await {
         Outcome::Ok(floor) => floor,
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let message_id = id_allocator.allocate(db_floor, archive_seed);
+    let message_id = match id_allocator.allocate(db_floor, || {
+        crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
+    }) {
+        Ok(id) => id,
+        Err(error) => return Outcome::Err(error),
+    };
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
@@ -6360,19 +6359,18 @@ async fn create_message_with_recipients_impl(
         // MESSAGE_WRITE_SERIALIZER) so MVCC retries of the transaction reuse a
         // stable id.
         let id_allocator = pool.message_id_allocator();
-        let archive_seed = if id_allocator.needs_archive_seed() {
-            id_allocator.mark_archive_seeded();
-            crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
-        } else {
-            0
-        };
         let db_floor = match read_messages_id_floor(cx, &tracked).await {
             Outcome::Ok(floor) => floor,
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let message_id = id_allocator.allocate(db_floor, archive_seed);
+        let message_id = match id_allocator.allocate(db_floor, || {
+            crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
+        }) {
+            Ok(id) => id,
+            Err(error) => return Outcome::Err(error),
+        };
 
         let created_outcome =
             match run_with_mvcc_retry(cx, "create_message_with_recipients", || {

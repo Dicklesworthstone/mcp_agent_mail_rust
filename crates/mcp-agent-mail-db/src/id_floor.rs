@@ -19,7 +19,7 @@
 //! the archive it's a no-op.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use sqlmodel_core::Value;
 use sqlmodel_sqlite::SqliteConnection;
@@ -158,11 +158,7 @@ pub fn advance_messages_id_floor(
             conn.query_sync(sql, params)
                 .map_err(|error| error.to_string())
         },
-        |sql| {
-            conn.execute_raw(sql)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        },
+        |sql| conn.execute_raw(sql).map_err(|error| error.to_string()),
     )
 }
 
@@ -178,11 +174,7 @@ pub(crate) fn advance_messages_id_floor_franken(
             conn.query_sync(sql, params)
                 .map_err(|error| error.to_string())
         },
-        |sql| {
-            conn.execute_raw(sql)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        },
+        |sql| conn.execute_raw(sql).map_err(|error| error.to_string()),
     )
 }
 
@@ -336,10 +328,29 @@ pub struct MessageIdAllocator {
     /// The largest id this process has handed out for this database.
     /// `0` means "no id allocated yet" (the first allocation seeds it).
     high_water: AtomicI64,
-    /// Set once the archive max has been folded into the high-water mark, so
-    /// the (relatively expensive) archive filesystem walk happens at most once
-    /// per process per database rather than on every message creation.
-    seeded_from_archive: AtomicBool,
+    /// The authoritative archive floor, or a negative initialization state.
+    /// Publishing the value rather than a separate boolean prevents another
+    /// writer from observing "seeded" without also observing the actual floor.
+    archive_floor: AtomicI64,
+}
+
+const ARCHIVE_FLOOR_UNSEEDED: i64 = -1;
+const ARCHIVE_FLOOR_SEEDING: i64 = -2;
+
+struct ArchiveSeedGuard<'a> {
+    archive_floor: &'a AtomicI64,
+    armed: bool,
+}
+
+impl Drop for ArchiveSeedGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // The scanner panicked before publishing a floor. Let a later
+            // allocation retry instead of leaving every writer spinning.
+            self.archive_floor
+                .store(ARCHIVE_FLOOR_UNSEEDED, Ordering::Release);
+        }
+    }
 }
 
 impl MessageIdAllocator {
@@ -351,49 +362,100 @@ impl MessageIdAllocator {
     pub fn new() -> Self {
         Self {
             high_water: AtomicI64::new(0),
-            seeded_from_archive: AtomicBool::new(false),
+            archive_floor: AtomicI64::new(ARCHIVE_FLOOR_UNSEEDED),
         }
     }
 
     /// Whether the archive max still needs to be folded into the high-water
-    /// mark. The caller scans the archive only when this returns `true`,
-    /// then passes the result to [`MessageIdAllocator::allocate`] and calls
-    /// [`MessageIdAllocator::mark_archive_seeded`].
+    /// mark. This is exposed for diagnostics; callers should let
+    /// [`MessageIdAllocator::allocate`] decide whether to invoke its archive
+    /// scanner so scan completion cannot be published prematurely.
     #[must_use]
     pub fn needs_archive_seed(&self) -> bool {
-        !self.seeded_from_archive.load(Ordering::Acquire)
+        self.archive_floor.load(Ordering::Acquire) < 0
     }
 
-    /// Mark that the archive max has been folded in, so subsequent
-    /// allocations skip the archive walk.
-    pub fn mark_archive_seeded(&self) {
-        self.seeded_from_archive.store(true, Ordering::Release);
+    fn archive_floor_with<F>(&self, archive_scan: F) -> i64
+    where
+        F: FnOnce() -> i64,
+    {
+        let mut archive_scan = Some(archive_scan);
+        loop {
+            let state = self.archive_floor.load(Ordering::Acquire);
+            if state >= 0 {
+                return state;
+            }
+            if state == ARCHIVE_FLOOR_SEEDING {
+                std::thread::yield_now();
+                continue;
+            }
+            debug_assert_eq!(state, ARCHIVE_FLOOR_UNSEEDED);
+            if self
+                .archive_floor
+                .compare_exchange(
+                    ARCHIVE_FLOOR_UNSEEDED,
+                    ARCHIVE_FLOOR_SEEDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let mut guard = ArchiveSeedGuard {
+                archive_floor: &self.archive_floor,
+                armed: true,
+            };
+            let scan = archive_scan
+                .take()
+                .expect("archive scanner is consumed only by the elected initializer");
+            let floor = scan().max(0);
+            self.archive_floor.store(floor, Ordering::Release);
+            guard.armed = false;
+            return floor;
+        }
     }
 
     /// Allocate the next message id.
     ///
     /// * `db_floor` — `max(MAX(id) FROM messages, sqlite_sequence.seq)` read
     ///   from the live database for the messages table.
-    /// * `archive_seed` — the maximum message id found in the canonical
-    ///   archive, or `0` when not scanning on this call.
+    /// * `archive_scan` — returns the maximum message id found in the
+    ///   canonical archive, or `0` when no messages were found. It is invoked
+    ///   exactly once while the archive floor is initialized. Concurrent
+    ///   first allocations wait for and reuse that same published floor.
     ///
-    /// Returns an id strictly greater than `db_floor`, `archive_seed`, and any
+    /// Returns an id strictly greater than `db_floor`, the archive floor, and any
     /// id previously handed out by this allocator in this process. The
     /// returned id is what the caller MUST use for both the DB row and the
     /// canonical archive filename so the two never diverge.
-    #[must_use]
-    pub fn allocate(&self, db_floor: i64, archive_seed: i64) -> i64 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Internal`] when every positive SQLite row id has
+    /// been exhausted. Reissuing `i64::MAX` would violate the uniqueness
+    /// guarantee, so exhaustion must fail closed.
+    pub fn allocate<F>(&self, db_floor: i64, archive_scan: F) -> DbResult<i64>
+    where
+        F: FnOnce() -> i64,
+    {
+        let archive_floor = self.archive_floor_with(archive_scan);
         let mut current = self.high_water.load(Ordering::Acquire);
         loop {
-            let base = current.max(db_floor).max(archive_seed).max(0);
-            let next = base.saturating_add(1);
+            let base = current.max(db_floor).max(archive_floor).max(0);
+            let Some(next) = base.checked_add(1) else {
+                return Err(DbError::Internal(
+                    "message id allocator exhausted the positive i64 row-id range".to_string(),
+                ));
+            };
             match self.high_water.compare_exchange_weak(
                 current,
                 next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return next,
+                Ok(_) => return Ok(next),
                 Err(observed) => current = observed,
             }
         }
@@ -604,9 +666,7 @@ mod tests {
                         )
                         .map_err(|error| error.to_string())?;
                 }
-                conn.execute_raw(sql)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                conn.execute_raw(sql).map_err(|error| error.to_string())
             },
         )
         .unwrap();
@@ -626,12 +686,12 @@ mod tests {
     fn allocator_hands_out_strictly_increasing_ids() {
         let alloc = MessageIdAllocator::new();
         // First allocation seeds from the larger of db_floor / archive_seed.
-        assert_eq!(alloc.allocate(1128, 1128), 1129);
+        assert_eq!(alloc.allocate(1128, || 1128).unwrap(), 1129);
         // db_floor stays at 1128 (the durable allocator failed to advance,
         // exactly the #176 suspect-mode scenario), but the in-memory
         // high-water carries forward so the next id is still fresh.
-        assert_eq!(alloc.allocate(1128, 0), 1130);
-        assert_eq!(alloc.allocate(1128, 0), 1131);
+        assert_eq!(alloc.allocate(1128, || 0).unwrap(), 1130);
+        assert_eq!(alloc.allocate(1128, || 0).unwrap(), 1131);
         assert_eq!(alloc.current_high_water(), 1131);
     }
 
@@ -642,11 +702,11 @@ mod tests {
         // *below* an id we already handed out (e.g. a write that never landed
         // durably). The allocator must still never re-issue an id.
         let alloc = MessageIdAllocator::new();
-        let first = alloc.allocate(1128, 1128);
+        let first = alloc.allocate(1128, || 1128).unwrap();
         assert_eq!(first, 1129);
         // db_floor regresses to 1000; archive_seed is 0. Without the in-memory
         // guard this would re-issue 1001 and collide with the archive.
-        let second = alloc.allocate(1000, 0);
+        let second = alloc.allocate(1000, || 0).unwrap();
         assert!(
             second > first,
             "allocator re-issued or regressed: first={first} second={second}"
@@ -657,15 +717,105 @@ mod tests {
     #[test]
     fn allocator_starts_at_one_for_empty_db_and_archive() {
         let alloc = MessageIdAllocator::new();
-        assert_eq!(alloc.allocate(0, 0), 1);
-        assert_eq!(alloc.allocate(0, 0), 2);
+        assert_eq!(alloc.allocate(0, || 0).unwrap(), 1);
+        assert_eq!(alloc.allocate(0, || 0).unwrap(), 2);
     }
 
     #[test]
     fn allocator_archive_seed_gate_flips_once() {
         let alloc = MessageIdAllocator::new();
         assert!(alloc.needs_archive_seed());
-        alloc.mark_archive_seeded();
+        assert_eq!(alloc.allocate(0, || 0).unwrap(), 1);
+        assert!(!alloc.needs_archive_seed());
+    }
+
+    #[test]
+    fn allocator_scans_archive_only_until_floor_is_published() {
+        let alloc = MessageIdAllocator::new();
+        let scans = std::cell::Cell::new(0_u32);
+        let first = alloc
+            .allocate(10, || {
+                scans.set(scans.get() + 1);
+                50
+            })
+            .unwrap();
+        let second = alloc
+            .allocate(10, || {
+                scans.set(scans.get() + 1);
+                100
+            })
+            .unwrap();
+
+        assert_eq!(first, 51);
+        assert_eq!(second, 52);
+        assert_eq!(scans.get(), 1);
+    }
+
+    #[test]
+    fn concurrent_allocator_waits_for_authoritative_archive_floor() {
+        let alloc = std::sync::Arc::new(MessageIdAllocator::new());
+        let (scan_started_tx, scan_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_scan_tx, release_scan_rx) = std::sync::mpsc::sync_channel(0);
+
+        let first_alloc = std::sync::Arc::clone(&alloc);
+        let first = std::thread::spawn(move || {
+            first_alloc.allocate(0, || {
+                scan_started_tx.send(()).unwrap();
+                release_scan_rx.recv().unwrap();
+                100
+            })
+        });
+        scan_started_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (second_result_tx, second_result_rx) = std::sync::mpsc::sync_channel(0);
+        let second_alloc = std::sync::Arc::clone(&alloc);
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let result = second_alloc.allocate(0, || {
+                panic!("concurrent allocator ran a second archive scan")
+            });
+            second_result_tx.send(result).unwrap();
+        });
+        second_started_rx.recv().unwrap();
+
+        assert!(
+            second_result_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "concurrent allocation completed before the authoritative archive floor was published"
+        );
+        release_scan_tx.send(()).unwrap();
+
+        let first_id = first.join().unwrap().unwrap();
+        let second_id = second_result_rx.recv().unwrap().unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(first_id.min(second_id), 101);
+        assert_eq!(first_id.max(second_id), 102);
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn allocator_fails_closed_when_row_id_space_is_exhausted() {
+        let alloc = MessageIdAllocator::new();
+        let error = alloc.allocate(i64::MAX, || 0).unwrap_err();
+        assert!(
+            error.to_string().contains("exhausted"),
+            "unexpected exhaustion error: {error}"
+        );
+        assert_eq!(alloc.current_high_water(), 0);
+        assert!(!alloc.needs_archive_seed());
+    }
+
+    #[test]
+    fn allocator_retries_archive_seed_after_scanner_panic() {
+        let alloc = MessageIdAllocator::new();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = alloc.allocate(0, || panic!("injected archive scan panic"));
+        }));
+        assert!(panic.is_err());
+        assert!(alloc.needs_archive_seed());
+        assert_eq!(alloc.allocate(0, || 40).unwrap(), 41);
         assert!(!alloc.needs_archive_seed());
     }
 }
