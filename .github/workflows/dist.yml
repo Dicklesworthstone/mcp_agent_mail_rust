@@ -478,7 +478,7 @@ jobs:
             echo "Cosign version mismatch: expected ${COSIGN_VERSION}" >&2
             exit 1
           fi
-          printf '%s\n' "$cosign_dir" >> "$GITHUB_PATH"
+          printf 'COSIGN_BIN=%s\n' "$cosign_path" >> "$GITHUB_ENV"
 
       - name: Assemble, sign, and verify release assets
         env:
@@ -620,9 +620,9 @@ jobs:
           expected_certificate_identity="https://github.com/${expected_workflow_ref}"
           signed_subjects=("${expected_payloads[@]}" SHA256SUMS)
           for subject in "${signed_subjects[@]}"; do
-            cosign sign-blob --yes --bundle "${subject}.sigstore.json" "$subject"
+            "$COSIGN_BIN" sign-blob --yes --bundle "${subject}.sigstore.json" "$subject"
             test -s "${subject}.sigstore.json"
-            cosign verify-blob \
+            "$COSIGN_BIN" verify-blob \
               --bundle "${subject}.sigstore.json" \
               --certificate-identity "$expected_certificate_identity" \
               --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
