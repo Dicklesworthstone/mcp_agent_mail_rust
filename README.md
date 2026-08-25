@@ -1630,7 +1630,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Local patched dependencies.** Building from source expects local sibling checkouts in the parent directory for **eight** repos: `asupersync`, `fastmcp_rust`, `beads_rust`, `franken_agent_detection`, `frankentui`, `frankensearch`, `toon_rust`, and `rich_rust`. SQLmodel and FrankenSQLite resolve from crates.io.
+- **Local patched dependencies.** Building from source expects sibling checkouts in the parent directory for **two** repos: `frankensearch` (plus its own `fast_cmaes` workspace sibling when running workspace-wide Cargo metadata) and `beads_rust`. The remaining dependencies, including `franken-agent-detection`, resolve from crates.io.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
