@@ -3455,6 +3455,53 @@ fn revalidate_open_user_env_leaf(path: &Path, file: std::fs::File) -> io::Result
 }
 
 #[cfg(all(unix, not(target_os = "redox")))]
+fn revalidate_open_user_env_parent(
+    parent: &Path,
+    parent_fd: &std::os::fd::OwnedFd,
+    directory_flags: nix::fcntl::OFlag,
+) -> io::Result<()> {
+    use nix::fcntl::open;
+    use nix::sys::stat::{Mode, fstat};
+
+    let opened_parent = fstat(parent_fd).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} could not revalidate its open directory identity: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+    let observed_parent_fd = open(parent, directory_flags, Mode::empty()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} changed directory authority during read: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+    let observed_parent = fstat(&observed_parent_fd).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} could not revalidate its directory identity: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+    if opened_parent.st_dev != observed_parent.st_dev
+        || opened_parent.st_ino != observed_parent.st_ino
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory identity during read", parent.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
 fn read_user_env_candidate_with_hooks(
     path: &Path,
     after_parent_open: impl FnOnce(),
@@ -3492,7 +3539,13 @@ fn read_user_env_candidate_with_hooks(
         OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
     let file_fd = match openat(&parent_fd, file_name, file_flags, Mode::empty()) {
         Ok(fd) => fd,
-        Err(Errno::ENOENT) => return Ok(None),
+        Err(Errno::ENOENT) => {
+            // The leaf may genuinely be absent, but the bound directory could
+            // also have been detached or replaced after `open(parent)`. Never
+            // permit that race to fall through to a lower-precedence token.
+            revalidate_open_user_env_parent(parent, &parent_fd, directory_flags)?;
+            return Ok(None);
+        }
         Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
     };
     after_file_open();
@@ -3522,38 +3575,7 @@ fn read_user_env_candidate_with_hooks(
         ));
     }
 
-    let opened_parent = fstat(&parent_fd).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} could not revalidate its open directory identity: {error}",
-                parent.display()
-            ),
-        )
-    })?;
-    let observed_parent_fd = open(parent, directory_flags, Mode::empty()).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} changed directory authority during read: {error}", parent.display()),
-        )
-    })?;
-    let observed_parent = fstat(&observed_parent_fd).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} could not revalidate its directory identity: {error}",
-                parent.display()
-            ),
-        )
-    })?;
-    if opened_parent.st_dev != observed_parent.st_dev
-        || opened_parent.st_ino != observed_parent.st_ino
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} changed directory identity during read", parent.display()),
-        ));
-    }
+    revalidate_open_user_env_parent(parent, &parent_fd, directory_flags)?;
     Ok(Some(bytes))
 }
 
@@ -5820,6 +5842,30 @@ mod tests {
             || {},
         )
         .expect_err("parent replacement must invalidate the authority");
+        assert!(error.to_string().contains("identity"));
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn user_env_parent_replacement_is_rejected_when_bound_leaf_is_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("authority");
+        let replacement = tmp.path().join("replacement");
+        let detached = tmp.path().join("detached");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(replacement.join("config.env"), "FOO=swapped\n").unwrap();
+        let candidate = parent.join("config.env");
+
+        let error = read_user_env_candidate_with_hooks(
+            &candidate,
+            || {
+                std::fs::rename(&parent, &detached).unwrap();
+                std::fs::rename(&replacement, &parent).unwrap();
+            },
+            || {},
+        )
+        .expect_err("an absent leaf in a detached authority must not permit fallback");
         assert!(error.to_string().contains("identity"));
     }
 

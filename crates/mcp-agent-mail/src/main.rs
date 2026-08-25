@@ -655,6 +655,18 @@ fn decide_reuse_preflight(
     }
 }
 
+fn validate_then_decide_reuse_preflight(
+    config: &Config,
+    reuse_running_enabled: bool,
+    probe_port: impl FnOnce() -> PortStatus,
+) -> std::io::Result<ReusePreflightDecision> {
+    config.validate_user_env_authority()?;
+    Ok(decide_reuse_preflight(
+        reuse_running_enabled,
+        probe_port(),
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() {
     // Initialize process start time immediately for accurate uptime.
@@ -800,10 +812,17 @@ fn main() {
                 env_value("AM_REUSE_RUNNING").as_deref(),
             );
 
-            let preflight_decision = decide_reuse_preflight(
+            let preflight_decision = match validate_then_decide_reuse_preflight(
+                &config,
                 reuse_running_enabled,
-                startup_checks::check_port_status(&config.http_host, config.http_port),
-            );
+                || startup_checks::check_port_status(&config.http_host, config.http_port),
+            ) {
+                Ok(decision) => decision,
+                Err(err) => {
+                    tracing::error!("startup configuration rejected: {err}");
+                    std::process::exit(1);
+                }
+            };
             match preflight_decision {
                 ReusePreflightDecision::Proceed => {}
                 ReusePreflightDecision::ReusedExistingServer => {
@@ -1307,6 +1326,22 @@ mod tests {
             ),
             ReusePreflightDecision::Proceed
         );
+    }
+
+    #[test]
+    fn unsafe_user_env_authority_rejects_before_port_probe() {
+        let mut config = Config::default();
+        config.user_env_authority_error = Some("unsafe user config authority".to_string());
+        let mut probe_called = false;
+
+        let error = validate_then_decide_reuse_preflight(&config, false, || {
+            probe_called = true;
+            PortStatus::Free
+        })
+        .expect_err("unsafe user authority must reject before probing the listener");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!probe_called, "port probe must not run after authority rejection");
     }
 
     #[test]
