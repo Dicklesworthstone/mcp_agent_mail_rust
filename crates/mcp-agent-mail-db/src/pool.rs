@@ -3307,6 +3307,12 @@ impl DbPool {
     /// `storage_root()` remains available for diagnostics that only render or
     /// hash the frozen path. Every caller that performs archive or index I/O
     /// must use this fallible accessor instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::InvalidArgument`] when the frozen path now resolves
+    /// through a different filesystem authority (for example, because a
+    /// missing leaf was replaced with a symlink after pool construction).
     pub(crate) fn validated_storage_root(&self, context: &'static str) -> DbResult<&Path> {
         validate_frozen_storage_root_authority(&self.storage_root, context).map_err(|error| {
             DbError::InvalidArgument {
@@ -3398,10 +3404,18 @@ impl DbPool {
     /// Single acquire attempt: creates and initializes a new connection if needed.
     #[allow(clippy::too_many_lines)]
     async fn acquire_once(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
+        let start = Instant::now();
         if let Err(error) = validate_frozen_storage_root_authority(
             &self.storage_root,
             "pooled connection checkout",
         ) {
+            let dur_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
+                .unwrap_or(u64::MAX);
+            let metrics = mcp_agent_mail_core::global_metrics();
+            metrics.db.pool_acquires_total.inc();
+            metrics.db.pool_acquire_latency_us.record(dur_us);
+            metrics.db.pool_acquire_errors_total.inc();
+            self.stats_sampler.maybe_sample(&self.pool);
             return Outcome::Err(error);
         }
         let sqlite_path = self.sqlite_path.clone();
@@ -3413,7 +3427,6 @@ impl DbPool {
         let open_mode = self.open_mode;
         let cx2 = cx.clone();
 
-        let start = Instant::now();
         let out = self
             .pool
             .acquire(cx, || {

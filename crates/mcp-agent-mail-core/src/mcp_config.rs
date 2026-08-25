@@ -156,8 +156,8 @@ pub fn detect_mcp_config_mutation_locations(
             location.tool != McpConfigTool::Omp
                 || (active_omp_user_config
                     .as_ref()
-                    .is_some_and(|active| location.config_path == *active)
-                    || location.config_path == project_omp_primary)
+                    .is_some_and(|active| location.config_path.as_path() == active.as_path())
+                    || location.config_path.as_path() == project_omp_primary.as_path())
         })
         .collect()
 }
@@ -791,9 +791,17 @@ fn add_omp_agent_candidates(
         primary_config.to_path_buf(),
         primary_config.with_file_name(".mcp.json"),
     ] {
-        if !omp_config_path_is_unsafe(&config) {
-            push_candidate(out, seen, McpConfigTool::Omp, config);
-        }
+        push_omp_candidate_if_safe(out, seen, config);
+    }
+}
+
+fn push_omp_candidate_if_safe(
+    out: &mut Vec<(McpConfigTool, PathBuf)>,
+    seen: &mut HashSet<(McpConfigTool, PathBuf)>,
+    config: PathBuf,
+) {
+    if !omp_config_path_is_unsafe(&config) {
+        push_candidate(out, seen, McpConfigTool::Omp, config);
     }
 }
 
@@ -929,20 +937,14 @@ fn add_project_candidates(
         McpConfigTool::Gemini,
         project_dir.join("gemini.mcp.json"),
     );
-    push_candidate(
+    push_omp_candidate_if_safe(out, seen, project_dir.join(".omp").join("mcp.json"));
+    push_omp_candidate_if_safe(
         out,
         seen,
-        McpConfigTool::Omp,
-        project_dir.join(".omp").join("mcp.json"),
-    );
-    push_candidate(
-        out,
-        seen,
-        McpConfigTool::Omp,
         project_dir.join(".omp").join(".mcp.json"),
     );
-    push_candidate(out, seen, McpConfigTool::Omp, project_dir.join("mcp.json"));
-    push_candidate(out, seen, McpConfigTool::Omp, project_dir.join(".mcp.json"));
+    push_omp_candidate_if_safe(out, seen, project_dir.join("mcp.json"));
+    push_omp_candidate_if_safe(out, seen, project_dir.join(".mcp.json"));
     push_candidate(
         out,
         seen,
@@ -1294,8 +1296,9 @@ mod tests {
 
         for expected in [
             home.join(".omp/agent/mcp.json"),
-            home.join(".omp/profiles/work/agent/mcp.json"),
+            home.join(".omp/agent/.mcp.json"),
             project.join(".omp/mcp.json"),
+            project.join(".omp/.mcp.json"),
             project.join("mcp.json"),
             project.join(".mcp.json"),
         ] {
@@ -1303,6 +1306,16 @@ mod tests {
                 contains_location(&locations, McpConfigTool::Omp, &expected),
                 "expected OMP config candidate {}",
                 expected.display()
+            );
+        }
+        for inactive in [
+            home.join(".omp/profiles/work/agent/mcp.json"),
+            home.join(".omp/profiles/work/agent/.mcp.json"),
+        ] {
+            assert!(
+                !contains_location(&locations, McpConfigTool::Omp, &inactive),
+                "inactive OMP profile must not be ambient authority: {}",
+                inactive.display()
             );
         }
     }
@@ -1376,6 +1389,11 @@ mod tests {
         assert!(contains_location(
             &locations,
             McpConfigTool::Omp,
+            &active_config.with_file_name(".mcp.json")
+        ));
+        assert!(!contains_location(
+            &locations,
+            McpConfigTool::Omp,
             &omp_root.join("agent/mcp.json")
         ));
         assert!(
@@ -1387,6 +1405,82 @@ mod tests {
                 .is_some_and(|entry| entry.exists),
             "the active OMP profile candidate should report its live existence"
         );
+
+        let mutation_locations = detect_mcp_config_mutation_locations(&McpConfigDetectParams {
+            home_dir: Some(tmp.path().join("home")),
+            project_dir: Some(tmp.path().join("project")),
+            omp_config_root: Some(omp_root.clone()),
+            omp_user_mcp_config: Some(active_config.clone()),
+            ..McpConfigDetectParams::default()
+        });
+        assert!(contains_location(
+            &mutation_locations,
+            McpConfigTool::Omp,
+            &active_config
+        ));
+        assert!(!contains_location(
+            &mutation_locations,
+            McpConfigTool::Omp,
+            &active_config.with_file_name(".mcp.json")
+        ));
+        assert!(contains_location(
+            &mutation_locations,
+            McpConfigTool::Omp,
+            &tmp.path().join("project/.omp/mcp.json")
+        ));
+        for fallback in [
+            tmp.path().join("project/.omp/.mcp.json"),
+            tmp.path().join("project/mcp.json"),
+            tmp.path().join("project/.mcp.json"),
+        ] {
+            assert!(
+                !contains_location(&mutation_locations, McpConfigTool::Omp, &fallback),
+                "OMP compatibility fallback must stay read-only: {}",
+                fallback.display()
+            );
+        }
+    }
+
+    #[test]
+    fn detect_locations_honor_custom_active_omp_agent_directory_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let omp_root = home.join(".omp");
+        let active_config = tmp.path().join("custom-agent/mcp.json");
+        let default_config = omp_root.join("agent/mcp.json");
+        let inactive_config = omp_root.join("profiles/work/agent/mcp.json");
+        for config in [&active_config, &default_config, &inactive_config] {
+            std::fs::create_dir_all(config.parent().expect("config parent"))
+                .expect("create config parent");
+            std::fs::write(config, "{}").expect("write config");
+        }
+
+        let params = McpConfigDetectParams {
+            home_dir: Some(home),
+            project_dir: Some(project),
+            omp_config_root: Some(omp_root),
+            omp_user_mcp_config: Some(active_config.clone()),
+            ..McpConfigDetectParams::default()
+        };
+        let locations = detect_mcp_config_locations(&params);
+        assert!(contains_location(
+            &locations,
+            McpConfigTool::Omp,
+            &active_config
+        ));
+        assert!(contains_location(
+            &locations,
+            McpConfigTool::Omp,
+            &active_config.with_file_name(".mcp.json")
+        ));
+        for inactive in [default_config, inactive_config] {
+            assert!(
+                !contains_location(&locations, McpConfigTool::Omp, &inactive),
+                "only PI_CODING_AGENT_DIR may supply user authority: {}",
+                inactive.display()
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1408,7 +1502,7 @@ mod tests {
 
         let linked_config = omp_root.join("profiles/linked/agent/mcp.json");
         let locations = detect_mcp_config_locations(&McpConfigDetectParams {
-            home_dir: Some(home),
+            home_dir: Some(home.clone()),
             project_dir: Some(project),
             omp_config_root: Some(omp_root),
             omp_user_mcp_config: Some(linked_config.clone()),
@@ -1417,7 +1511,15 @@ mod tests {
 
         assert!(
             !contains_location(&locations, McpConfigTool::Omp, &linked_config),
-            "OMP discovery must not follow an active or enumerated symlinked profile"
+            "OMP discovery must not follow an active symlinked profile"
+        );
+        assert!(
+            !contains_location(
+                &locations,
+                McpConfigTool::Omp,
+                &home.join(".omp/agent/mcp.json")
+            ),
+            "unsafe active authority must not fall back to the default profile"
         );
     }
 

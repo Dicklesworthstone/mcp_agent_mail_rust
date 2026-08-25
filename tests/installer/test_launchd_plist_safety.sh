@@ -313,6 +313,7 @@ desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
 REMOTE_PROBE_CALLS=0
 probe_remote_http_endpoint() {
     REMOTE_PROBE_CALLS=$((REMOTE_PROBE_CALLS + 1))
+    REMOTE_HTTP_PROBE_DETAIL="stub healthy"
     return 0
 }
 HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness \
@@ -326,6 +327,7 @@ EOF
 chmod 755 "$readiness_dest/am"
 probe_remote_http_endpoint() {
     REMOTE_PROBE_CALLS=$((REMOTE_PROBE_CALLS + 1))
+    REMOTE_HTTP_PROBE_DETAIL="stub unhealthy"
     return 1
 }
 service_management_allowed() { return 0; }
