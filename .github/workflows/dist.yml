@@ -453,35 +453,20 @@ jobs:
         # signing step — the entire sigstore integrity chain hinges on this
         # action's code being the one we audited.
         uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+        with:
+          # v3.1.3 fixes GHSA-fx35-mq7g-6g98 in keyless blob verification.
+          cosign-release: v3.1.3
 
-      - name: Sign release artifacts (sigstore bundle)
+      - name: Assemble, sign, and verify release assets
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          GITHUB_WORKFLOW_REF_VALUE: ${{ github.workflow_ref }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          cd dist
-          for f in mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip; do
-            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
-          done
 
-      - name: Generate consolidated SHA256SUMS
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          cd dist
-          archives=(mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip)
-          if [ "${#archives[@]}" -eq 0 ]; then
-            echo "No release archives found in dist/" >&2
-            exit 1
-          fi
-          shasum -a 256 "${archives[@]}" > SHA256SUMS
-          echo "=== SHA256SUMS ==="
-          cat SHA256SUMS
-
-      - name: Validate release bundle completeness
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          cd dist
           expected_archives=(
             mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz
             mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz
@@ -490,24 +475,28 @@ jobs:
             mcp-agent-mail-aarch64-apple-darwin.tar.xz
             mcp-agent-mail-x86_64-pc-windows-msvc.zip
           )
-          archives=(mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip)
-          if [ "${#archives[@]}" -ne "${#expected_archives[@]}" ]; then
-            echo "Expected ${#expected_archives[@]} release archives, found ${#archives[@]}" >&2
-            printf 'Found: %s\n' "${archives[@]}" >&2
-            exit 1
-          fi
-          test -s SHA256SUMS
-          mapfile -t sums_lines < SHA256SUMS
-          if [ "${#sums_lines[@]}" -ne "${#expected_archives[@]}" ]; then
-            echo "SHA256SUMS must contain exactly ${#expected_archives[@]} lines" >&2
-            exit 1
-          fi
-          for artifact in "${expected_archives[@]}"; do
-            test -s "$artifact"
-            test -s "${artifact}.sha256"
-            test -s "${artifact}.sigstore.json"
 
-            mapfile -t sidecar_lines < "${artifact}.sha256"
+          expected_download_entries=()
+          for artifact in "${expected_archives[@]}"; do
+            expected_download_entries+=("$artifact" "${artifact}.sha256")
+          done
+          mapfile -t expected_download_entries < <(printf '%s\n' "${expected_download_entries[@]}" | sort)
+          mapfile -t actual_download_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${actual_download_entries[*]}" != "${expected_download_entries[*]}" ]; then
+            echo "Downloaded build artifacts contain missing or unexpected entries" >&2
+            printf 'Expected: %s\n' "${expected_download_entries[@]}" >&2
+            printf 'Actual: %s\n' "${actual_download_entries[@]}" >&2
+            exit 1
+          fi
+
+          mkdir -p publish
+          for artifact in "${expected_archives[@]}"; do
+            test -f "dist/$artifact"
+            test -s "dist/$artifact"
+            test -f "dist/${artifact}.sha256"
+            test -s "dist/${artifact}.sha256"
+
+            mapfile -t sidecar_lines < "dist/${artifact}.sha256"
             if [ "${#sidecar_lines[@]}" -ne 1 ]; then
               echo "${artifact}.sha256 must contain exactly one checksum line" >&2
               exit 1
@@ -518,25 +507,15 @@ jobs:
               echo "${artifact}.sha256 must name exactly ${artifact} with one SHA-256 digest" >&2
               exit 1
             fi
-
-            mapfile -t sums_hashes < <(
-              awk -v artifact="$artifact" \
-                '$2 == artifact && NF == 2 {print $1}' \
-                SHA256SUMS
-            )
-            if [ "${#sums_hashes[@]}" -ne 1 ]; then
-              echo "SHA256SUMS must contain exactly one entry for ${artifact}" >&2
-              exit 1
-            fi
-            actual_hash="$(shasum -a 256 "$artifact" | awk '{print $1}')"
-            if [ "$actual_hash" != "$sidecar_hash" ] || [ "$actual_hash" != "${sums_hashes[0]}" ]; then
-              echo "Checksum witnesses disagree with the bytes of ${artifact}" >&2
+            actual_hash="$(shasum -a 256 "dist/$artifact" | awk '{print $1}')"
+            if [ "$actual_hash" != "$sidecar_hash" ]; then
+              echo "Build sidecar disagrees with the bytes of ${artifact}" >&2
               exit 1
             fi
 
             case "$artifact" in
               *.tar.xz)
-                python3 - "$artifact" <<'PY'
+                python3 - "dist/$artifact" <<'PY'
           import sys
           import tarfile
 
@@ -551,7 +530,7 @@ jobs:
           PY
                 ;;
               *.zip)
-                python3 - "$artifact" <<'PY'
+                python3 - "dist/$artifact" <<'PY'
           import stat
           import sys
           import zipfile
@@ -573,25 +552,75 @@ jobs:
                 exit 1
                 ;;
             esac
+            cp -- "dist/$artifact" publish/
           done
 
-          expected_bundle_files=(SHA256SUMS)
-          for artifact in "${expected_archives[@]}"; do
-            expected_bundle_files+=("$artifact" "${artifact}.sha256" "${artifact}.sigstore.json")
+          # Installer scripts are release payloads, so absence is fatal rather
+          # than a warning and they enter the same checksum/signature envelope.
+          cp -- install.sh install.ps1 publish/
+          cd publish
+          expected_payloads=("${expected_archives[@]}" install.sh install.ps1)
+          for payload in "${expected_payloads[@]}"; do
+            test -f "$payload"
+            test -s "$payload"
           done
-          mapfile -t expected_bundle_files < <(printf '%s\n' "${expected_bundle_files[@]}" | sort)
-          mapfile -t actual_bundle_files < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
-          if [ "${actual_bundle_files[*]}" != "${expected_bundle_files[*]}" ]; then
-            echo "Release bundle contains missing or unexpected files" >&2
-            printf 'Expected: %s\n' "${expected_bundle_files[@]}" >&2
-            printf 'Actual: %s\n' "${actual_bundle_files[@]}" >&2
+
+          shasum -a 256 "${expected_payloads[@]}" > SHA256SUMS
+          mapfile -t sums_lines < SHA256SUMS
+          if [ "${#sums_lines[@]}" -ne "${#expected_payloads[@]}" ]; then
+            echo "SHA256SUMS must contain exactly ${#expected_payloads[@]} lines" >&2
             exit 1
           fi
+          for payload in "${expected_payloads[@]}"; do
+            mapfile -t sums_hashes < <(
+              awk -v payload="$payload" '$2 == payload && NF == 2 {print $1}' SHA256SUMS
+            )
+            if [ "${#sums_hashes[@]}" -ne 1 ]; then
+              echo "SHA256SUMS must contain exactly one entry for ${payload}" >&2
+              exit 1
+            fi
+            actual_hash="$(shasum -a 256 "$payload" | awk '{print $1}')"
+            if [ "$actual_hash" != "${sums_hashes[0]}" ]; then
+              echo "SHA256SUMS disagrees with the bytes of ${payload}" >&2
+              exit 1
+            fi
+          done
 
-      - name: Copy install scripts to dist
-        run: |
-          cp install.sh dist/ 2>/dev/null || echo "No install.sh found"
-          cp install.ps1 dist/ 2>/dev/null || echo "No install.ps1 found"
+          expected_workflow_ref="${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}"
+          if [ "$GITHUB_WORKFLOW_REF_VALUE" != "$expected_workflow_ref" ]; then
+            echo "Workflow identity ${GITHUB_WORKFLOW_REF_VALUE} does not match ${expected_workflow_ref}" >&2
+            exit 1
+          fi
+          expected_certificate_identity="https://github.com/${expected_workflow_ref}"
+          signed_subjects=("${expected_payloads[@]}" SHA256SUMS)
+          for subject in "${signed_subjects[@]}"; do
+            cosign sign-blob --yes --bundle "${subject}.sigstore.json" "$subject"
+            test -s "${subject}.sigstore.json"
+            cosign verify-blob \
+              --bundle "${subject}.sigstore.json" \
+              --certificate-identity "$expected_certificate_identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
+              --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
+              --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+              --certificate-github-workflow-trigger "push" \
+              "$subject"
+          done
+
+          # Bundles are verification material and are not recursively signed;
+          # each one authenticates a payload or the complete checksum manifest.
+          expected_release_assets=("${signed_subjects[@]}")
+          for subject in "${signed_subjects[@]}"; do
+            expected_release_assets+=("${subject}.sigstore.json")
+          done
+          mapfile -t expected_release_assets < <(printf '%s\n' "${expected_release_assets[@]}" | sort)
+          mapfile -t actual_release_assets < <(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${actual_release_assets[*]}" != "${expected_release_assets[*]}" ]; then
+            echo "Release asset directory contains missing or unexpected entries" >&2
+            printf 'Expected: %s\n' "${expected_release_assets[@]}" >&2
+            printf 'Actual: %s\n' "${actual_release_assets[@]}" >&2
+            exit 1
+          fi
 
       - name: Revalidate release tag immediately before publication
         env:
@@ -618,7 +647,6 @@ jobs:
           prerelease: ${{ needs.release_contract.outputs.prerelease }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            dist/*
+          files: publish/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
