@@ -963,6 +963,7 @@ fn sanitize_search_index_owner(value: &str) -> String {
 }
 
 fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
+    pool.validated_sqlite_path("lexical search database selection")?;
     let shared = pool
         .validated_storage_root("lexical search index selection")?
         .join("search_index");
@@ -1121,7 +1122,7 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
                 active_db_identity: active_key,
                 stale_reason: Some(error.to_string()),
                 safe_remediation: Some(
-                    "Restore the configured storage-root path to its original filesystem authority, then retry lexical health"
+                    "Restore the configured SQLite and storage-root paths to their original filesystem authorities, then retry lexical health"
                         .to_string(),
                 ),
             };

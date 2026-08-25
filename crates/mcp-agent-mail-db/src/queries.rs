@@ -1494,8 +1494,21 @@ pub(crate) async fn ensure_file_backed_atc_pool_initialized(
     // keys, subjects, and evidence summaries (br-bvq1x.11.7). Best-effort — a
     // chmod failure must not block ATC telemetry.
     #[cfg(unix)]
-    if let Some(atc_path) = pool.atc_sqlite_path() {
+    {
         use std::os::unix::fs::PermissionsExt;
+        let atc_path = match pool.validated_atc_sqlite_path("restrict ATC sidecar permissions") {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
+                return Outcome::Err(DbError::Internal(
+                    "file-backed ATC initialization lost its sidecar path".to_string(),
+                ));
+            }
+            Err(error) => {
+                close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
+                return Outcome::Err(error);
+            }
+        };
         if let Err(error) =
             std::fs::set_permissions(&atc_path, std::fs::Permissions::from_mode(0o600))
         {
@@ -1724,6 +1737,9 @@ async fn durability_probe_query(
         // Use a plain open — no recovery, no fallback paths. Durability probes
         // must be side-effect-free so they never trigger REINDEX or open a
         // fallback database, which could make committed rows appear to vanish.
+        if let Err(error) = pool.validated_sqlite_path("durability probe") {
+            return Outcome::Err(error);
+        }
         let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
             Ok(conn) => conn,
             Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
@@ -2136,6 +2152,7 @@ async fn fetch_durable_atc_experience_by_id(
 }
 
 fn open_fresh_file_backed_conn(pool: &DbPool) -> std::result::Result<crate::DbConn, DbError> {
+    pool.validated_sqlite_path("fresh file-backed connection")?;
     let conn = crate::DbConn::open_file(pool.sqlite_path())
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
@@ -2172,7 +2189,7 @@ pub(crate) fn open_canonical_atc_conn(
     // storage.sqlite3's VACUUM/integrity/backup/size (br-bvq1x.11.7). The
     // sidecar is opened only through canonical SQLite, which sidesteps the
     // FrankenConnection page-corruption bug (br-q37ep) entirely.
-    let atc_path = pool.atc_sqlite_path().ok_or_else(|| {
+    let atc_path = pool.validated_atc_sqlite_path(purpose)?.ok_or_else(|| {
         DbError::Internal(format!(
             "{purpose}: canonical ATC connection requested for an in-memory pool"
         ))
@@ -2203,7 +2220,7 @@ pub(crate) fn open_canonical_atc_conn(
 /// idle mailbox never logs `no such table: atc_experiences` (GH#232). The
 /// probe never creates the sidecar file.
 pub(crate) fn atc_sidecar_schema_ready(pool: &DbPool) -> std::result::Result<bool, DbError> {
-    let Some(atc_path) = pool.atc_sqlite_path() else {
+    let Some(atc_path) = pool.validated_atc_sqlite_path("atc sidecar readiness probe")? else {
         return Ok(false);
     };
     match std::fs::metadata(&atc_path) {

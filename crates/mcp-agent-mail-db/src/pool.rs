@@ -3303,7 +3303,7 @@ impl DbPool {
     ///
     /// Returns [`DbError::InvalidArgument`] when the path now resolves through
     /// a different authority than the one frozen at pool construction.
-    fn validated_sqlite_path(&self, context: &'static str) -> DbResult<&Path> {
+    pub(crate) fn validated_sqlite_path(&self, context: &'static str) -> DbResult<&Path> {
         validate_frozen_sqlite_open_authority(
             &self.sqlite_path,
             self.sqlite_identity.as_deref(),
@@ -3314,6 +3314,33 @@ impl DbPool {
             message: error.to_string(),
         })?;
         Ok(Path::new(&self.sqlite_path))
+    }
+
+    /// Return the derived ATC sidecar path after validating both its mailbox
+    /// parent authority and the sidecar leaf itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::InvalidArgument`] when either path now resolves
+    /// through a different filesystem authority.
+    pub(crate) fn validated_atc_sqlite_path(
+        &self,
+        context: &'static str,
+    ) -> DbResult<Option<String>> {
+        self.validated_sqlite_path(context)?;
+        let Some(atc_path) = self.atc_sqlite_path() else {
+            return Ok(None);
+        };
+        validate_frozen_sqlite_open_authority(
+            &atc_path,
+            Some(Path::new(&atc_path)),
+            context,
+        )
+        .map_err(|error| DbError::InvalidArgument {
+            field: "database_url",
+            message: error.to_string(),
+        })?;
+        Ok(Some(atc_path))
     }
 
     /// Return the frozen archive authority after proving its path has not
@@ -4625,19 +4652,9 @@ impl DbPool {
     /// so it defers under contention rather than failing. No-ops for `:memory:`
     /// pools and when the sidecar file does not exist (ATC never wrote).
     pub fn vacuum_atc_sidecar(&self) -> DbResult<()> {
-        let Some(atc_path) = self.atc_sqlite_path() else {
+        let Some(atc_path) = self.validated_atc_sqlite_path("ATC sidecar vacuum")? else {
             return Ok(());
         };
-        self.validated_sqlite_path("ATC sidecar vacuum")?;
-        validate_frozen_sqlite_open_authority(
-            &atc_path,
-            Some(Path::new(&atc_path)),
-            "ATC sidecar vacuum",
-        )
-        .map_err(|error| DbError::InvalidArgument {
-            field: "database_url",
-            message: error.to_string(),
-        })?;
         if !std::path::Path::new(&atc_path).exists() {
             return Ok(());
         }
