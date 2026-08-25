@@ -7959,12 +7959,13 @@ where
 }
 
 fn require_canonical_setup_config_env_path(path: Option<PathBuf>) -> CliResult<PathBuf> {
-    path.ok_or_else(|| {
-        CliError::Other(
+    match path {
+        Some(path) if path.is_absolute() => Ok(path),
+        _ => Err(CliError::Other(
             "Could not resolve an absolute config.env path; set HOME or set XDG_CONFIG_HOME to an absolute directory"
                 .to_string(),
-        )
-    })
+        )),
+    }
 }
 
 fn canonical_setup_config_env_path() -> CliResult<PathBuf> {
@@ -43613,6 +43614,42 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             !without_no_auth.http_allow_localhost_unauthenticated,
             "without --no-auth the localhost-unauthenticated default must be preserved"
+        );
+    }
+
+    #[test]
+    fn setup_config_env_path_falls_back_from_empty_or_relative_xdg() {
+        let temp = canonical_test_tempdir("am-setup-config-path-");
+        let home = temp.path().to_string_lossy().into_owned();
+        let expected = temp
+            .path()
+            .join(".config")
+            .join("mcp-agent-mail")
+            .join("config.env");
+
+        for xdg in ["", "relative-config"] {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("XDG_CONFIG_HOME", xdg), ("HOME", home.as_str())],
+                || {
+                    assert_eq!(canonical_setup_config_env_path().unwrap(), expected);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn setup_config_env_path_fails_closed_without_absolute_authority() {
+        let relative = require_canonical_setup_config_env_path(Some(PathBuf::from(".config")))
+            .expect_err("relative config path must be rejected");
+        assert!(relative.to_string().contains("absolute config.env path"));
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", ""), ("HOME", "")],
+            || {
+                let missing = canonical_setup_config_env_path()
+                    .expect_err("missing absolute config authority must fail closed");
+                assert!(missing.to_string().contains("absolute config.env path"));
+            },
         );
     }
 
