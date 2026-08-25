@@ -1002,6 +1002,123 @@ EOF
     else
       e2e_pass "failed native setup leaves project security files untouched"
     fi
+
+    OMP_DURABILITY_FAKE_CLI="${OMP_INSTALLER_DIR}/durability-am"
+    cat > "${OMP_DURABILITY_FAKE_CLI}" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "setup" ] && [ "${2:-}" = "--help" ]; then
+  exit 0
+fi
+if [ "${1:-}" = "setup" ] && [ "${2:-}" = "run" ]; then
+  case "${OMP_DURABILITY_MODE:?}" in
+    missing) exit 0 ;;
+    wrong) durable_token='wrong-old-token' ;;
+    exact) durable_token="${HTTP_BEARER_TOKEN:?}" ;;
+    *) exit 9 ;;
+  esac
+  mkdir -p "$(dirname "${OMP_DURABILITY_ENV:?}")"
+  umask 077
+  printf 'HTTP_BEARER_TOKEN=%s\n' "${durable_token}" > "${OMP_DURABILITY_ENV}"
+  chmod 600 "${OMP_DURABILITY_ENV}"
+  exit 0
+fi
+exit 7
+EOF
+    chmod +x "${OMP_DURABILITY_FAKE_CLI}"
+
+    for OMP_DURABILITY_FAILURE_MODE in missing wrong; do
+      OMP_DURABILITY_FAILURE_ENV="${OMP_INSTALLER_DIR}/${OMP_DURABILITY_FAILURE_MODE}-xdg/mcp-agent-mail/config.env"
+      set +e
+      (
+        # shellcheck disable=SC2329
+        resolve_setup_http_bearer_token() { printf '%s' 'selected-durable-token'; }
+        # shellcheck disable=SC2329
+        rust_config_env_path() { printf '%s' "${OMP_DURABILITY_FAILURE_ENV}"; }
+        # shellcheck disable=SC2329
+        token_env_targets_outside_git_worktrees() { return 0; }
+        # shellcheck disable=SC2329
+        read_env_assignment_value() {
+          sed -n "s/^${2}=//p" "$1" 2>/dev/null | tail -1
+        }
+        # shellcheck disable=SC2329
+        warn() { :; }
+        # shellcheck disable=SC2329
+        verbose() { :; }
+        # shellcheck disable=SC2329
+        ok() { :; }
+        # shellcheck disable=SC1090
+        source "${OMP_UPDATE_LIBRARY}"
+        export OMP_DURABILITY_MODE="${OMP_DURABILITY_FAILURE_MODE}"
+        export OMP_DURABILITY_ENV="${OMP_DURABILITY_FAILURE_ENV}"
+        update_mcp_configs "/unused/mcp-agent-mail" "${OMP_DURABILITY_FAKE_CLI}"
+      ) >/dev/null 2>&1
+      OMP_DURABILITY_FAILURE_RC=$?
+      set -e
+      e2e_assert_exit_code "native setup ${OMP_DURABILITY_FAILURE_MODE} token authority blocks fallback writers" \
+        "1" "${OMP_DURABILITY_FAILURE_RC}"
+    done
+
+    OMP_DURABILITY_EXACT_ENV="${OMP_INSTALLER_DIR}/exact-xdg/mcp-agent-mail/config.env"
+    OMP_DURABILITY_ORDER_CONTRACT="$(
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'selected-durable-token'; }
+      # shellcheck disable=SC2329
+      generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
+      # shellcheck disable=SC2329
+      rust_config_env_path() { printf '%s' "${OMP_DURABILITY_EXACT_ENV}"; }
+      # shellcheck disable=SC2329
+      token_env_targets_outside_git_worktrees() { return 0; }
+      # shellcheck disable=SC2329
+      read_env_assignment_value() {
+        sed -n "s/^${2}=//p" "$1" 2>/dev/null | tail -1
+      }
+      # shellcheck disable=SC2329
+      detect_mcp_configs() { printf 'opencode\t%s\t1\n' "${OMP_PROJECT_OUTSIDE_CONFIG}"; }
+      # shellcheck disable=SC2329
+      setup_claude_code_mcp_via_cli() { return 1; }
+      OMP_DURABLE_WRITER_VALID=0
+      # shellcheck disable=SC2329
+      setup_single_mcp_config() {
+        local durable_mode durable_token
+        if stat -f '%Lp' "${OMP_DURABILITY_EXACT_ENV}" >/dev/null 2>&1; then
+          durable_mode="$(stat -f '%Lp' "${OMP_DURABILITY_EXACT_ENV}")"
+        else
+          durable_mode="$(stat -c '%a' "${OMP_DURABILITY_EXACT_ENV}" 2>/dev/null || true)"
+        fi
+        durable_token="$(read_env_assignment_value "${OMP_DURABILITY_EXACT_ENV}" HTTP_BEARER_TOKEN)"
+        if [ "$4" = "selected-durable-token" ] \
+          && [ "${HTTP_BEARER_TOKEN:-}" = "selected-durable-token" ] \
+          && [ "$durable_token" = "selected-durable-token" ] \
+          && [ "$durable_mode" = "600" ]; then
+          OMP_DURABLE_WRITER_VALID=1
+          return 1
+        fi
+        return 2
+      }
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC1090
+      source "${OMP_SETUP_LIBRARY}"
+      # shellcheck disable=SC1090
+      source "${OMP_UPDATE_LIBRARY}"
+      cd "${OMP_PROJECT_DIR}"
+      export OMP_DURABILITY_MODE=exact
+      export OMP_DURABILITY_ENV="${OMP_DURABILITY_EXACT_ENV}"
+      configure_mcp_clients "/unused/mcp-agent-mail" "${OMP_DURABILITY_FAKE_CLI}"
+      if [ "$OMP_DURABLE_WRITER_VALID" -eq 1 ]; then
+        printf '%s' valid
+      else
+        printf '%s' invalid
+      fi
+    )"
+    e2e_assert_eq "installer persists the exact mode-600 token before any fallback writer" \
+      "valid" "${OMP_DURABILITY_ORDER_CONTRACT}"
   fi
 fi
 

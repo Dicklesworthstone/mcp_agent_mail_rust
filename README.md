@@ -469,12 +469,25 @@ Setup also honors OMP's `PI_CONFIG_DIR` and default-profile `PI_CODING_AGENT_DIR
 overrides. The project config is profile-independent and applies under every
 named OMP profile.
 
-`am setup run --agent omp --no-user-config` leaves the active user config's
-bytes untouched, but setup and status still read its runtime authority. If that
-file's `disabledServers` disables either Agent Mail alias, or its relevant
-structure is unsupported, they report the effective drift instead of claiming
-success. The remediation deliberately omits `--no-user-config`, because a
-project-only write cannot repair OMP's active user-level authority.
+`am setup run --agent omp --no-user-config` leaves active-user bytes untouched,
+but setup and status still read the authorities that decide whether the
+project entry can run. They check the active `mcp.json` `disabledServers` list
+against all three accepted Agent Mail aliases (`mcp-agent-mail`,
+`mcp_agent_mail`, and `agent-mail`). They also evaluate
+`mcp.enableProjectConfig` with OMP's persistent settings precedence: the active
+profile's `config.yml` (falling back to `config.yaml` only when it is absent),
+the project's `.omp/config.yml`, then each ambient `PI_CONFIG_FILES` overlay in
+order. An effective `false`, malformed settings, an unreadable authority, or a
+missing explicit overlay is reported as runtime-relevant drift instead of
+success. Remediation deliberately omits `--no-user-config`, because a
+project-only write cannot overcome an authority that excludes every project
+MCP source.
+
+This check is bound to the persistent files and the `PI_CONFIG_FILES` value in
+the `am` process environment. A one-shot OMP `--config` argument or a
+programmatic runtime settings override is launch-specific and is outside this
+static setup/status boundary; run `am setup status` under the same ambient
+overlay environment used to launch OMP.
 
 To configure it manually:
 

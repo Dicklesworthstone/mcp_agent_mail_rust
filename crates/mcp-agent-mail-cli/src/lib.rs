@@ -15326,7 +15326,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 Ok(())
             } else {
                 Err(CliError::Other(format!(
-                    "project-only OMP setup cannot make Agent Mail reachable while the active user config remains authoritative: {}",
+                    "project-only OMP setup cannot make Agent Mail reachable while effective OMP runtime authorities reject the project entry: {}",
                     residual_omp_drift.join("; ")
                 )))
             }
@@ -43750,6 +43750,75 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn project_only_omp_setup_postcheck_rejects_project_source_exclusion_in_dry_run() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, ConfigDriftReason, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let home_dir = temp.path().join("home");
+        let project_mcp = project_dir.join(".omp/mcp.json");
+        let settings = home_dir.join(".omp/agent/config.yml");
+        std::fs::create_dir_all(project_mcp.parent().expect("project MCP parent"))
+            .expect("create project MCP parent");
+        std::fs::create_dir_all(settings.parent().expect("OMP settings parent"))
+            .expect("create OMP settings parent");
+        std::fs::write(
+            &project_mcp,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}}}"#,
+        )
+        .expect("write healthy project MCP config");
+        let settings_bytes = "mcp:\n  enableProjectConfig: false\n";
+        std::fs::write(&settings, settings_bytes).expect("write OMP settings");
+        let mut params = SetupParams {
+            token: "tok".to_string(),
+            project_dir,
+            home_dir_override: Some(home_dir),
+            agents: Some(vec![AgentPlatform::Omp]),
+            dry_run: true,
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+
+        let results = mcp_agent_mail_core::setup::run_setup(&params);
+        let failed = results
+            .iter()
+            .flat_map(|result| &result.actions)
+            .filter(|action| {
+                matches!(
+                    action.outcome,
+                    mcp_agent_mail_core::setup::ActionOutcome::Failed(_)
+                )
+            })
+            .count();
+        assert_eq!(failed, 0);
+        let status = mcp_agent_mail_core::setup::check_status(&params)
+            .into_iter()
+            .next()
+            .expect("OMP status");
+        let file = status.config_files.first().expect("OMP file status");
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled
+        );
+        let postcheck = project_only_omp_setup_drift(&params, true, failed);
+        assert_eq!(postcheck.len(), 1);
+        assert!(postcheck[0].contains("mcp.enableProjectConfig=false"));
+        assert!(!postcheck[0].contains("--no-user-config"));
+        assert_eq!(
+            std::fs::read_to_string(&settings).expect("read unchanged settings"),
+            settings_bytes,
+            "dry-run status must never mutate OMP settings authority"
+        );
+
+        params.agents = Some(vec![AgentPlatform::Cline]);
+        assert!(
+            project_only_omp_setup_drift(&params, true, 0).is_empty(),
+            "explicit non-OMP setup must exclude the OMP authority check"
+        );
+    }
+
+    #[test]
     fn setup_self_heal_fingerprint_detects_same_length_content_change() {
         use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
 
@@ -43804,12 +43873,25 @@ http_headers = { Authorization = "Bearer secret" }
         };
 
         let first = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
-        assert_eq!(first.len(), 2);
+        assert_eq!(
+            first.len(),
+            5,
+            "project MCP, active user MCP, preferred/fallback user settings, and project settings are all cache authorities"
+        );
         assert!(
             first
                 .iter()
                 .any(|fingerprint| fingerprint.path == user_config.display().to_string())
         );
+        for settings_path in [
+            user_config.parent().unwrap().join("config.yml"),
+            user_config.parent().unwrap().join("config.yaml"),
+            params.project_dir.join(".omp/config.yml"),
+        ] {
+            assert!(first.iter().any(|fingerprint| {
+                fingerprint.path == settings_path.display().to_string()
+            }));
+        }
 
         std::fs::write(&user_config, "mcp_agent_mail").expect("replace user config");
         let mut second = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
@@ -43882,6 +43964,51 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             stable,
             collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Cline])
+        );
+    }
+
+    #[test]
+    fn setup_self_heal_rejects_omp_settings_aba_snapshot() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let home_dir = temp.path().join("home");
+        let project_mcp = project_dir.join(".omp/mcp.json");
+        let user_settings = home_dir.join(".omp/agent/config.yml");
+        std::fs::create_dir_all(project_mcp.parent().expect("project MCP parent"))
+            .expect("create project MCP parent");
+        std::fs::create_dir_all(user_settings.parent().expect("user settings parent"))
+            .expect("create user settings parent");
+        std::fs::write(
+            &project_mcp,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","enabled":true}}}"#,
+        )
+        .expect("write healthy OMP project config");
+        let disabled = "mcp:\n  enableProjectConfig: false\n";
+        let enabled = "mcp:\n  enableProjectConfig: true\n";
+        std::fs::write(&user_settings, disabled).expect("write disabled settings");
+        let params = SetupParams {
+            project_dir,
+            home_dir_override: Some(home_dir),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+
+        let error = verify_setup_status_snapshot_with(&params, &[AgentPlatform::Omp], || {
+            std::fs::write(&user_settings, enabled).expect("make OMP settings transiently healthy");
+            let statuses = mcp_agent_mail_core::setup::check_status(&params);
+            assert!(setup_status_drift_summaries(&statuses, None).is_empty());
+            std::fs::write(&user_settings, disabled).expect("restore disabled OMP settings");
+            statuses
+        })
+        .expect_err("an OMP settings ABA snapshot must not be cached");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the bytes evaluated by status")
         );
     }
 

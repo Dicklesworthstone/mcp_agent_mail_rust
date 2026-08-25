@@ -5318,6 +5318,39 @@ mod tests {
     }
 
     #[test]
+    fn resolve_omp_settings_overlays_matches_runtime_path_rules() {
+        let joined = std::env::join_paths([
+            Path::new("relative.yml"),
+            Path::new("~/profile overlay.yml"),
+            Path::new("/absolute/overlay.yml"),
+        ])
+        .unwrap();
+        let paths = resolve_omp_settings_overlay_paths(
+            Some(&joined),
+            Path::new("/work/repo"),
+            Some(Path::new("/home/alice")),
+        )
+        .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/work/repo/relative.yml"),
+                PathBuf::from("/home/alice/profile overlay.yml"),
+                PathBuf::from("/absolute/overlay.yml"),
+            ]
+        );
+
+        let tilde = std::env::join_paths([Path::new("~/overlay.yml")]).unwrap();
+        let error = resolve_omp_settings_overlay_paths(
+            Some(&tilde),
+            Path::new("/work/repo"),
+            None,
+        )
+        .expect_err("a tilde overlay without a home directory must fail closed");
+        assert!(error.to_string().contains("home directory is unavailable"));
+    }
+
+    #[test]
     fn resolve_omp_config_paths_rejects_invalid_profiles_like_runtime_boot() {
         let home = Path::new("/home/alice");
         let cwd = Path::new("/work/repo");
@@ -6839,6 +6872,147 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(malformed.remediation.starts_with(
             "inspect unsupported active OMP user config ~/.omp/profiles/work/agent/mcp.json"
         ));
+    }
+
+    #[test]
+    fn check_status_project_only_honors_effective_omp_project_config_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let project_mcp = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(project_mcp.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_mcp,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}}}"#,
+        )
+        .unwrap();
+        let user_settings = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/agent/config.yml");
+        let project_settings = params.project_dir.join(".omp/config.yml");
+        std::fs::create_dir_all(user_settings.parent().unwrap()).unwrap();
+
+        let default_enabled = first_setup_status_file(&params);
+        assert!(default_enabled.drift_reasons.is_empty());
+        assert!(!default_enabled.omp_settings_config_drift);
+        assert!(default_enabled.status_observations.iter().any(|observation| {
+            observation.path == project_settings.display().to_string() && !observation.exists
+        }));
+
+        std::fs::write(&user_settings, "mcp:\n  enableProjectConfig: false\n").unwrap();
+        let user_disabled = first_setup_status_file(&params);
+        assert_eq!(
+            user_disabled.primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled
+        );
+        assert!(user_disabled.omp_settings_config_drift);
+        assert!(user_disabled.remediation.contains(
+            "effective OMP setting mcp.enableProjectConfig=false from ~/.omp/agent/config.yml"
+        ));
+        assert!(!user_disabled.remediation.contains("--no-user-config"));
+
+        std::fs::write(&project_settings, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        let project_override = first_setup_status_file(&params);
+        assert!(
+            project_override.drift_reasons.is_empty(),
+            "project settings override the active profile's global setting"
+        );
+
+        std::fs::write(&project_settings, "mcp:\n  enableProjectConfig: false\n").unwrap();
+        let project_disabled = first_setup_status_file(&params);
+        assert_eq!(
+            project_disabled.primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled
+        );
+        assert!(project_disabled.remediation.contains(".omp/config.yml"));
+
+        let first_overlay = tmp.path().join("first-overlay.yml");
+        let second_overlay = tmp.path().join("second overlay.yml");
+        std::fs::write(&first_overlay, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        std::fs::write(&second_overlay, "mcp:\n  enableProjectConfig: false\n").unwrap();
+        params.omp_settings_overlay_paths = vec![first_overlay, second_overlay.clone()];
+        let overlay_disabled = first_setup_status_file(&params);
+        assert_eq!(
+            overlay_disabled.primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled
+        );
+        assert!(
+            overlay_disabled
+                .remediation
+                .contains("second overlay.yml")
+        );
+
+        std::fs::write(&second_overlay, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        let final_overlay_override = first_setup_status_file(&params);
+        assert!(
+            final_overlay_override.drift_reasons.is_empty(),
+            "later overlays override project and earlier overlay settings"
+        );
+    }
+
+    #[test]
+    fn check_status_omp_settings_fallback_profile_and_parse_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let project_mcp = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(project_mcp.parent().unwrap()).unwrap();
+        std::fs::write(
+            project_mcp,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}}}"#,
+        )
+        .unwrap();
+        let home = params.home_dir_override.as_ref().unwrap();
+        let default_settings = home.join(".omp/agent/config.yml");
+        let active_user_mcp = home.join(".omp/profiles/work/agent/mcp.json");
+        let active_yml = home.join(".omp/profiles/work/agent/config.yml");
+        let active_yaml = home.join(".omp/profiles/work/agent/config.yaml");
+        std::fs::create_dir_all(default_settings.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(active_yaml.parent().unwrap()).unwrap();
+        std::fs::write(&default_settings, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        std::fs::write(&active_yaml, "mcp:\n  enableProjectConfig: false\n").unwrap();
+        params.omp_user_config_path_override = Some(active_user_mcp);
+
+        let named_fallback = first_setup_status_file(&params);
+        assert_eq!(
+            named_fallback.primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled
+        );
+        assert!(
+            named_fallback
+                .remediation
+                .contains("~/.omp/profiles/work/agent/config.yaml")
+        );
+
+        std::fs::write(&active_yml, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+
+        std::fs::write(&active_yml, "mcp:\n  enableProjectConfig: 'false'\n").unwrap();
+        let malformed = first_setup_status_file(&params);
+        assert_eq!(
+            malformed.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(malformed.omp_settings_config_drift);
+        assert!(malformed.remediation.contains("config.yml"));
+
+        std::fs::write(&active_yml, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        let missing_overlay = tmp.path().join("missing-overlay.yml");
+        params.omp_settings_overlay_paths = vec![missing_overlay.clone()];
+        let missing = first_setup_status_file(&params);
+        assert_eq!(missing.primary_drift_reason, ConfigDriftReason::UnsupportedConfig);
+        assert!(
+            missing
+                .remediation
+                .contains(&missing_overlay.display().to_string())
+        );
+
+        params.agents = Some(vec![AgentPlatform::Cline]);
+        let non_omp = first_setup_status_file(&params);
+        assert!(!non_omp.omp_settings_config_drift);
+        assert!(!non_omp.status_observations.iter().any(|observation| {
+            observation.path == missing_overlay.display().to_string()
+        }));
     }
 
     #[test]
