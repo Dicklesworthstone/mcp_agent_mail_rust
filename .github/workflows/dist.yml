@@ -6,24 +6,48 @@ on:
     tags:
       - 'v*'
 
+env:
+  # Release sibling path dependencies are pinned so rerunning a tag resolves
+  # the same source bytes even after their default branches advance.
+  FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
+  FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
+  BEADS_RUST_COMMIT: b5dc5444270d82218e8de6bb4c6320731e0bdd00
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone sibling dependencies
+      - name: Checkout pinned sibling dependencies
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          set -euo pipefail
+
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            local actual_commit
+
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            actual_commit="$(git -C "$destination" rev-parse HEAD)"
+            if [ "$actual_commit" != "$expected_commit" ]; then
+              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
+              exit 1
+            fi
+          }
+
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          # beads_rust 0.5.1 is not yet published, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.1.
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -46,18 +70,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone sibling dependencies
+      - name: Checkout pinned sibling dependencies
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          set -euo pipefail
+
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            local actual_commit
+
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            actual_commit="$(git -C "$destination" rev-parse HEAD)"
+            if [ "$actual_commit" != "$expected_commit" ]; then
+              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
+              exit 1
+            fi
+          }
+
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          # beads_rust 0.5.1 is not yet published, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.1.
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -96,22 +137,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone sibling dependencies
+      - name: Checkout pinned sibling dependencies
         shell: bash
         run: |
+          set -euo pipefail
+
           # Windows MAX_PATH (260 chars) trips on frankensqlite's perf-fixture
-          # paths; enable git's long-path support before cloning. No-op on
-          # Unix runners (the setting is harmless).
+          # paths; enable git's long-path support before creating sibling
+          # checkouts. No-op on Unix runners (the setting is harmless).
           git config --global core.longpaths true
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            local actual_commit
+
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            actual_commit="$(git -C "$destination" rev-parse HEAD)"
+            if [ "$actual_commit" != "$expected_commit" ]; then
+              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
+              exit 1
+            fi
+          }
+
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
-          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
-          # 2026-08-22 registry universe: asupersync, fastmcp, sqlmodel, fsqlite,
-          # ftui, franken-agent-detection, tru, and rich_rust all resolve from
-          # crates.io. beads_rust stays path-patched (registry 0.3.2 pins
-          # asupersync =0.4.4; the 0.4.0 line on main pins =0.4.9).
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          # beads_rust 0.5.1 is not yet published, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.1.
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly

@@ -4453,20 +4453,26 @@ if not isinstance(existing_entry, dict):
 if tool == "omp":
     entry_key = "mcp-agent-mail"
 
+managed_entry_keys = {
+    "command",
+    "args",
+    "cwd",
+    "environment",
+    "env",
+    "transport",
+    "httpUrl",
+    "http_headers",
+    "bearer_token_env_var",
+}
+if tool == "omp":
+    # OMP resolves explicit OAuth metadata after loading configured headers;
+    # a stale credential can therefore replace the bearer written below.
+    managed_entry_keys.update({"auth", "oauth"})
+
 new_entry = {
     key: value
     for key, value in existing_entry.items()
-    if key not in {
-        "command",
-        "args",
-        "cwd",
-        "environment",
-        "env",
-        "transport",
-        "httpUrl",
-        "http_headers",
-        "bearer_token_env_var",
-    }
+    if key not in managed_entry_keys
 }
 new_entry["type"] = "http"
 new_entry["url"] = desired_url
@@ -4514,6 +4520,19 @@ if tool == "omp":
             name
             for name in disabled_servers
             if name not in entry_names
+        ]
+    enabled_servers = doc.get("enabledServers")
+    if enabled_servers is not None and not isinstance(enabled_servers, list):
+        print("ERROR:enabled_servers_not_array")
+        raise SystemExit(0)
+    if isinstance(enabled_servers, list):
+        if any(not isinstance(name, str) for name in enabled_servers):
+            print("ERROR:enabled_servers_entries_not_strings")
+            raise SystemExit(0)
+        doc["enabledServers"] = [
+            name
+            for name in enabled_servers
+            if name == entry_key or name not in entry_names
         ]
 new_text = dump_json(doc)
 effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600

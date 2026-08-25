@@ -611,6 +611,8 @@ else
       "args": [],
       "cwd": "/stale/stdio/root",
       "env": {"HTTP_BEARER_TOKEN": "stale-token"},
+      "auth": {"type": "oauth", "credentialId": "stale-credential"},
+      "oauth": {"credentialId": "legacy-stale-credential"},
       "headers": {
         "authorization": "Bearer stale-token",
         "X-Trace": "preserve-me"
@@ -618,6 +620,7 @@ else
     }
   },
   "disabledServers": ["sibling", "mcp_agent_mail", "mcp-agent-mail", "agent-mail"],
+  "enabledServers": ["sibling", "agent-mail", "mcp_agent_mail"],
   "servers": {
     "other": {"command": "other-server"}
   }
@@ -645,7 +648,7 @@ EOF
       # shellcheck disable=SC2329
       desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
       # shellcheck disable=SC2329
-      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      resolve_setup_http_bearer_token() { printf '%s' 'fresh-token'; }
       # shellcheck disable=SC1090
       source "${OMP_WRITER_LIBRARY}"
       setup_single_standard_http_json_config omp "${OMP_CONFIG}"
@@ -665,12 +668,16 @@ entry = doc["mcpServers"]["mcp-agent-mail"]
 assert entry["type"] == "http"
 assert entry["url"] == "http://127.0.0.1:8765/mcp/"
 assert entry["enabled"] is True
-assert entry["headers"] == {"X-Trace": "preserve-me"}
-assert "command" not in entry and "args" not in entry and "cwd" not in entry and "env" not in entry
+assert entry["headers"] == {
+    "X-Trace": "preserve-me",
+    "Authorization": "Bearer fresh-token",
+}
+assert not ({"command", "args", "cwd", "env", "auth", "oauth"} & entry.keys())
 assert "agent-mail" not in doc["mcpServers"]
 assert doc["servers"]["other"]["command"] == "other-server"
 assert doc["mcpServers"]["sibling"]["url"] == "http://sibling.invalid/mcp"
 assert doc["disabledServers"] == ["sibling"]
+assert doc["enabledServers"] == ["sibling"]
 print("valid")
 PY
     )"
@@ -685,7 +692,7 @@ PY
       # shellcheck disable=SC2329
       desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
       # shellcheck disable=SC2329
-      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      resolve_setup_http_bearer_token() { printf '%s' 'fresh-token'; }
       # shellcheck disable=SC1090
       source "${OMP_WRITER_LIBRARY}"
       setup_single_standard_http_json_config omp "${OMP_CONFIG}"
@@ -708,7 +715,7 @@ PY
       # shellcheck disable=SC2329
       desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
       # shellcheck disable=SC2329
-      resolve_setup_http_bearer_token() { printf '%s' ''; }
+      resolve_setup_http_bearer_token() { printf '%s' 'fresh-token'; }
       # shellcheck disable=SC1090
       source "${OMP_WRITER_LIBRARY}"
       setup_single_standard_http_json_config omp "${OMP_CONFIG}"
