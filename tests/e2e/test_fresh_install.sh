@@ -29,7 +29,10 @@ SERVER_BIN="${CARGO_TARGET_DIR}/debug/mcp-agent-mail"
 CLI_BIN="${CARGO_TARGET_DIR}/debug/am"
 
 # Create an isolated HOME to simulate a clean system
-FAKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/fresh_install_home.XXXXXX")"
+# RCH intentionally points TMPDIR inside the checkout. A fake HOME created
+# there is not an outside-home control and can make Git-boundary tests
+# false-fail. Use the system temp root explicitly for this isolation suite.
+FAKE_HOME="$(mktemp -d "/tmp/fresh_install_home.XXXXXX")"
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 FAKE_DEST="${FAKE_HOME}/.local/bin"
 mkdir -p "$FAKE_DEST"
@@ -62,12 +65,8 @@ e2e_case_banner "am binary exists and is executable"
 e2e_assert_file_exists "am binary in DEST" "$FAKE_DEST/am"
 e2e_assert_file_exists "mcp-agent-mail binary in DEST" "$FAKE_DEST/mcp-agent-mail"
 
-set +e
-test -x "$FAKE_DEST/am"
-AM_EXEC_RC=$?
-test -x "$FAKE_DEST/mcp-agent-mail"
-SERVER_EXEC_RC=$?
-set -e
+if [ -x "$FAKE_DEST/am" ]; then AM_EXEC_RC=0; else AM_EXEC_RC=1; fi
+if [ -x "$FAKE_DEST/mcp-agent-mail" ]; then SERVER_EXEC_RC=0; else SERVER_EXEC_RC=1; fi
 
 e2e_assert_exit_code "am is executable" "0" "$AM_EXEC_RC"
 e2e_assert_exit_code "mcp-agent-mail is executable" "0" "$SERVER_EXEC_RC"
@@ -263,43 +262,34 @@ cat > "$FAKE_HOME/.claude/settings.json" <<'EOF'
   "mcpServers": {}
 }
 EOF
+CURSOR_CONFIG="$FAKE_HOME/.cursor/mcp.json"
+printf '%s\n' '{}' > "$CURSOR_CONFIG"
 
-set +e
-# Source install.sh in a subshell to get detect_mcp_configs
-DETECT_OUT="$(
-  # Source only the functions we need (run detect in a subshell)
-  HOME="$FAKE_HOME" bash -c "
-    set -euo pipefail
-    # Source the entire script but prevent main execution by overriding traps
-    # and checking for function availability
-    source '$INSTALL_SH' --help 2>/dev/null || true
-    # If sourcing didn't work (it runs main), call detect directly
-    if type detect_mcp_configs >/dev/null 2>&1; then
-      detect_mcp_configs '${FAKE_HOME}'
-    fi
-  " 2>/dev/null || true
-)"
-DETECT_RC=$?
-set -e
+MCP_DETECT_LIBRARY="${FAKE_HOME}/detect-mcp-configs-function.sh"
+sed -n '/^detect_mcp_configs() {/,/^generate_bearer_token() {/p' "${INSTALL_SH}" \
+  | sed '$d' > "${MCP_DETECT_LIBRARY}"
+if [ ! -s "${MCP_DETECT_LIBRARY}" ]; then
+  e2e_fail "extract installer MCP detector" "function body" "missing"
+  DETECT_OUT=""
+else
+  DETECT_OUT="$(
+    # shellcheck disable=SC1090
+    source "${MCP_DETECT_LIBRARY}"
+    unset OMP_PROFILE PI_PROFILE PI_CONFIG_DIR PI_CODING_AGENT_DIR
+    detect_mcp_configs "${FAKE_HOME}"
+  )"
+fi
 
 e2e_save_artifact "case_09_detect_configs.txt" "$DETECT_OUT"
-
-# Since install.sh runs its main flow on source, we test the detection
-# by checking that the function would detect our created config.
-# Use grep on the existing Claude settings.json we created
-if [ -f "$FAKE_HOME/.claude/settings.json" ]; then
-  e2e_assert_eq "Claude settings.json exists" "yes" "yes"
-else
-  e2e_assert_eq "Claude settings.json exists" "yes" "no"
-fi
+e2e_assert_contains "detector reports an existing Cursor MCP config" \
+  "$DETECT_OUT" "cursor"$'\t'"${CURSOR_CONFIG}"$'\t'"1"
+e2e_assert_not_contains "detector does not mislabel Claude Code settings as MCP config" \
+  "$DETECT_OUT" "${FAKE_HOME}/.claude/settings.json"
 
 # ===========================================================================
 # Case 10: setup_mcp_configs creates config entries for detected tools
 # ===========================================================================
 e2e_case_banner "MCP config insertion creates valid JSON"
-
-# Test by directly creating what setup_single_mcp_config would create
-CURSOR_CONFIG="$FAKE_HOME/.cursor/mcp.json"
 
 # Simulate a fresh MCP config creation (what setup_single_mcp_config does)
 if command -v python3 >/dev/null 2>&1; then
@@ -776,9 +766,7 @@ PY
     fi
   fi
 
-  OMP_DETECT_LIBRARY="${OMP_INSTALLER_DIR}/detect-function.sh"
-  sed -n '/^detect_mcp_configs() {/,/^generate_bearer_token() {/p' "${INSTALL_SH}" \
-    | sed '$d' > "${OMP_DETECT_LIBRARY}"
+  OMP_DETECT_LIBRARY="${MCP_DETECT_LIBRARY}"
   if [ ! -s "${OMP_DETECT_LIBRARY}" ]; then
     e2e_fail "extract OMP installer detector" "function body" "missing"
   else
@@ -813,7 +801,7 @@ PY
   fi
 
   OMP_SETUP_LIBRARY="${OMP_INSTALLER_DIR}/setup-mcp-configs-function.sh"
-  sed -n '/^setup_mcp_configs() {/,/^sync_codex_http_configs() {/p' "${INSTALL_SH}" \
+  sed -n '/^path_resolves_within_directory() {/,/^update_mcp_configs() {/p' "${INSTALL_SH}" \
     | sed '$d' > "${OMP_SETUP_LIBRARY}"
   OMP_UPDATE_LIBRARY="${OMP_INSTALLER_DIR}/update-mcp-configs-function.sh"
   sed -n '/^update_mcp_configs() {/,/^record_uninstall_summary() {/p' "${INSTALL_SH}" \
@@ -863,12 +851,54 @@ PY
     e2e_assert_eq "installer reuses one bearer token across OMP setup phases" \
       "valid" "${OMP_TOKEN_CONTRACT}"
 
+    OMP_CONTAINMENT_FAILURE_WRITES="$(
+      # An interpreter failure is not proof that an arbitrary config lives
+      # outside the project. Shadow python3 to mutation-test the fail-closed
+      # status mapping without depending on a host-level Python failure.
+      # shellcheck disable=SC2329
+      python3() { return 3; }
+      # shellcheck disable=SC2329
+      detect_mcp_configs() { printf 'cursor\t%s\t1\n' "${OMP_CONFIG}"; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'unknown-path-secret'; }
+      # shellcheck disable=SC2329
+      generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
+      # shellcheck disable=SC2329
+      setup_claude_code_mcp_via_cli() { return 1; }
+      OMP_UNKNOWN_PATH_WRITES=0
+      # shellcheck disable=SC2329
+      setup_single_mcp_config() {
+        OMP_UNKNOWN_PATH_WRITES=$((OMP_UNKNOWN_PATH_WRITES + 1))
+        return 0
+      }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${OMP_SETUP_LIBRARY}"
+      setup_mcp_configs "/unused/mcp-agent-mail"
+      printf '%s' "${OMP_UNKNOWN_PATH_WRITES}"
+    )"
+    e2e_assert_eq "installer fails closed when project containment is indeterminate" \
+      "0" "${OMP_CONTAINMENT_FAILURE_WRITES}"
+
     OMP_PROJECT_DIR="${OMP_INSTALLER_DIR}/project-defer"
     OMP_PROJECT_CONFIG="${OMP_PROJECT_DIR}/.omp/mcp.json"
+    OMP_PROJECT_OVERRIDE_CONFIG="${OMP_PROJECT_DIR}/.omp/agent/mcp.json"
+    OMP_PROJECT_CURSOR_CONFIG="${OMP_PROJECT_DIR}/cursor.mcp.json"
+    OMP_PROJECT_CODEX_CONFIG="${OMP_PROJECT_DIR}/codex.mcp.json"
     OMP_PROJECT_FAKE_CLI="${OMP_INSTALLER_DIR}/failing-am"
     OMP_PROJECT_NATIVE_MARKER="${OMP_INSTALLER_DIR}/native-setup-invoked"
-    mkdir -p "${OMP_PROJECT_DIR}/.omp"
+    mkdir -p "${OMP_PROJECT_DIR}/.omp/agent"
     printf '%s\n' '{"mcpServers":{"sibling":{"command":"node"}}}' > "${OMP_PROJECT_CONFIG}"
+    printf '%s\n' '{"mcpServers":{"override-sibling":{"command":"node"}}}' > "${OMP_PROJECT_OVERRIDE_CONFIG}"
+    printf '%s\n' '{"mcpServers":{"cursor-sibling":{"command":"node"}}}' > "${OMP_PROJECT_CURSOR_CONFIG}"
+    printf '%s\n' '{"mcpServers":{"codex-sibling":{"command":"node"}}}' > "${OMP_PROJECT_CODEX_CONFIG}"
     cat > "${OMP_PROJECT_FAKE_CLI}" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "setup" ] && [ "${2:-}" = "--help" ]; then
@@ -883,17 +913,25 @@ EOF
 
     OMP_PROJECT_DEFER_CONTRACT="$(
       # shellcheck disable=SC2329
-      detect_mcp_configs() { printf 'omp\t%s\t1\n' "${OMP_PROJECT_CONFIG}"; }
+      detect_mcp_configs() {
+        printf 'omp\t%s\t1\nomp\t%s\t1\ncursor\t%s\t1\ncodex\t%s\t1\n' \
+          "${OMP_PROJECT_CONFIG}" '.omp/agent/mcp.json' 'cursor.mcp.json' 'codex.mcp.json'
+      }
       # shellcheck disable=SC2329
       resolve_setup_http_bearer_token() { printf '%s' 'project-secret'; }
       # shellcheck disable=SC2329
       generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
       # shellcheck disable=SC2329
-      setup_claude_code_mcp_via_cli() { return 1; }
       OMP_PROJECT_DIRECT_WRITES=0
+      setup_claude_code_mcp_via_cli() {
+        OMP_PROJECT_DIRECT_WRITES=$((OMP_PROJECT_DIRECT_WRITES + 1))
+        printf '%s' "$1" > "${HOME}/.claude.json"
+        return 0
+      }
       # shellcheck disable=SC2329
       setup_single_mcp_config() {
         OMP_PROJECT_DIRECT_WRITES=$((OMP_PROJECT_DIRECT_WRITES + 1))
+        printf '%s' "$4" > "$2"
         return 0
       }
       # shellcheck disable=SC2329
@@ -909,9 +947,11 @@ EOF
       # shellcheck disable=SC1090
       source "${OMP_UPDATE_LIBRARY}"
       cd "${OMP_PROJECT_DIR}"
+      export HOME="${OMP_PROJECT_DIR}"
       export OMP_PROJECT_NATIVE_MARKER
       setup_mcp_configs "/unused/mcp-agent-mail"
       update_mcp_configs "/unused/mcp-agent-mail" "${OMP_PROJECT_FAKE_CLI}"
+      sync_codex_http_configs "/unused/mcp-agent-mail"
       printf '%s' "${OMP_PROJECT_DIRECT_WRITES}"
     )"
     e2e_assert_eq "installer defers project OMP bearer writes when native setup fails" \
@@ -921,6 +961,27 @@ EOF
       "$(cat "${OMP_PROJECT_CONFIG}")"
     e2e_assert_not_contains "failed native setup leaves no project bearer" \
       "$(cat "${OMP_PROJECT_CONFIG}")" "project-secret"
+    e2e_assert_eq "installer leaves project-local OMP override byte-preserved" \
+      '{"mcpServers":{"override-sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_OVERRIDE_CONFIG}")"
+    e2e_assert_not_contains "installer leaves no bearer in project-local OMP override" \
+      "$(cat "${OMP_PROJECT_OVERRIDE_CONFIG}")" "project-secret"
+    e2e_assert_eq "installer leaves project-local non-OMP config byte-preserved" \
+      '{"mcpServers":{"cursor-sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_CURSOR_CONFIG}")"
+    e2e_assert_not_contains "installer leaves no bearer in project-local non-OMP config" \
+      "$(cat "${OMP_PROJECT_CURSOR_CONFIG}")" "project-secret"
+    e2e_assert_eq "installer leaves project-local Codex sync config byte-preserved" \
+      '{"mcpServers":{"codex-sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_CODEX_CONFIG}")"
+    e2e_assert_not_contains "installer leaves no bearer in project-local Codex sync config" \
+      "$(cat "${OMP_PROJECT_CODEX_CONFIG}")" "project-secret"
+    if [ -e "${OMP_PROJECT_DIR}/.claude.json" ]; then
+      e2e_fail "installer defers project-contained Claude CLI config" \
+        "no .claude.json shell write" "created .claude.json"
+    else
+      e2e_pass "installer defers project-contained Claude CLI config"
+    fi
     e2e_assert_eq "installer invoked native setup with the selected bearer" \
       "project-secret" "$(cat "${OMP_PROJECT_NATIVE_MARKER}")"
     if [ -e "${OMP_PROJECT_DIR}/.gitignore" ]; then
@@ -928,6 +989,192 @@ EOF
         "no .gitignore side effect" "created .gitignore"
     else
       e2e_pass "failed native setup leaves project security files untouched"
+    fi
+  fi
+fi
+
+# ===========================================================================
+# Case 17: legacy env migration never writes credentials into a Git worktree
+# ===========================================================================
+e2e_case_banner "legacy env migration respects every Git worktree boundary"
+
+if ! command -v git >/dev/null 2>&1; then
+  e2e_skip "git unavailable; skipping legacy env containment case"
+else
+  LEGACY_ENV_CONTRACT_DIR="${FAKE_HOME}/legacy-env-contract"
+  LEGACY_ENV_LIBRARY="${LEGACY_ENV_CONTRACT_DIR}/migration-functions.sh"
+  LEGACY_PROJECT_DIR="${LEGACY_ENV_CONTRACT_DIR}/worktree"
+  LEGACY_PROJECT_CONFIG_DIR="${LEGACY_PROJECT_DIR}/.config/mcp-agent-mail"
+  LEGACY_PROJECT_CONFIG="${LEGACY_PROJECT_CONFIG_DIR}/config.env"
+  LEGACY_PROJECT_COMPAT="${LEGACY_PROJECT_CONFIG_DIR}/.env"
+  LEGACY_OTHER_PROJECT_DIR="${LEGACY_ENV_CONTRACT_DIR}/other-worktree"
+  LEGACY_OTHER_CONFIG_DIR="${LEGACY_OTHER_PROJECT_DIR}/.config/mcp-agent-mail"
+  LEGACY_OTHER_CONFIG="${LEGACY_OTHER_CONFIG_DIR}/config.env"
+  LEGACY_OTHER_COMPAT="${LEGACY_OTHER_CONFIG_DIR}/.env"
+  LEGACY_OUTSIDE_HOME="${LEGACY_ENV_CONTRACT_DIR}/outside-home"
+  mkdir -p "${LEGACY_ENV_CONTRACT_DIR}" "${LEGACY_PROJECT_CONFIG_DIR}" \
+    "${LEGACY_OTHER_CONFIG_DIR}" \
+    "${LEGACY_OUTSIDE_HOME}/mcp_agent_mail"
+
+  sed -n '/^strip_wrapping_quotes() {/,/^python_db_format_needs_import() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${LEGACY_ENV_LIBRARY}"
+  sed -n '/^git_worktree_root_for_path() {/,/^resolve_migrated_bearer_token() {/p' "${INSTALL_SH}" \
+    | sed '$d' >> "${LEGACY_ENV_LIBRARY}"
+  sed -n '/^path_resolves_within_directory() {/,/^mcp_config_must_skip_shell_write() {/p' "${INSTALL_SH}" \
+    | sed '$d' >> "${LEGACY_ENV_LIBRARY}"
+
+  if [ ! -s "${LEGACY_ENV_LIBRARY}" ]; then
+    e2e_fail "extract legacy env migration contract" "function bodies" "missing"
+  else
+    git init -q -b main "${LEGACY_PROJECT_DIR}"
+    cat > "${LEGACY_PROJECT_CONFIG}" <<'EOF'
+# tracked project sentinel
+HTTP_BEARER_TOKEN=old-project-secret
+KEEP_ME=byte-preserved
+EOF
+    git -C "${LEGACY_PROJECT_DIR}" add .config/mcp-agent-mail/config.env
+
+    set +e
+    (
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC1090
+      source "${LEGACY_ENV_LIBRARY}"
+      cd "${LEGACY_PROJECT_DIR}"
+      export HOME="${LEGACY_PROJECT_DIR}"
+      export PYTHON_CLONE_FOUND=0
+      export PYTHON_CLONE_PATH=""
+      export RUST_STORAGE_ROOT="${LEGACY_PROJECT_DIR}/mailbox"
+      export RUST_DB_PATH="${LEGACY_PROJECT_DIR}/mailbox/storage.sqlite3"
+      export MIGRATED_BEARER_TOKEN="project-new-secret"
+      migrate_env_config
+    ) >/dev/null 2>&1
+    LEGACY_PROJECT_GUARD_RC=$?
+    set -e
+
+    e2e_assert_exit_code "legacy env migration refuses project-contained HOME" \
+      "1" "${LEGACY_PROJECT_GUARD_RC}"
+    e2e_assert_eq "project-contained env remains byte-preserved" \
+      $'# tracked project sentinel\nHTTP_BEARER_TOKEN=old-project-secret\nKEEP_ME=byte-preserved' \
+      "$(cat "${LEGACY_PROJECT_CONFIG}")"
+    e2e_assert_not_contains "project-contained env receives no replacement bearer" \
+      "$(cat "${LEGACY_PROJECT_CONFIG}")" "project-new-secret"
+    if [ -e "${LEGACY_PROJECT_COMPAT}" ]; then
+      e2e_fail "legacy env refusal creates no compatibility mirror" \
+        "absent" "created ${LEGACY_PROJECT_COMPAT}"
+    else
+      e2e_pass "legacy env refusal creates no compatibility mirror"
+    fi
+    LEGACY_PROJECT_SIDE_EFFECTS="$(
+      find "${LEGACY_PROJECT_CONFIG_DIR}" -maxdepth 1 -type f \
+        \( -name '*.bak.mcp-agent-mail-*' -o -name '*.tmp.*' \) -print \
+        | wc -l | tr -d ' '
+    )"
+    e2e_assert_eq "legacy env refusal creates no backup or temporary files" \
+      "0" "${LEGACY_PROJECT_SIDE_EFFECTS}"
+
+    git init -q -b main "${LEGACY_OTHER_PROJECT_DIR}"
+    cat > "${LEGACY_OTHER_CONFIG}" <<'EOF'
+# unrelated tracked project sentinel
+HTTP_BEARER_TOKEN=other-project-secret
+KEEP_ME=other-byte-preserved
+EOF
+    git -C "${LEGACY_OTHER_PROJECT_DIR}" add .config/mcp-agent-mail/config.env
+    set +e
+    (
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC1090
+      source "${LEGACY_ENV_LIBRARY}"
+      cd "${LEGACY_PROJECT_DIR}"
+      export HOME="${LEGACY_OTHER_PROJECT_DIR}"
+      export PYTHON_CLONE_FOUND=0
+      export PYTHON_CLONE_PATH=""
+      export RUST_STORAGE_ROOT="${LEGACY_OTHER_PROJECT_DIR}/mailbox"
+      export RUST_DB_PATH="${LEGACY_OTHER_PROJECT_DIR}/mailbox/storage.sqlite3"
+      export MIGRATED_BEARER_TOKEN="other-project-new-secret"
+      migrate_env_config
+    ) >/dev/null 2>&1
+    LEGACY_OTHER_GUARD_RC=$?
+    set -e
+
+    e2e_assert_exit_code "legacy env migration refuses an unrelated worktree HOME" \
+      "1" "${LEGACY_OTHER_GUARD_RC}"
+    e2e_assert_eq "unrelated worktree env remains byte-preserved" \
+      $'# unrelated tracked project sentinel\nHTTP_BEARER_TOKEN=other-project-secret\nKEEP_ME=other-byte-preserved' \
+      "$(cat "${LEGACY_OTHER_CONFIG}")"
+    e2e_assert_not_contains "unrelated worktree receives no replacement bearer" \
+      "$(cat "${LEGACY_OTHER_CONFIG}")" "other-project-new-secret"
+    if [ -e "${LEGACY_OTHER_COMPAT}" ]; then
+      e2e_fail "unrelated worktree refusal creates no compatibility mirror" \
+        "absent" "created ${LEGACY_OTHER_COMPAT}"
+    else
+      e2e_pass "unrelated worktree refusal creates no compatibility mirror"
+    fi
+    LEGACY_OTHER_SIDE_EFFECTS="$(
+      find "${LEGACY_OTHER_CONFIG_DIR}" -maxdepth 1 -type f \
+        \( -name '*.bak.mcp-agent-mail-*' -o -name '*.tmp.*' \) -print \
+        | wc -l | tr -d ' '
+    )"
+    e2e_assert_eq "unrelated worktree refusal creates no backup or temporary files" \
+      "0" "${LEGACY_OTHER_SIDE_EFFECTS}"
+
+    cat > "${LEGACY_OUTSIDE_HOME}/mcp_agent_mail/.env" <<'EOF'
+DATABASE_URL=sqlite+aiosqlite:////legacy/storage.sqlite3
+STORAGE_ROOT=/legacy/storage
+HTTP_BEARER_TOKEN=outside-legacy-secret
+PRESERVE_ME=yes
+EOF
+    set +e
+    (
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC1090
+      source "${LEGACY_ENV_LIBRARY}"
+      cd "${LEGACY_PROJECT_DIR}"
+      export HOME="${LEGACY_OUTSIDE_HOME}"
+      export PYTHON_CLONE_FOUND=0
+      export PYTHON_CLONE_PATH=""
+      export RUST_STORAGE_ROOT="${LEGACY_OUTSIDE_HOME}/mailbox"
+      export RUST_DB_PATH="${LEGACY_OUTSIDE_HOME}/mailbox/storage.sqlite3"
+      unset MIGRATED_BEARER_TOKEN
+      migrate_env_config
+    ) >/dev/null 2>&1
+    LEGACY_OUTSIDE_RC=$?
+    set -e
+
+    LEGACY_OUTSIDE_CONFIG="${LEGACY_OUTSIDE_HOME}/.config/mcp-agent-mail/config.env"
+    LEGACY_OUTSIDE_COMPAT="${LEGACY_OUTSIDE_HOME}/.config/mcp-agent-mail/.env"
+    e2e_assert_exit_code "legacy env migration still permits an outside HOME" \
+      "0" "${LEGACY_OUTSIDE_RC}"
+    e2e_assert_contains "outside migration rewrites DATABASE_URL" \
+      "$(cat "${LEGACY_OUTSIDE_CONFIG}")" \
+      "DATABASE_URL=sqlite:///${LEGACY_OUTSIDE_HOME}/mailbox/storage.sqlite3"
+    e2e_assert_contains "outside migration rewrites STORAGE_ROOT" \
+      "$(cat "${LEGACY_OUTSIDE_CONFIG}")" \
+      "STORAGE_ROOT=${LEGACY_OUTSIDE_HOME}/mailbox"
+    e2e_assert_contains "outside migration preserves the legacy bearer" \
+      "$(cat "${LEGACY_OUTSIDE_CONFIG}")" \
+      "HTTP_BEARER_TOKEN=outside-legacy-secret"
+    e2e_assert_contains "outside migration preserves compatible settings" \
+      "$(cat "${LEGACY_OUTSIDE_CONFIG}")" "PRESERVE_ME=yes"
+    if cmp -s "${LEGACY_OUTSIDE_CONFIG}" "${LEGACY_OUTSIDE_COMPAT}"; then
+      e2e_pass "outside migration creates an exact compatibility mirror"
+    else
+      e2e_fail "outside migration creates an exact compatibility mirror" \
+        "byte-identical files" "files differ"
     fi
   fi
 fi

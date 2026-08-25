@@ -2169,6 +2169,89 @@ resolve_database_path() {
 # T5.3: Migrate .env configuration from Python to Rust
 # Python .env may live in clone dir or storage root. Rust reads the same
 # env vars but DATABASE_URL format differs (no aiosqlite prefix).
+git_authority_probe() (
+  # Discovery-affecting Git variables belong to the caller's repository, not
+  # to this destination-path authority check. Leaving them set can hide a
+  # target worktree/bare repository or redirect the probe to unrelated state.
+  unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES \
+    GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX
+  LC_ALL=C command git "$@"
+)
+
+git_worktree_root_for_path() {
+  local candidate="$1"
+  local cursor="$candidate"
+  local root=""
+
+  [ -n "$candidate" ] || return 2
+  command -v git >/dev/null 2>&1 || return 2
+
+  # Git needs an existing directory. Walk to the deepest existing ancestor so
+  # a not-yet-created config below HOME still inherits that ancestor's worktree
+  # authority. A dangling/non-directory leaf is governed by its parent.
+  while [ ! -e "$cursor" ] && [ ! -L "$cursor" ]; do
+    local parent
+    parent=$(dirname "$cursor")
+    [ "$parent" != "$cursor" ] || break
+    cursor="$parent"
+  done
+  if [ ! -d "$cursor" ]; then
+    cursor=$(dirname "$cursor")
+  fi
+  [ -d "$cursor" ] && [ -r "$cursor" ] && [ -x "$cursor" ] || return 2
+
+  if root=$(git_authority_probe -C "$cursor" rev-parse --show-toplevel 2>/dev/null); then
+    [ -n "$root" ] && [ -d "$root" ] || return 2
+    printf '%s' "$root"
+    return 0
+  fi
+
+  # A bare repository is also an unsafe destination for token material even
+  # though it has no worktree root.
+  if [ "$(git_authority_probe -C "$cursor" rev-parse --is-bare-repository 2>/dev/null || true)" = "true" ]; then
+    return 2
+  fi
+
+  # A failed Git probe is an ordinary "not in a worktree" only when no parent
+  # advertises Git metadata. If metadata exists but Git could not resolve it
+  # (for example because of ownership or permissions), authority is
+  # indeterminate and secret migration must stop.
+  local parent
+  while :; do
+    if [ -e "$cursor/.git" ] || [ -L "$cursor/.git" ]; then
+      return 2
+    fi
+    parent=$(dirname "$cursor")
+    [ "$parent" != "$cursor" ] || break
+    cursor="$parent"
+  done
+  return 1
+}
+
+legacy_env_targets_outside_git_worktrees() {
+  local canonical_env="$1"
+  local compatibility_env="$2"
+  local target
+  local worktree_root
+  local worktree_rc
+
+  for target in "$canonical_env" "$compatibility_env"; do
+    if worktree_root=$(git_worktree_root_for_path "$target"); then
+      warn "Refusing to migrate a token-bearing env file inside a Git worktree: $target"
+      warn "Destination worktree: $worktree_root"
+      warn "Move HOME/config outside every checkout, then rerun the installer; no env migration bytes were written."
+      return 1
+    else
+      worktree_rc=$?
+    fi
+    if [ "$worktree_rc" -ne 1 ]; then
+      warn "Cannot establish Git authority for token-bearing env target: $target"
+      return 1
+    fi
+  done
+  return 0
+}
+
 migrate_env_config() {
   [ -z "${RUST_STORAGE_ROOT:-}" ] && RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
   [ -z "${RUST_DB_PATH:-}" ] && RUST_DB_PATH="$RUST_STORAGE_ROOT/storage.sqlite3"
@@ -2194,6 +2277,11 @@ migrate_env_config() {
   local rust_config_dir="$HOME/.config/mcp-agent-mail"
   local rust_env="$rust_config_dir/config.env"
   local rust_env_compat="$rust_config_dir/.env"
+  # This check precedes directory creation, backups, temp files, and both
+  # final writes. Every artifact produced below is a sibling of one of these
+  # two targets, so proving both outside every Git worktree keeps the entire
+  # token-bearing generation outside Git. Unknown authority fails closed.
+  legacy_env_targets_outside_git_worktrees "$rust_env" "$rust_env_compat" || return 1
   mkdir -p "$rust_config_dir"
 
   backup_envfile_if_present() {
@@ -4396,6 +4484,111 @@ setup_claude_code_mcp_via_cli() {
   return 2
 }
 
+# Return success only when `candidate` resolves inside `root`. Return 2 when
+# containment cannot be established so credential-bearing callers can fail
+# closed instead of guessing that the path is safe.
+path_resolves_within_directory() {
+  local candidate="$1"
+  local root="$2"
+  local verdict
+
+  [ -n "$candidate" ] && [ -n "$root" ] || return 2
+  command -v python3 >/dev/null 2>&1 || return 2
+
+  if verdict=$(python3 - "$candidate" "$root" <<'PY'
+import os
+import sys
+
+candidate, root = sys.argv[1:3]
+try:
+    candidate_lexical = os.path.abspath(candidate)
+    root_lexical = os.path.abspath(root)
+    candidate_resolved = os.path.realpath(candidate_lexical)
+    root_resolved = os.path.realpath(root_lexical)
+
+    # `commonpath` is string-based. On a case-insensitive filesystem, two
+    # spellings of the same directory can compare unequal, so also walk the
+    # candidate's existing ancestry by file identity. This covers missing
+    # leaf paths because their deepest existing parent still identifies the
+    # directory that would receive the write.
+    candidate_ancestor = candidate_lexical
+    while not os.path.lexists(candidate_ancestor):
+        parent = os.path.dirname(candidate_ancestor)
+        if parent == candidate_ancestor:
+            break
+        candidate_ancestor = parent
+    physically_inside = False
+    while os.path.lexists(candidate_ancestor):
+        if os.path.samefile(candidate_ancestor, root_lexical):
+            physically_inside = True
+            break
+        parent = os.path.dirname(candidate_ancestor)
+        if parent == candidate_ancestor:
+            break
+        candidate_ancestor = parent
+
+    inside = (
+        os.path.commonpath((candidate_lexical, root_lexical)) == root_lexical
+        or os.path.commonpath((candidate_resolved, root_resolved)) == root_resolved
+        or physically_inside
+    )
+except (OSError, ValueError):
+    raise SystemExit(2)
+print("inside" if inside else "outside")
+PY
+  )
+  then
+    case "$verdict" in
+      inside) return 0 ;;
+      outside) return 1 ;;
+      *) return 2 ;;
+    esac
+  fi
+
+  # Only the script's exact successful "outside" verdict permits the shell
+  # writer. An interpreter failure can itself exit with any small status, so
+  # an exit-code sentinel is not an authoritative containment result.
+  return 2
+}
+
+# The shell writers embed bearer credentials but cannot establish the native
+# setup command's Git tracked/ignore protections. Never let them write a config
+# inside the current project. OMP needs extra handling because user-path
+# overrides can be relative to the checkout and inactive named profiles may
+# also live beneath it; only the canonical project config is handled by native
+# setup, while the other project-local OMP candidates stay untouched.
+mcp_config_must_skip_shell_write() {
+  local tool="$1"
+  local path="$2"
+  local project_dir="$3"
+  local containment_rc
+
+  if [ "$tool" = "omp" ]; then
+    case "$path" in
+      "$project_dir/.omp/mcp.json")
+        verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
+        return 0
+        ;;
+      "$project_dir/.omp/.mcp.json"|"$project_dir/mcp.json"|"$project_dir/.mcp.json")
+        verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
+        return 0
+        ;;
+    esac
+  fi
+
+  if path_resolves_within_directory "$path" "$project_dir"; then
+    verbose "setup_mcp_configs:defer tool=${tool} path=${path} reason=project_local_path_requires_native_git_protection"
+    return 0
+  else
+    containment_rc=$?
+  fi
+  if [ "$containment_rc" -eq 2 ]; then
+    verbose "setup_mcp_configs:skip tool=${tool} path=${path} reason=project_containment_unknown"
+    return 0
+  fi
+  return 1
+}
+
 # Set up MCP configs for all detected tools.
 # For fresh installs: create configs where missing, insert entries where absent.
 setup_mcp_configs() {
@@ -4436,7 +4629,17 @@ setup_mcp_configs() {
   # surface in the candidate scan any more. Pass the same $bearer_token the
   # rest of this function writes into other tools' configs so every MCP
   # client in this install agrees on the same Authorization header.
-  if setup_claude_code_mcp_via_cli "$bearer_token"; then
+  # `claude mcp add --scope user` writes $HOME/.claude.json itself. Apply the
+  # same project-containment boundary before invoking that external writer;
+  # when HOME is relative, project-local, or unavailable, native setup owns the
+  # eventual write and its Git protection.
+  local claude_code_config_path=""
+  if [ -n "${HOME:-}" ]; then
+    claude_code_config_path="${HOME}/.claude.json"
+  fi
+  if mcp_config_must_skip_shell_write "claude" "$claude_code_config_path" "$PWD"; then
+    verbose "setup_claude_code_mcp:defer reason=project_containment_requires_native_setup"
+  elif setup_claude_code_mcp_via_cli "$bearer_token"; then
     configured=$((configured + 1))
   fi
 
@@ -4452,22 +4655,8 @@ setup_mcp_configs() {
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" != "1" ] && continue
 
-    # Project-local OMP configs can carry the generated bearer token. Native
-    # setup owns the higher-precedence `.omp/mcp.json` and secures it in the
-    # project `.gitignore` before writing. Portable fallback files may already
-    # be tracked or shared with another MCP client, so the installer leaves
-    # them untouched rather than injecting a literal credential.
-    if [ "$tool" = "omp" ]; then
-      case "$path" in
-        "$PWD/.omp/mcp.json")
-          verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
-          continue
-          ;;
-        "$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
-          verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
-          continue
-          ;;
-      esac
+    if mcp_config_must_skip_shell_write "$tool" "$path" "$PWD"; then
+      continue
     fi
 
     # Most tools have one authoritative config, but OMP can have multiple
@@ -4504,17 +4693,8 @@ setup_mcp_configs() {
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" = "1" ] && continue
 
-    if [ "$tool" = "omp" ]; then
-      case "$path" in
-        "$PWD/.omp/mcp.json")
-          verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
-          continue
-          ;;
-        "$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
-          verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
-          continue
-          ;;
-      esac
+    if mcp_config_must_skip_shell_write "$tool" "$path" "$PWD"; then
+      continue
     fi
 
     # Skip if already configured
@@ -4559,6 +4739,13 @@ sync_codex_http_configs() {
   while IFS=$'\t' read -r tool path exists_flag; do
     [ -z "${tool:-}" ] && continue
     [ "$tool" != "codex" ] && continue
+
+    # The TOML/JSON writers resolve HTTP_BEARER_TOKEN internally even though
+    # this sync call passes empty legacy stdio arguments. Preserve the same
+    # pre-native Git boundary used by setup_mcp_configs.
+    if mcp_config_must_skip_shell_write "$tool" "$path" "$PWD"; then
+      continue
+    fi
 
     if [ "$exists_flag" != "1" ]; then
       local parent_dir

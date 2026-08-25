@@ -177,7 +177,7 @@ Agent Mail has been available since October 2025 and was designed around real mu
 
 **No "broadcast to all" mode.** Given the option, many agents will overuse broadcast-style messaging. That is the equivalent of default reply-all in email: lots of irrelevant noise and wasted context.
 
-**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 39 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
+**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 40 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
 
 **No git worktrees.** Worktrees can slow development velocity and create reconciliation debt when agents diverge. Agent Mail takes the opposite approach: keep agents in one shared space, surface conflicts quickly, and give them tools to coordinate through them.
 
@@ -467,7 +467,16 @@ must use OMP's lowercase `[a-z0-9][a-z0-9._-]{0,63}` syntax; an invalid
 explicit profile fails closed instead of redirecting setup to the default.
 Setup also honors OMP's `PI_CONFIG_DIR` and default-profile `PI_CODING_AGENT_DIR`
 overrides. The project config is profile-independent and applies under every
-named OMP profile. To configure it manually:
+named OMP profile.
+
+`am setup run --agent omp --no-user-config` leaves the active user config's
+bytes untouched, but setup and status still read its runtime authority. If that
+file's `disabledServers` disables either Agent Mail alias, or its relevant
+structure is unsupported, they report the effective drift instead of claiming
+success. The remediation deliberately omits `--no-user-config`, because a
+project-only write cannot repair OMP's active user-level authority.
+
+To configure it manually:
 
 ```json
 {
