@@ -362,6 +362,16 @@ mod dist_release_contract {
         if workflow.contains("sidecar_name=\"${sidecar_name#") {
             return Err("checksum sidecar names must not be normalized".to_string());
         }
+        for forbidden in [
+            "No install.sh found",
+            "No install.ps1 found",
+            "--certificate-identity-regexp",
+            "--certificate-oidc-issuer-regexp",
+        ] {
+            if workflow.contains(forbidden) {
+                return Err(format!("forbidden release bypass remains: {forbidden}"));
+            }
+        }
 
         for (action, expected) in [
             (CHECKOUT_ACTION, 5),
@@ -396,20 +406,41 @@ mod dist_release_contract {
             "server_version=\"$(staging/mcp-agent-mail --version)\"",
             "$cliVersion -ne \"am $env:EXPECTED_VERSION\"",
             "$serverVersion -ne \"mcp-agent-mail $env:EXPECTED_VERSION\"",
-            "mapfile -t sidecar_lines < \"${artifact}.sha256\"",
+            "cosign-release: v3.1.3",
+            "expected_download_entries+=(\"$artifact\" \"${artifact}.sha256\")",
+            "mapfile -t actual_download_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
+            "mapfile -t sidecar_lines < \"dist/${artifact}.sha256\"",
             "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
             "[ \"$sidecar_name\" != \"$artifact\" ]",
-            "[ \"${#sums_lines[@]}\" -ne \"${#expected_archives[@]}\" ]",
-            "'$2 == artifact && NF == 2 {print $1}'",
+            "cp -- install.sh install.ps1 publish/",
+            "expected_payloads=(\"${expected_archives[@]}\" install.sh install.ps1)",
+            "shasum -a 256 \"${expected_payloads[@]}\" > SHA256SUMS",
+            "[ \"${#sums_lines[@]}\" -ne \"${#expected_payloads[@]}\" ]",
+            "'$2 == payload && NF == 2 {print $1}'",
             "[ \"${#sums_hashes[@]}\" -ne 1 ]",
             "names = sorted(member.name for member in members)",
             "names != [\"am\", \"mcp-agent-mail\"]",
             "names = sorted(member.filename for member in members)",
             "names != [\"am.exe\", \"mcp-agent-mail.exe\"]",
-            "expected_bundle_files=(SHA256SUMS)",
+            "expected_workflow_ref=\"${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}\"",
+            "[ \"$GITHUB_WORKFLOW_REF_VALUE\" != \"$expected_workflow_ref\" ]",
+            "expected_certificate_identity=\"https://github.com/${expected_workflow_ref}\"",
+            "signed_subjects=(\"${expected_payloads[@]}\" SHA256SUMS)",
+            "cosign sign-blob --yes --bundle \"${subject}.sigstore.json\" \"$subject\"",
+            "cosign verify-blob \\",
+            "--certificate-identity \"$expected_certificate_identity\"",
+            "--certificate-oidc-issuer \"https://token.actions.githubusercontent.com\"",
+            "--certificate-github-workflow-repository \"$EXPECTED_REPOSITORY\"",
+            "--certificate-github-workflow-ref \"refs/tags/${RELEASE_TAG}\"",
+            "--certificate-github-workflow-sha \"$EXPECTED_REVISION\"",
+            "--certificate-github-workflow-trigger \"push\"",
+            "expected_release_assets=(\"${signed_subjects[@]}\")",
+            "expected_release_assets+=(\"${subject}.sigstore.json\")",
+            "mapfile -t actual_release_assets < <(find . -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
             "tag_name: ${{ needs.release_contract.outputs.tag }}",
             "prerelease: ${{ needs.release_contract.outputs.prerelease }}",
             "fail_on_unmatched_files: true",
+            "files: publish/*",
             "if [ \"$checked_out_revision\" != \"$EXPECTED_REVISION\" ] || [ \"$remote_revision\" != \"$EXPECTED_REVISION\" ]; then",
             "Release tag moved after preflight; refusing publication",
         ];
@@ -449,7 +480,7 @@ mod dist_release_contract {
         require_in_order(
             workflow,
             &[
-                "- name: Validate release bundle completeness",
+                "- name: Assemble, sign, and verify release assets",
                 "- name: Revalidate release tag immediately before publication",
                 "- name: Create GitHub Release",
             ],
@@ -529,6 +560,11 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "cosign-release: v3.1.3",
+                "cosign-release: v3.0.2",
+            ),
+            mutate(
+                &workflow,
                 BEADS_RUST_COMMIT,
                 "b5dc5444270d82218e8de6bb4c6320731e0bdd00",
             ),
@@ -565,13 +601,28 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "[ \"${#sums_lines[@]}\" -ne \"${#expected_archives[@]}\" ]",
+                "cp -- install.sh install.ps1 publish/",
+                "cp -- install.sh publish/",
+            ),
+            mutate(
+                &workflow,
+                "expected_payloads=(\"${expected_archives[@]}\" install.sh install.ps1)",
+                "expected_payloads=(\"${expected_archives[@]}\" install.sh)",
+            ),
+            mutate(
+                &workflow,
+                "shasum -a 256 \"${expected_payloads[@]}\" > SHA256SUMS",
+                "shasum -a 256 \"${expected_archives[@]}\" > SHA256SUMS",
+            ),
+            mutate(
+                &workflow,
+                "[ \"${#sums_lines[@]}\" -ne \"${#expected_payloads[@]}\" ]",
                 "[ \"${#sums_lines[@]}\" -eq 0 ]",
             ),
             mutate(
                 &workflow,
-                "'$2 == artifact && NF == 2 {print $1}'",
-                "'$2 == artifact || $2 == (\"./\" artifact) {print $1}'",
+                "'$2 == payload && NF == 2 {print $1}'",
+                "'$2 == payload || $2 == (\"./\" payload) {print $1}'",
             ),
             mutate(
                 &workflow,
@@ -593,6 +644,37 @@ mod dist_release_contract {
                 "names != [\"am.exe\", \"mcp-agent-mail.exe\"]",
                 "names != [\"mcp-agent-mail.exe\"]",
             ),
+            mutate(
+                &workflow,
+                "signed_subjects=(\"${expected_payloads[@]}\" SHA256SUMS)",
+                "signed_subjects=(\"${expected_payloads[@]}\")",
+            ),
+            mutate(
+                &workflow,
+                "cosign sign-blob --yes --bundle \"${subject}.sigstore.json\" \"$subject\"",
+                "cosign sign-blob --yes \"$subject\"",
+            ),
+            mutate(
+                &workflow,
+                "cosign verify-blob \\",
+                "cosign version \\",
+            ),
+            mutate(
+                &workflow,
+                "--certificate-identity \"$expected_certificate_identity\"",
+                "--certificate-identity-regexp \".*\"",
+            ),
+            mutate(
+                &workflow,
+                "--certificate-github-workflow-ref \"refs/tags/${RELEASE_TAG}\"",
+                "--certificate-github-workflow-ref \"refs/tags/other\"",
+            ),
+            mutate(
+                &workflow,
+                "expected_release_assets+=(\"${subject}.sigstore.json\")",
+                "expected_release_assets+=(\"$subject\")",
+            ),
+            mutate(&workflow, "files: publish/*", "files: dist/*"),
             mutate(
                 &workflow,
                 "ref: ${{ needs.release_contract.outputs.revision }}",
