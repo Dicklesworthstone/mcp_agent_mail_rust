@@ -1851,6 +1851,42 @@ fn escape_gitignore_literal(path: &str) -> String {
     escaped
 }
 
+fn gitignore_relative_path(path: &Path) -> Result<String, SetupError> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(segment) => {
+                let segment = segment.to_str().ok_or_else(|| {
+                    SetupError::Other(format!(
+                        "cannot protect non-UTF-8 secret config path {} with .gitignore",
+                        path.display()
+                    ))
+                })?;
+                if segment.contains('\r') || segment.contains('\n') {
+                    return Err(SetupError::Other(format!(
+                        "secret config path {} must not contain CR or LF",
+                        path.display()
+                    )));
+                }
+                segments.push(segment);
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(SetupError::Other(format!(
+                    "secret config path {} is not a normal relative path",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if segments.is_empty() {
+        return Err(SetupError::Other(
+            "secret config path must name a relative file".to_string(),
+        ));
+    }
+    Ok(segments.join("/"))
+}
+
 /// Secure a literal-credential config before writing it in a Git worktree.
 ///
 /// Adding a path to `.gitignore` does not make an already tracked file safe:
@@ -1936,13 +1972,7 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
         )));
     }
     if tracked_probe.status.code() == Some(1) {
-        let relative = relative.to_str().ok_or_else(|| {
-            SetupError::Other(format!(
-                "cannot protect non-UTF-8 secret config path {} with .gitignore",
-                path.display()
-            ))
-        })?;
-        let relative = relative.replace('\\', "/");
+        let relative = gitignore_relative_path(relative)?;
         let (directory, basename) = relative
             .rsplit_once('/')
             .map_or(("", relative.as_str()), |parts| parts);
@@ -1962,6 +1992,35 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
         ];
         let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
         ensure_gitignore_entries(&repo_root.join(".gitignore"), &entry_refs)?;
+        let representative_paths = [
+            relative.clone(),
+            format!("{directory}/.{basename}.probe.tmp").trim_start_matches('/').to_string(),
+            format!("{directory}/.{basename}.probe.bak").trim_start_matches('/').to_string(),
+            format!("{relative}.bak"),
+        ];
+        for representative in representative_paths {
+            let ignored = crate::git_cmd::GitCmd::new(&repo_root)
+                .env("LC_ALL", "C")
+                .args([
+                    "--literal-pathspecs",
+                    "check-ignore",
+                    "--quiet",
+                    "--no-index",
+                    "--",
+                ])
+                .arg(&representative)
+                .run()
+                .map_err(|error| {
+                    SetupError::Other(format!(
+                        "cannot verify .gitignore protection for secret artifact {representative}: {error}"
+                    ))
+                })?;
+            if !ignored.status.success() {
+                return Err(SetupError::Other(format!(
+                    "refusing secret write because .gitignore does not protect artifact {representative}"
+                )));
+            }
+        }
         return Ok(());
     }
     Err(SetupError::Other(format!(
