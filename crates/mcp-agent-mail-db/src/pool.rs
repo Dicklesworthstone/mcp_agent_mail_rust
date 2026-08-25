@@ -3735,10 +3735,8 @@ impl DbPool {
             return Ok(None);
         }
 
-        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path).map_err(|e| {
-            DbError::Sqlite(format!("id_floor: open sqlite for floor advance: {e}"))
-        })?;
-        crate::id_floor::advance_messages_id_floor(&conn, archive_max)
+        let conn = self.live_maintenance_connection("id_floor archive advance", 20_000)?;
+        crate::id_floor::advance_messages_id_floor_franken(&conn, archive_max)
     }
 
     /// The shared, process-wide monotonic message-id allocator for this

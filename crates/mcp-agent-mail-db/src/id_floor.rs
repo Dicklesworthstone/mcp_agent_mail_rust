@@ -152,6 +152,55 @@ pub fn advance_messages_id_floor(
     conn: &SqliteConnection,
     archive_max_id: Option<i64>,
 ) -> DbResult<Option<i64>> {
+    advance_messages_id_floor_with(
+        archive_max_id,
+        |sql, params| conn.query_sync(sql, params).map_err(|error| error.to_string()),
+        |sql| {
+            conn.execute_raw(sql)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+        |sql, params| {
+            conn.execute_sync(sql, params)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// Advance the live FrankenSQLite allocator without opening the mailbox main
+/// inode through canonical SQLite.
+pub(crate) fn advance_messages_id_floor_franken(
+    conn: &crate::DbConn,
+    archive_max_id: Option<i64>,
+) -> DbResult<Option<i64>> {
+    advance_messages_id_floor_with(
+        archive_max_id,
+        |sql, params| conn.query_sync(sql, params).map_err(|error| error.to_string()),
+        |sql| {
+            conn.execute_raw(sql)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+        |sql, params| {
+            conn.execute_sync(sql, params)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn advance_messages_id_floor_with<Q, E, U>(
+    archive_max_id: Option<i64>,
+    query: Q,
+    execute_raw: E,
+    execute_sync: U,
+) -> DbResult<Option<i64>>
+where
+    Q: Fn(&str, &[Value]) -> Result<Vec<sqlmodel_core::Row>, String>,
+    E: Fn(&str) -> Result<(), String>,
+    U: Fn(&str, &[Value]) -> Result<(), String>,
+{
     let Some(archive_max) = archive_max_id else {
         return Ok(None);
     };
@@ -159,18 +208,16 @@ pub fn advance_messages_id_floor(
         return Ok(None);
     }
 
-    let db_max_id: i64 = conn
-        .query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
+    let db_max_id: i64 = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
         .map_err(|e| DbError::Sqlite(format!("id_floor: read MAX(id): {e}")))?
         .first()
         .and_then(|row| row.get_named("max_id").ok())
         .unwrap_or(0);
 
-    let seq_value: i64 = conn
-        .query_sync(
-            "SELECT COALESCE(seq, 0) AS seq FROM sqlite_sequence WHERE name = 'messages'",
-            &[],
-        )
+    let seq_value: i64 = query(
+        "SELECT COALESCE(seq, 0) AS seq FROM sqlite_sequence WHERE name = 'messages'",
+        &[],
+    )
         .map_err(|e| DbError::Sqlite(format!("id_floor: read sqlite_sequence: {e}")))?
         .first()
         .and_then(|row| row.get_named("seq").ok())
@@ -187,9 +234,9 @@ pub fn advance_messages_id_floor(
     // INSERT OR IGNORE first to create the row if missing, then UPDATE
     // unconditionally — INSERT OR REPLACE would clobber other tables
     // sharing sqlite_sequence rows.
-    conn.execute_raw("INSERT OR IGNORE INTO sqlite_sequence (name, seq) VALUES ('messages', 0)")
+    execute_raw("INSERT OR IGNORE INTO sqlite_sequence (name, seq) VALUES ('messages', 0)")
         .map_err(|e| DbError::Sqlite(format!("id_floor: ensure sqlite_sequence row: {e}")))?;
-    conn.execute_sync(
+    execute_sync(
         "UPDATE sqlite_sequence SET seq = ? WHERE name = 'messages'",
         &[Value::BigInt(archive_max)],
     )
