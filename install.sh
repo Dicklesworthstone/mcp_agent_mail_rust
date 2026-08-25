@@ -3143,37 +3143,64 @@ service_setup_unavailable_failure() {
   printf '%s\n' "$output" | grep -qiE 'failed to run (systemctl|launchctl)|systemctl: command not found|launchctl: command not found|failed to connect (to )?(user scope )?bus|system has not been booted with systemd|could not find domain for'
 }
 
+# Emit the remote-client kinds that are actually present, one per line. This
+# is the single authority shared by readiness and install-failure admission:
+# binaries, the established user config roots, and the active-profile-aware
+# candidate scan all contribute. An invalid/unsafe OMP profile returns 2 and
+# emits nothing so callers cannot misclassify bad authority as simple absence.
+remote_http_client_target_tools() {
+  local codex_present=0
+  local omp_present=0
+  local home_dir="${HOME:-}"
+  local scan
+  local scan_rc
+
+  if command -v codex >/dev/null 2>&1 \
+    || { [ -n "$home_dir" ] && [ -d "${home_dir}/.codex" ]; } \
+    || { [ -n "$home_dir" ] && [ -d "${home_dir}/.config/codex" ]; }; then
+    codex_present=1
+  fi
+  if command -v omp >/dev/null 2>&1 \
+    || { [ -n "$home_dir" ] && [ -d "${home_dir}/.omp" ]; }; then
+    omp_present=1
+  fi
+
+  if scan=$(detect_mcp_configs "$PWD" 2>/dev/null); then
+    scan_rc=0
+  else
+    scan_rc=$?
+    return "$scan_rc"
+  fi
+
+  local tool path exists_flag
+  while IFS=$'\t' read -r tool path exists_flag; do
+    [ "$exists_flag" = "1" ] && [ -f "$path" ] || continue
+    case "$tool" in
+      codex) codex_present=1 ;;
+      omp) omp_present=1 ;;
+    esac
+  done <<< "$scan"
+
+  [ "$codex_present" -eq 1 ] && printf '%s\n' codex
+  [ "$omp_present" -eq 1 ] && printf '%s\n' omp
+  return 0
+}
+
 has_remote_http_client_targets() {
   if [ "${AM_INSTALL_SKIP_REMOTE_HTTP_READINESS:-0}" = "1" ]; then
     verbose "remote_http_readiness:skip reason=env_override"
     return 1
   fi
 
-  if command -v codex >/dev/null 2>&1 \
-    || command -v omp >/dev/null 2>&1 \
-    || [ -d "${HOME}/.codex" ] \
-    || [ -d "${HOME}/.config/codex" ] \
-    || [ -d "${HOME}/.omp" ]; then
-    return 0
+  local targets
+  local targets_rc
+  if targets=$(remote_http_client_target_tools); then
+    targets_rc=0
+  else
+    targets_rc=$?
+    return "$targets_rc"
   fi
-
-  local scan
-  scan="$(detect_mcp_configs "$PWD" 2>/dev/null || true)"
-  [ -z "$scan" ] && return 1
-
-  local tool path exists_flag
-  while IFS=$'\t' read -r tool path exists_flag; do
-    [ -z "${tool:-}" ] && continue
-    case "$tool" in
-      codex|omp) ;;
-      *) continue ;;
-    esac
-    if [ "$exists_flag" = "1" ] && [ -f "$path" ]; then
-      return 0
-    fi
-  done <<< "$scan"
-
-  return 1
+  [ -n "$targets" ]
 }
 
 probe_remote_http_endpoint() {
@@ -3451,9 +3478,17 @@ repair_launchd_service_env_from_rust_config() {
 }
 
 ensure_remote_http_client_readiness() {
-  if ! has_remote_http_client_targets; then
-    verbose "remote_http_readiness:skip reason=no_remote_http_clients"
-    return 0
+  local target_rc
+  if has_remote_http_client_targets; then
+    target_rc=0
+  else
+    target_rc=$?
+    if [ "$target_rc" -eq 1 ]; then
+      verbose "remote_http_readiness:skip reason=no_remote_http_clients"
+      return 0
+    fi
+    err "Remote MCP client authority discovery failed; refusing to report readiness."
+    return "$target_rc"
   fi
 
   local desired_url
@@ -5013,6 +5048,45 @@ configure_mcp_clients() {
     warn "One or more Codex HTTP synchronization writes failed."
     return 1
   fi
+  return 0
+}
+
+# Run the production MCP configuration phase with a failure policy derived
+# from the same target authority as readiness. A clean host with no OMP target
+# may legitimately have `am setup run` perform no work and leave no token file;
+# preserve that non-fatal install contract. Once OMP is present, however, any
+# native or fallback setup failure means the detected client was not proven
+# usable and must fail the installer instead of being hidden by `|| true`.
+configure_mcp_clients_for_install() {
+  local binary_path="$1"
+  local am_cli="$2"
+  local targets
+  local targets_rc
+  local omp_present=0
+  local tool
+
+  if targets=$(remote_http_client_target_tools); then
+    targets_rc=0
+  else
+    targets_rc=$?
+    err "MCP client authority discovery failed; refusing to continue installation."
+    return "$targets_rc"
+  fi
+  while IFS= read -r tool; do
+    [ "$tool" = "omp" ] && omp_present=1
+  done <<< "$targets"
+
+  if configure_mcp_clients "$binary_path" "$am_cli"; then
+    return 0
+  fi
+  if [ "$omp_present" -eq 1 ]; then
+    err "Detected OMP client setup failed; installation cannot report success."
+    err "Resolve the MCP configuration error above, then rerun the installer."
+    return 1
+  fi
+
+  warn "MCP client setup did not complete, but no OMP client target was detected."
+  warn "The binaries remain installed; run 'am setup run' after installing a supported client."
   return 0
 }
 
@@ -6663,7 +6737,11 @@ fi
 #   - BOM/JSONC/trailing-comma tolerance
 #   - Backup before modification
 if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  configure_mcp_clients "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI" || true
+  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
+    err "MCP client configuration failed."
+    error_support_hint
+    exit 1
+  fi
 fi
 
 collect_migration_counts() {
