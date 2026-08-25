@@ -69,7 +69,7 @@ use sqlmodel_core::{Connection, Value};
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "hybrid")]
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -910,9 +910,33 @@ fn stable_direct_surface_index_dir(pool: &DbPool) -> PathBuf {
     // from a replaced or drifted DB are dropped at query time by candidate
     // canonicalization, exactly as on the shared route.
     let mut hasher = Sha256::new();
-    hasher.update(pool.storage_root().display().to_string().as_bytes());
+    update_path_identity_digest(&mut hasher, pool.storage_root());
     let digest = hex::encode(hasher.finalize());
     stable_direct_surface_index_root().join(digest)
+}
+
+fn update_path_identity_digest(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        hasher.update(b"unix\0");
+        hasher.update(path.as_os_str().as_bytes());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        hasher.update(b"windows-utf16le\0");
+        for unit in path.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        hasher.update(b"platform-lossy\0");
+        hasher.update(path.to_string_lossy().as_bytes());
+    }
 }
 
 fn stable_direct_surface_index_root() -> PathBuf {
@@ -4897,6 +4921,47 @@ mod tests {
             .expect("pool"),
         );
         assert_ne!(first, other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_direct_surface_index_dir_keeps_native_byte_authorities_distinct() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_a = root
+            .path()
+            .join(OsString::from_vec(b"storage-\xff".to_vec()));
+        let storage_b = root
+            .path()
+            .join(OsString::from_vec(b"storage-\xfe".to_vec()));
+        std::fs::create_dir_all(&storage_a).expect("create first native-byte root");
+        std::fs::create_dir_all(&storage_b).expect("create second native-byte root");
+        assert_eq!(
+            storage_a.to_string_lossy(),
+            storage_b.to_string_lossy(),
+            "fixture must collide under the former display-string namespace"
+        );
+
+        let pool_for = |db_name: &str, storage_root: PathBuf| {
+            crate::DbPool::new(&crate::DbPoolConfig {
+                database_url: format!("sqlite:///{}", root.path().join(db_name).display()),
+                storage_root: Some(storage_root),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("construct native-byte search authority")
+        };
+        let first = stable_direct_surface_index_dir(&pool_for("first.sqlite3", storage_a));
+        let second = stable_direct_surface_index_dir(&pool_for("second.sqlite3", storage_b));
+        assert_ne!(
+            first, second,
+            "byte-distinct archive roots must not share a lexical index namespace"
+        );
     }
 
     #[test]

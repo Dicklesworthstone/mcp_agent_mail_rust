@@ -3503,6 +3503,18 @@ impl DbPool {
                         }
                     }
 
+                    // Initialization can create or durably replace the SQLite
+                    // leaf. Revalidate immediately before the engine open so
+                    // an independently inserted symlink cannot inherit this
+                    // pool's frozen authority between init and checkout.
+                    if let Err(error) = validate_frozen_sqlite_open_authority(
+                        &sqlite_path,
+                        sqlite_identity.as_deref(),
+                        "pooled connection post-init open",
+                    ) {
+                        return Outcome::Err(error);
+                    }
+
                     // Now open pool connection (migrations are complete).
                     let mut conn = if sqlite_path == ":memory:" {
                         match DbConn::open_memory() {
@@ -3518,7 +3530,10 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     } else {
-                        match open_sqlite_file_with_recovery(&sqlite_path) {
+                        match open_sqlite_file_with_recovery_and_storage_root(
+                            &sqlite_path,
+                            &storage_root_for_recovery,
+                        ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
@@ -3590,7 +3605,17 @@ impl DbPool {
                             return Outcome::Err(recovery_err);
                         }
 
-                        conn = match open_sqlite_file_with_recovery(&sqlite_path) {
+                        if let Err(error) = validate_frozen_sqlite_open_authority(
+                            &sqlite_path,
+                            sqlite_identity.as_deref(),
+                            "pooled connection post-recovery open",
+                        ) {
+                            return Outcome::Err(error);
+                        }
+                        conn = match open_sqlite_file_with_recovery_and_storage_root(
+                            &sqlite_path,
+                            &storage_root_for_recovery,
+                        ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         };
@@ -6622,6 +6647,21 @@ fn assert_required_startup_pragmas(conn: &DbConn, sqlite_path: &str) -> Result<(
 #[allow(clippy::result_large_err)]
 pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlError> {
     if sqlite_path == ":memory:" {
+        return open_sqlite_file_with_recovery_and_storage_root(sqlite_path, Path::new(""));
+    }
+    let config = mcp_agent_mail_core::Config::from_env();
+    open_sqlite_file_with_recovery_and_storage_root(sqlite_path, config.storage_root.as_path())
+}
+
+/// Pool-internal recovery open that preserves the archive authority frozen by
+/// [`DbPoolAuthority`]. The public convenience wrapper resolves its ambient
+/// archive root once per standalone call; a live pool must never do that.
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_recovery_and_storage_root(
+    sqlite_path: &str,
+    storage_root: &Path,
+) -> Result<DbConn, SqlError> {
+    if sqlite_path == ":memory:" {
         let conn = DbConn::open_memory()?;
         conn.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL)?;
         return Ok(conn);
@@ -6648,7 +6688,7 @@ pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlEr
                 return Err(primary_err);
             }
 
-            recover_sqlite_file(Path::new(sqlite_path))?;
+            recover_sqlite_file_with_storage_root(Path::new(sqlite_path), storage_root)?;
             open_sqlite_file_with_configured_pragmas(sqlite_path).map_err(|reopen_err| {
                 SqlError::Custom(format!(
                     "cannot open sqlite at {sqlite_path}: {primary_err}; reopen after recovery failed: {reopen_err}"
@@ -8866,12 +8906,6 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
         "in-place REINDEX repaired index-only sqlite corruption"
     );
     Ok(true)
-}
-
-#[allow(clippy::result_large_err)]
-fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
-    let config = mcp_agent_mail_core::Config::from_env();
-    recover_sqlite_file_with_storage_root(primary_path, config.storage_root.as_path())
 }
 
 #[allow(clippy::result_large_err)]
