@@ -1,10 +1,16 @@
 name: dist
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dist-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   # Release sibling path dependencies are pinned so rerunning a tag resolves
@@ -14,10 +20,96 @@ env:
   BEADS_RUST_COMMIT: b5dc5444270d82218e8de6bb4c6320731e0bdd00
 
 jobs:
-  lint:
+  release_contract:
+    name: Bind tag, version, and toolchain
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.contract.outputs.tag }}
+      version: ${{ steps.contract.outputs.version }}
+      revision: ${{ steps.contract.outputs.revision }}
+      prerelease: ${{ steps.contract.outputs.prerelease }}
+      toolchain: ${{ steps.contract.outputs.toolchain }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout exact tag source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify release identity
+        id: contract
+        env:
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          release_tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+          if [ "$GITHUB_REF_VALUE" != "refs/tags/${REF_NAME}" ] || [[ ! "$REF_NAME" =~ $release_tag_pattern ]]; then
+            echo "Release publication requires an exact refs/tags/vX.Y.Z or vX.Y.Z-prerelease ref" >&2
+            exit 1
+          fi
+
+          revision="$(git rev-parse HEAD)"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Checked-out release revision is not a full commit SHA: ${revision}" >&2
+            exit 1
+          fi
+
+          remote_revision="$(git ls-remote origin "refs/tags/${REF_NAME}^{}" | awk 'NR == 1 {print $1}')"
+          if [ -z "$remote_revision" ]; then
+            remote_revision="$(git ls-remote origin "refs/tags/${REF_NAME}" | awk 'NR == 1 {print $1}')"
+          fi
+          if [ "$remote_revision" != "$revision" ]; then
+            echo "Remote tag ${REF_NAME} resolves to ${remote_revision:-missing}, not checked-out ${revision}" >&2
+            exit 1
+          fi
+
+          mapfile -t release_metadata < <(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          toolchain = tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8"))
+          print(manifest["workspace"]["package"]["version"])
+          print(toolchain["toolchain"]["channel"])
+          PY
+          )
+          if [ "${#release_metadata[@]}" -ne 2 ]; then
+            echo "Could not read the workspace version and pinned Rust channel" >&2
+            exit 1
+          fi
+          manifest_version="${release_metadata[0]}"
+          toolchain="${release_metadata[1]}"
+          tag_version="${REF_NAME#v}"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "Tag version ${tag_version} does not match workspace version ${manifest_version}" >&2
+            exit 1
+          fi
+          if [[ ! "$toolchain" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "rust-toolchain.toml must pin a dated nightly, found ${toolchain}" >&2
+            exit 1
+          fi
+
+          prerelease=false
+          if [[ "$tag_version" == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            printf 'tag=%s\n' "$REF_NAME"
+            printf 'version=%s\n' "$manifest_version"
+            printf 'revision=%s\n' "$revision"
+            printf 'prerelease=%s\n' "$prerelease"
+            printf 'toolchain=%s\n' "$toolchain"
+          } >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: release_contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -52,23 +144,37 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
+          toolchain: ${{ needs.release_contract.outputs.toolchain }}
           components: rustfmt, clippy
+
+      - name: Verify pinned Rust toolchain
+        env:
+          EXPECTED_TOOLCHAIN: ${{ needs.release_contract.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain)"
+          [[ "$active_toolchain" == "${EXPECTED_TOOLCHAIN}-"* ]]
+          rustc --version --verbose
+          cargo --version --verbose
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Check workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
+    needs: release_contract
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -103,13 +209,26 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: ${{ needs.release_contract.outputs.toolchain }}
+
+      - name: Verify pinned Rust toolchain
+        env:
+          EXPECTED_TOOLCHAIN: ${{ needs.release_contract.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain)"
+          [[ "$active_toolchain" == "${EXPECTED_TOOLCHAIN}-"* ]]
+          rustc --version --verbose
+          cargo --version --verbose
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   build:
-    needs: [lint, test]
+    needs: [release_contract, lint, test]
     strategy:
       fail-fast: false
       matrix:
@@ -131,11 +250,10 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
+    timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -171,14 +289,22 @@ jobs:
           # requires this pinned sibling checkout to remain on version 0.5.1.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
         with:
+          toolchain: ${{ needs.release_contract.outputs.toolchain }}
           targets: ${{ matrix.target }}
 
-      - name: Install pinned Rust target
+      - name: Verify pinned Rust toolchain
         shell: bash
-        run: rustup target add "${{ matrix.target }}"
+        env:
+          EXPECTED_TOOLCHAIN: ${{ needs.release_contract.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain)"
+          [[ "$active_toolchain" == "${EXPECTED_TOOLCHAIN}-"* ]]
+          rustc --version --verbose
+          cargo --version --verbose
 
       - name: Install musl toolchain
         if: contains(matrix.target, 'musl')
@@ -194,11 +320,14 @@ jobs:
           # x86_64 Linux regardless of host libc. Leaves other targets alone.
           RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=+crt-static' || '' }}
         run: |
-          cargo build --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
+          cargo build --locked --release --target ${{ matrix.target }} -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
+        env:
+          EXPECTED_VERSION: ${{ needs.release_contract.outputs.version }}
         run: |
+          set -euo pipefail
           mkdir -p dist staging
           TARBALL="mcp-agent-mail-${{ matrix.target }}.tar.xz"
           # Copy raw binaries into a flat staging dir to guarantee no nested archives
@@ -215,6 +344,16 @@ jobs:
           # Surface verification: fail fast if binaries are swapped/mispackaged.
           staging/am --help > staging/am.help.txt
           staging/mcp-agent-mail --help > staging/mcp-agent-mail.help.txt
+          cli_version="$(staging/am --version)"
+          server_version="$(staging/mcp-agent-mail --version)"
+          if [ "$cli_version" != "am ${EXPECTED_VERSION}" ]; then
+            echo "ERROR: staging/am reports ${cli_version}, expected am ${EXPECTED_VERSION}" >&2
+            exit 1
+          fi
+          if [ "$server_version" != "mcp-agent-mail ${EXPECTED_VERSION}" ]; then
+            echo "ERROR: staging/mcp-agent-mail reports ${server_version}, expected mcp-agent-mail ${EXPECTED_VERSION}" >&2
+            exit 1
+          fi
           grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' staging/am.help.txt || {
             echo "ERROR: staging/am missing expected CLI command surface" >&2
             exit 1
@@ -234,9 +373,20 @@ jobs:
       - name: Create zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ needs.release_contract.outputs.version }}
         run: |
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $zipName = "mcp-agent-mail-${{ matrix.target }}.zip"
+          $cliVersion = ((& "target/${{ matrix.target }}/release/am.exe" --version) | Out-String).Trim()
+          if ($cliVersion -ne "am $env:EXPECTED_VERSION") {
+            throw "target/${{ matrix.target }}/release/am.exe reports '$cliVersion', expected 'am $env:EXPECTED_VERSION'"
+          }
+          $serverVersion = ((& "target/${{ matrix.target }}/release/mcp-agent-mail.exe" --version) | Out-String).Trim()
+          if ($serverVersion -ne "mcp-agent-mail $env:EXPECTED_VERSION") {
+            throw "target/${{ matrix.target }}/release/mcp-agent-mail.exe reports '$serverVersion', expected 'mcp-agent-mail $env:EXPECTED_VERSION'"
+          }
           $cliHelp = & "target/${{ matrix.target }}/release/am.exe" --help | Out-String
           if ($cliHelp -notmatch '(^|\s)serve-http(\s|$)') {
             throw "target/${{ matrix.target }}/release/am.exe missing expected CLI command surface"
@@ -254,23 +404,25 @@ jobs:
           "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}
           path: dist/*
 
   release:
-    needs: [lint, test, build]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [release_contract, lint, test, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
