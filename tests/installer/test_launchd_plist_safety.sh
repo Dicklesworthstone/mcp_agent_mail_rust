@@ -516,9 +516,9 @@ fi
 step "scenario K5: private atomic writer statically binds publication without path chmod"
 private_security_body="$(extract_function private_file_security_identity)"
 private_writer_body="$(extract_function write_private_file_atomic)"
-printf '%s\n' "$private_security_body" | grep -Fq "stat -f '%d:%i:%HT:%Lp:%l'" \
+printf '%s\n' "$private_security_body" | grep -Fq "stat -f '%d:%i:%Lp:%l:%HT'" \
     || fail "private writer lacks BSD no-follow type/mode/link identity"
-printf '%s\n' "$private_security_body" | grep -Fq "stat -c '%d:%i:%F:%a:%h'" \
+printf '%s\n' "$private_security_body" | grep -Fq "stat -c '%d:%i:%a:%h:%F'" \
     || fail "private writer lacks GNU no-follow type/mode/link identity"
 printf '%s\n' "$private_writer_body" | grep -Fq \
     "published_security_identity=\$(private_file_security_identity \"\$path\")" \

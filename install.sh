@@ -2332,17 +2332,20 @@ private_file_security_identity() {
   local path="$1"
   local metadata
 
-  if metadata=$(LC_ALL=C stat -f '%d:%i:%HT:%Lp:%l' "$path" 2>/dev/null); then
+  if metadata=$(LC_ALL=C stat -f '%d:%i:%Lp:%l:%HT' "$path" 2>/dev/null); then
     case "$metadata" in
-      *:Regular\ File:600:1)
-        printf '%s' "$metadata"
+      *:600:1:Regular\ File)
+        printf '%s:regular' "${metadata%:*}"
         return 0
         ;;
     esac
-  elif metadata=$(LC_ALL=C stat -c '%d:%i:%F:%a:%h' "$path" 2>/dev/null); then
+  elif metadata=$(LC_ALL=C stat -c '%d:%i:%a:%h:%F' "$path" 2>/dev/null); then
     case "$metadata" in
-      *:regular*file:600:1)
-        printf '%s' "$metadata"
+      *:600:1:regular*file)
+        # GNU stat distinguishes an empty regular file from a non-empty one in
+        # %F. Normalize that descriptive suffix after validating the type so
+        # writing content does not spuriously look like an inode change.
+        printf '%s:regular' "${metadata%:*}"
         return 0
         ;;
     esac
