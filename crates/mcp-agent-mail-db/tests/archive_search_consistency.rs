@@ -178,12 +178,9 @@ fn setup_consistency_fixture() -> CorpusFixture {
     build_archive_fixture(&storage_root);
     build_salvage_fixture(&salvage_db_path);
 
-    let reconstruct_stats = reconstruct_from_archive_with_private_salvage(
-        &db_path,
-        &storage_root,
-        &salvage_db_path,
-    )
-    .expect("reconstruct from archive with private product/contact salvage");
+    let reconstruct_stats =
+        reconstruct_from_archive_with_private_salvage(&db_path, &storage_root, &salvage_db_path)
+            .expect("reconstruct from archive with private product/contact salvage");
 
     let pool = DbPool::new(&DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),

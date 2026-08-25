@@ -2576,10 +2576,8 @@ impl SearchCockpitScreen {
         let Ok(conn) = self.open_live_metadata_operation_db_connection() else {
             return;
         };
-        let conn = mcp_agent_mail_db::guard_db_conn(
-            conn,
-            "search screen recipe/history schema and list",
-        );
+        let conn =
+            mcp_agent_mail_db::guard_db_conn(conn, "search screen recipe/history schema and list");
         let recipes = list_recipes(&conn);
         let history = list_recent_history(&conn, 50);
         if let Ok(saved_recipes) = recipes.as_ref() {
@@ -2648,7 +2646,8 @@ impl SearchCockpitScreen {
             ..Default::default()
         };
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-        if let Ok(conn) = self.open_live_metadata_operation_db_connection()
+        if let Ok(conn) = self
+            .open_live_metadata_operation_db_connection()
             .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen insert recipe"))
             && let Ok(id) = insert_recipe(&conn, &recipe)
         {

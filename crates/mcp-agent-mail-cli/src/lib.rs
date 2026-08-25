@@ -7490,7 +7490,8 @@ fn doctor_index_owner_tables_for_damage(
     damaged_indexes: &[String],
 ) -> CliResult<Vec<String>> {
     doctor_index_owner_tables_for_damage_from_query(damaged_indexes, |sql, params| {
-        conn.query_sync(sql, params).map_err(|error| error.to_string())
+        conn.query_sync(sql, params)
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -7499,7 +7500,8 @@ fn doctor_index_owner_tables_for_damage_franken(
     damaged_indexes: &[String],
 ) -> CliResult<Vec<String>> {
     doctor_index_owner_tables_for_damage_from_query(damaged_indexes, |sql, params| {
-        conn.query_sync(sql, params).map_err(|error| error.to_string())
+        conn.query_sync(sql, params)
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -7678,10 +7680,8 @@ fn doctor_index_repair_live_franken_is_healthy(db_path: &Path) -> bool {
     ) else {
         return false;
     };
-    let conn = mcp_agent_mail_db::guard_db_conn(
-        conn,
-        "index-only REINDEX live verification connection",
-    );
+    let conn =
+        mcp_agent_mail_db::guard_db_conn(conn, "index-only REINDEX live verification connection");
     matches!(
         sqlite_conn_check_ok(&conn, mcp_agent_mail_db::CheckKind::Full),
         Ok(true)
@@ -7783,8 +7783,8 @@ fn doctor_attempt_index_only_reindex(db_path: &Path, backup_dir: &Path) -> Optio
             })?
         }
         DoctorIndexRepairEngine::OfflineCanonical => {
-            let conn =
-                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string()).ok()?;
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+                .ok()?;
             doctor_run_reindex_statements(db_path, affected_tables, |sql| {
                 conn.execute_raw(sql).map_err(|error| error.to_string())
             })?
@@ -13187,12 +13187,7 @@ fn recover_sqlite_file_with_storage_root_admitted(
             // Reconstruct into a temp file so the original is untouched on failure.
             let temp_reconstruct = next_doctor_artifact_path(path, "reconstruct", "sqlite3");
             let reconstruct = salvage_db_path.map_or_else(
-                || {
-                    mcp_agent_mail_db::reconstruct_from_archive(
-                        &temp_reconstruct,
-                        &storage_root,
-                    )
-                },
+                || mcp_agent_mail_db::reconstruct_from_archive(&temp_reconstruct, &storage_root),
                 |private_salvage_db_path| {
                     mcp_agent_mail_db::reconstruct_from_archive_with_private_salvage(
                         &temp_reconstruct,
@@ -13388,15 +13383,14 @@ fn cli_sqlite_family_requires_preopen_admission(path: &Path) -> CliResult<bool> 
         ))
     })?;
 
-    let unresolved_breaker_authority =
-        match mcp_agent_mail_db::recovery_breaker::load(path) {
-            Ok(Some(state)) => state.consecutive_failures > 0,
-            Ok(None) => false,
-            // An unreadable breaker is authority we cannot safely ignore. A
-            // directly usable exact family may still serve, but every other
-            // case must flow through admission and surface the trust failure.
-            Err(_) => true,
-        };
+    let unresolved_breaker_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
+        Ok(Some(state)) => state.consecutive_failures > 0,
+        Ok(None) => false,
+        // An unreadable breaker is authority we cannot safely ignore. A
+        // directly usable exact family may still serve, but every other
+        // case must flow through admission and surface the trust failure.
+        Err(_) => true,
+    };
     if !path.exists() {
         return Ok(unresolved_breaker_authority);
     }
@@ -13452,7 +13446,9 @@ fn open_live_sqlite_read_only(
             context,
         )
         .map_err(|error| {
-            CliError::Other(format!("{context}: cannot open DB at {path} read-only: {error}"))
+            CliError::Other(format!(
+                "{context}: cannot open DB at {path} read-only: {error}"
+            ))
         })?;
         conn.execute_raw("PRAGMA busy_timeout = 20000;")
             .map_err(|error| {
@@ -13482,14 +13478,13 @@ fn open_private_sqlite_read_only(
             path.display()
         ))
     })?;
-    let conn = mcp_agent_mail_db::DbConn::open_file_read_only(path_text.to_string()).map_err(
-        |error| {
+    let conn =
+        mcp_agent_mail_db::DbConn::open_file_read_only(path_text.to_string()).map_err(|error| {
             CliError::Other(format!(
                 "{context} cannot open private SQLite materialization {} read-only: {error}",
                 path.display()
             ))
-        },
-    )?;
+        })?;
     conn.execute_raw("PRAGMA query_only = ON; PRAGMA busy_timeout = 20000;")
         .map_err(|error| {
             CliError::Other(format!(
@@ -13548,10 +13543,7 @@ fn require_existing_regular_sqlite_path_metadata(path: &Path, context: &str) -> 
 /// locks can be released when any descriptor for that inode closes. Live paths
 /// use [`require_existing_regular_sqlite_path_metadata`] and are validated by
 /// the retained guarded FrankenSQLite connection itself.
-fn require_existing_regular_private_sqlite_source(
-    path: &Path,
-    context: &str,
-) -> CliResult<()> {
+fn require_existing_regular_private_sqlite_source(path: &Path, context: &str) -> CliResult<()> {
     require_existing_regular_sqlite_path_metadata(path, context)?;
 
     let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
@@ -13921,9 +13913,8 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
     } else {
         None
     };
-    let open_after_mutation_locks = || {
-        open_db_sync_after_mutation_locks(&path, database_url, storage_root_override)
-    };
+    let open_after_mutation_locks =
+        || open_db_sync_after_mutation_locks(&path, database_url, storage_root_override);
     if !requires_preopen_admission {
         return open_after_mutation_locks();
     }
@@ -14305,11 +14296,7 @@ fn sqlite_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn sqlite_snapshot_path_text<'a>(
-    path: &'a Path,
-    context: &str,
-    role: &str,
-) -> CliResult<&'a str> {
+fn sqlite_snapshot_path_text<'a>(path: &'a Path, context: &str, role: &str) -> CliResult<&'a str> {
     path.to_str().ok_or_else(|| {
         CliError::Other(format!(
             "{context} refuses non-UTF-8 SQLite {role} path {}",
@@ -14345,15 +14332,14 @@ fn vacuum_live_franken_sqlite_into_snapshot(
 ) -> CliResult<()> {
     let destination_text = sqlite_snapshot_path_text(destination, context, "destination")?;
     prepare_sqlite_snapshot_destination(destination, context)?;
-    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
-        source, context,
-    )
-    .map_err(|error| {
-        CliError::Other(format!(
-            "{context} guarded live snapshot source open failed for {}: {error}",
-            source.display()
-        ))
-    })?;
+    let conn =
+        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(source, context)
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "{context} guarded live snapshot source open failed for {}: {error}",
+                    source.display()
+                ))
+            })?;
     // `query_only` is a connection-local SQL policy. The pager remains
     // engine-enforced read-only after this is disabled, while FrankenSQLite's
     // `VACUUM INTO` may create only the new private destination.
@@ -14405,14 +14391,13 @@ where
     // canonical open is process-exclusive. The guarded *offline* canonical
     // helper intentionally rejects such records and therefore is not the
     // correct API for this engine-owned private output.
-    let snapshot = mcp_agent_mail_db::CanonicalDbConn::open_file(destination_text).map_err(
-        |error| {
+    let snapshot =
+        mcp_agent_mail_db::CanonicalDbConn::open_file(destination_text).map_err(|error| {
             CliError::Other(format!(
                 "{context} could not open private canonical snapshot {}: {error}",
                 snapshot_path.display()
             ))
-        },
-    )?;
+        })?;
     probe(&snapshot)
 }
 
@@ -14712,10 +14697,10 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
     // best-effort lane can only touch a caller-owned private inode.
     let (storage_root, mailbox_read_locks, source) =
         open_canonical_async_read_source_with_database_url(
-        database_url,
-        storage_root_override,
-        context,
-    )?;
+            database_url,
+            storage_root_override,
+            context,
+        )?;
     let conn = source.open_read_only(context)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
@@ -14865,8 +14850,7 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     let path = resolve_sqlite_runtime_path(&path);
-    let (conn, _opened_path) =
-        open_live_sqlite_read_only(&path, "robot attachment mailbox read")?;
+    let (conn, _opened_path) = open_live_sqlite_read_only(&path, "robot attachment mailbox read")?;
     if sqlite_conn_supports_robot_attachment_reads(&conn)? {
         return Ok(conn);
     }
@@ -19966,8 +19950,7 @@ fn open_db_sync_for_migrate(database_url: &str) -> CliResult<mcp_agent_mail_db::
 
     // `am migrate` is an explicit schema/bootstrap command. It must not
     // silently import archive state from the ambient mailbox storage root.
-    open_sqlite_with_fallback_internal(&path, None, false)
-        .map(|(conn, _opened_path)| conn)
+    open_sqlite_with_fallback_internal(&path, None, false).map(|(conn, _opened_path)| conn)
 }
 
 fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> {
@@ -24264,10 +24247,7 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
         )));
     }
 
-    match doctor_open_canonical_source_for_diagnostic(
-        Path::new(&candidate_path),
-        "doctor_check",
-    ) {
+    match doctor_open_canonical_source_for_diagnostic(Path::new(&candidate_path), "doctor_check") {
         Ok(opened) => match opened.conn.query_sync("SELECT 1 AS one", &[]) {
             Ok(_) => Ok(DoctorReadOnlyOpenContext {
                 conn: opened.conn,
@@ -25448,9 +25428,8 @@ fn doctor_open_canonical_source_for_diagnostic(
         Err(error) => error,
     };
 
-    match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
-        db_path, operation,
-    ) {
+    match mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(db_path, operation)
+    {
         Ok(conn) => Ok(DoctorCanonicalDiagnosticOpen {
             conn,
             _snapshot_source: None,
@@ -29765,26 +29744,24 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
         );
     }
 
-    let opened = match doctor_open_canonical_source_for_diagnostic(
-        resolved,
-        "double_probe_cross_check",
-    ) {
-        Ok(opened) => opened,
-        Err(error) => {
-            // The selector can fail while materializing the guarded Franken
-            // source, before canonical SQLite has observed any private bytes.
-            // Only an independently classified corruption error from the
-            // explicitly offline canonical authority may confirm damage.
-            if let Some(detail) = error.offline_corruption_detail() {
-                return DoctorCanonicalCrossCheck::ConfirmsCorruption(format!(
-                    "guarded offline canonical open reported corruption: {detail}"
+    let opened =
+        match doctor_open_canonical_source_for_diagnostic(resolved, "double_probe_cross_check") {
+            Ok(opened) => opened,
+            Err(error) => {
+                // The selector can fail while materializing the guarded Franken
+                // source, before canonical SQLite has observed any private bytes.
+                // Only an independently classified corruption error from the
+                // explicitly offline canonical authority may confirm damage.
+                if let Some(detail) = error.offline_corruption_detail() {
+                    return DoctorCanonicalCrossCheck::ConfirmsCorruption(format!(
+                        "guarded offline canonical open reported corruption: {detail}"
+                    ));
+                }
+                return DoctorCanonicalCrossCheck::Inconclusive(format!(
+                    "canonical read-only source selection failed: {error}"
                 ));
             }
-            return DoctorCanonicalCrossCheck::Inconclusive(format!(
-                "canonical read-only source selection failed: {error}"
-            ));
-        }
-    };
+        };
     let conn = &opened.conn;
 
     // First inconclusive reason wins; an authoritative corruption short-circuits.
@@ -30086,18 +30063,17 @@ fn doctor_read_only_physical_integrity_check(
     }
 
     let live_path = Path::new(&opened.opened_path);
-    let primary_result =
-        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
-            live_path,
-            "read-only doctor physical integrity probe",
-        )
-        .map_err(|error| {
-            CliError::Other(format!(
-                "guarded live physical integrity open failed for {}: {error}",
-                live_path.display()
-            ))
-        })
-        .and_then(|conn| sqlite_conn_check_ok(&conn, kind));
+    let primary_result = mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(
+        live_path,
+        "read-only doctor physical integrity probe",
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "guarded live physical integrity open failed for {}: {error}",
+            live_path.display()
+        ))
+    })
+    .and_then(|conn| sqlite_conn_check_ok(&conn, kind));
 
     reconcile_private_canonical_corroboration(primary_result, canonical_result)
 }
@@ -30182,28 +30158,29 @@ fn doctor_database_fix_strategy_read_only_probes(
         }
     }
 
-    let integrity_ok =
-        match doctor_read_only_physical_integrity_check(&opened, mcp_agent_mail_db::CheckKind::Full)
-        {
-            Ok(ok) => ok,
-            Err(error) => {
-                let detail = format!(
-                    "PRAGMA integrity_check failed for {}: {error}",
-                    opened.opened_path
-                );
-                if is_sqlite_recovery_error_message(&error.to_string()) {
-                    return Ok(if archive_reconstruct_available {
-                        DoctorDatabaseFixStrategy::Reconstruct(format!(
-                            "{detail}; reconstruct from archive {}",
-                            archive_root.display()
-                        ))
-                    } else {
-                        DoctorDatabaseFixStrategy::Repair(detail)
-                    });
-                }
-                return Err(CliError::Other(detail));
+    let integrity_ok = match doctor_read_only_physical_integrity_check(
+        &opened,
+        mcp_agent_mail_db::CheckKind::Full,
+    ) {
+        Ok(ok) => ok,
+        Err(error) => {
+            let detail = format!(
+                "PRAGMA integrity_check failed for {}: {error}",
+                opened.opened_path
+            );
+            if is_sqlite_recovery_error_message(&error.to_string()) {
+                return Ok(if archive_reconstruct_available {
+                    DoctorDatabaseFixStrategy::Reconstruct(format!(
+                        "{detail}; reconstruct from archive {}",
+                        archive_root.display()
+                    ))
+                } else {
+                    DoctorDatabaseFixStrategy::Repair(detail)
+                });
             }
-        };
+            return Err(CliError::Other(detail));
+        }
+    };
     if !integrity_ok {
         return Ok(if archive_reconstruct_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
@@ -37967,8 +37944,8 @@ mod mail_server_cli_bridge_tests {
         persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
         post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
         reject_local_fallback_with_ownership_probe, reject_local_registration_when_gate,
-        resolve_mailbox_activity_sqlite_path,
-        resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        resolve_mailbox_activity_sqlite_path, resolve_sender_token,
+        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
         validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
     };
@@ -54349,10 +54326,7 @@ startup_timeout_sec = 42
             .query_sync("SELECT COUNT(*) AS count FROM agents", &[])
             .expect("table b-tree remains readable");
         assert_eq!(rows[0].get_named::<i64>("count").expect("count"), 50);
-        mcp_agent_mail_db::close_db_conn(
-            admitted,
-            "settle live Franken index-corruption fixture",
-        );
+        mcp_agent_mail_db::close_db_conn(admitted, "settle live Franken index-corruption fixture");
 
         let opened = open_db_for_doctor_check_read_only_with_context(&db_url)
             .expect("materialize guarded live logical snapshot");
@@ -54366,11 +54340,8 @@ startup_timeout_sec = 42
             "VACUUM rebuild should normalize the damaged secondary index in the private image"
         );
         assert!(
-            !doctor_read_only_physical_integrity_check(
-                &opened,
-                mcp_agent_mail_db::CheckKind::Full
-            )
-            .expect("run admitted live physical check"),
+            !doctor_read_only_physical_integrity_check(&opened, mcp_agent_mail_db::CheckKind::Full)
+                .expect("run admitted live physical check"),
             "the live physical index defect must remain authoritative"
         );
         drop(opened);
@@ -54378,8 +54349,7 @@ startup_timeout_sec = 42
         match doctor_database_fix_strategy_read_only(&db_url, dir.path())
             .expect("classify live physical index corruption")
         {
-            DoctorDatabaseFixStrategy::Repair(_)
-            | DoctorDatabaseFixStrategy::Reconstruct(_) => {}
+            DoctorDatabaseFixStrategy::Repair(_) | DoctorDatabaseFixStrategy::Reconstruct(_) => {}
             DoctorDatabaseFixStrategy::None(detail) => panic!(
                 "a clean logical snapshot must not make startup skip the admitted physical re-probe: {detail}"
             ),
@@ -54387,10 +54357,7 @@ startup_timeout_sec = 42
         let repair_plan = doctor_classify_index_only_repair(&db_path)
             .expect("classify the live physical index defect");
         assert_eq!(repair_plan.engine, DoctorIndexRepairEngine::LiveFranken);
-        assert_eq!(
-            repair_plan.damaged_indexes,
-            vec!["idx_agents_project_name"]
-        );
+        assert_eq!(repair_plan.damaged_indexes, vec!["idx_agents_project_name"]);
 
         let repair_called = std::cell::Cell::new(false);
         let reconstruct_called = std::cell::Cell::new(false);
@@ -56678,7 +56645,8 @@ startup_timeout_sec = 42
                         || detail.contains("failed a direct sqlite probe")
                         || detail.contains("could not be materialized through guarded live")
                         || detail.contains("could not be opened for canonical salvage read")
-                        || detail.contains("could not be opened for private canonical salvage read")
+                        || detail
+                            .contains("could not be opened for private canonical salvage read")
                         || detail.contains("failed a canonical salvage probe")
                         || detail.contains("failed a canonical salvage quick_check"),
                     "unexpected salvage failure detail: {detail}"
@@ -68118,21 +68086,23 @@ startup_timeout_sec = 42
 
     #[test]
     fn open_live_sqlite_read_only_is_source_namespace_neutral_without_breaker() {
-        for family_kind in ["healthy", "corrupt-primary", "truncated-wal", "missing-primary"] {
+        for family_kind in [
+            "healthy",
+            "corrupt-primary",
+            "truncated-wal",
+            "missing-primary",
+        ] {
             let dir = tempfile::tempdir().expect("tempdir");
-            let db_path = dir
-                .path()
-                .join(format!("read-only-{family_kind}.sqlite3"));
+            let db_path = dir.path().join(format!("read-only-{family_kind}.sqlite3"));
             if family_kind != "missing-primary" {
                 init_schema_sqlite_canonical(&db_path.display().to_string())
                     .expect("seed read-only probe primary");
             }
             match family_kind {
                 "healthy" => {
-                    let admitted = mcp_agent_mail_db::DbConn::open_file(
-                        db_path.display().to_string(),
-                    )
-                    .expect("admit healthy CLI read-only fixture through FrankenSQLite");
+                    let admitted =
+                        mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                            .expect("admit healthy CLI read-only fixture through FrankenSQLite");
                     mcp_agent_mail_db::close_db_conn(
                         admitted,
                         "settle healthy CLI read-only fixture",
@@ -68140,8 +68110,7 @@ startup_timeout_sec = 42
                 }
                 "missing-primary" => {}
                 "corrupt-primary" => {
-                    std::fs::write(&db_path, b"not a sqlite database")
-                        .expect("corrupt primary");
+                    std::fs::write(&db_path, b"not a sqlite database").expect("corrupt primary");
                 }
                 "truncated-wal" => {
                     std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
@@ -68206,8 +68175,7 @@ startup_timeout_sec = 42
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         assert!(
             std::fs::metadata(&wal_path).is_ok_and(|metadata| {
-                metadata.len()
-                    > u64::from(mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES)
+                metadata.len() > u64::from(mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES)
             }),
             "fixture must retain committed WAL frames"
         );
@@ -68225,10 +68193,9 @@ startup_timeout_sec = 42
             source_before,
             "guarded live VACUUM must not checkpoint or rewrite the source family"
         );
-        let snapshot = mcp_agent_mail_db::CanonicalDbConn::open_file(
-            snapshot_path.display().to_string(),
-        )
-        .expect("open guarded VACUUM output");
+        let snapshot =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(snapshot_path.display().to_string())
+                .expect("open guarded VACUUM output");
         let row = snapshot
             .query_sync(
                 "SELECT COUNT(*) AS count, MAX(value) AS max_value FROM snapshot_witness",
@@ -68400,9 +68367,7 @@ startup_timeout_sec = 42
         for family_kind in ["corrupt-primary", "truncated-wal"] {
             mcp_agent_mail_db::pool::recovery_admission().reset();
             let dir = tempfile::tempdir().expect("tempdir");
-            let db_path = dir
-                .path()
-                .join(format!("no-breaker-{family_kind}.sqlite3"));
+            let db_path = dir.path().join(format!("no-breaker-{family_kind}.sqlite3"));
             let db_url = format!("sqlite:///{}", db_path.display());
             init_schema_sqlite_canonical(&db_path.display().to_string())
                 .expect("seed healthy primary");
@@ -68410,8 +68375,7 @@ startup_timeout_sec = 42
             std::fs::copy(&db_path, &backup_path).expect("create tempting backup");
             match family_kind {
                 "corrupt-primary" => {
-                    std::fs::write(&db_path, b"not a sqlite database")
-                        .expect("corrupt primary");
+                    std::fs::write(&db_path, b"not a sqlite database").expect("corrupt primary");
                 }
                 "truncated-wal" => {
                     std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
@@ -68422,7 +68386,10 @@ startup_timeout_sec = 42
                 other => panic!("unknown no-breaker fixture kind: {other}"),
             }
             let breaker_path = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
-            assert!(!breaker_path.exists(), "fixture must have no durable breaker state");
+            assert!(
+                !breaker_path.exists(),
+                "fixture must have no durable breaker state"
+            );
             let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
             let entries_before = directory_entry_names_for_cli_open_test(dir.path());
 
@@ -68433,13 +68400,11 @@ startup_timeout_sec = 42
             let held_admission = mcp_agent_mail_db::pool::recovery_admission()
                 .try_acquire(&db_path)
                 .expect("occupy recovery admission controller");
-            let error = match open_db_sync_with_database_url_and_storage_root(
-                &db_url,
-                Some(dir.path()),
-            ) {
-                Ok(_) => panic!("occupied admission must refuse unhealthy normal CLI open"),
-                Err(error) => error,
-            };
+            let error =
+                match open_db_sync_with_database_url_and_storage_root(&db_url, Some(dir.path())) {
+                    Ok(_) => panic!("occupied admission must refuse unhealthy normal CLI open"),
+                    Err(error) => error,
+                };
             assert!(
                 error.to_string().contains("already in progress"),
                 "unexpected no-breaker {family_kind} refusal: {error}"
@@ -68460,7 +68425,10 @@ startup_timeout_sec = 42
                 std::ffi::OsString::from(".mailbox.activity.lock"),
                 std::ffi::OsString::from(format!(
                     "{}.activity.lock",
-                    db_path.file_name().expect("database filename").to_string_lossy()
+                    db_path
+                        .file_name()
+                        .expect("database filename")
+                        .to_string_lossy()
                 )),
                 mcp_agent_mail_db::recovery_breaker::breaker_lock_path(&db_path)
                     .file_name()
@@ -68498,10 +68466,8 @@ startup_timeout_sec = 42
                 } else {
                     init_schema_sqlite_canonical(&db_path.display().to_string())
                         .expect("seed healthy primary");
-                    let conn = mcp_agent_mail_db::DbConn::open_file(
-                        db_path.display().to_string(),
-                    )
-                    .expect("open fixture primary");
+                    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                        .expect("open fixture primary");
                     conn.execute_raw("CREATE TABLE cli_admission_marker(value TEXT)")
                         .expect("create marker table");
                     conn.execute_raw(
@@ -68541,9 +68507,9 @@ startup_timeout_sec = 42
                     &db_url,
                     Some(dir.path()),
                 ) {
-                    Ok(_) => panic!(
-                        "durable breaker must refuse an unhealthy or missing live family"
-                    ),
+                    Ok(_) => {
+                        panic!("durable breaker must refuse an unhealthy or missing live family")
+                    }
                     Err(error) => error,
                 };
                 let error_text = error.to_string();
@@ -68569,7 +68535,10 @@ startup_timeout_sec = 42
                     std::ffi::OsString::from(".mailbox.activity.lock"),
                     std::ffi::OsString::from(format!(
                         "{}.activity.lock",
-                        db_path.file_name().expect("database filename").to_string_lossy()
+                        db_path
+                            .file_name()
+                            .expect("database filename")
+                            .to_string_lossy()
                     )),
                 ]);
                 let unexpected_new_entries = entries_after
@@ -68601,14 +68570,10 @@ startup_timeout_sec = 42
             init_schema_sqlite_canonical(&db_path.display().to_string())
                 .expect("seed healthy primary");
             let breaker_path = plant_cli_open_breaker_fixture(&db_path, breaker_kind);
-            let breaker_before =
-                std::fs::read(&breaker_path).expect("snapshot breaker authority");
+            let breaker_before = std::fs::read(&breaker_path).expect("snapshot breaker authority");
 
-            let conn = open_db_sync_with_database_url_and_storage_root(
-                &db_url,
-                Some(dir.path()),
-            )
-            .expect("source-neutrally proven healthy family may continue serving");
+            let conn = open_db_sync_with_database_url_and_storage_root(&db_url, Some(dir.path()))
+                .expect("source-neutrally proven healthy family may continue serving");
             let rows = conn
                 .query_sync("SELECT 1 AS one", &[])
                 .expect("query healthy family");

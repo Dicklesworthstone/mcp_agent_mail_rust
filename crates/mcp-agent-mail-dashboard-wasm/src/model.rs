@@ -441,8 +441,7 @@ impl DashboardModel {
 
     fn activate_screen(&mut self, screen: MailScreenId) {
         if self.active_screen != screen {
-            self.public_screen
-                .switch_screen(self.active_screen, screen);
+            self.public_screen.switch_screen(self.active_screen, screen);
             self.active_screen = screen;
             self.interaction_revision = self.interaction_revision.saturating_add(1);
         }
@@ -473,8 +472,7 @@ impl DashboardModel {
                         let previous = self.help_scroll;
                         self.help_scroll = self.help_scroll.saturating_sub(1);
                         if self.help_scroll != previous {
-                            self.interaction_revision =
-                                self.interaction_revision.saturating_add(1);
+                            self.interaction_revision = self.interaction_revision.saturating_add(1);
                         }
                     }
                     _ => {
@@ -484,14 +482,14 @@ impl DashboardModel {
                     }
                 },
                 Event::Mouse(mouse) => {
-                    let overlay = crate::tui_chrome::help_overlay_rect(self.last_terminal_area.get());
+                    let overlay =
+                        crate::tui_chrome::help_overlay_rect(self.last_terminal_area.get());
                     let inside = crate::tui_hit_regions::point_in_rect(overlay, mouse.x, mouse.y);
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) if !inside => {
                             self.help_visible = false;
                             self.help_scroll = 0;
-                            self.interaction_revision =
-                                self.interaction_revision.saturating_add(1);
+                            self.interaction_revision = self.interaction_revision.saturating_add(1);
                         }
                         MouseEventKind::ScrollDown if inside => {
                             self.scroll_help_down();
@@ -828,8 +826,7 @@ fn render_browser_help(
 #[cfg(test)]
 mod tests {
     use ftui::{
-        Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
-        layout::Rect,
+        Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind, layout::Rect,
     };
     use ftui_runtime::program::Model;
 

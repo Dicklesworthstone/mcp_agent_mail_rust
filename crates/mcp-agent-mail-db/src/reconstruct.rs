@@ -7153,18 +7153,12 @@ body
         drop(source);
         let source_before = exact_test_directory_files(source_dir.path());
         assert!(
-            !mcp_agent_mail_core::disk::sqlite_sidecar_path(
-                &source_path,
-                "-fsqlite-ns-gate"
-            )
-            .exists()
+            !mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_path, "-fsqlite-ns-gate")
+                .exists()
         );
         assert!(
-            !mcp_agent_mail_core::disk::sqlite_sidecar_path(
-                &source_path,
-                "-fsqlite-ns-use"
-            )
-            .exists()
+            !mcp_agent_mail_core::disk::sqlite_sidecar_path(&source_path, "-fsqlite-ns-use")
+                .exists()
         );
 
         let archive_dir = tempfile::tempdir().expect("archive tempdir");
