@@ -321,7 +321,7 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect sibling checkouts in the parent directory for **two** repos: [`../frankensearch`](https://github.com/Dicklesworthstone/frankensearch) (a path dependency; its workspace also needs [`../fast_cmaes`](https://github.com/Dicklesworthstone/fast_cmaes) for workspace-wide `cargo metadata`) and [`../beads_rust`](https://github.com/Dicklesworthstone/beads_rust) on `main` (path-patched until a 0.4.x release lands on crates.io). Everything else -- asupersync, fastmcp, SQLmodel, FrankenSQLite, FrankenTUI, franken-agent-detection, tru, and rich_rust -- resolves from crates.io.
+Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect a sibling checkout of [`../frankensearch`](https://github.com/Dicklesworthstone/frankensearch) (a path dependency; its workspace also needs [`../fast_cmaes`](https://github.com/Dicklesworthstone/fast_cmaes) for workspace-wide `cargo metadata`). Everything else -- including beads_rust, asupersync, fastmcp, SQLmodel, FrankenSQLite, FrankenTUI, franken-agent-detection, tru, and rich_rust -- resolves from crates.io.
 
 ### Platforms
 
@@ -1631,7 +1631,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Local patched dependencies.** Building from source expects sibling checkouts in the parent directory for **two** repos: `frankensearch` (plus its own `fast_cmaes` workspace sibling when running workspace-wide Cargo metadata) and `beads_rust`. The remaining dependencies, including `franken-agent-detection`, resolve from crates.io.
+- **Local path dependency.** Building from source expects a sibling `frankensearch` checkout (plus its own `fast_cmaes` workspace sibling when running workspace-wide Cargo metadata). The remaining dependencies, including `beads_rust` and `franken-agent-detection`, resolve from crates.io.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.

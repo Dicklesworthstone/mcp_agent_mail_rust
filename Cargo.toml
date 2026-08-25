@@ -57,7 +57,7 @@ ftui-widgets = { version = "0.5.0", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.5.0"
 ftui-harness = "0.5.0"
 ftui-render = "0.5.0"
-beads_rust = { version = "0.4.0", default-features = false }
+beads_rust = { version = "0.5.0", default-features = false }
 toon = { version = "0.2.3", package = "tru" }
 # GH#161: global allocator for the long-running serve-http daemon to avoid
 # glibc per-thread arena fragmentation (multi-GB retained RSS under load).
@@ -183,17 +183,9 @@ inherits = "release"     # Benchmarks use same optimizations as release
 #   cleanup trigger fired, so those eight patch lines are gone too.
 # - fastmcp family resolves from crates.io (0.7.1).
 #
-# beads_rust: registry 0.3.2 still pins asupersync =0.4.4, unsatisfiable in
-# the =0.4.9 universe, so it stays path-patched to the ../beads_rust checkout
-# on main (0.4.0, asupersync =0.4.9 — not yet on crates.io; the 0.4.0 req in
-# [workspace.dependencies] is satisfied ONLY through this patch).
-# Cleanup trigger: beads_rust 0.4.x published to crates.io.
-beads_rust = { path = "../beads_rust" }
-# ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3 resolve from
-# crates.io as of 2026-08-22 — the ../frankentui, ../franken_agent_detection,
-# and ../toon_rust path patches are gone. Path patches made builds depend on
-# whatever state each machine's sibling checkout happened to be in (a broken
-# frankentui HEAD was failing local builds outright).
+# beads_rust 0.5.0, ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3
+# resolve from crates.io. Their former path patches made builds depend on
+# whatever state each machine's sibling checkout happened to be in.
 # rich_rust resolves from the registry (0.2.3) as of 2026-08-20 —
 # fastmcp-console 0.7.1 pins =0.2.3 and registry 0.2.3 carries the
 # time ^0.3.54 req, so the 0.2.2 gated-clone patch is gone.
