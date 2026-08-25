@@ -1894,7 +1894,7 @@ fn gitignore_relative_path(path: &Path) -> Result<String, SetupError> {
 /// therefore refuses tracked targets, then atomically appends anchored ignore
 /// rules for the live file and every adjacent backup/temp name used by setup
 /// and doctor. If Git cannot answer reliably, it fails closed.
-pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupError> {
+fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Result<(), SetupError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -1972,6 +1972,9 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
         )));
     }
     if tracked_probe.status.code() == Some(1) {
+        if !secure_gitignore {
+            return Ok(());
+        }
         let relative = gitignore_relative_path(relative)?;
         let (directory, basename) = relative
             .rsplit_once('/')
@@ -1994,8 +1997,12 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
         ensure_gitignore_entries(&repo_root.join(".gitignore"), &entry_refs)?;
         let representative_paths = [
             relative.clone(),
-            format!("{directory}/.{basename}.probe.tmp").trim_start_matches('/').to_string(),
-            format!("{directory}/.{basename}.probe.bak").trim_start_matches('/').to_string(),
+            format!("{directory}/.{basename}.probe.tmp")
+                .trim_start_matches('/')
+                .to_string(),
+            format!("{directory}/.{basename}.probe.bak")
+                .trim_start_matches('/')
+                .to_string(),
             format!("{relative}.bak"),
         ];
         for representative in representative_paths {
@@ -2027,6 +2034,16 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
         "cannot verify whether secret config {} is Git-tracked: git ls-files failed",
         path.display()
     )))
+}
+
+/// Read-only preflight for a secret-bearing config write.
+pub fn preflight_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupError> {
+    check_secret_config_git_exposure(path, false)
+}
+
+/// Refuse tracked targets and secure ignore rules for an untracked secret file.
+pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupError> {
+    check_secret_config_git_exposure(path, true)
 }
 
 /// Execute a single config write action, returning the outcome.

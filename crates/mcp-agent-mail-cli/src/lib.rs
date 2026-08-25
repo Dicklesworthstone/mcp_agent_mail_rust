@@ -34291,6 +34291,29 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
             if let Some(repair_reason) = repair_reason {
                 any_fixable = true;
                 if dry_run {
+                    let secret_repair = desired_bearer_token.is_some_and(|token| !token.is_empty())
+                        || content.contains("Bearer ")
+                        || content.contains("HTTP_BEARER_TOKEN");
+                    if secret_repair
+                        && let Err(error) =
+                            mcp_agent_mail_core::setup::preflight_secret_config_not_git_tracked(
+                                &loc.config_path,
+                            )
+                    {
+                        let detail = format!(
+                            "Would refuse {} in {}: {error}",
+                            repair_reason,
+                            loc.config_path.display()
+                        );
+                        ftui_runtime::ftui_eprintln!("[fail] mcp_config: {detail}");
+                        results.push(serde_json::json!({
+                            "check": "mcp_config",
+                            "action": "failed",
+                            "detail": detail,
+                        }));
+                        failed_count += 1;
+                        continue;
+                    }
                     ftui_runtime::ftui_eprintln!(
                         "[dry-run] {mode_label}: {} in {} to use {}",
                         repair_reason,
