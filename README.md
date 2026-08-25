@@ -476,12 +476,20 @@ against all three accepted Agent Mail aliases (`mcp-agent-mail`,
 `mcp_agent_mail`, and `agent-mail`). They also evaluate
 `mcp.enableProjectConfig` with OMP's persistent settings precedence: the active
 profile's `config.yml` (falling back to `config.yaml` only when it is absent),
-the project's `.omp/config.yml`, then each ambient `PI_CONFIG_FILES` overlay in
-order. An effective `false`, malformed settings, an unreadable authority, or a
+then the project settings providers in runtime merge order: `.omp/settings.json`,
+`.omp/config.yml`, `.claude/settings.json`, `.codex/config.toml`,
+`.gemini/settings.json`, project-root `opencode.json` and `opencode.jsonc`,
+`.opencode/opencode.json` and `.opencode/opencode.jsonc`, and
+`.cursor/settings.json`. Ordered ambient `PI_CONFIG_FILES` overlays apply last.
+Invalid or unreadable foreign-provider settings are skipped as OMP skips them;
+the active-profile YAML, native `.omp/config.yml`, and explicit overlays remain
+strict authorities. An effective `false`, an unsupported strict authority, or a
 missing explicit overlay is reported as runtime-relevant drift instead of
-success. Remediation deliberately omits `--no-user-config`, because a
-project-only write cannot overcome an authority that excludes every project
-MCP source.
+success. OpenCode `{env:...}` and `{file:...}` substitutions are also reported
+unsupported because their external dependencies cannot be proven by a cache of
+the config bytes alone. Remediation deliberately omits `--no-user-config`,
+because a project-only write cannot overcome an authority that excludes every
+project MCP source.
 
 This check is bound to the persistent files and the `PI_CONFIG_FILES` value in
 the `am` process environment. A one-shot OMP `--config` argument or a

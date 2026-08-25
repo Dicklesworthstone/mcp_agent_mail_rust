@@ -1126,8 +1126,22 @@ read_env_assignment_value() {
 # from silently reading $HOME/.config while `am setup` writes under XDG.
 rust_config_env_path() {
   local config_home="${XDG_CONFIG_HOME:-}"
+  case "$config_home" in
+    /*) ;;
+    "") ;;
+    *)
+      verbose "rust_config_env_path:ignore_relative_xdg value=${config_home}"
+      config_home=""
+      ;;
+  esac
   if [ -z "$config_home" ]; then
-    config_home="${HOME}/.config"
+    case "${HOME:-}" in
+      /*) config_home="${HOME}/.config" ;;
+      *)
+        warn "Cannot resolve an absolute config.env path: HOME is unset or relative."
+        return 1
+        ;;
+    esac
   fi
   printf '%s' "${config_home}/mcp-agent-mail/config.env"
 }
@@ -1697,8 +1711,16 @@ cat > "$tmpfile" <<EOF
 set -euo pipefail
 
 AM_RUST_BIN="${DEST}/${BIN_CLI}"
-AM_RUST_ENV_FILE_DEFAULT="${HOME}/.config/mcp-agent-mail/config.env"
+AM_XDG_CONFIG_HOME="\${XDG_CONFIG_HOME:-}"
+case "\$AM_XDG_CONFIG_HOME" in
+  /*) ;;
+  *) AM_XDG_CONFIG_HOME="\${HOME}/.config" ;;
+esac
+AM_RUST_ENV_FILE_DEFAULT="\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/config.env"
 AM_RUST_ENV_FILE="\${AM_RUST_ENV_FILE:-\$AM_RUST_ENV_FILE_DEFAULT}"
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/.env" ]; then
+  AM_RUST_ENV_FILE="\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/.env"
+fi
 if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${HOME}/.config/mcp-agent-mail/config.env" ]; then
   AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/config.env"
 fi
@@ -2810,8 +2832,6 @@ detect_mcp_configs() {
   local omp_profile_dir
   local omp_profiles_root
   local omp_profile_error=0
-  local profile_dir
-  local profile_name
   local -a candidates=()
 
   if [ -n "$home_dir" ]; then
@@ -2840,8 +2860,9 @@ detect_mcp_configs() {
 
     # Oh My Pi (OMP). Match its v18 directory resolver: OMP_PROFILE wins over
     # PI_PROFILE, PI_CONFIG_DIR replaces `.omp`, and PI_CODING_AGENT_DIR only
-    # applies to the default profile. Also inspect every existing named profile
-    # so an installer run repairs configs that are not currently active.
+    # applies to the default profile. Only the effective active profile is an
+    # authority: copying a live bearer into inactive profiles creates durable
+    # secret sprawl and does not affect the OMP process being configured.
     omp_config_name="${PI_CONFIG_DIR:-.omp}"
     while [ "${omp_config_name#/}" != "$omp_config_name" ]; do
       omp_config_name="${omp_config_name#/}"
@@ -2868,6 +2889,9 @@ detect_mcp_configs() {
         && [ ! -L "${omp_profile_dir}/agent" ]; then
         candidates+=("omp|${omp_profile_dir}/agent/mcp.json")
         candidates+=("omp|${omp_profile_dir}/agent/.mcp.json")
+      else
+        err "Active OMP profile path contains a symlink; refusing to configure it: ${omp_profile_dir}"
+        omp_profile_error=2
       fi
     elif [ -n "$omp_profile" ] && [ "$omp_profile" != "default" ]; then
       err "Invalid OMP profile \"${omp_profile}\". Profile names must match ^[a-z0-9][a-z0-9._-]{0,63}$ and cannot be '.', '..', end with '.', or use a Windows reserved device name."
@@ -2875,27 +2899,9 @@ detect_mcp_configs() {
     elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
       candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
       candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
-    fi
-    if [ "$omp_profile_error" -eq 0 ]; then
+    else
       candidates+=("omp|${omp_config_root}/agent/mcp.json")
       candidates+=("omp|${omp_config_root}/agent/.mcp.json")
-      if [ ! -L "$omp_profiles_root" ]; then
-        for profile_dir in "${omp_profiles_root}"/*; do
-          if [ ! -d "$profile_dir" ] \
-            || [ -L "$profile_dir" ] \
-            || [ -L "${profile_dir}/agent" ]; then
-            continue
-          fi
-          profile_name="${profile_dir##*/}"
-          [ "$profile_name" != "default" ] || continue
-          omp_profile_base="${profile_name%%.*}"
-          printf '%s\n' "$profile_name" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || continue
-          printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' && continue
-          [ "${profile_name%.}" = "$profile_name" ] || continue
-          candidates+=("omp|${profile_dir}/agent/mcp.json")
-          candidates+=("omp|${profile_dir}/agent/.mcp.json")
-        done
-      fi
     fi
 
     # GitHub Copilot / VS Code settings
@@ -2966,14 +2972,29 @@ detect_mcp_configs() {
 }
 
 generate_bearer_token() {
+  local token=""
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 32
-  elif [ -r /dev/urandom ]; then
-    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    token="$(openssl rand -hex 32)" || {
+      warn "OpenSSL could not generate an HTTP bearer token."
+      return 1
+    }
+  elif [ -r /dev/urandom ] \
+    && command -v head >/dev/null 2>&1 \
+    && command -v od >/dev/null 2>&1 \
+    && command -v tr >/dev/null 2>&1; then
+    token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" || {
+      warn "The operating-system random source could not generate an HTTP bearer token."
+      return 1
+    }
   else
-    # Fallback: use date-based hash (weak but functional)
-    printf '%s' "$(date +%s%N)$$" | sha256sum 2>/dev/null | cut -d' ' -f1 || echo "placeholder-token-replace-me"
+    warn "No cryptographically secure HTTP bearer-token generator is available."
+    return 1
   fi
+  if [ "${#token}" -ne 64 ] || [[ ! "$token" =~ ^[[:xdigit:]]{64}$ ]]; then
+    warn "The HTTP bearer-token generator returned invalid output."
+    return 1
+  fi
+  printf '%s' "$token"
 }
 
 normalize_mcp_http_path() {
@@ -3117,7 +3138,11 @@ has_remote_http_client_targets() {
     return 1
   fi
 
-  if command -v codex >/dev/null 2>&1 || [ -d "${HOME}/.codex" ] || [ -d "${HOME}/.config/codex" ]; then
+  if command -v codex >/dev/null 2>&1 \
+    || command -v omp >/dev/null 2>&1 \
+    || [ -d "${HOME}/.codex" ] \
+    || [ -d "${HOME}/.config/codex" ] \
+    || [ -d "${HOME}/.omp" ]; then
     return 0
   fi
 
@@ -3128,7 +3153,10 @@ has_remote_http_client_targets() {
   local tool path exists_flag
   while IFS=$'\t' read -r tool path exists_flag; do
     [ -z "${tool:-}" ] && continue
-    [ "$tool" = "codex" ] || continue
+    case "$tool" in
+      codex|omp) ;;
+      *) continue ;;
+    esac
     if [ "$exists_flag" = "1" ] && [ -f "$path" ]; then
       return 0
     fi
@@ -3342,7 +3370,9 @@ EOF
   then
     return 1
   fi
-  chmod 644 "$tmp_plist" || return 1
+  # The plist embeds the HTTP bearer token, so it is a credential file even
+  # though launchd also treats it as service metadata.
+  chmod 600 "$tmp_plist" || return 1
   mv -f "$tmp_plist" "$plist_path" || return 1
 }
 
@@ -3359,7 +3389,7 @@ repair_launchd_service_env_from_rust_config() {
   local plist_path="$HOME/Library/LaunchAgents/com.agent-mail.plist"
   if [ -L "$plist_path" ]; then
     warn "LaunchAgent plist is a symlink; refusing to rewrite it automatically: $plist_path"
-    return 0
+    return 1
   fi
   [ -f "$plist_path" ] || return 0
 
@@ -3394,7 +3424,7 @@ repair_launchd_service_env_from_rust_config() {
   if ! write_launchd_service_plist "$plist_path" "$DEST/$BIN_CLI" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path"
   then
     warn "Failed to rewrite LaunchAgent plist with Rust config environment."
-    return 0
+    return 1
   fi
 
   local uid
@@ -3402,7 +3432,7 @@ repair_launchd_service_env_from_rust_config() {
   launchctl bootout "gui/${uid}" "$plist_path" >/dev/null 2>&1 || true
   if ! launchctl bootstrap "gui/${uid}" "$plist_path" >/dev/null 2>&1; then
     warn "LaunchAgent plist was updated, but launchctl could not restart it automatically."
-    return 0
+    return 1
   fi
 
   verbose "remote_http_readiness:launchd_env_repaired plist=${plist_path}"
@@ -3411,7 +3441,7 @@ repair_launchd_service_env_from_rust_config() {
 
 ensure_remote_http_client_readiness() {
   if ! has_remote_http_client_targets; then
-    verbose "remote_http_readiness:skip reason=no_codex_targets"
+    verbose "remote_http_readiness:skip reason=no_remote_http_clients"
     return 0
   fi
 
@@ -4596,7 +4626,11 @@ mcp_config_must_skip_shell_write() {
         verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
         return 0
         ;;
-      "$project_dir/.omp/.mcp.json"|"$project_dir/mcp.json"|"$project_dir/.mcp.json")
+      */.mcp.json)
+        verbose "setup_mcp_configs:skip tool=omp path=${path} reason=secondary_authority_is_read_only"
+        return 0
+        ;;
+      "$project_dir/mcp.json"|"$project_dir/.mcp.json")
         verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
         return 0
         ;;
@@ -4626,7 +4660,10 @@ setup_mcp_configs() {
   local bearer_token
   bearer_token="$(resolve_setup_http_bearer_token)"
   if [ -z "$bearer_token" ]; then
-    bearer_token="$(generate_bearer_token)"
+    if ! bearer_token="$(generate_bearer_token)"; then
+      warn "Refusing to update MCP clients without a cryptographically secure bearer token."
+      return 1
+    fi
     verbose "setup_mcp_configs:selected_token source=generated len=${#bearer_token}"
   else
     verbose "setup_mcp_configs:selected_token source=existing len=${#bearer_token}"
@@ -4686,15 +4723,11 @@ setup_mcp_configs() {
       continue
     fi
 
-    # Most tools have one authoritative config, but OMP can have multiple
-    # existing named-profile configs. Refresh every existing OMP file; the
-    # second pass still sees `omp` in configured_tools and will not proliferate
-    # new files across inactive profiles.
-    if [ "$tool" != "omp" ]; then
-      case "|${configured_tools}|" in
-        *"|${tool}|"*) continue ;;
-      esac
-    fi
+    # OMP's secondary `.mcp.json` authority is filtered above; like every
+    # other tool, only its first writable canonical config is updated.
+    case "|${configured_tools}|" in
+      *"|${tool}|"*) continue ;;
+    esac
 
     if setup_single_mcp_config "$tool" "$path" "$binary_path" "$bearer_token" "$storage_root"; then
       ok "[$tool] Configured MCP entry in $path"
@@ -4740,6 +4773,15 @@ setup_mcp_configs() {
         ok "[$tool] Created fresh MCP config at $path"
         configured=$((configured + 1))
         configured_tools="${configured_tools}|${tool}"
+      else
+        local rc=$?
+        if [ "$rc" -eq 1 ]; then
+          skipped=$((skipped + 1))
+          configured_tools="${configured_tools}|${tool}"
+        else
+          failed=$((failed + 1))
+          warn "[$tool] Failed to create MCP config at $path"
+        fi
       fi
     fi
   done <<< "$scan"
@@ -4751,6 +4793,7 @@ setup_mcp_configs() {
     info "$skipped MCP config(s) already had mcp-agent-mail entry"
   fi
   verbose "setup_mcp_configs:done configured=${configured} skipped=${skipped} failed=${failed}"
+  [ "$failed" -eq 0 ]
 }
 
 sync_codex_http_configs() {
@@ -4800,7 +4843,9 @@ sync_codex_http_configs() {
   fi
   if [ "$failed" -gt 0 ]; then
     warn "[codex] Failed to sync $failed HTTP MCP config(s)"
+    return 1
   fi
+  return 0
 }
 
 # Update existing MCP configs that point to Python to use the Rust binary.
@@ -4846,17 +4891,23 @@ update_mcp_configs() {
     return 1
   fi
 
-  set +e
   local setup_out
+  local setup_rc
   local setup_token
   setup_token="$(resolve_setup_http_bearer_token)"
   if [ -n "$setup_token" ]; then
-    setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1)
+    if setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1); then
+      setup_rc=0
+    else
+      setup_rc=$?
+    fi
   else
-    setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 2>&1)
+    if setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 2>&1); then
+      setup_rc=0
+    else
+      setup_rc=$?
+    fi
   fi
-  local setup_rc=$?
-  set -e
 
   verbose "update_mcp_configs:result rc=${setup_rc}"
   if [ -n "$setup_out" ]; then
@@ -4924,13 +4975,19 @@ update_mcp_configs() {
 configure_mcp_clients() {
   local binary_path="$1"
   local am_cli="$2"
+  local failed=0
 
   if ! update_mcp_configs "$binary_path" "$am_cli"; then
     warn "Skipping shell MCP fallback writers because native setup did not prove durable token continuity."
     return 1
   fi
-  setup_mcp_configs "$binary_path"
-  sync_codex_http_configs "$binary_path"
+  setup_mcp_configs "$binary_path" || failed=1
+  sync_codex_http_configs "$binary_path" || failed=1
+  if [ "$failed" -ne 0 ]; then
+    warn "One or more MCP fallback configuration writes failed."
+    return 1
+  fi
+  return 0
 }
 
 record_uninstall_summary() {

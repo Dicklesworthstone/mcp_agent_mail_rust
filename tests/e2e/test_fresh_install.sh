@@ -770,7 +770,11 @@ PY
   if [ ! -s "${OMP_DETECT_LIBRARY}" ]; then
     e2e_fail "extract OMP installer detector" "function body" "missing"
   else
-    mkdir -p "${FAKE_HOME}/.omp/profiles/Work/agent" "${FAKE_HOME}/custom-agent"
+    mkdir -p "${FAKE_HOME}/.omp/agent" \
+      "${FAKE_HOME}/.omp/profiles/Work/agent" \
+      "${FAKE_HOME}/.omp/profiles/work/agent" \
+      "${FAKE_HOME}/.omp/profiles/inactive/agent" \
+      "${FAKE_HOME}/custom-agent"
     ln -s "${OMP_INSTALLER_DIR}" "${FAKE_HOME}/.omp/profiles/linked"
     set +e
     OMP_DETECT_OUT="$(
@@ -791,11 +795,56 @@ PY
     e2e_assert_contains "invalid OMP profile does not suppress unrelated config discovery" \
       "${OMP_DETECT_OUT}" "codex"
 
+    OMP_ACTIVE_DETECT_OUT="$(
+      # shellcheck disable=SC1090
+      source "${OMP_DETECT_LIBRARY}"
+      OMP_PROFILE=work PI_PROFILE=inactive PI_CODING_AGENT_DIR="${FAKE_HOME}/custom-agent" \
+        detect_mcp_configs "${FAKE_HOME}"
+    )"
+    e2e_assert_contains "active named OMP profile is advertised" \
+      "${OMP_ACTIVE_DETECT_OUT}" "${FAKE_HOME}/.omp/profiles/work/agent/mcp.json"
+    e2e_assert_not_contains "inactive named OMP profile is not advertised" \
+      "${OMP_ACTIVE_DETECT_OUT}" "${FAKE_HOME}/.omp/profiles/inactive/agent/"
+    e2e_assert_not_contains "named OMP profile does not also advertise default config" \
+      "${OMP_ACTIVE_DETECT_OUT}" "${FAKE_HOME}/.omp/agent/mcp.json"
+    e2e_assert_not_contains "OMP_PROFILE wins over default coding-agent override" \
+      "${OMP_ACTIVE_DETECT_OUT}" "${FAKE_HOME}/custom-agent/mcp.json"
+
+    OMP_CUSTOM_DETECT_OUT="$(
+      # shellcheck disable=SC1090
+      source "${OMP_DETECT_LIBRARY}"
+      unset OMP_PROFILE PI_PROFILE
+      PI_CODING_AGENT_DIR="${FAKE_HOME}/custom-agent" detect_mcp_configs "${FAKE_HOME}"
+    )"
+    e2e_assert_contains "default OMP coding-agent override is advertised" \
+      "${OMP_CUSTOM_DETECT_OUT}" "${FAKE_HOME}/custom-agent/mcp.json"
+    e2e_assert_not_contains "custom OMP agent dir does not also advertise default config" \
+      "${OMP_CUSTOM_DETECT_OUT}" "${FAKE_HOME}/.omp/agent/mcp.json"
+    e2e_assert_not_contains "custom OMP agent dir does not advertise inactive profiles" \
+      "${OMP_CUSTOM_DETECT_OUT}" "${FAKE_HOME}/.omp/profiles/"
+
+    OMP_DEFAULT_DETECT_OUT="$(
+      # shellcheck disable=SC1090
+      source "${OMP_DETECT_LIBRARY}"
+      unset OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+      detect_mcp_configs "${FAKE_HOME}"
+    )"
+    e2e_assert_contains "default OMP agent config is advertised without overrides" \
+      "${OMP_DEFAULT_DETECT_OUT}" "${FAKE_HOME}/.omp/agent/mcp.json"
+    e2e_assert_not_contains "default OMP discovery does not advertise inactive profiles" \
+      "${OMP_DEFAULT_DETECT_OUT}" "${FAKE_HOME}/.omp/profiles/"
+
+    set +e
     OMP_SYMLINK_DETECT_OUT="$(
       # shellcheck disable=SC1090
       source "${OMP_DETECT_LIBRARY}"
+      err() { printf '%s\n' "$*" >&2; }
       OMP_PROFILE=linked detect_mcp_configs "${FAKE_HOME}"
     )"
+    OMP_SYMLINK_DETECT_RC=$?
+    set -e
+    e2e_assert_exit_code "symlinked active OMP profile fails closed" \
+      "2" "${OMP_SYMLINK_DETECT_RC}"
     e2e_assert_not_contains "symlinked OMP profile is not followed" \
       "${OMP_SYMLINK_DETECT_OUT}" "/profiles/linked/"
   fi
