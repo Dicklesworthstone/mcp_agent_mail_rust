@@ -33,9 +33,14 @@ FAKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/fresh_install_home.XXXXXX")"
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 FAKE_DEST="${FAKE_HOME}/.local/bin"
 mkdir -p "$FAKE_DEST"
+AM_E2E_PRESERVE_TEMP="${AM_E2E_PRESERVE_TEMP:-0}"
 
 cleanup_fresh() {
-  rm -rf "$FAKE_HOME" 2>/dev/null || true
+  if [ "$AM_E2E_PRESERVE_TEMP" = "1" ]; then
+    printf 'Preserved fresh-install sandbox: %s\n' "$FAKE_HOME" >&2
+  else
+    rm -rf "$FAKE_HOME" 2>/dev/null || true
+  fi
 }
 trap cleanup_fresh EXIT
 
@@ -112,7 +117,11 @@ set -e
 
 e2e_save_artifact "case_04_am_type.txt" "command -v: ${AM_TYPE_OUT}\nfile: ${AM_FILE_TYPE}"
 e2e_assert_exit_code "command -v am" "0" "$AM_TYPE_RC"
-e2e_assert_contains "am is ELF binary" "$AM_FILE_TYPE" "ELF"
+case "$AM_FILE_TYPE" in
+  *ELF*|*Mach-O*) AM_NATIVE_BINARY="yes" ;;
+  *) AM_NATIVE_BINARY="no" ;;
+esac
+e2e_assert_eq "am is a native binary" "yes" "$AM_NATIVE_BINARY"
 
 # ===========================================================================
 # Case 5: PATH includes ~/.local/bin
@@ -229,7 +238,11 @@ else
   fi
 fi
 
-rm -rf "$SRV_WORK" 2>/dev/null || true
+if [ "$AM_E2E_PRESERVE_TEMP" = "1" ]; then
+  printf 'Preserved stdio sandbox: %s\n' "$SRV_WORK" >&2
+else
+  rm -rf "$SRV_WORK" 2>/dev/null || true
+fi
 
 # ===========================================================================
 # Case 9: install.sh detect_mcp_configs works in isolated env
@@ -454,7 +467,9 @@ set -e
 # ===========================================================================
 e2e_case_banner "Installer migration: no null-byte warning and CLI-mode override"
 
-if ! command -v sqlite3 >/dev/null 2>&1; then
+if [ "${AM_E2E_SKIP_INSTALLER_MIGRATION:-0}" = "1" ]; then
+  e2e_skip "AM_E2E_SKIP_INSTALLER_MIGRATION=1; skipping installer migration robustness case"
+elif ! command -v sqlite3 >/dev/null 2>&1; then
   e2e_skip "sqlite3 unavailable; skipping installer migration robustness case"
 else
   INSTALL_HOME="$(mktemp -d "${TMPDIR:-/tmp}/fresh_install_migrate.XXXXXX")"
@@ -580,7 +595,11 @@ EOF
     e2e_assert_eq "legacy am alias/function disabled in $(basename "${rc}")" "0" "${ACTIVE_ALIAS_COUNT}"
   done
 
-  rm -rf "${INSTALL_HOME}" 2>/dev/null || true
+  if [ "$AM_E2E_PRESERVE_TEMP" = "1" ]; then
+    printf 'Preserved migration sandbox: %s\n' "$INSTALL_HOME" >&2
+  else
+    rm -rf "${INSTALL_HOME}" 2>/dev/null || true
+  fi
 fi
 
 # ===========================================================================

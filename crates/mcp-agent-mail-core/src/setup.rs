@@ -1954,13 +1954,13 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     } else {
         repo_probe.skip_flock()
     }
-        .run()
-        .map_err(|error| {
-            SetupError::Other(format!(
-                "cannot verify whether secret config {} is Git-tracked: {error}",
-                path.display()
-            ))
-        })?;
+    .run()
+    .map_err(|error| {
+        SetupError::Other(format!(
+            "cannot verify whether secret config {} is Git-tracked: {error}",
+            path.display()
+        ))
+    })?;
     if !repo_probe.status.success() {
         let stderr = String::from_utf8_lossy(&repo_probe.stderr);
         if stderr.contains("not a git repository") {
@@ -4205,10 +4205,7 @@ mod tests {
             panic!("symlinked .gitignore must fail closed in dry-run: {results:?}");
         };
         assert!(error.contains("must not be a symlink"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(&config).unwrap(),
-            original_config
-        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original_config);
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
             original_gitignore
