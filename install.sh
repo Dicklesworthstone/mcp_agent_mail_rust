@@ -3071,6 +3071,9 @@ detect_mcp_configs() {
   local key
   local exists_flag
   local omp_config_name
+  local omp_config_component
+  local omp_config_cursor
+  local omp_config_path_error=0
   local omp_config_root
   local omp_profile
   local omp_profile_base
@@ -3078,6 +3081,7 @@ detect_mcp_configs() {
   local omp_profiles_root
   local omp_profile_error=0
   local -a candidates=()
+  local -a omp_config_components=()
 
   if [ -n "$home_dir" ]; then
     # Claude Desktop only. Claude Code does NOT read MCP server
@@ -3112,7 +3116,35 @@ detect_mcp_configs() {
     while [ "${omp_config_name#/}" != "$omp_config_name" ]; do
       omp_config_name="${omp_config_name#/}"
     done
-    omp_config_root="${home_dir}/${omp_config_name}"
+    omp_config_cursor="${home_dir%/}"
+    [ -n "$omp_config_cursor" ] || omp_config_cursor="/"
+    IFS='/' read -r -a omp_config_components <<< "$omp_config_name"
+    for omp_config_component in "${omp_config_components[@]}"; do
+      case "$omp_config_component" in
+        "" | .) continue ;;
+        ..)
+          err "PI_CONFIG_DIR contains parent traversal; refusing OMP authority: ${PI_CONFIG_DIR}"
+          omp_config_path_error=2
+          break
+          ;;
+      esac
+      if [ "$omp_config_cursor" = "/" ]; then
+        omp_config_cursor="/${omp_config_component}"
+      else
+        omp_config_cursor="${omp_config_cursor}/${omp_config_component}"
+      fi
+      if [ -L "$omp_config_cursor" ]; then
+        err "PI_CONFIG_DIR contains a symlinked component; refusing OMP authority: ${omp_config_cursor}"
+        omp_config_path_error=2
+        break
+      fi
+      if [ -e "$omp_config_cursor" ] && [ ! -d "$omp_config_cursor" ]; then
+        err "PI_CONFIG_DIR contains a non-directory component; refusing OMP authority: ${omp_config_cursor}"
+        omp_config_path_error=2
+        break
+      fi
+    done
+    omp_config_root="$omp_config_cursor"
     omp_profiles_root="${omp_config_root}/profiles"
     omp_profile=""
     if [ "${OMP_PROFILE+x}" = "x" ]; then
@@ -3123,7 +3155,9 @@ detect_mcp_configs() {
     omp_profile="${omp_profile#"${omp_profile%%[![:space:]]*}"}"
     omp_profile="${omp_profile%"${omp_profile##*[![:space:]]}"}"
     omp_profile_base="${omp_profile%%.*}"
-    if [ -n "$omp_profile" ] \
+    if [ "$omp_config_path_error" -ne 0 ]; then
+      omp_profile_error=2
+    elif [ -n "$omp_profile" ] \
       && [ "$omp_profile" != "default" ] \
       && printf '%s\n' "$omp_profile" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' \
       && ! printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' \
@@ -3142,8 +3176,21 @@ detect_mcp_configs() {
       err "Invalid OMP profile \"${omp_profile}\". Profile names must match ^[a-z0-9][a-z0-9._-]{0,63}$ and cannot be '.', '..', end with '.', or use a Windows reserved device name."
       omp_profile_error=2
     elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
-      candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
-      candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
+      case "$PI_CODING_AGENT_DIR" in
+        /*)
+          if [ -L "$PI_CODING_AGENT_DIR" ]; then
+            err "PI_CODING_AGENT_DIR is a symlink; refusing OMP authority: ${PI_CODING_AGENT_DIR}"
+            omp_profile_error=2
+          else
+            candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
+            candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
+          fi
+          ;;
+        *)
+          err "PI_CODING_AGENT_DIR must be absolute; refusing cwd-relative OMP authority: ${PI_CODING_AGENT_DIR}"
+          omp_profile_error=2
+          ;;
+      esac
     else
       candidates+=("omp|${omp_config_root}/agent/mcp.json")
       candidates+=("omp|${omp_config_root}/agent/.mcp.json")

@@ -149,15 +149,33 @@ pub fn detect_mcp_config_mutation_locations(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let project_omp_primary = project_dir.join(".omp").join("mcp.json");
+    let mut read_only_omp_paths = HashSet::from([
+        project_dir.join(".omp").join(".mcp.json"),
+        project_dir.join("mcp.json"),
+        project_dir.join(".mcp.json"),
+    ]);
+    if let Some(active) = active_omp_user_config.as_ref() {
+        let hidden = active.with_file_name(".mcp.json");
+        if hidden != *active {
+            read_only_omp_paths.insert(hidden);
+        }
+    }
 
     detect_mcp_config_locations(params)
         .into_iter()
         .filter(|location| {
+            // Filter physical compatibility paths before considering the tool
+            // label. Project `.mcp.json` is emitted twice (Claude and OMP); a
+            // tool-only filter would leave the Claude alias writable and let a
+            // doctor fixer mutate OMP's read-only root fallback anyway.
+            if read_only_omp_paths.contains(&location.config_path) {
+                return false;
+            }
             location.tool != McpConfigTool::Omp
-                || (active_omp_user_config
+                || active_omp_user_config
                     .as_ref()
                     .is_some_and(|active| location.config_path.as_path() == active.as_path())
-                    || location.config_path.as_path() == project_omp_primary.as_path())
+                || location.config_path.as_path() == project_omp_primary.as_path()
         })
         .collect()
 }
@@ -743,6 +761,15 @@ fn add_home_omp_candidates(
 
 fn omp_config_path_is_unsafe(config: &Path) -> bool {
     if !config.is_absolute() {
+        return true;
+    }
+    // Validate the complete lexical shape before probing the filesystem. If a
+    // missing ancestor returned early first, a later `..` could evade this
+    // check and become live after setup creates the missing directory.
+    if config
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return true;
     }
     let Some(parent) = config.parent() else {

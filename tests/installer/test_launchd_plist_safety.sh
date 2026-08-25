@@ -315,6 +315,55 @@ relative_home_targets="$(
 [ -z "$relative_home_targets" ] \
     || fail "production detector accepted cwd-relative HOME authority"
 
+relative_agent_root="$tmp/relative-agent-root"
+relative_agent_home="$tmp/relative-agent-home"
+mkdir -p "$relative_agent_root/relative-agent" "$relative_agent_home"
+printf '%s\n' '{}' >"$relative_agent_root/relative-agent/mcp.json"
+set +e
+relative_agent_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" PI_CODING_AGENT_DIR=relative-agent \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+relative_agent_rc=$?
+set -e
+[ "$relative_agent_rc" -eq 2 ] \
+    || fail "cwd-relative PI_CODING_AGENT_DIR returned $relative_agent_rc instead of 2"
+[ -z "$relative_agent_targets" ] \
+    || fail "production detector emitted a cwd-relative OMP target"
+
+symlink_config_home="$tmp/symlink-config-home"
+symlink_config_target="$tmp/symlink-config-target"
+mkdir -p "$symlink_config_home" "$symlink_config_target/nested/agent"
+printf '%s\n' '{}' >"$symlink_config_target/nested/agent/mcp.json"
+ln -s "$symlink_config_target" "$symlink_config_home/custom-root"
+set +e
+symlink_config_targets="$(
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$symlink_config_home" PI_CONFIG_DIR=custom-root/nested \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+symlink_config_rc=$?
+set -e
+[ "$symlink_config_rc" -eq 2 ] \
+    || fail "symlinked PI_CONFIG_DIR ancestry returned $symlink_config_rc instead of 2"
+[ -z "$symlink_config_targets" ] \
+    || fail "production detector emitted an OMP target through symlinked PI_CONFIG_DIR ancestry"
+
+set +e
+traversal_config_targets="$(
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$relative_agent_home" PI_CONFIG_DIR=../relative-agent-root/relative-agent \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+traversal_config_rc=$?
+set -e
+[ "$traversal_config_rc" -eq 2 ] \
+    || fail "parent-traversing PI_CONFIG_DIR returned $traversal_config_rc instead of 2"
+[ -z "$traversal_config_targets" ] \
+    || fail "production detector emitted an OMP target through PI_CONFIG_DIR traversal"
+
 step "scenario J: OMP-only targets activate healthy and unhealthy readiness lanes"
 omp_only_config="$tmp/omp-only-mcp.json"
 printf '%s\n' '{}' >"$omp_only_config"
