@@ -295,8 +295,7 @@ where
         previous_seq = seq_value,
         previous_sequence_rows = seq_row_count,
         new_seq = persisted_floor,
-        "advanced messages id allocator: archive_latest_message_id > db_max(messages); \
-         subsequent INSERTs will receive ids strictly greater than the archive (mcp_agent_mail#160)"
+        "repaired or advanced the messages id allocator; subsequent INSERTs will remain strictly above the durable database/archive floor (mcp_agent_mail#160)"
     );
 
     Ok(Some(persisted_floor))
