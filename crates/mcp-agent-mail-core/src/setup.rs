@@ -1920,7 +1920,12 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
 
     let tracked_probe = crate::git_cmd::GitCmd::new(&repo_root)
         .env("LC_ALL", "C")
-        .args(["ls-files", "--error-unmatch", "--"])
+        .args([
+            "--literal-pathspecs",
+            "ls-files",
+            "--error-unmatch",
+            "--",
+        ])
         .arg(relative.as_os_str())
         .run()
         .map_err(|error| {
@@ -2146,7 +2151,10 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
                     std::path::Component::Normal(_) | std::path::Component::CurDir
                 )
             }) {
-                let entry = relative.to_string_lossy().replace('\\', "/");
+                let entry = format!(
+                    "/{}",
+                    escape_gitignore_literal(&relative.to_string_lossy().replace('\\', "/"))
+                );
                 if !entry.is_empty() && !entries.contains(&entry) {
                     entries.push(entry);
                 }
@@ -3936,6 +3944,63 @@ mod tests {
             .filter_map(Result::ok)
             .find(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
             .expect("token rotation must preserve the old config in a backup");
+        assert!(
+            std::fs::read_to_string(backup.path())
+                .unwrap()
+                .contains("Bearer old-secret-token")
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status = String::from_utf8(status.stdout).unwrap();
+        assert!(!status.contains(".omp/"), "secret artifacts leaked: {status}");
+        assert!(!status.contains(".bak"), "backup leaked: {status}");
+    }
+
+    #[test]
+    fn run_setup_token_removal_protects_backup_of_old_literal_secret() {
+        let tmp = setup_real_tempdir();
+        let config = tmp.path().join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","enabled":true,"headers":{"Authorization":"Bearer old-secret-token"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let params = SetupParams {
+            token: String::new(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+
+        let result = run_setup(&params);
+        assert!(matches!(
+            result[0].actions[0].outcome,
+            ActionOutcome::Updated
+        ));
+        assert!(!std::fs::read_to_string(&config).unwrap().contains("old-secret-token"));
+        let backup = std::fs::read_dir(config.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .expect("old literal secret must be backed up before removal");
         assert!(
             std::fs::read_to_string(backup.path())
                 .unwrap()
