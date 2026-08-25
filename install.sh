@@ -4630,7 +4630,7 @@ mcp_config_must_skip_shell_write() {
         verbose "setup_mcp_configs:skip tool=omp path=${path} reason=secondary_authority_is_read_only"
         return 0
         ;;
-      "$project_dir/mcp.json"|"$project_dir/.mcp.json")
+      "$project_dir/mcp.json")
         verbose "setup_mcp_configs:skip tool=omp path=${path} reason=portable_fallback_left_untouched"
         return 0
         ;;

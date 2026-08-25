@@ -1345,6 +1345,36 @@ pub fn omp_active_user_config_path(params: &SetupParams) -> PathBuf {
         .unwrap_or_else(|| home.join(".omp").join("agent").join("mcp.json"))
 }
 
+fn omp_active_user_secondary_config_path(params: &SetupParams) -> PathBuf {
+    omp_active_user_config_path(params)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".mcp.json")
+}
+
+/// Return OMP's native MCP discovery inputs in exact first-wins load order.
+///
+/// Setup writes only the canonical `mcp.json` files. The `.mcp.json` siblings
+/// remain read-only runtime authorities: a repeated server name is shadowed by
+/// its earlier canonical definition, while a distinct Agent Mail alias remains
+/// a separate live MCP key.
+#[must_use]
+pub fn omp_mcp_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
+    let candidates = [
+        params.project_dir.join(".omp/mcp.json"),
+        params.project_dir.join(".omp/.mcp.json"),
+        omp_active_user_config_path(params),
+        omp_active_user_secondary_config_path(params),
+    ];
+    let mut paths = Vec::with_capacity(candidates.len());
+    for path in candidates {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 fn omp_active_user_settings_paths(params: &SetupParams) -> (PathBuf, PathBuf) {
     let user_config = omp_active_user_config_path(params);
     let agent_dir = user_config
@@ -2605,6 +2635,10 @@ pub struct ConfigFileStatus {
     /// reasons and remediation already describe the operator-facing result.
     #[serde(skip_serializing)]
     pub omp_active_user_config_drift: bool,
+    /// Whether another OMP-native MCP input contributes a distinct live Agent
+    /// Mail alias that is not shadowed by the canonical primary entry.
+    #[serde(skip_serializing)]
+    pub omp_mcp_alias_drift: bool,
     /// Whether OMP's effective settings authority either excludes project MCP
     /// sources or could not be evaluated safely.
     #[serde(skip_serializing)]
@@ -2708,6 +2742,17 @@ struct OmpActiveUserConfigInspection {
     observation: ConfigStatusFileObservation,
     disabled: bool,
     unsupported: bool,
+}
+
+struct OmpMcpAliasInspection {
+    observations: Vec<ConfigStatusFileObservation>,
+    conflict_paths: Vec<PathBuf>,
+}
+
+impl OmpMcpAliasInspection {
+    fn has_drift(&self) -> bool {
+        !self.conflict_paths.is_empty()
+    }
 }
 
 struct OmpSettingsAuthorityInspection {
@@ -3204,6 +3249,52 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
         disabled,
         unsupported,
     }
+}
+
+fn omp_mcp_entry_can_claim_runtime_key(entry: &Value) -> bool {
+    entry.as_object().is_some_and(|entry| {
+        entry.get("command").is_some() || entry.get("url").is_some()
+    })
+}
+
+fn inspect_omp_mcp_aliases(
+    params: &SetupParams,
+    action_path: &Path,
+) -> OmpMcpAliasInspection {
+    let mut inspection = OmpMcpAliasInspection {
+        observations: Vec::new(),
+        conflict_paths: Vec::new(),
+    };
+    for path in omp_mcp_authority_paths(params) {
+        if path == action_path {
+            continue;
+        }
+        let content = read_setup_file(&path, "OMP native MCP authority");
+        inspection
+            .observations
+            .push(config_status_file_observation(&path, &content));
+        let Ok(Some((content, _))) = content else {
+            // Discovery skips missing, unreadable, and malformed secondary
+            // native files. The canonical action and user denylist have their
+            // own strict status checks.
+            continue;
+        };
+        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let Some(Value::Object(servers)) = root.get("mcpServers") else {
+            continue;
+        };
+        let has_distinct_alias = OMP_SERVER_ALIASES[1..].iter().any(|alias| {
+            servers
+                .get(*alias)
+                .is_some_and(omp_mcp_entry_can_claim_runtime_key)
+        });
+        if has_distinct_alias {
+            inspection.conflict_paths.push(path);
+        }
+    }
+    inspection
 }
 
 fn normalize_jsonc(content: &str) -> Result<String, ()> {

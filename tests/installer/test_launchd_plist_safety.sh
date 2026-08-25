@@ -46,6 +46,9 @@ extract_function() {
 {
     printf '%s\n' 'warn() { printf "%s\n" "$*" >&2; }'
     printf '%s\n' 'verbose() { printf "%s\n" "$*" >&2; }'
+    printf '%s\n' 'info() { :; }'
+    printf '%s\n' 'ok() { :; }'
+    printf '%s\n' 'err() { :; }'
     extract_function trim_ascii_whitespace
     extract_function strip_wrapping_quotes
     extract_function parse_env_assignment_rhs
@@ -61,9 +64,11 @@ extract_function() {
     extract_function ensure_real_file_target_path
     extract_function write_launchd_service_plist
     extract_function repair_launchd_service_env_from_rust_config
+    extract_function has_remote_http_client_targets
+    extract_function ensure_remote_http_client_readiness
 } >"$extract"
 
-for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config has_remote_http_client_targets ensure_remote_http_client_readiness; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -82,7 +87,7 @@ path_xdg="$tmp/path-xdg"
 [ "$(HOME="$path_home" XDG_CONFIG_HOME="$path_xdg" rust_config_env_path)" = \
     "$path_xdg/mcp-agent-mail/config.env" ] \
     || fail "absolute XDG_CONFIG_HOME was not selected"
-[ "$(HOME="$path_home" XDG_CONFIG_HOME= rust_config_env_path)" = \
+[ "$(HOME="$path_home" XDG_CONFIG_HOME='' rust_config_env_path)" = \
     "$path_home/.config/mcp-agent-mail/config.env" ] \
     || fail "empty XDG_CONFIG_HOME did not fall back to HOME"
 [ "$(HOME="$path_home" XDG_CONFIG_HOME=relative-config rust_config_env_path)" = \
@@ -287,5 +292,54 @@ if (
 ); then
     fail "launchctl bootstrap failure was reported as successful"
 fi
+
+step "scenario J: OMP-only targets activate healthy and unhealthy readiness lanes"
+omp_only_config="$tmp/omp-only-mcp.json"
+printf '%s\n' '{}' >"$omp_only_config"
+readiness_home="$tmp/readiness-home"
+readiness_path="$tmp/readiness-empty-path"
+readiness_dest="$tmp/readiness-bin"
+mkdir -p "$readiness_home" "$readiness_path" "$readiness_dest"
+remote_scan_mode=omp
+detect_mcp_configs() {
+    if [ "$remote_scan_mode" = "omp" ]; then
+        printf 'omp\t%s\t1\n' "$omp_only_config"
+    fi
+}
+desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+REMOTE_PROBE_CALLS=0
+probe_remote_http_endpoint() {
+    REMOTE_PROBE_CALLS=$((REMOTE_PROBE_CALLS + 1))
+    REMOTE_HTTP_PROBE_DETAIL="test-probe"
+    return 0
+}
+HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness \
+    || fail "healthy OMP-only readiness lane failed"
+[ "$REMOTE_PROBE_CALLS" -eq 1 ] || fail "OMP-only target did not run the healthy endpoint probe"
+
+cat >"$readiness_dest/am" <<'EOF'
+#!/bin/sh
+exit 64
+EOF
+chmod 755 "$readiness_dest/am"
+probe_remote_http_endpoint() {
+    REMOTE_PROBE_CALLS=$((REMOTE_PROBE_CALLS + 1))
+    return 1
+}
+service_management_allowed() { return 0; }
+platform_supports_user_service_management() { return 0; }
+DEST="$readiness_dest"
+BIN_CLI=am
+if HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness; then
+    fail "unhealthy OMP-only readiness lane was reported as successful"
+fi
+
+step "scenario K: readiness still skips when no remote HTTP client is present"
+remote_scan_mode=none
+REMOTE_PROBE_CALLS=0
+if ! HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness; then
+    fail "no-client readiness skip returned failure"
+fi
+[ "$REMOTE_PROBE_CALLS" -eq 0 ] || fail "no-client readiness skip still probed the endpoint"
 
 step "ALL SCENARIOS PASSED"
