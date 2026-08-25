@@ -522,6 +522,11 @@ fi
 no_verify_line=$(grep -nF 'if [ "$NO_VERIFY" -eq 1 ]; then' "$INSTALL_SH" | tail -1 | cut -d: -f1)
 verify_call_line=$(grep -nF 'verify_release_archive "$TMP/$TAR" "$URL" "$TAR"' "$INSTALL_SH" | cut -d: -f1)
 extract_line=$(grep -nF 'tar -xf "$TMP/$TAR" -C "$TMP"' "$INSTALL_SH" | cut -d: -f1)
+if ! grep -Fxq 'NO_VERIFY=0' "$INSTALL_SH" || \
+    ! grep -Fq -- '--no-verify) NO_VERIFY=1; shift;;' "$INSTALL_SH"; then
+    echo "FAIL: Unix archive verification must default on and require an explicit --no-verify escape" >&2
+    exit 1
+fi
 if [ -z "$no_verify_line" ] || [ -z "$verify_call_line" ] || [ -z "$extract_line" ] || \
     [ "$no_verify_line" -ge "$verify_call_line" ] || [ "$verify_call_line" -ge "$extract_line" ]; then
     echo "FAIL: Unix verification/bypass gate must be explicit and precede extraction" >&2
@@ -544,6 +549,10 @@ fi
 ps_gate_line=$(grep -nF 'if ($ShouldVerifyArchive) {' "$INSTALL_PS1" | cut -d: -f1)
 ps_sigstore_line=$(grep -nF 'Verify-SigstoreBundle -FilePath $zipPath' "$INSTALL_PS1" | cut -d: -f1)
 ps_extract_line=$(grep -nF 'Expand-Archive -LiteralPath $zipPath' "$INSTALL_PS1" | cut -d: -f1)
+if ! grep -Fq '$ShouldVerifyArchive = if ($NoVerify) { $false } else { $true }' "$INSTALL_PS1"; then
+    echo "FAIL: PowerShell archive verification must default on and require an explicit -NoVerify escape" >&2
+    exit 1
+fi
 if [ -z "$ps_gate_line" ] || [ -z "$ps_sigstore_line" ] || [ -z "$ps_extract_line" ] || \
     [ "$ps_gate_line" -ge "$ps_sigstore_line" ] || [ "$ps_sigstore_line" -ge "$ps_extract_line" ]; then
     echo "FAIL: PowerShell checksum/Sigstore gate must precede Expand-Archive" >&2

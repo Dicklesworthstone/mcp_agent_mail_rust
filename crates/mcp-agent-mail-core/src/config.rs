@@ -3393,7 +3393,7 @@ fn user_env_file_candidates(
 }
 
 fn read_open_user_env_file_bounded(
-    mut file: std::fs::File,
+    file: &mut std::fs::File,
     path: &Path,
 ) -> io::Result<Vec<u8>> {
     let metadata = file.metadata()?;
@@ -3432,6 +3432,25 @@ fn read_open_user_env_file_bounded(
         ));
     }
     Ok(bytes)
+}
+
+fn revalidate_open_user_env_leaf(path: &Path, file: std::fs::File) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed regular-file authority during read", path.display()),
+        ));
+    }
+    let opened = same_file::Handle::from_file(file)?;
+    let observed = same_file::Handle::from_path(path)?;
+    if opened != observed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed file identity during read", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "redox")))]
@@ -3476,8 +3495,26 @@ fn read_user_env_candidate_with_hooks(
         Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
     };
     after_file_open();
-    let file = std::fs::File::from(file_fd);
-    read_open_user_env_file_bounded(file, path).map(Some)
+    let mut file = std::fs::File::from(file_fd);
+    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    revalidate_open_user_env_leaf(path, file)?;
+
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory authority during read", parent.display()),
+        ));
+    }
+    let opened_parent = same_file::Handle::from_file(std::fs::File::from(parent_fd))?;
+    let observed_parent = same_file::Handle::from_path(parent)?;
+    if opened_parent != observed_parent {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory identity during read", parent.display()),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 #[cfg(not(all(unix, not(target_os = "redox"))))]
@@ -3550,7 +3587,7 @@ fn read_user_env_candidate_with_hooks(
     // read and rejects any observed replacement.
     let parent_before = same_file::Handle::from_path(parent)?;
     after_parent_open();
-    let file = match crate::disk::open_regular_file_no_follow(path) {
+    let mut file = match crate::disk::open_regular_file_no_follow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             revalidate_user_env_parent(parent, &parent_before)?;
@@ -3559,7 +3596,8 @@ fn read_user_env_candidate_with_hooks(
         Err(error) => return Err(error),
     };
     after_file_open();
-    let bytes = read_open_user_env_file_bounded(file, path)?;
+    let bytes = read_open_user_env_file_bounded(&mut file, path)?;
+    revalidate_open_user_env_leaf(path, file)?;
     revalidate_user_env_parent(parent, &parent_before)?;
     Ok(Some(bytes))
 }
@@ -5722,7 +5760,7 @@ mod tests {
 
     #[cfg(all(unix, not(target_os = "redox")))]
     #[test]
-    fn user_env_parent_handle_remains_bound_across_path_replacement() {
+    fn user_env_parent_path_replacement_is_rejected_after_bound_read() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("authority");
         let replacement = tmp.path().join("replacement");
@@ -5733,7 +5771,7 @@ mod tests {
         std::fs::write(replacement.join("config.env"), "FOO=swapped\n").unwrap();
         let candidate = parent.join("config.env");
 
-        let bytes = read_user_env_candidate_with_hooks(
+        let error = read_user_env_candidate_with_hooks(
             &candidate,
             || {
                 std::fs::rename(&parent, &detached).unwrap();
@@ -5741,14 +5779,13 @@ mod tests {
             },
             || {},
         )
-        .unwrap()
-        .expect("bound candidate");
-        assert_eq!(String::from_utf8(bytes).unwrap(), "FOO=bound\n");
+        .expect_err("parent replacement must invalidate the authority");
+        assert!(error.to_string().contains("identity"));
     }
 
     #[cfg(all(unix, not(target_os = "redox")))]
     #[test]
-    fn user_env_leaf_handle_remains_bound_across_path_replacement() {
+    fn user_env_leaf_path_replacement_is_rejected_after_bound_read() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("authority");
         let displaced = tmp.path().join("displaced.env");
@@ -5756,7 +5793,7 @@ mod tests {
         let candidate = parent.join("config.env");
         std::fs::write(&candidate, "FOO=bound\n").unwrap();
 
-        let bytes = read_user_env_candidate_with_hooks(
+        let error = read_user_env_candidate_with_hooks(
             &candidate,
             || {},
             || {
@@ -5764,9 +5801,8 @@ mod tests {
                 std::fs::write(&candidate, "FOO=swapped\n").unwrap();
             },
         )
-        .unwrap()
-        .expect("bound candidate");
-        assert_eq!(String::from_utf8(bytes).unwrap(), "FOO=bound\n");
+        .expect_err("leaf replacement must invalidate the authority");
+        assert!(error.to_string().contains("identity"));
     }
 
     #[test]
