@@ -69,6 +69,7 @@ extract_function() {
     extract_function write_private_file_atomic
     extract_function write_launchd_service_plist
     extract_function repair_launchd_service_env_from_rust_config
+    extract_function trusted_system_directory_alias_target
     extract_function detect_mcp_configs
     extract_function remote_http_client_target_tools
     extract_function has_remote_http_client_targets
@@ -77,7 +78,7 @@ extract_function() {
     sed -n '/^install_legacy_launcher_takeover_shims() {/,/^# T1\.5:/p' "$INSTALL_SH" | sed '$d'
 } >"$extract"
 
-for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config trusted_system_directory_alias_target detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -344,6 +345,21 @@ absolute_agent_targets="$(
 )"
 [ "$absolute_agent_targets" = "omp" ] \
     || fail "production detector rejected an absolute PI_CODING_AGENT_DIR authority"
+
+trusted_alias_body="$(extract_function trusted_system_directory_alias_target)"
+for trusted_alias_mapping in \
+    '/var) expected="/private/var"' \
+    '/tmp) expected="/private/tmp"' \
+    '/etc) expected="/private/etc"'; do
+    printf '%s\n' "$trusted_alias_body" | grep -Fq "$trusted_alias_mapping" \
+        || fail "trusted system alias policy is missing exact mapping: $trusted_alias_mapping"
+done
+printf '%s\n' "$trusted_alias_body" \
+    | grep -Fq 'resolved=$(CDPATH= cd -P "$path" 2>/dev/null && pwd -P)' \
+    || fail "trusted system alias policy does not bind the physical destination"
+printf '%s\n' "$trusted_alias_body" \
+    | grep -Fq '[ "$resolved" = "$expected" ] || return 1' \
+    || fail "trusted system alias policy accepts a retargeted root alias"
 
 symlink_agent_root="$tmp/symlink-agent-root"
 symlink_agent_target="$tmp/symlink-agent-target"

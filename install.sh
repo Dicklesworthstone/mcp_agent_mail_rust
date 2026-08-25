@@ -3063,6 +3063,41 @@ activate_mac_python_cli_compat_shell() {
   esac
 }
 
+trusted_system_directory_alias_target() {
+  local path="$1"
+  local expected
+  local platform="${OS:-}"
+  local resolved
+
+  # Match the Rust disk guard's macOS compatibility policy exactly: only the
+  # three root-owned aliases below may be followed, and only when their
+  # physical destination is the corresponding directory under /private.
+  # Every user-controlled or retargeted symlink remains a hard refusal.
+  if [ -z "$platform" ]; then
+    if [ -x /usr/bin/uname ]; then
+      platform=$(/usr/bin/uname -s 2>/dev/null) || return 1
+    elif [ -x /bin/uname ]; then
+      platform=$(/bin/uname -s 2>/dev/null) || return 1
+    else
+      return 1
+    fi
+  fi
+  case "$platform" in
+    Darwin|darwin) ;;
+    *) return 1 ;;
+  esac
+  case "$path" in
+    /var) expected="/private/var" ;;
+    /tmp) expected="/private/tmp" ;;
+    /etc) expected="/private/etc" ;;
+    *) return 1 ;;
+  esac
+
+  resolved=$(CDPATH= cd -P "$path" 2>/dev/null && pwd -P) || return 1
+  [ "$resolved" = "$expected" ] || return 1
+  printf '%s\n' "$resolved"
+}
+
 detect_mcp_configs() {
   local project_dir="${1:-$PWD}"
   local home_dir="${HOME:-}"
@@ -3075,6 +3110,7 @@ detect_mcp_configs() {
   local exists_flag
   local omp_agent_component
   local omp_agent_cursor
+  local omp_agent_resolved
   local omp_agent_path_error=0
   local omp_config_name
   local omp_config_component
@@ -3202,9 +3238,14 @@ detect_mcp_configs() {
               omp_agent_cursor="${omp_agent_cursor}/${omp_agent_component}"
             fi
             if [ -L "$omp_agent_cursor" ]; then
-              err "PI_CODING_AGENT_DIR contains a symlinked component; refusing OMP authority: ${omp_agent_cursor}"
-              omp_agent_path_error=2
-              break
+              if omp_agent_resolved=$(trusted_system_directory_alias_target "$omp_agent_cursor"); then
+                omp_agent_cursor="$omp_agent_resolved"
+                continue
+              else
+                err "PI_CODING_AGENT_DIR contains a symlinked component; refusing OMP authority: ${omp_agent_cursor}"
+                omp_agent_path_error=2
+                break
+              fi
             fi
             if [ -e "$omp_agent_cursor" ] && [ ! -d "$omp_agent_cursor" ]; then
               err "PI_CODING_AGENT_DIR contains a non-directory component; refusing OMP authority: ${omp_agent_cursor}"
