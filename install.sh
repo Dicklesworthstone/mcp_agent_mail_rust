@@ -2322,6 +2322,34 @@ private_file_link_count() {
   stat -f '%l' "$path" 2>/dev/null || stat -c '%h' "$path" 2>/dev/null
 }
 
+# Return one no-follow stat identity only for a mode-0600 regular file with a
+# single link. Including device and inode lets the atomic writer prove that the
+# file published by rename is the exact tempfile it validated beforehand. Both
+# BSD and GNU stat inspect the directory entry itself unless explicitly asked
+# to dereference it, so a swapped symlink fails the type check instead of being
+# followed.
+private_file_security_identity() {
+  local path="$1"
+  local metadata
+
+  if metadata=$(LC_ALL=C stat -f '%d:%i:%HT:%Lp:%l' "$path" 2>/dev/null); then
+    case "$metadata" in
+      *:Regular\ File:600:1)
+        printf '%s' "$metadata"
+        return 0
+        ;;
+    esac
+  elif metadata=$(LC_ALL=C stat -c '%d:%i:%F:%a:%h' "$path" 2>/dev/null); then
+    case "$metadata" in
+      *:regular\ file:600:1)
+        printf '%s' "$metadata"
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
 ensure_private_file_target_path() {
   local path="$1"
   local label="$2"
@@ -2351,6 +2379,8 @@ write_private_file_atomic() {
   local target_identity=""
   local current_identity=""
   local tmpfile=""
+  local tmp_security_identity=""
+  local published_security_identity=""
 
   ensure_private_file_target_path "$path" "$label" || return 1
   if [ -e "$path" ] || [ -L "$path" ]; then
@@ -2368,14 +2398,11 @@ write_private_file_atomic() {
     warn "Could not create a private temporary file for $label: $path"
     return 1
   }
-  if ! chmod 600 "$tmpfile" \
-    || [ -L "$tmpfile" ] \
-    || [ ! -f "$tmpfile" ] \
-    || [ "$(private_file_link_count "$tmpfile")" != "1" ]; then
+  tmp_security_identity=$(private_file_security_identity "$tmpfile") || {
     umask "$previous_umask"
     warn "Private temporary-file validation failed for $label: $tmpfile"
     return 1
-  fi
+  }
   if ! command cat > "$tmpfile"; then
     umask "$previous_umask"
     warn "Could not write private temporary file for $label: $tmpfile"
@@ -2403,11 +2430,14 @@ write_private_file_atomic() {
     warn "$label appeared while its replacement was prepared; refusing to clobber it: $path"
     return 1
   fi
-  if [ -L "$tmpfile" ] \
-    || [ ! -f "$tmpfile" ] \
-    || [ "$(private_file_link_count "$tmpfile")" != "1" ]; then
+  current_identity=$(private_file_security_identity "$tmpfile") || {
     umask "$previous_umask"
     warn "Private temporary file changed before replacement: $tmpfile"
+    return 1
+  }
+  if [ "$current_identity" != "$tmp_security_identity" ]; then
+    umask "$previous_umask"
+    warn "Private temporary file identity changed before replacement: $tmpfile"
     return 1
   fi
   if ! mv -f "$tmpfile" "$path"; then
@@ -2415,9 +2445,14 @@ write_private_file_atomic() {
     warn "Could not atomically replace $label: $path"
     return 1
   fi
-  if ! chmod 600 "$path"; then
+  published_security_identity=$(private_file_security_identity "$path") || {
     umask "$previous_umask"
-    warn "Could not enforce mode 600 on $label: $path"
+    warn "Published $label is not a mode-600, single-link regular file: $path"
+    return 1
+  }
+  if [ "$published_security_identity" != "$tmp_security_identity" ]; then
+    umask "$previous_umask"
+    warn "Published $label is not the validated private temporary file: $path"
     return 1
   fi
   umask "$previous_umask"
@@ -3369,7 +3404,7 @@ remote_http_client_target_tools() {
     omp_present=1
   fi
 
-  if scan=$(detect_mcp_configs "$PWD" 2>/dev/null); then
+  if scan=$(HOME="$home_dir" detect_mcp_configs "$PWD" 2>/dev/null); then
     scan_rc=0
   else
     scan_rc=$?
