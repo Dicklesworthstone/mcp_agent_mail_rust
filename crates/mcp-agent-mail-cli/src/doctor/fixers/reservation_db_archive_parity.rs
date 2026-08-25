@@ -549,8 +549,7 @@ mod tests {
     const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_PATH";
     const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_READY";
     const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_RELEASE";
-    const WAL_WRITER_TEST: &str =
-        "doctor::fixers::reservation_db_archive_parity::tests::live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix";
+    const WAL_WRITER_TEST: &str = "doctor::fixers::reservation_db_archive_parity::tests::live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix";
     const WAL_WRITER_WITNESS: &str = "RESERVATION_WAL_WRITER_CHILD_RAN";
 
     fn materialize_fixture(
@@ -634,8 +633,7 @@ mod tests {
                 std::env::var(WAL_WRITER_READY_ENV).expect("reservation WAL writer ready path"),
             );
             let release_path = PathBuf::from(
-                std::env::var(WAL_WRITER_RELEASE_ENV)
-                    .expect("reservation WAL writer release path"),
+                std::env::var(WAL_WRITER_RELEASE_ENV).expect("reservation WAL writer release path"),
             );
             let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
                 .expect("open cross-process reservation WAL writer");

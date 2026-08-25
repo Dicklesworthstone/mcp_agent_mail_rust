@@ -208,8 +208,7 @@ mod tests {
     const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_PATH";
     const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_READY";
     const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_RELEASE";
-    const WAL_WRITER_TEST: &str =
-        "doctor::fixers::integrity_page_malformed::tests::live_wal_only_check_violation_is_integrity_truth";
+    const WAL_WRITER_TEST: &str = "doctor::fixers::integrity_page_malformed::tests::live_wal_only_check_violation_is_integrity_truth";
     const WAL_WRITER_WITNESS: &str = "INTEGRITY_WAL_WRITER_CHILD_RAN";
 
     fn make_healthy_db(td: &TempDir) -> PathBuf {
@@ -247,8 +246,7 @@ mod tests {
                      INSERT INTO checked_values(value) VALUES (-1);",
                 )
                 .expect("commit invalid CHECK row only to WAL");
-            std::fs::write(&ready_path, b"ready")
-                .expect("publish integrity WAL writer readiness");
+            std::fs::write(&ready_path, b"ready").expect("publish integrity WAL writer readiness");
             println!("{WAL_WRITER_WITNESS}");
             assert!(
                 super::super::wait_for_cross_process_release(&release_path),

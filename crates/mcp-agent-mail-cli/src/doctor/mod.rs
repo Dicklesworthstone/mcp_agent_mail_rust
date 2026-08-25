@@ -3297,9 +3297,7 @@ mod tests {
             .expect("spawn shared SQLite lock holder");
         let holder = fixers::CrossProcessTestChild::new(holder, release_path);
         if !fixers::wait_for_cross_process_signal(&ready_path) {
-            let output = holder
-                .release_and_wait()
-                .expect("collect unready holder");
+            let output = holder.release_and_wait().expect("collect unready holder");
             panic!(
                 "shared-lock holder never became ready: stdout={} stderr={}",
                 String::from_utf8_lossy(&output.stdout),

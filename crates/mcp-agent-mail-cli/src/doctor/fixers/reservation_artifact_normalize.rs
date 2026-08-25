@@ -497,8 +497,7 @@ mod tests {
     const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_PATH";
     const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_READY";
     const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_RELEASE";
-    const WAL_WRITER_TEST: &str =
-        "doctor::fixers::reservation_artifact_normalize::tests::wal_generation_truth_replaces_stale_quarantine_plan_before_mutation";
+    const WAL_WRITER_TEST: &str = "doctor::fixers::reservation_artifact_normalize::tests::wal_generation_truth_replaces_stale_quarantine_plan_before_mutation";
     const WAL_WRITER_WITNESS: &str = "GENERATION_WAL_WRITER_CHILD_RAN";
 
     fn fixture() -> (TempDir, PathBuf, PathBuf) {
@@ -600,8 +599,7 @@ mod tests {
                      WHERE singleton = 0;"
                 ))
                 .expect("commit current generation only to WAL");
-            std::fs::write(&ready_path, b"ready")
-                .expect("publish generation WAL writer readiness");
+            std::fs::write(&ready_path, b"ready").expect("publish generation WAL writer readiness");
             println!("{WAL_WRITER_WITNESS}");
             assert!(
                 super::super::wait_for_cross_process_release(&release_path),

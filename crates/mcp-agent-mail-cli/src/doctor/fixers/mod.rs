@@ -204,10 +204,7 @@ pub(crate) struct CrossProcessTestChild {
 #[cfg(test)]
 impl CrossProcessTestChild {
     #[must_use]
-    pub(crate) const fn new(
-        child: std::process::Child,
-        release_path: std::path::PathBuf,
-    ) -> Self {
+    pub(crate) const fn new(child: std::process::Child, release_path: std::path::PathBuf) -> Self {
         Self {
             child: Some(child),
             release_path,
