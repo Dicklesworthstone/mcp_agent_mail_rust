@@ -1988,7 +1988,13 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     // read/append, and post-write verification. Locking only the individual
     // Git commands leaves the intervening atomic file rewrite exposed to a
     // lost-update race between concurrent setup/doctor processes.
-    let _secret_guard = if secure_gitignore {
+    let secret_mutex = secure_gitignore.then(|| crate::GitRepoLocks::global().lock_for(&repo_root));
+    let _secret_mutex_guard = secret_mutex.as_ref().map(|mutex| {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let _secret_flock_guard = if secure_gitignore {
         let guard = crate::RepoFlock::acquire(&repo_root).map_err(|error| {
             SetupError::Other(format!(
                 "cannot serialize secret-config protection in {}: {error}",
@@ -2023,6 +2029,7 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     // be redundant (and would deadlock when the outer guard is real).
     let tracked_probe = tracked_probe
         .skip_flock()
+        .skip_mutex()
         .run()
         .map_err(|error| {
             SetupError::Other(format!(
@@ -2074,17 +2081,18 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
             format!("{relative}.bak"),
         ];
         for representative in representative_paths {
+            // `git check-ignore` does not accept the global
+            // `--literal-pathspecs` option. Feed the one pathname through its
+            // NUL-delimited stdin mode instead so Git treats metacharacters as
+            // pathname bytes rather than command-line pathspec magic.
+            let mut pathname = representative.as_bytes().to_vec();
+            pathname.push(0);
             let ignored = crate::git_cmd::GitCmd::new(&repo_root)
                 .env("LC_ALL", "C")
-                .args([
-                    "--literal-pathspecs",
-                    "check-ignore",
-                    "--quiet",
-                    "--no-index",
-                    "--",
-                ])
-                .arg(&representative)
+                .args(["check-ignore", "--no-index", "--stdin", "-z"])
+                .stdin(pathname)
                 .skip_flock()
+                .skip_mutex()
                 .run()
                 .map_err(|error| {
                     SetupError::Other(format!(
@@ -2092,8 +2100,11 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
                     ))
                 })?;
             if !ignored.status.success() {
+                let stderr = String::from_utf8_lossy(&ignored.stderr);
                 return Err(SetupError::Other(format!(
-                    "refusing secret write because .gitignore does not protect artifact {representative}"
+                    "refusing secret write because .gitignore does not protect artifact {representative} (git status {}; {})",
+                    ignored.status,
+                    stderr.trim()
                 )));
             }
         }
