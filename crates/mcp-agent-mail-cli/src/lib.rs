@@ -33666,8 +33666,8 @@ fn fix_mcp_config_entry(
     validate_real_file_target_path(config_path, "MCP config").map_err(|error| error.to_string())?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
-    let secret_write = desired_bearer_token.is_some_and(|token| !token.is_empty())
-        || content.contains("Bearer ");
+    let existing_secret_material =
+        content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN");
 
     if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
         let fixed = fix_mcp_config_toml_text(&content, desired_url, desired_bearer_token)
@@ -33677,6 +33677,7 @@ fn fix_mcp_config_entry(
                     config_path.display()
                 )
             })?;
+        let secret_write = existing_secret_material || fixed.contains("Bearer ");
         if secret_write {
             mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
                 .map_err(|error| error.to_string())?;
@@ -33726,6 +33727,14 @@ fn fix_mcp_config_entry(
         ));
     }
 
+    let serialized = serde_json::to_string(&doc).map_err(|error| {
+        format!(
+            "cannot inspect repaired config {} for credentials: {error}",
+            config_path.display()
+        )
+    })?;
+    let secret_write = existing_secret_material || serialized.contains("Bearer ");
+
     if tool != mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
         && secret_write
     {
@@ -33742,11 +33751,8 @@ fn fix_mcp_config_entry(
             permissions: 0o600,
             backup: true,
         };
-        mcp_agent_mail_core::setup::write_config_atomic(
-            &action,
-            secret_write,
-        )
-        .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
+        mcp_agent_mail_core::setup::write_config_atomic(&action, secret_write)
+            .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
         return Ok(format!(
             "Updated {} with an atomic backup",
             config_path.display()

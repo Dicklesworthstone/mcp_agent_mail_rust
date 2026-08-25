@@ -660,6 +660,7 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
         },
     );
 
+    ensure_secret_config_not_git_tracked(env_path)?;
     if existing_content
         .as_deref()
         .is_some_and(|existing| existing == content)
@@ -667,7 +668,6 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
         return Ok(());
     }
 
-    ensure_secret_config_not_git_tracked(env_path)?;
     write_setup_file_atomic(env_path, content.as_bytes(), 0o600, "token env file")?;
     Ok(())
 }
@@ -2053,10 +2053,14 @@ pub fn write_config_atomic(
         } => merge_toml_section(existing.as_deref(), section_header, key_values),
     };
 
-    let existing_may_contain_literal_secret = existing
-        .as_deref()
-        .is_some_and(|content| content.contains("Bearer "));
-    if contains_literal_secret || existing_may_contain_literal_secret {
+    let existing_may_contain_secret = existing.as_deref().is_some_and(|content| {
+        content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
+    });
+    let output_contains_literal_secret = new_content.contains("Bearer ");
+    if contains_literal_secret
+        || existing_may_contain_secret
+        || output_contains_literal_secret
+    {
         ensure_secret_config_not_git_tracked(&action.file_path)?;
     }
 
@@ -4053,6 +4057,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_setup_escapes_gitignore_metacharacters_in_omp_override_path() {
+        let tmp = setup_real_tempdir();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let override_path = tmp.path().join("custom[agent]/mcp*.json");
+        let mut params = SetupParams {
+            token: "first-secret".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            omp_user_config_path_override: Some(override_path.clone()),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: false,
+            skip_hooks: true,
+            ..Default::default()
+        };
+        assert!(
+            run_setup(&params)[0]
+                .actions
+                .iter()
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
+        params.token = "second-secret".into();
+        assert!(
+            run_setup(&params)[0]
+                .actions
+                .iter()
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status = String::from_utf8(status.stdout).unwrap();
+        assert!(
+            !status.contains("custom[agent]"),
+            "metacharacter path was not ignored literally: {status}"
+        );
+        assert!(
+            std::fs::read_dir(override_path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".bak")),
+            "token rotation should exercise the escaped backup pattern"
+        );
+    }
+
     /// `project_local_secret_files()` must list exactly the project-dir files
     /// each platform's `config_actions` actually writes (keep them in sync so a
     /// new client doesn't leak a token). User-level (home) files are excluded.
@@ -4939,6 +5001,37 @@ mod tests {
         assert!(content.contains("OTHER=value"));
         assert!(content.contains("MORE=stuff"));
         assert!(content.ends_with('\n'), "file must end with newline");
+    }
+
+    #[test]
+    fn save_token_to_env_file_refuses_tracked_idempotent_secret() {
+        let tmp = setup_real_tempdir();
+        let env_path = tmp.path().join("config.env");
+        let original = "HTTP_BEARER_TOKEN=already-tracked\n";
+        std::fs::write(&env_path, original).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["add", "--", "config.env"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = save_token_to_env_file(&env_path, "already-tracked")
+            .expect_err("idempotence must not bypass tracked-secret refusal");
+        assert!(error.to_string().contains("Git-tracked config"), "{error}");
+        assert_eq!(std::fs::read_to_string(env_path).unwrap(), original);
     }
 
     #[cfg(unix)]
