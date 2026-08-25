@@ -4110,9 +4110,11 @@ impl DbPool {
     /// Create (or refresh) a `.bak` backup of the database file.
     ///
     /// Skips silently for `:memory:` databases or when the primary file
-    /// doesn't exist. Materializes the backup with canonical SQLite's online
-    /// backup API, which provides a transactionally consistent snapshot of a
-    /// live WAL database without copying mutable main-file pages directly.
+    /// doesn't exist. Materializes the backup through a guarded FrankenSQLite
+    /// `VACUUM INTO`, then canonical SQLite's online backup API against that
+    /// private logical image. Canonical SQLite never opens the live primary
+    /// inode, so publishing a backup cannot release process-wide locks held by
+    /// other FrankenSQLite connections.
     ///
     /// Returns `Ok(Some(path))` with the backup path on success, `Ok(None)`
     /// if the operation was skipped (memory DB, missing file, or the existing
@@ -4187,7 +4189,6 @@ impl DbPool {
             )));
         }
 
-        ensure_proactive_backup_source_is_safe(primary, &bak_path)?;
         let source_bytes = std::fs::metadata(primary)
             .map_err(|error| {
                 DbError::Sqlite(format!(
@@ -10634,29 +10635,6 @@ pub fn sqlite_recovery_candidate_passes_full_integrity_check(
     normalize_recovery_candidate_probe_result(probe)
 }
 
-fn sqlite_file_is_backup_safe(path: &Path) -> Result<bool, SqlError> {
-    if !sqlite_file_is_healthy(path)? {
-        return Ok(false);
-    }
-    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
-}
-
-fn ensure_proactive_backup_source_is_safe(primary: &Path, backup_path: &Path) -> DbResult<()> {
-    match sqlite_file_is_backup_safe(primary) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(DbError::Sqlite(format!(
-            "proactive backup aborted: source database {} failed full health checks; preserving existing backup at {}",
-            primary.display(),
-            backup_path.display()
-        ))),
-        Err(error) => Err(DbError::Sqlite(format!(
-            "proactive backup aborted: source database {} health check failed: {error}; preserving existing backup at {}",
-            primary.display(),
-            backup_path.display()
-        ))),
-    }
-}
-
 fn validate_proactive_backup_stage(primary: &Path, staged_backup: &Path) -> DbResult<()> {
     if !sqlite_recovery_candidate_is_standalone(staged_backup) {
         return Err(DbError::Sqlite(format!(
@@ -10773,22 +10751,6 @@ fn create_proactive_backup_stage(
     source: &Path,
     backup_path: &Path,
 ) -> DbResult<(CanonicalSnapshotTempDir, PathBuf)> {
-    let source_str = sqlite_path_as_utf8(source).map_err(|error| {
-        DbError::Sqlite(format!(
-            "proactive backup source path is not usable by canonical SQLite: {error}"
-        ))
-    })?;
-    let source_config = sqlmodel_sqlite::SqliteConfig::file(source_str.to_string())
-        .flags(sqlmodel_sqlite::OpenFlags::read_only());
-    let conn = crate::CanonicalDbConn::open(&source_config).map_err(|error| {
-        DbError::Sqlite(format!(
-            "proactive backup failed to open existing live source {} read-only with canonical SQLite: {error}",
-            source.display()
-        ))
-    })?;
-    conn.execute_raw("PRAGMA busy_timeout = 60000;")
-        .map_err(|error| DbError::Sqlite(format!("proactive backup busy timeout: {error}")))?;
-
     let stage_parent = backup_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -10803,20 +10765,61 @@ fn create_proactive_backup_stage(
             backup_path.display()
         ))
     })?;
+    let live_export = staging_directory.path().join("live-export.sqlite3");
+    let live_export_str = sqlite_path_as_utf8(&live_export).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup private export path is not usable by FrankenSQLite: {error}"
+        ))
+    })?;
+    let source_conn = open_guarded_read_only_franken_existing_file(
+        source,
+        "proactive backup live-source export",
+    )
+    .map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup failed to open live source {} through guarded FrankenSQLite authority: {error}",
+            source.display()
+        ))
+    })?;
+    source_conn
+        .execute_raw("PRAGMA query_only = OFF;")
+        .map_err(|error| DbError::Sqlite(format!("proactive backup snapshot export: {error}")))?;
+    let live_export_literal = format!("'{}'", live_export_str.replace('\'', "''"));
+    source_conn
+        .execute_raw(&format!("VACUUM INTO {live_export_literal}"))
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "proactive backup failed to materialize live source {} into private export {}: {error}",
+                source.display(),
+                live_export.display()
+            ))
+        })?;
+    drop(source_conn);
+
+    // FrankenSQLite may leave private namespace records beside VACUUM INTO
+    // output. Canonical SQLite therefore reads only this process-exclusive
+    // intermediate image and emits the standalone artifact that can be
+    // published as the `.bak` generation.
+    let private_source = crate::CanonicalDbConn::open_file(live_export_str).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup failed to open private export {} with canonical SQLite: {error}",
+            live_export.display()
+        ))
+    })?;
     let staged_backup = staging_directory.path().join("snapshot.sqlite3");
     let staged_str = sqlite_path_as_utf8(&staged_backup).map_err(|error| {
         DbError::Sqlite(format!(
             "proactive backup stage path is not usable by canonical SQLite: {error}"
         ))
     })?;
-    conn.backup_to_path(staged_str).map_err(|error| {
+    private_source.backup_to_path(staged_str).map_err(|error| {
         DbError::Sqlite(format!(
-            "proactive backup failed to materialize a consistent online snapshot from {} at {}: {error}",
+            "proactive backup failed to materialize a standalone snapshot from private export of {} at {}: {error}",
             source.display(),
             staged_backup.display()
         ))
     })?;
-    drop(conn);
+    drop(private_source);
 
     let staged_file = std::fs::OpenOptions::new()
         .read(true)
@@ -22829,8 +22832,10 @@ mod tests {
         let bak_path = dir.path().join("test_live_wal.db.bak");
         write_marker_db(&db_path, "main-generation");
 
-        let writer = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
-            .expect("open live WAL writer");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_str().unwrap()).expect("open live WAL writer"),
+            "clean up proactive-backup WAL writer",
+        );
         writer
             .execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
             .expect("keep committed frames in WAL");
@@ -22871,7 +22876,72 @@ mod tests {
             Some("main-generation"),
             "the test must remain mutation-sensitive to replacing online backup with a raw main-file copy"
         );
-        drop(writer);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proactive_backup_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_PROACTIVE_BACKUP_LOCK_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::proactive_backup_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "proactive-backup-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("proactive-backup-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open proactive-backup lock fixture"),
+            "clean up proactive-backup lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE backup_lock_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO backup_lock_probe(value) VALUES ('settled');",
+            )
+            .expect("seed proactive-backup lock fixture");
+        let pool = maintenance_test_pool(&db_path);
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent proactive-backup writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let _ = pool.create_proactive_backup(std::time::Duration::ZERO);
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent proactive-backup writer lock");
+        let backup = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect("proactive backup succeeds after writer rollback")
+            .expect("proactive backup path");
+        let verify = crate::CanonicalDbConn::open_file(backup.to_string_lossy().as_ref())
+            .expect("open private published backup verifier");
+        let rows = verify
+            .query_sync("SELECT value FROM backup_lock_probe", &[])
+            .expect("query published proactive backup");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("value")
+                .expect("decode published backup value"),
+            "settled"
+        );
     }
 
     #[test]
@@ -22885,7 +22955,9 @@ mod tests {
             Ok(_) => panic!("read-only source open must fail instead of creating a blank database"),
         };
         assert!(
-            error.to_string().contains("read-only"),
+            error
+                .to_string()
+                .contains("guarded FrankenSQLite authority"),
             "unexpected error: {error}"
         );
         assert!(
@@ -23214,9 +23286,9 @@ mod tests {
             .expect_err("unhealthy primary must not overwrite backup");
         let msg = err.to_string();
         assert!(
-            msg.contains("proactive backup aborted")
-                && msg.contains("source database")
-                && msg.contains("preserving existing backup"),
+            msg.contains("proactive backup")
+                && (msg.contains("guarded FrankenSQLite authority")
+                    || msg.contains("failed to materialize live source")),
             "unexpected error: {msg}"
         );
         assert_eq!(
@@ -23231,8 +23303,8 @@ mod tests {
                 .all(|entry| !entry
                     .file_name()
                     .to_string_lossy()
-                    .contains(".backup-stage-")),
-            "source validation should fail before any staged backup is written"
+                    .contains(".mcp-agent-mail-proactive-backup-")),
+            "failed guarded export must not leave a staging directory behind"
         );
     }
 
@@ -23254,7 +23326,9 @@ mod tests {
             .expect_err("unhealthy primary must not create a backup");
         let msg = err.to_string();
         assert!(
-            msg.contains("proactive backup aborted") && msg.contains("source database"),
+            msg.contains("proactive backup")
+                && (msg.contains("guarded FrankenSQLite authority")
+                    || msg.contains("failed to materialize live source")),
             "unexpected error: {msg}"
         );
         assert!(
