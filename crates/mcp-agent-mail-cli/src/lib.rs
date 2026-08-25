@@ -33378,6 +33378,169 @@ fn fix_path_order(home: &Path) -> Result<String, String> {
 }
 
 const CODEX_HTTP_BEARER_TOKEN_ENV_VAR: &str = "HTTP_BEARER_TOKEN";
+const OMP_MCP_AGENT_MAIL_ENTRY_KEYS: &[&str] = &["mcp-agent-mail", "mcp_agent_mail"];
+
+fn omp_config_needs_native_contract_repair(content: &str) -> bool {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(content)
+        .or_else(|_| json5::from_str::<serde_json::Value>(content))
+    else {
+        return false;
+    };
+    let Some(object) = doc.as_object() else {
+        return false;
+    };
+
+    let native_entries = object
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, |servers| {
+            OMP_MCP_AGENT_MAIL_ENTRY_KEYS
+                .iter()
+                .filter(|name| servers.contains_key(**name))
+                .count()
+        });
+    let legacy_entry_exists = ["servers", "mcp", "mcp_servers"].iter().any(|container| {
+        object
+            .get(*container)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|servers| {
+                OMP_MCP_AGENT_MAIL_ENTRY_KEYS
+                    .iter()
+                    .any(|name| servers.contains_key(*name))
+            })
+    });
+    let any_target_entry = native_entries > 0 || legacy_entry_exists;
+    if !any_target_entry {
+        return false;
+    }
+
+    if native_entries != 1
+        || object
+            .get("mcpServers")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|servers| !servers.contains_key("mcp-agent-mail"))
+        || legacy_entry_exists
+    {
+        return true;
+    }
+
+    let native_entry = &object["mcpServers"]["mcp-agent-mail"];
+    let disabled_in_entry = native_entry.get("enabled").is_some_and(|enabled| {
+        enabled == &serde_json::Value::Bool(false)
+            || enabled.as_str().is_some_and(|value| {
+                matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0")
+            })
+    });
+    let disabled_by_profile = match object.get("disabledServers") {
+        None => false,
+        Some(serde_json::Value::Array(names)) => names.iter().any(|name| {
+            name.as_str()
+                .is_some_and(|name| OMP_MCP_AGENT_MAIL_ENTRY_KEYS.contains(&name))
+        }),
+        Some(_) => true,
+    };
+
+    disabled_in_entry || disabled_by_profile
+}
+
+fn rewrite_omp_mcp_config_to_native_http(
+    doc: &mut serde_json::Value,
+    desired_url: &str,
+    desired_bearer_token: Option<&str>,
+) -> Result<bool, String> {
+    let object = doc
+        .as_object_mut()
+        .ok_or_else(|| "OMP config must be a JSON object".to_string())?;
+
+    let mut source_entry = None;
+    for container in ["mcpServers", "servers", "mcp", "mcp_servers"] {
+        let Some(servers) = object.get(container).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        source_entry = OMP_MCP_AGENT_MAIL_ENTRY_KEYS
+            .iter()
+            .find_map(|name| servers.get(*name).and_then(serde_json::Value::as_object))
+            .cloned()
+            .or(source_entry);
+        if source_entry.is_some() {
+            break;
+        }
+    }
+    let Some(mut entry) = source_entry else {
+        return Ok(false);
+    };
+
+    rewrite_json_mcp_entry_to_http_url(
+        &mut entry,
+        desired_url,
+        desired_bearer_token,
+        mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
+    );
+    for incompatible in [
+        "cwd",
+        "environment",
+        "env",
+        "httpUrl",
+        "http_headers",
+        "bearer_token_env_var",
+    ] {
+        entry.remove(incompatible);
+    }
+    entry.insert("enabled".to_string(), serde_json::Value::Bool(true));
+
+    if let Some(headers) = entry
+        .get_mut("headers")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+        if let Some(token) = desired_bearer_token.filter(|token| !token.trim().is_empty()) {
+            headers.insert(
+                "Authorization".to_string(),
+                serde_json::Value::String(format!("Bearer {token}")),
+            );
+        }
+        if headers.is_empty() {
+            entry.remove("headers");
+        }
+    }
+
+    let native_servers = object
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "OMP mcpServers must be a JSON object".to_string())?;
+    for alias in OMP_MCP_AGENT_MAIL_ENTRY_KEYS {
+        native_servers.remove(*alias);
+    }
+    native_servers.insert(
+        "mcp-agent-mail".to_string(),
+        serde_json::Value::Object(entry),
+    );
+
+    for container in ["servers", "mcp", "mcp_servers"] {
+        if let Some(servers) = object
+            .get_mut(container)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for alias in OMP_MCP_AGENT_MAIL_ENTRY_KEYS {
+                servers.remove(*alias);
+            }
+        }
+    }
+
+    if let Some(disabled_servers) = object.get_mut("disabledServers") {
+        let disabled_servers = disabled_servers
+            .as_array_mut()
+            .ok_or_else(|| "OMP disabledServers must be a JSON array".to_string())?;
+        disabled_servers.retain(|value| {
+            !value
+                .as_str()
+                .is_some_and(|name| OMP_MCP_AGENT_MAIL_ENTRY_KEYS.contains(&name))
+        });
+    }
+
+    Ok(true)
+}
 
 /// Update an MCP config file to point `mcp-agent-mail` to HTTP URL mode.
 fn fix_mcp_config_entry(
@@ -33411,23 +33574,29 @@ fn fix_mcp_config_entry(
         .or_else(|_| json5::from_str(&content))
         .map_err(|e| format!("cannot parse {}: {e}", config_path.display()))?;
 
-    let container_keys = ["mcpServers", "servers", "mcp", "mcp_servers"];
-    let mut updated = false;
-    for ck in &container_keys {
-        let Some(container) = doc.get_mut(*ck).and_then(serde_json::Value::as_object_mut) else {
-            continue;
-        };
-        for ek in JSON_MCP_AGENT_MAIL_ENTRY_KEYS {
-            let Some(entry) = container
-                .get_mut(*ek)
-                .and_then(serde_json::Value::as_object_mut)
+    let updated = if tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp {
+        rewrite_omp_mcp_config_to_native_http(&mut doc, desired_url, desired_bearer_token)?
+    } else {
+        let container_keys = ["mcpServers", "servers", "mcp", "mcp_servers"];
+        let mut updated = false;
+        for ck in &container_keys {
+            let Some(container) = doc.get_mut(*ck).and_then(serde_json::Value::as_object_mut)
             else {
                 continue;
             };
-            rewrite_json_mcp_entry_to_http_url(entry, desired_url, desired_bearer_token, tool);
-            updated = true;
+            for ek in JSON_MCP_AGENT_MAIL_ENTRY_KEYS {
+                let Some(entry) = container
+                    .get_mut(*ek)
+                    .and_then(serde_json::Value::as_object_mut)
+                else {
+                    continue;
+                };
+                rewrite_json_mcp_entry_to_http_url(entry, desired_url, desired_bearer_token, tool);
+                updated = true;
+            }
         }
-    }
+        updated
+    };
 
     if !updated {
         return Err(format!(
@@ -33919,6 +34088,9 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
             else {
                 continue;
             };
+            let omp_contract_fix_needed = loc.tool
+                == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
+                && omp_config_needs_native_contract_repair(&content);
             let repair_reason = match kind {
                 McpAgentMailEntryKind::Rust => Some("convert stdio command mode".to_string()),
                 McpAgentMailEntryKind::Python => {
@@ -33945,11 +34117,17 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                             "set Codex startup_timeout_sec to {}",
                             CODEX_STARTUP_TIMEOUT_SECS
                         )),
+                        Some(_) if omp_contract_fix_needed => {
+                            Some("restore OMP native enablement contract".to_string())
+                        }
                         Some(_) => None,
                         None if timeout_fix_needed => Some(format!(
                             "set Codex startup_timeout_sec to {}",
                             CODEX_STARTUP_TIMEOUT_SECS
                         )),
+                        None if omp_contract_fix_needed => {
+                            Some("restore OMP native enablement contract".to_string())
+                        }
                         None => None,
                     }
                 }
@@ -51939,10 +52117,108 @@ http_headers = { Authorization = "Bearer secret" }
         let entry = &doc["mcpServers"]["mcp-agent-mail"];
         assert_eq!(entry["type"], "http");
         assert_eq!(entry["url"], desired_url);
+        assert_eq!(entry["enabled"], true);
         assert_eq!(entry["headers"]["Authorization"], "Bearer omp-token");
         assert!(entry.get("command").is_none());
         assert!(entry.get("args").is_none());
         assert!(entry.get("transport").is_none());
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_restores_the_complete_omp_enablement_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".omp").join("mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let desired_url = "http://127.0.0.1:8765/mcp/";
+        std::fs::write(
+            &config,
+            r#"{
+                "mcpServers": {
+                    "mcp_agent_mail": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:8765/mcp/",
+                        "enabled": false,
+                        "timeout": 90,
+                        "headers": {
+                            "authorization": "Bearer stale-token",
+                            "X-Operator": "keep"
+                        }
+                    },
+                    "keep-native": {"command": "node"}
+                },
+                "servers": {
+                    "mcp-agent-mail": {"command": "stale"},
+                    "keep-legacy": {"command": "keep"}
+                },
+                "disabledServers": ["mcp-agent-mail", "mcp_agent_mail", "keep-disabled"]
+            }"#,
+        )
+        .unwrap();
+
+        let original = std::fs::read_to_string(&config).unwrap();
+        assert!(omp_config_needs_native_contract_repair(&original));
+        fix_mcp_config_entry(
+            &config,
+            desired_url,
+            None,
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
+        )
+        .unwrap();
+
+        let repaired = std::fs::read_to_string(&config).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        let native = doc["mcpServers"].as_object().unwrap();
+        let entry = native["mcp-agent-mail"].as_object().unwrap();
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], desired_url);
+        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["timeout"], 90);
+        assert_eq!(entry["headers"]["X-Operator"], "keep");
+        assert!(
+            entry["headers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|name| !name.eq_ignore_ascii_case("authorization"))
+        );
+        assert!(!native.contains_key("mcp_agent_mail"));
+        assert_eq!(native["keep-native"]["command"], "node");
+        assert!(doc["servers"].get("mcp-agent-mail").is_none());
+        assert_eq!(doc["servers"]["keep-legacy"]["command"], "keep");
+        assert_eq!(doc["disabledServers"], serde_json::json!(["keep-disabled"]));
+        assert!(!omp_config_needs_native_contract_repair(&repaired));
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_refuses_malformed_omp_disablement_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let original = r#"{
+            "mcpServers": {
+                "mcp-agent-mail": {
+                    "type": "http",
+                    "url": "http://127.0.0.1:8765/mcp/",
+                    "enabled": false
+                }
+            },
+            "disabledServers": "mcp-agent-mail"
+        }"#;
+        std::fs::write(&config, original).unwrap();
+
+        let error = fix_mcp_config_entry(
+            &config,
+            "http://127.0.0.1:8765/mcp/",
+            Some("new-token"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
+        )
+        .expect_err("malformed OMP disablement authority must fail closed");
+
+        assert!(
+            error.contains("disabledServers must be a JSON array"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(!mcp_config_backup_candidate(&config, None).exists());
     }
 
     #[test]
