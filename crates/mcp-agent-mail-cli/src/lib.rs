@@ -15438,6 +15438,9 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
 
             let config_env_file = canonical_setup_config_env_path()?;
             let resolved_token = setup::resolve_existing_token(token.as_deref(), &config_env_file)
+                .map_err(|error| {
+                    CliError::Other(format!("setup token resolution failed: {error}"))
+                })?
                 .unwrap_or_default();
             let agents = match agent {
                 Some(agent_list) => Some(

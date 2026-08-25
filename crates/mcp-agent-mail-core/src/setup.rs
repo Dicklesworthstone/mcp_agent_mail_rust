@@ -766,7 +766,7 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
     {
         return Ok(t.to_string());
     }
-    if let Some(t) = read_env_file_token(env_file) {
+    if let Some(t) = read_env_file_token(env_file)? {
         return Ok(t);
     }
     if let Some(t) = env_value_for_setup("HTTP_BEARER_TOKEN")
@@ -778,30 +778,35 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
 }
 
 /// Resolve an existing bearer token without generating or writing a replacement.
-#[must_use]
-pub fn resolve_existing_token(explicit: Option<&str>, env_file: &Path) -> Option<String> {
+pub fn resolve_existing_token(
+    explicit: Option<&str>,
+    env_file: &Path,
+) -> Result<Option<String>, SetupError> {
     if let Some(token) = explicit
         && !token.is_empty()
     {
-        return Some(token.to_string());
+        return Ok(Some(token.to_string()));
     }
-    read_env_file_token(env_file)
-        .or_else(|| env_value_for_setup("HTTP_BEARER_TOKEN").filter(|token| !token.is_empty()))
+    let file_token = read_env_file_token(env_file)?;
+    Ok(file_token
+        .or_else(|| env_value_for_setup("HTTP_BEARER_TOKEN").filter(|token| !token.is_empty())))
 }
 
 /// Read `HTTP_BEARER_TOKEN=...` from a .env file.
-fn read_env_file_token(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+fn read_env_file_token(path: &Path) -> Result<Option<String>, SetupError> {
+    let Some(content) = crate::config::read_user_env_authority_text(path)? else {
+        return Ok(None);
+    };
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(val) = trimmed.strip_prefix("HTTP_BEARER_TOKEN=") {
             let val = val.trim().trim_matches('"').trim_matches('\'');
             if !val.is_empty() {
-                return Some(val.to_string());
+                return Ok(Some(val.to_string()));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Save the bearer token to a .env file (create or update).

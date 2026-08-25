@@ -3691,6 +3691,24 @@ fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
     read_user_env_candidate_with_hooks(path, || {}, || {})
 }
 
+/// Read one explicitly selected user configuration authority as bounded UTF-8.
+///
+/// Setup uses this fresh (uncached) seam when repairing the canonical
+/// `config.env`. Keeping it beside runtime discovery ensures the recovery path
+/// gets the same regular-file, no-follow, parent-binding, and identity
+/// revalidation guarantees as normal configuration loading.
+pub(crate) fn read_user_env_authority_text(path: &Path) -> io::Result<Option<String>> {
+    let Some(bytes) = read_user_env_candidate(path)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes).map(Some).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid UTF-8: {error}", path.display()),
+        )
+    })
+}
+
 fn load_user_env_values_from_with_reader(
     home: Option<&Path>,
     xdg_config_dir: Option<&Path>,
