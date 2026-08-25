@@ -10,6 +10,10 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+### Changed
+
+- **`send_message.auto_contact_if_blocked` now accepts explicit JSON `null`** (GH#255 Python parity, final delta): fastmcp 0.7.1 publishes nullable `["boolean", "null"]` schemas for `Option<T>` tool parameters and treats explicit `null` as omitted at extraction, so `null` and omission both take the server-default path (`messaging_auto_handshake_on_block`). The same widening applies to every optional tool parameter this server exposes. Dependency: fastmcp family 0.7.0 → 0.7.1; the pinned dispatch contract test flipped from asserting a loud typed rejection to asserting Python-parity acceptance.
+
 ## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-24 **[Release]**
 
 Durability-diagnostics release: the database layer learned to explain itself.
