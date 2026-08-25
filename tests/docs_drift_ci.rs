@@ -133,8 +133,9 @@ mod container_release_contract {
         )?;
         if release_dockerfile.contains("GLIBC_2.28")
             || release_dockerfile.contains("cargo zigbuild")
+            || release_dockerfile.contains("dsr already cross-builds and signs")
         {
-            return Err("release Dockerfile claims a false arm64 glibc provenance".to_string());
+            return Err("release Dockerfile claims stale release artifact provenance".to_string());
         }
 
         Ok(())

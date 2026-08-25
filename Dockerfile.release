@@ -11,9 +11,9 @@
 # fails the build for both architectures at once. Building linux/arm64 that way
 # additionally means a full Rust workspace compile under QEMU, which is hours.
 #
-# This file takes the other route: it packages the *exact binaries that ship in
-# the GitHub release* — the ones dsr already cross-builds and signs — into the
-# same runtime image. Two consequences worth stating plainly:
+# This file takes the other route: it packages the *exact binaries that the
+# tag-triggered dist workflow publishes in the GitHub release* into the same
+# runtime image. Two consequences worth stating plainly:
 #
 #   * The image and the release tarballs are bit-identical binaries. A user who
 #     pulls the container and a user who curl|bash-installs run the same code.
