@@ -367,6 +367,9 @@ mod dist_release_contract {
             "No install.ps1 found",
             "--certificate-identity-regexp",
             "--certificate-oidc-issuer-regexp",
+            "--insecure-ignore-sct",
+            "--insecure-ignore-tlog",
+            "--new-bundle-format=false",
         ] {
             if workflow.contains(forbidden) {
                 return Err(format!("forbidden release bypass remains: {forbidden}"));
@@ -688,6 +691,11 @@ mod dist_release_contract {
                 &workflow,
                 "--certificate-identity \"$expected_certificate_identity\"",
                 "--certificate-identity-regexp \".*\"",
+            ),
+            mutate(
+                &workflow,
+                "--certificate-oidc-issuer \"https://token.actions.githubusercontent.com\"",
+                "--certificate-oidc-issuer \"https://token.actions.githubusercontent.com\" --insecure-ignore-tlog",
             ),
             mutate(
                 &workflow,
