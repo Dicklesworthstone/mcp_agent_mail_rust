@@ -33675,6 +33675,10 @@ fn fix_mcp_config_entry(
                     config_path.display()
                 )
             })?;
+        if desired_bearer_token.is_some_and(|token| !token.is_empty()) {
+            mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
+                .map_err(|error| error.to_string())?;
+        }
         let backup_path =
             create_mcp_config_backup(config_path).map_err(|e| format!("backup failed: {e}"))?;
         std::fs::write(config_path, fixed).map_err(|e| format!("write failed: {e}"))?;
@@ -33736,7 +33740,10 @@ fn fix_mcp_config_entry(
             permissions: 0o600,
             backup: true,
         };
-        mcp_agent_mail_core::setup::write_config_atomic(&action)
+        mcp_agent_mail_core::setup::write_config_atomic(
+            &action,
+            desired_bearer_token.is_some_and(|token| !token.is_empty()),
+        )
             .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
         return Ok(format!(
             "Updated {} with an atomic backup",

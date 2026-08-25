@@ -10,7 +10,6 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -1858,56 +1857,42 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
             parent.display()
         ))
     })?;
-    let has_git_marker = parent
-        .ancestors()
-        .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
-
-    let mut repo_probe = Command::new("git");
-    repo_probe
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .arg("-C")
-        .arg(&parent)
-        .args(["rev-parse", "--is-inside-work-tree"]);
-    let repo_probe = match repo_probe.output() {
-        Ok(output) => output,
-        Err(error) if !has_git_marker && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(SetupError::Other(format!(
+    let repo_probe = crate::git_cmd::GitCmd::new(&parent)
+        .env("LC_ALL", "C")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .run()
+        .map_err(|error| {
+            SetupError::Other(format!(
                 "cannot verify whether secret config {} is Git-tracked: {error}",
                 path.display()
-            )));
-        }
-    };
+            ))
+        })?;
     if !repo_probe.status.success() {
-        if has_git_marker {
-            return Err(SetupError::Other(format!(
-                "cannot verify whether secret config {} is Git-tracked: git rev-parse failed",
-                path.display()
-            )));
+        let stderr = String::from_utf8_lossy(&repo_probe.stderr);
+        if stderr.contains("not a git repository") {
+            return Ok(());
         }
-        return Ok(());
+        return Err(SetupError::Other(format!(
+            "cannot verify whether secret config {} is Git-tracked: git rev-parse failed: {}",
+            path.display(),
+            stderr.trim()
+        )));
     }
-    if repo_probe.stdout != b"true\n" && repo_probe.stdout != b"true\r\n" {
+    if String::from_utf8_lossy(&repo_probe.stdout).trim() != "true" {
         return Ok(());
     }
 
-    let mut tracked_probe = Command::new("git");
-    tracked_probe
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .arg("-C")
-        .arg(&parent)
+    let tracked_probe = crate::git_cmd::GitCmd::new(&parent)
+        .env("LC_ALL", "C")
         .args(["ls-files", "--error-unmatch", "--"])
-        .arg(file_name);
-    let tracked_probe = tracked_probe.output().map_err(|error| {
-        SetupError::Other(format!(
-            "cannot verify whether secret config {} is Git-tracked: {error}",
-            path.display()
-        ))
-    })?;
+        .arg(file_name)
+        .run()
+        .map_err(|error| {
+            SetupError::Other(format!(
+                "cannot verify whether secret config {} is Git-tracked: {error}",
+                path.display()
+            ))
+        })?;
     if tracked_probe.status.success() {
         return Err(SetupError::Other(format!(
             "refusing to write a literal bearer token to Git-tracked config {}; remove it from the index or use an untracked config path",
@@ -1924,7 +1909,10 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
 }
 
 /// Execute a single config write action, returning the outcome.
-pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, SetupError> {
+pub fn write_config_atomic(
+    action: &ConfigAction,
+    contains_literal_secret: bool,
+) -> Result<ActionOutcome, SetupError> {
     let parent = action.file_path.parent().unwrap_or_else(|| Path::new("."));
     ensure_setup_parent_dir(&action.file_path, "config file")?;
     validate_setup_file_target(&action.file_path, "config file")?;
@@ -1998,7 +1986,7 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
         } => merge_toml_section(existing.as_deref(), section_header, key_values),
     };
 
-    if new_content.contains("Bearer ") {
+    if contains_literal_secret {
         ensure_secret_config_not_git_tracked(&action.file_path)?;
     }
 
@@ -2113,6 +2101,8 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
 
         for action in &actions {
             let is_token_bearing_project_config = project_token_paths.contains(&action.file_path);
+            let contains_literal_secret =
+                expected_authorization_for_action(action, &params.token).is_some();
             let outcome = if let Some(error) = gitignore_error.as_deref()
                 && is_token_bearing_project_config
             {
@@ -2122,7 +2112,7 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
             } else if params.dry_run {
                 ActionOutcome::Skipped
             } else {
-                match write_config_atomic(action) {
+                match write_config_atomic(action, contains_literal_secret) {
                     Ok(o) => o,
                     Err(e) => ActionOutcome::Failed(e.to_string()),
                 }
@@ -3795,7 +3785,7 @@ mod tests {
         let tmp = setup_real_tempdir();
         let config = tmp.path().join(".omp/mcp.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        let original = r#"{"mcpServers":{"operator-owned":{"command":"keep"}}}\n"#;
+        let original = "{\"mcpServers\":{\"operator-owned\":{\"command\":\"keep\"}}}\n";
         std::fs::write(&config, original).unwrap();
         assert!(
             Command::new("git")
@@ -4095,7 +4085,7 @@ mod tests {
             .next()
             .expect("OMP project action");
         assert_eq!(
-            write_config_atomic(&action).expect("write config"),
+            write_config_atomic(&action, true).expect("write config"),
             ActionOutcome::Updated
         );
 
@@ -4121,7 +4111,7 @@ mod tests {
         assert_eq!(doc["servers"]["legacy-sibling"]["command"], "node");
         assert_eq!(doc["disabledServers"], json!(["other"]));
         assert_eq!(
-            write_config_atomic(&action).expect("idempotent rewrite"),
+            write_config_atomic(&action, true).expect("idempotent rewrite"),
             ActionOutcome::Unchanged
         );
     }
@@ -4159,7 +4149,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("OMP project action");
-        let error = write_config_atomic(&action)
+        let error = write_config_atomic(&action, true)
             .expect_err("malformed OMP disablement authority must fail closed");
 
         assert!(error.to_string().contains("entries must be strings"));
@@ -4461,7 +4451,7 @@ mod tests {
             permissions: 0o644,
             backup: false,
         };
-        let outcome = write_config_atomic(&action).unwrap();
+        let outcome = write_config_atomic(&action, false).unwrap();
         assert_eq!(outcome, ActionOutcome::Created);
         assert!(deep.exists());
         let content: Value =
@@ -4483,7 +4473,7 @@ mod tests {
             permissions: 0o644,
             backup: true,
         };
-        let outcome = write_config_atomic(&action).unwrap();
+        let outcome = write_config_atomic(&action, false).unwrap();
         assert_eq!(outcome, ActionOutcome::Updated);
 
         // Check backup file was created
@@ -4510,7 +4500,8 @@ mod tests {
             permissions: 0o600,
             backup: true,
         };
-        let error = write_config_atomic(&action).expect_err("invalid UTF-8 must fail closed");
+        let error =
+            write_config_atomic(&action, false).expect_err("invalid UTF-8 must fail closed");
 
         assert!(matches!(
             error,
@@ -4539,7 +4530,7 @@ mod tests {
             backup: true,
         };
         assert_eq!(
-            write_config_atomic(&action).unwrap(),
+            write_config_atomic(&action, false).unwrap(),
             ActionOutcome::Updated
         );
         assert_eq!(
@@ -4573,13 +4564,13 @@ mod tests {
             backup: true,
         };
         assert_eq!(
-            write_config_atomic(&action).unwrap(),
+            write_config_atomic(&action, false).unwrap(),
             ActionOutcome::Created
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert_eq!(
-            write_config_atomic(&action).unwrap(),
+            write_config_atomic(&action, false).unwrap(),
             ActionOutcome::Updated,
             "permission repair is a material update even when bytes already match"
         );
@@ -4618,7 +4609,7 @@ mod tests {
             permissions: 0o644,
             backup: true,
         };
-        let err = write_config_atomic(&action).unwrap_err();
+        let err = write_config_atomic(&action, false).unwrap_err();
 
         assert!(err.to_string().contains("must not be a symlink"), "{err}");
         assert_eq!(
@@ -4646,7 +4637,7 @@ mod tests {
             permissions: 0o644,
             backup: false,
         };
-        let err = write_config_atomic(&action).unwrap_err();
+        let err = write_config_atomic(&action, false).unwrap_err();
 
         assert!(
             err.to_string()
@@ -4678,7 +4669,7 @@ mod tests {
             permissions: 0o644,
             backup: false,
         };
-        let outcome = write_config_atomic(&action).unwrap();
+        let outcome = write_config_atomic(&action, false).unwrap();
         assert_eq!(outcome, ActionOutcome::Unchanged);
     }
 
@@ -5561,7 +5552,7 @@ http_headers = { Authorization = "Bearer tok" }
                 if matches!(action.content, ConfigContent::HooksMerge { .. }) {
                     continue;
                 }
-                write_config_atomic(&action).unwrap();
+                write_config_atomic(&action, false).unwrap();
             }
         }
 
