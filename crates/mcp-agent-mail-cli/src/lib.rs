@@ -7026,6 +7026,7 @@ fn handle_serve_http(
     takeover: bool,
 ) -> CliResult<()> {
     let mut config = build_http_config(host, port, path, no_auth, allowed_host);
+    config.validate_user_env_authority()?;
     if no_tui {
         config.tui_enabled = false;
     }
@@ -8006,6 +8007,7 @@ pub fn prepare_runtime_server_startup_with_takeover(
     config: &Config,
     takeover: bool,
 ) -> CliResult<()> {
+    config.validate_user_env_authority()?;
     run_runtime_server_startup_prep_with(
         config,
         |cfg| auto_clear_db_blockers_with_takeover(cfg, takeover),

@@ -433,6 +433,8 @@ run_verification_case() {
     EXTRACT="$extract" CASE_TMP="$case_tmp" ARCHIVE_FILE="$archive_file" \
         ARCHIVE_SHA256="$archive_sha256" ARTIFACT_NAME="$archive_name" \
         ARTIFACT_URL="$artifact_url" COSIGN_LOG="$tmp/$name.cosign.log" \
+        CHECKSUM_OVERRIDE="${CHECKSUM_OVERRIDE:-}" WITNESS_MODE="${WITNESS_MODE:-valid}" \
+        COSIGN_VERIFY_RC="${COSIGN_VERIFY_RC:-0}" \
         PATH="$tmp/bin:$PATH" "$@" "$verification_harness" \
         >"$tmp/$name.out" 2>&1
 }

@@ -1693,6 +1693,7 @@ fn ensure_stdio_startup_probes_pass(report: &startup_checks::StartupReport) -> s
 }
 
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    config.validate_user_env_authority()?;
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
@@ -3843,6 +3844,7 @@ fn write_crash_marker(storage_root: &Path, info: &std::panic::PanicHookInfo<'_>,
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -3919,6 +3921,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {

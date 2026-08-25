@@ -6055,7 +6055,7 @@ resolve_and_verify_archive_checksum() {
       if [ -n "$expected_checksum" ]; then
         checksum_resolved=1
       else
-        err "SHA256SUMS has no entry for ${artifact_name}."
+        verbose "checksum:SHA256SUMS_no_match artifact=${artifact_name}"
       fi
     fi
   fi

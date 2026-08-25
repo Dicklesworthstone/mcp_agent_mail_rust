@@ -3389,24 +3389,193 @@ fn user_env_file_candidates(
     candidates
 }
 
-fn user_env_file_path_from(
-    home: Option<&Path>,
-    xdg_config_dir: Option<&Path>,
-) -> Option<PathBuf> {
-    user_env_file_candidates(home, xdg_config_dir)
-        .into_iter()
-        .find(|path| path.is_file())
+fn read_open_user_env_file_bounded(
+    mut file: std::fs::File,
+    path: &Path,
+) -> io::Result<Vec<u8>> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > USER_ENV_FILE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is {} bytes, exceeding the {}-byte user configuration limit",
+                path.display(),
+                metadata.len(),
+                USER_ENV_FILE_MAX_BYTES
+            ),
+        ));
+    }
+
+    let allocation = usize::try_from(metadata.len().min(USER_ENV_FILE_MAX_BYTES))
+        .unwrap_or(USER_ENV_FILE_MAX_BYTES as usize);
+    let mut bytes = Vec::with_capacity(allocation);
+    file.by_ref()
+        .take(USER_ENV_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > USER_ENV_FILE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} grew beyond the {}-byte user configuration limit",
+                path.display(),
+                USER_ENV_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
-fn user_env_file_path() -> Option<PathBuf> {
-    let home = configured_home_dir().filter(|path| path.is_absolute());
-    let xdg = xdg_config_dir();
-    user_env_file_path_from(home.as_deref(), xdg.as_deref())
+#[cfg(all(unix, not(target_os = "redox")))]
+fn read_user_env_candidate_with_hooks(
+    path: &Path,
+    after_parent_open: impl FnOnce(),
+    after_file_open: impl FnOnce(),
+) -> io::Result<Option<Vec<u8>>> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no file name", path.display()),
+        )
+    })?;
+    let directory_flags = OFlag::O_RDONLY
+        | OFlag::O_CLOEXEC
+        | OFlag::O_DIRECTORY
+        | OFlag::O_NOFOLLOW
+        | OFlag::O_NONBLOCK;
+    let parent_fd = match open(parent, directory_flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+    };
+    after_parent_open();
+
+    let file_flags =
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
+    let file_fd = match openat(&parent_fd, file_name, file_flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+    };
+    after_file_open();
+    let file = std::fs::File::from(file_fd);
+    read_open_user_env_file_bounded(file, path).map(Some)
+}
+
+#[cfg(not(all(unix, not(target_os = "redox"))))]
+fn read_user_env_candidate_with_hooks(
+    path: &Path,
+    after_parent_open: impl FnOnce(),
+    after_file_open: impl FnOnce(),
+) -> io::Result<Option<Vec<u8>>> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    let parent_metadata = match fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular directory authority", parent.display()),
+        ));
+    }
+
+    // `same_file::Handle` binds the platform file identity. The non-Unix
+    // implementation cannot open the leaf relative to that directory handle,
+    // so it revalidates the parent identity immediately after the bounded leaf
+    // read and rejects any observed replacement.
+    let parent_before = same_file::Handle::from_path(parent)?;
+    after_parent_open();
+    let file = match crate::disk::open_regular_file_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    after_file_open();
+    let bytes = read_open_user_env_file_bounded(file, path)?;
+    let parent_after_metadata = fs::symlink_metadata(parent)?;
+    if !parent_after_metadata.file_type().is_dir()
+        || parent_after_metadata.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory authority during read", parent.display()),
+        ));
+    }
+    let parent_after = same_file::Handle::from_path(parent)?;
+    if parent_before != parent_after {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory identity during read", parent.display()),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    read_user_env_candidate_with_hooks(path, || {}, || {})
+}
+
+fn load_user_env_values_from(home: Option<&Path>, xdg_config_dir: Option<&Path>) -> UserEnvLoad {
+    for path in user_env_file_candidates(home, xdg_config_dir) {
+        let bytes = match read_user_env_candidate(&path) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(error) => return UserEnvLoad::rejected(&path, &error),
+        };
+        let contents = match String::from_utf8(bytes) {
+            Ok(contents) => contents,
+            Err(error) => {
+                let error = io::Error::new(io::ErrorKind::InvalidData, error);
+                return UserEnvLoad::rejected(&path, &error);
+            }
+        };
+        return UserEnvLoad::loaded(parse_dotenv_contents(&contents));
+    }
+    UserEnvLoad::absent()
+}
+
+fn user_env_load() -> &'static UserEnvLoad {
+    USER_ENV_LOAD.get_or_init(|| {
+        let home = configured_home_dir().filter(|path| path.is_absolute());
+        let xdg = xdg_config_dir();
+        load_user_env_values_from(home.as_deref(), xdg.as_deref())
+    })
 }
 
 fn user_env_values() -> &'static HashMap<String, String> {
-    USER_ENV_VALUES
-        .get_or_init(|| user_env_file_path().map_or_else(HashMap::new, |p| load_dotenv_file(&p)))
+    &user_env_load().values
+}
+
+/// Return the reason the user-global env-file authority was rejected.
+///
+/// An absent credential file is not an error and returns `None`. Once a
+/// higher-precedence candidate exists but cannot be read as one bounded,
+/// regular, no-follow authority, lower-precedence files are never consulted.
+#[must_use]
+pub fn user_env_authority_error() -> Option<String> {
+    user_env_load().authority_error.clone()
 }
 
 /// Read a value from the user-global env file (`~/.mcp_agent_mail/.env`).
@@ -5193,18 +5362,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // user_env_file_path
+    // user env-file authority
     // -----------------------------------------------------------------------
 
     #[test]
-    fn user_env_file_path_returns_none_when_no_files_exist() {
-        // Since we can't control home dir in tests, just verify it returns
-        // Some or None without panicking.
-        let _ = user_env_file_path();
+    fn user_env_load_is_empty_when_no_candidates_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("missing-xdg").join(XDG_APP_DIR);
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert!(load.values.is_empty());
+        assert!(load.authority_error.is_none());
     }
 
     #[test]
-    fn user_env_file_path_prefers_xdg_config_env_over_legacy() {
+    fn user_env_load_prefers_xdg_config_env_over_legacy() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let xdg = tmp.path().join(".config/mcp-agent-mail");
         let dotted = tmp.path().join(".mcp_agent_mail");
@@ -5216,13 +5387,13 @@ mod tests {
         std::fs::write(dotted.join(".env"), "FOO=bar\n").unwrap();
         std::fs::write(legacy.join(".env"), "FOO=baz\n").unwrap();
 
-        let selected =
-            user_env_file_path_from(Some(tmp.path()), Some(&xdg)).expect("env path");
-        assert_eq!(selected, xdg.join("config.env"));
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert_eq!(load.values.get("FOO").map(String::as_str), Some("xdg"));
+        assert!(load.authority_error.is_none());
     }
 
     #[test]
-    fn user_env_file_path_prefers_custom_xdg_over_portable_home_config() {
+    fn user_env_load_prefers_custom_xdg_over_portable_home_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let portable = tmp.path().join(".config/mcp-agent-mail");
         let custom_xdg = tmp.path().join("custom-xdg").join("mcp-agent-mail");
@@ -5231,13 +5402,16 @@ mod tests {
         std::fs::write(portable.join("config.env"), "FOO=portable\n").unwrap();
         std::fs::write(custom_xdg.join("config.env"), "FOO=custom\n").unwrap();
 
-        let selected = user_env_file_path_from(Some(tmp.path()), Some(&custom_xdg))
-            .expect("env path");
-        assert_eq!(selected, custom_xdg.join("config.env"));
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&custom_xdg));
+        assert_eq!(
+            load.values.get("FOO").map(String::as_str),
+            Some("custom")
+        );
+        assert!(load.authority_error.is_none());
     }
 
     #[test]
-    fn user_env_file_path_prefers_xdg_dotenv_mirror_over_legacy() {
+    fn user_env_load_prefers_xdg_dotenv_mirror_over_legacy() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let xdg = tmp.path().join(".config/mcp-agent-mail");
         let dotted = tmp.path().join(".mcp_agent_mail");
@@ -5246,9 +5420,12 @@ mod tests {
         std::fs::write(xdg.join(".env"), "FOO=xdg-mirror\n").unwrap();
         std::fs::write(dotted.join(".env"), "FOO=legacy\n").unwrap();
 
-        let selected =
-            user_env_file_path_from(Some(tmp.path()), Some(&xdg)).expect("env path");
-        assert_eq!(selected, xdg.join(".env"));
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert_eq!(
+            load.values.get("FOO").map(String::as_str),
+            Some("xdg-mirror")
+        );
+        assert!(load.authority_error.is_none());
     }
 
     #[test]
