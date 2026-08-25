@@ -483,6 +483,12 @@ mod dist_release_contract {
             workflow,
             &[
                 "- name: Assemble, sign, and verify release assets",
+                "cp -- install.sh install.ps1 publish/",
+                "shasum -a 256 \"${expected_payloads[@]}\" > SHA256SUMS",
+                "signed_subjects=(\"${expected_payloads[@]}\" SHA256SUMS)",
+                "cosign sign-blob --yes --bundle \"${subject}.sigstore.json\" \"$subject\"",
+                "cosign verify-blob \\",
+                "expected_release_assets=(\"${signed_subjects[@]}\")",
                 "- name: Revalidate release tag immediately before publication",
                 "- name: Create GitHub Release",
             ],
