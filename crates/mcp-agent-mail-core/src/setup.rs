@@ -3883,7 +3883,11 @@ impl OmpMcpConnection {
         match self.effective_transport() {
             "stdio" => self.command.is_some(),
             "http" | "sse" => self.url.is_some(),
-            _ => false,
+            // OMP's capability validator admits historical/unknown transport
+            // spellings when a command is present. Its legacy conversion then
+            // falls back to stdio, so such an entry can still open a live
+            // connection. A URL alone is not enough for that fallback.
+            _ => self.command.is_some(),
         }
     }
 
@@ -8969,6 +8973,26 @@ http_headers = { Authorization = "Bearer tok" }
         )
         .unwrap();
         assert!(first_setup_status_file(&params).omp_mcp_alias_drift);
+
+        std::fs::write(
+            &root,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"future-stdio","command":"stale-agent-mail"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "standalone importers preserve an unknown transport and OMP falls back to stdio when a command exists"
+        );
+
+        std::fs::write(
+            &root,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"future-http","url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "an unknown transport with only a URL fails OMP's runtime validation and cannot claim a live alias"
+        );
 
         std::fs::write(
             &root,
