@@ -3550,17 +3550,23 @@ fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
 /// mailbox, listener, or archive target from [`Config`]; after an unsafe
 /// higher-precedence file is suppressed, letting them continue could mutate a
 /// default or otherwise unintended target. Capability reflection is
-/// configuration-independent. Setup and doctor are the repair/diagnostic
-/// surfaces. Supervisor status, logs, and restart remain available so an
-/// operator can drain or replace a live owner before repair, but service
-/// installation is intentionally not exempt because it persists config-derived
-/// values.
+/// configuration-independent. Setup is the authority repair surface, while the
+/// exempt doctor verbs are static reflection or an isolated-tempdir self-test;
+/// live-mailbox doctor actions still require trusted target configuration.
+/// Supervisor status, logs, and restart remain available so an operator can
+/// drain or replace a live owner before repair, but service installation is
+/// intentionally not exempt because it persists config-derived values.
 fn command_requires_trusted_user_env(command: Option<&Commands>) -> bool {
     !matches!(
         command,
         Some(
             Commands::Capabilities { .. }
-                | Commands::Doctor { .. }
+                | Commands::Doctor {
+                    action: DoctorCommand::Capabilities { .. }
+                        | DoctorCommand::RobotDocs
+                        | DoctorCommand::Selftest { .. }
+                        | DoctorCommand::Fixers { .. },
+                }
                 | Commands::Setup { .. }
                 | Commands::Service {
                     action: ServiceCommand::Status
@@ -41137,19 +41143,26 @@ mod tests {
 
     #[test]
     fn unsafe_user_env_authority_stops_dispatch_before_side_effects() {
+        let mut config = Config::default();
+        config.user_env_authority_error = Some("unsafe user config authority".to_string());
         let dispatch_called = std::cell::Cell::new(false);
         let result = dispatch_after_user_env_guard(
             true,
-            || Err(CliError::Other("unsafe user config authority".to_string())),
+            || {
+                config
+                    .validate_user_env_authority()
+                    .map_err(|error| CliError::Other(error.to_string()))
+            },
             || {
                 dispatch_called.set(true);
                 Ok(())
             },
         );
 
-        assert!(
-            matches!(result, Err(CliError::Other(message)) if message == "unsafe user config authority")
-        );
+        assert!(matches!(
+            result,
+            Err(CliError::Other(message)) if message.contains("unsafe user config authority")
+        ));
         assert!(
             !dispatch_called.get(),
             "a failed authority guard must stop dispatch before any handler side effect"
@@ -41160,11 +41173,14 @@ mod tests {
     fn trusted_user_env_authority_preserves_dispatch() {
         let validation_called = std::cell::Cell::new(false);
         let dispatch_called = std::cell::Cell::new(false);
+        let config = Config::default();
         dispatch_after_user_env_guard(
             true,
             || {
                 validation_called.set(true);
-                Ok(())
+                config
+                    .validate_user_env_authority()
+                    .map_err(|error| CliError::Other(error.to_string()))
             },
             || {
                 dispatch_called.set(true);
@@ -41204,11 +41220,8 @@ mod tests {
             format: None,
             json: false,
         };
-        let doctor = Commands::Doctor {
-            action: DoctorCommand::Backups {
-                format: None,
-                json: false,
-            },
+        let doctor_capabilities = Commands::Doctor {
+            action: DoctorCommand::Capabilities { format: None },
         };
         let setup = Commands::Setup {
             action: SetupCommand::Status {
@@ -41239,7 +41252,7 @@ mod tests {
 
         for recovery_command in [
             capabilities,
-            doctor,
+            doctor_capabilities,
             setup,
             service_status,
             service_logs,
@@ -41261,6 +41274,15 @@ mod tests {
             no_archive: true,
         };
         assert!(command_requires_trusted_user_env(None));
+        let live_mailbox_doctor = Commands::Doctor {
+            action: DoctorCommand::Backups {
+                format: None,
+                json: false,
+            },
+        };
+        assert!(command_requires_trusted_user_env(Some(
+            &live_mailbox_doctor
+        )));
         assert!(command_requires_trusted_user_env(Some(&service_install)));
         assert!(command_requires_trusted_user_env(Some(
             &destructive_mailbox_command
