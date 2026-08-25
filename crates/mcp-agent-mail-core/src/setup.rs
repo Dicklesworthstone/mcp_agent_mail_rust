@@ -7324,7 +7324,7 @@ http_headers = { Authorization = "Bearer tok" }
         }
         let canonical = |url: &str| {
             format!(
-                r#"{{"mcpServers":{{"mcp-agent-mail":{{"type":"http","url":"{url}"}}}}}}"#
+                r#"{{"mcpServers":{{"mcp-agent-mail":{{"type":"http","url":"{url}","headers":{{"Authorization":"Bearer tok"}},"enabled":true}}}}}}"#
             )
         };
         std::fs::write(

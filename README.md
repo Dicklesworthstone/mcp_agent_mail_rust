@@ -471,9 +471,14 @@ named OMP profile.
 
 `am setup run --agent omp --no-user-config` leaves active-user bytes untouched,
 but setup and status still read the authorities that decide whether the
-project entry can run. They check the active `mcp.json` `disabledServers` list
-against all three accepted Agent Mail aliases (`mcp-agent-mail`,
-`mcp_agent_mail`, and `agent-mail`). They also evaluate
+project entry can run. They check the active canonical `mcp.json`
+`disabledServers` list against all three accepted Agent Mail aliases
+(`mcp-agent-mail`, `mcp_agent_mail`, and `agent-mail`). OMP also discovers the
+read-only `.mcp.json` sibling after `mcp.json` in both project and active-user
+scopes. An exact repeated server name is shadowed by the earlier source, while a
+different Agent Mail alias remains a separate MCP key; setup status reports and
+fingerprints that conflict without mirror-writing the secondary file. Status
+also evaluates
 `mcp.enableProjectConfig` with OMP's persistent settings precedence: the active
 profile's `config.yml` (falling back to `config.yaml` only when it is absent),
 then the project settings providers in runtime merge order: `.omp/settings.json`,

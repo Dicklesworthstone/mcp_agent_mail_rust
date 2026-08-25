@@ -43884,18 +43884,27 @@ http_headers = { Authorization = "Bearer secret" }
         };
 
         let first = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        let mcp_authorities = mcp_agent_mail_core::setup::omp_mcp_authority_paths(&params);
         let settings_authorities =
             mcp_agent_mail_core::setup::omp_settings_authority_paths(&params);
         assert_eq!(
             first.len(),
-            2 + settings_authorities.len(),
-            "project MCP, active user MCP, and every effective settings source are cache authorities"
+            mcp_authorities.len() + settings_authorities.len(),
+            "every native MCP input and effective settings source is a cache authority"
         );
+        assert_eq!(mcp_authorities.len(), 4);
         assert!(
             first
                 .iter()
                 .any(|fingerprint| fingerprint.path == user_config.display().to_string())
         );
+        for mcp_path in mcp_authorities {
+            assert!(
+                first
+                    .iter()
+                    .any(|fingerprint| fingerprint.path == mcp_path.display().to_string())
+            );
+        }
         assert_eq!(settings_authorities.len(), 12);
         for settings_path in settings_authorities {
             assert!(first.iter().any(|fingerprint| {
@@ -43917,6 +43926,23 @@ http_headers = { Authorization = "Bearer secret" }
         second_user.modified_micros = first_user.modified_micros;
         assert_ne!(first_user.content_sha256, second_user.content_sha256);
         assert_ne!(first, second);
+
+        let hidden_user_config = user_config.parent().unwrap().join(".mcp.json");
+        let before_hidden = second;
+        std::fs::write(&hidden_user_config, "agent-mail").expect("write hidden user authority");
+        let after_hidden =
+            collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        let before_hidden_file = before_hidden
+            .iter()
+            .find(|fingerprint| fingerprint.path == hidden_user_config.display().to_string())
+            .expect("missing hidden user fingerprint");
+        let after_hidden_file = after_hidden
+            .iter()
+            .find(|fingerprint| fingerprint.path == hidden_user_config.display().to_string())
+            .expect("present hidden user fingerprint");
+        assert!(!before_hidden_file.exists);
+        assert!(after_hidden_file.exists);
+        assert_ne!(before_hidden, after_hidden);
     }
 
     #[test]
