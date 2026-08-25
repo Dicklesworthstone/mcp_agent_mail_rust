@@ -2706,6 +2706,7 @@ detect_mcp_configs() {
   local omp_profile_base
   local omp_profile_dir
   local omp_profiles_root
+  local omp_profile_error=0
   local profile_dir
   local profile_name
   local -a candidates=()
@@ -2765,28 +2766,33 @@ detect_mcp_configs() {
         candidates+=("omp|${omp_profile_dir}/agent/mcp.json")
         candidates+=("omp|${omp_profile_dir}/agent/.mcp.json")
       fi
+    elif [ -n "$omp_profile" ] && [ "$omp_profile" != "default" ]; then
+      err "Invalid OMP profile \"${omp_profile}\". Profile names must match ^[a-z0-9][a-z0-9._-]{0,63}$ and cannot be '.', '..', end with '.', or use a Windows reserved device name."
+      omp_profile_error=2
     elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
       candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
       candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
     fi
-    candidates+=("omp|${omp_config_root}/agent/mcp.json")
-    candidates+=("omp|${omp_config_root}/agent/.mcp.json")
-    if [ ! -L "$omp_profiles_root" ]; then
-      for profile_dir in "${omp_profiles_root}"/*; do
-        if [ ! -d "$profile_dir" ] \
-          || [ -L "$profile_dir" ] \
-          || [ -L "${profile_dir}/agent" ]; then
-          continue
-        fi
-        profile_name="${profile_dir##*/}"
-        [ "$profile_name" != "default" ] || continue
-        omp_profile_base="${profile_name%%.*}"
-        printf '%s\n' "$profile_name" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || continue
-        printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' && continue
-        [ "${profile_name%.}" = "$profile_name" ] || continue
-        candidates+=("omp|${profile_dir}/agent/mcp.json")
-        candidates+=("omp|${profile_dir}/agent/.mcp.json")
-      done
+    if [ "$omp_profile_error" -eq 0 ]; then
+      candidates+=("omp|${omp_config_root}/agent/mcp.json")
+      candidates+=("omp|${omp_config_root}/agent/.mcp.json")
+      if [ ! -L "$omp_profiles_root" ]; then
+        for profile_dir in "${omp_profiles_root}"/*; do
+          if [ ! -d "$profile_dir" ] \
+            || [ -L "$profile_dir" ] \
+            || [ -L "${profile_dir}/agent" ]; then
+            continue
+          fi
+          profile_name="${profile_dir##*/}"
+          [ "$profile_name" != "default" ] || continue
+          omp_profile_base="${profile_name%%.*}"
+          printf '%s\n' "$profile_name" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$' || continue
+          printf '%s\n' "$omp_profile_base" | LC_ALL=C grep -Eiq '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$' && continue
+          [ "${profile_name%.}" = "$profile_name" ] || continue
+          candidates+=("omp|${profile_dir}/agent/mcp.json")
+          candidates+=("omp|${profile_dir}/agent/.mcp.json")
+        done
+      fi
     fi
 
     # GitHub Copilot / VS Code settings
@@ -2853,6 +2859,7 @@ detect_mcp_configs() {
     fi
     printf '%s\t%s\t%s\n' "$tool" "$path" "$exists_flag"
   done
+  return "$omp_profile_error"
 }
 
 generate_bearer_token() {
@@ -3861,8 +3868,13 @@ else:
         doc[container_key] = {}
 
 container = doc[container_key]
+entry_names = (
+    ("mcp-agent-mail", "mcp_agent_mail", "agent-mail")
+    if tool == "omp"
+    else ("mcp-agent-mail", "mcp_agent_mail")
+)
 entry_key = "mcp-agent-mail"
-for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+for candidate in entry_names:
     value = container.get(candidate)
     if isinstance(value, dict):
         entry_key = candidate
@@ -3874,7 +3886,7 @@ if tool == "omp" and not isinstance(existing_entry, dict):
         legacy_container = doc.get(legacy_key)
         if not isinstance(legacy_container, dict):
             continue
-        for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+        for candidate in entry_names:
             candidate_entry = legacy_container.get(candidate)
             if isinstance(candidate_entry, dict):
                 existing_entry = candidate_entry
@@ -3883,6 +3895,12 @@ if tool == "omp" and not isinstance(existing_entry, dict):
             break
 if not isinstance(existing_entry, dict):
     existing_entry = {}
+
+# OMP accepts arbitrary server names, but Agent Mail owns one canonical key.
+# Always migrate historical aliases instead of refreshing them in place and
+# leaving setup/status with multiple possible authorities.
+if tool == "omp":
+    entry_key = "mcp-agent-mail"
 
 new_entry = {
     key: value
@@ -3922,7 +3940,7 @@ else:
     new_entry.pop("headers", None)
 
 container[entry_key] = new_entry
-for candidate in ("mcp-agent-mail", "mcp_agent_mail"):
+for candidate in entry_names:
     if candidate != entry_key:
         container.pop(candidate, None)
 
@@ -3931,17 +3949,20 @@ if tool == "omp":
         legacy_container = doc.get(legacy_key)
         if not isinstance(legacy_container, dict):
             continue
-        legacy_container.pop("mcp-agent-mail", None)
-        legacy_container.pop("mcp_agent_mail", None)
+        for candidate in entry_names:
+            legacy_container.pop(candidate, None)
     disabled_servers = doc.get("disabledServers")
     if disabled_servers is not None and not isinstance(disabled_servers, list):
         print("ERROR:disabled_servers_not_array")
         raise SystemExit(0)
     if isinstance(disabled_servers, list):
+        if any(not isinstance(name, str) for name in disabled_servers):
+            print("ERROR:disabled_servers_entries_not_strings")
+            raise SystemExit(0)
         doc["disabledServers"] = [
             name
             for name in disabled_servers
-            if name not in ("mcp-agent-mail", "mcp_agent_mail")
+            if name not in entry_names
         ]
 new_text = dump_json(doc)
 effective_mode = 0o600 if existing_mode is None else existing_mode & 0o600
@@ -4431,6 +4452,20 @@ setup_mcp_configs() {
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" != "1" ] && continue
 
+    # Project-local OMP configs can carry the generated bearer token. Leave
+    # them exclusively to the native `am setup` phase, which first secures
+    # `.omp/mcp.json` in the project `.gitignore`. If that later phase is
+    # unavailable or fails, the installer must not leave a new trackable
+    # credential behind.
+    if [ "$tool" = "omp" ]; then
+      case "$path" in
+        "$PWD/.omp/mcp.json"|"$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
+          verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
+          continue
+          ;;
+      esac
+    fi
+
     # Most tools have one authoritative config, but OMP can have multiple
     # existing named-profile configs. Refresh every existing OMP file; the
     # second pass still sees `omp` in configured_tools and will not proliferate
@@ -4464,6 +4499,15 @@ setup_mcp_configs() {
   while IFS=$'\t' read -r tool path exists_flag; do
     [ -z "${tool:-}" ] && continue
     [ "$exists_flag" = "1" ] && continue
+
+    if [ "$tool" = "omp" ]; then
+      case "$path" in
+        "$PWD/.omp/mcp.json"|"$PWD/.omp/.mcp.json"|"$PWD/mcp.json"|"$PWD/.mcp.json")
+          verbose "setup_mcp_configs:defer tool=omp path=${path} reason=native_setup_secures_gitignore"
+          continue
+          ;;
+      esac
+    fi
 
     # Skip if already configured
     case "|${configured_tools}|" in

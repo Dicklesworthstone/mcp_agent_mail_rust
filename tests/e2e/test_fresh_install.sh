@@ -597,11 +597,8 @@ else
   cat > "${OMP_CONFIG}" <<'EOF'
 {
   "mcpServers": {
-    "sibling": {"type": "http", "url": "http://sibling.invalid/mcp"}
-  },
-  "disabledServers": ["sibling", "mcp_agent_mail", "mcp-agent-mail"],
-  "servers": {
-    "mcp_agent_mail": {
+    "sibling": {"type": "http", "url": "http://sibling.invalid/mcp"},
+    "agent-mail": {
       "command": "legacy-agent-mail",
       "args": [],
       "cwd": "/stale/stdio/root",
@@ -610,7 +607,10 @@ else
         "authorization": "Bearer stale-token",
         "X-Trace": "preserve-me"
       }
-    },
+    }
+  },
+  "disabledServers": ["sibling", "mcp_agent_mail", "mcp-agent-mail", "agent-mail"],
+  "servers": {
     "other": {"command": "other-server"}
   }
 }
@@ -659,7 +659,7 @@ assert entry["url"] == "http://127.0.0.1:8765/mcp/"
 assert entry["enabled"] is True
 assert entry["headers"] == {"X-Trace": "preserve-me"}
 assert "command" not in entry and "args" not in entry and "cwd" not in entry and "env" not in entry
-assert "mcp_agent_mail" not in doc["servers"]
+assert "agent-mail" not in doc["mcpServers"]
 assert doc["servers"]["other"]["command"] == "other-server"
 assert doc["mcpServers"]["sibling"]["url"] == "http://sibling.invalid/mcp"
 assert doc["disabledServers"] == ["sibling"]
@@ -766,16 +766,24 @@ PY
   else
     mkdir -p "${FAKE_HOME}/.omp/profiles/Work/agent" "${FAKE_HOME}/custom-agent"
     ln -s "${OMP_INSTALLER_DIR}" "${FAKE_HOME}/.omp/profiles/linked"
+    set +e
     OMP_DETECT_OUT="$(
       # shellcheck disable=SC1090
       source "${OMP_DETECT_LIBRARY}"
+      err() { printf '%s\n' "$*" >&2; }
       OMP_PROFILE=Work PI_CODING_AGENT_DIR="${FAKE_HOME}/custom-agent" \
         detect_mcp_configs "${FAKE_HOME}"
     )"
-    e2e_assert_contains "invalid uppercase OMP profile falls back to the default override" \
+    OMP_INVALID_PROFILE_RC=$?
+    set -e
+    e2e_assert_exit_code "invalid uppercase OMP profile fails closed" \
+      "2" "${OMP_INVALID_PROFILE_RC}"
+    e2e_assert_not_contains "invalid uppercase OMP profile does not target the default override" \
       "${OMP_DETECT_OUT}" "${FAKE_HOME}/custom-agent/mcp.json"
     e2e_assert_not_contains "invalid uppercase OMP profile is not advertised" \
       "${OMP_DETECT_OUT}" "/profiles/Work/"
+    e2e_assert_contains "invalid OMP profile does not suppress unrelated config discovery" \
+      "${OMP_DETECT_OUT}" "codex"
 
     OMP_SYMLINK_DETECT_OUT="$(
       # shellcheck disable=SC1090
@@ -789,8 +797,11 @@ PY
   OMP_SETUP_LIBRARY="${OMP_INSTALLER_DIR}/setup-mcp-configs-function.sh"
   sed -n '/^setup_mcp_configs() {/,/^sync_codex_http_configs() {/p' "${INSTALL_SH}" \
     | sed '$d' > "${OMP_SETUP_LIBRARY}"
-  if [ ! -s "${OMP_SETUP_LIBRARY}" ]; then
-    e2e_fail "extract installer MCP setup orchestrator" "function body" "missing"
+  OMP_UPDATE_LIBRARY="${OMP_INSTALLER_DIR}/update-mcp-configs-function.sh"
+  sed -n '/^update_mcp_configs() {/,/^record_uninstall_summary() {/p' "${INSTALL_SH}" \
+    | sed '$d' > "${OMP_UPDATE_LIBRARY}"
+  if [ ! -s "${OMP_SETUP_LIBRARY}" ] || [ ! -s "${OMP_UPDATE_LIBRARY}" ]; then
+    e2e_fail "extract installer MCP setup orchestrators" "function bodies" "missing"
   else
     OMP_TOKEN_CONTRACT="$(
       # These stubs let the orchestration contract run without touching any
@@ -817,6 +828,8 @@ PY
       # shellcheck disable=SC2329
       info() { :; }
       # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
       verbose() { :; }
       # shellcheck disable=SC1090
       source "${OMP_SETUP_LIBRARY}"
@@ -831,6 +844,66 @@ PY
     )"
     e2e_assert_eq "installer reuses one bearer token across OMP setup phases" \
       "valid" "${OMP_TOKEN_CONTRACT}"
+
+    OMP_PROJECT_DIR="${OMP_INSTALLER_DIR}/project-defer"
+    OMP_PROJECT_CONFIG="${OMP_PROJECT_DIR}/.omp/mcp.json"
+    OMP_PROJECT_FAKE_CLI="${OMP_INSTALLER_DIR}/failing-am"
+    mkdir -p "${OMP_PROJECT_DIR}/.omp"
+    printf '%s\n' '{"mcpServers":{"sibling":{"command":"node"}}}' > "${OMP_PROJECT_CONFIG}"
+    cat > "${OMP_PROJECT_FAKE_CLI}" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "setup" ] && [ "${2:-}" = "--help" ]; then
+  exit 0
+fi
+exit 7
+EOF
+    chmod +x "${OMP_PROJECT_FAKE_CLI}"
+
+    OMP_PROJECT_DEFER_CONTRACT="$(
+      # shellcheck disable=SC2329
+      detect_mcp_configs() { printf 'omp\t%s\t1\n' "${OMP_PROJECT_CONFIG}"; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'project-secret'; }
+      # shellcheck disable=SC2329
+      generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
+      # shellcheck disable=SC2329
+      setup_claude_code_mcp_via_cli() { return 1; }
+      OMP_PROJECT_DIRECT_WRITES=0
+      # shellcheck disable=SC2329
+      setup_single_mcp_config() {
+        OMP_PROJECT_DIRECT_WRITES=$((OMP_PROJECT_DIRECT_WRITES + 1))
+        return 0
+      }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC1090
+      source "${OMP_SETUP_LIBRARY}"
+      # shellcheck disable=SC1090
+      source "${OMP_UPDATE_LIBRARY}"
+      cd "${OMP_PROJECT_DIR}"
+      setup_mcp_configs "/unused/mcp-agent-mail"
+      update_mcp_configs "/unused/mcp-agent-mail" "${OMP_PROJECT_FAKE_CLI}"
+      printf '%s' "${OMP_PROJECT_DIRECT_WRITES}"
+    )"
+    e2e_assert_eq "installer defers project OMP bearer writes when native setup fails" \
+      "0" "${OMP_PROJECT_DEFER_CONTRACT}"
+    e2e_assert_eq "failed native setup leaves project OMP config byte-preserved" \
+      '{"mcpServers":{"sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_CONFIG}")"
+    e2e_assert_not_contains "failed native setup leaves no project bearer" \
+      "$(cat "${OMP_PROJECT_CONFIG}")" "project-secret"
+    if [ -e "${OMP_PROJECT_DIR}/.gitignore" ]; then
+      e2e_fail "failed native setup does not fake a secured project write" \
+        "no .gitignore side effect" "created .gitignore"
+    else
+      e2e_pass "failed native setup leaves project security files untouched"
+    fi
   fi
 fi
 
