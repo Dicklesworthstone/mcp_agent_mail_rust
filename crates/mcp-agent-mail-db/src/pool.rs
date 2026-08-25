@@ -15287,6 +15287,144 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn automatic_recovery_admission_fingerprint_preserves_live_locks_and_tracks_wal() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_BREAKER_FINGERPRINT_LOCK_PATH";
+        const CHILD_MODE_ENV: &str = "MCP_AGENT_MAIL_BREAKER_FINGERPRINT_LOCK_MODE";
+        const CHILD_TEST_NAME: &str = "pool::tests::automatic_recovery_admission_fingerprint_preserves_live_locks_and_tracks_wal";
+        const CHILD_WITNESS: &str = "breaker-fingerprint-child-observed-busy";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let mode = std::env::var(CHILD_MODE_ENV).expect("child lock-probe mode");
+            let config = sqlmodel_sqlite::SqliteConfig::file(
+                PathBuf::from(path).to_string_lossy().into_owned(),
+            )
+            .flags(sqlmodel_sqlite::OpenFlags::read_write())
+            .busy_timeout(10);
+            let competitor = crate::CanonicalDbConn::open(&config)
+                .expect("child opens competing canonical connection");
+            let conflict = match mode.as_str() {
+                "reserved" => competitor.execute_raw("BEGIN IMMEDIATE;"),
+                "shared" => competitor.execute_raw("BEGIN EXCLUSIVE;"),
+                _ => panic!("unexpected child lock-probe mode: {mode}"),
+            };
+            assert!(
+                conflict.is_err(),
+                "separate process must observe the parent's {mode} lock"
+            );
+            println!("{CHILD_WITNESS}-{mode}");
+            return;
+        }
+
+        fn assert_child_observes_busy(path: &Path, mode: &str) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, path)
+            .env(CHILD_MODE_ENV, mode)
+            .output()
+            .expect("run competing child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("{CHILD_WITNESS}-{mode}")),
+                "child filter ran no causal lock probe: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("breaker-fingerprint-lock.sqlite3");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken breaker-fingerprint fixture"),
+            "clean up breaker-fingerprint fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE fingerprint_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO fingerprint_probe(value) VALUES ('settled');",
+            )
+            .expect("seed breaker-fingerprint fixture");
+        assert!(
+            sqlite_path_requires_lock_neutral_fingerprint(&db_path),
+            "a live Franken generation must select the descriptor-neutral fingerprint"
+        );
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent RESERVED lock");
+        assert_child_observes_busy(&db_path, "reserved");
+        recovery_admission().reset();
+        with_recovery_admission(&db_path, "lock-neutral fingerprint success probe", || {
+            Ok::<(), SqlError>(())
+        })
+        .expect("successful admitted fingerprint probe");
+        assert_child_observes_busy(&db_path, "reserved");
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent RESERVED lock");
+
+        writer
+            .execute_raw("BEGIN; SELECT value FROM fingerprint_probe;")
+            .expect("acquire parent SHARED lock");
+        assert_child_observes_busy(&db_path, "shared");
+        recovery_admission().reset();
+        let failure =
+            with_recovery_admission(&db_path, "lock-neutral fingerprint failure probe", || {
+                Err::<(), _>(SqlError::Custom("synthetic admitted failure".to_string()))
+            })
+            .expect_err("synthetic recovery must fail after admission");
+        assert!(failure.to_string().contains("synthetic admitted failure"));
+        assert_child_observes_busy(&db_path, "shared");
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent SHARED lock");
+
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("enable retained WAL generation");
+        let before = recovery_breaker_fingerprint(&db_path, None);
+        let main_before = std::fs::symlink_metadata(&db_path)
+            .expect("stat main before WAL commit")
+            .len();
+        writer
+            .execute_raw("INSERT INTO fingerprint_probe(value) VALUES ('wal-generation');")
+            .expect("commit a WAL-only generation");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        assert!(
+            std::fs::symlink_metadata(&wal_path)
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "fixture must retain committed WAL frames"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&db_path)
+                .expect("stat main after WAL commit")
+                .len(),
+            main_before,
+            "the decisive generation change must not rely on main-file growth"
+        );
+        let after = recovery_breaker_fingerprint(&db_path, None);
+        assert!(breaker_fingerprint_is_lock_neutral(&before));
+        assert!(breaker_fingerprint_is_lock_neutral(&after));
+        assert_ne!(
+            before, after,
+            "committed WAL truth must change the lock-neutral breaker fingerprint"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ANALYZE_LOCK_PROBE_PATH";
         const CHILD_TEST_NAME: &str = "pool::tests::live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback";
