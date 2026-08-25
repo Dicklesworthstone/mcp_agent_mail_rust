@@ -2297,6 +2297,188 @@ token_env_targets_outside_git_worktrees() {
   return 0
 }
 
+# Return a mutation-sensitive identity for a regular, non-symlink file. The
+# checksum closes the same-size/same-mtime gap left by metadata alone; callers
+# compare the identity immediately before and after a copy or atomic replace.
+private_file_identity() {
+  local path="$1"
+  local metadata
+  local checksum
+
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  if metadata=$(stat -f '%d:%i:%z:%m:%c:%l' "$path" 2>/dev/null); then
+    :
+  elif metadata=$(stat -c '%d:%i:%s:%Y:%Z:%h' "$path" 2>/dev/null); then
+    :
+  else
+    return 1
+  fi
+  checksum=$(cksum < "$path") || return 1
+  printf '%s:%s' "$metadata" "$checksum"
+}
+
+private_file_link_count() {
+  local path="$1"
+  stat -f '%l' "$path" 2>/dev/null || stat -c '%h' "$path" 2>/dev/null
+}
+
+ensure_private_file_target_path() {
+  local path="$1"
+  local label="$2"
+  local previous_umask
+  local rc
+
+  previous_umask=$(umask)
+  umask 077
+  if ensure_real_file_target_path "$path" "$label"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  umask "$previous_umask"
+  return "$rc"
+}
+
+# Create a mode-0600, same-directory temporary file with an unpredictable
+# name, verify that neither it nor the destination changed underneath us, and
+# atomically rename it into place. Failure leaves the private temporary file
+# for diagnosis; this installer never deletes it.
+write_private_file_atomic() {
+  local path="$1"
+  local label="$2"
+  local previous_umask
+  local target_existed=0
+  local target_identity=""
+  local current_identity=""
+  local tmpfile=""
+
+  ensure_private_file_target_path "$path" "$label" || return 1
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    target_existed=1
+    target_identity=$(private_file_identity "$path") || {
+      warn "$label is not a stable regular file; refusing to replace it: $path"
+      return 1
+    }
+  fi
+
+  previous_umask=$(umask)
+  umask 077
+  tmpfile=$(mktemp "${path}.tmp.mcp-agent-mail.XXXXXX") || {
+    umask "$previous_umask"
+    warn "Could not create a private temporary file for $label: $path"
+    return 1
+  }
+  if ! chmod 600 "$tmpfile" \
+    || [ -L "$tmpfile" ] \
+    || [ ! -f "$tmpfile" ] \
+    || [ "$(private_file_link_count "$tmpfile")" != "1" ]; then
+    umask "$previous_umask"
+    warn "Private temporary-file validation failed for $label: $tmpfile"
+    return 1
+  fi
+  if ! command cat > "$tmpfile"; then
+    umask "$previous_umask"
+    warn "Could not write private temporary file for $label: $tmpfile"
+    return 1
+  fi
+  sync "$tmpfile" 2>/dev/null || sync 2>/dev/null || true
+
+  if ! ensure_private_file_target_path "$path" "$label"; then
+    umask "$previous_umask"
+    return 1
+  fi
+  if [ "$target_existed" -eq 1 ]; then
+    current_identity=$(private_file_identity "$path") || {
+      umask "$previous_umask"
+      warn "$label changed type before replacement; refusing to continue: $path"
+      return 1
+    }
+    if [ "$current_identity" != "$target_identity" ]; then
+      umask "$previous_umask"
+      warn "$label changed while its replacement was prepared; refusing to clobber it: $path"
+      return 1
+    fi
+  elif [ -e "$path" ] || [ -L "$path" ]; then
+    umask "$previous_umask"
+    warn "$label appeared while its replacement was prepared; refusing to clobber it: $path"
+    return 1
+  fi
+  if [ -L "$tmpfile" ] \
+    || [ ! -f "$tmpfile" ] \
+    || [ "$(private_file_link_count "$tmpfile")" != "1" ]; then
+    umask "$previous_umask"
+    warn "Private temporary file changed before replacement: $tmpfile"
+    return 1
+  fi
+  if ! mv -f "$tmpfile" "$path"; then
+    umask "$previous_umask"
+    warn "Could not atomically replace $label: $path"
+    return 1
+  fi
+  if ! chmod 600 "$path"; then
+    umask "$previous_umask"
+    warn "Could not enforce mode 600 on $label: $path"
+    return 1
+  fi
+  umask "$previous_umask"
+  return 0
+}
+
+PRIVATE_BACKUP_PATH=""
+backup_envfile_if_present() {
+  local path="$1"
+  local label="$2"
+  local previous_umask
+  local before_identity
+  local after_identity
+  local backup
+
+  PRIVATE_BACKUP_PATH=""
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  ensure_private_file_target_path "$path" "$label" || return 1
+  before_identity=$(private_file_identity "$path") || {
+    warn "$label is not a stable regular file; refusing to back it up: $path"
+    return 1
+  }
+
+  previous_umask=$(umask)
+  umask 077
+  backup=$(mktemp "${path}.bak.mcp-agent-mail.XXXXXX") || {
+    umask "$previous_umask"
+    warn "Could not create a private backup for $label: $path"
+    return 1
+  }
+  if ! chmod 600 "$backup" \
+    || [ -L "$backup" ] \
+    || [ ! -f "$backup" ] \
+    || [ "$(private_file_link_count "$backup")" != "1" ]; then
+    umask "$previous_umask"
+    warn "Private backup validation failed for $label: $backup"
+    return 1
+  fi
+  if ! command cat "$path" > "$backup"; then
+    umask "$previous_umask"
+    warn "Could not back up $label: $path"
+    return 1
+  fi
+  sync "$backup" 2>/dev/null || sync 2>/dev/null || true
+  after_identity=$(private_file_identity "$path") || {
+    umask "$previous_umask"
+    warn "$label changed type while it was backed up: $path"
+    return 1
+  }
+  if [ "$after_identity" != "$before_identity" ] \
+    || ! cmp -s "$path" "$backup"; then
+    umask "$previous_umask"
+    warn "$label changed while it was backed up; refusing to continue: $path"
+    return 1
+  fi
+  umask "$previous_umask"
+  PRIVATE_BACKUP_PATH="$backup"
+  info "Backed up $path -> $backup"
+  return 0
+}
+
 migrate_env_config() {
   [ -z "${RUST_STORAGE_ROOT:-}" ] && RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
   [ -z "${RUST_DB_PATH:-}" ] && RUST_DB_PATH="$RUST_STORAGE_ROOT/storage.sqlite3"
@@ -2329,23 +2511,13 @@ migrate_env_config() {
   # two targets, so proving both outside every Git worktree keeps the entire
   # token-bearing generation outside Git. Unknown authority fails closed.
   token_env_targets_outside_git_worktrees "$rust_env" "$rust_env_compat" || return 1
-  mkdir -p "$rust_config_dir"
-
-  backup_envfile_if_present() {
-    local path="$1"
-    [ -f "$path" ] || return 0
-
-    local timestamp backup
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    backup="${path}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
-    if ! cp -p "$path" "$backup"; then
-      warn "Failed to back up existing Rust config before rewrite: $path"
-      return 1
-    fi
-    info "Backed up $path -> $backup"
-  }
+  ensure_private_file_target_path "$rust_env" "canonical Rust config env" || return 1
+  ensure_private_file_target_path "$rust_env_compat" "compatibility Rust env mirror" || return 1
 
   local source_env=""
+  local source_env_identity=""
+  local source_content=""
+  local rust_env_read_path="$rust_env"
   local updating_existing=0
   local legacy_http_bearer_token="${MIGRATED_BEARER_TOKEN:-}"
   if [ -f "$rust_env" ]; then
@@ -2358,27 +2530,59 @@ migrate_env_config() {
     source_env="$env_file"
   fi
 
-  if [ -n "$env_file" ]; then
-    info "Found Python .env at: $env_file"
-    if [ -z "$legacy_http_bearer_token" ]; then
-      legacy_http_bearer_token=$(read_env_assignment_value "$env_file" "HTTP_BEARER_TOKEN")
-    fi
-  fi
-  if [ -f "$rust_env" ] && [ -z "$legacy_http_bearer_token" ]; then
-    legacy_http_bearer_token=$(read_env_assignment_value "$rust_env" "HTTP_BEARER_TOKEN")
-  fi
-  MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
-
   if [ "$updating_existing" -eq 1 ]; then
-    backup_envfile_if_present "$rust_env" || return 1
+    backup_envfile_if_present "$rust_env" "canonical Rust config env" || return 1
+    if [ -n "$PRIVATE_BACKUP_PATH" ]; then
+      rust_env_read_path="$PRIVATE_BACKUP_PATH"
+      if [ "$source_env" = "$rust_env" ]; then
+        source_env="$PRIVATE_BACKUP_PATH"
+      fi
+    fi
     if [ "$rust_env_compat" != "$rust_env" ]; then
-      backup_envfile_if_present "$rust_env_compat" || return 1
+      backup_envfile_if_present "$rust_env_compat" "compatibility Rust env mirror" || return 1
+      if [ -n "$PRIVATE_BACKUP_PATH" ] && [ "$source_env" = "$rust_env_compat" ]; then
+        source_env="$PRIVATE_BACKUP_PATH"
+      fi
     fi
     info "Updating Rust config at $rust_env to adopt legacy Python data paths"
   elif [ -n "$env_file" ]; then
     info "Migrating Python .env config into $rust_env"
   else
     info "Writing Rust config at $rust_env with adopted legacy data paths"
+  fi
+
+  if [ -n "$env_file" ]; then
+    info "Found Python .env at: $env_file"
+    source_env_identity=$(private_file_identity "$env_file") || {
+      warn "Legacy Python env input is not a stable regular file: $env_file"
+      return 1
+    }
+    if [ -z "$legacy_http_bearer_token" ]; then
+      legacy_http_bearer_token=$(read_env_assignment_value "$env_file" "HTTP_BEARER_TOKEN")
+    fi
+    if [ "$(private_file_identity "$env_file")" != "$source_env_identity" ]; then
+      warn "Legacy Python env input changed while it was read: $env_file"
+      return 1
+    fi
+  fi
+  if [ -f "$rust_env_read_path" ] && [ -z "$legacy_http_bearer_token" ]; then
+    legacy_http_bearer_token=$(read_env_assignment_value "$rust_env_read_path" "HTTP_BEARER_TOKEN")
+  fi
+  if [ -n "$source_env" ] && [ -z "$legacy_http_bearer_token" ]; then
+    legacy_http_bearer_token=$(read_env_assignment_value "$source_env" "HTTP_BEARER_TOKEN")
+  fi
+  MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
+
+  if [ -n "$source_env" ]; then
+    source_env_identity=$(private_file_identity "$source_env") || {
+      warn "Env migration input is not a stable regular file: $source_env"
+      return 1
+    }
+    source_content=$(command cat "$source_env") || return 1
+    if [ "$(private_file_identity "$source_env")" != "$source_env_identity" ]; then
+      warn "Env migration input changed while it was read: $source_env"
+      return 1
+    fi
   fi
 
   # Python-only vars are skipped; non-Python settings are preserved so operator
@@ -2388,8 +2592,8 @@ migrate_env_config() {
   local seen_storage_root=0
   local seen_http_bearer_token=0
 
-  local tmpfile="${rust_env}.tmp.$$"
-  {
+  local migrated_content
+  migrated_content="$({
     if [ "$updating_existing" -eq 1 ]; then
       echo "# Updated by Rust installer to adopt legacy Python data paths"
     elif [ -n "$env_file" ]; then
@@ -2433,10 +2637,6 @@ migrate_env_config() {
 
       if [ "$key" = "HTTP_BEARER_TOKEN" ]; then
         seen_http_bearer_token=1
-        if [ -z "${legacy_http_bearer_token:-}" ]; then
-          legacy_http_bearer_token=$(strip_wrapping_quotes "$val")
-          MIGRATED_BEARER_TOKEN="$legacy_http_bearer_token"
-        fi
         if [ -n "${legacy_http_bearer_token:-}" ]; then
           echo "HTTP_BEARER_TOKEN=$legacy_http_bearer_token"
         else
@@ -2447,7 +2647,7 @@ migrate_env_config() {
 
       # Pass through compatible vars as-is
       echo "$line"
-    done < <(if [ -n "$source_env" ] && [ -f "$source_env" ]; then cat "$source_env"; fi)
+    done <<< "$source_content"
 
     if [ "$seen_database_url" -eq 0 ]; then
       echo "DATABASE_URL=sqlite:///$RUST_DB_PATH"
@@ -2458,18 +2658,17 @@ migrate_env_config() {
     if [ "$seen_http_bearer_token" -eq 0 ] && [ -n "${legacy_http_bearer_token:-}" ]; then
       echo "HTTP_BEARER_TOKEN=$legacy_http_bearer_token"
     fi
-  } > "$tmpfile"
+  })"
+  migrated_content+=$'\n'
 
-  if ! grep -qE '^[[:space:]]*HTTP_BEARER_TOKEN=' "$tmpfile" 2>/dev/null && [ -n "${legacy_http_bearer_token:-}" ]; then
-    printf '\nHTTP_BEARER_TOKEN=%s\n' "$legacy_http_bearer_token" >> "$tmpfile"
+  if ! printf '%s' "$migrated_content" \
+    | write_private_file_atomic "$rust_env" "canonical Rust config env"; then
+    return 1
   fi
-
-  mv "$tmpfile" "$rust_env"
-  chmod 600 "$rust_env"  # Restrict access (may contain tokens)
-  local compat_tmp="${rust_env_compat}.tmp.$$"
-  cp "$rust_env" "$compat_tmp"
-  mv "$compat_tmp" "$rust_env_compat"
-  chmod 600 "$rust_env_compat"
+  if ! printf '%s' "$migrated_content" \
+    | write_private_file_atomic "$rust_env_compat" "compatibility Rust env mirror"; then
+    return 1
+  fi
   if [ "$updating_existing" -eq 1 ]; then
     ok "Updated Rust config at $rust_env"
   else
@@ -3154,6 +3353,11 @@ remote_http_client_target_tools() {
   local home_dir="${HOME:-}"
   local scan
   local scan_rc
+
+  case "$home_dir" in
+    /*) ;;
+    *) home_dir="" ;;
+  esac
 
   if command -v codex >/dev/null 2>&1 \
     || { [ -n "$home_dir" ] && [ -d "${home_dir}/.codex" ]; } \
@@ -5052,18 +5256,16 @@ configure_mcp_clients() {
 }
 
 # Run the production MCP configuration phase with a failure policy derived
-# from the same target authority as readiness. A clean host with no OMP target
+# from the same target authority as readiness. A clean host with no target
 # may legitimately have `am setup run` perform no work and leave no token file;
-# preserve that non-fatal install contract. Once OMP is present, however, any
-# native or fallback setup failure means the detected client was not proven
-# usable and must fail the installer instead of being hidden by `|| true`.
+# preserve that non-fatal install contract. Once a remote client is present,
+# however, any native or fallback setup failure means the detected client was
+# not proven usable and must fail the installer instead of being hidden.
 configure_mcp_clients_for_install() {
   local binary_path="$1"
   local am_cli="$2"
   local targets
   local targets_rc
-  local omp_present=0
-  local tool
 
   if targets=$(remote_http_client_target_tools); then
     targets_rc=0
@@ -5072,20 +5274,18 @@ configure_mcp_clients_for_install() {
     err "MCP client authority discovery failed; refusing to continue installation."
     return "$targets_rc"
   fi
-  while IFS= read -r tool; do
-    [ "$tool" = "omp" ] && omp_present=1
-  done <<< "$targets"
 
   if configure_mcp_clients "$binary_path" "$am_cli"; then
     return 0
   fi
-  if [ "$omp_present" -eq 1 ]; then
-    err "Detected OMP client setup failed; installation cannot report success."
+  if [ -n "$targets" ]; then
+    err "Detected remote MCP client setup failed; installation cannot report success."
+    err "Affected client kind(s): $(printf '%s' "$targets" | tr '\n' ' ')"
     err "Resolve the MCP configuration error above, then rerun the installer."
     return 1
   fi
 
-  warn "MCP client setup did not complete, but no OMP client target was detected."
+  warn "MCP client setup did not complete, but no remote MCP client target was detected."
   warn "The binaries remain installed; run 'am setup run' after installing a supported client."
   return 0
 }
