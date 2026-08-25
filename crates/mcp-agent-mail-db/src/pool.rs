@@ -5113,7 +5113,6 @@ fn normalize_sqlite_identity_path_lossless(path: &Path) -> PathBuf {
     })
 }
 
-#[must_use]
 fn pool_cache_key(config: &DbPoolConfig) -> DbResult<PoolCacheKey> {
     let authority = DbPoolAuthority::resolve(config)?;
     Ok(pool_cache_key_from_authority(
