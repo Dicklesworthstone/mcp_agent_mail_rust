@@ -268,6 +268,7 @@ mod dist_release_contract {
         "sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad";
     const RELEASE_ACTION: &str =
         "softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe";
+    const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
 
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -431,6 +432,20 @@ mod dist_release_contract {
         )?;
         require_exactly(workflow, "rustc --version --verbose", 3)?;
         require_exactly(workflow, "cargo --version --verbose", 3)?;
+        require_once(
+            workflow,
+            &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"),
+        )?;
+        require_exactly(
+            workflow,
+            "# Cargo.lock resolves beads_rust 0.5.2, so the workspace patch",
+            3,
+        )?;
+        require_exactly(
+            workflow,
+            "checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust \"$BEADS_RUST_COMMIT\"",
+            3,
+        )?;
         require_in_order(
             workflow,
             &[
@@ -511,6 +526,11 @@ mod dist_release_contract {
                 &workflow,
                 TOOLCHAIN_ACTION,
                 "dtolnay/rust-toolchain@nightly",
+            ),
+            mutate(
+                &workflow,
+                BEADS_RUST_COMMIT,
+                "b5dc5444270d82218e8de6bb4c6320731e0bdd00",
             ),
             mutate(
                 &workflow,

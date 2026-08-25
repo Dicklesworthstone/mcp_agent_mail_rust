@@ -17,7 +17,7 @@ env:
   # the same source bytes even after their default branches advance.
   FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
   FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
-  BEADS_RUST_COMMIT: b5dc5444270d82218e8de6bb4c6320731e0bdd00
+  BEADS_RUST_COMMIT: a3f89e6624661259ffa73f876d105656c5b5246e
 
 jobs:
   release_contract:
@@ -141,8 +141,8 @@ jobs:
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # beads_rust 0.5.1 is not yet published, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.1.
+          # Cargo.lock resolves beads_rust 0.5.2, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.2.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
@@ -212,8 +212,8 @@ jobs:
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # beads_rust 0.5.1 is not yet published, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.1.
+          # Cargo.lock resolves beads_rust 0.5.2, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.2.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install system dependencies
@@ -298,8 +298,8 @@ jobs:
           # frankensearch's tools/optimize_params workspace member depends on
           # ../../../fast_cmaes — required for workspace-wide cargo metadata.
           checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
-          # beads_rust 0.5.1 is not yet published, so the workspace patch
-          # requires this pinned sibling checkout to remain on version 0.5.1.
+          # Cargo.lock resolves beads_rust 0.5.2, so the workspace patch
+          # requires this pinned sibling checkout to remain on version 0.5.2.
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install pinned Rust toolchain
