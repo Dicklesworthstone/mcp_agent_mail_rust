@@ -709,6 +709,21 @@ thread_local! {
     static TEST_RANDOM_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+const TEST_OMP_HOME_DIR_OVERRIDE_KEY: &str = "__MCP_AGENT_MAIL_TEST_OMP_HOME_DIR";
+
+fn home_dir_for_omp_setup() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(value) = TEST_ENV_OVERRIDES
+            .with(|cell| cell.borrow().get(TEST_OMP_HOME_DIR_OVERRIDE_KEY).cloned())
+        {
+            return value.map(PathBuf::from);
+        }
+    }
+    dirs::home_dir()
+}
+
 fn env_value_for_setup(key: &str) -> Option<String> {
     #[cfg(test)]
     {
@@ -1425,7 +1440,10 @@ pub fn omp_active_user_config_path(params: &SetupParams) -> Result<PathBuf, Setu
         .map_or_else(
             || {
                 require_absolute_omp_home_dir(
-                    params.home_dir_override.clone(),
+                    params
+                        .home_dir_override
+                        .clone()
+                        .or_else(home_dir_for_omp_setup),
                 )
                 .map(|home| home.join(".omp").join("agent").join("mcp.json"))
             },
@@ -2818,7 +2836,7 @@ pub struct ConfigFileStatus {
     /// reasons and remediation already describe the operator-facing result.
     #[serde(skip_serializing)]
     pub omp_active_user_config_drift: bool,
-    /// Whether another OMP-native MCP input contributes a distinct live Agent
+    /// Whether another OMP MCP discovery input contributes a distinct live Agent
     /// Mail alias that is not shadowed by the canonical primary entry.
     #[serde(skip_serializing)]
     pub omp_mcp_alias_drift: bool,
@@ -5968,6 +5986,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let sentinel = project.join("operator-owned");
         std::fs::write(&sentinel, "sentinel\n").unwrap();
+        let _missing_process_home = EnvVarGuard::unset(TEST_OMP_HOME_DIR_OVERRIDE_KEY);
 
         for mut params in [
             SetupParams {
@@ -7715,11 +7734,15 @@ http_headers = { Authorization = "Bearer tok" }
         let project_secondary = params.project_dir.join(".omp/.mcp.json");
         let user_primary = omp_active_user_config_path(&params).unwrap();
         let user_secondary = user_primary.parent().unwrap().join(".mcp.json");
+        let root_primary = params.project_dir.join("mcp.json");
+        let root_secondary = params.project_dir.join(".mcp.json");
         for path in [
             &project_primary,
             &project_secondary,
             &user_primary,
             &user_secondary,
+            &root_primary,
+            &root_secondary,
         ] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
@@ -7733,7 +7756,13 @@ http_headers = { Authorization = "Bearer tok" }
             canonical("http://127.0.0.1:8765/mcp/"),
         )
         .unwrap();
-        for path in [&project_secondary, &user_primary, &user_secondary] {
+        for path in [
+            &project_secondary,
+            &user_primary,
+            &user_secondary,
+            &root_primary,
+            &root_secondary,
+        ] {
             std::fs::write(path, canonical("http://stale.example/mcp")).unwrap();
         }
 
@@ -7780,6 +7809,75 @@ http_headers = { Authorization = "Bearer tok" }
             hidden_project_alias
                 .remediation
                 .contains(".omp/.mcp.json")
+        );
+
+        std::fs::write(
+            &project_secondary,
+            canonical("http://stale.example/mcp"),
+        )
+        .unwrap();
+        std::fs::write(
+            &root_primary,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let root_alias = first_setup_status_file(&params);
+        assert!(root_alias.omp_mcp_alias_drift);
+        assert!(root_alias.remediation.contains("mcp.json"));
+
+        for disabled in [Value::Bool(false), Value::String("false".to_string()), Value::String("0".to_string())] {
+            std::fs::write(
+                &root_primary,
+                canonical("http://stale.example/mcp"),
+            )
+            .unwrap();
+            std::fs::write(
+                &user_secondary,
+                serde_json::to_string(&json!({
+                    "mcpServers": {
+                        "mcp_agent_mail": {
+                            "type": "http",
+                            "url": "http://stale.example/mcp",
+                            "enabled": disabled,
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let disabled_alias = first_setup_status_file(&params);
+            assert!(
+                !disabled_alias.omp_mcp_alias_drift,
+                "OMP-native disabled alias {disabled:?} must not be reported as a live duplicate"
+            );
+        }
+
+        std::fs::write(&user_secondary, canonical("http://stale.example/mcp")).unwrap();
+        std::fs::write(
+            &root_primary,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp","enabled":false}}}"#,
+        )
+        .unwrap();
+        assert!(!first_setup_status_file(&params).omp_mcp_alias_drift);
+
+        std::fs::write(
+            &root_primary,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp","enabled":"false"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "standalone mcp-json ignores non-boolean enabled values instead of coercing them"
+        );
+
+        std::fs::write(
+            &root_primary,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","command":"stale"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !first_setup_status_file(&params).omp_mcp_alias_drift,
+            "transport/endpoint mismatches cannot become a live connection"
         );
     }
 
