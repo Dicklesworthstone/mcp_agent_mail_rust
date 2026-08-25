@@ -52,6 +52,7 @@ CHECKSUM_URL="${CHECKSUM_URL:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
 COSIGN_IDENTITY=""
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+COSIGN_BIN=""
 EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
@@ -576,6 +577,7 @@ proc = subprocess.Popen(
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     text=True,
+    start_new_session=True,
 )
 
 deadline = time.time() + timeout_secs
@@ -587,7 +589,12 @@ while time.time() < deadline:
 
 if proc.poll() is None:
     timed_out = True
-    proc.kill()
+    try:
+        import os
+        import signal
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        proc.kill()
 
 output, _ = proc.communicate()
 with open(output_path, "w", encoding="utf-8") as handle:
@@ -613,7 +620,21 @@ PY
     return "$CAPTURED_CMD_STATUS"
   fi
 
-  if CAPTURED_CMD_OUTPUT=$("$@" 2>&1); then
+  # Never turn a bounded probe into an unbounded one merely because Python is
+  # absent. GNU timeout is common on Linux; Homebrew installs it as gtimeout on
+  # macOS. Hosts with neither receive a fail-closed, actionable result.
+  local timeout_bin=""
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_bin="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_bin="gtimeout"
+  else
+    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires python3, timeout, or gtimeout)."
+    CAPTURED_CMD_STATUS=125
+    return 125
+  fi
+
+  if CAPTURED_CMD_OUTPUT=$("$timeout_bin" --signal=KILL "$timeout_secs" "$@" 2>&1); then
     CAPTURED_CMD_STATUS=0
     return 0
   fi
@@ -2756,27 +2777,210 @@ resolve_migrated_bearer_token() {
   printf ''
 }
 
-# T2.3: Atomic binary installation (crash-safe)
-# Writes to a temp file, syncs, then renames atomically.
-# Cleans up stale tmp files from previous failed installs.
-atomic_install() {
-  local src="$1"
-  local dest="$2"
-  local tmp_dest="${dest}.tmp.$$"
+# Return one lowercase SHA-256 digest and nothing else. Release installation
+# uses this both before and after replacement so a same-version but byte-different
+# executable cannot satisfy the exact-artifact contract.
+file_sha256_hex() {
+  local file="$1"
+  local digest=""
 
-  # Clean up stale tmp files from previous failed installs
-  for stale in "${dest}".tmp.*; do
-    [ -f "$stale" ] && rm -f "$stale" 2>/dev/null
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(sha256sum "$file" 2>/dev/null | awk '{print $1}') || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}') || return 1
+  else
+    return 1
+  fi
+  [[ "$digest" =~ ^[A-Fa-f0-9]{64}$ ]] || return 1
+  printf '%s' "$digest" | tr '[:upper:]' '[:lower:]'
+}
+
+# Restore one binary after a failed pair replacement. We remove a newly
+# installed destination only when its digest proves that it is the byte string
+# this invocation wrote; an unexpected concurrent replacement is never
+# clobbered during rollback.
+rollback_binary_install_target() {
+  local dest="$1"
+  local backup="$2"
+  local had_original="$3"
+  local installed_new="$4"
+  local expected_new_hash="$5"
+  local label="$6"
+  local current_hash=""
+
+  if [ "$installed_new" -eq 1 ] && { [ -e "$dest" ] || [ -L "$dest" ]; }; then
+    if [ ! -f "$dest" ] || [ -L "$dest" ]; then
+      err "Rollback refused to remove an unexpected $label target: $dest"
+      return 1
+    fi
+    current_hash=$(file_sha256_hex "$dest" 2>/dev/null || true)
+    if [ "$current_hash" != "$expected_new_hash" ]; then
+      err "Rollback refused to clobber a concurrently modified $label target: $dest"
+      return 1
+    fi
+    rm -f "$dest" || return 1
+  fi
+
+  if [ "$had_original" -eq 1 ]; then
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      err "Rollback cannot restore $label because its destination is occupied: $dest"
+      return 1
+    fi
+    if [ ! -f "$backup" ] || [ -L "$backup" ]; then
+      err "Rollback backup for $label is missing or unsafe: $backup"
+      return 1
+    fi
+    mv -f "$backup" "$dest" || return 1
+  fi
+}
+
+rollback_binary_pair_install() {
+  local server_dest="$1"
+  local cli_dest="$2"
+  local server_backup="$3"
+  local cli_backup="$4"
+  local had_server="$5"
+  local had_cli="$6"
+  local installed_server="$7"
+  local installed_cli="$8"
+  local server_hash="$9"
+  local cli_hash="${10}"
+  local rollback_failed=0
+
+  rollback_binary_install_target \
+    "$cli_dest" "$cli_backup" "$had_cli" "$installed_cli" "$cli_hash" "$BIN_CLI" \
+    || rollback_failed=1
+  rollback_binary_install_target \
+    "$server_dest" "$server_backup" "$had_server" "$installed_server" "$server_hash" "$BIN_SERVER" \
+    || rollback_failed=1
+  return "$rollback_failed"
+}
+
+# Replace the server and CLI as one rollback domain. Individual renames are
+# atomic, while pair-level failure is transactionally restored. Backups remain
+# present until both installed digests and both exact version lines pass.
+install_binary_pair_transactional() {
+  local server_src="$1"
+  local cli_src="$2"
+  local install_dir="$3"
+  local fault_after_first_replace_for_test="${4:-0}"
+  local nonce="$$.${RANDOM}.${RANDOM}"
+  local server_dest="$install_dir/$BIN_SERVER"
+  local cli_dest="$install_dir/$BIN_CLI"
+  local server_tmp="${server_dest}.tmp.${nonce}"
+  local cli_tmp="${cli_dest}.tmp.${nonce}"
+  local server_backup="${server_dest}.bak.preinstall-${nonce}"
+  local cli_backup="${cli_dest}.bak.preinstall-${nonce}"
+  local server_hash="" cli_hash="" installed_server_hash="" installed_cli_hash=""
+  local had_server=0 had_cli=0 installed_server=0 installed_cli=0
+
+  for source_path in "$server_src" "$cli_src"; do
+    if [ ! -f "$source_path" ] || [ -L "$source_path" ] || \
+       [ ! -s "$source_path" ] || [ ! -x "$source_path" ]; then
+      err "Binary transaction source is not a non-empty executable regular file: $source_path"
+      return 1
+    fi
   done
+  ensure_real_file_target_path "$server_dest" "$BIN_SERVER install target" || return 1
+  ensure_real_file_target_path "$cli_dest" "$BIN_CLI install target" || return 1
 
-  # Write to temp file
-  install -m 0755 "$src" "$tmp_dest"
+  if ! server_hash=$(file_sha256_hex "$server_src") || \
+     ! cli_hash=$(file_sha256_hex "$cli_src"); then
+    err "A SHA256 implementation is required to bind staged and installed binaries."
+    return 1
+  fi
 
-  # Sync to disk if available
-  sync "$tmp_dest" 2>/dev/null || sync 2>/dev/null || true
+  if ! install -m 0755 "$server_src" "$server_tmp" || \
+     ! install -m 0755 "$cli_src" "$cli_tmp"; then
+    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+    err "Could not stage both binaries in the destination directory."
+    return 1
+  fi
+  if [ "$(file_sha256_hex "$server_tmp" 2>/dev/null || true)" != "$server_hash" ] || \
+     [ "$(file_sha256_hex "$cli_tmp" 2>/dev/null || true)" != "$cli_hash" ]; then
+    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+    err "Destination staging changed binary bytes; refusing replacement."
+    return 1
+  fi
+  sync "$server_tmp" "$cli_tmp" 2>/dev/null || sync 2>/dev/null || true
 
-  # Atomic rename
-  mv -f "$tmp_dest" "$dest"
+  if [ -e "$server_dest" ]; then
+    if ! mv "$server_dest" "$server_backup"; then
+      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+      err "Could not preserve the existing $BIN_SERVER binary."
+      return 1
+    fi
+    had_server=1
+    if [ ! -f "$server_backup" ] || [ -L "$server_backup" ]; then
+      rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
+        "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
+      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+      err "Existing $BIN_SERVER changed type during replacement; rollback attempted."
+      return 1
+    fi
+  fi
+  if [ -e "$cli_dest" ]; then
+    if ! mv "$cli_dest" "$cli_backup"; then
+      rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
+        "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
+      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+      err "Could not preserve the existing $BIN_CLI binary; rollback attempted."
+      return 1
+    fi
+    had_cli=1
+    if [ ! -f "$cli_backup" ] || [ -L "$cli_backup" ]; then
+      rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
+        "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
+      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+      err "Existing $BIN_CLI changed type during replacement; rollback attempted."
+      return 1
+    fi
+  fi
+
+  if ! mv "$server_tmp" "$server_dest"; then
+    rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
+      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
+    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+    err "Could not replace $BIN_SERVER; rollback attempted."
+    return 1
+  fi
+  installed_server=1
+
+  if [ "$fault_after_first_replace_for_test" = "1" ]; then
+    rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
+      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
+    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+    err "Injected failure after first binary replacement; rollback attempted."
+    return 1
+  fi
+
+  if ! mv "$cli_tmp" "$cli_dest"; then
+    rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
+      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
+    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
+    err "Could not replace $BIN_CLI; rollback attempted."
+    return 1
+  fi
+  installed_cli=1
+
+  installed_server_hash=$(file_sha256_hex "$server_dest" 2>/dev/null || true)
+  installed_cli_hash=$(file_sha256_hex "$cli_dest" 2>/dev/null || true)
+  if [ "$installed_server_hash" != "$server_hash" ] || [ "$installed_cli_hash" != "$cli_hash" ] || \
+     ! verify_release_binaries_exact "$server_dest" "$cli_dest" "Installed"; then
+    if ! rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
+      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash"; then
+      err "Post-install verification failed and rollback was incomplete; inspect $install_dir before retrying."
+      return 1
+    fi
+    err "Post-install verification failed; the previous binary pair was restored."
+    return 1
+  fi
+
+  sync "$server_dest" "$cli_dest" 2>/dev/null || sync 2>/dev/null || true
+  [ "$had_server" -eq 0 ] || rm -f "$server_backup" 2>/dev/null || warn "Retained old server backup: $server_backup"
+  [ "$had_cli" -eq 0 ] || rm -f "$cli_backup" 2>/dev/null || warn "Retained old CLI backup: $cli_backup"
+  return 0
 }
 
 # ── End Python detection & displacement ────────────────────────────────────
@@ -5979,6 +6183,65 @@ ensure_rust() {
   rustup component add rustfmt clippy || true
 }
 
+checkout_exact_release_source() {
+  local repository_url="$1"
+  local destination="$2"
+  local release_tag="$3"
+  local fetched_revision="" remote_revision=""
+
+  git init --quiet "$destination" || return 1
+  git -C "$destination" remote add origin "$repository_url" || return 1
+  git -C "$destination" fetch --quiet --depth 1 origin "refs/tags/${release_tag}" || return 1
+  git -C "$destination" checkout --quiet --detach FETCH_HEAD || return 1
+  fetched_revision=$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)
+  remote_revision=$(git -C "$destination" ls-remote origin "refs/tags/${release_tag}^{}" \
+    | awk 'NR == 1 {print $1}')
+  if [ -z "$remote_revision" ]; then
+    remote_revision=$(git -C "$destination" ls-remote origin "refs/tags/${release_tag}" \
+      | awk 'NR == 1 {print $1}')
+  fi
+  if ! [[ "$fetched_revision" =~ ^[0-9a-f]{40}$ ]] || \
+     [ "$remote_revision" != "$fetched_revision" ]; then
+    err "Release tag ${release_tag} resolved to ${remote_revision:-missing}, not fetched ${fetched_revision:-missing}."
+    return 1
+  fi
+  verbose "source_checkout:tag=${release_tag} revision=${fetched_revision}"
+}
+
+release_dependency_pin() {
+  local source_root="$1"
+  local key="$2"
+  local workflow="$source_root/.github/workflows/dist.yml"
+  local matches="" count=0 pin=""
+
+  [ -f "$workflow" ] || return 1
+  matches=$(awk -v key="${key}:" '$1 == key { print $2 }' "$workflow")
+  if [ -n "$matches" ]; then
+    count=$(printf '%s\n' "$matches" | grep -c . || true)
+  fi
+  [ "$count" -eq 1 ] || return 1
+  pin="$matches"
+  [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s' "$pin"
+}
+
+checkout_pinned_dependency() {
+  local repository_url="$1"
+  local destination="$2"
+  local expected_revision="$3"
+  local actual_revision=""
+
+  git init --quiet "$destination" || return 1
+  git -C "$destination" remote add origin "$repository_url" || return 1
+  git -C "$destination" fetch --quiet --depth 1 origin "$expected_revision" || return 1
+  git -C "$destination" checkout --quiet --detach FETCH_HEAD || return 1
+  actual_revision=$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)
+  if [ "$actual_revision" != "$expected_revision" ]; then
+    err "Pinned dependency at $destination resolved to ${actual_revision:-missing}, expected $expected_revision."
+    return 1
+  fi
+}
+
 # Verify the SHA256 checksum of a file. Verification is fail-closed: callers
 # must use --no-verify explicitly if this host cannot compute SHA256.
 verify_checksum() {
@@ -6106,16 +6369,52 @@ resolve_and_verify_archive_checksum() {
 # Verify the standardized Sigstore bundle for a file. cosign is the parser and
 # verifier for the bundle, certificate identity, issuer, and transparency proof;
 # any missing dependency or invalid evidence is fatal before extraction.
+require_safe_cosign() {
+  local version_output="" parsed_versions="" version_count=0 version=""
+  local major=0 minor=0 patch=0
+
+  COSIGN_BIN=$(type -P cosign 2>/dev/null || true)
+  if [ -z "$COSIGN_BIN" ] || [ ! -x "$COSIGN_BIN" ]; then
+    err "cosign is required to verify release archive authenticity but was not found."
+    err "Install cosign v3.1.3 or newer in the v3 line, or use --no-verify only for a trusted local artifact."
+    return 1
+  fi
+  if ! version_output=$("$COSIGN_BIN" version 2>/dev/null); then
+    err "Could not determine the installed cosign version."
+    err "Release verification requires a parseable stable cosign v3.1.3 or newer, below v4."
+    return 1
+  fi
+
+  parsed_versions=$(printf '%s\n' "$version_output" | sed -n \
+    's/^[[:space:]]*GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)[[:space:]]*$/\1/p')
+  if [ -n "$parsed_versions" ]; then
+    version_count=$(printf '%s\n' "$parsed_versions" | grep -c . || true)
+  fi
+  if [ "$version_count" -ne 1 ]; then
+    err "Could not parse exactly one stable GitVersion from cosign version output."
+    err "Release verification requires cosign >=3.1.3 and <4.0.0."
+    return 1
+  fi
+
+  version="$parsed_versions"
+  IFS=. read -r major minor patch <<< "$version"
+  if [ "$major" -ne 3 ] || \
+     { [ "$minor" -lt 1 ] || { [ "$minor" -eq 1 ] && [ "$patch" -lt 3 ]; }; }; then
+    err "Unsafe or unsupported cosign version v${version}; require >=v3.1.3 and <v4.0.0."
+    err "Older versions are affected by identity-policy bypasses for attacker-supplied legacy bundles."
+    return 1
+  fi
+
+  verbose "verify_sigstore_bundle:cosign_bin=${COSIGN_BIN} cosign_version=v${version}"
+  return 0
+}
+
 verify_sigstore_bundle() {
   local file="$1"
   local artifact_url="$2"
   verbose "verify_sigstore_bundle:start file=${file} artifact_url=${artifact_url}"
 
-  if ! command -v cosign &>/dev/null; then
-    err "cosign is required to verify release archive authenticity but was not found."
-    err "Install cosign, or use --no-verify only for a trusted local artifact."
-    return 1
-  fi
+  require_safe_cosign || return 1
 
   local bundle_url="$SIGSTORE_BUNDLE_URL"
   if [ -z "$bundle_url" ]; then
@@ -6144,37 +6443,21 @@ verify_sigstore_bundle() {
     return 1
   fi
 
-  # Our releases ship the new standardized Sigstore protobuf bundle
-  # (.sigstore.json). cosign 2.x can verify it but only with an explicit
-  # --new-bundle-format; cosign 3.x enables that format by default. Passing the
-  # flag to a 3.x build is harmless (it still exists), but to avoid depending on
-  # the flag's continued presence we only add it for the 2.x line. For an
-  # unparseable version we add it: every cosign that can verify a .sigstore.json
-  # bundle at all (2.4+) accepts the flag, so this is the safe default.
-  local nbf_flag=""
-  case "$bundle_file" in
-    *.sigstore.json|*.sigstore)
-      local cosign_major
-      cosign_major="$(cosign version 2>/dev/null \
-        | sed -n 's/.*GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\).*/\1/p' \
-        | head -n1)"
-      # Add the flag unless cosign is a known v3+ (where the new format is the
-      # default). Empty/non-numeric version (e.g. "devel") falls through to the
-      # safe default of adding it.
-      if ! printf '%s' "$cosign_major" | grep -qE '^[0-9]+$' || [ "$cosign_major" -lt 3 ]; then
-        nbf_flag="--new-bundle-format"
-      fi
-      verbose "verify_sigstore_bundle:cosign_major=${cosign_major:-unknown} new_bundle_format=${nbf_flag:-off}"
-      ;;
-  esac
-
-  if ! cosign verify-blob \
-    ${nbf_flag:+$nbf_flag} \
+  # Force standardized-bundle parsing even though v3 defaults to it. This makes
+  # a substituted legacy JSON bundle fail closed instead of entering a legacy
+  # parser. Clear every documented custom-trust override so the release policy
+  # is anchored in Sigstore's public-good trust root, not caller-supplied roots.
+  if ! env \
+    -u SIGSTORE_ROOT_FILE \
+    -u SIGSTORE_REKOR_PUBLIC_KEY \
+    -u SIGSTORE_CT_LOG_PUBLIC_KEY_FILE \
+    "$COSIGN_BIN" verify-blob \
+    --new-bundle-format \
     --bundle "$bundle_file" \
     --certificate-identity "$COSIGN_IDENTITY" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
-    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=${nbf_flag:-off}"
+    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=on"
     err "Sigstore verification failed for ${file}."
     err "The bundle must be valid and signed by ${COSIGN_IDENTITY} via ${COSIGN_OIDC_ISSUER}."
     return 1
@@ -6901,6 +7184,10 @@ TMP_PARENT="${TMPDIR:-/tmp}"
 TMP=$(mktemp -d "${TMP_PARENT%/}/mcp-agent-mail-install.XXXXXX")
 trap cleanup EXIT
 
+SERVER_BIN=""
+CLI_BIN=""
+INSTALL_METHOD_LABEL="release archive"
+
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
   binary_download_failed=0
@@ -6917,122 +7204,116 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
   fi
   if [ "$binary_download_failed" -eq 1 ]; then
     # If we preferred a musl artifact that isn't published for this release
-    # (older tags only shipped gnu), fall back to the gnu artifact before
-    # giving up and attempting a source build.
+    # (older tags only shipped gnu), fall back to the gnu artifact. A failed
+    # release download never changes into a source build: that would discard
+    # the caller's exact artifact-selection and verification intent.
     if linux_x86_64_gnu_fallback_allowed; then
       warn "musl artifact not available for $VERSION; falling back to gnu artifact"
       verbose "binary-download:musl_fallback_to_gnu version=${VERSION} url=${URL}"
       select_linux_x86_64_gnu_artifact
       info "Downloading $URL"
-      if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+      if download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+        binary_download_failed=0
+      else
         if select_same_target_gzip_artifact; then
           warn "gnu tar.xz artifact not available for $VERSION; trying gnu tar.gz"
           verbose "binary-download:gnu_tar_gz_fallback version=${VERSION} url=${URL}"
           info "Downloading $URL"
-          if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
-            warn "Binary download failed (release may not exist for $VERSION)"
-            warn "Attempting build from source as fallback..."
-            verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-            FROM_SOURCE=1
+          if download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+            binary_download_failed=0
           fi
-        else
-          warn "Binary download failed (release may not exist for $VERSION)"
-          warn "Attempting build from source as fallback..."
-          verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-          FROM_SOURCE=1
         fi
       fi
-    else
-      warn "Binary download failed (release may not exist for $VERSION)"
-      warn "Attempting build from source as fallback..."
-      verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-      FROM_SOURCE=1
     fi
+  fi
+  if [ "$binary_download_failed" -eq 1 ]; then
+    err "Could not download an exact release archive for $VERSION."
+    err "The installer will not silently substitute a source build."
+    err "Retry the release download, choose another --version, or pass --from-source explicitly."
+    error_support_hint
+    exit 1
   fi
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git, rust nightly, and all local dependencies)"
+  INSTALL_METHOD_LABEL="exact-tag source build"
+  info "Building exact release tag $VERSION from source"
   ensure_rust
-  git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  source_repository_url="https://github.com/${OWNER}/${REPO}.git"
+  if ! checkout_exact_release_source "$source_repository_url" "$TMP/src" "$VERSION"; then
+    err "Could not check out and verify exact release tag $VERSION."
+    err "Source installation never builds an unverified default branch."
+    exit 1
+  fi
 
-  # Cargo.toml path-depends on ../frankensearch and path-patches beads_rust to
-  # ../beads_rust (registry 0.3.2 pins an older asupersync); everything else
-  # resolves from crates.io. Provision those siblings next to the checkout.
-  # fast_cmaes is a member of frankensearch's workspace and is needed for
-  # workspace-wide cargo metadata there.
-  for sibling in frankensearch fast_cmaes beads_rust; do
-    if ! git clone --depth 1 "https://github.com/Dicklesworthstone/${sibling}.git" "$TMP/$sibling"; then
-      err "Build from source requires a sibling checkout of ${sibling}, and cloning it failed."
-      err ""
-      err "For end-user installation, use pre-built release binaries:"
-      err "  curl -fsSL ${INSTALL_SCRIPT_URL} | bash"
-      err ""
-      err "If no release exists yet, check https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases"
-      exit 1
-    fi
-  done
+  if ! frankensearch_commit=$(release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT) || \
+     ! fast_cmaes_commit=$(release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT) || \
+     ! beads_rust_commit=$(release_dependency_pin "$TMP/src" BEADS_RUST_COMMIT); then
+    err "Release tag $VERSION does not contain one exact full-SHA pin for every source-build sibling."
+    err "Expected FRANKENSEARCH_COMMIT, FAST_CMAES_COMMIT, and BEADS_RUST_COMMIT in dist.yml."
+    exit 1
+  fi
 
-  if ! (cd "$TMP/src" && cargo build --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
+  if ! checkout_pinned_dependency \
+      "https://github.com/Dicklesworthstone/frankensearch.git" \
+      "$TMP/frankensearch" "$frankensearch_commit" || \
+     ! checkout_pinned_dependency \
+      "https://github.com/Dicklesworthstone/fast_cmaes.git" \
+      "$TMP/fast_cmaes" "$fast_cmaes_commit" || \
+     ! checkout_pinned_dependency \
+      "https://github.com/Dicklesworthstone/beads_rust.git" \
+      "$TMP/beads_rust" "$beads_rust_commit"; then
+    err "Could not check out an exact pinned source-build dependency."
+    exit 1
+  fi
+
+  if ! (cd "$TMP/src" && cargo build --locked --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
     err "Build failed. Check compiler output above for details."
     error_support_hint
     exit 1
   fi
-  local_server="$TMP/src/target/release/$BIN_SERVER"
-  local_cli="$TMP/src/target/release/$BIN_CLI"
-  [ -x "$local_server" ] || {
+  SERVER_BIN="$TMP/src/target/release/$BIN_SERVER"
+  CLI_BIN="$TMP/src/target/release/$BIN_CLI"
+  [ -x "$SERVER_BIN" ] || {
     err "Build failed: $BIN_SERVER not found"
     err "Retry with --verbose and ensure cargo build completed successfully."
     error_support_hint
     exit 1
   }
-  [ -x "$local_cli" ] || {
+  [ -x "$CLI_BIN" ] || {
     err "Build failed: $BIN_CLI not found"
     err "Retry with --verbose and ensure cargo build completed successfully."
     error_support_hint
     exit 1
   }
-  atomic_install "$local_server" "$DEST/$BIN_SERVER"
-  atomic_install "$local_cli" "$DEST/$BIN_CLI"
-  ok "Installed to $DEST (source build)"
-  ok "  $DEST/$BIN_SERVER"
-  ok "  $DEST/$BIN_CLI"
-  maybe_add_path
-  install_local_bin_links
-  if [ "$VERIFY" -eq 1 ]; then
-    "$DEST/$BIN_CLI" --version || true
-    ok "Self-test complete"
-  fi
-  exit 0
-fi
-
-# Release archive verification is mandatory unless the caller explicitly accepts
-# the risk with --no-verify. This gate always runs before the first tar command.
-if [ "$NO_VERIFY" -eq 1 ]; then
-  warn "UNSAFE: archive checksum and Sigstore verification skipped (--no-verify)"
-  warn "Archive-member and exact-version checks remain mandatory."
 else
-  if ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then
+  # Release archive verification is mandatory unless the caller explicitly
+  # accepts the risk with --no-verify. This gate always runs before extraction.
+  if [ "$NO_VERIFY" -eq 1 ]; then
+    warn "UNSAFE: archive checksum and Sigstore verification skipped (--no-verify)"
+    warn "The archive's binaries will execute for version checks before installation."
+    warn "Archive-member and exact-version checks remain mandatory."
+  elif ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then
     err "Archive verification failed; aborting before extraction or installation."
     err "Retry with a fresh release, install the required verification tools, or use --no-verify only for a trusted local artifact."
     error_support_hint
     exit 1
   fi
+
+  if ! verify_archive_members_exact "$TMP/$TAR"; then
+    err "Archive member verification failed; aborting before extraction or installation."
+    error_support_hint
+    exit 1
+  fi
+
+  info "Extracting"
+  EXTRACT_DIR="$TMP/extract"
+  mkdir "$EXTRACT_DIR"
+  tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"
+  SERVER_BIN="$EXTRACT_DIR/$BIN_SERVER"
+  CLI_BIN="$EXTRACT_DIR/$BIN_CLI"
 fi
 
-if ! verify_archive_members_exact "$TMP/$TAR"; then
-  err "Archive member verification failed; aborting before extraction or installation."
-  error_support_hint
-  exit 1
-fi
-
-info "Extracting"
-EXTRACT_DIR="$TMP/extract"
-mkdir "$EXTRACT_DIR"
-tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"
-
-SERVER_BIN="$EXTRACT_DIR/$BIN_SERVER"
-CLI_BIN="$EXTRACT_DIR/$BIN_CLI"
 for staged_binary in "$SERVER_BIN" "$CLI_BIN"; do
   if [ ! -f "$staged_binary" ] || [ -L "$staged_binary" ] || \
      [ ! -s "$staged_binary" ] || [ ! -x "$staged_binary" ]; then
@@ -7048,14 +7329,12 @@ if ! verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"; then
   exit 1
 fi
 
-atomic_install "$SERVER_BIN" "$DEST/$BIN_SERVER"
-atomic_install "$CLI_BIN" "$DEST/$BIN_CLI"
-if ! verify_release_binaries_exact "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI" "Installed"; then
-  err "Post-install release verification failed."
+if ! install_binary_pair_transactional "$SERVER_BIN" "$CLI_BIN" "$DEST"; then
+  err "Binary pair installation failed."
   error_support_hint
   exit 1
 fi
-ok "Installed to $DEST"
+ok "Installed to $DEST ($INSTALL_METHOD_LABEL)"
 ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
 maybe_add_path

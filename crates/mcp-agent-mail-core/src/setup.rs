@@ -5865,6 +5865,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_token_explicit_bypasses_rejected_file_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let generated = resolve_token(Some("operator-token"), tmp.path())
+            .expect("an explicit token must not inspect the rejected file authority");
+        let existing = resolve_existing_token(Some("operator-token"), tmp.path())
+            .expect("an explicit token must not inspect the rejected file authority");
+
+        assert_eq!(generated, "operator-token");
+        assert_eq!(existing.as_deref(), Some("operator-token"));
+    }
+
+    #[test]
     fn resolve_token_generates_when_no_source() {
         let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::tempdir().unwrap();
@@ -5889,6 +5902,92 @@ mod tests {
         std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN='single-quoted-token'\n").unwrap();
         let t = resolve_token(None, tmp.path()).expect("env file token should resolve");
         assert_eq!(t, "single-quoted-token");
+    }
+
+    #[test]
+    fn resolve_existing_token_reads_env_file() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN=existing-token\n").unwrap();
+
+        let token = resolve_existing_token(None, tmp.path())
+            .expect("ordinary authority should be readable");
+
+        assert_eq!(token.as_deref(), Some("existing-token"));
+    }
+
+    #[test]
+    fn resolve_token_rejects_non_regular_file_authority() {
+        let _env = EnvVarGuard::set("HTTP_BEARER_TOKEN", "stale-fallback-token");
+        let tmp = tempfile::tempdir().unwrap();
+
+        let error = resolve_token(None, tmp.path())
+            .expect_err("a directory authority must not degrade to token generation");
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn resolve_existing_token_rejects_invalid_utf8_authority() {
+        let _env = EnvVarGuard::set("HTTP_BEARER_TOKEN", "stale-fallback-token");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), [0xff, 0xfe, 0xfd]).unwrap();
+
+        let error = resolve_existing_token(None, tmp.path())
+            .expect_err("invalid UTF-8 must not degrade to an absent token");
+
+        assert!(error.to_string().contains("not valid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn resolve_token_rejects_oversized_authority() {
+        let _env = EnvVarGuard::set("HTTP_BEARER_TOKEN", "stale-fallback-token");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let oversized_len =
+            usize::try_from(crate::config::USER_ENV_FILE_MAX_BYTES).unwrap() + 1;
+        std::fs::write(tmp.path(), vec![b'x'; oversized_len]).unwrap();
+
+        let error = resolve_token(None, tmp.path())
+            .expect_err("an oversized authority must not degrade to token generation");
+
+        assert!(error.to_string().contains("exceeding"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_token_rejects_symlinked_file_authority() {
+        use std::os::unix::fs::symlink;
+
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
+        let tmp = setup_real_tempdir();
+        let outside = tmp.path().join("outside.env");
+        let linked = tmp.path().join("config.env");
+        std::fs::write(&outside, "HTTP_BEARER_TOKEN=redirected-token\n").unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        resolve_token(None, &linked)
+            .expect_err("a symlinked credential authority must not be followed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_token_rejects_symlinked_parent_authority() {
+        use std::os::unix::fs::symlink;
+
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
+        let tmp = setup_real_tempdir();
+        let outside_dir = tmp.path().join("outside");
+        let linked_dir = tmp.path().join("linked");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(
+            outside_dir.join("config.env"),
+            "HTTP_BEARER_TOKEN=redirected-token\n",
+        )
+        .unwrap();
+        symlink(&outside_dir, &linked_dir).unwrap();
+
+        resolve_token(None, &linked_dir.join("config.env"))
+            .expect_err("a symlinked parent authority must not be followed");
     }
 
     #[test]
