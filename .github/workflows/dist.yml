@@ -9,8 +9,6 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
-    # Lint failures are reported but do not block the release build.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -35,10 +33,13 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
 
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -64,13 +65,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Run tests
-        run: cargo test --lib
+        run: cargo test --workspace
 
   build:
-    needs: test
-    # Test failures should not block release builds — tests use nightly
-    # Rust and may fail due to toolchain instability.
-    if: always() && !cancelled()
+    needs: [lint, test]
     strategy:
       fail-fast: false
       matrix:
@@ -84,9 +82,9 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          # x86_64-apple-darwin removed: ort-sys lacks prebuilt ONNX
-          # Runtime binaries for this target.  v0.2.20 never shipped it.
-          - os: macos-14
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -204,10 +202,7 @@ jobs:
           path: dist/*
 
   release:
-    needs: build
-    # Run when all build matrix entries succeed, even if test/lint failed
-    # (build already gates on !cancelled via its own `if`).
-    if: always() && !cancelled() && needs.build.result == 'success'
+    needs: [lint, test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -243,13 +238,6 @@ jobs:
 
       - name: Generate consolidated SHA256SUMS
         run: |
-          cd dist
-          shasum -a 256 mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip 2>/dev/null > SHA256SUMS || true
-          echo "=== SHA256SUMS ==="
-          cat SHA256SUMS
-
-      - name: Validate release bundle completeness
-        run: |
           set -euo pipefail
           shopt -s nullglob
           cd dist
@@ -258,8 +246,31 @@ jobs:
             echo "No release archives found in dist/" >&2
             exit 1
           fi
+          shasum -a 256 "${archives[@]}" > SHA256SUMS
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Validate release bundle completeness
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd dist
+          expected_archives=(
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz
+            mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-apple-darwin.tar.xz
+            mcp-agent-mail-aarch64-apple-darwin.tar.xz
+            mcp-agent-mail-x86_64-pc-windows-msvc.zip
+          )
+          archives=(mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip)
+          if [ "${#archives[@]}" -ne "${#expected_archives[@]}" ]; then
+            echo "Expected ${#expected_archives[@]} release archives, found ${#archives[@]}" >&2
+            printf 'Found: %s\n' "${archives[@]}" >&2
+            exit 1
+          fi
           test -s SHA256SUMS
-          for artifact in "${archives[@]}"; do
+          for artifact in "${expected_archives[@]}"; do
             test -s "$artifact"
             test -s "${artifact}.sha256"
             test -s "${artifact}.sigstore.json"
