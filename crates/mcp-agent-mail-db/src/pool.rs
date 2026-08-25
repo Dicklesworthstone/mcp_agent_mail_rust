@@ -3301,6 +3301,22 @@ impl DbPool {
         &self.storage_root
     }
 
+    /// Return the frozen archive authority after proving its path has not
+    /// become a symlink to a different filesystem identity.
+    ///
+    /// `storage_root()` remains available for diagnostics that only render or
+    /// hash the frozen path. Every caller that performs archive or index I/O
+    /// must use this fallible accessor instead.
+    pub(crate) fn validated_storage_root(&self, context: &'static str) -> DbResult<&Path> {
+        validate_frozen_storage_root_authority(&self.storage_root, context).map_err(|error| {
+            DbError::InvalidArgument {
+                field: "storage_root",
+                message: error.to_string(),
+            }
+        })?;
+        Ok(&self.storage_root)
+    }
+
     #[must_use]
     pub fn sqlite_identity_key(&self) -> String {
         // A recovery may replace the database file at this same path while
@@ -3382,6 +3398,12 @@ impl DbPool {
     /// Single acquire attempt: creates and initializes a new connection if needed.
     #[allow(clippy::too_many_lines)]
     async fn acquire_once(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
+        if let Err(error) = validate_frozen_storage_root_authority(
+            &self.storage_root,
+            "pooled connection checkout",
+        ) {
+            return Outcome::Err(error);
+        }
         let sqlite_path = self.sqlite_path.clone();
         let sqlite_identity = self.sqlite_identity.clone();
         let storage_root = self.storage_root.clone();
@@ -3723,6 +3745,8 @@ impl DbPool {
                 kind: integrity::CheckKind::Quick,
             });
         }
+        let storage_root =
+            self.validated_storage_root("startup/periodic integrity archive recovery")?;
 
         // Check if the file exists first. If missing, it requires recovery (e.g. from archive or backup).
         if !Path::new(&self.sqlite_path).exists() {
@@ -3768,7 +3792,7 @@ impl DbPool {
                         );
                         recover_sqlite_file_with_storage_root(
                             Path::new(&self.sqlite_path),
-                            &self.storage_root,
+                            storage_root,
                         )
                         .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
                         open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
@@ -3804,7 +3828,7 @@ impl DbPool {
 
                     if let Err(e) = recover_sqlite_file_with_storage_root(
                         Path::new(&self.sqlite_path),
-                        &self.storage_root,
+                        storage_root,
                     ) {
                         return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
                     }
@@ -3840,7 +3864,7 @@ impl DbPool {
 
                     if let Err(recovery_error) = recover_sqlite_file_with_storage_root(
                         Path::new(&self.sqlite_path),
-                        &self.storage_root,
+                        storage_root,
                     ) {
                         return Err(DbError::Sqlite(format!(
                             "startup recovery failed: {recovery_error}"
@@ -3901,7 +3925,8 @@ impl DbPool {
         if !Path::new(&self.sqlite_path).exists() {
             return Ok(None);
         }
-        let archive_max = crate::id_floor::max_message_id_in_archive(&self.storage_root)?;
+        let storage_root = self.validated_storage_root("message-id floor archive scan")?;
+        let archive_max = crate::id_floor::max_message_id_in_archive(storage_root)?;
         if archive_max.is_none() {
             return Ok(None);
         }
@@ -3984,6 +4009,7 @@ impl DbPool {
                 kind: integrity::CheckKind::Full,
             });
         }
+        let storage_root = self.validated_storage_root("full integrity archive recovery")?;
 
         if !Path::new(&self.sqlite_path).exists() {
             return Err(DbError::IntegrityCorruption {
@@ -4028,7 +4054,7 @@ impl DbPool {
                     );
                     recover_sqlite_file_with_storage_root(
                         Path::new(&self.sqlite_path),
-                        &self.storage_root,
+                        storage_root,
                     )
                     .map_err(|re| {
                         DbError::Sqlite(format!("full integrity recovery failed: {re}"))
@@ -4657,6 +4683,7 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(false);
         }
+        let storage_root = self.validated_storage_root("runtime corruption archive recovery")?;
 
         if RECOVERY_IN_PROGRESS
             .compare_exchange(
@@ -4744,7 +4771,7 @@ impl DbPool {
         // does not retry the same parser-only-rejected query.
         let bespoke_parser_only_trigger = on_disk_healthy;
 
-        match recover_sqlite_file_with_storage_root(primary_path, &self.storage_root) {
+        match recover_sqlite_file_with_storage_root(primary_path, storage_root) {
             Ok(()) => {
                 self.retire_runtime_state_after_recovery(trigger_error);
                 if bespoke_parser_only_trigger {
@@ -5091,6 +5118,22 @@ fn validate_frozen_sqlite_open_authority(
         open_path.display(),
         observed.display(),
         expected.display()
+    )))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_frozen_storage_root_authority(
+    storage_root: &Path,
+    context: &'static str,
+) -> Result<(), SqlError> {
+    let observed = normalize_sqlite_identity_path_buf(storage_root);
+    if observed == storage_root {
+        return Ok(());
+    }
+    Err(SqlError::Custom(format!(
+        "{context}: frozen storage-root path {} now resolves to {}; refusing to cross archive authority",
+        storage_root.display(),
+        observed.display(),
     )))
 }
 

@@ -1455,6 +1455,138 @@ EOF
       e2e_fail "outside migration creates an exact compatibility mirror" \
         "byte-identical files" "files differ"
     fi
+
+    legacy_private_mode() {
+      local path="$1"
+      stat -f '%Lp' "$path" 2>/dev/null || stat -c '%a' "$path" 2>/dev/null
+    }
+    e2e_assert_eq "outside canonical env is private" \
+      "600" "$(legacy_private_mode "${LEGACY_OUTSIDE_CONFIG}")"
+    e2e_assert_eq "outside compatibility env is private" \
+      "600" "$(legacy_private_mode "${LEGACY_OUTSIDE_COMPAT}")"
+
+    LEGACY_HARDLINK_HOME="${LEGACY_ENV_CONTRACT_DIR}/hardlink-home"
+    LEGACY_HARDLINK_CONFIG_DIR="${LEGACY_HARDLINK_HOME}/.config/mcp-agent-mail"
+    LEGACY_HARDLINK_CONFIG="${LEGACY_HARDLINK_CONFIG_DIR}/config.env"
+    LEGACY_HARDLINK_COMPAT="${LEGACY_HARDLINK_CONFIG_DIR}/.env"
+    LEGACY_HARDLINK_OUTSIDE="${LEGACY_ENV_CONTRACT_DIR}/hardlink-outside.env"
+    LEGACY_HARDLINK_TMP_TARGET="${LEGACY_ENV_CONTRACT_DIR}/predictable-temp-target"
+    LEGACY_HARDLINK_COMPAT_TMP_TARGET="${LEGACY_ENV_CONTRACT_DIR}/predictable-compat-temp-target"
+    mkdir -p "${LEGACY_HARDLINK_CONFIG_DIR}"
+    cat > "${LEGACY_HARDLINK_OUTSIDE}" <<'EOF'
+# hardlink sentinel
+HTTP_BEARER_TOKEN=hardlink-old-secret
+PRESERVE_HARDLINK=yes
+EOF
+    ln "${LEGACY_HARDLINK_OUTSIDE}" "${LEGACY_HARDLINK_CONFIG}"
+    printf '%s\n' 'predictable temp must stay untouched' >"${LEGACY_HARDLINK_TMP_TARGET}"
+    printf '%s\n' 'predictable compat temp must stay untouched' \
+      >"${LEGACY_HARDLINK_COMPAT_TMP_TARGET}"
+
+    set +e
+    (
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC1090
+      source "${LEGACY_ENV_LIBRARY}"
+      export HOME="${LEGACY_HARDLINK_HOME}"
+      unset XDG_CONFIG_HOME
+      export PYTHON_CLONE_FOUND=0
+      export PYTHON_CLONE_PATH=""
+      export RUST_STORAGE_ROOT="${LEGACY_HARDLINK_HOME}/mailbox"
+      export RUST_DB_PATH="${LEGACY_HARDLINK_HOME}/mailbox/storage.sqlite3"
+      export MIGRATED_BEARER_TOKEN="hardlink-new-secret"
+      ln -s "${LEGACY_HARDLINK_TMP_TARGET}" "${LEGACY_HARDLINK_CONFIG}.tmp.$$"
+      ln -s "${LEGACY_HARDLINK_COMPAT_TMP_TARGET}" "${LEGACY_HARDLINK_COMPAT}.tmp.$$"
+      migrate_env_config
+    ) >/dev/null 2>&1
+    LEGACY_HARDLINK_RC=$?
+    set -e
+
+    e2e_assert_exit_code "hardlinked env migration succeeds through a detached replacement" \
+      "0" "${LEGACY_HARDLINK_RC}"
+    e2e_assert_eq "hardlink peer remains byte-preserved" \
+      $'# hardlink sentinel\nHTTP_BEARER_TOKEN=hardlink-old-secret\nPRESERVE_HARDLINK=yes' \
+      "$(cat "${LEGACY_HARDLINK_OUTSIDE}")"
+    e2e_assert_contains "hardlinked canonical env receives the new bearer" \
+      "$(cat "${LEGACY_HARDLINK_CONFIG}")" "HTTP_BEARER_TOKEN=hardlink-new-secret"
+    e2e_assert_contains "hardlinked canonical env preserves compatible settings" \
+      "$(cat "${LEGACY_HARDLINK_CONFIG}")" "PRESERVE_HARDLINK=yes"
+    if [ "${LEGACY_HARDLINK_CONFIG}" -ef "${LEGACY_HARDLINK_OUTSIDE}" ]; then
+      e2e_fail "hardlinked canonical env is detached before replacement" \
+        "distinct file identity" "still hardlinked"
+    else
+      e2e_pass "hardlinked canonical env is detached before replacement"
+    fi
+    e2e_assert_eq "predictable canonical temp symlink target remains untouched" \
+      "predictable temp must stay untouched" "$(cat "${LEGACY_HARDLINK_TMP_TARGET}")"
+    e2e_assert_eq "predictable compatibility temp symlink target remains untouched" \
+      "predictable compat temp must stay untouched" \
+      "$(cat "${LEGACY_HARDLINK_COMPAT_TMP_TARGET}")"
+    e2e_assert_eq "hardlink replacement canonical env is private" \
+      "600" "$(legacy_private_mode "${LEGACY_HARDLINK_CONFIG}")"
+    e2e_assert_eq "hardlink replacement compatibility env is private" \
+      "600" "$(legacy_private_mode "${LEGACY_HARDLINK_COMPAT}")"
+    LEGACY_HARDLINK_BACKUP="$(
+      find "${LEGACY_HARDLINK_CONFIG_DIR}" -maxdepth 1 -type f \
+        -name 'config.env.bak.mcp-agent-mail.*' -print -quit
+    )"
+    e2e_assert_file_exists "hardlink migration preserves a private preimage backup" \
+      "${LEGACY_HARDLINK_BACKUP}"
+    e2e_assert_eq "hardlink preimage backup is private" \
+      "600" "$(legacy_private_mode "${LEGACY_HARDLINK_BACKUP}")"
+
+    LEGACY_SYMLINK_HOME="${LEGACY_ENV_CONTRACT_DIR}/symlink-home"
+    LEGACY_SYMLINK_CONFIG_DIR="${LEGACY_SYMLINK_HOME}/.config/mcp-agent-mail"
+    LEGACY_SYMLINK_CONFIG="${LEGACY_SYMLINK_CONFIG_DIR}/config.env"
+    LEGACY_SYMLINK_COMPAT="${LEGACY_SYMLINK_CONFIG_DIR}/.env"
+    LEGACY_SYMLINK_TARGET="${LEGACY_ENV_CONTRACT_DIR}/symlink-target.env"
+    mkdir -p "${LEGACY_SYMLINK_CONFIG_DIR}"
+    printf '%s\n' 'symlink target must stay untouched' >"${LEGACY_SYMLINK_TARGET}"
+    ln -s "${LEGACY_SYMLINK_TARGET}" "${LEGACY_SYMLINK_CONFIG}"
+
+    set +e
+    (
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC1090
+      source "${LEGACY_ENV_LIBRARY}"
+      export HOME="${LEGACY_SYMLINK_HOME}"
+      unset XDG_CONFIG_HOME
+      export PYTHON_CLONE_FOUND=0
+      export PYTHON_CLONE_PATH=""
+      export RUST_STORAGE_ROOT="${LEGACY_SYMLINK_HOME}/mailbox"
+      export RUST_DB_PATH="${LEGACY_SYMLINK_HOME}/mailbox/storage.sqlite3"
+      export MIGRATED_BEARER_TOKEN="symlink-new-secret"
+      migrate_env_config
+    ) >/dev/null 2>&1
+    LEGACY_SYMLINK_RC=$?
+    set -e
+
+    e2e_assert_exit_code "symlinked canonical env fails closed" \
+      "1" "${LEGACY_SYMLINK_RC}"
+    e2e_assert_eq "symlink target remains byte-preserved" \
+      "symlink target must stay untouched" "$(cat "${LEGACY_SYMLINK_TARGET}")"
+    if [ -L "${LEGACY_SYMLINK_CONFIG}" ]; then
+      e2e_pass "symlinked canonical env remains an untouched symlink"
+    else
+      e2e_fail "symlinked canonical env remains an untouched symlink" \
+        "symlink" "changed type"
+    fi
+    if [ -e "${LEGACY_SYMLINK_COMPAT}" ]; then
+      e2e_fail "symlink refusal creates no compatibility mirror" \
+        "absent" "created ${LEGACY_SYMLINK_COMPAT}"
+    else
+      e2e_pass "symlink refusal creates no compatibility mirror"
+    fi
   fi
 fi
 
