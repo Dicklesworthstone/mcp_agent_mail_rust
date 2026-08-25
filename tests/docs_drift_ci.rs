@@ -37,7 +37,11 @@ mod container_release_contract {
         }
     }
 
-    fn validate(workflow: &str, dockerfile: &str) -> Result<(), String> {
+    fn validate(
+        workflow: &str,
+        release_dockerfile: &str,
+        source_dockerfile: &str,
+    ) -> Result<(), String> {
         let workflow_once = [
             "dockerfile=\"./Dockerfile.release\"",
             "dockerfile=\"./Dockerfile\"",
@@ -48,8 +52,16 @@ mod container_release_contract {
             "file: ${{ needs.prepare.outputs.dockerfile }}",
             "AM_VERSION=${{ needs.prepare.outputs.version }}",
             "AM_REVISION=${{ needs.prepare.outputs.revision }}",
-            "type=raw,value=source-${{ inputs.tag_suffix }}-${{ github.sha }}",
-            "type=sha,format=long,prefix=source-sha-",
+            "requested_am_ref=\"${INPUT_AM_REF:-main}\"",
+            "git ls-remote --heads --tags origin",
+            "git fetch --no-tags --depth=1 origin \"$fetch_ref\"",
+            "revision=\"$(git rev-parse --verify 'FETCH_HEAD^{commit}')\"",
+            "[ \"$revision\" != \"$expected_revision\" ]",
+            "type=raw,value=source-${{ steps.refs.outputs.tag_suffix }}-${{ steps.refs.outputs.revision }}",
+            "type=raw,value=source-sha-${{ steps.refs.outputs.revision }}",
+            "org.opencontainers.image.revision=${{ steps.refs.outputs.revision }}",
+            "[ \"$AM_REF\" = \"$REVISION\" ]",
+            "provenance: mode=max",
             "expected_digest_files=(linux-amd64.digest linux-arm64.digest)",
             "docker buildx imagetools inspect --raw \"$IMAGE@$digest\"",
         ];
@@ -70,6 +82,8 @@ mod container_release_contract {
         for platform in ["platform: linux/amd64", "platform: linux/arm64"] {
             require_exactly_once(workflow, platform)?;
         }
+        require_exactly(workflow, "am_ref=\"$revision\"", 2)?;
+        require_exactly(workflow, "Source revision: `%s`", 2)?;
         for asset in [
             "mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz",
             "mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz",
@@ -85,6 +99,20 @@ mod container_release_contract {
         {
             return Err("source and release tag namespaces can collide".to_string());
         }
+        if workflow.contains("source-${{ inputs.tag_suffix }}-${{ github.sha }}")
+            || workflow.contains("type=sha,format=long,prefix=source-sha-")
+            || workflow.contains("WORKFLOW_SHA: ${{ github.sha }}")
+        {
+            return Err("manual source identity still depends on the workflow SHA".to_string());
+        }
+
+        for needle in [
+            "if printf '%s' \"${AM_REF}\" | grep -Eq '^[0-9a-f]{40}$'; then",
+            "git fetch --depth 1 origin \"${AM_REF}\";",
+            "git checkout -q FETCH_HEAD;",
+        ] {
+            require_exactly_once(source_dockerfile, needle)?;
+        }
 
         for needle in [
             "ARG AM_VERSION",
@@ -95,7 +123,16 @@ mod container_release_contract {
             "org.opencontainers.image.version=\"${AM_VERSION}\"",
             "org.opencontainers.image.revision=\"${AM_REVISION}\"",
         ] {
-            require_exactly_once(dockerfile, needle)?;
+            require_exactly_once(release_dockerfile, needle)?;
+        }
+        require_exactly_once(
+            release_dockerfile,
+            "The dist matrix builds both GNU artifacts natively",
+        )?;
+        if release_dockerfile.contains("GLIBC_2.28")
+            || release_dockerfile.contains("cargo zigbuild")
+        {
+            return Err("release Dockerfile claims a false arm64 glibc provenance".to_string());
         }
 
         Ok(())
@@ -104,14 +141,17 @@ mod container_release_contract {
     #[test]
     fn release_container_workflow_is_artifact_bound_and_multi_arch() {
         let workflow = read(".github/workflows/docker.yml");
-        let dockerfile = read("Dockerfile.release");
-        validate(&workflow, &dockerfile).unwrap_or_else(|error| panic!("{error}"));
+        let release_dockerfile = read("Dockerfile.release");
+        let source_dockerfile = read("Dockerfile");
+        validate(&workflow, &release_dockerfile, &source_dockerfile)
+            .unwrap_or_else(|error| panic!("{error}"));
     }
 
     #[test]
     fn release_container_contract_guard_rejects_causal_mutations() {
         let workflow = read(".github/workflows/docker.yml");
-        let dockerfile = read("Dockerfile.release");
+        let release_dockerfile = read("Dockerfile.release");
+        let source_dockerfile = read("Dockerfile");
 
         let workflow_mutations = [
             workflow.replacen(
@@ -126,10 +166,32 @@ mod container_release_contract {
             ),
             workflow.replacen("platform: linux/arm64", "platform: linux/amd64", 1),
             workflow.replacen(
+                "type=raw,value=source-${{ steps.refs.outputs.tag_suffix }}-${{ steps.refs.outputs.revision }}",
                 "type=raw,value=source-${{ inputs.tag_suffix }}-${{ github.sha }}",
-                "type=raw,value=latest-${{ github.sha }}",
                 1,
             ),
+            workflow.replacen(
+                "git ls-remote --heads --tags origin",
+                "git rev-parse \"$requested_am_ref\"",
+                1,
+            ),
+            workflow.replacen(
+                "[ \"$revision\" != \"$expected_revision\" ]",
+                "[ -z \"$revision\" ]",
+                1,
+            ),
+            workflow.replacen(
+                "org.opencontainers.image.revision=${{ steps.refs.outputs.revision }}",
+                "org.opencontainers.image.revision=${{ github.sha }}",
+                1,
+            ),
+            workflow.replacen("am_ref=\"$revision\"", "am_ref=\"$requested_am_ref\"", 2),
+            workflow.replacen(
+                "[ \"$AM_REF\" = \"$REVISION\" ]",
+                "[ -n \"$AM_REF\" ]",
+                1,
+            ),
+            workflow.replacen("provenance: mode=max", "provenance: true", 1),
             workflow.replacen(
                 "expected_digest_files=(linux-amd64.digest linux-arm64.digest)",
                 "expected_digest_files=(linux-amd64.digest)",
@@ -143,29 +205,41 @@ mod container_release_contract {
         ];
         for mutation in workflow_mutations {
             assert!(
-                validate(&mutation, &dockerfile).is_err(),
+                validate(&mutation, &release_dockerfile, &source_dockerfile).is_err(),
                 "workflow contract mutation unexpectedly passed"
             );
         }
 
-        let dockerfile_mutations = [
-            dockerfile.replacen("ARG AM_REVISION", "ARG SOURCE_REF", 1),
-            dockerfile.replacen(
+        let release_dockerfile_mutations = [
+            release_dockerfile.replacen("ARG AM_REVISION", "ARG SOURCE_REF", 1),
+            release_dockerfile.replacen(
                 "mcp-agent-mail --version)",
                 "mcp-agent-mail --help)",
                 1,
             ),
-            dockerfile.replacen(
+            release_dockerfile.replacen(
                 "test \"${#AM_REVISION}\" -eq 40",
                 "test -n \"${AM_REVISION}\"",
                 1,
             ),
+            release_dockerfile.replacen(
+                "The dist matrix builds both GNU artifacts natively",
+                "linux/arm64 needs GLIBC_2.28 because cargo zigbuild is used",
+                1,
+            ),
         ];
-        for mutation in dockerfile_mutations {
+        for mutation in release_dockerfile_mutations {
             assert!(
-                validate(&workflow, &mutation).is_err(),
-                "Dockerfile contract mutation unexpectedly passed"
+                validate(&workflow, &mutation, &source_dockerfile).is_err(),
+                "release Dockerfile contract mutation unexpectedly passed"
             );
         }
+
+        let source_dockerfile_mutation =
+            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1);
+        assert!(
+            validate(&workflow, &release_dockerfile, &source_dockerfile_mutation).is_err(),
+            "source Dockerfile checkout mutation unexpectedly passed"
+        );
     }
 }
