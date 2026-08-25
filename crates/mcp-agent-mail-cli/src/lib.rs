@@ -43881,21 +43881,20 @@ http_headers = { Authorization = "Bearer secret" }
         };
 
         let first = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        let settings_authorities =
+            mcp_agent_mail_core::setup::omp_settings_authority_paths(&params);
         assert_eq!(
             first.len(),
-            5,
-            "project MCP, active user MCP, preferred/fallback user settings, and project settings are all cache authorities"
+            2 + settings_authorities.len(),
+            "project MCP, active user MCP, and every effective settings source are cache authorities"
         );
         assert!(
             first
                 .iter()
                 .any(|fingerprint| fingerprint.path == user_config.display().to_string())
         );
-        for settings_path in [
-            user_config.parent().unwrap().join("config.yml"),
-            user_config.parent().unwrap().join("config.yaml"),
-            params.project_dir.join(".omp/config.yml"),
-        ] {
+        assert_eq!(settings_authorities.len(), 12);
+        for settings_path in settings_authorities {
             assert!(first.iter().any(|fingerprint| {
                 fingerprint.path == settings_path.display().to_string()
             }));

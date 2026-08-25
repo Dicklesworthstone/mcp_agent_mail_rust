@@ -112,7 +112,7 @@ pub use backpressure::{
 };
 pub use config::{
     AppEnvironment, AtcWriteMode, Config, InterfaceMode, ProjectIdentityMode, RateLimitBackend,
-    compute_ephemeral_storage_root,
+    canonical_config_env_path, compute_ephemeral_storage_root,
 };
 pub use diagnostics::{
     ArchiveScanDedupeRule, ArchiveScanDiagnostic, ArchiveScanScope, ArchiveScanSeverityBucket,

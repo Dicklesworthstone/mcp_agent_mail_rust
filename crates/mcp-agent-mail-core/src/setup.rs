@@ -1353,12 +1353,20 @@ fn omp_active_user_settings_paths(params: &SetupParams) -> (PathBuf, PathBuf) {
     (agent_dir.join("config.yml"), agent_dir.join("config.yaml"))
 }
 
+fn omp_project_settings_paths(params: &SetupParams) -> Vec<PathBuf> {
+    omp_project_settings_sources(params)
+        .into_iter()
+        .map(|source| source.path)
+        .collect()
+}
+
 /// Return every settings file whose current bytes can decide whether OMP loads
 /// project MCP configuration for these setup parameters.
 ///
 /// OMP prefers the active profile's `config.yml` over `config.yaml`; the
-/// fallback path is relevant only while the preferred path is absent. Project
-/// settings and ordered `PI_CONFIG_FILES` overlays follow it.
+/// fallback path is relevant only while the preferred path is absent. Every
+/// registered persistent project-settings provider follows in OMP's merge
+/// order, then the ordered `PI_CONFIG_FILES` overlays.
 #[must_use]
 pub fn omp_settings_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
     let (user_yml, user_yaml) = omp_active_user_settings_paths(params);
@@ -1368,7 +1376,7 @@ pub fn omp_settings_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
     }) {
         paths.push(user_yaml);
     }
-    paths.push(params.project_dir.join(".omp").join("config.yml"));
+    paths.extend(omp_project_settings_paths(params));
     paths.extend(params.omp_settings_overlay_paths.iter().cloned());
     paths
 }
@@ -2704,6 +2712,7 @@ struct OmpActiveUserConfigInspection {
 
 struct OmpSettingsAuthorityInspection {
     observations: Vec<ConfigStatusFileObservation>,
+    merged_mcp_settings: Option<Value>,
     project_config_enabled: bool,
     effective_source: Option<PathBuf>,
     unsupported_path: Option<PathBuf>,
@@ -2715,12 +2724,35 @@ impl OmpSettingsAuthorityInspection {
     }
 }
 
-#[derive(Clone, Copy)]
 enum OmpSettingsFileValue {
     Missing,
-    Inherit,
-    Enabled(bool),
+    Parsed(Map<String, Value>),
     Unsupported,
+}
+
+#[derive(Clone, Copy)]
+enum OmpSettingsFormat {
+    Yaml,
+    Json,
+    Jsonc,
+    Toml,
+}
+
+#[derive(Clone, Copy)]
+enum OmpSettingsInvalidPolicy {
+    FailClosed,
+    Skip,
+}
+
+struct OmpProjectSettingsSource {
+    path: PathBuf,
+    format: OmpSettingsFormat,
+    invalid_policy: OmpSettingsInvalidPolicy,
+}
+
+enum OmpSettingsParseError {
+    Invalid,
+    DynamicAuthority,
 }
 
 fn config_status_file_observation(
@@ -3174,96 +3206,365 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
     }
 }
 
-fn parse_omp_enable_project_config(content: &str) -> Result<Option<bool>, ()> {
-    let document = serde_norway::from_str::<Value>(content).map_err(|_| ())?;
-    let root = match document {
-        Value::Null => return Ok(None),
-        Value::Object(root) => root,
-        _ => return Err(()),
-    };
-    let Some(mcp) = root.get("mcp") else {
-        return Ok(None);
-    };
-    let Value::Object(mcp) = mcp else {
+fn normalize_jsonc(content: &str) -> Result<String, ()> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let bytes = content.as_bytes();
+    let mut without_comments = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            without_comments.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            without_comments.push(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            without_comments.extend_from_slice(b"  ");
+            index += 2;
+            while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                without_comments.push(b' ');
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            without_comments.extend_from_slice(b"  ");
+            index += 2;
+            let mut closed = false;
+            while index < bytes.len() {
+                if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    without_comments.extend_from_slice(b"  ");
+                    index += 2;
+                    closed = true;
+                    break;
+                }
+                without_comments.push(if matches!(bytes[index], b'\n' | b'\r') {
+                    bytes[index]
+                } else {
+                    b' '
+                });
+                index += 1;
+            }
+            if !closed {
+                return Err(());
+            }
+            continue;
+        }
+        without_comments.push(byte);
+        index += 1;
+    }
+    if in_string {
         return Err(());
+    }
+
+    let mut normalized = Vec::with_capacity(without_comments.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < without_comments.len() {
+        let byte = without_comments[index];
+        if in_string {
+            normalized.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            normalized.push(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b',' {
+            let mut lookahead = index + 1;
+            while without_comments
+                .get(lookahead)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                lookahead += 1;
+            }
+            if matches!(without_comments.get(lookahead), Some(b'}' | b']')) {
+                index += 1;
+                continue;
+            }
+        }
+        normalized.push(byte);
+        index += 1;
+    }
+    String::from_utf8(normalized).map_err(|_| ())
+}
+
+fn contains_opencode_substitution(value: &str) -> bool {
+    value.contains("{env:") || value.contains("{file:")
+}
+
+fn parse_omp_settings_document(
+    content: &str,
+    format: OmpSettingsFormat,
+) -> Result<Map<String, Value>, OmpSettingsParseError> {
+    let document = match format {
+        OmpSettingsFormat::Yaml => {
+            let mut document = serde_norway::from_str::<serde_norway::Value>(content)
+                .map_err(|_| OmpSettingsParseError::Invalid)?;
+            document
+                .apply_merge()
+                .map_err(|_| OmpSettingsParseError::Invalid)?;
+            serde_json::to_value(document).map_err(|_| OmpSettingsParseError::Invalid)?
+        }
+        OmpSettingsFormat::Json => serde_json::from_str::<Value>(content)
+            .map_err(|_| OmpSettingsParseError::Invalid)?,
+        OmpSettingsFormat::Jsonc => {
+            // OpenCode expands these tokens before parsing. Environment values
+            // are inserted without JSON escaping and referenced files can
+            // change independently of the config bytes, so even a token that
+            // currently appears unrelated can change the parsed document or
+            // its authority after a cache entry is written. Until those
+            // dependencies are fingerprinted, fail closed on every token.
+            if contains_opencode_substitution(content) {
+                return Err(OmpSettingsParseError::DynamicAuthority);
+            }
+            let normalized = normalize_jsonc(content).map_err(|()| {
+                OmpSettingsParseError::Invalid
+            })?;
+            match serde_json::from_str::<Value>(&normalized) {
+                Ok(document) => document,
+                Err(_) => return Err(OmpSettingsParseError::Invalid),
+            }
+        }
+        OmpSettingsFormat::Toml => {
+            let document = toml::from_str::<toml::Value>(content)
+                .map_err(|_| OmpSettingsParseError::Invalid)?;
+            serde_json::to_value(document).map_err(|_| OmpSettingsParseError::Invalid)?
+        }
     };
-    match mcp.get("enableProjectConfig") {
-        None => Ok(None),
-        Some(Value::Bool(enabled)) => Ok(Some(*enabled)),
-        Some(_) => Err(()),
+    match document {
+        Value::Null => Ok(Map::new()),
+        Value::Object(root) => Ok(root),
+        _ => Err(OmpSettingsParseError::Invalid),
     }
 }
 
 fn inspect_omp_settings_file(
     path: &Path,
     required: bool,
+    format: OmpSettingsFormat,
+    invalid_policy: OmpSettingsInvalidPolicy,
 ) -> (ConfigStatusFileObservation, OmpSettingsFileValue) {
     let content = read_setup_file(path, "OMP settings authority");
     let observation = config_status_file_observation(path, &content);
     let value = match content {
         Ok(None) if required => OmpSettingsFileValue::Unsupported,
         Ok(None) => OmpSettingsFileValue::Missing,
-        Ok(Some((content, _))) => match parse_omp_enable_project_config(&content) {
-            Ok(None) => OmpSettingsFileValue::Inherit,
-            Ok(Some(enabled)) => OmpSettingsFileValue::Enabled(enabled),
-            Err(()) => OmpSettingsFileValue::Unsupported,
+        Ok(Some((content, _))) => match parse_omp_settings_document(&content, format) {
+            Ok(root) => OmpSettingsFileValue::Parsed(root),
+            Err(OmpSettingsParseError::Invalid)
+                if matches!(invalid_policy, OmpSettingsInvalidPolicy::Skip) =>
+            {
+                OmpSettingsFileValue::Missing
+            }
+            Err(OmpSettingsParseError::Invalid | OmpSettingsParseError::DynamicAuthority) => {
+                OmpSettingsFileValue::Unsupported
+            }
         },
+        Err(_) if matches!(invalid_policy, OmpSettingsInvalidPolicy::Skip) => {
+            OmpSettingsFileValue::Missing
+        }
         Err(_) => OmpSettingsFileValue::Unsupported,
     };
     (observation, value)
+}
+
+fn deep_merge_omp_setting(base: &mut Value, override_value: Value) {
+    if let (Value::Object(base), Value::Object(overrides)) = (&mut *base, &override_value) {
+        for (key, value) in overrides {
+            if let Some(existing) = base.get_mut(key) {
+                deep_merge_omp_setting(existing, value.clone());
+            } else {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *base = override_value;
+    }
+}
+
+fn omp_project_config_is_enabled(mcp: Option<&Value>) -> bool {
+    let Some(value) = mcp
+        .and_then(Value::as_object)
+        .and_then(|mcp| mcp.get("enableProjectConfig"))
+    else {
+        return true;
+    };
+    match value {
+        // The SDK applies `?? true` before the loader's JavaScript truthiness
+        // check, so an explicit null behaves like the default true.
+        Value::Null => true,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_none_or(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+fn merge_omp_settings_document(
+    inspection: &mut OmpSettingsAuthorityInspection,
+    path: &Path,
+    mut root: Map<String, Value>,
+    drop_group_shadows: bool,
+) {
+    let Some(incoming_mcp) = root.remove("mcp") else {
+        return;
+    };
+    if drop_group_shadows && !incoming_mcp.is_object() {
+        return;
+    }
+    let directly_supplies_leaf = incoming_mcp
+        .as_object()
+        .is_some_and(|mcp| mcp.contains_key("enableProjectConfig"));
+    let replaces_mcp_group = !incoming_mcp.is_object();
+    if let Some(merged) = &mut inspection.merged_mcp_settings {
+        deep_merge_omp_setting(merged, incoming_mcp);
+    } else {
+        inspection.merged_mcp_settings = Some(incoming_mcp);
+    }
+    inspection.project_config_enabled =
+        omp_project_config_is_enabled(inspection.merged_mcp_settings.as_ref());
+    if directly_supplies_leaf || replaces_mcp_group {
+        inspection.effective_source = Some(path.to_path_buf());
+    }
 }
 
 fn merge_omp_settings_file(
     inspection: &mut OmpSettingsAuthorityInspection,
     path: &Path,
     required: bool,
+    format: OmpSettingsFormat,
+    invalid_policy: OmpSettingsInvalidPolicy,
+    drop_group_shadows: bool,
 ) -> OmpSettingsFileValue {
-    let (observation, value) = inspect_omp_settings_file(path, required);
+    let (observation, value) =
+        inspect_omp_settings_file(path, required, format, invalid_policy);
     inspection.observations.push(observation);
-    match value {
-        OmpSettingsFileValue::Enabled(enabled) => {
-            inspection.project_config_enabled = enabled;
-            inspection.effective_source = Some(path.to_path_buf());
+    match &value {
+        OmpSettingsFileValue::Parsed(root) => {
+            merge_omp_settings_document(inspection, path, root.clone(), drop_group_shadows);
         }
         OmpSettingsFileValue::Unsupported => {
             inspection.unsupported_path = Some(path.to_path_buf());
         }
-        OmpSettingsFileValue::Missing | OmpSettingsFileValue::Inherit => {}
+        OmpSettingsFileValue::Missing => {}
     }
     value
+}
+
+fn omp_project_settings_sources(params: &SetupParams) -> Vec<OmpProjectSettingsSource> {
+    use OmpSettingsFormat::{Json, Jsonc, Toml, Yaml};
+    use OmpSettingsInvalidPolicy::{FailClosed, Skip};
+
+    let project = &params.project_dir;
+    [
+        (".omp/settings.json", Json, Skip),
+        (".omp/config.yml", Yaml, FailClosed),
+        (".claude/settings.json", Json, Skip),
+        (".codex/config.toml", Toml, Skip),
+        (".gemini/settings.json", Json, Skip),
+        ("opencode.json", Jsonc, Skip),
+        ("opencode.jsonc", Jsonc, Skip),
+        (".opencode/opencode.json", Jsonc, Skip),
+        (".opencode/opencode.jsonc", Jsonc, Skip),
+        (".cursor/settings.json", Json, Skip),
+    ]
+    .into_iter()
+    .map(|(path, format, invalid_policy)| OmpProjectSettingsSource {
+        path: project.join(path),
+        format,
+        invalid_policy,
+    })
+    .collect()
 }
 
 fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityInspection {
     let mut inspection = OmpSettingsAuthorityInspection {
         observations: Vec::new(),
+        merged_mcp_settings: None,
         project_config_enabled: true,
         effective_source: None,
         unsupported_path: None,
     };
     let (user_yml, user_yaml) = omp_active_user_settings_paths(params);
-    let preferred = merge_omp_settings_file(&mut inspection, &user_yml, false);
+    let preferred = merge_omp_settings_file(
+        &mut inspection,
+        &user_yml,
+        false,
+        OmpSettingsFormat::Yaml,
+        OmpSettingsInvalidPolicy::FailClosed,
+        false,
+    );
     if matches!(preferred, OmpSettingsFileValue::Unsupported) {
         return inspection;
     }
     if matches!(preferred, OmpSettingsFileValue::Missing)
         && matches!(
-            merge_omp_settings_file(&mut inspection, &user_yaml, false),
+            merge_omp_settings_file(
+                &mut inspection,
+                &user_yaml,
+                false,
+                OmpSettingsFormat::Yaml,
+                OmpSettingsInvalidPolicy::FailClosed,
+                false,
+            ),
             OmpSettingsFileValue::Unsupported
         )
     {
         return inspection;
     }
 
-    let project_settings = params.project_dir.join(".omp").join("config.yml");
-    if matches!(
-        merge_omp_settings_file(&mut inspection, &project_settings, false),
-        OmpSettingsFileValue::Unsupported
-    ) {
-        return inspection;
+    for source in omp_project_settings_sources(params) {
+        if matches!(
+            merge_omp_settings_file(
+                &mut inspection,
+                &source.path,
+                false,
+                source.format,
+                source.invalid_policy,
+                true,
+            ),
+            OmpSettingsFileValue::Unsupported
+        ) {
+            return inspection;
+        }
     }
     for overlay in &params.omp_settings_overlay_paths {
         if matches!(
-            merge_omp_settings_file(&mut inspection, overlay, true),
+            merge_omp_settings_file(
+                &mut inspection,
+                overlay,
+                true,
+                OmpSettingsFormat::Yaml,
+                OmpSettingsInvalidPolicy::FailClosed,
+                false,
+            ),
             OmpSettingsFileValue::Unsupported
         ) {
             break;
@@ -6988,7 +7289,18 @@ http_headers = { Authorization = "Bearer tok" }
         std::fs::write(&active_yml, "mcp:\n  enableProjectConfig: true\n").unwrap();
         assert!(first_setup_status_file(&params).drift_reasons.is_empty());
 
-        std::fs::write(&active_yml, "mcp:\n  enableProjectConfig: 'false'\n").unwrap();
+        std::fs::write(
+            &active_yml,
+            "defaults: &disabled\n  enableProjectConfig: false\nmcp:\n  <<: *disabled\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled,
+            "YAML merge keys must affect the same effective leaf as OMP's Bun YAML loader"
+        );
+
+        std::fs::write(&active_yml, "mcp: [\n").unwrap();
         let malformed = first_setup_status_file(&params);
         assert_eq!(
             malformed.primary_drift_reason,
@@ -7014,6 +7326,156 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(!non_omp.status_observations.iter().any(|observation| {
             observation.path == missing_overlay.display().to_string()
         }));
+    }
+
+    #[test]
+    fn check_status_omp_honors_every_project_settings_provider_format() {
+        let cases = [
+            (
+                ".omp/settings.json",
+                r#"{"mcp":{"enableProjectConfig":false}}"#,
+            ),
+            (".omp/config.yml", "mcp:\n  enableProjectConfig: false\n"),
+            (
+                ".claude/settings.json",
+                r#"{"mcp":{"enableProjectConfig":false}}"#,
+            ),
+            (
+                ".codex/config.toml",
+                "[mcp]\nenableProjectConfig = false\n",
+            ),
+            (
+                ".gemini/settings.json",
+                r#"{"mcp":{"enableProjectConfig":false}}"#,
+            ),
+            (
+                "opencode.json",
+                "{\n  // JSONC is accepted even with a .json name\n  \"mcp\": {\"enableProjectConfig\": false,},\n}\n",
+            ),
+            (
+                "opencode.jsonc",
+                r#"{"mcp":{"enableProjectConfig":false}}"#,
+            ),
+            (
+                ".opencode/opencode.json",
+                r#"{"mcp":{"enableProjectConfig":false}}"#,
+            ),
+            (
+                ".opencode/opencode.jsonc",
+                r#"{"mcp":{"enableProjectConfig":false}}"#,
+            ),
+            (
+                ".cursor/settings.json",
+                r#"{"mcp":{"enableProjectConfig":false}}"#,
+            ),
+        ];
+
+        for (relative_path, settings) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+            let project_mcp = params.project_dir.join(".omp/mcp.json");
+            std::fs::create_dir_all(project_mcp.parent().unwrap()).unwrap();
+            std::fs::write(
+                project_mcp,
+                r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}}}"#,
+            )
+            .unwrap();
+            let source = params.project_dir.join(relative_path);
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, settings).unwrap();
+
+            let status = first_setup_status_file(&params);
+            assert_eq!(
+                status.primary_drift_reason,
+                ConfigDriftReason::ProjectConfigDisabled,
+                "provider source {relative_path} must govern the effective OMP setting"
+            );
+            assert!(status.omp_settings_config_drift);
+            assert!(status.remediation.contains(relative_path));
+            assert!(status.status_observations.iter().any(|observation| {
+                observation.path == source.display().to_string() && observation.exists
+            }));
+        }
+    }
+
+    #[test]
+    fn check_status_omp_project_provider_precedence_and_invalid_skip_match_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let project_mcp = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(project_mcp.parent().unwrap()).unwrap();
+        std::fs::write(
+            project_mcp,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}}}"#,
+        )
+        .unwrap();
+        let native_legacy = params.project_dir.join(".omp/settings.json");
+        let native_yaml = params.project_dir.join(".omp/config.yml");
+        let codex = params.project_dir.join(".codex/config.toml");
+        let cursor = params.project_dir.join(".cursor/settings.json");
+        for path in [&native_legacy, &native_yaml, &codex, &cursor] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            &native_legacy,
+            r#"{"mcp":{"enableProjectConfig":false}}"#,
+        )
+        .unwrap();
+        std::fs::write(&native_yaml, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        std::fs::write(&codex, "[mcp]\nenableProjectConfig = false\n").unwrap();
+        std::fs::write(&cursor, r#"{"mcp":{"enableProjectConfig":true}}"#).unwrap();
+
+        let cursor_wins = first_setup_status_file(&params);
+        assert!(
+            cursor_wins.drift_reasons.is_empty(),
+            "lower-priority providers are merged later, so Cursor overrides Codex and native settings"
+        );
+
+        std::fs::write(&cursor, "not json").unwrap();
+        let invalid_cursor_is_skipped = first_setup_status_file(&params);
+        assert_eq!(
+            invalid_cursor_is_skipped.primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled,
+            "foreign-provider parse failures are warned and skipped, exposing the prior Codex value"
+        );
+        assert!(invalid_cursor_is_skipped.remediation.contains(".codex/config.toml"));
+
+        let opencode = params.project_dir.join("opencode.jsonc");
+        std::fs::write(
+            &opencode,
+            r#"{"mcp":{"enableProjectConfig":"{env:OMP_PROJECT_CONFIG}"}}"#,
+        )
+        .unwrap();
+        let dynamic_authority = first_setup_status_file(&params);
+        assert_eq!(
+            dynamic_authority.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig,
+            "a dynamic OpenCode value that can change project-source authority must fail closed rather than enter the cache"
+        );
+
+        std::fs::write(
+            &opencode,
+            r#"{"apiKey":"{env:UNRELATED_KEY}","mcp":{"enableProjectConfig":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig,
+            "even currently unrelated substitutions can change parsed structure and must not enter the cache without dependency fingerprints"
+        );
+
+        std::fs::write(
+            &opencode,
+            r#"{"apiKey":"literal","mcp":{"enableProjectConfig":true}}"#,
+        )
+        .unwrap();
+        let overlay = tmp.path().join("overlay.yml");
+        std::fs::write(&overlay, "mcp:\n  enableProjectConfig: true\n").unwrap();
+        params.omp_settings_overlay_paths = vec![overlay];
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "PI_CONFIG_FILES overlays merge after every project provider"
+        );
     }
 
     #[test]

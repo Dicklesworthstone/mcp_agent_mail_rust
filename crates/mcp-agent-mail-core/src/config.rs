@@ -1005,11 +1005,35 @@ fn configured_home_dir() -> Option<PathBuf> {
     config_path_override("HOME").or_else(dirs::home_dir)
 }
 
+fn absolute_xdg_path_override(key: &str) -> Option<PathBuf> {
+    real_env_value(key)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 fn xdg_config_dir() -> Option<PathBuf> {
-    config_path_override("XDG_CONFIG_HOME")
-        .or_else(|| configured_home_dir().map(|home| home.join(".config")))
+    absolute_xdg_path_override("XDG_CONFIG_HOME")
+        .or_else(|| {
+            configured_home_dir()
+                .filter(|home| home.is_absolute())
+                .map(|home| home.join(".config"))
+        })
         .or_else(dirs::config_dir)
+        .filter(|path| path.is_absolute())
         .map(|d| d.join(XDG_APP_DIR))
+}
+
+/// Return the single user-global `config.env` path used by setup and runtime.
+///
+/// Empty or relative `XDG_CONFIG_HOME` values are ignored. The latter follows
+/// the XDG Base Directory contract and, critically for this credential file,
+/// prevents an ambient override from redirecting a bearer token below the
+/// current working directory. `None` means no absolute user config directory
+/// could be resolved, so callers that write credentials must fail closed.
+#[must_use]
+pub fn canonical_config_env_path() -> Option<PathBuf> {
+    xdg_config_dir().map(|dir| dir.join("config.env"))
 }
 
 /// Return the XDG-compliant data directory for this application.
@@ -3275,11 +3299,10 @@ pub fn dotenv_value(key: &str) -> Option<String> {
 
 /// Candidate paths for the user-global env file, checked in order.
 ///
-/// 1. `~/.config/mcp-agent-mail/config.env` — canonical installer path
-/// 2. `~/.config/mcp-agent-mail/.env` — compatibility mirror for older binaries
-/// 3. Native config dir `mcp-agent-mail/config.env` (e.g. `$XDG_CONFIG_HOME/...`,
-///    or macOS `~/Library/Application Support/...`) when different from `~/.config`
-/// 4. Native config dir `mcp-agent-mail/.env`
+/// 1. Canonical XDG config dir `mcp-agent-mail/config.env`
+/// 2. Canonical XDG config dir `mcp-agent-mail/.env` — compatibility mirror
+/// 3. `~/.config/mcp-agent-mail/config.env` when distinct from the XDG dir
+/// 4. `~/.config/mcp-agent-mail/.env`
 /// 5. `~/.mcp_agent_mail/.env` — legacy preferred over the old shell wrapper
 /// 6. `~/mcp_agent_mail/.env` — legacy (old shell wrapper)
 fn push_user_env_candidate_dir(candidates: &mut Vec<PathBuf>, dir: &Path) {
@@ -3291,27 +3314,35 @@ fn push_user_env_candidate_dir(candidates: &mut Vec<PathBuf>, dir: &Path) {
     }
 }
 
-fn user_env_file_candidates(home: &Path, xdg_config_dir: Option<&Path>) -> Vec<PathBuf> {
+fn user_env_file_candidates(
+    home: Option<&Path>,
+    xdg_config_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(6);
-    push_user_env_candidate_dir(&mut candidates, &home.join(".config").join(XDG_APP_DIR));
     if let Some(xdg) = xdg_config_dir {
         push_user_env_candidate_dir(&mut candidates, xdg);
     }
-    candidates.push(home.join(".mcp_agent_mail").join(".env"));
-    candidates.push(home.join("mcp_agent_mail").join(".env"));
+    if let Some(home) = home {
+        push_user_env_candidate_dir(&mut candidates, &home.join(".config").join(XDG_APP_DIR));
+        candidates.push(home.join(".mcp_agent_mail").join(".env"));
+        candidates.push(home.join("mcp_agent_mail").join(".env"));
+    }
     candidates
 }
 
-fn user_env_file_path_from(home: &Path, xdg_config_dir: Option<&Path>) -> Option<PathBuf> {
+fn user_env_file_path_from(
+    home: Option<&Path>,
+    xdg_config_dir: Option<&Path>,
+) -> Option<PathBuf> {
     user_env_file_candidates(home, xdg_config_dir)
         .into_iter()
         .find(|path| path.is_file())
 }
 
 fn user_env_file_path() -> Option<PathBuf> {
-    let home = configured_home_dir()?;
+    let home = configured_home_dir().filter(|path| path.is_absolute());
     let xdg = xdg_config_dir();
-    user_env_file_path_from(&home, xdg.as_deref())
+    user_env_file_path_from(home.as_deref(), xdg.as_deref())
 }
 
 fn user_env_values() -> &'static HashMap<String, String> {
@@ -5126,25 +5157,24 @@ mod tests {
         std::fs::write(dotted.join(".env"), "FOO=bar\n").unwrap();
         std::fs::write(legacy.join(".env"), "FOO=baz\n").unwrap();
 
-        let selected = user_env_file_path_from(tmp.path(), Some(&xdg)).expect("env path");
+        let selected =
+            user_env_file_path_from(Some(tmp.path()), Some(&xdg)).expect("env path");
         assert_eq!(selected, xdg.join("config.env"));
     }
 
     #[test]
-    fn user_env_file_path_prefers_portable_dot_config_installer_path_on_macos() {
+    fn user_env_file_path_prefers_custom_xdg_over_portable_home_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let portable = tmp.path().join(".config/mcp-agent-mail");
-        let native = tmp
-            .path()
-            .join("Library/Application Support")
-            .join("mcp-agent-mail");
+        let custom_xdg = tmp.path().join("custom-xdg").join("mcp-agent-mail");
         std::fs::create_dir_all(&portable).unwrap();
-        std::fs::create_dir_all(&native).unwrap();
+        std::fs::create_dir_all(&custom_xdg).unwrap();
         std::fs::write(portable.join("config.env"), "FOO=portable\n").unwrap();
-        std::fs::write(native.join("config.env"), "FOO=native\n").unwrap();
+        std::fs::write(custom_xdg.join("config.env"), "FOO=custom\n").unwrap();
 
-        let selected = user_env_file_path_from(tmp.path(), Some(&native)).expect("env path");
-        assert_eq!(selected, portable.join("config.env"));
+        let selected = user_env_file_path_from(Some(tmp.path()), Some(&custom_xdg))
+            .expect("env path");
+        assert_eq!(selected, custom_xdg.join("config.env"));
     }
 
     #[test]
@@ -5157,7 +5187,8 @@ mod tests {
         std::fs::write(xdg.join(".env"), "FOO=xdg-mirror\n").unwrap();
         std::fs::write(dotted.join(".env"), "FOO=legacy\n").unwrap();
 
-        let selected = user_env_file_path_from(tmp.path(), Some(&xdg)).expect("env path");
+        let selected =
+            user_env_file_path_from(Some(tmp.path()), Some(&xdg)).expect("env path");
         assert_eq!(selected, xdg.join(".env"));
     }
 
@@ -5165,7 +5196,7 @@ mod tests {
     fn user_env_file_candidates_do_not_duplicate_same_portable_and_native_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let portable = tmp.path().join(".config").join(XDG_APP_DIR);
-        let candidates = user_env_file_candidates(tmp.path(), Some(&portable));
+        let candidates = user_env_file_candidates(Some(tmp.path()), Some(&portable));
         let config_env = portable.join("config.env");
         let compat_env = portable.join(".env");
         assert_eq!(
@@ -5184,6 +5215,120 @@ mod tests {
             1,
             ".env candidate should not be duplicated when dirs::config_dir matches ~/.config"
         );
+    }
+
+    #[test]
+    fn canonical_config_env_path_uses_custom_absolute_xdg() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-config");
+        let xdg_text = xdg.to_string_lossy();
+        let home_text = tmp.path().to_string_lossy();
+        let _env = TestEnvOverrideGuard::set(&[
+            ("XDG_CONFIG_HOME", xdg_text.as_ref()),
+            ("HOME", home_text.as_ref()),
+        ]);
+
+        assert_eq!(
+            canonical_config_env_path(),
+            Some(xdg.join(XDG_APP_DIR).join("config.env"))
+        );
+    }
+
+    #[test]
+    fn canonical_config_env_path_treats_empty_xdg_as_unset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_text = tmp.path().to_string_lossy();
+        let _env = TestEnvOverrideGuard::set(&[
+            ("XDG_CONFIG_HOME", ""),
+            ("HOME", home_text.as_ref()),
+        ]);
+
+        assert_eq!(
+            canonical_config_env_path(),
+            Some(
+                tmp.path()
+                    .join(".config")
+                    .join(XDG_APP_DIR)
+                    .join("config.env")
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_config_env_path_ignores_relative_xdg() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_text = tmp.path().to_string_lossy();
+        let _env = TestEnvOverrideGuard::set(&[
+            ("XDG_CONFIG_HOME", "relative-config"),
+            ("HOME", home_text.as_ref()),
+        ]);
+
+        let selected = canonical_config_env_path().expect("absolute HOME fallback");
+        assert_eq!(
+            selected,
+            tmp.path()
+                .join(".config")
+                .join(XDG_APP_DIR)
+                .join("config.env")
+        );
+        assert!(selected.is_absolute());
+    }
+
+    #[test]
+    fn user_env_file_path_can_resolve_custom_xdg_without_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-config").join(XDG_APP_DIR);
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::write(xdg.join("config.env"), "FOO=custom\n").unwrap();
+
+        assert_eq!(
+            user_env_file_path_from(None, Some(&xdg)),
+            Some(xdg.join("config.env"))
+        );
+    }
+
+    #[test]
+    fn fresh_process_runtime_prefers_custom_xdg_token_over_home_fallback() {
+        const CHILD_MARKER: &str = "AM_TEST_CUSTOM_XDG_TOKEN_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let config = Config::from_env();
+            assert_eq!(
+                config.http_bearer_token.as_deref(),
+                Some("new-custom-xdg-token"),
+                "fresh runtime must load the same custom-XDG credential setup writes"
+            );
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("custom-config");
+        let home_config = home.join(".config").join(XDG_APP_DIR);
+        let xdg_config = xdg.join(XDG_APP_DIR);
+        std::fs::create_dir_all(&home_config).unwrap();
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        std::fs::write(
+            home_config.join("config.env"),
+            "HTTP_BEARER_TOKEN=stale-home-token\n",
+        )
+        .unwrap();
+        std::fs::write(
+            xdg_config.join("config.env"),
+            "HTTP_BEARER_TOKEN=new-custom-xdg-token\n",
+        )
+        .unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("config::tests::fresh_process_runtime_prefers_custom_xdg_token_over_home_fallback")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env_remove("HTTP_BEARER_TOKEN")
+            .status()
+            .expect("spawn isolated config child");
+        assert!(status.success(), "isolated config child failed: {status}");
     }
 
     #[test]
