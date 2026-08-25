@@ -2196,29 +2196,32 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
                 }
             }
         }
+        let mut path_error = None;
         for path in &project_token_paths {
             let Ok(relative) = path.strip_prefix(&params.project_dir) else {
                 continue;
             };
-            if relative.components().all(|component| {
-                matches!(
-                    component,
-                    std::path::Component::Normal(_) | std::path::Component::CurDir
-                )
-            }) {
-                let entry = format!(
-                    "/{}",
-                    escape_gitignore_literal(&relative.to_string_lossy().replace('\\', "/"))
-                );
-                if !entry.is_empty() && !entries.contains(&entry) {
-                    entries.push(entry);
+            match gitignore_relative_path(relative) {
+                Ok(relative) => {
+                    let entry = format!("/{}", escape_gitignore_literal(&relative));
+                    if !entries.contains(&entry) {
+                        entries.push(entry);
+                    }
+                }
+                Err(error) => {
+                    path_error = Some(error.to_string());
+                    break;
                 }
             }
         }
-        let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
-        ensure_gitignore_entries(&gitignore, &entry_refs)
-            .err()
-            .map(|error| error.to_string())
+        if path_error.is_some() {
+            path_error
+        } else {
+            let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
+            ensure_gitignore_entries(&gitignore, &entry_refs)
+                .err()
+                .map(|error| error.to_string())
+        }
     };
 
     let mut results = Vec::new();
