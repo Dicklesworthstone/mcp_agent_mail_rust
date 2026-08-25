@@ -1269,6 +1269,23 @@ fn project_local_action(
     }
 }
 
+/// Return the active OMP user-level MCP config path represented by setup parameters.
+///
+/// This is also the cross-file authority for project-only status: OMP applies
+/// its top-level `disabledServers` list to project MCP entries.
+#[must_use]
+pub fn omp_active_user_config_path(params: &SetupParams) -> PathBuf {
+    let home = params
+        .home_dir_override
+        .clone()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    params
+        .omp_user_config_path_override
+        .clone()
+        .unwrap_or_else(|| home.join(".omp").join("agent").join("mcp.json"))
+}
+
 impl AgentPlatform {
     /// Generate config file actions for this platform.
     #[must_use]
@@ -1329,7 +1346,7 @@ impl AgentPlatform {
                 }]
             }
             Self::Gemini => self.gemini_actions(params, &url, token, pdir, &home),
-            Self::Omp => self.omp_actions(params, &url, token, pdir, &home),
+            Self::Omp => self.omp_actions(params, &url, token, pdir),
             Self::Antigravity => self.antigravity_actions(params, &url, token, pdir, &home),
             Self::OpenCode => vec![project_local_action(
                 self,
@@ -1505,7 +1522,6 @@ impl AgentPlatform {
         url: &str,
         token: &str,
         pdir: &Path,
-        home: &Path,
     ) -> Vec<ConfigAction> {
         let mut actions = vec![project_local_action(
             self,
@@ -1518,10 +1534,7 @@ impl AgentPlatform {
         if !params.skip_user_config {
             actions.push(ConfigAction {
                 platform: self,
-                file_path: params
-                    .omp_user_config_path_override
-                    .clone()
-                    .unwrap_or_else(|| home.join(".omp").join("agent").join("mcp.json")),
+                file_path: omp_active_user_config_path(params),
                 description: "Oh My Pi (OMP) active-profile MCP config".into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
@@ -2490,6 +2503,16 @@ impl fmt::Display for ConfigDriftRisk {
 pub struct ConfigFileStatus {
     #[serde(skip_serializing)]
     pub path: String,
+    /// Whether OMP's separate active user config contributes to this file's
+    /// effective-runtime drift. Kept out of JSON because the public drift
+    /// reasons and remediation already describe the operator-facing result.
+    #[serde(skip_serializing)]
+    pub omp_active_user_config_drift: bool,
+    /// Exact file contents evaluated for this verdict. Startup self-heal uses
+    /// these non-serialized observations to bind a healthy status result to
+    /// the fingerprint it caches, including OMP's separate user authority.
+    #[serde(skip_serializing)]
+    pub status_observations: Vec<ConfigStatusFileObservation>,
     #[serde(rename = "path")]
     pub redacted_path: String,
     pub exists: bool,
@@ -2504,6 +2527,17 @@ pub struct ConfigFileStatus {
     pub primary_drift_reason: ConfigDriftReason,
     pub risk: ConfigDriftRisk,
     pub remediation: String,
+}
+
+/// A content witness captured by the same read that produced setup status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigStatusFileObservation {
+    /// Display form of the exact path read by status.
+    pub path: String,
+    /// Whether that read observed a regular file.
+    pub exists: bool,
+    /// SHA-256 of the UTF-8 bytes status parsed, when a regular file was read.
+    pub content_sha256: Option<String>,
 }
 
 impl ConfigFileStatus {
@@ -2568,6 +2602,38 @@ struct ConfigContentAnalysis {
     drift_reasons: Vec<ConfigDriftReason>,
 }
 
+struct OmpActiveUserConfigInspection {
+    path: PathBuf,
+    observation: ConfigStatusFileObservation,
+    disabled: bool,
+    unsupported: bool,
+}
+
+fn config_status_file_observation(
+    path: &Path,
+    content: &Result<Option<(String, u32)>, SetupError>,
+) -> ConfigStatusFileObservation {
+    use sha2::{Digest as _, Sha256};
+
+    match content {
+        Ok(Some((content, _))) => ConfigStatusFileObservation {
+            path: path.display().to_string(),
+            exists: true,
+            content_sha256: Some(format!("{:x}", Sha256::digest(content.as_bytes()))),
+        },
+        Ok(None) => ConfigStatusFileObservation {
+            path: path.display().to_string(),
+            exists: false,
+            content_sha256: None,
+        },
+        Err(_) => ConfigStatusFileObservation {
+            path: path.display().to_string(),
+            exists: path.symlink_metadata().is_ok(),
+            content_sha256: None,
+        },
+    }
+}
+
 fn config_file_status_for_action(
     action: &ConfigAction,
     params: &SetupParams,
@@ -2579,12 +2645,34 @@ fn config_file_status_for_action(
     let expected_auth = expected_authorization_for_action(action, &params.token);
     let expected_timeout = expected_startup_timeout_for_action(action);
     let redacted_path = redact_path_for_status(&action.file_path, home.as_deref());
+    let omp_user_config_inspection = if action.platform == AgentPlatform::Omp
+        && params.skip_user_config
+    {
+        Some(inspect_omp_active_user_config(params))
+    } else {
+        None
+    };
+    let omp_user_config_drift = omp_user_config_inspection
+        .as_ref()
+        .filter(|inspection| inspection.disabled || inspection.unsupported);
 
     let content = read_setup_file(&action.file_path, "config status file");
+    let mut status_observations = vec![config_status_file_observation(
+        &action.file_path,
+        &content,
+    )];
+    if let Some(inspection) = &omp_user_config_inspection {
+        status_observations.push(inspection.observation.clone());
+    }
     if matches!(&content, Ok(None)) {
-        let drift_reasons = vec![ConfigDriftReason::MissingFile];
+        let mut drift_reasons = vec![ConfigDriftReason::MissingFile];
+        if let Some(drift) = &omp_user_config_drift {
+            apply_omp_active_user_config_drift(&mut drift_reasons, drift);
+        }
         return ConfigFileStatus {
             path: action.file_path.display().to_string(),
+            omp_active_user_config_drift: omp_user_config_drift.is_some(),
+            status_observations,
             redacted_path,
             exists: false,
             has_server_entry: false,
@@ -2596,7 +2684,12 @@ fn config_file_status_for_action(
             expected_entry,
             primary_drift_reason: primary_drift_reason(&drift_reasons),
             risk: risk_for_drift_reasons(&drift_reasons),
-            remediation: setup_status_remediation(action, params, &drift_reasons),
+            remediation: setup_status_remediation_for_action(
+                action,
+                params,
+                &drift_reasons,
+                omp_user_config_drift.as_ref(),
+            ),
             drift_reasons,
         };
     }
@@ -2632,9 +2725,14 @@ fn config_file_status_for_action(
             home.as_deref(),
         );
     }
+    if let Some(drift) = &omp_user_config_drift {
+        apply_omp_active_user_config_drift(&mut analysis.drift_reasons, drift);
+    }
 
     ConfigFileStatus {
         path: action.file_path.display().to_string(),
+        omp_active_user_config_drift: omp_user_config_drift.is_some(),
+        status_observations,
         redacted_path,
         exists: true,
         has_server_entry: analysis.has_server_entry,
@@ -2646,7 +2744,12 @@ fn config_file_status_for_action(
         expected_entry,
         primary_drift_reason: primary_drift_reason(&analysis.drift_reasons),
         risk: risk_for_drift_reasons(&analysis.drift_reasons),
-        remediation: setup_status_remediation(action, params, &analysis.drift_reasons),
+        remediation: setup_status_remediation_for_action(
+            action,
+            params,
+            &analysis.drift_reasons,
+            omp_user_config_drift.as_ref(),
+        ),
         drift_reasons: analysis.drift_reasons,
     }
 }
@@ -2859,29 +2962,90 @@ fn apply_omp_disabled_servers_contract(
     analysis: &mut ConfigContentAnalysis,
     aliases: &[&str],
 ) {
-    match object.get("disabledServers") {
-        None => {}
-        Some(Value::Array(servers)) => {
-            if servers.iter().any(|value| !value.is_string()) {
-                push_drift_reason(
-                    &mut analysis.drift_reasons,
-                    ConfigDriftReason::UnsupportedConfig,
-                );
-            }
-            if servers
-                .iter()
-                .any(|value| value.as_str().is_some_and(|name| aliases.contains(&name)))
-            {
-                push_drift_reason(
-                    &mut analysis.drift_reasons,
-                    ConfigDriftReason::DisabledServer,
-                );
-            }
-        }
-        Some(_) => push_drift_reason(
+    let (disabled, unsupported) = inspect_omp_disabled_servers_contract(object, aliases);
+    if unsupported {
+        push_drift_reason(
             &mut analysis.drift_reasons,
             ConfigDriftReason::UnsupportedConfig,
+        );
+    }
+    if disabled {
+        push_drift_reason(
+            &mut analysis.drift_reasons,
+            ConfigDriftReason::DisabledServer,
+        );
+    }
+}
+
+fn inspect_omp_disabled_servers_contract(
+    object: &Map<String, Value>,
+    aliases: &[&str],
+) -> (bool, bool) {
+    match object.get("disabledServers") {
+        None => (false, false),
+        Some(Value::Array(servers)) => (
+            servers
+                .iter()
+                .any(|value| value.as_str().is_some_and(|name| aliases.contains(&name))),
+            servers.iter().any(|value| !value.is_string()),
         ),
+        Some(_) => (false, true),
+    }
+}
+
+fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigInspection {
+    let path = omp_active_user_config_path(params);
+    let content = read_setup_file(&path, "OMP active-profile user config");
+    let observation = config_status_file_observation(&path, &content);
+    let content = match content {
+        Ok(None) => {
+            return OmpActiveUserConfigInspection {
+                path,
+                observation,
+                disabled: false,
+                unsupported: false,
+            };
+        }
+        Ok(Some((content, _))) => content,
+        Err(_) => {
+            return OmpActiveUserConfigInspection {
+                path,
+                observation,
+                disabled: false,
+                unsupported: true,
+            };
+        }
+    };
+    let object = match serde_json::from_str::<Value>(&content) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) | Err(_) => {
+            return OmpActiveUserConfigInspection {
+                path,
+                observation,
+                disabled: false,
+                unsupported: true,
+            };
+        }
+    };
+    let (disabled, unsupported) =
+        inspect_omp_disabled_servers_contract(&object, &OMP_SERVER_ALIASES);
+    OmpActiveUserConfigInspection {
+        path,
+        observation,
+        disabled,
+        unsupported,
+    }
+}
+
+fn apply_omp_active_user_config_drift(
+    reasons: &mut Vec<ConfigDriftReason>,
+    drift: &OmpActiveUserConfigInspection,
+) {
+    if drift.unsupported {
+        push_drift_reason(reasons, ConfigDriftReason::UnsupportedConfig);
+    }
+    if drift.disabled {
+        push_drift_reason(reasons, ConfigDriftReason::DisabledServer);
     }
 }
 
@@ -3485,22 +3649,7 @@ fn setup_status_remediation(
         return "no action".to_string();
     }
 
-    let home = params.home_dir_override.clone().or_else(dirs::home_dir);
-    let project_dir = redact_path_for_status(&params.project_dir, home.as_deref());
-    let args = format!(
-        "--agent {} --host {} --port {} --path {} --project-dir {}{}{}",
-        action.platform.slug(),
-        params.host,
-        params.port,
-        params.path,
-        project_dir,
-        if params.skip_user_config {
-            " --no-user-config"
-        } else {
-            ""
-        },
-        if params.skip_hooks { " --no-hooks" } else { "" }
-    );
+    let args = setup_status_command_args(action, params, params.skip_user_config);
     let dry_run = format!("am setup run --dry-run {args}");
     let fix = format!("am setup run --yes {args}");
 
@@ -3518,6 +3667,74 @@ fn setup_status_remediation(
         );
     }
     format!("{dry_run}; {fix}")
+}
+
+fn setup_status_command_args(
+    action: &ConfigAction,
+    params: &SetupParams,
+    skip_user_config: bool,
+) -> String {
+    let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+    let project_dir = redact_path_for_status(&params.project_dir, home.as_deref());
+    format!(
+        "--agent {} --host {} --port {} --path {} --project-dir {}{}{}",
+        action.platform.slug(),
+        shell_quote_status_arg(&params.host),
+        params.port,
+        shell_quote_status_arg(&params.path),
+        shell_quote_status_path(&project_dir),
+        if skip_user_config {
+            " --no-user-config"
+        } else {
+            ""
+        },
+        if params.skip_hooks { " --no-hooks" } else { "" }
+    )
+}
+
+fn shell_quote_status_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-')
+        })
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn shell_quote_status_path(value: &str) -> String {
+    if value == "~" {
+        return value.to_string();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        // Keep only the tilde unquoted so the shell expands the redacted home;
+        // quote the complete suffix as one argument.
+        return format!("~/{}", shell_quote_status_arg(rest));
+    }
+    shell_quote_status_arg(value)
+}
+
+fn setup_status_remediation_for_action(
+    action: &ConfigAction,
+    params: &SetupParams,
+    reasons: &[ConfigDriftReason],
+    omp_user_config_drift: Option<&OmpActiveUserConfigInspection>,
+) -> String {
+    let Some(drift) = omp_user_config_drift else {
+        return setup_status_remediation(action, params, reasons);
+    };
+    let home = params.home_dir_override.clone().or_else(dirs::home_dir);
+    let path = redact_path_for_status(&drift.path, home.as_deref());
+    let args = setup_status_command_args(action, params, false);
+    let dry_run = format!("am setup run --dry-run {args}");
+    let fix = format!("am setup run --yes {args}");
+    if drift.unsupported {
+        return format!("inspect unsupported active OMP user config {path}, then {dry_run}; {fix}");
+    }
+    format!("active OMP user config {path} globally disables Agent Mail; {dry_run}; {fix}")
 }
 
 fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
@@ -6253,6 +6470,127 @@ http_headers = { Authorization = "Bearer tok" }
         );
         assert_eq!(file.risk, ConfigDriftRisk::Medium);
         assert!(file.remediation.contains("am setup run --yes"));
+    }
+
+    #[test]
+    fn check_status_project_only_honors_active_omp_user_denylist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let project_config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_config,
+            r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"},
+      "enabled": true
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let home = params.home_dir_override.clone().unwrap();
+        let default_user_config = home.join(".omp/agent/mcp.json");
+        let active_user_config = home.join(".omp/profiles/work/agent/mcp.json");
+        std::fs::create_dir_all(default_user_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(active_user_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            default_user_config,
+            r#"{"disabledServers":["mcp-agent-mail"]}"#,
+        )
+        .unwrap();
+        std::fs::write(&active_user_config, r#"{"disabledServers":["other"]}"#).unwrap();
+        params.omp_user_config_path_override = Some(active_user_config.clone());
+
+        let healthy = first_setup_status_file(&params);
+        assert!(healthy.exists && healthy.has_server_entry && healthy.url_matches);
+        assert!(
+            healthy.drift_reasons.is_empty(),
+            "the selected profile, not the default profile, is authoritative"
+        );
+
+        std::fs::write(
+            &active_user_config,
+            r#"{"disabledServers":["mcp_agent_mail"]}"#,
+        )
+        .unwrap();
+        let disabled = first_setup_status_file(&params);
+        assert!(
+            disabled
+                .drift_reasons
+                .contains(&ConfigDriftReason::DisabledServer)
+        );
+        assert_eq!(
+            disabled.primary_drift_reason,
+            ConfigDriftReason::DisabledServer
+        );
+        assert_eq!(disabled.risk, ConfigDriftRisk::Medium);
+        assert!(
+            disabled
+                .remediation
+                .contains("~/.omp/profiles/work/agent/mcp.json")
+        );
+        assert!(
+            !disabled.remediation.contains("--no-user-config"),
+            "repair must include the globally authoritative user config"
+        );
+
+        std::fs::write(
+            active_user_config,
+            r#"{"disabledServers":["mcp-agent-mail",7]}"#,
+        )
+        .unwrap();
+        let malformed = first_setup_status_file(&params);
+        assert_eq!(
+            malformed.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(
+            malformed
+                .drift_reasons
+                .contains(&ConfigDriftReason::DisabledServer)
+        );
+        assert!(malformed.remediation.starts_with(
+            "inspect unsupported active OMP user config ~/.omp/profiles/work/agent/mcp.json"
+        ));
+    }
+
+    #[test]
+    fn setup_status_remediation_shell_quotes_untrusted_arguments() {
+        let home = PathBuf::from("/home/tester");
+        let params = SetupParams {
+            host: "host;$(touch bad)".to_string(),
+            path: "/mcp path/$HOME/'".to_string(),
+            project_dir: home.join("project dir/$(touch bad)'"),
+            home_dir_override: Some(home),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        let action = AgentPlatform::Omp
+            .config_actions(&params)
+            .into_iter()
+            .next()
+            .expect("OMP project config action");
+        let args = setup_status_command_args(&action, &params, true);
+        let quoted_host = shell_quote_status_arg(&params.host);
+        let quoted_path = shell_quote_status_arg(&params.path);
+        let quoted_project = shell_quote_status_path("~/project dir/$(touch bad)'");
+
+        assert_eq!(quoted_host, "'host;$(touch bad)'");
+        assert_eq!(quoted_path, "'/mcp path/$HOME/'\"'\"''");
+        assert_eq!(quoted_project, "~/'project dir/$(touch bad)'\"'\"''");
+        assert!(args.contains(&format!("--host {quoted_host} ")));
+        assert!(args.contains(&format!("--path {quoted_path} ")));
+        assert!(args.contains(&format!("--project-dir {quoted_project} ")));
+        assert!(args.ends_with("--no-user-config --no-hooks"));
+        assert_eq!(shell_quote_status_path("~"), "~");
+        assert_eq!(shell_quote_status_path("~/safe/path"), "~/safe/path");
     }
 
     #[test]

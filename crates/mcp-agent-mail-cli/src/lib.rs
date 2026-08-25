@@ -8064,43 +8064,36 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
             .collect(),
         skip_user_config: params.skip_user_config,
         skip_hooks: params.skip_hooks,
+        stable_status_verified: true,
         file_fingerprints: Vec::new(),
     };
-    let mut computed_fingerprints: Option<Vec<SetupSelfHealFileFingerprint>> = None;
-    let mut build_expected_full_cache = || {
-        let fingerprints = computed_fingerprints
-            .get_or_insert_with(|| {
-                collect_setup_self_heal_file_fingerprints(&params, &target_agents)
-            })
-            .clone();
-        let mut cache = expected_static_cache.clone();
-        cache.file_fingerprints = fingerprints;
-        cache
-    };
-
     let static_match = existing_cache
         .as_ref()
         .is_some_and(|cache| cache.matches_static(&expected_static_cache));
     if static_match {
-        let expected_cache = build_expected_full_cache();
+        let mut expected_cache = expected_static_cache.clone();
+        expected_cache.file_fingerprints =
+            collect_setup_self_heal_file_fingerprints(&params, &target_agents);
+        // A full match is authoritative only for caches carrying the stable
+        // status marker. Such caches were written after a drift-free status
+        // read bracketed by identical fingerprints, and the current full
+        // fingerprint match revalidates every setup file plus OMP's read-only
+        // active-user authority. Legacy caches lack the marker and fall
+        // through to the fenced status check below.
         if existing_cache
             .as_ref()
             .is_some_and(|cache| cache.matches_full(&expected_cache))
         {
             return Ok(());
         }
-    }
 
-    let statuses = setup::check_status(&params);
-    let status_ok = statuses.iter().all(|status| {
-        !status.config_files.is_empty()
-            && status.config_files.iter().all(setup_status_file_is_healthy)
-    });
-
-    if status_ok && static_match {
-        let expected_cache = build_expected_full_cache();
-        write_setup_self_heal_cache(config, &project_dir, &expected_cache);
-        return Ok(());
+        let (residual_drift, stable_fingerprints) =
+            verify_setup_status_snapshot(&params, &target_agents)?;
+        if residual_drift.is_empty() {
+            expected_cache.file_fingerprints = stable_fingerprints;
+            write_setup_self_heal_cache(config, &project_dir, &expected_cache);
+            return Ok(());
+        }
     }
 
     // Never persist an empty token (would clobber a real one under `--no-auth`).
@@ -8128,15 +8121,88 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         )));
     }
 
+    let (residual_drift, stable_fingerprints) =
+        verify_setup_status_snapshot(&params, &target_agents)?;
+    if !residual_drift.is_empty() {
+        return Err(CliError::Other(format!(
+            "setup self-heal left runtime-relevant config drift and will not cache success: {}",
+            residual_drift.join("; ")
+        )));
+    }
+
     let mut refreshed_cache = expected_static_cache;
-    refreshed_cache.file_fingerprints =
-        collect_setup_self_heal_file_fingerprints(&params, &target_agents);
+    refreshed_cache.file_fingerprints = stable_fingerprints;
     write_setup_self_heal_cache(config, &project_dir, &refreshed_cache);
     Ok(())
 }
 
 fn setup_status_file_is_healthy(file: &mcp_agent_mail_core::setup::ConfigFileStatus) -> bool {
     file.exists && file.has_server_entry && file.url_matches && file.drift_reasons.is_empty()
+}
+
+fn setup_status_drift_summaries(
+    statuses: &[mcp_agent_mail_core::setup::AgentConfigStatus],
+    only_slug: Option<&str>,
+) -> Vec<String> {
+    let mut summaries = Vec::new();
+    for status in statuses {
+        if only_slug.is_some_and(|slug| status.slug != slug) {
+            continue;
+        }
+        if status.config_files.is_empty() {
+            summaries.push(format!("{}: no config files inspected", status.slug));
+            continue;
+        }
+        for file in &status.config_files {
+            if setup_status_file_is_healthy(file) {
+                continue;
+            }
+            summaries.push(setup_status_file_drift_summary(&status.slug, file));
+        }
+    }
+    summaries
+}
+
+fn setup_status_file_drift_summary(
+    slug: &str,
+    file: &mcp_agent_mail_core::setup::ConfigFileStatus,
+) -> String {
+    format!(
+        "{} {}: {} (risk {}); {}",
+        slug, file.redacted_path, file.primary_drift_reason, file.risk, file.remediation
+    )
+}
+
+fn project_only_omp_setup_drift(
+    params: &mcp_agent_mail_core::setup::SetupParams,
+    dry_run: bool,
+    action_failures: usize,
+) -> Vec<String> {
+    use mcp_agent_mail_core::setup::{self, AgentPlatform};
+
+    let omp_is_selected = params
+        .agents
+        .as_ref()
+        .is_none_or(|agents| agents.contains(&AgentPlatform::Omp));
+    if action_failures != 0 || !params.skip_user_config || !omp_is_selected {
+        return Vec::new();
+    }
+    let statuses = setup::check_status(params);
+    if !dry_run {
+        return setup_status_drift_summaries(&statuses, Some(AgentPlatform::Omp.slug()));
+    }
+
+    statuses
+        .iter()
+        .filter(|status| status.slug == AgentPlatform::Omp.slug())
+        .flat_map(|status| {
+            status
+                .config_files
+                .iter()
+                .filter(|file| file.omp_active_user_config_drift)
+                .map(|file| setup_status_file_drift_summary(&status.slug, file))
+        })
+        .collect()
 }
 
 const SETUP_SELF_HEAL_CACHE_VERSION: u32 = 3;
@@ -8160,6 +8226,10 @@ struct SetupSelfHealCache {
     target_agents: Vec<String>,
     skip_user_config: bool,
     skip_hooks: bool,
+    /// True only after status was drift-free across an unchanged fingerprint
+    /// snapshot. Missing on legacy v3 caches, which must not take the fast path.
+    #[serde(default)]
+    stable_status_verified: bool,
     #[serde(default)]
     file_fingerprints: Vec<SetupSelfHealFileFingerprint>,
 }
@@ -8176,7 +8246,10 @@ impl SetupSelfHealCache {
     }
 
     fn matches_full(&self, expected: &Self) -> bool {
-        self.matches_static(expected) && self.file_fingerprints == expected.file_fingerprints
+        self.matches_static(expected)
+            && self.stable_status_verified
+            && expected.stable_status_verified
+            && self.file_fingerprints == expected.file_fingerprints
     }
 }
 
@@ -8194,6 +8267,17 @@ fn collect_setup_self_heal_file_fingerprints(
             }
             paths.insert(action.file_path);
         }
+    }
+    if params.skip_user_config
+        && target_agents.contains(&mcp_agent_mail_core::setup::AgentPlatform::Omp)
+    {
+        // This file is intentionally not a setup action in project-only mode,
+        // but OMP's global disabledServers list still governs project entries.
+        // Fingerprint that read-only authority so the cache cannot bypass a
+        // status check after it changes.
+        paths.insert(mcp_agent_mail_core::setup::omp_active_user_config_path(
+            params,
+        ));
     }
 
     paths
@@ -8231,6 +8315,71 @@ fn collect_setup_self_heal_file_fingerprints(
             }
         })
         .collect()
+}
+
+fn verify_setup_status_snapshot(
+    params: &mcp_agent_mail_core::setup::SetupParams,
+    target_agents: &[mcp_agent_mail_core::setup::AgentPlatform],
+) -> CliResult<(Vec<String>, Vec<SetupSelfHealFileFingerprint>)> {
+    verify_setup_status_snapshot_with(params, target_agents, || {
+        mcp_agent_mail_core::setup::check_status(params)
+    })
+}
+
+fn verify_setup_status_snapshot_with<F>(
+    params: &mcp_agent_mail_core::setup::SetupParams,
+    target_agents: &[mcp_agent_mail_core::setup::AgentPlatform],
+    status_check: F,
+) -> CliResult<(Vec<String>, Vec<SetupSelfHealFileFingerprint>)>
+where
+    F: FnOnce() -> Vec<mcp_agent_mail_core::setup::AgentConfigStatus>,
+{
+    let fingerprints_before =
+        collect_setup_self_heal_file_fingerprints(params, target_agents);
+    let statuses = status_check();
+    let residual_drift = setup_status_drift_summaries(&statuses, None);
+    let fingerprints_after = collect_setup_self_heal_file_fingerprints(params, target_agents);
+    if fingerprints_before != fingerprints_after {
+        return Err(CliError::Other(
+            "setup self-heal config changed during status verification; refusing to cache an unstable snapshot"
+                .to_string(),
+        ));
+    }
+    if residual_drift.is_empty()
+        && !setup_status_observations_match_fingerprints(&statuses, &fingerprints_after)
+    {
+        return Err(CliError::Other(
+            "setup self-heal fingerprint does not match the bytes evaluated by status; refusing to cache an unstable snapshot"
+                .to_string(),
+        ));
+    }
+    Ok((residual_drift, fingerprints_after))
+}
+
+fn setup_status_observations_match_fingerprints(
+    statuses: &[mcp_agent_mail_core::setup::AgentConfigStatus],
+    fingerprints: &[SetupSelfHealFileFingerprint],
+) -> bool {
+    let mut observations = std::collections::BTreeMap::new();
+    for observation in statuses
+        .iter()
+        .flat_map(|status| &status.config_files)
+        .flat_map(|file| &file.status_observations)
+    {
+        if let Some(existing) = observations.insert(observation.path.clone(), observation)
+            && existing != observation
+        {
+            return false;
+        }
+    }
+
+    observations.len() == fingerprints.len()
+        && fingerprints.iter().all(|fingerprint| {
+            observations.get(&fingerprint.path).is_some_and(|observed| {
+                observed.exists == fingerprint.exists
+                    && observed.content_sha256 == fingerprint.content_sha256
+            })
+        })
 }
 
 fn detect_installed_setup_agents() -> Vec<mcp_agent_mail_core::setup::AgentPlatform> {
@@ -15114,6 +15263,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 .flat_map(|result| &result.actions)
                 .filter(|action| matches!(action.outcome, setup::ActionOutcome::Failed(_)))
                 .count();
+            let residual_omp_drift = project_only_omp_setup_drift(&params, dry_run, failed);
 
             output::emit_output(&results, fmt, || {
                 render_setup_actions_table(&results, dry_run);
@@ -15136,21 +15286,27 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                     .count();
 
                 ftui_runtime::ftui_println!("");
-                if failed == 0 {
+                if failed == 0 && residual_omp_drift.is_empty() {
                     output::success(&format!(
                         "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged"
                     ));
                 } else {
                     output::warn(&format!(
-                        "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged, {failed} failed"
+                        "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged, {failed} failed, {} runtime-authority finding(s) remain",
+                        residual_omp_drift.len()
                     ));
                 }
             });
-            if failed == 0 {
+            if failed != 0 {
+                Err(CliError::Other(format!(
+                    "setup failed for {failed} config action(s)"
+                )))
+            } else if residual_omp_drift.is_empty() {
                 Ok(())
             } else {
                 Err(CliError::Other(format!(
-                    "setup failed for {failed} config action(s)"
+                    "project-only OMP setup cannot make Agent Mail reachable while the active user config remains authoritative: {}",
+                    residual_omp_drift.join("; ")
                 )))
             }
         }
@@ -43473,20 +43629,21 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
-    fn setup_self_heal_health_gate_rejects_omp_disablement_drift() {
+    fn project_only_omp_setup_postcheck_rejects_user_disablement_without_mutation() {
         use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let project_dir = temp.path().join("project");
         let home_dir = temp.path().join("home");
         let config_path = project_dir.join(".omp/mcp.json");
+        let user_config_path = home_dir.join(".omp/profiles/work/agent/mcp.json");
         std::fs::create_dir_all(config_path.parent().expect("OMP config parent"))
             .expect("create OMP config parent");
-        std::fs::create_dir_all(&home_dir).expect("create home fixture");
+        std::fs::create_dir_all(user_config_path.parent().expect("OMP user config parent"))
+            .expect("create OMP user config parent");
         std::fs::write(
             &config_path,
             r#"{
-  "disabledServers": ["mcp-agent-mail"],
   "mcpServers": {
     "mcp-agent-mail": {
       "type": "http",
@@ -43497,11 +43654,14 @@ http_headers = { Authorization = "Bearer secret" }
   }
 }"#,
         )
-        .expect("write disabled OMP config");
-        let params = SetupParams {
+        .expect("write healthy OMP project config");
+        let user_config = r#"{"disabledServers":["mcp-agent-mail"]}"#;
+        std::fs::write(&user_config_path, user_config).expect("write disabling OMP user config");
+        let mut params = SetupParams {
             token: "tok".to_string(),
             project_dir,
             home_dir_override: Some(home_dir),
+            omp_user_config_path_override: Some(user_config_path.clone()),
             agents: Some(vec![AgentPlatform::Omp]),
             skip_user_config: true,
             skip_hooks: true,
@@ -43524,6 +43684,37 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             !setup_status_file_is_healthy(file),
             "self-heal must not cache a disabled OMP config as healthy"
+        );
+        let postcheck = project_only_omp_setup_drift(&params, false, 0);
+        assert_eq!(postcheck.len(), 1);
+        assert!(postcheck[0].contains("globally disables Agent Mail"));
+        assert!(
+            !postcheck[0].contains("--no-user-config"),
+            "the actionable repair must include the authoritative user config"
+        );
+        assert!(
+            !project_only_omp_setup_drift(&params, true, 0).is_empty(),
+            "a dry-run must still surface independently authoritative user drift"
+        );
+        assert!(
+            project_only_omp_setup_drift(&params, false, 1).is_empty(),
+            "an action failure remains the primary setup error"
+        );
+        params.agents = Some(vec![AgentPlatform::Cline]);
+        assert!(
+            project_only_omp_setup_drift(&params, false, 0).is_empty(),
+            "an explicit non-OMP selection must not run the OMP postcheck"
+        );
+        params.agents = None;
+        assert_eq!(
+            project_only_omp_setup_drift(&params, false, 0).len(),
+            1,
+            "an omitted agent filter means all platforms, including OMP"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user_config_path).expect("read OMP user config"),
+            user_config,
+            "the postcheck must remain read-only"
         );
     }
 
@@ -43558,6 +43749,142 @@ http_headers = { Authorization = "Bearer secret" }
         assert_ne!(first[0].content_sha256, second[0].content_sha256);
     }
 
+    #[test]
+    fn setup_self_heal_fingerprints_project_only_omp_user_authority() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let project_config = project_dir.join(".omp/mcp.json");
+        let user_config = temp.path().join("home/.omp/profiles/work/agent/mcp.json");
+        std::fs::create_dir_all(project_config.parent().expect("project config parent"))
+            .expect("create project config parent");
+        std::fs::create_dir_all(user_config.parent().expect("user config parent"))
+            .expect("create user config parent");
+        std::fs::write(&project_config, "project").expect("write project config");
+        std::fs::write(&user_config, "mcp-agent-mail").expect("write user config");
+        let params = SetupParams {
+            project_dir,
+            omp_user_config_path_override: Some(user_config.clone()),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+
+        let first = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        assert_eq!(first.len(), 2);
+        assert!(
+            first
+                .iter()
+                .any(|fingerprint| fingerprint.path == user_config.display().to_string())
+        );
+
+        std::fs::write(&user_config, "mcp_agent_mail").expect("replace user config");
+        let mut second = collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Omp]);
+        let first_user = first
+            .iter()
+            .find(|fingerprint| fingerprint.path == user_config.display().to_string())
+            .expect("first user fingerprint");
+        let second_user = second
+            .iter_mut()
+            .find(|fingerprint| fingerprint.path == user_config.display().to_string())
+            .expect("second user fingerprint");
+        assert_eq!(first_user.len, second_user.len);
+        second_user.modified_micros = first_user.modified_micros;
+        assert_ne!(first_user.content_sha256, second_user.content_sha256);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn setup_self_heal_status_snapshot_rejects_mid_check_config_change() {
+        use mcp_agent_mail_core::setup::{AgentPlatform, SetupParams};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let config_path = project_dir.join("cline.mcp.json");
+        std::fs::create_dir_all(&project_dir).expect("create project fixture");
+        std::fs::write(&config_path, "before").expect("write initial config");
+        let params = SetupParams {
+            project_dir,
+            agents: Some(vec![AgentPlatform::Cline]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+
+        let error = verify_setup_status_snapshot_with(
+            &params,
+            &[AgentPlatform::Cline],
+            || {
+                std::fs::write(
+                    &config_path,
+                    r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/"}}}"#,
+                )
+                .expect("write transient healthy config");
+                let statuses = mcp_agent_mail_core::setup::check_status(&params);
+                assert!(setup_status_drift_summaries(&statuses, None).is_empty());
+                std::fs::write(&config_path, "before").expect("restore original config");
+                statuses
+            },
+        )
+        .expect_err("an ABA status snapshot must not be cached");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the bytes evaluated by status"),
+            "the before/after fingerprints are both the restored bytes, so the status observation must close the ABA race"
+        );
+
+        std::fs::write(
+            &config_path,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/"}}}"#,
+        )
+        .expect("write stable healthy config");
+        let (drift, stable) = verify_setup_status_snapshot_with(
+            &params,
+            &[AgentPlatform::Cline],
+            || mcp_agent_mail_core::setup::check_status(&params),
+        )
+        .expect("unchanged snapshot");
+        assert!(drift.is_empty());
+        assert_eq!(
+            stable,
+            collect_setup_self_heal_file_fingerprints(&params, &[AgentPlatform::Cline])
+        );
+    }
+
+    #[test]
+    fn setup_self_heal_legacy_cache_cannot_take_verified_fast_path() {
+        let expected = SetupSelfHealCache {
+            schema_version: SETUP_SELF_HEAL_CACHE_VERSION,
+            project_dir: "/project".to_string(),
+            server_url: "http://127.0.0.1:8765/mcp/".to_string(),
+            token_fingerprint: token_fingerprint("secret"),
+            target_agents: vec!["omp".to_string()],
+            skip_user_config: true,
+            skip_hooks: true,
+            stable_status_verified: true,
+            file_fingerprints: vec![SetupSelfHealFileFingerprint {
+                path: "/project/.omp/mcp.json".to_string(),
+                exists: true,
+                len: 7,
+                modified_micros: 42,
+                content_sha256: Some("digest".to_string()),
+            }],
+        };
+        let mut legacy = expected.clone();
+        legacy.stable_status_verified = false;
+
+        assert!(legacy.matches_static(&expected));
+        assert!(
+            !legacy.matches_full(&expected),
+            "an old cache without a fenced status witness must be rechecked"
+        );
+        legacy.stable_status_verified = true;
+        assert!(legacy.matches_full(&expected));
+    }
+
     #[cfg(unix)]
     #[test]
     fn setup_self_heal_cache_ignores_symlinked_cache_file() {
@@ -43579,6 +43906,7 @@ http_headers = { Authorization = "Bearer secret" }
             target_agents: vec!["codex".to_string()],
             skip_user_config: false,
             skip_hooks: false,
+            stable_status_verified: true,
             file_fingerprints: Vec::new(),
         };
 
@@ -43619,6 +43947,7 @@ http_headers = { Authorization = "Bearer secret" }
             target_agents: vec!["codex".to_string()],
             skip_user_config: false,
             skip_hooks: false,
+            stable_status_verified: true,
             file_fingerprints: Vec::new(),
         };
 
@@ -77970,16 +78299,27 @@ fn handle_doctor_reconstruct_with(
     // against an archive that's still being written to by other agents
     // — making the additional floor advance a safe defensive bump.
     {
-        let archive_max = mcp_agent_mail_db::id_floor::max_message_id_in_archive(&storage_root);
-        if let Some(max) = archive_max {
-            let conn_result =
-                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string());
-            if let Ok(conn) = conn_result
-                && let Err(e) =
-                    mcp_agent_mail_db::id_floor::advance_messages_id_floor(&conn, Some(max))
-            {
-                ftui_runtime::ftui_eprintln!("  Warning: post-swap id-floor advance failed: {e}");
+        match mcp_agent_mail_db::id_floor::max_message_id_in_archive(&storage_root) {
+            Ok(Some(max)) => {
+                match mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string()) {
+                    Ok(conn) => {
+                        if let Err(error) =
+                            mcp_agent_mail_db::id_floor::advance_messages_id_floor(&conn, Some(max))
+                        {
+                            ftui_runtime::ftui_eprintln!(
+                                "  Warning: post-swap id-floor advance failed: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => ftui_runtime::ftui_eprintln!(
+                        "  Warning: post-swap id-floor database open failed: {error}"
+                    ),
+                }
             }
+            Ok(None) => {}
+            Err(error) => ftui_runtime::ftui_eprintln!(
+                "  Warning: post-swap archive id-floor scan failed: {error}"
+            ),
         }
     }
 
