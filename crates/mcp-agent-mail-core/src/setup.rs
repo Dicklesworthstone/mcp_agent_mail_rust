@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -206,16 +206,12 @@ pub struct OmpConfigPaths {
 /// explicitly selected `OMP_PROFILE` or legacy `PI_PROFILE` does not satisfy
 /// OMP's profile-name contract.
 pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError> {
-    let home = require_absolute_omp_home_dir(dirs::home_dir())?;
+    let home = require_absolute_omp_home_dir(home_dir_for_omp_setup())?;
     let cwd = std::env::current_dir()?;
-    let omp_profile =
-        std::env::var_os("OMP_PROFILE").map(|value| value.to_string_lossy().into_owned());
-    let pi_profile =
-        std::env::var_os("PI_PROFILE").map(|value| value.to_string_lossy().into_owned());
-    let config_dir =
-        std::env::var_os("PI_CONFIG_DIR").map(|value| value.to_string_lossy().into_owned());
-    let agent_dir =
-        std::env::var_os("PI_CODING_AGENT_DIR").map(|value| value.to_string_lossy().into_owned());
+    let omp_profile = utf8_env_value_for_setup("OMP_PROFILE")?;
+    let pi_profile = utf8_env_value_for_setup("PI_PROFILE")?;
+    let config_dir = utf8_env_value_for_setup("PI_CONFIG_DIR")?;
+    let agent_dir = utf8_env_value_for_setup("PI_CODING_AGENT_DIR")?;
 
     resolve_omp_config_paths(
         &home,
@@ -239,7 +235,10 @@ fn require_absolute_omp_home_dir(home: Option<PathBuf>) -> Result<PathBuf, Setup
 }
 
 fn omp_path_is_absolute_and_traversal_free(path: &Path) -> bool {
-    path.is_absolute() && !path.components().any(|component| component == Component::ParentDir)
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir)
 }
 
 fn looks_like_windows_path_prefix(path: &str) -> bool {
@@ -275,8 +274,7 @@ fn resolve_omp_agent_dir_override(cwd: &Path, path: &str) -> Result<PathBuf, Set
     let path = PathBuf::from(path);
     if looks_like_windows_path_prefix(path.to_string_lossy().as_ref()) && !path.is_absolute() {
         return Err(SetupError::Other(
-            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory"
-                .to_string(),
+            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory".to_string(),
         ));
     }
     if path
@@ -284,8 +282,7 @@ fn resolve_omp_agent_dir_override(cwd: &Path, path: &str) -> Result<PathBuf, Set
         .any(|component| component == Component::ParentDir)
     {
         return Err(SetupError::Other(
-            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory"
-                .to_string(),
+            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory".to_string(),
         ));
     }
     let resolved = if path.is_absolute() {
@@ -295,8 +292,7 @@ fn resolve_omp_agent_dir_override(cwd: &Path, path: &str) -> Result<PathBuf, Set
     };
     if !omp_path_is_absolute_and_traversal_free(&resolved) {
         return Err(SetupError::Other(
-            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory"
-                .to_string(),
+            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory".to_string(),
         ));
     }
     Ok(resolved)
@@ -308,9 +304,7 @@ fn resolve_omp_agent_dir_override(cwd: &Path, path: &str) -> Result<PathBuf, Set
 /// OMP resolves relative entries against its launch working directory and
 /// expands a leading `~` against the active user's home directory. Empty path
 /// list entries are ignored, matching OMP's JavaScript loader.
-pub fn omp_settings_overlay_paths_from_env(
-    project_dir: &Path,
-) -> Result<Vec<PathBuf>, SetupError> {
+pub fn omp_settings_overlay_paths_from_env(project_dir: &Path) -> Result<Vec<PathBuf>, SetupError> {
     resolve_omp_settings_overlay_paths(
         std::env::var_os("PI_CONFIG_FILES").as_deref(),
         project_dir,
@@ -469,6 +463,10 @@ pub enum ConfigContent {
         servers_key: &'static str,
         server_name: &'static str,
         server_value: Value,
+        /// Reconcile OMP's active-user-only disable/force-enable lists.
+        /// This must remain false for project files, where OMP ignores those
+        /// top-level keys and setup must preserve their unrelated bytes.
+        reconcile_omp_user_runtime_lists: bool,
     },
     /// Merge an MCP server entry into Claude Code's *local* (per-project) scope:
     /// `projects.<project_path>.mcpServers.<server_name>` inside `~/.claude.json`
@@ -734,6 +732,32 @@ fn env_value_for_setup(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+fn os_env_value_for_setup(key: &str) -> Option<OsString> {
+    #[cfg(test)]
+    {
+        if let Some(value) = TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned()) {
+            return value.map(OsString::from);
+        }
+    }
+    std::env::var_os(key)
+}
+
+fn utf8_env_value_for_setup(key: &str) -> Result<Option<String>, SetupError> {
+    #[cfg(test)]
+    {
+        if let Some(value) = TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned()) {
+            return Ok(value);
+        }
+    }
+    std::env::var_os(key).map_or(Ok(None), |value| {
+        value.into_string().map(Some).map_err(|_| {
+            SetupError::Other(format!(
+                "{key} must contain valid UTF-8; refusing to guess an OMP credential authority"
+            ))
+        })
+    })
+}
+
 /// Resolve the bearer token from multiple sources in priority order:
 /// explicit flag > config.env file > `HTTP_BEARER_TOKEN` env var > generate new.
 pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, SetupError> {
@@ -872,6 +896,7 @@ fn merge_omp_mcp_server(
     existing: Option<&str>,
     server_name: &str,
     mut server_value: Value,
+    reconcile_user_runtime_lists: bool,
 ) -> Result<String, SetupError> {
     let desired_entry = server_value
         .as_object_mut()
@@ -912,10 +937,11 @@ fn merge_omp_mcp_server(
         .cloned()
         .unwrap_or_default();
 
-    // Preserve OMP-native tuning/auth fields and unrelated headers, while
-    // removing transport fields that are incompatible with the desired HTTP
-    // entry. This mirrors the installer writer and avoids erasing operator
-    // choices such as `timeout`, `requestIdFormat`, and `oauth`.
+    // Preserve OMP-native neutral tuning fields and unrelated headers, while
+    // removing transport/auth fields that are incompatible with the desired
+    // HTTP bearer entry. In particular, an explicit OMP OAuth credential can
+    // replace the configured Authorization header at runtime, so keeping
+    // stale `auth`/`oauth` metadata would make setup and status false-green.
     let mut merged_entry = existing_entry;
     for key in [
         "command",
@@ -927,6 +953,8 @@ fn merge_omp_mcp_server(
         "httpUrl",
         "http_headers",
         "bearer_token_env_var",
+        "auth",
+        "oauth",
     ] {
         merged_entry.remove(key);
     }
@@ -969,16 +997,26 @@ fn merge_omp_mcp_server(
         }
     }
 
-    if let Some(disabled) = obj.get_mut("disabledServers") {
-        let disabled = disabled.as_array_mut().ok_or_else(|| {
-            SetupError::Other("OMP disabledServers must be a JSON array".to_string())
-        })?;
-        if disabled.iter().any(|value| !value.is_string()) {
-            return Err(SetupError::Other(
-                "OMP disabledServers entries must be strings".to_string(),
-            ));
+    if reconcile_user_runtime_lists {
+        // These exact-name lists are loaded only from the active user file.
+        // The canonical entry now carries `enabled: true`, so stale Agent Mail
+        // names are unnecessary in either list. In particular, retaining a
+        // historical alias in enabledServers could force-enable a distinct
+        // imported entry and create a second live connection.
+        for key in ["disabledServers", "enabledServers"] {
+            let Some(values) = obj.get_mut(key) else {
+                continue;
+            };
+            let values = values
+                .as_array_mut()
+                .ok_or_else(|| SetupError::Other(format!("OMP {key} must be a JSON array")))?;
+            if values.iter().any(|value| !value.is_string()) {
+                return Err(SetupError::Other(format!(
+                    "OMP {key} entries must be strings"
+                )));
+            }
+            values.retain(|value| !value.as_str().is_some_and(|name| aliases.contains(&name)));
         }
-        disabled.retain(|value| !value.as_str().is_some_and(|name| aliases.contains(&name)));
     }
 
     Ok(serde_json::to_string_pretty(&doc)? + "\n")
@@ -1417,6 +1455,7 @@ fn project_local_action(
             servers_key,
             server_name: "mcp-agent-mail",
             server_value,
+            reconcile_omp_user_runtime_lists: false,
         },
         permissions: 0o600,
         backup: true,
@@ -1434,25 +1473,26 @@ fn project_local_action(
 /// path as a filesystem authority. OMP setup files can contain bearer tokens,
 /// so a caller must never redirect an unresolved home into its working tree.
 pub fn omp_active_user_config_path(params: &SetupParams) -> Result<PathBuf, SetupError> {
-    let path = params
-        .omp_user_config_path_override
-        .clone()
-        .map_or_else(
-            || {
-                require_absolute_omp_home_dir(
-                    params
-                        .home_dir_override
-                        .clone()
-                        .or_else(home_dir_for_omp_setup),
+    let path = if let Some(path) = &params.omp_user_config_path_override {
+        path.clone()
+    } else if let Some(home) = &params.home_dir_override {
+        require_absolute_omp_home_dir(Some(home.clone()))?
+            .join(".omp")
+            .join("agent")
+            .join("mcp.json")
+    } else {
+        omp_config_paths_from_env()?
+            .ok_or_else(|| {
+                SetupError::Other(
+                    "cannot resolve the active OMP user config from the live environment"
+                        .to_string(),
                 )
-                .map(|home| home.join(".omp").join("agent").join("mcp.json"))
-            },
-            Ok,
-        )?;
+            })?
+            .user_mcp_config
+    };
     if !omp_path_is_absolute_and_traversal_free(&path) {
         return Err(SetupError::Other(
-            "OMP active-profile user config must be an absolute, traversal-free path"
-                .to_string(),
+            "OMP active-profile user config must be an absolute, traversal-free path".to_string(),
         ));
     }
     Ok(path)
@@ -1462,94 +1502,342 @@ fn omp_active_user_secondary_config_path(params: &SetupParams) -> Result<PathBuf
     Ok(omp_active_user_config_path(params)?
         .parent()
         .ok_or_else(|| {
-            SetupError::Other(
-                "OMP active-profile user config has no parent directory".to_string(),
-            )
+            SetupError::Other("OMP active-profile user config has no parent directory".to_string())
         })?
         .join(".mcp.json"))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum OmpMcpAuthorityFormat {
     Native,
+    StandardJson,
+    CodexToml,
+    OpenCodeJsonc,
+    VsCodeJson,
+    Standalone,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OmpMcpAuthorityProvider {
+    Native,
+    ClaudeProject,
+    ClaudeUser,
+    Codex,
+    Gemini,
+    OpenCode,
+    Cursor,
+    Windsurf,
+    VsCode,
     Standalone,
 }
 
 struct OmpMcpAuthoritySource {
     path: PathBuf,
     format: OmpMcpAuthorityFormat,
+    provider: OmpMcpAuthorityProvider,
+    project_level: bool,
+}
+
+fn push_omp_mcp_authority_source(
+    sources: &mut Vec<OmpMcpAuthoritySource>,
+    path: PathBuf,
+    format: OmpMcpAuthorityFormat,
+    provider: OmpMcpAuthorityProvider,
+    project_level: bool,
+) {
+    if sources.iter().any(|existing| {
+        existing.path == path
+            && existing.format == format
+            && existing.provider == provider
+            && existing.project_level == project_level
+    }) {
+        return;
+    }
+    sources.push(OmpMcpAuthoritySource {
+        path,
+        format,
+        provider,
+        project_level,
+    });
+}
+
+fn omp_provider_home(params: &SetupParams) -> Option<PathBuf> {
+    require_absolute_omp_home_dir(
+        params
+            .home_dir_override
+            .clone()
+            .or_else(home_dir_for_omp_setup),
+    )
+    .ok()
+}
+
+fn omp_claude_user_base(params: &SetupParams, home: &Path) -> Result<(PathBuf, PathBuf), PathBuf> {
+    if let Some(raw_override) = os_env_value_for_setup("CLAUDE_CONFIG_DIR") {
+        let Some(override_path) = raw_override.to_str() else {
+            return Err(PathBuf::from(raw_override));
+        };
+        let override_path = override_path.trim();
+        if !override_path.is_empty() {
+            let unresolved = PathBuf::from(override_path);
+            let config_dir = resolve_omp_agent_dir_override(&params.project_dir, override_path)
+                .map_err(|_| unresolved)?;
+            return Ok((config_dir.join(".claude.json"), config_dir));
+        }
+    }
+    Ok((home.join(".claude.json"), home.join(".claude")))
 }
 
 fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource> {
-    let mut candidates = vec![
-        OmpMcpAuthoritySource {
-            path: params.project_dir.join(".omp/mcp.json"),
-            format: OmpMcpAuthorityFormat::Native,
-        },
-        OmpMcpAuthoritySource {
-            path: params.project_dir.join(".omp/.mcp.json"),
-            format: OmpMcpAuthorityFormat::Native,
-        },
-    ];
+    use OmpMcpAuthorityFormat::{
+        CodexToml, Native, OpenCodeJsonc, Standalone, StandardJson, Unsupported, VsCodeJson,
+    };
+    use OmpMcpAuthorityProvider::{
+        ClaudeProject, ClaudeUser, Codex, Cursor, Gemini, Native as NativeProvider, OpenCode,
+        Standalone as StandaloneProvider, VsCode, Windsurf,
+    };
+
+    let project = &params.project_dir;
+    let mut sources = Vec::new();
+
+    // Native provider, priority 100. Every file contributes; first key wins.
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".omp/mcp.json"),
+        Native,
+        NativeProvider,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".omp/.mcp.json"),
+        Native,
+        NativeProvider,
+        true,
+    );
     if let Ok(path) = omp_active_user_config_path(params) {
-        candidates.push(OmpMcpAuthoritySource {
-            path,
-            format: OmpMcpAuthorityFormat::Native,
-        });
+        push_omp_mcp_authority_source(&mut sources, path, Native, NativeProvider, false);
     }
     if let Ok(path) = omp_active_user_secondary_config_path(params) {
-        candidates.push(OmpMcpAuthoritySource {
-            path,
-            format: OmpMcpAuthorityFormat::Native,
-        });
+        push_omp_mcp_authority_source(&mut sources, path, Native, NativeProvider, false);
     }
-    candidates.extend([
-        OmpMcpAuthoritySource {
-            path: params.project_dir.join("mcp.json"),
-            format: OmpMcpAuthorityFormat::Standalone,
-        },
-        OmpMcpAuthoritySource {
-            path: params.project_dir.join(".mcp.json"),
-            format: OmpMcpAuthorityFormat::Standalone,
-        },
-    ]);
 
-    let mut sources = Vec::with_capacity(candidates.len());
-    for source in candidates {
-        if !sources
-            .iter()
-            .any(|existing: &OmpMcpAuthoritySource| existing.path == source.path)
-        {
-            sources.push(source);
+    // Stable imported tool providers, in descending provider priority. OMP
+    // plugin/extension MCP providers are intentionally not guessed here: their
+    // roots and manifests are dynamic and remain an explicit status gap.
+    let provider_home = omp_provider_home(params);
+
+    // Claude, priority 80: first non-empty project alternative, then first
+    // non-empty user alternative.
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".claude/.mcp.json"),
+        StandardJson,
+        ClaudeProject,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".claude/mcp.json"),
+        StandardJson,
+        ClaudeProject,
+        true,
+    );
+    if let Some(home) = &provider_home {
+        match omp_claude_user_base(params, home) {
+            Ok((claude_json, claude_dir)) => {
+                push_omp_mcp_authority_source(
+                    &mut sources,
+                    claude_json,
+                    StandardJson,
+                    ClaudeUser,
+                    false,
+                );
+                push_omp_mcp_authority_source(
+                    &mut sources,
+                    claude_dir.join("mcp.json"),
+                    StandardJson,
+                    ClaudeUser,
+                    false,
+                );
+            }
+            Err(path) => {
+                push_omp_mcp_authority_source(&mut sources, path, Unsupported, ClaudeUser, false)
+            }
         }
+    } else {
+        push_omp_mcp_authority_source(
+            &mut sources,
+            project.join("<unresolved-claude-user-home>"),
+            Unsupported,
+            ClaudeUser,
+            false,
+        );
     }
+
+    // Codex priority 70.
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".codex/config.toml"),
+        CodexToml,
+        Codex,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        provider_home.as_ref().map_or_else(
+            || project.join("<unresolved-codex-user-home>"),
+            |home| home.join(".codex/config.toml"),
+        ),
+        if provider_home.is_some() {
+            CodexToml
+        } else {
+            Unsupported
+        },
+        Codex,
+        false,
+    );
+
+    // Gemini priority 60.
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".gemini/settings.json"),
+        StandardJson,
+        Gemini,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        provider_home.as_ref().map_or_else(
+            || project.join("<unresolved-gemini-user-home>"),
+            |home| home.join(".gemini/settings.json"),
+        ),
+        if provider_home.is_some() {
+            StandardJson
+        } else {
+            Unsupported
+        },
+        Gemini,
+        false,
+    );
+
+    // OpenCode priority 55. Its provider deep-merges these low-to-high.
+    if let Some(home) = &provider_home {
+        for path in [
+            home.join(".config/opencode/opencode.json"),
+            home.join(".config/opencode/opencode.jsonc"),
+        ] {
+            push_omp_mcp_authority_source(&mut sources, path, OpenCodeJsonc, OpenCode, false);
+        }
+    } else {
+        push_omp_mcp_authority_source(
+            &mut sources,
+            project.join("<unresolved-opencode-user-home>"),
+            Unsupported,
+            OpenCode,
+            false,
+        );
+    }
+    for path in [
+        project.join("opencode.json"),
+        project.join("opencode.jsonc"),
+        project.join(".opencode/opencode.json"),
+        project.join(".opencode/opencode.jsonc"),
+    ] {
+        push_omp_mcp_authority_source(&mut sources, path, OpenCodeJsonc, OpenCode, true);
+    }
+
+    // Cursor and Windsurf both have priority 50; Cursor registers first.
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".cursor/mcp.json"),
+        StandardJson,
+        Cursor,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        provider_home.as_ref().map_or_else(
+            || project.join("<unresolved-cursor-user-home>"),
+            |home| home.join(".cursor/mcp.json"),
+        ),
+        if provider_home.is_some() {
+            StandardJson
+        } else {
+            Unsupported
+        },
+        Cursor,
+        false,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".windsurf/mcp_config.json"),
+        StandardJson,
+        Windsurf,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        provider_home.as_ref().map_or_else(
+            || project.join("<unresolved-windsurf-user-home>"),
+            |home| home.join(".codeium/windsurf/mcp_config.json"),
+        ),
+        if provider_home.is_some() {
+            StandardJson
+        } else {
+            Unsupported
+        },
+        Windsurf,
+        false,
+    );
+
+    // VS Code priority 20 (project-only), then standalone root priority 5.
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".vscode/mcp.json"),
+        VsCodeJson,
+        VsCode,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join("mcp.json"),
+        Standalone,
+        StandaloneProvider,
+        true,
+    );
+    push_omp_mcp_authority_source(
+        &mut sources,
+        project.join(".mcp.json"),
+        Standalone,
+        StandaloneProvider,
+        true,
+    );
+
     sources
 }
 
 /// Return OMP's stable MCP discovery inputs in exact first-wins load order.
 ///
 /// Setup writes only the canonical native `mcp.json` files. Native `.mcp.json`
-/// siblings and project-root `mcp.json` / `.mcp.json` fallback inputs remain
+/// siblings, stable imported-tool files, and project-root fallbacks remain
 /// read-only runtime authorities.
 #[must_use]
 pub fn omp_mcp_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
-    omp_mcp_authority_sources(params)
-        .into_iter()
-        .map(|source| source.path)
-        .collect()
+    let mut paths = Vec::new();
+    for source in omp_mcp_authority_sources(params) {
+        if source.format != OmpMcpAuthorityFormat::Unsupported && !paths.contains(&source.path) {
+            paths.push(source.path);
+        }
+    }
+    paths
 }
 
-fn omp_active_user_settings_paths(
-    params: &SetupParams,
-) -> Result<(PathBuf, PathBuf), SetupError> {
+fn omp_active_user_settings_paths(params: &SetupParams) -> Result<(PathBuf, PathBuf), SetupError> {
     let user_config = omp_active_user_config_path(params)?;
-    let agent_dir = user_config
-        .parent()
-        .ok_or_else(|| {
-            SetupError::Other(
-                "OMP active-profile user config has no parent directory".to_string(),
-            )
-        })?;
+    let agent_dir = user_config.parent().ok_or_else(|| {
+        SetupError::Other("OMP active-profile user config has no parent directory".to_string())
+    })?;
     Ok((agent_dir.join("config.yml"), agent_dir.join("config.yaml")))
 }
 
@@ -1572,9 +1860,10 @@ pub fn omp_settings_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok((user_yml, user_yaml)) = omp_active_user_settings_paths(params) {
         paths.push(user_yml.clone());
-        if user_yml.symlink_metadata().is_err_and(|error| {
-            error.kind() == std::io::ErrorKind::NotFound
-        }) {
+        if user_yml
+            .symlink_metadata()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
             paths.push(user_yaml);
         }
     }
@@ -1588,6 +1877,15 @@ impl AgentPlatform {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn config_actions(self, params: &SetupParams) -> Vec<ConfigAction> {
+        // `ConfigAction` and `write_config_atomic` are public because the CLI's
+        // repair/fingerprint surfaces consume them directly. Do not hand a
+        // caller even the project bearer action until OMP's active-user
+        // authority is known: otherwise a caller could bypass `run_setup`'s
+        // preflight and write a token while a named/custom profile remains
+        // unresolved.
+        if self == Self::Omp && omp_active_user_config_path(params).is_err() {
+            return Vec::new();
+        }
         let url = params.server_url();
         let token = &params.token;
         let pdir = &params.project_dir;
@@ -1667,6 +1965,7 @@ impl AgentPlatform {
                     servers_key: "servers",
                     server_name: "mcp-agent-mail",
                     server_value: standard_http_server_value(&url, token),
+                    reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o600,
                 backup: true,
@@ -1715,6 +2014,7 @@ impl AgentPlatform {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
                     server_value: standard_http_server_value(url, token),
+                    reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o600,
                 backup: true,
@@ -1763,6 +2063,7 @@ impl AgentPlatform {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
                     server_value: json!({ "type": "http", "url": url }),
+                    reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o644,
                 backup: true,
@@ -1799,6 +2100,7 @@ impl AgentPlatform {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
                     server_value: json!({ "httpUrl": url }),
+                    reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o644,
                 backup: true,
@@ -1820,14 +2122,7 @@ impl AgentPlatform {
         token: &str,
         pdir: &Path,
     ) -> Vec<ConfigAction> {
-        let mut actions = vec![project_local_action(
-            self,
-            pdir,
-            ".omp/mcp.json",
-            "mcpServers",
-            omp_http_server_value(url, token),
-            "Oh My Pi (OMP) project-local MCP config",
-        )];
+        let mut actions = vec![self.omp_project_action(url, token, pdir)];
         if !params.skip_user_config
             && let Ok(file_path) = omp_active_user_config_path(params)
         {
@@ -1839,12 +2134,24 @@ impl AgentPlatform {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
                     server_value: omp_http_server_value(url, token),
+                    reconcile_omp_user_runtime_lists: true,
                 },
                 permissions: 0o600,
                 backup: true,
             });
         }
         actions
+    }
+
+    fn omp_project_action(self, url: &str, token: &str, pdir: &Path) -> ConfigAction {
+        project_local_action(
+            self,
+            pdir,
+            ".omp/mcp.json",
+            "mcpServers",
+            omp_http_server_value(url, token),
+            "Oh My Pi (OMP) project-local MCP config",
+        )
     }
 
     /// Antigravity (`agy`) MCP config actions.
@@ -1892,6 +2199,7 @@ impl AgentPlatform {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
                     server_value: json!({ "httpUrl": url }),
+                    reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o644,
                 backup: true,
@@ -1928,6 +2236,7 @@ impl AgentPlatform {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
                     server_value: json!({ "url": url }),
+                    reconcile_omp_user_runtime_lists: false,
                 },
                 permissions: 0o644,
                 backup: true,
@@ -2513,10 +2822,16 @@ pub fn write_config_atomic(
             servers_key,
             server_name,
             server_value,
+            reconcile_omp_user_runtime_lists,
         } => {
             if action.platform == AgentPlatform::Omp {
                 debug_assert_eq!(*servers_key, "mcpServers");
-                merge_omp_mcp_server(existing.as_deref(), server_name, server_value.clone())?
+                merge_omp_mcp_server(
+                    existing.as_deref(),
+                    server_name,
+                    server_value.clone(),
+                    *reconcile_omp_user_runtime_lists,
+                )?
             } else {
                 merge_mcp_server(
                     existing.as_deref(),
@@ -2643,10 +2958,10 @@ fn omp_setup_authority_preflight(
         return None;
     }
     let error = omp_active_user_config_path(params).err()?;
-    let requested_path = params
-        .omp_user_config_path_override
-        .as_deref()
-        .map_or_else(|| "<unresolved>".to_string(), |path| path.display().to_string());
+    let requested_path = params.omp_user_config_path_override.as_deref().map_or_else(
+        || "<unresolved>".to_string(),
+        |path| path.display().to_string(),
+    );
     Some(SetupResult {
         platform: AgentPlatform::Omp.display_name().to_string(),
         actions: vec![ActionResult {
@@ -2906,7 +3221,17 @@ pub fn check_status(params: &SetupParams) -> Vec<AgentConfigStatus> {
     let mut statuses = Vec::new();
 
     for platform in &platforms {
-        let actions = platform.config_actions(params);
+        let mut actions = platform.config_actions(params);
+        if *platform == AgentPlatform::Omp
+            && actions.is_empty()
+            && omp_active_user_config_path(params).is_err()
+        {
+            // Planning deliberately exposes no writable OMP action when the
+            // active user authority is unresolved. Status still needs a
+            // non-writable diagnostic target so it can report the failure
+            // instead of returning an empty, false-green platform result.
+            actions.push(platform.omp_project_action(&url, &params.token, &params.project_dir));
+        }
         let mut file_statuses = Vec::new();
 
         for action in &actions {
@@ -2948,11 +3273,24 @@ struct OmpActiveUserConfigInspection {
 struct OmpMcpAliasInspection {
     observations: Vec<ConfigStatusFileObservation>,
     conflict_paths: Vec<PathBuf>,
+    unsupported_paths: Vec<PathBuf>,
 }
 
 impl OmpMcpAliasInspection {
     fn has_drift(&self) -> bool {
-        !self.conflict_paths.is_empty()
+        !self.conflict_paths.is_empty() || !self.unsupported_paths.is_empty()
+    }
+}
+
+fn apply_omp_mcp_authority_drift(
+    reasons: &mut Vec<ConfigDriftReason>,
+    drift: &OmpMcpAliasInspection,
+) {
+    if !drift.unsupported_paths.is_empty() {
+        push_drift_reason(reasons, ConfigDriftReason::UnsupportedConfig);
+    }
+    if !drift.conflict_paths.is_empty() {
+        push_drift_reason(reasons, ConfigDriftReason::DuplicateServerEntries);
     }
 }
 
@@ -3052,22 +3390,18 @@ fn config_file_status_for_action(
     let omp_mcp_alias_drift = omp_mcp_alias_inspection
         .as_ref()
         .filter(|inspection| inspection.has_drift());
-    let omp_settings_inspection = if action.platform == AgentPlatform::Omp
-        && params.skip_user_config
-    {
-        Some(inspect_omp_settings_authority(params))
-    } else {
-        None
-    };
+    let omp_settings_inspection =
+        if action.platform == AgentPlatform::Omp && params.skip_user_config {
+            Some(inspect_omp_settings_authority(params))
+        } else {
+            None
+        };
     let omp_settings_drift = omp_settings_inspection
         .as_ref()
         .filter(|inspection| inspection.has_drift());
 
     let content = read_setup_file(&action.file_path, "config status file");
-    let mut status_observations = vec![config_status_file_observation(
-        &action.file_path,
-        &content,
-    )];
+    let mut status_observations = vec![config_status_file_observation(&action.file_path, &content)];
     if let Some(inspection) = &omp_user_config_inspection {
         status_observations.push(inspection.observation.clone());
     }
@@ -3082,11 +3416,8 @@ fn config_file_status_for_action(
         if let Some(drift) = &omp_user_config_drift {
             apply_omp_active_user_config_drift(&mut drift_reasons, drift);
         }
-        if omp_mcp_alias_drift.is_some() {
-            push_drift_reason(
-                &mut drift_reasons,
-                ConfigDriftReason::DuplicateServerEntries,
-            );
+        if let Some(drift) = omp_mcp_alias_drift {
+            apply_omp_mcp_authority_drift(&mut drift_reasons, drift);
         }
         if let Some(drift) = omp_settings_drift {
             apply_omp_settings_authority_drift(&mut drift_reasons, drift);
@@ -3143,22 +3474,22 @@ fn config_file_status_for_action(
     if action.platform == AgentPlatform::Omp
         && let Ok(Some((content, _))) = &content
     {
+        let is_active_user_config =
+            omp_active_user_config_path(params).is_ok_and(|path| path == action.file_path);
         apply_omp_config_contract(
             content,
             &mut analysis,
             expected_url,
             expected_auth.as_deref(),
             home.as_deref(),
+            is_active_user_config,
         );
     }
     if let Some(drift) = &omp_user_config_drift {
         apply_omp_active_user_config_drift(&mut analysis.drift_reasons, drift);
     }
-    if omp_mcp_alias_drift.is_some() {
-        push_drift_reason(
-            &mut analysis.drift_reasons,
-            ConfigDriftReason::DuplicateServerEntries,
-        );
+    if let Some(drift) = omp_mcp_alias_drift {
+        apply_omp_mcp_authority_drift(&mut analysis.drift_reasons, drift);
     }
     if let Some(drift) = omp_settings_drift {
         apply_omp_settings_authority_drift(&mut analysis.drift_reasons, drift);
@@ -3204,6 +3535,7 @@ fn apply_omp_config_contract(
     expected_url: &str,
     expected_auth: Option<&str>,
     home: Option<&Path>,
+    is_active_user_config: bool,
 ) {
     let Ok(doc) = serde_json::from_str::<Value>(content) else {
         return;
@@ -3236,7 +3568,14 @@ fn apply_omp_config_contract(
             ConfigDriftReason::DuplicateServerEntries,
         );
     }
-    apply_omp_disabled_servers_contract(object, analysis, &OMP_SERVER_ALIASES);
+    if is_active_user_config {
+        // OMP reads these runtime lists only from the active user mcp.json.
+        // Project files may contain similarly named keys, but they have no
+        // effect on discovery. The lists are exact server-name sets: a deny
+        // for the historical underscore alias does not disable the canonical
+        // hyphenated entry.
+        apply_omp_disabled_servers_contract(object, analysis, &OMP_SERVER_ALIASES[..1]);
+    }
 }
 
 fn apply_omp_native_server_contract(
@@ -3349,18 +3688,26 @@ fn apply_omp_native_entries_contract(
             );
         }
     }
-    let auth_matches = expected_auth.map_or_else(
-        || {
-            native_entries
+    let has_runtime_auth_override = native_entries.iter().any(|(_, entry)| {
+        entry.as_object().is_some_and(|entry| {
+            ["auth", "oauth"]
                 .iter()
-                .all(|(_, entry)| json_entry_authorization(entry).is_none())
-        },
-        |expected| {
-            native_entries
-                .iter()
-                .any(|(_, entry)| json_entry_authorization(entry) == Some(expected))
-        },
-    );
+                .any(|key| entry.get(*key).is_some_and(|value| !value.is_null()))
+        })
+    });
+    let auth_matches = !has_runtime_auth_override
+        && expected_auth.map_or_else(
+            || {
+                native_entries
+                    .iter()
+                    .all(|(_, entry)| json_entry_authorization(entry).is_none())
+            },
+            |expected| {
+                native_entries
+                    .iter()
+                    .any(|(_, entry)| json_entry_authorization(entry) == Some(expected))
+            },
+        );
     if !auth_matches {
         push_drift_reason(
             &mut analysis.drift_reasons,
@@ -3485,7 +3832,7 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
         }
     };
     let (disabled, unsupported) =
-        inspect_omp_disabled_servers_contract(&object, &OMP_SERVER_ALIASES);
+        inspect_omp_disabled_servers_contract(&object, &OMP_SERVER_ALIASES[..1]);
     OmpActiveUserConfigInspection {
         path,
         observation,
@@ -3494,79 +3841,530 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
     }
 }
 
-fn omp_mcp_entry_can_claim_runtime_key(
-    entry: &Value,
-    format: OmpMcpAuthorityFormat,
-) -> bool {
-    let Some(entry) = entry.as_object() else {
-        return false;
-    };
-    let disabled = match entry.get("enabled") {
-        Some(Value::Bool(false)) => true,
-        Some(Value::String(value)) if matches!(format, OmpMcpAuthorityFormat::Native) => {
-            matches!(value.to_ascii_lowercase().as_str(), "false" | "0")
-        }
-        _ => false,
-    };
-    if disabled {
-        return false;
+#[derive(Clone, PartialEq)]
+struct OmpMcpConnection {
+    transport: Option<String>,
+    command: Option<String>,
+    args: Option<Value>,
+    env: Option<Value>,
+    cwd: Option<String>,
+    url: Option<String>,
+    headers: Option<Value>,
+    auth: Option<Value>,
+    oauth: Option<Value>,
+    request_id_format: Option<String>,
+    invalid_endpoint_shape: bool,
+}
+
+impl OmpMcpConnection {
+    fn effective_transport(&self) -> &str {
+        self.transport.as_deref().unwrap_or_else(|| {
+            if self.command.is_some() {
+                "stdio"
+            } else if self.url.is_some() {
+                "http"
+            } else {
+                "stdio"
+            }
+        })
     }
 
-    let command = entry
-        .get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty());
-    let url = entry
-        .get("url")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty());
-    match entry.get("type") {
-        None | Some(Value::Null) => command || url,
-        Some(Value::String(transport)) if transport == "stdio" => command,
-        Some(Value::String(transport)) if matches!(transport.as_str(), "http" | "sse") => url,
-        Some(_) => false,
+    fn is_runtime_valid(&self) -> bool {
+        if self.invalid_endpoint_shape || (self.command.is_none() && self.url.is_none()) {
+            return false;
+        }
+        match self.effective_transport() {
+            "stdio" => self.command.is_some(),
+            "http" | "sse" => self.url.is_some(),
+            _ => false,
+        }
+    }
+
+    fn is_equivalent_to(&self, other: &Self) -> bool {
+        if self.auth != other.auth
+            || self.oauth != other.oauth
+            || self.request_id_format.as_deref().unwrap_or("number")
+                != other.request_id_format.as_deref().unwrap_or("number")
+            || self.effective_transport() != other.effective_transport()
+        {
+            return false;
+        }
+        if self.effective_transport() == "stdio" {
+            self.command == other.command
+                && self.args == other.args
+                && self.env == other.env
+                && self.cwd == other.cwd
+        } else {
+            self.url == other.url && self.headers == other.headers
+        }
     }
 }
 
-fn inspect_omp_mcp_aliases(
+#[derive(Clone)]
+struct OmpMcpCandidate {
+    name: String,
+    enabled: Option<bool>,
+    connection: OmpMcpConnection,
+    source_path: PathBuf,
+    project_level: bool,
+}
+
+fn omp_mcp_optional_string(
+    entry: &Map<String, Value>,
+    key: &str,
+    invalid_endpoint_shape: &mut bool,
+) -> Option<String> {
+    match entry.get(key) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        Some(_) => {
+            *invalid_endpoint_shape = true;
+            None
+        }
+    }
+}
+
+fn omp_mcp_enabled_value(
+    entry: &Map<String, Value>,
+    format: OmpMcpAuthorityFormat,
+) -> Option<bool> {
+    match entry.get("enabled") {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::String(value)) if format == OmpMcpAuthorityFormat::Native => {
+            match value.to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn omp_mcp_json_connection(
+    entry: &Map<String, Value>,
+    format: OmpMcpAuthorityFormat,
+    provider: OmpMcpAuthorityProvider,
+) -> OmpMcpConnection {
+    let mut invalid_endpoint_shape = false;
+    let mut command = if format == OmpMcpAuthorityFormat::OpenCodeJsonc
+        && entry.get("command").is_some_and(Value::is_array)
+    {
+        None
+    } else {
+        omp_mcp_optional_string(entry, "command", &mut invalid_endpoint_shape)
+    };
+    let mut args = entry.get("args").cloned();
+    let mut env = entry.get("env").cloned();
+    let mut cwd = None;
+    let url = omp_mcp_optional_string(entry, "url", &mut invalid_endpoint_shape);
+    let headers = entry.get("headers").cloned();
+    let mut auth = None;
+    let mut oauth = None;
+    let mut request_id_format = None;
+    let transport = match format {
+        OmpMcpAuthorityFormat::VsCodeJson => entry
+            .get("transport")
+            .and_then(Value::as_str)
+            .filter(|transport| matches!(*transport, "stdio" | "sse" | "http"))
+            .map(str::to_string),
+        OmpMcpAuthorityFormat::OpenCodeJsonc => match entry.get("type").and_then(Value::as_str) {
+            Some("local") => Some("stdio".to_string()),
+            Some("remote") => Some("http".to_string()),
+            _ => None,
+        },
+        OmpMcpAuthorityFormat::CodexToml => {
+            cwd = omp_mcp_optional_string(entry, "cwd", &mut invalid_endpoint_shape);
+            if entry.get("url").is_some() {
+                Some("http".to_string())
+            } else if entry.get("command").is_some() {
+                Some("stdio".to_string())
+            } else {
+                None
+            }
+        }
+        _ => entry
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(|transport| {
+                if matches!(
+                    provider,
+                    OmpMcpAuthorityProvider::Cursor | OmpMcpAuthorityProvider::Gemini
+                ) && !matches!(transport, "stdio" | "sse" | "http")
+                {
+                    None
+                } else {
+                    Some(transport.to_string())
+                }
+            }),
+    };
+
+    match format {
+        OmpMcpAuthorityFormat::Native | OmpMcpAuthorityFormat::Standalone => {
+            cwd = omp_mcp_optional_string(entry, "cwd", &mut invalid_endpoint_shape);
+            auth = entry.get("auth").cloned();
+            oauth = entry.get("oauth").cloned();
+            request_id_format = entry
+                .get("requestIdFormat")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "number" | "string"))
+                .map(str::to_string);
+        }
+        OmpMcpAuthorityFormat::CodexToml => {
+            env = entry.get("env").cloned();
+        }
+        OmpMcpAuthorityFormat::OpenCodeJsonc => {
+            if let Some(Value::Array(command_parts)) = entry.get("command") {
+                command = command_parts
+                    .first()
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                if command.is_none() || command_parts[1..].iter().any(|value| !value.is_string()) {
+                    invalid_endpoint_shape = true;
+                }
+                let mut combined = command_parts[1..].to_vec();
+                if let Some(Value::Array(configured_args)) = &args {
+                    combined.extend(configured_args.iter().cloned());
+                } else if args.is_some() {
+                    invalid_endpoint_shape = true;
+                }
+                args = (!combined.is_empty()).then_some(Value::Array(combined));
+            }
+            env = entry
+                .get("environment")
+                .filter(|value| value.is_object())
+                .cloned()
+                .or_else(|| entry.get("env").filter(|value| value.is_object()).cloned());
+        }
+        OmpMcpAuthorityFormat::StandardJson
+        | OmpMcpAuthorityFormat::VsCodeJson
+        | OmpMcpAuthorityFormat::Unsupported => {}
+    }
+
+    OmpMcpConnection {
+        transport,
+        command,
+        args,
+        env,
+        cwd,
+        url,
+        headers,
+        auth,
+        oauth,
+        request_id_format,
+        invalid_endpoint_shape,
+    }
+}
+
+fn omp_mcp_candidate_from_entry(
+    name: &str,
+    entry: &Value,
+    source: &OmpMcpAuthoritySource,
+) -> OmpMcpCandidate {
+    let empty = Map::new();
+    let object = entry.as_object().unwrap_or(&empty);
+    let mut connection = omp_mcp_json_connection(object, source.format, source.provider);
+    if !entry.is_object() {
+        connection.invalid_endpoint_shape = true;
+    }
+    OmpMcpCandidate {
+        name: name.to_string(),
+        enabled: omp_mcp_enabled_value(object, source.format),
+        connection,
+        source_path: source.path.clone(),
+        project_level: source.project_level,
+    }
+}
+
+fn omp_mcp_source_has_dynamic_inputs(content: &str, format: OmpMcpAuthorityFormat) -> bool {
+    match format {
+        OmpMcpAuthorityFormat::OpenCodeJsonc => normalize_jsonc(content)
+            .is_ok_and(|normalized| normalized.contains("{env:") || normalized.contains("{file:")),
+        OmpMcpAuthorityFormat::CodexToml => toml::from_str::<toml::Value>(content)
+            .ok()
+            .and_then(|document| document.get("mcp_servers").cloned())
+            .and_then(|servers| servers.as_table().cloned())
+            .is_some_and(|servers| {
+                servers.values().any(|entry| {
+                    entry.as_table().is_some_and(|entry| {
+                        ["env_vars", "env_http_headers", "bearer_token_env_var"]
+                            .iter()
+                            .any(|key| entry.contains_key(*key))
+                    })
+                })
+            }),
+        OmpMcpAuthorityFormat::Unsupported => true,
+        _ => content.contains("${"),
+    }
+}
+
+fn omp_mcp_parse_regular_source(
+    content: &str,
+    source: &OmpMcpAuthoritySource,
+) -> Vec<OmpMcpCandidate> {
+    let document = match source.format {
+        OmpMcpAuthorityFormat::CodexToml => {
+            let Ok(document) = toml::from_str::<toml::Value>(content) else {
+                return Vec::new();
+            };
+            let Ok(document) = serde_json::to_value(document) else {
+                return Vec::new();
+            };
+            document
+        }
+        OmpMcpAuthorityFormat::OpenCodeJsonc | OmpMcpAuthorityFormat::Unsupported => {
+            return Vec::new();
+        }
+        _ => {
+            let Ok(document) = serde_json::from_str::<Value>(content) else {
+                return Vec::new();
+            };
+            document
+        }
+    };
+    let servers = match source.format {
+        OmpMcpAuthorityFormat::CodexToml => document.get("mcp_servers"),
+        OmpMcpAuthorityFormat::VsCodeJson => document.get("mcp").and_then(|mcp| mcp.get("servers")),
+        _ => document.get("mcpServers"),
+    };
+    let Some(servers) = servers.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .map(|(name, entry)| {
+            let mut candidate = omp_mcp_candidate_from_entry(name, entry, source);
+            if source.format == OmpMcpAuthorityFormat::CodexToml {
+                candidate.connection.headers = entry.get("http_headers").cloned();
+            }
+            candidate
+        })
+        .collect()
+}
+
+fn merge_omp_mcp_config_record(base: &mut Value, incoming: Value) {
+    match (base, incoming) {
+        (Value::Object(base), Value::Object(incoming)) => {
+            for (key, incoming) in incoming {
+                if let Some(base) = base.get_mut(&key) {
+                    merge_omp_mcp_config_record(base, incoming);
+                } else {
+                    base.insert(key, incoming);
+                }
+            }
+        }
+        (base, incoming) => *base = incoming,
+    }
+}
+
+fn parse_omp_opencode_layer(content: &str) -> Option<Map<String, Value>> {
+    let normalized = normalize_jsonc(content).ok()?;
+    serde_json::from_str::<Value>(&normalized)
+        .ok()?
+        .get("mcp")?
+        .as_object()
+        .cloned()
+}
+
+fn inspect_omp_runtime_server_lists(
     params: &SetupParams,
-    action_path: &Path,
-) -> OmpMcpAliasInspection {
+) -> Result<
+    (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ),
+    PathBuf,
+> {
+    let path = omp_active_user_config_path(params).map_err(|_| {
+        params
+            .omp_user_config_path_override
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("<unresolved-omp-user-config>"))
+    })?;
+    let content =
+        read_setup_file(&path, "OMP active-profile MCP runtime lists").map_err(|_| path.clone())?;
+    let Some((content, _)) = content else {
+        return Ok(Default::default());
+    };
+    let Value::Object(document) =
+        serde_json::from_str::<Value>(&content).map_err(|_| path.clone())?
+    else {
+        return Err(path);
+    };
+    let read_list = |key: &str| -> Option<std::collections::HashSet<String>> {
+        match document.get(key) {
+            None => Some(std::collections::HashSet::new()),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect(),
+            Some(_) => None,
+        }
+    };
+    let disabled = read_list("disabledServers").ok_or_else(|| path.clone())?;
+    let enabled = read_list("enabledServers").ok_or_else(|| path.clone())?;
+    Ok((disabled, enabled))
+}
+
+fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAliasInspection {
     let mut inspection = OmpMcpAliasInspection {
         observations: Vec::new(),
         conflict_paths: Vec::new(),
+        unsupported_paths: Vec::new(),
     };
+
+    let settings = inspect_omp_settings_authority(params);
+    inspection
+        .observations
+        .extend(settings.observations.clone());
+    if let Some(path) = settings.unsupported_path {
+        inspection.unsupported_paths.push(path);
+    }
+    let project_config_enabled = settings.project_config_enabled;
+
+    let (disabled_servers, forced_enabled) = inspect_omp_runtime_server_lists(params)
+        .unwrap_or_else(|path| {
+            inspection.unsupported_paths.push(path);
+            Default::default()
+        });
+
+    let mut candidates = Vec::new();
+    let mut claude_project_selected = false;
+    let mut claude_user_selected = false;
+    let mut open_code_merged = Map::<String, Value>::new();
+    let mut open_code_sources = std::collections::HashMap::<String, (PathBuf, bool)>::new();
+
+    let flush_open_code =
+        |candidates: &mut Vec<OmpMcpCandidate>,
+         merged: &mut Map<String, Value>,
+         source_paths: &mut std::collections::HashMap<String, (PathBuf, bool)>| {
+            for (name, entry) in std::mem::take(merged) {
+                let Some((path, project_level)) = source_paths.remove(&name) else {
+                    continue;
+                };
+                let source = OmpMcpAuthoritySource {
+                    path,
+                    format: OmpMcpAuthorityFormat::OpenCodeJsonc,
+                    provider: OmpMcpAuthorityProvider::OpenCode,
+                    project_level,
+                };
+                candidates.push(omp_mcp_candidate_from_entry(&name, &entry, &source));
+            }
+        };
+
+    let mut in_open_code = false;
     for source in omp_mcp_authority_sources(params) {
-        if source.path == action_path {
+        if in_open_code && source.provider != OmpMcpAuthorityProvider::OpenCode {
+            flush_open_code(
+                &mut candidates,
+                &mut open_code_merged,
+                &mut open_code_sources,
+            );
+            in_open_code = false;
+        }
+
+        if source.format == OmpMcpAuthorityFormat::Unsupported {
+            inspection.unsupported_paths.push(source.path);
             continue;
         }
         let content = read_setup_file(&source.path, "OMP MCP discovery authority");
-        inspection
-            .observations
-            .push(config_status_file_observation(&source.path, &content));
-        let Ok(Some((content, _))) = content else {
-            // Discovery skips missing, unreadable, and malformed secondary
-            // native files. The canonical action and user denylist have their
-            // own strict status checks.
-            continue;
+        if source.path != action_path {
+            inspection
+                .observations
+                .push(config_status_file_observation(&source.path, &content));
+        }
+        let content = match content {
+            Ok(None) => continue,
+            Ok(Some((content, _))) => content,
+            Err(_) => {
+                inspection.unsupported_paths.push(source.path);
+                continue;
+            }
         };
-        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&content) else {
+        if omp_mcp_source_has_dynamic_inputs(&content, source.format) {
+            inspection.unsupported_paths.push(source.path);
             continue;
-        };
-        let Some(Value::Object(servers)) = root.get("mcpServers") else {
+        }
+
+        if source.provider == OmpMcpAuthorityProvider::OpenCode {
+            in_open_code = true;
+            if let Some(layer) = parse_omp_opencode_layer(&content) {
+                for (name, entry) in layer {
+                    if !entry.is_object() {
+                        continue;
+                    }
+                    if let Some(existing) = open_code_merged.get_mut(&name) {
+                        merge_omp_mcp_config_record(existing, entry);
+                    } else {
+                        open_code_merged.insert(name.clone(), entry);
+                    }
+                    open_code_sources.insert(name, (source.path.clone(), source.project_level));
+                }
+            }
             continue;
-        };
-        let has_distinct_alias = OMP_SERVER_ALIASES[1..].iter().any(|alias| {
-            servers
-                .get(*alias)
-                .is_some_and(|entry| {
-                    omp_mcp_entry_can_claim_runtime_key(entry, source.format)
-                })
-        });
-        if has_distinct_alias {
-            inspection.conflict_paths.push(source.path);
+        }
+
+        let parsed = omp_mcp_parse_regular_source(&content, &source);
+        match source.provider {
+            OmpMcpAuthorityProvider::ClaudeProject => {
+                if !claude_project_selected && !parsed.is_empty() {
+                    candidates.extend(parsed);
+                    claude_project_selected = true;
+                }
+            }
+            OmpMcpAuthorityProvider::ClaudeUser => {
+                if !claude_user_selected && !parsed.is_empty() {
+                    candidates.extend(parsed);
+                    claude_user_selected = true;
+                }
+            }
+            _ => candidates.extend(parsed),
         }
     }
+    if in_open_code {
+        flush_open_code(
+            &mut candidates,
+            &mut open_code_merged,
+            &mut open_code_sources,
+        );
+    }
+
+    let mut seen_names = std::collections::HashSet::new();
+    let mut surviving = Vec::<OmpMcpCandidate>::new();
+    for candidate in candidates {
+        if candidate.project_level && !project_config_enabled {
+            continue;
+        }
+        let suppressed = disabled_servers.contains(&candidate.name)
+            || (candidate.enabled == Some(false) && !forced_enabled.contains(&candidate.name));
+        if suppressed {
+            seen_names.insert(candidate.name);
+            continue;
+        }
+        if !seen_names.insert(candidate.name.clone()) {
+            continue;
+        }
+        if surviving
+            .iter()
+            .any(|existing| existing.connection.is_equivalent_to(&candidate.connection))
+        {
+            continue;
+        }
+        surviving.push(candidate);
+    }
+
+    for candidate in surviving {
+        if OMP_SERVER_ALIASES[1..].contains(&candidate.name.as_str())
+            && candidate.connection.is_runtime_valid()
+            && candidate.source_path != action_path
+            && !inspection.conflict_paths.contains(&candidate.source_path)
+        {
+            inspection.conflict_paths.push(candidate.source_path);
+        }
+    }
+    inspection.unsupported_paths.sort();
+    inspection.unsupported_paths.dedup();
     inspection
 }
 
@@ -3696,8 +4494,9 @@ fn parse_omp_settings_document(
                 .map_err(|_| OmpSettingsParseError::Invalid)?;
             serde_json::to_value(document).map_err(|_| OmpSettingsParseError::Invalid)?
         }
-        OmpSettingsFormat::Json => serde_json::from_str::<Value>(content)
-            .map_err(|_| OmpSettingsParseError::Invalid)?,
+        OmpSettingsFormat::Json => {
+            serde_json::from_str::<Value>(content).map_err(|_| OmpSettingsParseError::Invalid)?
+        }
         OmpSettingsFormat::Jsonc => {
             // OpenCode expands these tokens before parsing. Environment values
             // are inserted without JSON escaping and referenced files can
@@ -3708,9 +4507,8 @@ fn parse_omp_settings_document(
             if contains_opencode_substitution(content) {
                 return Err(OmpSettingsParseError::DynamicAuthority);
             }
-            let normalized = normalize_jsonc(content).map_err(|()| {
-                OmpSettingsParseError::Invalid
-            })?;
+            let normalized =
+                normalize_jsonc(content).map_err(|()| OmpSettingsParseError::Invalid)?;
             match serde_json::from_str::<Value>(&normalized) {
                 Ok(document) => document,
                 Err(_) => return Err(OmpSettingsParseError::Invalid),
@@ -3827,8 +4625,7 @@ fn merge_omp_settings_file(
     invalid_policy: OmpSettingsInvalidPolicy,
     drop_group_shadows: bool,
 ) -> OmpSettingsFileValue {
-    let (observation, value) =
-        inspect_omp_settings_file(path, required, format, invalid_policy);
+    let (observation, value) = inspect_omp_settings_file(path, required, format, invalid_policy);
     inspection.observations.push(observation);
     match &value {
         OmpSettingsFileValue::Parsed(root) => {
@@ -4376,6 +5173,7 @@ fn expected_entry_for_action(action: &ConfigAction) -> Value {
             servers_key,
             server_name,
             server_value,
+            ..
         } => json!({
             "container": servers_key,
             "server_name": server_name,
@@ -4616,7 +5414,10 @@ fn shell_quote_status_arg(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-')
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
         })
     {
         return value.to_string();
@@ -4669,6 +5470,14 @@ fn setup_status_remediation_for_action(
             redact_path_for_status(&drift.path, home.as_deref())
         ));
     }
+    if let Some(drift) = omp_mcp_alias_drift {
+        unsupported.extend(drift.unsupported_paths.iter().map(|path| {
+            format!(
+                "OMP MCP discovery authority {}",
+                redact_path_for_status(path, home.as_deref())
+            )
+        }));
+    }
     if !unsupported.is_empty() {
         return format!(
             "inspect unsupported {}, then {dry_run}; {fix}",
@@ -4694,7 +5503,7 @@ fn setup_status_remediation_for_action(
             redact_path_for_status(&drift.path, home.as_deref())
         ));
     }
-    if let Some(drift) = omp_mcp_alias_drift {
+    if let Some(drift) = omp_mcp_alias_drift.filter(|drift| !drift.conflict_paths.is_empty()) {
         let paths = drift
             .conflict_paths
             .iter()
@@ -5829,7 +6638,7 @@ mod tests {
     }
 
     #[test]
-    fn omp_setup_reenables_entry_and_removes_profile_denylist_aliases() {
+    fn omp_setup_reenables_project_entry_removes_stale_oauth_and_preserves_project_lists() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // macOS exposes its default temporary directory through the `/var`
         // compatibility symlink, which the production writer intentionally
@@ -5850,6 +6659,14 @@ mod tests {
       "enabled": "false",
       "timeout": 45000,
       "requestIdFormat": "string",
+      "auth": {
+        "type": "oauth",
+        "credentialId": "stale-credential"
+      },
+      "oauth": {
+        "clientId": "stale-client",
+        "authorizationUrl": "https://stale.example/authorize"
+      },
       "headers": {
         "authorization": "Bearer stale",
         "X-Trace": "preserve-me"
@@ -5896,6 +6713,14 @@ mod tests {
             doc["mcpServers"]["mcp-agent-mail"]["requestIdFormat"],
             "string"
         );
+        assert!(
+            doc["mcpServers"]["mcp-agent-mail"].get("auth").is_none(),
+            "an explicit OAuth credential can replace the setup bearer at runtime"
+        );
+        assert!(
+            doc["mcpServers"]["mcp-agent-mail"].get("oauth").is_none(),
+            "stale OAuth client metadata must not survive canonical bearer setup"
+        );
         assert_eq!(
             doc["mcpServers"]["mcp-agent-mail"]["headers"],
             json!({"Authorization": "Bearer tok", "X-Trace": "preserve-me"})
@@ -5903,7 +6728,11 @@ mod tests {
         assert_eq!(doc["mcpServers"]["sibling"]["command"], "node");
         assert!(doc["servers"].get("agent-mail").is_none());
         assert_eq!(doc["servers"]["legacy-sibling"]["command"], "node");
-        assert_eq!(doc["disabledServers"], json!(["other"]));
+        assert_eq!(
+            doc["disabledServers"],
+            json!(["other", "mcp_agent_mail", "mcp-agent-mail", "agent-mail"]),
+            "OMP ignores project runtime lists, so setup must leave them untouched"
+        );
         assert_eq!(
             write_config_atomic(&action, true).expect("idempotent rewrite"),
             ActionOutcome::Unchanged
@@ -5911,11 +6740,12 @@ mod tests {
     }
 
     #[test]
-    fn omp_setup_refuses_malformed_disabled_server_entries_without_writing() {
+    fn omp_setup_refuses_malformed_active_user_runtime_lists_without_writing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let tmp_root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
         let project_dir = tmp_root.join("project");
-        let config_path = project_dir.join(".omp/mcp.json");
+        let home = tmp_root.join("home");
+        let config_path = home.join(".omp/agent/mcp.json");
         std::fs::create_dir_all(config_path.parent().expect("config parent"))
             .expect("create config parent");
         let original = r#"{
@@ -5934,15 +6764,15 @@ mod tests {
         let params = SetupParams {
             token: "tok".into(),
             project_dir,
-            home_dir_override: Some(tmp_root.join("home")),
-            skip_user_config: true,
+            home_dir_override: Some(home),
+            skip_user_config: false,
             ..Default::default()
         };
         let action = AgentPlatform::Omp
             .config_actions(&params)
             .into_iter()
-            .next()
-            .expect("OMP project action");
+            .find(|action| action.file_path == config_path)
+            .expect("OMP active-user action");
         let error = write_config_atomic(&action, true)
             .expect_err("malformed OMP disablement authority must fail closed");
 
@@ -5951,6 +6781,52 @@ mod tests {
             std::fs::read_to_string(&config_path).expect("read untouched config"),
             original
         );
+    }
+
+    #[test]
+    fn omp_setup_reconciles_only_agent_mail_names_in_active_user_runtime_lists() {
+        let tmp = setup_real_tempdir();
+        let project_dir = tmp.path().join("project");
+        let home = tmp.path().join("home");
+        let config_path = home.join(".omp/agent/mcp.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{
+  "disabledServers": ["sibling", "mcp-agent-mail"],
+  "enabledServers": ["mcp_agent_mail", "agent-mail"],
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://stale.example/mcp",
+      "enabled": false
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir,
+            home_dir_override: Some(home),
+            skip_user_config: false,
+            ..Default::default()
+        };
+        let action = AgentPlatform::Omp
+            .config_actions(&params)
+            .into_iter()
+            .find(|action| action.file_path == config_path)
+            .expect("OMP active-user action");
+
+        write_config_atomic(&action, true).expect("reconcile active-user OMP config");
+
+        let document: Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("read active-user OMP config"),
+        )
+        .unwrap();
+        assert_eq!(document["disabledServers"], json!(["sibling"]));
+        assert_eq!(document["enabledServers"], json!([]));
+        assert_eq!(document["mcpServers"]["mcp-agent-mail"]["enabled"], true);
     }
 
     #[test]
@@ -5974,13 +6850,21 @@ mod tests {
 
     #[test]
     fn omp_home_authority_must_be_absolute() {
-        let missing = require_absolute_omp_home_dir(None)
-            .expect_err("missing OMP home must fail closed");
-        assert!(missing.to_string().contains("absolute home directory"));
+        let missing =
+            require_absolute_omp_home_dir(None).expect_err("missing OMP home must fail closed");
+        assert!(
+            missing
+                .to_string()
+                .contains("absolute, traversal-free home directory")
+        );
 
         let relative = require_absolute_omp_home_dir(Some(PathBuf::from("home")))
             .expect_err("relative OMP home must fail closed");
-        assert!(relative.to_string().contains("absolute home directory"));
+        assert!(
+            relative
+                .to_string()
+                .contains("absolute, traversal-free home directory")
+        );
 
         let temp = setup_real_tempdir();
         let absolute = temp.path().join("home");
@@ -6022,9 +6906,7 @@ mod tests {
             },
             SetupParams {
                 project_dir: project.clone(),
-                omp_user_config_path_override: Some(
-                    temp.path().join("user/../escaped/mcp.json"),
-                ),
+                omp_user_config_path_override: Some(temp.path().join("user/../escaped/mcp.json")),
                 agents: Some(vec![AgentPlatform::Omp]),
                 token: "must-not-be-written".to_string(),
                 skip_hooks: true,
@@ -6057,10 +6939,12 @@ mod tests {
             ..SetupParams::default()
         };
         let results = run_setup(&params);
-        assert!(results[0]
-            .actions
-            .iter()
-            .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))));
+        assert!(
+            results[0]
+                .actions
+                .iter()
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+        );
         assert!(project.join(".omp/mcp.json").is_file());
         assert!(process_home.join(".omp/agent/mcp.json").is_file());
     }
@@ -6120,29 +7004,20 @@ mod tests {
         let home = Path::new("/home/alice");
         let cwd = Path::new("/work/repo");
 
-        for config_dir in ["../escape", ".omp/../../escape", "C:\\escape", "\\\\host\\share"] {
-            let error = resolve_omp_config_paths(
-                home,
-                cwd,
-                None,
-                None,
-                Some(config_dir),
-                None,
-            )
-            .expect_err("unsafe PI_CONFIG_DIR must fail closed");
+        for config_dir in [
+            "../escape",
+            ".omp/../../escape",
+            "C:\\escape",
+            "\\\\host\\share",
+        ] {
+            let error = resolve_omp_config_paths(home, cwd, None, None, Some(config_dir), None)
+                .expect_err("unsafe PI_CONFIG_DIR must fail closed");
             assert!(error.to_string().contains("PI_CONFIG_DIR"));
         }
 
         for agent_dir in ["../escape", "agent/../../escape", "C:\\escape"] {
-            let error = resolve_omp_config_paths(
-                home,
-                cwd,
-                None,
-                None,
-                None,
-                Some(agent_dir),
-            )
-            .expect_err("unsafe PI_CODING_AGENT_DIR must fail closed");
+            let error = resolve_omp_config_paths(home, cwd, None, None, None, Some(agent_dir))
+                .expect_err("unsafe PI_CODING_AGENT_DIR must fail closed");
             assert!(error.to_string().contains("PI_CODING_AGENT_DIR"));
         }
 
@@ -6182,12 +7057,8 @@ mod tests {
         );
 
         let tilde = std::env::join_paths([Path::new("~/overlay.yml")]).unwrap();
-        let error = resolve_omp_settings_overlay_paths(
-            Some(&tilde),
-            Path::new("/work/repo"),
-            None,
-        )
-        .expect_err("a tilde overlay without a home directory must fail closed");
+        let error = resolve_omp_settings_overlay_paths(Some(&tilde), Path::new("/work/repo"), None)
+            .expect_err("a tilde overlay without a home directory must fail closed");
         assert!(error.to_string().contains("home directory is unavailable"));
     }
 
@@ -6633,6 +7504,7 @@ mod tests {
                 servers_key: "mcpServers",
                 server_name: "test",
                 server_value: json!({"url": "http://a"}),
+                reconcile_omp_user_runtime_lists: false,
             },
             permissions: 0o644,
             backup: false,
@@ -7644,7 +8516,7 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
-    fn check_status_reports_omp_disablement_even_when_transport_matches() {
+    fn check_status_ignores_project_omp_runtime_lists_when_transport_matches() {
         let tmp = tempfile::tempdir().unwrap();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
         let config = params.project_dir.join(".omp/mcp.json");
@@ -7658,7 +8530,7 @@ http_headers = { Authorization = "Bearer tok" }
       "type": "http",
       "url": "http://127.0.0.1:8765/mcp/",
       "headers": {"Authorization": "Bearer tok"},
-      "enabled": "0"
+      "enabled": true
     }
   }
 }"#,
@@ -7667,13 +8539,12 @@ http_headers = { Authorization = "Bearer tok" }
 
         let file = first_setup_status_file(&params);
         assert!(file.url_matches);
-        assert_eq!(file.primary_drift_reason, ConfigDriftReason::DisabledServer);
         assert!(
-            file.drift_reasons
-                .contains(&ConfigDriftReason::DisabledServer)
+            file.drift_reasons.is_empty(),
+            "OMP ignores disabledServers outside the active user mcp.json: {file:?}"
         );
-        assert_eq!(file.risk, ConfigDriftRisk::Medium);
-        assert!(file.remediation.contains("am setup run --yes"));
+        assert_eq!(file.primary_drift_reason, ConfigDriftReason::Ok);
+        assert_eq!(file.risk, ConfigDriftRisk::None);
     }
 
     #[test]
@@ -7719,7 +8590,7 @@ http_headers = { Authorization = "Bearer tok" }
 
         std::fs::write(
             &active_user_config,
-            r#"{"disabledServers":["mcp_agent_mail"]}"#,
+            r#"{"disabledServers":["mcp-agent-mail"]}"#,
         )
         .unwrap();
         let disabled = first_setup_status_file(&params);
@@ -7788,11 +8659,7 @@ http_headers = { Authorization = "Bearer tok" }
                 r#"{{"mcpServers":{{"mcp-agent-mail":{{"type":"http","url":"{url}","headers":{{"Authorization":"Bearer tok"}},"enabled":true}}}}}}"#
             )
         };
-        std::fs::write(
-            &project_primary,
-            canonical("http://127.0.0.1:8765/mcp/"),
-        )
-        .unwrap();
+        std::fs::write(&project_primary, canonical("http://127.0.0.1:8765/mcp/")).unwrap();
         for path in [
             &project_secondary,
             &user_primary,
@@ -7821,7 +8688,11 @@ http_headers = { Authorization = "Bearer tok" }
             ConfigDriftReason::DuplicateServerEntries
         );
         assert!(hidden_user_alias.omp_mcp_alias_drift);
-        assert!(hidden_user_alias.remediation.contains("~/.omp/agent/.mcp.json"));
+        assert!(
+            hidden_user_alias
+                .remediation
+                .contains("~/.omp/agent/.mcp.json")
+        );
         assert!(!hidden_user_alias.remediation.contains("--no-user-config"));
 
         std::fs::write(&user_secondary, canonical("http://stale.example/mcp")).unwrap();
@@ -7832,7 +8703,11 @@ http_headers = { Authorization = "Bearer tok" }
         .unwrap();
         let primary_user_alias = first_setup_status_file(&params);
         assert!(primary_user_alias.omp_mcp_alias_drift);
-        assert!(primary_user_alias.remediation.contains("~/.omp/agent/mcp.json"));
+        assert!(
+            primary_user_alias
+                .remediation
+                .contains("~/.omp/agent/mcp.json")
+        );
 
         std::fs::write(&user_primary, canonical("http://stale.example/mcp")).unwrap();
         std::fs::write(
@@ -7842,17 +8717,9 @@ http_headers = { Authorization = "Bearer tok" }
         .unwrap();
         let hidden_project_alias = first_setup_status_file(&params);
         assert!(hidden_project_alias.omp_mcp_alias_drift);
-        assert!(
-            hidden_project_alias
-                .remediation
-                .contains(".omp/.mcp.json")
-        );
+        assert!(hidden_project_alias.remediation.contains(".omp/.mcp.json"));
 
-        std::fs::write(
-            &project_secondary,
-            canonical("http://stale.example/mcp"),
-        )
-        .unwrap();
+        std::fs::write(&project_secondary, canonical("http://stale.example/mcp")).unwrap();
         std::fs::write(
             &root_primary,
             r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
@@ -7862,12 +8729,12 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(root_alias.omp_mcp_alias_drift);
         assert!(root_alias.remediation.contains("mcp.json"));
 
-        for disabled in [Value::Bool(false), Value::String("false".to_string()), Value::String("0".to_string())] {
-            std::fs::write(
-                &root_primary,
-                canonical("http://stale.example/mcp"),
-            )
-            .unwrap();
+        for disabled in [
+            Value::Bool(false),
+            Value::String("false".to_string()),
+            Value::String("0".to_string()),
+        ] {
+            std::fs::write(&root_primary, canonical("http://stale.example/mcp")).unwrap();
             std::fs::write(
                 &user_secondary,
                 serde_json::to_string(&json!({
@@ -7875,7 +8742,7 @@ http_headers = { Authorization = "Bearer tok" }
                         "mcp_agent_mail": {
                             "type": "http",
                             "url": "http://stale.example/mcp",
-                            "enabled": disabled,
+                            "enabled": disabled.clone(),
                         }
                     }
                 }))
@@ -7919,6 +8786,330 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
+    fn omp_unsupported_provider_authorities_are_never_probed_or_fingerprinted() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+
+        let intermediate = params.project_dir.join("intermediate");
+        std::fs::create_dir_all(&intermediate).unwrap();
+        let unsafe_target = params.project_dir.join("unsafe-claude-authority");
+        std::fs::write(
+            &unsafe_target,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let unsafe_override = intermediate.join("../unsafe-claude-authority");
+        let _claude_override =
+            EnvVarGuard::set("CLAUDE_CONFIG_DIR", unsafe_override.display().to_string());
+
+        assert!(
+            unsafe_override.is_file(),
+            "the no-probe control must be real"
+        );
+        assert!(
+            !omp_mcp_authority_paths(&params).contains(&unsafe_override),
+            "unsafe raw override must never enter cache fingerprints"
+        );
+        let unsafe_status = first_setup_status_file(&params);
+        assert_eq!(
+            unsafe_status.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(
+            unsafe_status
+                .status_observations
+                .iter()
+                .all(|observation| observation.path != unsafe_override.display().to_string()),
+            "unsupported raw authority must not be read or observed"
+        );
+        assert!(
+            !unsafe_status
+                .drift_reasons
+                .contains(&ConfigDriftReason::DuplicateServerEntries),
+            "bytes at the rejected raw path must not influence alias liveness"
+        );
+
+        drop(_claude_override);
+        let missing_home_tmp = setup_real_tempdir();
+        let project_dir = missing_home_tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let missing_home_params = SetupParams {
+            token: "tok".to_string(),
+            project_dir: project_dir.clone(),
+            omp_user_config_path_override: Some(
+                missing_home_tmp.path().join("active/agent/mcp.json"),
+            ),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        write_healthy_omp_project_config(&missing_home_params);
+        let sentinel = project_dir.join("<unresolved-claude-user-home>");
+        std::fs::write(
+            &sentinel,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let _missing_home = EnvVarGuard::unset(TEST_OMP_HOME_DIR_OVERRIDE_KEY);
+
+        assert!(!omp_mcp_authority_paths(&missing_home_params).contains(&sentinel));
+        let missing_home_status = first_setup_status_file(&missing_home_params);
+        assert_eq!(
+            missing_home_status.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(
+            missing_home_status
+                .status_observations
+                .iter()
+                .all(|observation| observation.path != sentinel.display().to_string())
+        );
+        assert!(
+            !missing_home_status
+                .drift_reasons
+                .contains(&ConfigDriftReason::DuplicateServerEntries)
+        );
+    }
+
+    #[test]
+    fn omp_global_runtime_lists_apply_exact_names_deny_wins_and_force_enable() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let root_alias = params.project_dir.join("mcp.json");
+        std::fs::write(
+            &root_alias,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp","enabled":false}}}"#,
+        )
+        .unwrap();
+        let user = omp_active_user_config_path(&params).unwrap();
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+
+        std::fs::write(
+            &user,
+            r#"{"disabledServers":["mcp_agent_mail"],"enabledServers":["mcp_agent_mail"]}"#,
+        )
+        .unwrap();
+        let deny_wins = first_setup_status_file(&params);
+        assert!(!deny_wins.omp_mcp_alias_drift);
+        assert!(deny_wins.drift_reasons.is_empty());
+
+        std::fs::write(&user, r#"{"enabledServers":["mcp_agent_mail"]}"#).unwrap();
+        let forced_live = first_setup_status_file(&params);
+        assert!(forced_live.omp_mcp_alias_drift);
+        assert!(
+            forced_live
+                .drift_reasons
+                .contains(&ConfigDriftReason::DuplicateServerEntries)
+        );
+
+        std::fs::write(&user, r#"{"disabledServers":["mcp_agent_mail"]}"#).unwrap();
+        assert!(first_setup_status_file(&params).drift_reasons.is_empty());
+
+        std::fs::write(&user, "{}\n").unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "entry-level enabled=false remains suppressed without a force-enable override"
+        );
+    }
+
+    #[test]
+    fn omp_semantic_equivalence_and_provider_transport_filter_match_runtime() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let root = params.project_dir.join("mcp.json");
+
+        std::fs::write(
+            &root,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "an exact connection alias is equivalence-shadowed by the canonical entry"
+        );
+
+        std::fs::write(
+            &root,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok","X-Route":"other"}}}}"#,
+        )
+        .unwrap();
+        assert!(first_setup_status_file(&params).omp_mcp_alias_drift);
+
+        std::fs::write(
+            &root,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://stale.example/shadowed"}}}"#,
+        )
+        .unwrap();
+        let vscode = params.project_dir.join(".vscode/mcp.json");
+        std::fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        std::fs::write(
+            &vscode,
+            r#"{"mcp":{"servers":{"mcp_agent_mail":{"transport":"future-http","url":"http://stale.example/mcp"}}}}"#,
+        )
+        .unwrap();
+        let inferred_http = first_setup_status_file(&params);
+        assert!(
+            inferred_http.omp_mcp_alias_drift,
+            "VS Code drops an unknown transport and then infers HTTP from url"
+        );
+        assert!(inferred_http.remediation.contains(".vscode/mcp.json"));
+
+        std::fs::write(&vscode, "{}\n").unwrap();
+        let _claude_overlap = EnvVarGuard::set(
+            "CLAUDE_CONFIG_DIR",
+            params.project_dir.display().to_string(),
+        );
+        std::fs::write(
+            params.project_dir.join(".claude.json"),
+            r#"{"mcpServers":{"unrelated":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &root,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://standalone.example/mcp"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            omp_mcp_authority_paths(&params)
+                .iter()
+                .filter(|path| **path == root)
+                .count(),
+            1,
+            "cache fingerprints dedupe a physical path even when provider identities do not"
+        );
+        let overlapping_provider_path = first_setup_status_file(&params);
+        assert!(
+            overlapping_provider_path.omp_mcp_alias_drift,
+            "Claude's skipped overlapping alternative must not erase the later standalone provider identity"
+        );
+    }
+
+    #[test]
+    fn omp_opencode_layers_deep_merge_and_project_filter_before_dedupe() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let home = params.home_dir_override.as_ref().unwrap();
+        let user_layer = home.join(".config/opencode/opencode.json");
+        let project_layer = params.project_dir.join("opencode.jsonc");
+        std::fs::create_dir_all(user_layer.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_layer,
+            r#"{"mcp":{"mcp_agent_mail":{"type":"remote","url":"http://stale.example/mcp","headers":{"Authorization":"Bearer tok"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_layer,
+            "{\n  // Partial project override inherits the user endpoint.\n  \"mcp\": {\"mcp_agent_mail\": {\"headers\": {\"X-Layer\": \"project\"},},},\n}\n",
+        )
+        .unwrap();
+
+        let merged = first_setup_status_file(&params);
+        assert!(merged.omp_mcp_alias_drift);
+        assert!(merged.remediation.contains("opencode.jsonc"));
+
+        let user_settings = home.join(".omp/agent/config.yml");
+        std::fs::create_dir_all(user_settings.parent().unwrap()).unwrap();
+        std::fs::write(&user_settings, "mcp:\n  enableProjectConfig: false\n").unwrap();
+        let project_filtered = first_setup_status_file(&params);
+        assert!(!project_filtered.omp_mcp_alias_drift);
+        assert!(
+            !project_filtered
+                .drift_reasons
+                .contains(&ConfigDriftReason::DuplicateServerEntries),
+            "the merged OpenCode item is project-level because its highest contributing layer is project-level"
+        );
+        assert_eq!(
+            project_filtered.primary_drift_reason,
+            ConfigDriftReason::ProjectConfigDisabled
+        );
+    }
+
+    #[test]
+    fn omp_public_planning_and_direct_setup_honor_active_environment_authority() {
+        let tmp = setup_real_tempdir();
+        let invalid = SetupParams {
+            project_dir: tmp.path().join("invalid-project"),
+            home_dir_override: Some(PathBuf::from("relative-home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            token: "must-not-be-planned".to_string(),
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
+        assert!(AgentPlatform::Omp.config_actions(&invalid).is_empty());
+        let invalid_status = first_setup_status_file(&invalid);
+        assert_eq!(
+            invalid_status.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+
+        let home = tmp.path().join("home");
+        let named_project = tmp.path().join("named-project");
+        std::fs::create_dir_all(&named_project).unwrap();
+        {
+            let _home =
+                EnvVarGuard::set(TEST_OMP_HOME_DIR_OVERRIDE_KEY, home.display().to_string());
+            let _omp_profile = EnvVarGuard::set("OMP_PROFILE", "work");
+            let _pi_profile = EnvVarGuard::unset("PI_PROFILE");
+            let _config_dir = EnvVarGuard::set("PI_CONFIG_DIR", ".custom-omp");
+            let _agent_dir = EnvVarGuard::set(
+                "PI_CODING_AGENT_DIR",
+                tmp.path().join("ignored-agent").display().to_string(),
+            );
+            let params = SetupParams {
+                project_dir: named_project.clone(),
+                agents: Some(vec![AgentPlatform::Omp]),
+                token: "named-profile-token".to_string(),
+                skip_hooks: true,
+                ..SetupParams::default()
+            };
+            let results = run_setup(&params);
+            assert!(
+                results
+                    .iter()
+                    .flat_map(|result| &result.actions)
+                    .all(|action| { !matches!(action.outcome, ActionOutcome::Failed(_)) })
+            );
+        }
+        let named_authority = home.join(".custom-omp/profiles/work/agent/mcp.json");
+        assert!(named_authority.is_file());
+        assert!(!home.join(".omp/agent/mcp.json").exists());
+
+        let custom_project = tmp.path().join("custom-agent-project");
+        let custom_agent = tmp.path().join("custom-agent");
+        std::fs::create_dir_all(&custom_project).unwrap();
+        {
+            let _home =
+                EnvVarGuard::set(TEST_OMP_HOME_DIR_OVERRIDE_KEY, home.display().to_string());
+            let _omp_profile = EnvVarGuard::unset("OMP_PROFILE");
+            let _pi_profile = EnvVarGuard::unset("PI_PROFILE");
+            let _config_dir = EnvVarGuard::unset("PI_CONFIG_DIR");
+            let _agent_dir =
+                EnvVarGuard::set("PI_CODING_AGENT_DIR", custom_agent.display().to_string());
+            let params = SetupParams {
+                project_dir: custom_project,
+                agents: Some(vec![AgentPlatform::Omp]),
+                token: "custom-agent-token".to_string(),
+                skip_hooks: true,
+                ..SetupParams::default()
+            };
+            let results = run_setup(&params);
+            assert!(
+                results
+                    .iter()
+                    .flat_map(|result| &result.actions)
+                    .all(|action| { !matches!(action.outcome, ActionOutcome::Failed(_)) })
+            );
+        }
+        assert!(custom_agent.join("mcp.json").is_file());
+        assert!(!home.join(".omp/agent/mcp.json").exists());
+    }
+
+    #[test]
     fn check_status_project_only_honors_effective_omp_project_config_setting() {
         let tmp = tempfile::tempdir().unwrap();
         let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
@@ -7940,9 +9131,15 @@ http_headers = { Authorization = "Bearer tok" }
         let default_enabled = first_setup_status_file(&params);
         assert!(default_enabled.drift_reasons.is_empty());
         assert!(!default_enabled.omp_settings_config_drift);
-        assert!(default_enabled.status_observations.iter().any(|observation| {
-            observation.path == project_settings.display().to_string() && !observation.exists
-        }));
+        assert!(
+            default_enabled
+                .status_observations
+                .iter()
+                .any(|observation| {
+                    observation.path == project_settings.display().to_string()
+                        && !observation.exists
+                })
+        );
 
         std::fs::write(&user_settings, "mcp:\n  enableProjectConfig: false\n").unwrap();
         let user_disabled = first_setup_status_file(&params);
@@ -7981,11 +9178,7 @@ http_headers = { Authorization = "Bearer tok" }
             overlay_disabled.primary_drift_reason,
             ConfigDriftReason::ProjectConfigDisabled
         );
-        assert!(
-            overlay_disabled
-                .remediation
-                .contains("second overlay.yml")
-        );
+        assert!(overlay_disabled.remediation.contains("second overlay.yml"));
 
         std::fs::write(&second_overlay, "mcp:\n  enableProjectConfig: true\n").unwrap();
         let final_overlay_override = first_setup_status_file(&params);
@@ -8055,7 +9248,10 @@ http_headers = { Authorization = "Bearer tok" }
         let missing_overlay = tmp.path().join("missing-overlay.yml");
         params.omp_settings_overlay_paths = vec![missing_overlay.clone()];
         let missing = first_setup_status_file(&params);
-        assert_eq!(missing.primary_drift_reason, ConfigDriftReason::UnsupportedConfig);
+        assert_eq!(
+            missing.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
         assert!(
             missing
                 .remediation
@@ -8065,9 +9261,12 @@ http_headers = { Authorization = "Bearer tok" }
         params.agents = Some(vec![AgentPlatform::Cline]);
         let non_omp = first_setup_status_file(&params);
         assert!(!non_omp.omp_settings_config_drift);
-        assert!(!non_omp.status_observations.iter().any(|observation| {
-            observation.path == missing_overlay.display().to_string()
-        }));
+        assert!(
+            !non_omp
+                .status_observations
+                .iter()
+                .any(|observation| { observation.path == missing_overlay.display().to_string() })
+        );
     }
 
     #[test]
@@ -8082,10 +9281,7 @@ http_headers = { Authorization = "Bearer tok" }
                 ".claude/settings.json",
                 r#"{"mcp":{"enableProjectConfig":false}}"#,
             ),
-            (
-                ".codex/config.toml",
-                "[mcp]\nenableProjectConfig = false\n",
-            ),
+            (".codex/config.toml", "[mcp]\nenableProjectConfig = false\n"),
             (
                 ".gemini/settings.json",
                 r#"{"mcp":{"enableProjectConfig":false}}"#,
@@ -8094,10 +9290,7 @@ http_headers = { Authorization = "Bearer tok" }
                 "opencode.json",
                 "{\n  // JSONC is accepted even with a .json name\n  \"mcp\": {\"enableProjectConfig\": false,},\n}\n",
             ),
-            (
-                "opencode.jsonc",
-                r#"{"mcp":{"enableProjectConfig":false}}"#,
-            ),
+            ("opencode.jsonc", r#"{"mcp":{"enableProjectConfig":false}}"#),
             (
                 ".opencode/opencode.json",
                 r#"{"mcp":{"enableProjectConfig":false}}"#,
@@ -8158,11 +9351,7 @@ http_headers = { Authorization = "Bearer tok" }
         for path in [&native_legacy, &native_yaml, &codex, &cursor] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         }
-        std::fs::write(
-            &native_legacy,
-            r#"{"mcp":{"enableProjectConfig":false}}"#,
-        )
-        .unwrap();
+        std::fs::write(&native_legacy, r#"{"mcp":{"enableProjectConfig":false}}"#).unwrap();
         std::fs::write(&native_yaml, "mcp:\n  enableProjectConfig: true\n").unwrap();
         std::fs::write(&codex, "[mcp]\nenableProjectConfig = false\n").unwrap();
         std::fs::write(&cursor, r#"{"mcp":{"enableProjectConfig":true}}"#).unwrap();
@@ -8180,7 +9369,11 @@ http_headers = { Authorization = "Bearer tok" }
             ConfigDriftReason::ProjectConfigDisabled,
             "foreign-provider parse failures are warned and skipped, exposing the prior Codex value"
         );
-        assert!(invalid_cursor_is_skipped.remediation.contains(".codex/config.toml"));
+        assert!(
+            invalid_cursor_is_skipped
+                .remediation
+                .contains(".codex/config.toml")
+        );
 
         let opencode = params.project_dir.join("opencode.jsonc");
         std::fs::write(
@@ -8414,6 +9607,43 @@ http_headers = { Authorization = "Bearer tok" }
                 .and_then(|entry| entry.get("container"))
                 .and_then(Value::as_str),
             Some("mcpServers")
+        );
+    }
+
+    #[test]
+    fn check_status_reports_omp_oauth_override_even_when_bearer_matches() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "headers": {"Authorization": "Bearer tok"},
+      "enabled": true,
+      "auth": {"type": "oauth", "credentialId": "stale-credential"},
+      "oauth": {"clientId": "stale-client"}
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let file = first_setup_status_file(&params);
+
+        assert!(file.url_matches);
+        assert_eq!(
+            file.primary_drift_reason,
+            ConfigDriftReason::WrongBearerHeader
+        );
+        assert!(
+            file.drift_reasons
+                .contains(&ConfigDriftReason::WrongBearerHeader),
+            "OMP OAuth metadata can replace a matching file bearer at runtime"
         );
     }
 
@@ -8692,6 +9922,16 @@ http_headers = { Authorization = "Bearer tok" }
             skip_hooks: true,
             ..Default::default()
         }
+    }
+
+    fn write_healthy_omp_project_config(params: &SetupParams) {
+        let path = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}}}"#,
+        )
+        .unwrap();
     }
 
     fn first_setup_status_file(params: &SetupParams) -> ConfigFileStatus {
