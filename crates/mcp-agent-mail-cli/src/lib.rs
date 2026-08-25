@@ -15099,13 +15099,13 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             };
 
             // Save token to canonical config.env (unless dry-run)
-            if !dry_run
-                && let Err(e) = setup::save_token_to_env_file(&config_env_file, &resolved_token)
-            {
-                output::warn(&format!(
-                    "Could not save token to {}: {e}",
-                    config_env_file.display()
-                ));
+            if !dry_run {
+                setup::save_token_to_env_file(&config_env_file, &resolved_token).map_err(|e| {
+                    CliError::Other(format!(
+                        "Could not save token to {}: {e}",
+                        config_env_file.display()
+                    ))
+                })?;
             }
 
             let results = setup::run_setup(&params);
@@ -33735,9 +33735,7 @@ fn fix_mcp_config_entry(
     })?;
     let secret_write = existing_secret_material || serialized.contains("Bearer ");
 
-    if tool != mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
-        && secret_write
-    {
+    if tool != mcp_agent_mail_core::mcp_config::McpConfigTool::Omp && secret_write {
         mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
             .map_err(|error| error.to_string())?;
     }
@@ -52680,6 +52678,44 @@ url = "http://127.0.0.1:9999/mcp/"
         assert_eq!(entry["httpUrl"], desired_url);
         assert!(entry.get("url").is_none());
         assert_eq!(entry["headers"]["Authorization"], "Bearer tok123");
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_refuses_tracked_env_token_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("settings.json");
+        let original = r#"{"mcpServers":{"mcp-agent-mail":{"command":"python","args":["-m","mcp_agent_mail"],"env":{"HTTP_BEARER_TOKEN":"must-not-promote"}}}}"#;
+        std::fs::write(&config, original).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", "--", "settings.json"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = fix_mcp_config_entry(
+            &config,
+            "http://127.0.0.1:8765/api/",
+            None,
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Gemini,
+        )
+        .expect_err("tracked env-token config must not be promoted to a literal header");
+
+        assert!(error.contains("Git-tracked config"), "{error}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(!mcp_config_backup_candidate(&config, None).exists());
     }
 
     #[test]

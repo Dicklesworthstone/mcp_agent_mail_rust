@@ -1920,12 +1920,7 @@ pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupErro
 
     let tracked_probe = crate::git_cmd::GitCmd::new(&repo_root)
         .env("LC_ALL", "C")
-        .args([
-            "--literal-pathspecs",
-            "ls-files",
-            "--error-unmatch",
-            "--",
-        ])
+        .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
         .arg(relative.as_os_str())
         .run()
         .map_err(|error| {
@@ -2057,10 +2052,7 @@ pub fn write_config_atomic(
         content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
     });
     let output_contains_literal_secret = new_content.contains("Bearer ");
-    if contains_literal_secret
-        || existing_may_contain_secret
-        || output_contains_literal_secret
-    {
+    if contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret {
         ensure_secret_config_not_git_tracked(&action.file_path)?;
     }
 
@@ -3961,7 +3953,10 @@ mod tests {
             .unwrap();
         assert!(status.status.success());
         let status = String::from_utf8(status.stdout).unwrap();
-        assert!(!status.contains(".omp/"), "secret artifacts leaked: {status}");
+        assert!(
+            !status.contains(".omp/"),
+            "secret artifacts leaked: {status}"
+        );
         assert!(!status.contains(".bak"), "backup leaked: {status}");
     }
 
@@ -3999,7 +3994,11 @@ mod tests {
             result[0].actions[0].outcome,
             ActionOutcome::Updated
         ));
-        assert!(!std::fs::read_to_string(&config).unwrap().contains("old-secret-token"));
+        assert!(
+            !std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("old-secret-token")
+        );
         let backup = std::fs::read_dir(config.parent().unwrap())
             .unwrap()
             .filter_map(Result::ok)
@@ -4018,7 +4017,10 @@ mod tests {
             .unwrap();
         assert!(status.status.success());
         let status = String::from_utf8(status.stdout).unwrap();
-        assert!(!status.contains(".omp/"), "secret artifacts leaked: {status}");
+        assert!(
+            !status.contains(".omp/"),
+            "secret artifacts leaked: {status}"
+        );
         assert!(!status.contains(".bak"), "backup leaked: {status}");
     }
 
