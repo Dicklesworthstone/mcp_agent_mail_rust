@@ -1714,7 +1714,15 @@ AM_RUST_BIN="${DEST}/${BIN_CLI}"
 AM_XDG_CONFIG_HOME="\${XDG_CONFIG_HOME:-}"
 case "\$AM_XDG_CONFIG_HOME" in
   /*) ;;
-  *) AM_XDG_CONFIG_HOME="\${HOME}/.config" ;;
+  *)
+    case "\${HOME:-}" in
+      /*) AM_XDG_CONFIG_HOME="\${HOME}/.config" ;;
+      *)
+        printf '%s\n' "Cannot resolve an absolute Agent Mail config.env path." >&2
+        exit 1
+        ;;
+    esac
+    ;;
 esac
 AM_RUST_ENV_FILE_DEFAULT="\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/config.env"
 AM_RUST_ENV_FILE="\${AM_RUST_ENV_FILE:-\$AM_RUST_ENV_FILE_DEFAULT}"
@@ -4655,7 +4663,14 @@ mcp_config_must_skip_shell_write() {
 setup_mcp_configs() {
   local binary_path="$1"
   local scan
-  scan=$(detect_mcp_configs "$PWD" || true)
+  local scan_rc
+  if scan=$(detect_mcp_configs "$PWD"); then
+    scan_rc=0
+  else
+    scan_rc=$?
+    warn "MCP config discovery failed; no fallback client writers will run."
+    return "$scan_rc"
+  fi
 
   local bearer_token
   bearer_token="$(resolve_setup_http_bearer_token)"
@@ -4799,7 +4814,14 @@ setup_mcp_configs() {
 sync_codex_http_configs() {
   local binary_path="$1"
   local scan
-  scan=$(detect_mcp_configs "$PWD" || true)
+  local scan_rc
+  if scan=$(detect_mcp_configs "$PWD"); then
+    scan_rc=0
+  else
+    scan_rc=$?
+    warn "MCP config discovery failed; Codex HTTP sync will not run."
+    return "$scan_rc"
+  fi
   [ -z "$scan" ] && return 0
 
   local synced=0
@@ -4975,16 +4997,17 @@ update_mcp_configs() {
 configure_mcp_clients() {
   local binary_path="$1"
   local am_cli="$2"
-  local failed=0
 
   if ! update_mcp_configs "$binary_path" "$am_cli"; then
     warn "Skipping shell MCP fallback writers because native setup did not prove durable token continuity."
     return 1
   fi
-  setup_mcp_configs "$binary_path" || failed=1
-  sync_codex_http_configs "$binary_path" || failed=1
-  if [ "$failed" -ne 0 ]; then
+  if ! setup_mcp_configs "$binary_path"; then
     warn "One or more MCP fallback configuration writes failed."
+    return 1
+  fi
+  if ! sync_codex_http_configs "$binary_path"; then
+    warn "One or more Codex HTTP synchronization writes failed."
     return 1
   fi
   return 0

@@ -5021,7 +5021,7 @@ fn absolute_lexical_authority_path(path: &Path, field: &'static str) -> DbResult
     Ok(normalize_lexical_path(&absolute))
 }
 
-fn sqlite_open_path_for_identity(configured_path: &str, identity: &Path) -> DbResult<String> {
+fn sqlite_open_path_for_identity(absolute_alias: &Path, identity: &Path) -> DbResult<String> {
     if let Some(path) = identity.to_str() {
         return Ok(path.to_string());
     }
@@ -5031,8 +5031,8 @@ fn sqlite_open_path_for_identity(configured_path: &str, identity: &Path) -> DbRe
     // frozen absolute alias for the final string-only API boundary. Connection
     // admission revalidates that alias against `identity` before every open;
     // a retargeted alias therefore fails closed instead of crossing authority.
-    let alias = absolute_lexical_authority_path(Path::new(configured_path), "database_url")?;
-    alias
+    absolute_alias
+        .to_path_buf()
         .into_os_string()
         .into_string()
         .map_err(|_| DbError::InvalidArgument {
@@ -5049,13 +5049,20 @@ impl DbPoolAuthority {
         let configured_sqlite_path = config.sqlite_path()?;
         let selected_sqlite_path =
             resolve_sqlite_path_with_absolute_fallback(&configured_sqlite_path);
-        let sqlite_identity = normalize_file_sqlite_identity(&selected_sqlite_path);
-        let sqlite_path = sqlite_identity.as_ref().map_or_else(
-            || Ok(":memory:".to_string()),
-            |identity| sqlite_open_path_for_identity(&selected_sqlite_path, identity),
-        )?;
-        let storage_root =
-            normalize_sqlite_identity_path_buf(&config.resolved_storage_root());
+        let (sqlite_identity, sqlite_path) = if selected_sqlite_path == ":memory:" {
+            (None, ":memory:".to_string())
+        } else {
+            let absolute_alias = absolute_lexical_authority_path(
+                Path::new(&selected_sqlite_path),
+                "database_url",
+            )?;
+            let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
+            let open_path = sqlite_open_path_for_identity(&absolute_alias, &identity)?;
+            (Some(identity), open_path)
+        };
+        let storage_root_alias =
+            absolute_lexical_authority_path(&config.resolved_storage_root(), "storage_root")?;
+        let storage_root = normalize_sqlite_identity_path_buf(&storage_root_alias);
 
         Ok(Self {
             sqlite_identity,
@@ -9198,10 +9205,16 @@ fn resolve_sqlite_path_with_absolute_fallback(sqlite_path: &str) -> String {
 #[must_use]
 pub fn normalize_sqlite_path_for_pool_key(sqlite_path: &str) -> String {
     let selected = resolve_sqlite_path_with_absolute_fallback(sqlite_path);
-    let Some(identity) = normalize_file_sqlite_identity(&selected) else {
+    if selected == ":memory:" {
+        return selected;
+    }
+    let Ok(absolute_alias) =
+        absolute_lexical_authority_path(Path::new(&selected), "database_url")
+    else {
         return selected;
     };
-    sqlite_open_path_for_identity(&selected, &identity).unwrap_or(selected)
+    let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
+    sqlite_open_path_for_identity(&absolute_alias, &identity).unwrap_or(selected)
 }
 
 pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailboxSqlitePath> {
@@ -9211,9 +9224,13 @@ pub fn resolve_mailbox_sqlite_path(database_url: &str) -> DbResult<ResolvedMailb
     };
     let configured_path = config.sqlite_path()?;
     let selected_path = resolve_sqlite_path_with_absolute_fallback(&configured_path);
-    let canonical_path = match normalize_file_sqlite_identity(&selected_path) {
-        None => ":memory:".to_string(),
-        Some(identity) => sqlite_open_path_for_identity(&selected_path, &identity)?,
+    let canonical_path = if selected_path == ":memory:" {
+        ":memory:".to_string()
+    } else {
+        let absolute_alias =
+            absolute_lexical_authority_path(Path::new(&selected_path), "database_url")?;
+        let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
+        sqlite_open_path_for_identity(&absolute_alias, &identity)?
     };
     Ok(ResolvedMailboxSqlitePath {
         used_absolute_fallback: selected_path != configured_path,
@@ -21370,10 +21387,14 @@ mod tests {
             ..DbPoolConfig::default()
         })
         .expect("construct lazy pool");
-        assert_eq!(mailbox_path.canonical_path, missing_relative);
+        let frozen_relative_identity =
+            normalize_sqlite_identity_path_buf(&missing_relative_path)
+                .to_string_lossy()
+                .into_owned();
+        assert_eq!(mailbox_path.canonical_path, frozen_relative_identity);
         assert_eq!(
-            pool.sqlite_path, missing_relative,
-            "the shared resolver and actual pool must retain one fresh-start authority"
+            pool.sqlite_path, mailbox_path.canonical_path,
+            "the shared resolver and actual pool must freeze one fresh-start authority"
         );
     }
 

@@ -964,6 +964,38 @@ PY
     e2e_assert_eq "default coding-agent override remains byte-preserved while named profile is active" \
       "custom-primary-sentinel" "$(cat "${OMP_CUSTOM_PRIMARY}")"
 
+    OMP_INVALID_SETUP_MARKER="${OMP_INSTALLER_DIR}/invalid-profile-writer-invoked"
+    set +e
+    (
+      # shellcheck disable=SC1090
+      source "${OMP_DETECT_LIBRARY}"
+      # shellcheck disable=SC1090
+      source "${OMP_SETUP_LIBRARY}"
+      # shellcheck disable=SC2329
+      setup_single_mcp_config() { printf '%s\n' invoked >"${OMP_INVALID_SETUP_MARKER}"; }
+      # shellcheck disable=SC2329
+      setup_claude_code_mcp_via_cli() { printf '%s\n' invoked >"${OMP_INVALID_SETUP_MARKER}"; }
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      err() { :; }
+      cd "${OMP_INSTALLER_DIR}"
+      export HOME="${FAKE_HOME}"
+      export OMP_PROFILE=Work
+      unset PI_PROFILE PI_CODING_AGENT_DIR HTTP_BEARER_TOKEN
+      setup_mcp_configs "/unused/mcp-agent-mail"
+    ) >/dev/null 2>&1
+    OMP_INVALID_SETUP_RC=$?
+    set -e
+    e2e_assert_exit_code "invalid OMP authority stops fallback setup before writers" \
+      "2" "${OMP_INVALID_SETUP_RC}"
+    if [ -e "${OMP_INVALID_SETUP_MARKER}" ]; then
+      e2e_fail "invalid OMP authority invokes no fallback writer" \
+        "absent marker" "writer was invoked"
+    else
+      e2e_pass "invalid OMP authority invokes no fallback writer"
+    fi
+
     OMP_CONTAINMENT_FAILURE_WRITES="$(
       # An interpreter failure is not proof that an arbitrary config lives
       # outside the project. Shadow python3 to mutation-test the fail-closed
