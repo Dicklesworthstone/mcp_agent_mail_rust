@@ -1852,7 +1852,9 @@ fn omp_project_settings_paths(params: &SetupParams) -> Vec<PathBuf> {
 /// project MCP configuration for these setup parameters.
 ///
 /// OMP prefers the active profile's `config.yml` over `config.yaml`; the
-/// fallback path is relevant only while the preferred path is absent. Every
+/// fallback path is relevant only while the preferred path is absent. If both
+/// YAML files are absent, OMP's legacy `settings.json` and `agent.db`
+/// migration inputs are authorities until a main YAML file exists. Every
 /// registered persistent project-settings provider follows in OMP's merge
 /// order, then the ordered `PI_CONFIG_FILES` overlays.
 #[must_use]
@@ -1864,7 +1866,15 @@ pub fn omp_settings_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
             .symlink_metadata()
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
-            paths.push(user_yaml);
+            paths.push(user_yaml.clone());
+            if user_yaml
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && let Some(agent_dir) = user_yml.parent()
+            {
+                paths.push(agent_dir.join("settings.json"));
+                paths.push(agent_dir.join("agent.db"));
+            }
         }
     }
     paths.extend(omp_project_settings_paths(params));
@@ -4560,12 +4570,37 @@ fn inspect_omp_settings_file(
                 OmpSettingsFileValue::Unsupported
             }
         },
-        Err(_) if matches!(invalid_policy, OmpSettingsInvalidPolicy::Skip) => {
-            OmpSettingsFileValue::Missing
-        }
+        // OMP warns and skips a foreign provider only after it successfully
+        // reads that provider's bytes and parsing fails. A symlink,
+        // non-regular file, permission failure, or other unsafe/unreadable
+        // authority is not equivalent to a missing/invalid provider. Agent
+        // Mail deliberately refuses to follow it, so fail closed regardless
+        // of the provider's parse-error policy.
         Err(_) => OmpSettingsFileValue::Unsupported,
     };
     (observation, value)
+}
+
+fn inspect_omp_legacy_settings_authorities(
+    inspection: &mut OmpSettingsAuthorityInspection,
+    paths: [&Path; 2],
+) -> bool {
+    let mut unsupported_path = None;
+    for path in paths {
+        let content = read_setup_file(path, "OMP legacy settings migration authority");
+        inspection
+            .observations
+            .push(config_status_file_observation(path, &content));
+        if !matches!(content, Ok(None)) && unsupported_path.is_none() {
+            unsupported_path = Some(path.to_path_buf());
+        }
+    }
+    if let Some(path) = unsupported_path {
+        inspection.unsupported_path = Some(path);
+        true
+    } else {
+        false
+    }
 }
 
 fn deep_merge_omp_setting(base: &mut Value, override_value: Value) {
@@ -4704,20 +4739,32 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
     if matches!(preferred, OmpSettingsFileValue::Unsupported) {
         return inspection;
     }
-    if matches!(preferred, OmpSettingsFileValue::Missing)
-        && matches!(
-            merge_omp_settings_file(
+    if matches!(preferred, OmpSettingsFileValue::Missing) {
+        let fallback = merge_omp_settings_file(
+            &mut inspection,
+            &user_yaml,
+            false,
+            OmpSettingsFormat::Yaml,
+            OmpSettingsInvalidPolicy::FailClosed,
+            false,
+        );
+        if matches!(fallback, OmpSettingsFileValue::Unsupported) {
+            return inspection;
+        }
+        if matches!(fallback, OmpSettingsFileValue::Missing) {
+            let Some(agent_dir) = user_yml.parent() else {
+                inspection.unsupported_path = Some(user_yml);
+                return inspection;
+            };
+            let legacy_settings = agent_dir.join("settings.json");
+            let legacy_db = agent_dir.join("agent.db");
+            if inspect_omp_legacy_settings_authorities(
                 &mut inspection,
-                &user_yaml,
-                false,
-                OmpSettingsFormat::Yaml,
-                OmpSettingsInvalidPolicy::FailClosed,
-                false,
-            ),
-            OmpSettingsFileValue::Unsupported
-        )
-    {
-        return inspection;
+                [&legacy_settings, &legacy_db],
+            ) {
+                return inspection;
+            }
+        }
     }
 
     for source in omp_project_settings_sources(params) {
