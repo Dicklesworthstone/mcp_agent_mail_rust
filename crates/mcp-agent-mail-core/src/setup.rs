@@ -3635,6 +3635,27 @@ fn reset_omp_server_analysis(analysis: &mut ConfigContentAnalysis, reason: Confi
     push_drift_reason(&mut analysis.drift_reasons, reason);
 }
 
+fn omp_native_entry_is_expected_http(entry: &Value) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    // OMP infers HTTP only when `type` is absent and a URL is present. A
+    // non-string type is not the same as absence, and historical/unknown
+    // strings can fall through to stdio conversion rather than opening the
+    // expected HTTP connection.
+    if entry.get("type").is_some_and(|value| !value.is_string()) {
+        return false;
+    }
+    let connection = omp_mcp_json_connection(
+        entry,
+        OmpMcpAuthorityFormat::Native,
+        OmpMcpAuthorityProvider::Native,
+    );
+    connection.is_runtime_valid()
+        && connection.effective_transport() == "http"
+        && connection.url.is_some()
+}
+
 fn apply_omp_native_entries_contract(
     native_entries: &[(&str, &Value)],
     analysis: &mut ConfigContentAnalysis,
@@ -3710,12 +3731,12 @@ fn apply_omp_native_entries_contract(
             || {
                 native_entries
                     .iter()
-                    .all(|(_, entry)| json_entry_authorization(entry).is_none())
+                    .all(|(_, entry)| json_entry_authorization_matches(entry, None))
             },
             |expected| {
                 native_entries
                     .iter()
-                    .any(|(_, entry)| json_entry_authorization(entry) == Some(expected))
+                    .any(|(_, entry)| json_entry_authorization_matches(entry, Some(expected)))
             },
         );
     if !auth_matches {
@@ -3726,6 +3747,12 @@ fn apply_omp_native_entries_contract(
     }
 
     for (_, entry) in native_entries {
+        if !omp_native_entry_is_expected_http(entry) {
+            push_drift_reason(
+                &mut analysis.drift_reasons,
+                ConfigDriftReason::UnsupportedConfig,
+            );
+        }
         let Some(entry) = entry.as_object() else {
             push_drift_reason(
                 &mut analysis.drift_reasons,
@@ -4932,12 +4959,12 @@ fn analyze_json_config_content(
         || {
             entries
                 .iter()
-                .all(|entry| json_entry_authorization(entry.entry).is_none())
+                .all(|entry| json_entry_authorization_matches(entry.entry, None))
         },
         |expected| {
             entries
                 .iter()
-                .any(|entry| json_entry_authorization(entry.entry) == Some(expected))
+                .any(|entry| json_entry_authorization_matches(entry.entry, Some(expected)))
         },
     );
     if !auth_matches {
@@ -5004,6 +5031,32 @@ fn json_entry_authorization(entry: &Value) -> Option<&str> {
                 .map(|(_, value)| value)
         })
         .and_then(Value::as_str)
+}
+
+fn json_entry_authorization_matches(entry: &Value, expected: Option<&str>) -> bool {
+    let Some(headers) = entry
+        .get("headers")
+        .or_else(|| entry.get("http_headers"))
+    else {
+        return expected.is_none();
+    };
+    let Some(headers) = headers.as_object() else {
+        return false;
+    };
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value);
+    let Some(value) = values.next() else {
+        return expected.is_none();
+    };
+    // Header maps can legally contain differently cased duplicate keys.
+    // OMP passes the object to a case-normalizing HTTP layer, so first-match
+    // status logic cannot prove which bearer reaches the wire.
+    if values.next().is_some() {
+        return false;
+    }
+    value.as_str() == expected
 }
 
 fn json_entry_has_legacy_stdio(entry: &Value) -> bool {
@@ -9369,6 +9422,111 @@ http_headers = { Authorization = "Bearer tok" }
                 .iter()
                 .any(|observation| { observation.path == missing_overlay.display().to_string() })
         );
+    }
+
+    #[test]
+    fn check_status_omp_legacy_user_settings_fail_closed_until_main_yaml_exists() {
+        for legacy_name in ["settings.json", "agent.db"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+            write_healthy_omp_project_config(&params);
+            let agent_dir = params
+                .home_dir_override
+                .as_ref()
+                .unwrap()
+                .join(".omp/agent");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let legacy_settings = agent_dir.join("settings.json");
+            let legacy_db = agent_dir.join("agent.db");
+            let legacy_path = agent_dir.join(legacy_name);
+            std::fs::write(&legacy_path, "legacy migration authority").unwrap();
+
+            let status = first_setup_status_file(&params);
+
+            assert_eq!(
+                status.primary_drift_reason,
+                ConfigDriftReason::UnsupportedConfig,
+                "readable legacy authority {legacy_name} must fail closed when both main YAML files are absent"
+            );
+            assert!(status.remediation.contains(legacy_name));
+            for path in [&legacy_settings, &legacy_db] {
+                assert!(
+                    status.status_observations.iter().any(|observation| {
+                        observation.path == path.display().to_string()
+                            && observation.exists == (path == &legacy_path)
+                    }),
+                    "both legacy migration inputs must be observed for a stable cache"
+                );
+                assert!(omp_settings_authority_paths(&params).contains(path));
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let agent_dir = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let legacy_settings = agent_dir.join("settings.json");
+        let legacy_db = agent_dir.join("agent.db");
+        std::fs::write(&legacy_settings, "legacy settings bytes").unwrap();
+        std::fs::write(&legacy_db, "legacy database bytes").unwrap();
+        std::fs::write(
+            agent_dir.join("config.yml"),
+            "mcp:\n  enableProjectConfig: true\n",
+        )
+        .unwrap();
+
+        let status = first_setup_status_file(&params);
+
+        assert!(
+            status.drift_reasons.is_empty(),
+            "an existing main YAML file suppresses legacy migration inputs"
+        );
+        for path in [&legacy_settings, &legacy_db] {
+            assert!(
+                !status
+                    .status_observations
+                    .iter()
+                    .any(|observation| observation.path == path.display().to_string())
+            );
+            assert!(!omp_settings_authority_paths(&params).contains(path));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_status_omp_foreign_settings_symlink_fails_closed_instead_of_skipping() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let codex = params.project_dir.join(".codex/config.toml");
+        let cursor = params.project_dir.join(".cursor/settings.json");
+        let target = tmp.path().join("readable-cursor-settings.json");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        std::fs::write(&codex, "[mcp]\nenableProjectConfig = false\n").unwrap();
+        std::fs::write(&target, r#"{"mcp":{"enableProjectConfig":true}}"#).unwrap();
+        symlink(&target, &cursor).unwrap();
+
+        let status = first_setup_status_file(&params);
+
+        assert_eq!(
+            status.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig,
+            "an unreadable/unsafe provider authority is not a skippable parse failure"
+        );
+        assert!(status.remediation.contains(".cursor/settings.json"));
+        assert!(status.status_observations.iter().any(|observation| {
+            observation.path == cursor.display().to_string()
+                && observation.exists
+                && observation.content_sha256.is_none()
+        }));
     }
 
     #[test]

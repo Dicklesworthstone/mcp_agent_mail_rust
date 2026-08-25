@@ -480,17 +480,23 @@ different Agent Mail alias remains a separate MCP key; setup status reports and
 fingerprints that conflict without mirror-writing the secondary file. Status
 also evaluates
 `mcp.enableProjectConfig` with OMP's persistent settings precedence: the active
-profile's `config.yml` (falling back to `config.yaml` only when it is absent),
-then the project settings providers in runtime merge order: `.omp/settings.json`,
+profile's `config.yml` (falling back to `config.yaml` only when it is absent).
+When both main YAML names are absent, an existing legacy `settings.json` or
+`agent.db` remains a migration authority and setup fails closed until OMP has
+migrated it or an operator has inspected it. Project settings providers then
+merge in runtime order: `.omp/settings.json`,
 `.omp/config.yml`, `.claude/settings.json`, `.codex/config.toml`,
 `.gemini/settings.json`, project-root `opencode.json` and `opencode.jsonc`,
 `.opencode/opencode.json` and `.opencode/opencode.jsonc`, and
 `.cursor/settings.json`. Ordered ambient `PI_CONFIG_FILES` overlays apply last.
-Invalid or unreadable foreign-provider settings are skipped as OMP skips them;
-the active-profile YAML, native `.omp/config.yml`, and explicit overlays remain
-strict authorities. An effective `false`, an unsupported strict authority, or a
-missing explicit overlay is reported as runtime-relevant drift instead of
-success. OpenCode `{env:...}` and `{file:...}` substitutions are also reported
+Foreign-provider parse failures are skipped as OMP skips them. Unsafe or
+unreadable paths still fail closed: OMP may follow a symlink or otherwise read
+bytes that Agent Mail deliberately refuses to trust, so treating that authority
+as absent could produce a false-green verdict. The active-profile YAML, native
+`.omp/config.yml`, and explicit overlays are also strict authorities. An
+effective `false`, an unsupported authority, or a missing explicit overlay is
+reported as runtime-relevant drift instead of success. OpenCode `{env:...}` and
+`{file:...}` substitutions are also reported
 unsupported because their external dependencies cannot be proven by a cache of
 the config bytes alone. Remediation deliberately omits `--no-user-config`,
 because a project-only write cannot overcome an authority that excludes every
