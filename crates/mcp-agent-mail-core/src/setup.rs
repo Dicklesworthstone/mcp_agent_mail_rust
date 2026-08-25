@@ -2303,9 +2303,9 @@ fn config_file_status_for_action(
     }
 }
 
-// `agent-mail` appeared in early/manual OMP examples. Treat it as migration
-// input only: setup/status must converge all three spellings onto the one
-// canonical native `mcpServers.mcp-agent-mail` entry.
+// `agent-mail` is a documented historical Agent Mail key and OMP accepts
+// arbitrary server names. Treat it as migration input here: OMP setup/status
+// converges all three spellings onto one canonical native entry.
 const OMP_SERVER_ALIASES: [&str; 3] = ["mcp-agent-mail", "mcp_agent_mail", "agent-mail"];
 
 fn apply_omp_config_contract(
