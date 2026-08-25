@@ -125,13 +125,23 @@ pub fn detect_mcp_config_locations(params: &McpConfigDetectParams) -> Vec<McpCon
 #[must_use]
 pub fn detect_mcp_config_locations_default() -> Vec<McpConfigLocation> {
     let omp_paths = crate::setup::omp_config_paths_from_env();
+    let invalid_omp_profile = omp_paths.is_err();
+    let omp_paths = omp_paths.ok().flatten();
     let params = McpConfigDetectParams {
         app_data_dir: std::env::var_os("APPDATA").map(PathBuf::from),
         omp_config_root: omp_paths.as_ref().map(|paths| paths.config_root.clone()),
         omp_user_mcp_config: omp_paths.map(|paths| paths.user_mcp_config),
         ..McpConfigDetectParams::default()
     };
-    detect_mcp_config_locations(&params)
+    let mut locations = detect_mcp_config_locations(&params);
+    if invalid_omp_profile {
+        // An invalid explicit profile has no authoritative OMP target. Never
+        // redirect it to the default config because doctor fixers consume
+        // these candidates. Mutating setup and startup self-heal propagate the
+        // precise validation error instead.
+        locations.retain(|location| location.tool != McpConfigTool::Omp);
+    }
+    locations
 }
 
 const TARGET_SERVER_NAME: &str = "mcp-agent-mail";

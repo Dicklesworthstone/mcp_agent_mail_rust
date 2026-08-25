@@ -195,11 +195,13 @@ pub struct OmpConfigPaths {
 ///
 /// OMP gives `OMP_PROFILE` precedence over the legacy `PI_PROFILE`, ignores
 /// `PI_CODING_AGENT_DIR` for named profiles, and roots `PI_CONFIG_DIR` beneath
-/// the user's home directory. Invalid profile names fall back to the default
-/// profile, matching OMP's guarded module-load behavior.
-#[must_use]
-pub fn omp_config_paths_from_env() -> Option<OmpConfigPaths> {
-    let home = dirs::home_dir()?;
+/// the user's home directory. Invalid explicit profile names are rejected,
+/// matching OMP's command-line boot behavior; only empty or `default` selects
+/// the default profile.
+pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(None);
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let omp_profile =
         std::env::var_os("OMP_PROFILE").map(|value| value.to_string_lossy().into_owned());
@@ -210,14 +212,15 @@ pub fn omp_config_paths_from_env() -> Option<OmpConfigPaths> {
     let agent_dir =
         std::env::var_os("PI_CODING_AGENT_DIR").map(|value| value.to_string_lossy().into_owned());
 
-    Some(resolve_omp_config_paths(
+    resolve_omp_config_paths(
         &home,
         &cwd,
         omp_profile.as_deref(),
         pi_profile.as_deref(),
         config_dir.as_deref(),
         agent_dir.as_deref(),
-    ))
+    )
+    .map(Some)
 }
 
 fn resolve_omp_config_paths(
@@ -227,11 +230,23 @@ fn resolve_omp_config_paths(
     pi_profile: Option<&str>,
     config_dir: Option<&str>,
     agent_dir_override: Option<&str>,
-) -> OmpConfigPaths {
-    let profile = omp_profile.map_or_else(
-        || pi_profile.and_then(normalize_omp_profile_name),
-        normalize_omp_profile_name,
-    );
+) -> Result<OmpConfigPaths, SetupError> {
+    let explicit_profile = omp_profile.or(pi_profile);
+    let profile = match explicit_profile {
+        None => None,
+        Some(profile) => {
+            let profile = profile.trim();
+            if profile.is_empty() || profile == "default" {
+                None
+            } else {
+                Some(normalize_omp_profile_name(profile).ok_or_else(|| {
+                    SetupError::Other(format!(
+                        "invalid OMP profile {profile:?}; expected lowercase [a-z0-9][a-z0-9._-]{{0,63}}, not '.'/'..', a trailing dot, or a Windows reserved device name"
+                    ))
+                })?)
+            }
+        }
+    };
     let config_dir = config_dir
         .filter(|value| !value.is_empty())
         .unwrap_or(".omp")
@@ -257,10 +272,10 @@ fn resolve_omp_config_paths(
         |profile| config_root.join("profiles").join(profile).join("agent"),
     );
 
-    OmpConfigPaths {
+    Ok(OmpConfigPaths {
         config_root,
         user_mcp_config: agent_dir.join("mcp.json"),
-    }
+    })
 }
 
 pub(crate) fn normalize_omp_profile_name(profile: &str) -> Option<&str> {
@@ -710,7 +725,7 @@ fn merge_omp_mcp_server(
     let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
 
     let aliases: &[&str] = if matches!(server_name, "mcp-agent-mail" | "mcp_agent_mail") {
-        &["mcp-agent-mail", "mcp_agent_mail"]
+        &OMP_SERVER_ALIASES
     } else {
         &[server_name]
     };
@@ -798,6 +813,11 @@ fn merge_omp_mcp_server(
         let disabled = disabled.as_array_mut().ok_or_else(|| {
             SetupError::Other("OMP disabledServers must be a JSON array".to_string())
         })?;
+        if disabled.iter().any(|value| !value.is_string()) {
+            return Err(SetupError::Other(
+                "OMP disabledServers entries must be strings".to_string(),
+            ));
+        }
         disabled.retain(|value| !value.as_str().is_some_and(|name| aliases.contains(&name)));
     }
 
@@ -2278,7 +2298,10 @@ fn config_file_status_for_action(
     }
 }
 
-const OMP_SERVER_ALIASES: [&str; 2] = ["mcp-agent-mail", "mcp_agent_mail"];
+// `agent-mail` appeared in early/manual OMP examples. Treat it as migration
+// input only: setup/status must converge all three spellings onto the one
+// canonical native `mcpServers.mcp-agent-mail` entry.
+const OMP_SERVER_ALIASES: [&str; 3] = ["mcp-agent-mail", "mcp_agent_mail", "agent-mail"];
 
 fn apply_omp_config_contract(
     content: &str,
@@ -3859,7 +3882,7 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"{
-  "disabledServers": ["other", "mcp_agent_mail", "mcp-agent-mail"],
+  "disabledServers": ["other", "mcp_agent_mail", "mcp-agent-mail", "agent-mail"],
   "mcpServers": {
     "mcp-agent-mail": {
       "type": "http",
@@ -3875,7 +3898,7 @@ mod tests {
     "sibling": {"command": "node"}
   },
   "servers": {
-    "mcp_agent_mail": {"command": "legacy-agent-mail", "args": []},
+    "agent-mail": {"command": "legacy-agent-mail", "args": []},
     "legacy-sibling": {"command": "node"}
   }
 }
@@ -3918,12 +3941,55 @@ mod tests {
             json!({"Authorization": "Bearer tok", "X-Trace": "preserve-me"})
         );
         assert_eq!(doc["mcpServers"]["sibling"]["command"], "node");
-        assert!(doc["servers"].get("mcp_agent_mail").is_none());
+        assert!(doc["servers"].get("agent-mail").is_none());
         assert_eq!(doc["servers"]["legacy-sibling"]["command"], "node");
         assert_eq!(doc["disabledServers"], json!(["other"]));
         assert_eq!(
             write_config_atomic(&action).expect("idempotent rewrite"),
             ActionOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn omp_setup_refuses_malformed_disabled_server_entries_without_writing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp_root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        let project_dir = tmp_root.join("project");
+        let config_path = project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config parent");
+        let original = r#"{
+  "disabledServers": ["mcp-agent-mail", 7],
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/",
+      "enabled": false
+    }
+  }
+}
+"#;
+        std::fs::write(&config_path, original).expect("write malformed OMP config");
+
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir,
+            home_dir_override: Some(tmp_root.join("home")),
+            skip_user_config: true,
+            ..Default::default()
+        };
+        let action = AgentPlatform::Omp
+            .config_actions(&params)
+            .into_iter()
+            .next()
+            .expect("OMP project action");
+        let error = write_config_atomic(&action)
+            .expect_err("malformed OMP disablement authority must fail closed");
+
+        assert!(error.to_string().contains("entries must be strings"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read untouched config"),
+            original
         );
     }
 
@@ -3958,7 +4024,8 @@ mod tests {
             Some("legacy"),
             Some(".custom-omp"),
             Some("ignored-for-named-profile"),
-        );
+        )
+        .unwrap();
         assert_eq!(named.config_root, PathBuf::from("/home/alice/.custom-omp"));
         assert_eq!(
             named.user_mcp_config,
@@ -3972,7 +4039,8 @@ mod tests {
             Some("legacy"),
             None,
             Some("relative-agent-dir"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             explicit_default.user_mcp_config,
             PathBuf::from("/work/repo/relative-agent-dir/mcp.json"),
@@ -3986,7 +4054,8 @@ mod tests {
             Some("legacy"),
             None,
             Some("ignored-for-named-profile"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             legacy.user_mcp_config,
             PathBuf::from("/home/alice/.omp/profiles/legacy/agent/mcp.json")
@@ -3997,23 +4066,34 @@ mod tests {
     fn resolve_omp_config_paths_rejects_invalid_profiles_like_runtime_boot() {
         let home = Path::new("/home/alice");
         let cwd = Path::new("/work/repo");
-        for invalid in [
-            "default",
-            ".",
-            "..",
-            "bad profile",
-            "Work",
-            "CON",
-            "LPT9.txt",
-            "bad.",
-        ] {
-            let paths = resolve_omp_config_paths(home, cwd, Some(invalid), None, None, None);
-            assert_eq!(
-                paths.user_mcp_config,
-                PathBuf::from("/home/alice/.omp/agent/mcp.json"),
-                "invalid profile {invalid:?} should fall back to default"
+        for invalid in [".", "..", "bad profile", "Work", "CON", "LPT9.txt", "bad."] {
+            let error = resolve_omp_config_paths(home, cwd, Some(invalid), None, None, None)
+                .expect_err("invalid explicit profile must fail closed");
+            assert!(
+                error.to_string().contains("invalid OMP profile"),
+                "unexpected error for {invalid:?}: {error}"
+            );
+
+            let legacy_error =
+                resolve_omp_config_paths(home, cwd, None, Some(invalid), None, None)
+                    .expect_err("invalid legacy PI_PROFILE must also fail closed");
+            assert!(
+                legacy_error.to_string().contains("invalid OMP profile"),
+                "unexpected PI_PROFILE error for {invalid:?}: {legacy_error}"
             );
         }
+
+        let precedence_error =
+            resolve_omp_config_paths(home, cwd, Some("Work"), Some("valid"), None, None)
+                .expect_err("invalid OMP_PROFILE must not fall through to valid PI_PROFILE");
+        assert!(precedence_error.to_string().contains("invalid OMP profile"));
+
+        let default = resolve_omp_config_paths(home, cwd, Some("default"), None, None, None)
+            .expect("the explicit default profile is valid");
+        assert_eq!(
+            default.user_mcp_config,
+            PathBuf::from("/home/alice/.omp/agent/mcp.json")
+        );
     }
 
     #[test]

@@ -8026,6 +8026,13 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     };
 
     let existing_cache = read_setup_self_heal_cache(config, &project_dir);
+    let omp_user_config_path_override = if target_agents.contains(&setup::AgentPlatform::Omp) {
+        setup::omp_config_paths_from_env()
+            .map_err(|error| CliError::Other(error.to_string()))?
+            .map(|paths| paths.user_mcp_config)
+    } else {
+        None
+    };
 
     let params = setup::SetupParams {
         host: config.http_host.clone(),
@@ -8034,8 +8041,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         token: resolved_token.clone(),
         project_dir: project_dir.clone(),
         home_dir_override: None,
-        omp_user_config_path_override: setup::omp_config_paths_from_env()
-            .map(|paths| paths.user_mcp_config),
+        omp_user_config_path_override,
         agents: Some(target_agents.clone()),
         dry_run: false,
         skip_user_config: existing_cache
@@ -15067,6 +15073,15 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 return Ok(());
             }
 
+            let omp_user_config_path_override =
+                if target_agents.contains(&setup::AgentPlatform::Omp) {
+                    setup::omp_config_paths_from_env()
+                        .map_err(|error| CliError::Other(error.to_string()))?
+                        .map(|paths| paths.user_mcp_config)
+                } else {
+                    None
+                };
+
             let params = setup::SetupParams {
                 host,
                 port,
@@ -15074,8 +15089,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 token: resolved_token.clone(),
                 project_dir: pdir.clone(),
                 home_dir_override: None,
-                omp_user_config_path_override: setup::omp_config_paths_from_env()
-                    .map(|paths| paths.user_mcp_config),
+                omp_user_config_path_override,
                 agents: Some(target_agents),
                 dry_run,
                 skip_user_config: no_user_config,
@@ -15095,6 +15109,11 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             }
 
             let results = setup::run_setup(&params);
+            let failed = results
+                .iter()
+                .flat_map(|result| &result.actions)
+                .filter(|action| matches!(action.outcome, setup::ActionOutcome::Failed(_)))
+                .count();
 
             output::emit_output(&results, fmt, || {
                 render_setup_actions_table(&results, dry_run);
@@ -15117,11 +15136,23 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                     .count();
 
                 ftui_runtime::ftui_println!("");
-                output::success(&format!(
-                    "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged"
-                ));
+                if failed == 0 {
+                    output::success(&format!(
+                        "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged"
+                    ));
+                } else {
+                    output::warn(&format!(
+                        "{total_actions} config files processed: {created} created, {updated} updated, {unchanged} unchanged, {failed} failed"
+                    ));
+                }
             });
-            Ok(())
+            if failed == 0 {
+                Ok(())
+            } else {
+                Err(CliError::Other(format!(
+                    "setup failed for {failed} config action(s)"
+                )))
+            }
         }
         SetupCommand::Status {
             format,
@@ -15153,6 +15184,16 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 ),
                 None => None,
             };
+            let omp_user_config_path_override = if agents
+                .as_ref()
+                .is_none_or(|agents| agents.contains(&setup::AgentPlatform::Omp))
+            {
+                setup::omp_config_paths_from_env()
+                    .map_err(|error| CliError::Other(error.to_string()))?
+                    .map(|paths| paths.user_mcp_config)
+            } else {
+                None
+            };
 
             let params = setup::SetupParams {
                 host,
@@ -15161,8 +15202,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 project_dir: pdir,
                 token: resolved_token,
                 agents,
-                omp_user_config_path_override: setup::omp_config_paths_from_env()
-                    .map(|paths| paths.user_mcp_config),
+                omp_user_config_path_override,
                 skip_user_config: no_user_config,
                 skip_hooks: no_hooks,
                 ..Default::default()
@@ -30755,11 +30795,11 @@ fn extract_mcp_agent_mail_toml_bearer(content: &str) -> Option<String> {
 }
 
 fn extract_mcp_agent_mail_entry_bearer(entry: &serde_json::Value) -> Option<String> {
-    let auth = entry
-        .as_object()?
-        .get("headers")?
-        .as_object()?
-        .get("Authorization")?
+    let headers = entry.as_object()?.get("headers")?.as_object()?;
+    let auth = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))?
+        .1
         .as_str()?;
     auth.strip_prefix("Bearer ").map(|t| t.to_string())
 }
@@ -32540,6 +32580,7 @@ fn handle_doctor_check_with_target(
             let mut pointing_to_http_url = 0u32;
             let mut pointing_to_wrong_http_url = 0u32;
             let mut codex_startup_timeout_issues = 0u32;
+            let mut omp_contract_issues = 0u32;
             let mut missing_entry = 0u32;
             let mut parse_errors = 0u32;
             let mut detail_parts: Vec<String> = Vec::new();
@@ -32555,6 +32596,17 @@ fn handle_doctor_check_with_target(
             let desired_urls_label = desired_urls.join(" or ");
 
             for loc in &existing {
+                if let Err(error) =
+                    validate_real_file_target_path(&loc.config_path, "MCP config check")
+                {
+                    parse_errors += 1;
+                    detail_parts.push(format!(
+                        "{} ({}) → unsafe config path: {error}",
+                        loc.tool.slug(),
+                        loc.config_path.display()
+                    ));
+                    continue;
+                }
                 match std::fs::read_to_string(&loc.config_path) {
                     Ok(content) => {
                         let Some(kind) = classify_mcp_agent_mail_config(
@@ -32598,6 +32650,16 @@ fn handle_doctor_check_with_target(
                                         ) =>
                                     {
                                         if loc.tool
+                                            == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
+                                            && omp_config_needs_native_contract_repair(&content)
+                                        {
+                                            omp_contract_issues += 1;
+                                            detail_parts.push(format!(
+                                                "{} ({}) → disabled, non-native, duplicate, or malformed OMP entry",
+                                                loc.tool.slug(),
+                                                loc.config_path.display()
+                                            ));
+                                        } else if loc.tool
                                             == mcp_agent_mail_core::mcp_config::McpConfigTool::Codex
                                             && codex_toml_startup_timeout_needs_fix(
                                                 &loc.config_path,
@@ -32667,6 +32729,8 @@ fn handle_doctor_check_with_target(
                 || pointing_to_rust > 0
                 || pointing_to_wrong_http_url > 0
                 || codex_startup_timeout_issues > 0
+                || omp_contract_issues > 0
+                || parse_errors > 0
             {
                 "warn"
             } else if pointing_to_http_url > 0 {
@@ -32694,11 +32758,18 @@ fn handle_doctor_check_with_target(
             } else {
                 summary
             };
+            let summary = if omp_contract_issues > 0 {
+                format!("{summary}, {omp_contract_issues} OMP contract issue(s)")
+            } else {
+                summary
+            };
 
             let detail = if pointing_to_python > 0
                 || pointing_to_rust > 0
                 || pointing_to_wrong_http_url > 0
                 || codex_startup_timeout_issues > 0
+                || omp_contract_issues > 0
+                || parse_errors > 0
             {
                 format!(
                     "{}. Fix: run `am setup` or `am doctor fix` to convert to HTTP URL mode or update the endpoint to {}: {}",
@@ -32720,6 +32791,16 @@ fn handle_doctor_check_with_target(
             if let Some(canonical_token) = env_config.http_bearer_token.as_deref() {
                 let mut token_problem_parts: Vec<String> = Vec::new();
                 for loc in &existing {
+                    if let Err(error) =
+                        validate_real_file_target_path(&loc.config_path, "MCP bearer check")
+                    {
+                        token_problem_parts.push(format!(
+                            "{} ({}) → unsafe config path: {error}",
+                            loc.tool.slug(),
+                            loc.config_path.display()
+                        ));
+                        continue;
+                    }
                     let Ok(content) = std::fs::read_to_string(&loc.config_path) else {
                         continue;
                     };
@@ -33378,7 +33459,7 @@ fn fix_path_order(home: &Path) -> Result<String, String> {
 }
 
 const CODEX_HTTP_BEARER_TOKEN_ENV_VAR: &str = "HTTP_BEARER_TOKEN";
-const OMP_MCP_AGENT_MAIL_ENTRY_KEYS: &[&str] = &["mcp-agent-mail", "mcp_agent_mail"];
+const OMP_MCP_AGENT_MAIL_ENTRY_KEYS: &[&str] = &["mcp-agent-mail", "mcp_agent_mail", "agent-mail"];
 
 fn omp_config_needs_native_contract_repair(content: &str) -> bool {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(content)
@@ -33425,22 +33506,21 @@ fn omp_config_needs_native_contract_repair(content: &str) -> bool {
     }
 
     let native_entry = &object["mcpServers"]["mcp-agent-mail"];
-    let disabled_in_entry = native_entry.get("enabled").is_some_and(|enabled| {
-        enabled == &serde_json::Value::Bool(false)
-            || enabled.as_str().is_some_and(|value| {
-                matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0")
-            })
-    });
+    let entry_contract_drift = native_entry.as_object().is_none()
+        || !matches!(
+            native_entry.get("enabled"),
+            None | Some(serde_json::Value::Bool(true))
+        );
     let disabled_by_profile = match object.get("disabledServers") {
         None => false,
         Some(serde_json::Value::Array(names)) => names.iter().any(|name| {
             name.as_str()
-                .is_some_and(|name| OMP_MCP_AGENT_MAIL_ENTRY_KEYS.contains(&name))
+                .is_none_or(|name| OMP_MCP_AGENT_MAIL_ENTRY_KEYS.contains(&name))
         }),
         Some(_) => true,
     };
 
-    disabled_in_entry || disabled_by_profile
+    entry_contract_drift || disabled_by_profile
 }
 
 fn rewrite_omp_mcp_config_to_native_http(
@@ -33453,20 +33533,28 @@ fn rewrite_omp_mcp_config_to_native_http(
         .ok_or_else(|| "OMP config must be a JSON object".to_string())?;
 
     let mut source_entry = None;
+    let mut target_entry_seen = false;
     for container in ["mcpServers", "servers", "mcp", "mcp_servers"] {
         let Some(servers) = object.get(container).and_then(serde_json::Value::as_object) else {
             continue;
         };
-        source_entry = OMP_MCP_AGENT_MAIL_ENTRY_KEYS
-            .iter()
-            .find_map(|name| servers.get(*name).and_then(serde_json::Value::as_object))
-            .cloned()
-            .or(source_entry);
+        for name in OMP_MCP_AGENT_MAIL_ENTRY_KEYS {
+            let Some(value) = servers.get(*name) else {
+                continue;
+            };
+            target_entry_seen = true;
+            if source_entry.is_none() {
+                source_entry = value.as_object().cloned();
+            }
+        }
         if source_entry.is_some() {
             break;
         }
     }
     let Some(mut entry) = source_entry else {
+        if target_entry_seen {
+            return Err("OMP mcp-agent-mail entry must be a JSON object".to_string());
+        }
         return Ok(false);
     };
 
@@ -33532,6 +33620,9 @@ fn rewrite_omp_mcp_config_to_native_http(
         let disabled_servers = disabled_servers
             .as_array_mut()
             .ok_or_else(|| "OMP disabledServers must be a JSON array".to_string())?;
+        if disabled_servers.iter().any(|value| !value.is_string()) {
+            return Err("OMP disabledServers entries must be strings".to_string());
+        }
         disabled_servers.retain(|value| {
             !value
                 .as_str()
@@ -33549,6 +33640,7 @@ fn fix_mcp_config_entry(
     desired_bearer_token: Option<&str>,
     tool: mcp_agent_mail_core::mcp_config::McpConfigTool,
 ) -> Result<String, String> {
+    validate_real_file_target_path(config_path, "MCP config").map_err(|error| error.to_string())?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
 
@@ -33601,6 +33693,23 @@ fn fix_mcp_config_entry(
     if !updated {
         return Err(format!(
             "No mcp-agent-mail entry found in {}",
+            config_path.display()
+        ));
+    }
+
+    if tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp {
+        let action = mcp_agent_mail_core::setup::ConfigAction {
+            platform: mcp_agent_mail_core::setup::AgentPlatform::Omp,
+            file_path: config_path.to_path_buf(),
+            description: "Repair OMP MCP config".to_string(),
+            content: mcp_agent_mail_core::setup::ConfigContent::JsonFull(doc),
+            permissions: 0o600,
+            backup: true,
+        };
+        mcp_agent_mail_core::setup::write_config_atomic(&action)
+            .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
+        return Ok(format!(
+            "Updated {} with an atomic backup",
             config_path.display()
         ));
     }
@@ -42536,6 +42645,26 @@ http_headers = { Authorization = "Bearer secret" }
 "#;
         let status = doctor_mcp_config_bearer_status(
             Path::new("/tmp/config.toml"),
+            content,
+            Path::new("/home/test/.local/bin/mcp-agent-mail"),
+            "secret",
+        );
+        assert_eq!(status, Some(DoctorMcpConfigBearerStatus::Match));
+    }
+
+    #[test]
+    fn doctor_mcp_config_bearer_status_accepts_case_insensitive_json_header_name() {
+        let content = r#"{
+            "mcpServers": {
+                "mcp-agent-mail": {
+                    "type": "http",
+                    "url": "http://127.0.0.1:8765/mcp/",
+                    "headers": {"authorization": "Bearer secret"}
+                }
+            }
+        }"#;
+        let status = doctor_mcp_config_bearer_status(
+            Path::new("/tmp/mcp.json"),
             content,
             Path::new("/home/test/.local/bin/mcp-agent-mail"),
             "secret",
@@ -52147,10 +52276,10 @@ http_headers = { Authorization = "Bearer secret" }
                     "keep-native": {"command": "node"}
                 },
                 "servers": {
-                    "mcp-agent-mail": {"command": "stale"},
+                    "agent-mail": {"command": "stale"},
                     "keep-legacy": {"command": "keep"}
                 },
-                "disabledServers": ["mcp-agent-mail", "mcp_agent_mail", "keep-disabled"]
+                "disabledServers": ["mcp-agent-mail", "mcp_agent_mail", "agent-mail", "keep-disabled"]
             }"#,
         )
         .unwrap();
@@ -52183,7 +52312,7 @@ http_headers = { Authorization = "Bearer secret" }
         );
         assert!(!native.contains_key("mcp_agent_mail"));
         assert_eq!(native["keep-native"]["command"], "node");
-        assert!(doc["servers"].get("mcp-agent-mail").is_none());
+        assert!(doc["servers"].get("agent-mail").is_none());
         assert_eq!(doc["servers"]["keep-legacy"]["command"], "keep");
         assert_eq!(doc["disabledServers"], serde_json::json!(["keep-disabled"]));
         assert!(!omp_config_needs_native_contract_repair(&repaired));
@@ -52219,6 +52348,44 @@ http_headers = { Authorization = "Bearer secret" }
         );
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
         assert!(!mcp_config_backup_candidate(&config, None).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix_mcp_config_entry_refuses_symlinked_omp_config_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.json");
+        let linked = dir.path().join("mcp.json");
+        let original = r#"{
+            "mcpServers": {
+                "mcp-agent-mail": {
+                    "command": "python",
+                    "args": ["-m", "mcp_agent_mail"]
+                }
+            }
+        }"#;
+        std::fs::write(&outside, original).unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        let error = fix_mcp_config_entry(
+            &linked,
+            "http://127.0.0.1:8765/mcp/",
+            Some("new-token"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
+        )
+        .expect_err("doctor repair must not follow a symlinked OMP config");
+
+        assert!(error.contains("must not be a symlink"), "{error}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!mcp_config_backup_candidate(&outside, None).exists());
     }
 
     #[test]
