@@ -494,6 +494,12 @@ mod tests {
 
     const CURRENT_GENERATION: &str = "aa11bb22";
     const FOREIGN_GENERATION: &str = "cc33dd44";
+    const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_PATH";
+    const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_READY";
+    const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_GENERATION_WAL_WRITER_RELEASE";
+    const WAL_WRITER_TEST: &str =
+        "doctor::fixers::reservation_artifact_normalize::tests::wal_generation_truth_replaces_stale_quarantine_plan_before_mutation";
+    const WAL_WRITER_WITNESS: &str = "GENERATION_WAL_WRITER_CHILD_RAN";
 
     fn fixture() -> (TempDir, PathBuf, PathBuf) {
         let td = TempDir::new().expect("tempdir");
@@ -578,6 +584,33 @@ mod tests {
 
     #[test]
     fn wal_generation_truth_replaces_stale_quarantine_plan_before_mutation() {
+        if let Ok(db_path) = std::env::var(WAL_WRITER_PATH_ENV) {
+            let ready_path = PathBuf::from(
+                std::env::var(WAL_WRITER_READY_ENV).expect("generation WAL writer ready path"),
+            );
+            let release_path = PathBuf::from(
+                std::env::var(WAL_WRITER_RELEASE_ENV).expect("generation WAL writer release path"),
+            );
+            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
+                .expect("open cross-process generation WAL writer");
+            writer
+                .execute_raw(&format!(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     UPDATE db_identity SET generation_id = '{FOREIGN_GENERATION}'
+                     WHERE singleton = 0;"
+                ))
+                .expect("commit current generation only to WAL");
+            std::fs::write(&ready_path, b"ready")
+                .expect("publish generation WAL writer readiness");
+            println!("{WAL_WRITER_WITNESS}");
+            assert!(
+                super::super::wait_for_cross_process_release(&release_path),
+                "parent did not release generation WAL writer in time"
+            );
+            drop(writer);
+            return;
+        }
+
         let (td, db_path, reservation_dir) = fixture();
         let admitted = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .expect("admit generation fixture through FrankenSQLite");
@@ -603,31 +636,66 @@ mod tests {
         }));
 
         let main_before = std::fs::read(&db_path).expect("read settled generation main");
-        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open generation WAL writer");
-        writer
-            .execute_raw(&format!(
-                "PRAGMA wal_autocheckpoint = 0;
-                 UPDATE db_identity SET generation_id = '{FOREIGN_GENERATION}'
-                 WHERE singleton = 0;"
-            ))
-            .expect("commit current generation only to WAL");
-        drop(writer);
-        assert_eq!(
-            std::fs::read(&db_path).expect("read WAL-only generation main"),
-            main_before,
-            "fixture must keep the new generation out of the main image"
-        );
-        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-        assert!(
-            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
-            "fixture must retain committed generation WAL frames"
-        );
+        let ready_path = td.path().join("generation-wal-writer.ready");
+        let release_path = td.path().join("generation-wal-writer.release");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("resolve generation test executable"),
+        )
+        .arg(WAL_WRITER_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_WRITER_PATH_ENV, &db_path)
+        .env(WAL_WRITER_READY_ENV, &ready_path)
+        .env(WAL_WRITER_RELEASE_ENV, &release_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process generation WAL writer");
+        let child = super::super::CrossProcessWalChild::new(child, release_path);
+        if !super::super::wait_for_cross_process_signal(&ready_path) {
+            let output = child
+                .release_and_wait()
+                .expect("collect unready generation WAL writer");
+            panic!(
+                "generation WAL writer never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let main_after = std::fs::read(&db_path);
+        let wal_len = std::fs::metadata(PathBuf::from(format!("{}-wal", db_path.display())))
+            .map(|metadata| metadata.len());
 
         let foreign_artifact = reservation_dir.join(format!("id-8-g{FOREIGN_GENERATION}.json"));
         let foreign_before = std::fs::read(&foreign_artifact).expect("read generation artifact");
         let outcome = fix_prepared(&ctx(&td), &stale_finding, &stale_candidate)
             .expect("refresh generation immediately before mutation");
+
+        let output = child
+            .release_and_wait()
+            .expect("collect generation WAL writer");
+        assert!(
+            output.status.success(),
+            "generation WAL writer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(WAL_WRITER_WITNESS),
+            "generation WAL writer filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            main_after.expect("read WAL-only generation main"),
+            main_before,
+            "fixture must keep the new generation out of the main image"
+        );
+        assert!(
+            wal_len.is_ok_and(|len| len > 32),
+            "fixture must retain committed generation WAL frames"
+        );
         assert!(
             outcome.quarantined_paths.is_empty(),
             "an artifact matching the current WAL generation must not be quarantined"

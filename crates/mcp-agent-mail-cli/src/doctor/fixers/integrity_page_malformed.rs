@@ -205,6 +205,13 @@ mod tests {
     use sqlmodel_sqlite::SqliteConnection;
     use tempfile::TempDir;
 
+    const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_PATH";
+    const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_READY";
+    const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_INTEGRITY_WAL_WRITER_RELEASE";
+    const WAL_WRITER_TEST: &str =
+        "doctor::fixers::integrity_page_malformed::tests::live_wal_only_check_violation_is_integrity_truth";
+    const WAL_WRITER_WITNESS: &str = "INTEGRITY_WAL_WRITER_CHILD_RAN";
+
     fn make_healthy_db(td: &TempDir) -> PathBuf {
         let db = td.path().join("storage.sqlite3");
         let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
@@ -224,6 +231,33 @@ mod tests {
 
     #[test]
     fn live_wal_only_check_violation_is_integrity_truth() {
+        if let Ok(db_path) = std::env::var(WAL_WRITER_PATH_ENV) {
+            let ready_path = PathBuf::from(
+                std::env::var(WAL_WRITER_READY_ENV).expect("integrity WAL writer ready path"),
+            );
+            let release_path = PathBuf::from(
+                std::env::var(WAL_WRITER_RELEASE_ENV).expect("integrity WAL writer release path"),
+            );
+            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
+                .expect("open cross-process integrity WAL writer");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     PRAGMA ignore_check_constraints = ON;
+                     INSERT INTO checked_values(value) VALUES (-1);",
+                )
+                .expect("commit invalid CHECK row only to WAL");
+            std::fs::write(&ready_path, b"ready")
+                .expect("publish integrity WAL writer readiness");
+            println!("{WAL_WRITER_WITNESS}");
+            assert!(
+                super::super::wait_for_cross_process_release(&release_path),
+                "parent did not release integrity WAL writer in time"
+            );
+            drop(writer);
+            return;
+        }
+
         let td = TempDir::new().unwrap();
         let db = td.path().join("storage.sqlite3");
         let admitted = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
@@ -243,32 +277,67 @@ mod tests {
         // insertion-time enforcement and commit the invalid row to WAL, leaving
         // the settled main image healthy. A direct immutable main-file probe
         // therefore false-greens this fixture.
-        let writer = mcp_agent_mail_db::DbConn::open_file(db.display().to_string())
-            .expect("reopen live integrity writer");
-        writer
-            .execute_raw(
-                "PRAGMA wal_autocheckpoint = 0;
-                 PRAGMA ignore_check_constraints = ON;
-                 INSERT INTO checked_values(value) VALUES (-1);",
-            )
-            .expect("commit invalid CHECK row only to WAL");
-        drop(writer);
-        assert_eq!(
-            std::fs::read(&db).expect("read WAL-only integrity main"),
-            main_before,
-            "fixture must keep the violating row out of the main image"
-        );
-        let wal_path = PathBuf::from(format!("{}-wal", db.display()));
-        assert!(
-            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
-            "fixture must retain committed WAL frames"
-        );
+        let ready_path = td.path().join("integrity-wal-writer.ready");
+        let release_path = td.path().join("integrity-wal-writer.release");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("resolve integrity test executable"),
+        )
+        .arg(WAL_WRITER_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_WRITER_PATH_ENV, &db)
+        .env(WAL_WRITER_READY_ENV, &ready_path)
+        .env(WAL_WRITER_RELEASE_ENV, &release_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process integrity WAL writer");
+        let child = super::super::CrossProcessWalChild::new(child, release_path);
+        if !super::super::wait_for_cross_process_signal(&ready_path) {
+            let output = child
+                .release_and_wait()
+                .expect("collect unready integrity WAL writer");
+            panic!(
+                "integrity WAL writer never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let main_after = std::fs::read(&db);
+        let wal_len = std::fs::metadata(PathBuf::from(format!("{}-wal", db.display())))
+            .map(|metadata| metadata.len());
 
         let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
             &db,
-            "WAL-only integrity truth test",
+            "cross-process WAL-only integrity truth test",
         );
         let findings = detect_prepared(std::slice::from_ref(&candidate));
+
+        let output = child
+            .release_and_wait()
+            .expect("collect integrity WAL writer");
+        assert!(
+            output.status.success(),
+            "integrity WAL writer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(WAL_WRITER_WITNESS),
+            "integrity WAL writer filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            main_after.expect("read WAL-only integrity main"),
+            main_before,
+            "fixture must keep the violating row out of the main image"
+        );
+        assert!(
+            wal_len.is_ok_and(|len| len > 32),
+            "fixture must retain committed WAL frames"
+        );
         assert_eq!(findings.len(), 1, "WAL-only violation must be visible");
         assert!(
             findings[0]

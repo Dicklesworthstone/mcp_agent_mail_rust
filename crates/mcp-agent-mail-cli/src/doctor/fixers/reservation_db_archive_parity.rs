@@ -546,6 +546,12 @@ mod tests {
     const ARCHIVE_ACTIVE_JSON: &str = include_str!(
         "../../../../../tests/fixtures/reservation_regression/recipes/db_archive_active_state_mismatch_archive_id_301.json"
     );
+    const WAL_WRITER_PATH_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_PATH";
+    const WAL_WRITER_READY_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_READY";
+    const WAL_WRITER_RELEASE_ENV: &str = "AM_DOCTOR_RESERVATION_WAL_WRITER_RELEASE";
+    const WAL_WRITER_TEST: &str =
+        "doctor::fixers::reservation_db_archive_parity::tests::live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix";
+    const WAL_WRITER_WITNESS: &str = "RESERVATION_WAL_WRITER_CHILD_RAN";
 
     fn materialize_fixture(
         sql: &str,
@@ -623,6 +629,37 @@ mod tests {
 
     #[test]
     fn live_wal_holder_and_release_truth_is_seen_and_revalidated_before_fix() {
+        if let Ok(db_path) = std::env::var(WAL_WRITER_PATH_ENV) {
+            let ready_path = PathBuf::from(
+                std::env::var(WAL_WRITER_READY_ENV).expect("reservation WAL writer ready path"),
+            );
+            let release_path = PathBuf::from(
+                std::env::var(WAL_WRITER_RELEASE_ENV)
+                    .expect("reservation WAL writer release path"),
+            );
+            let writer = mcp_agent_mail_db::DbConn::open_file(db_path)
+                .expect("open cross-process reservation WAL writer");
+            writer
+                .execute_raw(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     UPDATE file_reservations
+                     SET agent_id = 2, released_ts = 1700001015000000
+                     WHERE id = 101;
+                     INSERT OR REPLACE INTO file_reservation_releases
+                     (reservation_id, released_ts) VALUES (101, 1700001015000000);",
+                )
+                .expect("commit WAL-only holder and release drift");
+            std::fs::write(&ready_path, b"ready")
+                .expect("publish reservation WAL writer readiness");
+            println!("{WAL_WRITER_WITNESS}");
+            assert!(
+                super::super::wait_for_cross_process_release(&release_path),
+                "parent did not release reservation WAL writer in time"
+            );
+            drop(writer);
+            return;
+        }
+
         let (storage_root, db_path) = materialize_fixture(STALE_AGENT_SQL, STALE_AGENT_JSON, 101);
 
         // Align the settled main image with the archive, then admit the family
@@ -643,37 +680,69 @@ mod tests {
 
         // Commit both decisive drifts only to WAL. An immutable main-file read
         // sees the aligned holder/active state and therefore false-greens.
-        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("reopen live reservation writer");
-        writer
-            .execute_raw(
-                "PRAGMA wal_autocheckpoint = 0;
-                 UPDATE file_reservations
-                 SET agent_id = 2, released_ts = 1700001015000000
-                 WHERE id = 101;
-                 INSERT OR REPLACE INTO file_reservation_releases
-                 (reservation_id, released_ts) VALUES (101, 1700001015000000);",
-            )
-            .expect("commit WAL-only holder and release drift");
-        drop(writer);
-        assert_eq!(
-            std::fs::read(&db_path).expect("read WAL-only main"),
-            main_before,
-            "fixture must keep holder and release drift out of the main image"
-        );
-        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-        assert!(
-            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 32),
-            "fixture must retain committed WAL frames"
-        );
+        let ready_path = storage_root.path().join("reservation-wal-writer.ready");
+        let release_path = storage_root.path().join("reservation-wal-writer.release");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("resolve reservation test executable"),
+        )
+        .arg(WAL_WRITER_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(WAL_WRITER_PATH_ENV, &db_path)
+        .env(WAL_WRITER_READY_ENV, &ready_path)
+        .env(WAL_WRITER_RELEASE_ENV, &release_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cross-process reservation WAL writer");
+        let child = super::super::CrossProcessWalChild::new(child, release_path);
+        if !super::super::wait_for_cross_process_signal(&ready_path) {
+            let output = child
+                .release_and_wait()
+                .expect("collect unready reservation WAL writer");
+            panic!(
+                "reservation WAL writer never became ready: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let main_after = std::fs::read(&db_path);
+        let wal_len = std::fs::metadata(PathBuf::from(format!("{}-wal", db_path.display())))
+            .map(|metadata| metadata.len());
 
         let candidate = super::super::DoctorDbReadCandidate::open_live_or_explicit_offline(
             &db_path,
-            "reservation WAL truth test",
+            "cross-process reservation WAL truth test",
         );
         let finding = detect_prepared(Some(storage_root.path()), std::slice::from_ref(&candidate))
             .pop()
             .expect("WAL-only reservation drift must be visible");
+
+        let output = child
+            .release_and_wait()
+            .expect("collect reservation WAL writer");
+        assert!(
+            output.status.success(),
+            "reservation WAL writer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(WAL_WRITER_WITNESS),
+            "reservation WAL writer filter was vacuous: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            main_after.expect("read WAL-only main"),
+            main_before,
+            "fixture must keep holder and release drift out of the main image"
+        );
+        assert!(
+            wal_len.is_ok_and(|len| len > 32),
+            "fixture must retain committed WAL frames"
+        );
         assert_eq!(finding.report.drift.agent_id_mismatches, 1);
         assert_eq!(finding.report.drift.released_ts_mismatches, 1);
         assert_eq!(finding.report.drift.active_status_mismatches, 1);

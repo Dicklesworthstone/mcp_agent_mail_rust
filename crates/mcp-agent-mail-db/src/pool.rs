@@ -1448,11 +1448,10 @@ where
     match operation_result {
         Ok(value) => {
             recovery_admission().report_success(primary_path);
-            let cleared =
-                crate::recovery_breaker::cleared_state(&recovery_breaker_fingerprint(
-                    primary_path,
-                    None,
-                ));
+            let cleared = crate::recovery_breaker::cleared_state(&recovery_breaker_fingerprint(
+                primary_path,
+                None,
+            ));
             if let Err(error) = crate::recovery_breaker::store(primary_path, &cleared) {
                 if breaker_bypass {
                     tracing::warn!(

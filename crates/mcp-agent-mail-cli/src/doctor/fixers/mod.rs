@@ -190,6 +190,78 @@ pub(crate) fn sqlite_immutable_uri(db_path: &std::path::Path) -> String {
     uri
 }
 
+/// Test-only owner for a subprocess that holds decisive SQLite truth in WAL.
+///
+/// The release sentinel is written and the child reaped even while the parent
+/// test is unwinding, so a failed assertion cannot leave a writer behind.
+#[cfg(test)]
+pub(crate) struct CrossProcessWalChild {
+    child: Option<std::process::Child>,
+    release_path: std::path::PathBuf,
+    released: bool,
+}
+
+#[cfg(test)]
+impl CrossProcessWalChild {
+    pub(crate) fn new(child: std::process::Child, release_path: std::path::PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            release_path,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) -> std::io::Result<()> {
+        if !self.released {
+            std::fs::write(&self.release_path, b"release")?;
+            self.released = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_and_wait(mut self) -> std::io::Result<std::process::Output> {
+        self.release()?;
+        self.child
+            .take()
+            .expect("cross-process WAL child is present")
+            .wait_with_output()
+    }
+}
+
+#[cfg(test)]
+impl Drop for CrossProcessWalChild {
+    fn drop(&mut self) {
+        let _ = self.release();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_cross_process_signal(path: &std::path::Path) -> bool {
+    (0..1_000).any(|_| {
+        if path.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_cross_process_release(path: &std::path::Path) -> bool {
+    (0..3_000).any(|_| {
+        if path.exists() {
+            true
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    })
+}
+
 /// How a detector's canonical connection obtained its stable read authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorDbReadSourceKind {

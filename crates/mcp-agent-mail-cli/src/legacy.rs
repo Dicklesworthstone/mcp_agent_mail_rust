@@ -3334,6 +3334,9 @@ mod tests {
             fs::write(root.join("ready"), b"ready").expect("publish child readiness");
 
             while !root.join("start").exists() {
+                if root.join("stop").exists() {
+                    return;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
 
