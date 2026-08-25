@@ -28433,6 +28433,105 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validated_atc_sqlite_path_accepts_regular_authority_and_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("ATC authority tempdir");
+        let ordinary_dir = root.path().join("ordinary");
+        let redirected_dir = root.path().join("redirected");
+        std::fs::create_dir_all(&ordinary_dir).expect("create ordinary ATC authority directory");
+        std::fs::create_dir_all(&redirected_dir)
+            .expect("create redirected ATC authority directory");
+
+        let ordinary_primary = ordinary_dir.join("storage.sqlite3");
+        let ordinary_primary_text = ordinary_primary
+            .to_str()
+            .expect("temporary ordinary primary path is UTF-8");
+        let ordinary_primary_conn = crate::CanonicalDbConn::open_file(ordinary_primary_text)
+            .expect("open ordinary primary fixture");
+        ordinary_primary_conn
+            .execute_raw("CREATE TABLE ordinary_primary_authority(id INTEGER PRIMARY KEY)")
+            .expect("materialize ordinary primary fixture");
+        drop(ordinary_primary_conn);
+        let ordinary_storage = ordinary_dir.join("archive");
+        std::fs::create_dir_all(&ordinary_storage).expect("create ordinary archive authority");
+        let ordinary_pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", ordinary_primary.display()),
+            storage_root: Some(ordinary_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze ordinary ATC authority");
+        let ordinary_sidecar = atc_sidecar_sqlite_path(ordinary_primary_text);
+        assert!(
+            !Path::new(&ordinary_sidecar).exists(),
+            "ordinary ATC fixture must begin with a missing sidecar leaf"
+        );
+        assert_eq!(
+            ordinary_pool
+                .validated_atc_sqlite_path("ordinary missing ATC sidecar")
+                .expect("missing ATC sidecar leaf remains authoritative")
+                .expect("file-backed pool has an ATC sidecar"),
+            ordinary_sidecar
+        );
+        write_sidecar_fixture(&ordinary_sidecar);
+        assert_eq!(
+            ordinary_pool
+                .validated_atc_sqlite_path("ordinary regular ATC sidecar")
+                .expect("regular ATC sidecar remains authoritative")
+                .expect("file-backed pool has an ATC sidecar"),
+            ordinary_sidecar
+        );
+
+        let redirected_primary = redirected_dir.join("storage.sqlite3");
+        let redirected_primary_text = redirected_primary
+            .to_str()
+            .expect("temporary redirected primary path is UTF-8");
+        let redirected_primary_conn = crate::CanonicalDbConn::open_file(redirected_primary_text)
+            .expect("open redirected primary fixture");
+        redirected_primary_conn
+            .execute_raw("CREATE TABLE redirected_primary_authority(id INTEGER PRIMARY KEY)")
+            .expect("materialize redirected primary fixture");
+        drop(redirected_primary_conn);
+        let redirected_storage = redirected_dir.join("archive");
+        std::fs::create_dir_all(&redirected_storage)
+            .expect("create redirected archive authority");
+        let foreign_sidecar = root.path().join("foreign-atc.sqlite3");
+        write_sidecar_fixture(
+            foreign_sidecar
+                .to_str()
+                .expect("temporary foreign ATC path is UTF-8"),
+        );
+        let redirected_sidecar = atc_sidecar_sqlite_path(redirected_primary_text);
+        symlink(&foreign_sidecar, &redirected_sidecar)
+            .expect("insert foreign ATC symlink before validation admission");
+        let redirected_pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", redirected_primary.display()),
+            storage_root: Some(redirected_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze redirected ATC primary authority");
+
+        let error = redirected_pool
+            .validated_atc_sqlite_path("existing ATC sidecar symlink")
+            .expect_err("ATC validation must reject an existing sidecar symlink");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected ATC sidecar authority error: {error}"
+        );
+    }
+
     #[test]
     fn drop_legacy_atc_tables_drops_and_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");

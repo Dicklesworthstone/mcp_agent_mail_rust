@@ -15478,6 +15478,95 @@ mod tests {
     use tracing::field::{Field, Visit};
     use tracing::{Event, Id, Metadata, Subscriber, span};
 
+    #[cfg(unix)]
+    #[test]
+    fn open_fresh_file_backed_conn_accepts_regular_authority_and_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("fresh-connection authority tempdir");
+        let ordinary_dir = root.path().join("ordinary");
+        let redirected_dir = root.path().join("redirected");
+        std::fs::create_dir_all(&ordinary_dir).expect("create ordinary authority directory");
+        std::fs::create_dir_all(&redirected_dir).expect("create redirected authority directory");
+
+        let ordinary_db = ordinary_dir.join("mail.sqlite3");
+        let ordinary_db_text = ordinary_db
+            .to_str()
+            .expect("temporary ordinary database path is UTF-8");
+        let ordinary_seed = crate::DbConn::open_file(ordinary_db_text)
+            .expect("open ordinary fresh-connection fixture");
+        ordinary_seed
+            .execute_raw("CREATE TABLE fresh_authority_sentinel(value TEXT NOT NULL)")
+            .expect("create ordinary fresh-connection sentinel");
+        ordinary_seed
+            .execute_raw("INSERT INTO fresh_authority_sentinel(value) VALUES('ordinary')")
+            .expect("seed ordinary fresh-connection sentinel");
+        drop(ordinary_seed);
+        let ordinary_storage = ordinary_dir.join("archive");
+        std::fs::create_dir_all(&ordinary_storage).expect("create ordinary archive authority");
+        let ordinary_pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", ordinary_db.display()),
+            storage_root: Some(ordinary_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze ordinary fresh-connection authority");
+
+        let ordinary_conn = open_fresh_file_backed_conn(&ordinary_pool)
+            .expect("ordinary frozen authority must admit a fresh connection");
+        let rows = ordinary_conn
+            .query_sync("SELECT value FROM fresh_authority_sentinel", &[])
+            .expect("read ordinary fresh-connection sentinel");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("value")
+                .expect("decode ordinary fresh-connection sentinel"),
+            "ordinary"
+        );
+        drop(ordinary_conn);
+
+        let frozen_alias = redirected_dir.join("mail.sqlite3");
+        let foreign_db = redirected_dir.join("foreign.sqlite3");
+        let foreign_db_text = foreign_db
+            .to_str()
+            .expect("temporary foreign database path is UTF-8");
+        let foreign_seed = crate::DbConn::open_file(foreign_db_text)
+            .expect("open redirected fresh-connection fixture");
+        foreign_seed
+            .execute_raw("CREATE TABLE foreign_authority_sentinel(value TEXT NOT NULL)")
+            .expect("create redirected fresh-connection sentinel");
+        drop(foreign_seed);
+        let redirected_storage = redirected_dir.join("archive");
+        std::fs::create_dir_all(&redirected_storage).expect("create redirected archive authority");
+        let redirected_pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", frozen_alias.display()),
+            storage_root: Some(redirected_storage),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze missing fresh-connection authority");
+
+        symlink(&foreign_db, &frozen_alias)
+            .expect("insert foreign database symlink before fresh connection admission");
+        let error = match open_fresh_file_backed_conn(&redirected_pool) {
+            Ok(_) => panic!("fresh connection must reject an existing authority symlink"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected fresh-connection authority error: {error}"
+        );
+    }
+
     #[test]
     fn orphan_placeholder_identifier_shape_gates_the_inventory_scan() {
         // Only the literal placeholder shape can ever match a placeholder row,
@@ -18795,6 +18884,7 @@ mod tests {
             ..Default::default()
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
+        let cx = asupersync::Cx::for_testing();
 
         rt.block_on(async {
             let base = now_micros();

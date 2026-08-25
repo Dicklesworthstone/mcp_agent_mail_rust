@@ -4886,6 +4886,58 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn direct_surface_index_dir_accepts_missing_leaf_then_rejects_existing_sqlite_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("search authority tempdir");
+        let storage_root = root.path().join("archive");
+        let shared_index = storage_root.join("search_index");
+        std::fs::create_dir_all(&shared_index).expect("create shared search authority");
+        std::fs::write(shared_index.join("meta.json"), "{}")
+            .expect("write shared search marker");
+
+        let frozen_db = root.path().join("mail.sqlite3");
+        let foreign_db = root.path().join("foreign.sqlite3");
+        let foreign_db_text = foreign_db
+            .to_str()
+            .expect("temporary foreign search database path is UTF-8");
+        let foreign_conn = crate::CanonicalDbConn::open_file(foreign_db_text)
+            .expect("open foreign search database");
+        foreign_conn
+            .execute_raw("CREATE TABLE foreign_search_authority(id INTEGER PRIMARY KEY)")
+            .expect("materialize foreign search database");
+        drop(foreign_conn);
+
+        let pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", frozen_db.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze missing search database authority");
+        assert_eq!(
+            direct_surface_index_dir(&pool)
+                .expect("an unchanged missing SQLite leaf remains an ordinary lazy authority"),
+            shared_index
+        );
+
+        symlink(&foreign_db, &frozen_db)
+            .expect("insert foreign SQLite symlink before search index admission");
+        let error = direct_surface_index_dir(&pool)
+            .expect_err("search index selection must reject retargeted SQLite authority");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected search database authority error: {error}"
+        );
+    }
+
     #[test]
     fn stable_direct_surface_index_dir_is_stable_across_snapshot_copies() {
         let root = tempfile::tempdir().expect("tempdir");
