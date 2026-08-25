@@ -73,12 +73,13 @@ extract_function() {
     extract_function detect_mcp_configs
     extract_function remote_http_client_target_tools
     extract_function has_remote_http_client_targets
+    extract_function probe_remote_http_endpoint
     extract_function ensure_remote_http_client_readiness
     extract_function configure_mcp_clients_for_install
     sed -n '/^install_legacy_launcher_takeover_shims() {/,/^# T1\.5:/p' "$INSTALL_SH" | sed '$d'
 } >"$extract"
 
-for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config trusted_system_directory_alias_target detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config trusted_system_directory_alias_target detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets probe_remote_http_endpoint ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -442,6 +443,26 @@ safe_config_targets="$(
 [ "$safe_config_targets" = "omp" ] \
     || fail "production detector rejected a safe HOME-relative PI_CONFIG_DIR authority"
 
+active_profile_home="$tmp/active-profile-home"
+active_profile_path="$tmp/active-profile-path"
+mkdir -p "$active_profile_home/custom-omp/profiles/work/agent"
+mkdir -p "$active_profile_path"
+ln -s "$(command -v grep)" "$active_profile_path/grep"
+printf '%s\n' '{}' >"$active_profile_home/custom-omp/profiles/work/agent/mcp.json"
+set +e
+active_profile_targets="$(
+    cd "$active_profile_home"
+    unset APPDATA PI_PROFILE PI_CODING_AGENT_DIR
+    HOME="$active_profile_home" PI_CONFIG_DIR=custom-omp OMP_PROFILE=work \
+        PATH="$active_profile_path" remote_http_client_target_tools
+)"
+active_profile_rc=$?
+set -e
+[ "$active_profile_rc" -eq 0 ] \
+    || fail "custom active OMP profile authority returned $active_profile_rc"
+[ "$active_profile_targets" = "omp" ] \
+    || fail "production target discovery rejected a custom active OMP profile authority"
+
 step "scenario J: OMP-only targets activate healthy and unhealthy readiness lanes"
 omp_only_config="$tmp/omp-only-mcp.json"
 printf '%s\n' '{}' >"$omp_only_config"
@@ -449,6 +470,45 @@ readiness_home="$tmp/readiness-home"
 readiness_path="$tmp/readiness-empty-path"
 readiness_dest="$tmp/readiness-bin"
 mkdir -p "$readiness_home" "$readiness_path" "$readiness_dest"
+
+production_probe_path="$tmp/production-probe-path"
+production_probe_marker="$tmp/production-probe-marker"
+mkdir -p "$production_probe_path"
+cat >"$production_probe_path/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+saw_auth=0
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -H)
+            shift
+            [ "${1:-}" = 'Authorization: Bearer authenticated-probe-token' ] || exit 86
+            saw_auth=1
+            ;;
+        http://* | https://*) url="$1" ;;
+    esac
+    shift
+done
+[ "$saw_auth" -eq 1 ] || exit 87
+printf '%s\n' 'authenticated' >"$PRODUCTION_PROBE_MARKER"
+case "$url" in
+    */health/readiness) printf '%s\n' '{"status":"ready"}' ;;
+    *) exit 88 ;;
+esac
+EOF
+chmod 755 "$production_probe_path/curl"
+desired_mcp_http_base_url() { printf '%s' 'http://127.0.0.1:8765'; }
+resolve_setup_http_bearer_token() { printf '%s' 'authenticated-probe-token'; }
+export PRODUCTION_PROBE_MARKER="$production_probe_marker"
+production_probe_stdout="$(PATH="$production_probe_path:/usr/bin:/bin" probe_remote_http_endpoint)" \
+    || fail "production authenticated readiness probe failed"
+unset PRODUCTION_PROBE_MARKER
+[ -z "$production_probe_stdout" ] \
+    || fail "production authenticated readiness probe emitted credential-bearing output"
+[ "$(cat "$production_probe_marker")" = 'authenticated' ] \
+    || fail "production readiness probe omitted the bearer authorization header"
+
 remote_scan_mode=omp
 detect_mcp_configs() {
     if [ "$remote_scan_mode" = "omp" ]; then
