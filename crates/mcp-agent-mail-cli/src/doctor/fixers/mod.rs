@@ -2083,7 +2083,8 @@ pub fn dispatch_only(
         // `detect_mcp_config_locations_default` is a pure helper
         // that reads no env state beyond `dirs::home_dir()` + CWD;
         // we don't need a dedicated DispatchInputs field.
-        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let locations =
+            mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default();
         let findings = codex_startup_timeout::detect(&locations);
         outcome.findings_count = findings.len();
         for f in &findings {
@@ -2124,7 +2125,8 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == stale_python_launcher_entry::FM_ID {
-        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let locations =
+            mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default();
         let inputs = stale_python_launcher_entry::DetectInputs {
             locations,
             rust_binary_path: default_rust_binary_path(),
@@ -2745,7 +2747,8 @@ fn detect_only_with_db_reads(
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == stale_python_launcher_entry::FM_ID {
-        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let locations =
+            mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default();
         let inputs = stale_python_launcher_entry::DetectInputs {
             locations,
             rust_binary_path: default_rust_binary_path(),

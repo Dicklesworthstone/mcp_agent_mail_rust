@@ -1439,7 +1439,7 @@ fn default_mcp_config_candidates() -> Vec<PathBuf> {
         v.push(home.join(".cline.mcp.json"));
     }
     v.extend(
-        mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default()
+        mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default()
             .into_iter()
             .filter(|location| location.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
             .map(|location| location.config_path),
