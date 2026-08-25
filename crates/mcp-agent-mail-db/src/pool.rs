@@ -1057,6 +1057,161 @@ fn automatic_recovery_breaker_refusal<E>(
     ))
 }
 
+// Fingerprints produced without opening the live database inode reserve this
+// prefix inside the otherwise opaque 64-hex-digit breaker hash.  Old breaker
+// records contain a raw SHA-256 and therefore have no reliable algorithm tag;
+// a non-clean old record is kept fail-closed until an operator bypasses it or
+// a successful recovery rewrites it with the lock-neutral format.
+const LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX: &str = "fdc10ce1";
+
+#[must_use]
+fn breaker_fingerprint_is_lock_neutral(fingerprint: &str) -> bool {
+    fingerprint
+        .split_once(':')
+        .is_some_and(|(_, hash)| hash.starts_with(LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX))
+}
+
+#[must_use]
+fn sqlite_path_requires_lock_neutral_fingerprint(path: &Path) -> bool {
+    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
+    {
+        return true;
+    }
+
+    // A namespace-less hard-link alias may still name a Franken-managed inode
+    // whose namespace records sit beside another pathname.  Opening the alias
+    // would be enough to erase this process's classic POSIX locks.
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.nlink() != 1) {
+        return true;
+    }
+
+    false
+}
+
+/// Identify a live SQLite generation without opening its main inode.
+///
+/// Classic POSIX record locks belong to the process, not an individual file
+/// descriptor: closing an ad-hoc raw descriptor can release locks held by an
+/// unrelated live FrankenSQLite connection.  Metadata lookup (`stat`) is
+/// descriptor-neutral.  The fingerprint covers the main file plus durable
+/// journal/WAL certification members, so an ordinary main-file rewrite, WAL
+/// commit, or generation replacement changes it without sacrificing locks.
+#[must_use]
+fn lock_neutral_sqlite_generation_fingerprint(path: &Path) -> String {
+    use sha2::Digest as _;
+
+    fn hash_metadata(
+        hasher: &mut sha2::Sha256,
+        label: &[u8],
+        path: &Path,
+    ) -> Result<Option<u64>, ()> {
+        hasher.update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(label);
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update([0]);
+                return Ok(None);
+            }
+            Err(_) => return Err(()),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(());
+        }
+        hasher.update([1]);
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update([u8::from(metadata.permissions().readonly())]);
+
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok());
+        hasher.update(modified.map_or(0, |value| value.as_secs()).to_le_bytes());
+        hasher.update(
+            modified
+                .map_or(0, |value| value.subsec_nanos())
+                .to_le_bytes(),
+        );
+
+        #[cfg(unix)]
+        {
+            hasher.update(metadata.dev().to_le_bytes());
+            hasher.update(metadata.ino().to_le_bytes());
+            hasher.update(metadata.mode().to_le_bytes());
+            hasher.update(metadata.nlink().to_le_bytes());
+            hasher.update(metadata.mtime().to_le_bytes());
+            hasher.update(metadata.mtime_nsec().to_le_bytes());
+            hasher.update(metadata.ctime().to_le_bytes());
+            hasher.update(metadata.ctime_nsec().to_le_bytes());
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+
+            hasher.update(metadata.file_attributes().to_le_bytes());
+            hasher.update(metadata.creation_time().to_le_bytes());
+            hasher.update(metadata.last_write_time().to_le_bytes());
+            hasher.update(metadata.volume_serial_number().unwrap_or(0).to_le_bytes());
+            hasher.update(metadata.file_index().unwrap_or(0).to_le_bytes());
+        }
+
+        Ok(Some(metadata.len()))
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"mcp-agent-mail-lock-neutral-sqlite-generation-v1\0");
+    let main_len = match hash_metadata(&mut hasher, b"main", path) {
+        Ok(Some(len)) => len,
+        Ok(None) => return "missing".to_string(),
+        Err(()) => return "unreadable".to_string(),
+    };
+    for suffix in ["-journal", "-wal", "-wal-cert", "-wal-cert-head"] {
+        if hash_metadata(
+            &mut hasher,
+            suffix.as_bytes(),
+            &sqlite_sidecar_path(path, suffix),
+        )
+        .is_err()
+        {
+            return "unreadable".to_string();
+        }
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!(
+        "{main_len}:{LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX}{}",
+        &digest[LOCK_NEUTRAL_BREAKER_FINGERPRINT_PREFIX.len()..]
+    )
+}
+
+/// Recovery-breaker fingerprint that never independently opens a live
+/// FrankenSQLite main inode.
+#[must_use]
+fn recovery_breaker_fingerprint(
+    primary_path: &Path,
+    prior: Option<&crate::recovery_breaker::RecoveryBreakerState>,
+) -> String {
+    if !sqlite_path_requires_lock_neutral_fingerprint(primary_path) {
+        return crate::recovery_breaker::fingerprint_db(primary_path);
+    }
+
+    if let Some(prior) = prior
+        && (prior.tripped || prior.consecutive_failures > 0)
+        && !breaker_fingerprint_is_lock_neutral(&prior.db_fingerprint)
+    {
+        // There is no safe way to compare a legacy raw-content fingerprint
+        // while this generation is live.  Preserve its authority instead of
+        // accidentally resetting a tripped breaker.  Operator recovery remains
+        // the explicit escape hatch and rewrites the successful terminal state.
+        return prior.db_fingerprint.clone();
+    }
+
+    lock_neutral_sqlite_generation_fingerprint(primary_path)
+}
+
 /// Fail closed on existing durable breaker authority before pool bootstrap can
 /// create a missing primary or inspect an authoritative archive.
 ///
@@ -1072,13 +1227,13 @@ fn preflight_missing_primary_pool_breaker_authority(primary_path: &Path) -> Resu
     }
 
     let action = "pool initialization";
-    let fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
     let prior = crate::recovery_breaker::load(primary_path).map_err(|error| {
         SqlError::Custom(format!(
             "{action} for {} was refused because durable recovery-breaker state could not be trusted: {error}. Run `am doctor repair` or `am doctor reconstruct` for an operator-supervised bypass",
             primary_path.display()
         ))
     })?;
+    let fingerprint = recovery_breaker_fingerprint(primary_path, prior.as_ref());
     let verdict = crate::recovery_breaker::evaluate(
         prior.as_ref(),
         &fingerprint,
@@ -1155,7 +1310,6 @@ where
     let preflight_attempt_started_unix = if breaker_bypass {
         None
     } else {
-        let preflight_fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
         let preflight_prior = crate::recovery_breaker::load(primary_path).map_err(|error| {
             AutomaticRecoveryRunError::admission(
                 AutomaticRecoveryAdmissionFailureKind::Other,
@@ -1165,6 +1319,8 @@ where
                 )),
             )
         })?;
+        let preflight_fingerprint =
+            recovery_breaker_fingerprint(primary_path, preflight_prior.as_ref());
         let attempt_started_unix = now_unix();
         let preflight_verdict = crate::recovery_breaker::evaluate(
             preflight_prior.as_ref(),
@@ -1198,7 +1354,6 @@ where
     // failures for the SAME database content in a sidecar and refuses HERE,
     // before any capture, until the cooldown elapses, the content changes,
     // or an operator path runs under RecoveryBreakerBypassGuard.
-    let breaker_fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
     let breaker_prior = match crate::recovery_breaker::load(primary_path) {
         Ok(state) => state,
         Err(error) if breaker_bypass => {
@@ -1219,6 +1374,7 @@ where
             ));
         }
     };
+    let breaker_fingerprint = recovery_breaker_fingerprint(primary_path, breaker_prior.as_ref());
     let attempt_started_unix = preflight_attempt_started_unix.unwrap_or_else(&mut now_unix);
     let breaker_verdict = crate::recovery_breaker::evaluate(
         breaker_prior.as_ref(),
@@ -1292,9 +1448,11 @@ where
     match operation_result {
         Ok(value) => {
             recovery_admission().report_success(primary_path);
-            let cleared = crate::recovery_breaker::cleared_state(
-                &crate::recovery_breaker::fingerprint_db(primary_path),
-            );
+            let cleared =
+                crate::recovery_breaker::cleared_state(&recovery_breaker_fingerprint(
+                    primary_path,
+                    None,
+                ));
             if let Err(error) = crate::recovery_breaker::store(primary_path, &cleared) {
                 if breaker_bypass {
                     tracing::warn!(
@@ -1317,7 +1475,7 @@ where
         Err(error) => {
             recovery_admission().report_failure(primary_path, &error.to_string());
             let failure_unix = now_unix();
-            let terminal_fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
+            let terminal_fingerprint = recovery_breaker_fingerprint(primary_path, None);
             // A failed recovery may itself mutate the primary before returning
             // (for example, an in-place repair whose final verification fails).
             // Carry forward only history that matched the admitted pre-image,
@@ -3364,8 +3522,8 @@ impl DbPool {
         {
             Err(_) => true,
             Ok(Some(state)) => {
-                state.consecutive_failures > 0
-                    && state.db_fingerprint == crate::recovery_breaker::fingerprint_db(sqlite_path)
+                let fingerprint = recovery_breaker_fingerprint(sqlite_path, Some(&state));
+                state.consecutive_failures > 0 && state.db_fingerprint == fingerprint
             }
             Ok(None) => false,
         };

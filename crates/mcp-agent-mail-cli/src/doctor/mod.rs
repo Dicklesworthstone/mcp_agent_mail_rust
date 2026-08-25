@@ -3186,8 +3186,7 @@ mod tests {
     const FIX_ONLY_LOCK_FM_ENV: &str = "AM_DOCTOR_FIX_ONLY_LOCK_FM";
     const FIX_ONLY_LOCK_HOLDER_TEST: &str =
         "doctor::tests::fix_only_shared_sqlite_lock_holder_child";
-    const FIX_ONLY_LOCK_INVOKER_TEST: &str =
-        "doctor::tests::fix_only_exclusive_lock_invoker_child";
+    const FIX_ONLY_LOCK_INVOKER_TEST: &str = "doctor::tests::fix_only_exclusive_lock_invoker_child";
     const FIX_ONLY_LOCK_HOLDER_WITNESS: &str = "FIX_ONLY_SHARED_LOCK_HOLDER_RAN";
     const FIX_ONLY_LOCK_REFUSAL_WITNESS: &str = "FIX_ONLY_EXCLUSIVE_LOCK_REFUSED";
 
@@ -3342,7 +3341,9 @@ mod tests {
         }
 
         std::fs::write(&release_path, b"release").expect("release shared-lock holder");
-        let holder_output = holder.wait_with_output().expect("collect shared-lock holder");
+        let holder_output = holder
+            .wait_with_output()
+            .expect("collect shared-lock holder");
         assert!(
             holder_output.status.success(),
             "shared-lock holder failed: stdout={} stderr={}",
@@ -3350,8 +3351,7 @@ mod tests {
             String::from_utf8_lossy(&holder_output.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&holder_output.stdout)
-                .contains(FIX_ONLY_LOCK_HOLDER_WITNESS),
+            String::from_utf8_lossy(&holder_output.stdout).contains(FIX_ONLY_LOCK_HOLDER_WITNESS),
             "shared-lock holder filter was vacuous: stdout={} stderr={}",
             String::from_utf8_lossy(&holder_output.stdout),
             String::from_utf8_lossy(&holder_output.stderr)

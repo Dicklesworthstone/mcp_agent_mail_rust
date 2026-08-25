@@ -380,7 +380,9 @@ mod tests {
         let findings = detect_prepared(std::slice::from_ref(&candidate));
 
         std::fs::write(&release_path, b"release").expect("release schema WAL writer");
-        let output = writer.wait_with_output().expect("collect schema WAL writer");
+        let output = writer
+            .wait_with_output()
+            .expect("collect schema WAL writer");
         assert!(
             output.status.success(),
             "schema WAL writer failed: stdout={} stderr={}",
