@@ -1294,6 +1294,8 @@ else
     | sed '$d' > "${LEGACY_ENV_LIBRARY}"
   sed -n '/^git_authority_probe() (/,/^resolve_migrated_bearer_token() {/p' "${INSTALL_SH}" \
     | sed '$d' >> "${LEGACY_ENV_LIBRARY}"
+  sed -n '/^ensure_real_directory_tree() {/,/^write_launchd_service_plist() {/p' "${INSTALL_SH}" \
+    | sed '$d' >> "${LEGACY_ENV_LIBRARY}"
   sed -n '/^path_resolves_within_directory() {/,/^mcp_config_must_skip_shell_write() {/p' "${INSTALL_SH}" \
     | sed '$d' >> "${LEGACY_ENV_LIBRARY}"
 

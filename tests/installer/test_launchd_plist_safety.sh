@@ -64,12 +64,14 @@ extract_function() {
     extract_function ensure_real_file_target_path
     extract_function write_launchd_service_plist
     extract_function repair_launchd_service_env_from_rust_config
+    extract_function remote_http_client_target_tools
     extract_function has_remote_http_client_targets
     extract_function ensure_remote_http_client_readiness
+    extract_function configure_mcp_clients_for_install
     sed -n '/^install_legacy_launcher_takeover_shims() {/,/^# T1\.5:/p' "$INSTALL_SH" | sed '$d'
 } >"$extract"
 
-for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config has_remote_http_client_targets ensure_remote_http_client_readiness install_legacy_launcher_takeover_shims; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config remote_http_client_target_tools has_remote_http_client_targets ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -341,6 +343,58 @@ if ! HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_rea
     fail "no-client readiness skip returned failure"
 fi
 [ "$REMOTE_PROBE_CALLS" -eq 0 ] || fail "no-client readiness skip still probed the endpoint"
+
+relative_home_root="$tmp/relative-home-root"
+mkdir -p "$relative_home_root/relative-home/.omp"
+relative_home_targets="$({
+    cd "$relative_home_root"
+    HOME=relative-home PATH="$readiness_path" remote_http_client_target_tools
+})"
+[ -z "$relative_home_targets" ] \
+    || fail "relative HOME was accepted as remote-client detection authority"
+
+step "scenario K2: invalid OMP authority is a hard readiness failure"
+detect_mcp_configs() { return 2; }
+if HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_readiness; then
+    fail "invalid OMP authority was treated as a no-client readiness skip"
+else
+    invalid_readiness_rc=$?
+fi
+[ "$invalid_readiness_rc" -eq 2 ] \
+    || fail "invalid OMP authority returned $invalid_readiness_rc instead of 2"
+
+step "scenario K3: production setup wrapper fails only for established client authority"
+configure_mcp_clients() { return 1; }
+remote_http_client_target_tools() { printf '%s\n' omp; }
+if configure_mcp_clients_for_install /unused/server /unused/am; then
+    fail "detected OMP setup failure was suppressed"
+fi
+remote_http_client_target_tools() { printf '%s\n' codex; }
+if configure_mcp_clients_for_install /unused/server /unused/am; then
+    fail "detected Codex setup failure was suppressed"
+fi
+remote_http_client_target_tools() { return 0; }
+configure_mcp_clients_for_install /unused/server /unused/am \
+    || fail "genuine no-client setup failure became fatal"
+
+configure_call_marker="$tmp/configure-call-marker"
+configure_mcp_clients() { printf '%s\n' invoked >"$configure_call_marker"; return 0; }
+remote_http_client_target_tools() { return 2; }
+if configure_mcp_clients_for_install /unused/server /unused/am; then
+    fail "invalid client authority was reported as successful"
+else
+    invalid_setup_rc=$?
+fi
+[ "$invalid_setup_rc" -eq 2 ] \
+    || fail "invalid client authority returned $invalid_setup_rc instead of 2"
+[ ! -e "$configure_call_marker" ] \
+    || fail "setup writer ran after invalid client authority"
+
+grep -Fq 'if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then' \
+    "$INSTALL_SH" || fail "production installer does not call the failure-policy wrapper"
+if grep -Eq 'configure_mcp_clients(_for_install)? .*\|\| true' "$INSTALL_SH"; then
+    fail "production installer still suppresses MCP configuration failure"
+fi
 
 step "scenario L: generated legacy shim follows the absolute config.env authority contract"
 legacy_clone="$tmp/legacy-clone"
