@@ -198,6 +198,11 @@ pub struct OmpConfigPaths {
 /// the user's home directory. Invalid explicit profile names are rejected,
 /// matching OMP's command-line boot behavior; only empty or `default` selects
 /// the default profile.
+///
+/// # Errors
+///
+/// Returns an error when the explicitly selected `OMP_PROFILE` or legacy
+/// `PI_PROFILE` does not satisfy OMP's profile-name contract.
 pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError> {
     let Some(home) = dirs::home_dir() else {
         return Ok(None);

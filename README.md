@@ -463,8 +463,9 @@ AGENT_NAME=BlueLake AGENT_MODEL=gemini-2.5-pro scripts/register_gemini.sh /abs/p
 and the active profile's user config. The default profile uses
 `~/.omp/agent/mcp.json`; named profiles selected through `OMP_PROFILE` (or the
 legacy `PI_PROFILE`) use `~/.omp/profiles/<name>/agent/mcp.json`. Profile names
-must use OMP's lowercase `[a-z0-9][a-z0-9._-]{0,63}` syntax. Setup also
-honors OMP's `PI_CONFIG_DIR` and default-profile `PI_CODING_AGENT_DIR`
+must use OMP's lowercase `[a-z0-9][a-z0-9._-]{0,63}` syntax; an invalid
+explicit profile fails closed instead of redirecting setup to the default.
+Setup also honors OMP's `PI_CONFIG_DIR` and default-profile `PI_CODING_AGENT_DIR`
 overrides. The project config is profile-independent and applies under every
 named OMP profile. To configure it manually:
 
