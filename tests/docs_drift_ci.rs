@@ -264,8 +264,6 @@ mod dist_release_contract {
         "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
-    const COSIGN_ACTION: &str =
-        "sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad";
     const RELEASE_ACTION: &str =
         "softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe";
     const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
@@ -344,8 +342,8 @@ mod dist_release_contract {
                 return Err(format!("action on line {} has an empty pin comment", line_index + 1));
             }
         }
-        if action_count != 12 {
-            return Err(format!("expected 12 pinned actions, found {action_count}"));
+        if action_count != 11 {
+            return Err(format!("expected 11 pinned actions, found {action_count}"));
         }
         Ok(())
     }
@@ -365,6 +363,9 @@ mod dist_release_contract {
         for forbidden in [
             "No install.sh found",
             "No install.ps1 found",
+            "sigstore/cosign-installer@",
+            "cosign-release:",
+            "sigstore/cosign/releases/latest",
             "--certificate-identity-regexp",
             "--certificate-oidc-issuer-regexp",
             "--insecure-ignore-sct",
@@ -381,7 +382,6 @@ mod dist_release_contract {
             (TOOLCHAIN_ACTION, 3),
             (UPLOAD_ACTION, 1),
             (DOWNLOAD_ACTION, 1),
-            (COSIGN_ACTION, 1),
             (RELEASE_ACTION, 1),
         ] {
             require_exactly(workflow, action, expected)?;
@@ -411,7 +411,14 @@ mod dist_release_contract {
             "$serverVersion -ne \"mcp-agent-mail $env:EXPECTED_VERSION\"",
             "[System.IO.File]::WriteAllText(",
             "\"$hash  $zipName`n\"",
-            "cosign-release: v3.1.3",
+            "COSIGN_VERSION: v3.1.3",
+            "COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71",
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
+            "actual_sha256=\"$(sha256sum \"$cosign_path\" | awk '{print $1}')\"",
+            "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
+            "mapfile -t cosign_versions < <(\"$cosign_path\" version | awk '$1 == \"GitVersion:\" {print $2}')",
+            "[ \"${#cosign_versions[@]}\" -ne 1 ] || [ \"${cosign_versions[0]}\" != \"$COSIGN_VERSION\" ]",
+            "printf '%s\\n' \"$cosign_dir\" >> \"$GITHUB_PATH\"",
             "expected_download_entries+=(\"$artifact\" \"${artifact}.sha256\")",
             "mapfile -t actual_download_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
             "mapfile -t sidecar_lines < \"dist/${artifact}.sha256\"",
@@ -487,6 +494,12 @@ mod dist_release_contract {
         require_in_order(
             workflow,
             &[
+                "- name: Install verified Cosign",
+                "actual_sha256=\"$(sha256sum \"$cosign_path\" | awk '{print $1}')\"",
+                "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
+                "mapfile -t cosign_versions",
+                "[ \"${#cosign_versions[@]}\" -ne 1 ] || [ \"${cosign_versions[0]}\" != \"$COSIGN_VERSION\" ]",
+                "printf '%s\\n' \"$cosign_dir\" >> \"$GITHUB_PATH\"",
                 "- name: Assemble, sign, and verify release assets",
                 "cp -- install.sh install.ps1 publish/",
                 "shasum -a 256 \"${expected_payloads[@]}\" > SHA256SUMS",
@@ -578,8 +591,28 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "cosign-release: v3.1.3",
-                "cosign-release: v3.0.2",
+                "COSIGN_VERSION: v3.1.3",
+                "COSIGN_VERSION: v3.0.2",
+            ),
+            mutate(
+                &workflow,
+                "COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71",
+                "COSIGN_LINUX_AMD64_SHA256: 0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            mutate(
+                &workflow,
+                "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
+                "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
+                "[ -z \"$actual_sha256\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"${#cosign_versions[@]}\" -ne 1 ] || [ \"${cosign_versions[0]}\" != \"$COSIGN_VERSION\" ]",
+                "[ \"${#cosign_versions[@]}\" -eq 0 ]",
             ),
             mutate(
                 &workflow,

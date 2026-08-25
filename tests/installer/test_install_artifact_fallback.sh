@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Verifies that install.sh selects the Linux GNU artifact during network
-# preflight when the preferred x86_64 MUSL asset is absent but the GNU asset is
-# available. This keeps ACFS and direct installs from warning on releases that
-# only publish GNU Linux artifacts.
+# Verifies artifact fallback plus the fail-closed release-evidence contract
+# shared by the Unix and Windows installers: exact tag identity, checksum and
+# Sigstore witnesses, exact archive inventory, and exact staged/post-install
+# binary versions.
 
 set -euo pipefail
 
@@ -58,6 +58,8 @@ extract_function() {
     extract_function err
     extract_function error_support_hint
     echo 'verbose() { :; }'
+    extract_function establish_release_contract
+    extract_function capture_command_with_timeout
     extract_function set_artifact_url
     extract_function artifact_url_for_target_ext
     extract_function artifact_url_for_target
@@ -78,9 +80,14 @@ extract_function() {
     extract_function resolve_and_verify_archive_checksum
     extract_function verify_sigstore_bundle
     extract_function verify_release_archive
+    extract_function verify_archive_members_exact
+    extract_function binary_version_matches_exact
+    extract_function verify_release_binaries_exact
 } >"$extract"
 
-for required in set_artifact_url check_network select_linux_x86_64_gnu_artifact_if_available verify_release_archive; do
+for required in establish_release_contract set_artifact_url check_network \
+    select_linux_x86_64_gnu_artifact_if_available verify_release_archive \
+    verify_archive_members_exact verify_release_binaries_exact; do
     if ! grep -q "^${required}()" "$extract"; then
         echo "FATAL: could not extract ${required} from install.sh" >&2
         exit 2
@@ -136,6 +143,33 @@ if [ "${1:-}" = "version" ]; then
 fi
 if [ -n "${COSIGN_LOG:-}" ]; then
     printf '%s\n' "$@" >>"$COSIGN_LOG"
+fi
+
+certificate_identity="${COSIGN_CERTIFICATE_IDENTITY:-}"
+identity=""
+identity_regexp=""
+args=("$@")
+for ((index = 0; index < ${#args[@]}; index++)); do
+    case "${args[$index]}" in
+        --certificate-identity)
+            index=$((index + 1))
+            identity="${args[$index]:-}"
+            ;;
+        --certificate-identity-regexp)
+            index=$((index + 1))
+            identity_regexp="${args[$index]:-}"
+            ;;
+    esac
+done
+
+if [ -n "$certificate_identity" ]; then
+    if [ -n "$identity" ]; then
+        [ "$certificate_identity" = "$identity" ] || exit 42
+    elif [ -n "$identity_regexp" ]; then
+        [[ "$certificate_identity" =~ $identity_regexp ]] || exit 42
+    else
+        exit 42
+    fi
 fi
 exit "${COSIGN_VERIFY_RC:-0}"
 SHIM
@@ -370,8 +404,9 @@ TMP="${CASE_TMP:?}"
 CHECKSUM="${CHECKSUM_OVERRIDE:-}"
 CHECKSUM_URL=""
 SIGSTORE_BUNDLE_URL=""
-COSIGN_IDENTITY_RE='^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+VERSION="${REQUESTED_VERSION:-v9.9.9}"
+establish_release_contract
 
 download_to_file() {
     local _url="$1"
@@ -434,6 +469,8 @@ run_verification_case() {
         ARCHIVE_SHA256="$archive_sha256" ARTIFACT_NAME="$archive_name" \
         ARTIFACT_URL="$artifact_url" COSIGN_LOG="$tmp/$name.cosign.log" \
         CHECKSUM_OVERRIDE="${CHECKSUM_OVERRIDE:-}" WITNESS_MODE="${WITNESS_MODE:-valid}" \
+        REQUESTED_VERSION="${REQUESTED_VERSION:-v9.9.9}" \
+        COSIGN_CERTIFICATE_IDENTITY="${COSIGN_CERTIFICATE_IDENTITY:-https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9}" \
         COSIGN_VERIFY_RC="${COSIGN_VERIFY_RC:-0}" \
         PATH="$tmp/bin:$PATH" "$@" "$verification_harness" \
         >"$tmp/$name.out" 2>&1
@@ -450,6 +487,21 @@ fi
 if ! grep -q 'No SHA256 checksum witness is available' "$tmp/verify_missing_checksum.out"; then
     echo "FAIL: missing checksum failure was not actionable" >&2
     cat "$tmp/verify_missing_checksum.out" >&2
+    exit 1
+fi
+
+if CHECKSUM_OVERRIDE='not-a-sha256-digest' WITNESS_MODE=valid \
+    run_verification_case verify_invalid_checksum bash; then
+    echo "FAIL: malformed checksum witness must abort archive verification" >&2
+    exit 1
+fi
+if [ -s "$tmp/verify_invalid_checksum.cosign.log" ]; then
+    echo "FAIL: signature verification ran after malformed checksum failure" >&2
+    exit 1
+fi
+if ! grep -q 'Invalid SHA256 checksum witness' "$tmp/verify_invalid_checksum.out"; then
+    echo "FAIL: malformed checksum witness failure was not actionable" >&2
+    cat "$tmp/verify_invalid_checksum.out" >&2
     exit 1
 fi
 
@@ -508,8 +560,8 @@ printf '%s\n' \
     'verify-blob' \
     '--bundle' \
     "$tmp/verify_success/release.sigstore.json" \
-    '--certificate-identity-regexp' \
-    '^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$' \
+    '--certificate-identity' \
+    'https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9' \
     '--certificate-oidc-issuer' \
     'https://token.actions.githubusercontent.com' \
     "$archive_file" >"$expected_cosign_log"
@@ -519,25 +571,168 @@ if ! cmp -s "$expected_cosign_log" "$tmp/verify_success.cosign.log"; then
     exit 1
 fi
 
+step "scenario H: release tags normalize narrowly and another tag cannot authenticate"
+contract_output=$(EXTRACT="$extract" REQUESTED_VERSION='9.9.9-rc.1' bash -c '
+    set -euo pipefail
+    source "$EXTRACT"
+    VERSION="$REQUESTED_VERSION"
+    establish_release_contract
+    printf "%s\n%s\n%s\n" "$VERSION" "$EXPECTED_RELEASE_VERSION" "$COSIGN_IDENTITY"
+')
+expected_contract_output=$(printf '%s\n' \
+    'v9.9.9-rc.1' \
+    '9.9.9-rc.1' \
+    'https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9-rc.1')
+if [ "$contract_output" != "$expected_contract_output" ]; then
+    echo "FAIL: Unix release contract did not canonicalize the exact requested tag" >&2
+    printf 'Expected:\n%s\nObserved:\n%s\n' "$expected_contract_output" "$contract_output" >&2
+    exit 1
+fi
+for invalid_version in 'v9.9.9+build' 'release-v9.9.9' 'v9.9.9/../../other'; do
+    if EXTRACT="$extract" REQUESTED_VERSION="$invalid_version" bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        VERSION="$REQUESTED_VERSION"
+        establish_release_contract
+    '; then
+        echo "FAIL: invalid release version was accepted: $invalid_version" >&2
+        exit 1
+    fi
+done
+
+if CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE=valid COSIGN_VERIFY_RC=0 \
+    COSIGN_CERTIFICATE_IDENTITY='https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.8' \
+    run_verification_case verify_wrong_tag bash; then
+    echo "FAIL: a valid older-tag certificate must not authenticate v9.9.9" >&2
+    exit 1
+fi
+if ! grep -q 'Sigstore verification failed' "$tmp/verify_wrong_tag.out"; then
+    echo "FAIL: wrong-tag replay did not surface an actionable Sigstore failure" >&2
+    cat "$tmp/verify_wrong_tag.out" >&2
+    exit 1
+fi
+
 no_verify_line=$(grep -nF 'if [ "$NO_VERIFY" -eq 1 ]; then' "$INSTALL_SH" | tail -1 | cut -d: -f1)
 verify_call_line=$(grep -nF 'verify_release_archive "$TMP/$TAR" "$URL" "$TAR"' "$INSTALL_SH" | cut -d: -f1)
-extract_line=$(grep -nF 'tar -xf "$TMP/$TAR" -C "$TMP"' "$INSTALL_SH" | cut -d: -f1)
+members_line=$(grep -nF 'verify_archive_members_exact "$TMP/$TAR"' "$INSTALL_SH" | cut -d: -f1)
+extract_line=$(grep -nF 'tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"' "$INSTALL_SH" | cut -d: -f1)
+verify_gate_end_line=$(awk -v first="$verify_call_line" -v last="$members_line" \
+    'NR > first && NR < last && $0 == "fi" { line = NR } END { print line }' "$INSTALL_SH")
+verify_gate_fi_count=$(awk -v first="$verify_call_line" -v last="$members_line" \
+    'NR > first && NR < last && $0 == "fi" { count++ } END { print count + 0 }' "$INSTALL_SH")
 if ! grep -Fxq 'NO_VERIFY=0' "$INSTALL_SH" || \
     ! grep -Fq -- '--no-verify) NO_VERIFY=1; shift;;' "$INSTALL_SH"; then
     echo "FAIL: Unix archive verification must default on and require an explicit --no-verify escape" >&2
     exit 1
 fi
-if [ -z "$no_verify_line" ] || [ -z "$verify_call_line" ] || [ -z "$extract_line" ] || \
-    [ "$no_verify_line" -ge "$verify_call_line" ] || [ "$verify_call_line" -ge "$extract_line" ]; then
-    echo "FAIL: Unix verification/bypass gate must be explicit and precede extraction" >&2
+if [ -z "$no_verify_line" ] || [ -z "$verify_call_line" ] || [ -z "$verify_gate_end_line" ] || \
+    [ "$verify_gate_fi_count" -ne 2 ] || [ -z "$members_line" ] || [ -z "$extract_line" ] || \
+    [ "$no_verify_line" -ge "$verify_call_line" ] || \
+    [ "$verify_call_line" -ge "$verify_gate_end_line" ] || [ "$verify_gate_end_line" -ge "$members_line" ] || \
+    [ "$members_line" -ge "$extract_line" ]; then
+    echo "FAIL: Unix cryptographic and member gates must be explicit and precede extraction" >&2
     exit 1
 fi
 
-step "scenario H: PowerShell installer statically enforces the same pre-extraction contract"
-identity_re='^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
-if ! grep -Fq "COSIGN_IDENTITY_RE='$identity_re'" "$INSTALL_SH" || \
-    ! grep -Fq "\$CosignIdentityRegex = '$identity_re'" "$INSTALL_PS1"; then
-    echo "FAIL: installers do not share the exact dist workflow identity regex" >&2
+step "scenario I: archive inventory and staged versions are exact before replacement"
+member_root="$tmp/archive-member-fixtures"
+mkdir -p "$member_root/exact" "$member_root/extra" "$member_root/nested/bundle" \
+    "$member_root/missing" "$member_root/symlink"
+
+make_version_fixture() {
+    local path="$1"
+    local output="$2"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" %q\n' "$output" >"$path"
+    chmod +x "$path"
+}
+
+make_version_fixture "$member_root/exact/am" 'am 9.9.9'
+make_version_fixture "$member_root/exact/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
+cp "$member_root/exact/am" "$member_root/extra/am"
+cp "$member_root/exact/mcp-agent-mail" "$member_root/extra/mcp-agent-mail"
+printf '%s\n' unexpected >"$member_root/extra/README.txt"
+cp "$member_root/exact/am" "$member_root/nested/bundle/am"
+cp "$member_root/exact/mcp-agent-mail" "$member_root/nested/bundle/mcp-agent-mail"
+cp "$member_root/exact/am" "$member_root/missing/am"
+cp "$member_root/exact/am" "$member_root/symlink/am"
+ln -s "$member_root/exact/mcp-agent-mail" "$member_root/symlink/mcp-agent-mail"
+
+tar -cf "$member_root/exact.tar" -C "$member_root/exact" am mcp-agent-mail
+tar -cf "$member_root/extra.tar" -C "$member_root/extra" am mcp-agent-mail README.txt
+tar -cf "$member_root/nested.tar" -C "$member_root/nested" bundle/am bundle/mcp-agent-mail
+tar -cf "$member_root/missing.tar" -C "$member_root/missing" am
+tar -cf "$member_root/symlink.tar" -C "$member_root/symlink" am mcp-agent-mail
+
+run_member_case() {
+    local archive="$1"
+    EXTRACT="$extract" CASE_TMP="$member_root" ARCHIVE_FILE="$archive" bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        TMP="$CASE_TMP"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        verify_archive_members_exact "$ARCHIVE_FILE"
+    '
+}
+
+run_member_case "$member_root/exact.tar"
+for bad_archive in extra nested missing symlink; do
+    if run_member_case "$member_root/$bad_archive.tar"; then
+        echo "FAIL: $bad_archive archive inventory must be rejected" >&2
+        exit 1
+    fi
+done
+
+version_root="$tmp/version-fixtures"
+mkdir -p "$version_root/good" "$version_root/wrong-cli" "$version_root/wrong-server"
+make_version_fixture "$version_root/good/am" 'am 9.9.9'
+make_version_fixture "$version_root/good/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
+make_version_fixture "$version_root/wrong-cli/am" 'am 9.9.8'
+make_version_fixture "$version_root/wrong-cli/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
+make_version_fixture "$version_root/wrong-server/am" 'am 9.9.9'
+make_version_fixture "$version_root/wrong-server/mcp-agent-mail" 'mcp-agent-mail 9.9.8'
+
+run_version_case() {
+    local fixture_dir="$1"
+    EXTRACT="$extract" CASE_TMP="$version_root" FIXTURE_DIR="$fixture_dir" bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        TMP="$CASE_TMP"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        VERSION=v9.9.9
+        EXPECTED_RELEASE_VERSION=9.9.9
+        verify_release_binaries_exact "$FIXTURE_DIR/mcp-agent-mail" "$FIXTURE_DIR/am" "Staged"
+    '
+}
+
+run_version_case "$version_root/good"
+for bad_versions in wrong-cli wrong-server; do
+    if run_version_case "$version_root/$bad_versions"; then
+        echo "FAIL: $bad_versions fixture must be rejected before replacement" >&2
+        exit 1
+    fi
+done
+
+staged_version_line=$(grep -nF 'verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"' "$INSTALL_SH" | cut -d: -f1)
+replace_line=$(grep -nF 'atomic_install "$SERVER_BIN" "$DEST/$BIN_SERVER"' "$INSTALL_SH" | cut -d: -f1)
+installed_version_line=$(grep -nF 'verify_release_binaries_exact "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI" "Installed"' "$INSTALL_SH" | cut -d: -f1)
+if [ -z "$staged_version_line" ] || [ -z "$replace_line" ] || [ -z "$installed_version_line" ] || \
+    [ "$staged_version_line" -ge "$replace_line" ] || [ "$replace_line" -ge "$installed_version_line" ]; then
+    echo "FAIL: Unix exact version checks must bracket binary replacement" >&2
+    exit 1
+fi
+
+step "scenario J: PowerShell installer statically enforces the same exact-release contract"
+if ! grep -Fq 'COSIGN_IDENTITY="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/${VERSION}"' "$INSTALL_SH" || \
+    ! grep -Fq 'CertificateIdentity = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/$normalizedTag"' "$INSTALL_PS1"; then
+    echo "FAIL: installers do not derive the certificate identity from the exact normalized tag" >&2
+    exit 1
+fi
+if grep -Fq 'refs/tags/.+$' "$INSTALL_SH" || grep -Fq 'refs/tags/.+$' "$INSTALL_PS1" || \
+    grep -Fq -- '--certificate-identity-regexp' "$INSTALL_SH" || \
+    grep -Fq -- '--certificate-identity-regexp' "$INSTALL_PS1"; then
+    echo "FAIL: broad cross-tag certificate identity matching remains in an installer" >&2
     exit 1
 fi
 if ! grep -Fq "COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'" "$INSTALL_SH" || \
@@ -548,20 +743,42 @@ fi
 
 ps_gate_line=$(grep -nF 'if ($ShouldVerifyArchive) {' "$INSTALL_PS1" | cut -d: -f1)
 ps_sigstore_line=$(grep -nF 'Verify-SigstoreBundle -FilePath $zipPath' "$INSTALL_PS1" | cut -d: -f1)
+ps_members_line=$(grep -nF 'Assert-ExactArchiveMembers -ArchivePath $zipPath' "$INSTALL_PS1" | cut -d: -f1)
 ps_extract_line=$(grep -nF 'Expand-Archive -LiteralPath $zipPath' "$INSTALL_PS1" | cut -d: -f1)
+ps_gate_end_line=$(awk -v first="$ps_sigstore_line" -v last="$ps_members_line" \
+    'NR > first && NR < last && $0 == "    }" { line = NR } END { print line }' "$INSTALL_PS1")
+ps_staged_version_line=$(grep -nF 'Assert-ExactBinaryVersion -BinaryPath $amSource -ExpectedOutput "am $requestedNormalized" -Phase "Staged"' "$INSTALL_PS1" | cut -d: -f1)
+ps_replace_line=$(grep -nF 'Install-BinariesAtomically -AmSource $amSource -ServerSource $serverSource -InstallDir $Dest' "$INSTALL_PS1" | cut -d: -f1)
+ps_post_version_line=$(grep -nF 'Verify-Install -InstallDir $Dest -ExpectedVersion $requestedNormalized' "$INSTALL_PS1" | cut -d: -f1)
 if ! grep -Fq '$ShouldVerifyArchive = if ($NoVerify) { $false } else { $true }' "$INSTALL_PS1"; then
     echo "FAIL: PowerShell archive verification must default on and require an explicit -NoVerify escape" >&2
     exit 1
 fi
-if [ -z "$ps_gate_line" ] || [ -z "$ps_sigstore_line" ] || [ -z "$ps_extract_line" ] || \
-    [ "$ps_gate_line" -ge "$ps_sigstore_line" ] || [ "$ps_sigstore_line" -ge "$ps_extract_line" ]; then
-    echo "FAIL: PowerShell checksum/Sigstore gate must precede Expand-Archive" >&2
+if [ -z "$ps_gate_line" ] || [ -z "$ps_sigstore_line" ] || [ -z "$ps_gate_end_line" ] || \
+    [ -z "$ps_members_line" ] || [ -z "$ps_extract_line" ] || \
+    [ "$ps_gate_line" -ge "$ps_sigstore_line" ] || [ "$ps_sigstore_line" -ge "$ps_gate_end_line" ] || \
+    [ "$ps_gate_end_line" -ge "$ps_members_line" ] || [ "$ps_members_line" -ge "$ps_extract_line" ]; then
+    echo "FAIL: PowerShell cryptographic and member gates must precede Expand-Archive" >&2
+    exit 1
+fi
+if [ -z "$ps_staged_version_line" ] || [ -z "$ps_replace_line" ] || \
+    [ -z "$ps_post_version_line" ] || [ "$ps_staged_version_line" -ge "$ps_replace_line" ] || \
+    [ "$ps_replace_line" -ge "$ps_post_version_line" ]; then
+    echo "FAIL: PowerShell exact version checks must bracket binary replacement" >&2
     exit 1
 fi
 for required_text in \
     'Get-Command Get-FileHash -ErrorAction SilentlyContinue' \
     'Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue' \
     'ConvertFrom-Json -ErrorAction Stop' \
+    '"--certificate-identity", $CosignIdentity' \
+    "'^v?(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'" \
+    '$CosignIdentity = $releaseContract.CertificateIdentity' \
+    '$entries.Count -eq 2' \
+    '$versionLines.Count -ne 1' \
+    'Assert-ExactBinaryVersion -BinaryPath $serverSource -ExpectedOutput "mcp-agent-mail $requestedNormalized" -Phase "Staged"' \
+    'Assert-ExactBinaryVersion -BinaryPath $serverExe -ExpectedOutput "mcp-agent-mail $ExpectedVersion" -Phase "Post-install"' \
+    'Archive-member and exact-version checks remain mandatory.' \
     'UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)'; do
     if ! grep -Fq "$required_text" "$INSTALL_PS1"; then
         echo "FAIL: PowerShell fail-closed control missing: $required_text" >&2

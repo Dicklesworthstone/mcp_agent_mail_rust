@@ -3544,11 +3544,68 @@ fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
     }
 }
 
+/// Whether dispatch requires a trusted canonical user `config.env` authority.
+///
+/// Keep this recovery surface deliberately small. Most commands derive a
+/// mailbox, listener, or archive target from [`Config`]; after an unsafe
+/// higher-precedence file is suppressed, letting them continue could mutate a
+/// default or otherwise unintended target. Capability reflection is
+/// configuration-independent. Setup and doctor are the repair/diagnostic
+/// surfaces. Supervisor status, logs, and restart remain available so an
+/// operator can drain or replace a live owner before repair, but service
+/// installation is intentionally not exempt because it persists config-derived
+/// values.
+fn command_requires_trusted_user_env(command: Option<&Commands>) -> bool {
+    !matches!(
+        command,
+        Some(
+            Commands::Capabilities { .. }
+                | Commands::Doctor { .. }
+                | Commands::Setup { .. }
+                | Commands::Service {
+                    action: ServiceCommand::Status
+                        | ServiceCommand::Logs { .. }
+                        | ServiceCommand::Restart,
+                }
+        )
+    )
+}
+
+/// Execute a dispatch closure only after the user-env authority gate succeeds.
+///
+/// Keeping the ordering in one helper makes the negative proof
+/// mutation-sensitive: returning an authority error must make it impossible for
+/// the dispatch closure (and therefore any DB/archive/listener/filesystem side
+/// effect) to run.
+fn dispatch_after_user_env_guard<V, D>(
+    requires_trusted_user_env: bool,
+    validate: V,
+    dispatch: D,
+) -> CliResult<()>
+where
+    V: FnOnce() -> CliResult<()>,
+    D: FnOnce() -> CliResult<()>,
+{
+    if requires_trusted_user_env {
+        validate()?;
+    }
+    dispatch()
+}
+
 fn execute(cli: Cli) -> CliResult<()> {
-    let command = match cli.command {
-        Some(cmd) => cmd,
-        None => return handle_default_launch(),
-    };
+    let command = cli.command;
+    let requires_trusted_user_env = command_requires_trusted_user_env(command.as_ref());
+    dispatch_after_user_env_guard(
+        requires_trusted_user_env,
+        || Config::from_env().validate_user_env_authority().map_err(Into::into),
+        || match command {
+            Some(command) => dispatch_command(command),
+            None => handle_default_launch(),
+        },
+    )
+}
+
+fn dispatch_command(command: Commands) -> CliResult<()> {
     // #126(a): mark the thread as read-intent BEFORE handlers open the pool,
     // so the DB-init / archive-reconcile path can suppress the
     // mailbox-mutation refusal that otherwise blocks reads while a
@@ -41077,6 +41134,138 @@ fn current_uid() -> CliResult<u32> {
 mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn unsafe_user_env_authority_stops_dispatch_before_side_effects() {
+        let dispatch_called = std::cell::Cell::new(false);
+        let result = dispatch_after_user_env_guard(
+            true,
+            || Err(CliError::Other("unsafe user config authority".to_string())),
+            || {
+                dispatch_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(
+            matches!(result, Err(CliError::Other(message)) if message == "unsafe user config authority")
+        );
+        assert!(
+            !dispatch_called.get(),
+            "a failed authority guard must stop dispatch before any handler side effect"
+        );
+    }
+
+    #[test]
+    fn trusted_user_env_authority_preserves_dispatch() {
+        let validation_called = std::cell::Cell::new(false);
+        let dispatch_called = std::cell::Cell::new(false);
+        dispatch_after_user_env_guard(
+            true,
+            || {
+                validation_called.set(true);
+                Ok(())
+            },
+            || {
+                dispatch_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("trusted authority should preserve ordinary dispatch");
+
+        assert!(validation_called.get());
+        assert!(dispatch_called.get());
+    }
+
+    #[test]
+    fn recovery_exemption_bypasses_only_the_authority_validator() {
+        let validation_called = std::cell::Cell::new(false);
+        let dispatch_called = std::cell::Cell::new(false);
+        dispatch_after_user_env_guard(
+            false,
+            || {
+                validation_called.set(true);
+                Err(CliError::Other("validator must be bypassed".to_string()))
+            },
+            || {
+                dispatch_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("a recovery command must reach its own handler");
+
+        assert!(!validation_called.get());
+        assert!(dispatch_called.get());
+    }
+
+    #[test]
+    fn user_env_authority_exemptions_are_narrow_and_explicit() {
+        let capabilities = Commands::Capabilities {
+            format: None,
+            json: false,
+        };
+        let doctor = Commands::Doctor {
+            action: DoctorCommand::Backups {
+                format: None,
+                json: false,
+            },
+        };
+        let setup = Commands::Setup {
+            action: SetupCommand::Status {
+                format: None,
+                json: false,
+                agent: None,
+                token: None,
+                port: 8765,
+                host: "127.0.0.1".to_string(),
+                path: "/mcp/".to_string(),
+                project_dir: None,
+                no_user_config: false,
+                no_hooks: false,
+            },
+        };
+        let service_status = Commands::Service {
+            action: ServiceCommand::Status,
+        };
+        let service_logs = Commands::Service {
+            action: ServiceCommand::Logs {
+                lines: 10,
+                follow: false,
+            },
+        };
+        let service_restart = Commands::Service {
+            action: ServiceCommand::Restart,
+        };
+
+        for recovery_command in [
+            capabilities,
+            doctor,
+            setup,
+            service_status,
+            service_logs,
+            service_restart,
+        ] {
+            assert!(!command_requires_trusted_user_env(Some(&recovery_command)));
+        }
+
+        let service_install = Commands::Service {
+            action: ServiceCommand::Install {
+                host: None,
+                port: None,
+                no_auth: false,
+            },
+        };
+        let destructive_mailbox_command = Commands::ClearAndResetEverything {
+            force: true,
+            archive: false,
+            no_archive: true,
+        };
+        assert!(command_requires_trusted_user_env(None));
+        assert!(command_requires_trusted_user_env(Some(&service_install)));
+        assert!(command_requires_trusted_user_env(Some(
+            &destructive_mailbox_command
+        )));
+    }
 
     fn canonical_test_tempdir(prefix: &str) -> tempfile::TempDir {
         let temp_root = std::fs::canonicalize(std::env::temp_dir())

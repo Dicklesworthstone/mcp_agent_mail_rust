@@ -19,7 +19,7 @@
 #   --quiet            Suppress non-error output
 #   --verbose          Enable detailed installer diagnostics
 #   --no-gum           Disable gum formatting even if available
-#   --no-verify        UNSAFE: skip pre-extraction checksum + signature verification
+#   --no-verify        UNSAFE: skip checksum + signature checks (shape/version checks remain)
 #   --offline          Skip network preflight checks
 #   --force            Force reinstall even if already at version
 #   --migrate          Force Python->Rust migration/displacement when Python install detected
@@ -50,8 +50,9 @@ FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
-COSIGN_IDENTITY_RE='^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
+COSIGN_IDENTITY=""
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
 SYSTEM=0
@@ -335,6 +336,28 @@ resolve_version() {
     warn "Could not resolve latest version; defaulting to $VERSION"
   fi
   verbose "resolve_version:done resolved=${VERSION}"
+}
+
+# Canonicalize the requested release into the exact tag/version contract used
+# by dist.yml. Build metadata is intentionally rejected because published tags
+# do not admit it. The Sigstore certificate identity is a literal, not a
+# cross-tag regular expression, so a valid bundle from another release cannot
+# authenticate the requested archive.
+establish_release_contract() {
+  local requested="$VERSION"
+  local release_pattern='^v?([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'
+  local LC_ALL=C
+
+  if [[ ! "$requested" =~ $release_pattern ]]; then
+    err "Invalid release version: ${requested:-<empty>}"
+    err "Expected vX.Y.Z or vX.Y.Z-prerelease (a leading v is optional)."
+    return 1
+  fi
+
+  EXPECTED_RELEASE_VERSION="${BASH_REMATCH[1]}"
+  VERSION="v${EXPECTED_RELEASE_VERSION}"
+  COSIGN_IDENTITY="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/${VERSION}"
+  verbose "release_contract:tag=${VERSION} version=${EXPECTED_RELEASE_VERSION} identity=${COSIGN_IDENTITY}"
 }
 
 detect_platform() {
@@ -6148,12 +6171,12 @@ verify_sigstore_bundle() {
   if ! cosign verify-blob \
     ${nbf_flag:+$nbf_flag} \
     --bundle "$bundle_file" \
-    --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
+    --certificate-identity "$COSIGN_IDENTITY" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
     verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=${nbf_flag:-off}"
     err "Sigstore verification failed for ${file}."
-    err "The bundle must be valid and signed by ${COSIGN_IDENTITY_RE} via ${COSIGN_OIDC_ISSUER}."
+    err "The bundle must be valid and signed by ${COSIGN_IDENTITY} via ${COSIGN_OIDC_ISSUER}."
     return 1
   fi
 
@@ -6172,35 +6195,85 @@ verify_release_archive() {
   return 0
 }
 
+# Verify the archive inventory without extracting it. Release archives are
+# deliberately flat and contain exactly two non-empty regular files. This gate
+# remains mandatory under --no-verify: that flag bypasses cryptographic witness
+# verification, not archive-shape safety or release-version identity.
+verify_archive_members_exact() {
+  local archive_file="$1"
+  local members_file="$TMP/release-archive-members.txt"
+  local details_file="$TMP/release-archive-members.verbose.txt"
+  local actual_members expected_members member_count regular_count
+
+  if ! tar -tf "$archive_file" >"$members_file"; then
+    err "Could not read release archive inventory: $archive_file"
+    return 1
+  fi
+
+  actual_members=$(LC_ALL=C sort "$members_file")
+  expected_members=$(printf '%s\n' "$BIN_CLI" "$BIN_SERVER" | LC_ALL=C sort)
+  member_count=$(wc -l <"$members_file" | tr -d '[:space:]')
+  if [ "$member_count" != "2" ] || [ "$actual_members" != "$expected_members" ]; then
+    err "Release archive members are invalid."
+    err "Expected exactly the flat files: $BIN_CLI and $BIN_SERVER"
+    return 1
+  fi
+
+  if ! tar -tvf "$archive_file" >"$details_file"; then
+    err "Could not inspect release archive member types: $archive_file"
+    return 1
+  fi
+  regular_count=$(awk 'substr($0, 1, 1) == "-" { count++ } END { print count + 0 }' "$details_file")
+  if [ "$regular_count" != "2" ]; then
+    err "Release archive must contain exactly two regular files (no links or directories)."
+    return 1
+  fi
+
+  return 0
+}
+
+binary_version_matches_exact() {
+  local binary_path="$1"
+  local expected_output="$2"
+
+  CAPTURED_CMD_OUTPUT=""
+  CAPTURED_CMD_STATUS=0
+  [ -x "$binary_path" ] || return 1
+  capture_command_with_timeout 3 "$binary_path" --version || return 1
+  [ "$CAPTURED_CMD_OUTPUT" = "$expected_output" ]
+}
+
+verify_release_binaries_exact() {
+  local server_path="$1"
+  local cli_path="$2"
+  local phase="$3"
+  local expected_cli="am ${EXPECTED_RELEASE_VERSION}"
+  local expected_server="mcp-agent-mail ${EXPECTED_RELEASE_VERSION}"
+
+  if ! binary_version_matches_exact "$cli_path" "$expected_cli"; then
+    err "${phase} $BIN_CLI has the wrong release version."
+    err "Expected exactly: $expected_cli"
+    err "Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
+    return 1
+  fi
+  if ! binary_version_matches_exact "$server_path" "$expected_server"; then
+    err "${phase} $BIN_SERVER has the wrong release version."
+    err "Expected exactly: $expected_server"
+    err "Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
+    return 1
+  fi
+
+  ok "${phase} binaries match release ${VERSION}"
+  return 0
+}
+
 # Check if installed version matches target
 check_installed_version() {
   local target_version="$1"
-  if [ ! -x "$DEST/$BIN_CLI" ]; then
-    return 1
-  fi
-
-  local installed_version
-  if capture_command_with_timeout 3 "$DEST/$BIN_CLI" --version; then
-    installed_version=$(printf '%s\n' "$CAPTURED_CMD_OUTPUT" | head -1 | sed 's/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/')
-  else
-    if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
-      verbose "check_installed_version:timeout path=${DEST}/$BIN_CLI"
-    fi
-    return 1
-  fi
-
-  if [ -z "$installed_version" ]; then
-    return 1
-  fi
-
   local target_clean="${target_version#v}"
-  local installed_clean="${installed_version#v}"
 
-  if [ "$target_clean" = "$installed_clean" ]; then
-    return 0
-  fi
-
-  return 1
+  binary_version_matches_exact "$DEST/$BIN_CLI" "am ${target_clean}" || return 1
+  binary_version_matches_exact "$DEST/$BIN_SERVER" "mcp-agent-mail ${target_clean}"
 }
 
 EXISTING_INSTALL_REPAIR_REASON=""
@@ -6423,7 +6496,8 @@ Options:
   --verbose          Enable detailed installer diagnostics
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
-  --no-verify        UNSAFE: skip pre-extraction checksum + Sigstore verification
+  --no-verify        UNSAFE: skip checksum + Sigstore checks; archive shape and
+                     exact staged/installed version checks remain mandatory
                      (only for a trusted local artifact)
   --force            Force reinstall even if same version is installed
   --migrate          Force Python->Rust migration/displacement when Python install is detected
@@ -6546,6 +6620,10 @@ if [ "$QUIET" -eq 0 ]; then
 fi
 
 resolve_version
+if ! establish_release_contract; then
+  error_usage_hint
+  exit 2
+fi
 detect_platform
 set_artifact_url
 
@@ -6597,10 +6675,11 @@ print_install_plan() {
     echo "  Method:     Download pre-built binary"
     [ -n "${URL:-}" ] && echo "  URL:        $URL"
     if [ "$NO_VERIFY" -eq 1 ]; then
-      echo "  Integrity:  UNSAFE verification bypass (--no-verify)"
+      echo "  Integrity:  UNSAFE cryptographic verification bypass (--no-verify)"
     else
       echo "  Integrity:  required SHA256 + Sigstore/cosign before extraction"
     fi
+    echo "  Release:    exact archive members + staged/installed version required"
   fi
   echo ""
 
@@ -6931,6 +7010,7 @@ fi
 # the risk with --no-verify. This gate always runs before the first tar command.
 if [ "$NO_VERIFY" -eq 1 ]; then
   warn "UNSAFE: archive checksum and Sigstore verification skipped (--no-verify)"
+  warn "Archive-member and exact-version checks remain mandatory."
 else
   if ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then
     err "Archive verification failed; aborting before extraction or installation."
@@ -6940,61 +7020,41 @@ else
   fi
 fi
 
+if ! verify_archive_members_exact "$TMP/$TAR"; then
+  err "Archive member verification failed; aborting before extraction or installation."
+  error_support_hint
+  exit 1
+fi
+
 info "Extracting"
-tar -xf "$TMP/$TAR" -C "$TMP"
+EXTRACT_DIR="$TMP/extract"
+mkdir "$EXTRACT_DIR"
+tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"
 
-# Nested-archive detection: some releases accidentally nest a second archive
-# inside the outer archive. If we find one after the first extraction, unpack it too.
-shopt -s nullglob
-for nested in "$TMP"/*.tar.gz "$TMP"/mcp-agent-mail-*/*.tar.gz; do
-  if [ -f "$nested" ]; then
-    verbose "extract:nested_archive detected=${nested}"
-    warn "Nested archive detected (${nested##*/}); extracting inner archive"
-    tar -xzf "$nested" -C "$(dirname "$nested")"
-    rm -f "$nested"
+SERVER_BIN="$EXTRACT_DIR/$BIN_SERVER"
+CLI_BIN="$EXTRACT_DIR/$BIN_CLI"
+for staged_binary in "$SERVER_BIN" "$CLI_BIN"; do
+  if [ ! -f "$staged_binary" ] || [ -L "$staged_binary" ] || \
+     [ ! -s "$staged_binary" ] || [ ! -x "$staged_binary" ]; then
+    err "Release archive member is not a non-empty executable regular file: $staged_binary"
+    error_support_hint
+    exit 1
   fi
 done
-for nested in "$TMP"/*.tar.xz "$TMP"/mcp-agent-mail-*/*.tar.xz; do
-  # Skip the original download artifact itself
-  [ "$nested" = "$TMP/$TAR" ] && continue
-  if [ -f "$nested" ]; then
-    verbose "extract:nested_archive detected=${nested}"
-    warn "Nested archive detected (${nested##*/}); extracting inner archive"
-    tar -xJf "$nested" -C "$(dirname "$nested")"
-    rm -f "$nested"
-  fi
-done
-shopt -u nullglob
 
-# Find binaries in the extracted archive
-find_bin() {
-  local name="$1"
-  local bin="$TMP/$name"
-  if [ -x "$bin" ]; then echo "$bin"; return 0; fi
-  bin="$TMP/mcp-agent-mail-${TARGET}/$name"
-  if [ -x "$bin" ]; then echo "$bin"; return 0; fi
-  bin=$(find "$TMP" -maxdepth 3 -type f -name "$name" -perm -111 | head -n 1)
-  if [ -x "$bin" ]; then echo "$bin"; return 0; fi
-  return 1
-}
-
-SERVER_BIN=$(find_bin "$BIN_SERVER") || {
-  err "Binary $BIN_SERVER not found in archive"
-  err "The release artifact may be malformed or incomplete."
-  err "Re-run installer with a cache buster or pin a different --version."
+if ! verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"; then
+  err "Release archive version verification failed; existing binaries were not replaced."
   error_support_hint
   exit 1
-}
-CLI_BIN=$(find_bin "$BIN_CLI") || {
-  err "Binary $BIN_CLI not found in archive"
-  err "The release artifact may be malformed or incomplete."
-  err "Re-run installer with a cache buster or pin a different --version."
-  error_support_hint
-  exit 1
-}
+fi
 
 atomic_install "$SERVER_BIN" "$DEST/$BIN_SERVER"
 atomic_install "$CLI_BIN" "$DEST/$BIN_CLI"
+if ! verify_release_binaries_exact "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI" "Installed"; then
+  err "Post-install release verification failed."
+  error_support_hint
+  exit 1
+fi
 ok "Installed to $DEST"
 ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
@@ -8145,14 +8205,22 @@ verify_installation() {
     issues=$((issues + 1))
   fi
 
-  # 2. Check version output
-  local version_out
-  version_out=$("$DEST/$BIN_CLI" --version 2>&1 || true)
-  if [ -z "$version_out" ]; then
-    warn "VERIFY: 'am --version' produced no output"
+  # 2. Re-check the exact requested release for both installed binaries.
+  local expected_cli="am ${EXPECTED_RELEASE_VERSION}"
+  local expected_server="mcp-agent-mail ${EXPECTED_RELEASE_VERSION}"
+  if ! binary_version_matches_exact "$DEST/$BIN_CLI" "$expected_cli"; then
+    warn "VERIFY: '$BIN_CLI --version' did not equal '$expected_cli'"
+    warn "  Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
     issues=$((issues + 1))
   else
-    ok "VERIFY: $version_out"
+    ok "VERIFY: $expected_cli"
+  fi
+  if ! binary_version_matches_exact "$DEST/$BIN_SERVER" "$expected_server"; then
+    warn "VERIFY: '$BIN_SERVER --version' did not equal '$expected_server'"
+    warn "  Observed: ${CAPTURED_CMD_OUTPUT:-<no version output>}"
+    issues=$((issues + 1))
+  else
+    ok "VERIFY: $expected_server"
   fi
 
   # 3. Check binary command surfaces (prevents swapped/mispackaged installs)

@@ -8,7 +8,7 @@
     -Version vX.Y.Z   Install a specific release tag (default: latest)
     -Dest PATH        Install directory (default: %LOCALAPPDATA%\Programs\mcp-agent-mail)
     -Force            Reinstall even if the same version is already present
-    -NoVerify         UNSAFE: skip pre-extraction checksum + Sigstore verification
+    -NoVerify         UNSAFE: skip checksum + Sigstore checks (shape/version checks remain)
     -Verify           Explicitly require archive verification (already the default)
 #>
 
@@ -31,7 +31,7 @@ $AssetName = "mcp-agent-mail-$Target.zip"
 $DefaultDest = Join-Path $env:LOCALAPPDATA "Programs\mcp-agent-mail"
 $IssuesUrl = "https://github.com/$Owner/$Repo/issues"
 $ReleasesUrl = "https://github.com/$Owner/$Repo/releases"
-$CosignIdentityRegex = '^https://github\.com/Dicklesworthstone/mcp_agent_mail_rust/\.github/workflows/dist\.yml@refs/tags/.+$'
+$CosignIdentity = ""
 $CosignOidcIssuer = 'https://token.actions.githubusercontent.com'
 
 if ([string]::IsNullOrWhiteSpace($Dest)) {
@@ -70,23 +70,27 @@ function Write-WarnText {
     Write-Host "!! $Message" -ForegroundColor Yellow
 }
 
-function Normalize-Version {
+function Get-ReleaseContract {
     param([string]$RawVersion)
     if ([string]::IsNullOrWhiteSpace($RawVersion)) {
-        return ""
+        throw "Release version is empty. Pass -Version vX.Y.Z or allow the installer to resolve the latest release."
     }
     $trimmed = $RawVersion.Trim()
-    $semverMatch = [regex]::Match(
+    $releaseMatch = [regex]::Match(
         $trimmed,
-        "(?<!\d)v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z\.-]+)?(?:\+[0-9A-Za-z\.-]+)?)"
+        '^v?(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'
     )
-    if ($semverMatch.Success) {
-        return $semverMatch.Groups[1].Value
+    if (-not $releaseMatch.Success) {
+        throw "Invalid release version '$trimmed'. Expected vX.Y.Z or vX.Y.Z-prerelease (a leading v is optional)."
     }
-    if ($trimmed.StartsWith("v", [System.StringComparison]::OrdinalIgnoreCase)) {
-        return $trimmed.Substring(1)
+
+    $normalizedVersion = $releaseMatch.Groups['version'].Value
+    $normalizedTag = "v$normalizedVersion"
+    return [pscustomobject]@{
+        Tag = $normalizedTag
+        Version = $normalizedVersion
+        CertificateIdentity = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/$normalizedTag"
     }
-    return $trimmed
 }
 
 function Resolve-Version {
@@ -105,24 +109,6 @@ function Resolve-Version {
     }
 
     return [string]$response.tag_name
-}
-
-function Get-InstalledVersion {
-    param([string]$InstallDir)
-    $amExe = Join-Path $InstallDir "am.exe"
-    if (-not (Test-Path -LiteralPath $amExe)) {
-        return ""
-    }
-
-    try {
-        $line = (& $amExe --version 2>$null | Select-Object -First 1)
-        if ($null -eq $line) {
-            return ""
-        }
-        return ([string]$line).Trim()
-    } catch {
-        return ""
-    }
 }
 
 function Ensure-UserPathEntry {
@@ -280,17 +266,97 @@ function Verify-SigstoreBundle {
     $cosignArgs = @(
         "verify-blob",
         "--bundle", $bundlePath,
-        "--certificate-identity-regexp", $CosignIdentityRegex,
+        "--certificate-identity", $CosignIdentity,
         "--certificate-oidc-issuer", $CosignOidcIssuer,
         $FilePath
     )
     $cosignOutput = @(& $cosignCommand.Source @cosignArgs 2>&1)
     if ($LASTEXITCODE -ne 0) {
         $detail = ($cosignOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-        throw "Sigstore verification failed. The bundle must be valid and signed by $CosignIdentityRegex via $CosignOidcIssuer. cosign output: $detail"
+        throw "Sigstore verification failed. The bundle must be valid and signed by $CosignIdentity via $CosignOidcIssuer. cosign output: $detail"
     }
 
     Write-Ok "Signature verified (cosign)"
+}
+
+function Assert-ExactArchiveMembers {
+    param([string]$ArchivePath)
+
+    if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
+        throw "Release archive is missing: $ArchivePath"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $entries = @($archive.Entries)
+        $names = @($entries | ForEach-Object { $_.FullName })
+        $namesAreExact = (
+            $entries.Count -eq 2 -and
+            $names -ccontains "am.exe" -and
+            $names -ccontains "mcp-agent-mail.exe"
+        )
+        if (-not $namesAreExact) {
+            $observed = if ($names.Count -eq 0) { "<empty>" } else { $names -join ", " }
+            throw "Release archive members are '$observed'; expected exactly flat am.exe and mcp-agent-mail.exe."
+        }
+
+        foreach ($entry in $entries) {
+            $unixMode = ($entry.ExternalAttributes -shr 16) -band 0xFFFF
+            $fileType = $unixMode -band 0xF000
+            if ($entry.Length -le 0 -or ($fileType -ne 0 -and $fileType -ne 0x8000)) {
+                throw "Release archive member '$($entry.FullName)' is empty or is not a regular file."
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+function Assert-ExactBinaryVersion {
+    param(
+        [string]$BinaryPath,
+        [string]$ExpectedOutput,
+        [string]$Phase
+    )
+
+    if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
+        throw "$Phase binary is missing: $BinaryPath"
+    }
+
+    try {
+        $versionLines = @(& $BinaryPath --version 2>&1)
+        $versionExit = $LASTEXITCODE
+    } catch {
+        throw "$Phase version probe could not execute '$BinaryPath': $($_.Exception.Message)"
+    }
+
+    $actual = ($versionLines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    if ($versionExit -ne 0 -or $versionLines.Count -ne 1 -or $actual -cne $ExpectedOutput) {
+        $displayActual = if ([string]::IsNullOrEmpty($actual)) { "<no version output>" } else { $actual }
+        throw "$Phase '$BinaryPath --version' reported '$displayActual' (exit $versionExit); expected exactly '$ExpectedOutput'."
+    }
+}
+
+function Test-InstalledReleaseVersion {
+    param(
+        [string]$InstallDir,
+        [string]$ExpectedVersion
+    )
+
+    try {
+        Assert-ExactBinaryVersion `
+            -BinaryPath (Join-Path $InstallDir "am.exe") `
+            -ExpectedOutput "am $ExpectedVersion" `
+            -Phase "Installed"
+        Assert-ExactBinaryVersion `
+            -BinaryPath (Join-Path $InstallDir "mcp-agent-mail.exe") `
+            -ExpectedOutput "mcp-agent-mail $ExpectedVersion" `
+            -Phase "Installed"
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Install-BinariesAtomically {
@@ -540,7 +606,10 @@ function Ensure-SqliteDll {
 }
 
 function Verify-Install {
-    param([string]$InstallDir)
+    param(
+        [string]$InstallDir,
+        [string]$ExpectedVersion
+    )
     $amExe = Join-Path $InstallDir "am.exe"
     $serverExe = Join-Path $InstallDir "mcp-agent-mail.exe"
 
@@ -551,32 +620,23 @@ function Verify-Install {
         throw "Install verification failed: $serverExe is missing. Re-run with -Force and verify antivirus did not quarantine files under $InstallDir."
     }
 
-    $amVersion = (& $amExe --version 2>$null | Select-Object -First 1)
-    $serverVersion = (& $serverExe --version 2>$null | Select-Object -First 1)
-
-    if ([string]::IsNullOrWhiteSpace($amVersion)) {
-        throw "Install verification failed: am.exe --version returned no output. Re-run with -Force and run '$amExe --version' manually for diagnostics."
-    }
-    if ([string]::IsNullOrWhiteSpace($serverVersion)) {
-        throw "Install verification failed: mcp-agent-mail.exe --version returned no output. Re-run with -Force and run '$serverExe --version' manually for diagnostics."
-    }
-
-    Write-Ok "VERIFY am.exe -> $amVersion"
-    Write-Ok "VERIFY mcp-agent-mail.exe -> $serverVersion"
+    Assert-ExactBinaryVersion -BinaryPath $amExe -ExpectedOutput "am $ExpectedVersion" -Phase "Post-install"
+    Assert-ExactBinaryVersion -BinaryPath $serverExe -ExpectedOutput "mcp-agent-mail $ExpectedVersion" -Phase "Post-install"
+    Write-Ok "VERIFY am.exe -> am $ExpectedVersion"
+    Write-Ok "VERIFY mcp-agent-mail.exe -> mcp-agent-mail $ExpectedVersion"
 }
 
-$resolvedVersion = Resolve-Version -RequestedVersion $Version
-$requestedNormalized = Normalize-Version -RawVersion $resolvedVersion
+$requestedRelease = Resolve-Version -RequestedVersion $Version
+$releaseContract = Get-ReleaseContract -RawVersion $requestedRelease
+$resolvedVersion = $releaseContract.Tag
+$requestedNormalized = $releaseContract.Version
+$CosignIdentity = $releaseContract.CertificateIdentity
 Write-Info "Installing mcp-agent-mail $resolvedVersion for target $Target"
 
-$installedVersionRaw = Get-InstalledVersion -InstallDir $Dest
-if (-not [string]::IsNullOrWhiteSpace($installedVersionRaw) -and -not $Force) {
-    $installedNormalized = Normalize-Version -RawVersion $installedVersionRaw
-    if ($installedNormalized -eq $requestedNormalized) {
-        Write-Ok "mcp-agent-mail $resolvedVersion is already installed at $Dest"
-        Write-Host "Use -Force to reinstall."
-        exit 0
-    }
+if (-not $Force -and (Test-InstalledReleaseVersion -InstallDir $Dest -ExpectedVersion $requestedNormalized)) {
+    Write-Ok "mcp-agent-mail $resolvedVersion is already installed at $Dest"
+    Write-Host "Use -Force to reinstall."
+    exit 0
 }
 
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mcp-agent-mail-install-" + [Guid]::NewGuid().ToString("N"))
@@ -595,19 +655,32 @@ try {
         Verify-SigstoreBundle -FilePath $zipPath -AssetUrl $assetUrl -WorkDir $workDir
     } else {
         Write-WarnText "UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)"
+        Write-WarnText "Archive-member and exact-version checks remain mandatory."
     }
 
+    Assert-ExactArchiveMembers -ArchivePath $zipPath
     Write-Info "Extracting archive"
     Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
 
-    $amSource = Get-ChildItem -LiteralPath $extractDir -Filter "am.exe" -Recurse | Select-Object -First 1
-    $serverSource = Get-ChildItem -LiteralPath $extractDir -Filter "mcp-agent-mail.exe" -Recurse | Select-Object -First 1
-    if ($null -eq $amSource -or $null -eq $serverSource) {
-        throw "Release archive did not contain am.exe and mcp-agent-mail.exe. Retry download, pin a known-good -Version, or report at $IssuesUrl. Release list: $ReleasesUrl"
+    $amSource = Join-Path $extractDir "am.exe"
+    $serverSource = Join-Path $extractDir "mcp-agent-mail.exe"
+    foreach ($stagedPath in @($amSource, $serverSource)) {
+        if (-not (Test-Path -LiteralPath $stagedPath -PathType Leaf)) {
+            throw "Release archive did not extract the expected regular file '$stagedPath'. Retry download, pin a known-good -Version, or report at $IssuesUrl. Release list: $ReleasesUrl"
+        }
+        $stagedItem = Get-Item -LiteralPath $stagedPath
+        if (($stagedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $stagedItem.Length -le 0) {
+            throw "Release archive member '$stagedPath' is empty or is a reparse point; refusing installation."
+        }
     }
 
-    Install-BinariesAtomically -AmSource $amSource.FullName -ServerSource $serverSource.FullName -InstallDir $Dest
+    Assert-ExactBinaryVersion -BinaryPath $amSource -ExpectedOutput "am $requestedNormalized" -Phase "Staged"
+    Assert-ExactBinaryVersion -BinaryPath $serverSource -ExpectedOutput "mcp-agent-mail $requestedNormalized" -Phase "Staged"
+    Write-Ok "Staged binaries match release $resolvedVersion"
+
+    Install-BinariesAtomically -AmSource $amSource -ServerSource $serverSource -InstallDir $Dest
     Write-Ok "Installed binaries to $Dest (atomic replace)"
+    Verify-Install -InstallDir $Dest -ExpectedVersion $requestedNormalized
 
     $pythonModulePresent = Test-PythonModuleAvailable
     $pythonAmExecutables = @(Get-PythonAmExecutables -InstallDir $Dest)
@@ -631,7 +704,6 @@ try {
         Write-Info "User PATH already prioritizes $Dest"
     }
 
-    Verify-Install -InstallDir $Dest
 } finally {
     if (Test-Path -LiteralPath $workDir) {
         Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
