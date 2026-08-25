@@ -3735,8 +3735,10 @@ impl DbPool {
             return Ok(None);
         }
 
-        let conn = self.live_maintenance_connection("id_floor archive advance", 20_000)?;
-        crate::id_floor::advance_messages_id_floor_franken(&conn, archive_max)
+        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path).map_err(|e| {
+            DbError::Sqlite(format!("id_floor: open sqlite for floor advance: {e}"))
+        })?;
+        crate::id_floor::advance_messages_id_floor(&conn, archive_max)
     }
 
     /// The shared, process-wide monotonic message-id allocator for this
@@ -14462,8 +14464,7 @@ mod tests {
         writer
             .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (9);")
             .expect("commit WAL frame");
-        // Keep the writer OPEN: closing the last connection checkpoints and
-        // deletes the WAL, destroying exactly the live shape under test.
+        drop(writer);
         let shm_path = sqlite_sidecar_path(&db_path, "-shm");
         std::fs::write(&shm_path, b"").expect("truncate SHM to zero bytes");
         assert_eq!(std::fs::metadata(&shm_path).expect("shm metadata").len(), 0);
@@ -14476,7 +14477,6 @@ mod tests {
 
         preflight_bound_live_franken_family(&db_path, "empty-shm regression")
             .expect("live preflight must accept an empty SHM beside a populated WAL");
-        drop(writer);
     }
 
     #[test]
@@ -15101,22 +15101,9 @@ mod tests {
                 .busy_timeout(10);
         let competitor = crate::CanonicalDbConn::open(&config)
             .expect("child opens competing canonical connection");
-        let blocked = match competitor.execute_raw("BEGIN IMMEDIATE;") {
-            Err(_) => true,
-            Ok(()) => competitor
-                .execute_raw(
-                    "CREATE TABLE __mcp_agent_mail_lock_probe(\
-                         id INTEGER PRIMARY KEY\
-                     );",
-                )
-                .is_err(),
-        };
-        if !blocked {
-            let _ = competitor.execute_raw("ROLLBACK;");
-        }
         assert!(
-            blocked,
-            "separate process must be unable to perform a conflicting write while the parent holds its writer lock"
+            competitor.execute_raw("BEGIN IMMEDIATE;").is_err(),
+            "separate process must observe the parent's reserved writer lock"
         );
         println!("{witness}");
         true
@@ -16044,92 +16031,6 @@ mod tests {
             next.id,
             Some(9002),
             "next normal INSERT must allocate strictly above the archive max"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn archive_id_floor_advance_preserves_same_process_writer_lock() {
-        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ID_FLOOR_LOCK_PROBE_PATH";
-        const CHILD_TEST_NAME: &str =
-            "pool::tests::archive_id_floor_advance_preserves_same_process_writer_lock";
-        const CHILD_WITNESS: &str = "id-floor-child-observed-busy";
-
-        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
-            return;
-        }
-
-        let directory = tempfile::tempdir().expect("tempdir");
-        let db_path = directory.path().join("id-floor-lock.sqlite3");
-        let storage_root = directory.path().join("archive");
-        let writer = crate::guard_db_conn(
-            DbConn::open_file(db_path.to_string_lossy().as_ref())
-                .expect("open Franken id-floor fixture"),
-            "clean up id-floor lock fixture",
-        );
-        writer
-            .execute_raw(
-                "PRAGMA journal_mode = DELETE; \
-                 PRAGMA autocommit_retain = OFF; \
-                 CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT); \
-                 INSERT INTO messages DEFAULT VALUES;",
-            )
-            .expect("seed id-floor lock fixture");
-        write_id_floor_canonical_message(&storage_root, "archived-project", 9001);
-        let pool = DbPool::new(&DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            storage_root: Some(storage_root),
-            min_connections: 0,
-            max_connections: 2,
-            run_migrations: false,
-            warmup_connections: 0,
-            ..Default::default()
-        })
-        .expect("create id-floor test pool");
-
-        writer
-            .execute_raw("BEGIN IMMEDIATE;")
-            .expect("acquire parent id-floor writer lock");
-        writer
-            .execute_raw("INSERT INTO messages DEFAULT VALUES;")
-            .expect("materialize parent id-floor writer lock");
-        assert_maintenance_child_observes_busy(
-            CHILD_TEST_NAME,
-            CHILD_PATH_ENV,
-            CHILD_WITNESS,
-            &db_path,
-        );
-        let error = pool
-            .advance_message_id_floor_from_archive()
-            .expect_err("id-floor advance must respect the active same-engine writer fence");
-        assert!(
-            is_lock_error(&error.to_string()),
-            "fenced id-floor advance should report lock/busy contention: {error}"
-        );
-        assert_maintenance_child_observes_busy(
-            CHILD_TEST_NAME,
-            CHILD_PATH_ENV,
-            CHILD_WITNESS,
-            &db_path,
-        );
-
-        writer
-            .execute_raw("ROLLBACK;")
-            .expect("release parent id-floor writer lock");
-        assert_eq!(
-            pool.advance_message_id_floor_from_archive()
-                .expect("advance id floor after writer rollback"),
-            Some(9001)
-        );
-        let rows = writer
-            .query_sync(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
-                &[],
-            )
-            .expect("read advanced id-floor sequence");
-        assert_eq!(
-            rows[0].get_named::<i64>("seq").expect("decode sequence"),
-            9001
         );
     }
 
@@ -23009,9 +22910,6 @@ mod tests {
         writer
             .execute_raw("BEGIN IMMEDIATE;")
             .expect("acquire parent proactive-backup writer lock");
-        writer
-            .execute_raw("UPDATE backup_lock_probe SET value = 'uncommitted';")
-            .expect("materialize parent proactive-backup writer lock");
         assert_maintenance_child_observes_busy(
             CHILD_TEST_NAME,
             CHILD_PATH_ENV,

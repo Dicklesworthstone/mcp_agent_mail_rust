@@ -27,14 +27,14 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.7.1", package = "fastmcp-rust" }
-fastmcp-core = "0.7.1"
-fastmcp-server = "0.7.1"
-fastmcp-transport = "0.7.1"
-fastmcp-protocol = "0.7.1"
+fastmcp = { version = "0.7.0", package = "fastmcp-rust" }
+fastmcp-core = "0.7.0"
+fastmcp-server = "0.7.0"
+fastmcp-transport = "0.7.0"
+fastmcp-protocol = "0.7.0"
 
 # br-ba1ui: exact pins keep the shared Asupersync type universe coherent.
-# 2026-08-24: =0.4.9, lockstep with fastmcp 0.7.1 (which pins =0.4.9),
+# 2026-08-22: =0.4.9, lockstep with fastmcp 0.7.0 (which pins =0.4.9),
 # sqlmodel 0.4.0 (^0.4.9), and the fsqlite 0.3.9 registry baseline.
 # 0.4.9 is additive on the v0.4.3 public compatibility floor (RuntimeHandle
 # request-Cx / blocking-pool APIs, SQLite cancel correctness, owned-OTLP).
@@ -174,14 +174,14 @@ inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
 # 2026-08-22 registry adoption (asupersync =0.4.9 universe):
-# - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.1 pins =0.4.9).
+# - asupersync resolves from crates.io (=0.4.9; fastmcp 0.7.0 pins =0.4.9).
 # - fsqlite family resolves from crates.io (0.3.9) — the machine-specific
 #   /data/projects/frankensqlite path patches are GONE (they broke source
 #   builds on any host without that mount).
 # - sqlmodel family resolves from crates.io (=0.4.0, published 2026-08-21,
 #   accepting asupersync ^0.4.9 + fsqlite ^0.3.7) — the ../sqlmodel-rel-0327
 #   cleanup trigger fired, so those eight patch lines are gone too.
-# - fastmcp family resolves from crates.io (0.7.1).
+# - fastmcp family resolves from crates.io (0.7.0, published 2026-08-20).
 #
 # beads_rust: registry 0.3.2 still pins asupersync =0.4.4, unsatisfiable in
 # the =0.4.9 universe, so it stays path-patched to the ../beads_rust checkout
@@ -195,7 +195,7 @@ beads_rust = { path = "../beads_rust" }
 # whatever state each machine's sibling checkout happened to be in (a broken
 # frankentui HEAD was failing local builds outright).
 # rich_rust resolves from the registry (0.2.3) as of 2026-08-20 —
-# fastmcp-console 0.7.1 pins =0.2.3 and registry 0.2.3 carries the
+# fastmcp-console 0.6.0 pins =0.2.3 and registry 0.2.3 carries the
 # time ^0.3.54 req, so the 0.2.2 gated-clone patch is gone.
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
