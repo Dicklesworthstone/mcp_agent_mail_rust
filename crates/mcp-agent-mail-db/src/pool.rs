@@ -14464,7 +14464,8 @@ mod tests {
         writer
             .execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (9);")
             .expect("commit WAL frame");
-        drop(writer);
+        // Keep the writer OPEN: closing the last connection checkpoints and
+        // deletes the WAL, destroying exactly the live shape under test.
         let shm_path = sqlite_sidecar_path(&db_path, "-shm");
         std::fs::write(&shm_path, b"").expect("truncate SHM to zero bytes");
         assert_eq!(std::fs::metadata(&shm_path).expect("shm metadata").len(), 0);
@@ -14477,6 +14478,7 @@ mod tests {
 
         preflight_bound_live_franken_family(&db_path, "empty-shm regression")
             .expect("live preflight must accept an empty SHM beside a populated WAL");
+        drop(writer);
     }
 
     #[test]
