@@ -298,6 +298,17 @@ mod dist_release_contract {
         require_exactly(text, needle, 1)
     }
 
+    fn require_in_order(text: &str, needles: &[&str]) -> Result<(), String> {
+        let mut remainder = text;
+        for needle in needles {
+            let Some(index) = remainder.find(needle) else {
+                return Err(format!("required ordered marker is missing: {needle:?}"));
+            };
+            remainder = &remainder[index + needle.len()..];
+        }
+        Ok(())
+    }
+
     fn validate_action_pins(workflow: &str) -> Result<(), String> {
         let mut action_count = 0;
         for (line_index, line) in workflow.lines().enumerate() {
@@ -413,6 +424,14 @@ mod dist_release_contract {
         )?;
         require_exactly(workflow, "rustc --version --verbose", 3)?;
         require_exactly(workflow, "cargo --version --verbose", 3)?;
+        require_in_order(
+            workflow,
+            &[
+                "- name: Validate release bundle completeness",
+                "- name: Revalidate release tag immediately before publication",
+                "- name: Create GitHub Release",
+            ],
+        )?;
 
         for line in workflow.lines().map(str::trim) {
             if [
@@ -477,6 +496,11 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "server_version=\"$(staging/mcp-agent-mail --version)\"",
+                "server_version=\"$(staging/mcp-agent-mail --help)\"",
+            ),
+            mutate(
+                &workflow,
                 CHECKOUT_ACTION,
                 "actions/checkout@v4",
             ),
@@ -498,6 +522,11 @@ mod dist_release_contract {
             mutate(&workflow, "contents: read", "contents: write"),
             mutate(
                 &workflow,
+                "persist-credentials: false",
+                "persist-credentials: true",
+            ),
+            mutate(
+                &workflow,
                 "[ \"$sidecar_name\" != \"$artifact\" ]",
                 "[ -z \"$sidecar_name\" ]",
             ),
@@ -510,6 +539,11 @@ mod dist_release_contract {
                 &workflow,
                 "names != [\"am\", \"mcp-agent-mail\"]",
                 "names != [\"mcp-agent-mail\"]",
+            ),
+            mutate(
+                &workflow,
+                "names != [\"am.exe\", \"mcp-agent-mail.exe\"]",
+                "names != [\"mcp-agent-mail.exe\"]",
             ),
             mutate(
                 &workflow,

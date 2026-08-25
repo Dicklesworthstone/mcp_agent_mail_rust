@@ -3221,6 +3221,9 @@ pub fn detect_source(key: &str) -> ConfigSource {
     if user_env_value(key).is_some() {
         return ConfigSource::UserEnvFile;
     }
+    if user_env_load().authority_error.is_some() {
+        return ConfigSource::Default;
+    }
     if dotenv_value(key).is_some() {
         return ConfigSource::ProjectDotenv;
     }
@@ -3621,11 +3624,18 @@ pub fn process_env_value(key: &str) -> Option<String> {
 /// then the working-directory `.env`.
 #[must_use]
 pub fn env_value(key: &str) -> Option<String> {
-    layered_env_value(
-        process_env_value(key),
-        user_env_value(key),
-        dotenv_value(key),
-    )
+    if let Some(value) = process_env_value(key) {
+        return Some(value);
+    }
+    let user_env = user_env_load();
+    if user_env.authority_error.is_some() {
+        return None;
+    }
+    user_env
+        .values
+        .get(key)
+        .cloned()
+        .or_else(|| dotenv_value(key))
 }
 
 /// Read an **infrastructure-level** environment value.
@@ -3638,9 +3648,14 @@ pub fn env_value(key: &str) -> Option<String> {
 /// Precedence: process env -> user-global env file (only).
 #[must_use]
 pub fn infra_env_value(key: &str) -> Option<String> {
-    // Intentionally pass `None` for the project dotenv layer so that a
-    // project-local `.env` can never override infrastructure keys.
-    layered_env_value(process_env_value(key), user_env_value(key), None)
+    if let Some(value) = process_env_value(key) {
+        return Some(value);
+    }
+    let user_env = user_env_load();
+    if user_env.authority_error.is_some() {
+        return None;
+    }
+    user_env.values.get(key).cloned()
 }
 
 fn normalize_http_path(raw: &str) -> String {
