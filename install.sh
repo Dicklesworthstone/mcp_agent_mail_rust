@@ -2341,7 +2341,7 @@ private_file_security_identity() {
     esac
   elif metadata=$(LC_ALL=C stat -c '%d:%i:%F:%a:%h' "$path" 2>/dev/null); then
     case "$metadata" in
-      *:regular\ file:600:1)
+      *:regular*file:600:1)
         printf '%s' "$metadata"
         return 0
         ;;
