@@ -33,10 +33,9 @@ FAKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/fresh_install_home.XXXXXX")"
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 FAKE_DEST="${FAKE_HOME}/.local/bin"
 mkdir -p "$FAKE_DEST"
-AM_E2E_PRESERVE_TEMP="${AM_E2E_PRESERVE_TEMP:-0}"
 
 cleanup_fresh() {
-  if [ "$AM_E2E_PRESERVE_TEMP" = "1" ]; then
+  if [ "$AM_E2E_KEEP_TMP" = "1" ] || [ "$AM_E2E_KEEP_TMP" = "true" ]; then
     printf 'Preserved fresh-install sandbox: %s\n' "$FAKE_HOME" >&2
   else
     rm -rf "$FAKE_HOME" 2>/dev/null || true
@@ -238,7 +237,7 @@ else
   fi
 fi
 
-if [ "$AM_E2E_PRESERVE_TEMP" = "1" ]; then
+if [ "$AM_E2E_KEEP_TMP" = "1" ] || [ "$AM_E2E_KEEP_TMP" = "true" ]; then
   printf 'Preserved stdio sandbox: %s\n' "$SRV_WORK" >&2
 else
   rm -rf "$SRV_WORK" 2>/dev/null || true
@@ -595,7 +594,7 @@ EOF
     e2e_assert_eq "legacy am alias/function disabled in $(basename "${rc}")" "0" "${ACTIVE_ALIAS_COUNT}"
   done
 
-  if [ "$AM_E2E_PRESERVE_TEMP" = "1" ]; then
+  if [ "$AM_E2E_KEEP_TMP" = "1" ] || [ "$AM_E2E_KEEP_TMP" = "true" ]; then
     printf 'Preserved migration sandbox: %s\n' "$INSTALL_HOME" >&2
   else
     rm -rf "${INSTALL_HOME}" 2>/dev/null || true
