@@ -16559,6 +16559,290 @@ mod tests {
         );
     }
 
+    fn seed_pool_authority_sentinel(path: &Path, value: &str) {
+        let insert = match value {
+            "A" => "INSERT INTO pool_authority_sentinel(value) VALUES('A')",
+            "B" => "INSERT INTO pool_authority_sentinel(value) VALUES('B')",
+            other => panic!("unsupported pool-authority sentinel {other:?}"),
+        };
+        let conn = crate::CanonicalDbConn::open_file(
+            path.to_str()
+                .expect("temporary pool-authority path must be valid UTF-8"),
+        )
+        .expect("open pool-authority sentinel database");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use standalone journal mode for pool-authority fixture");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize pool-authority mailbox schema");
+        conn.execute_raw(
+            "CREATE TABLE pool_authority_sentinel(value TEXT NOT NULL UNIQUE)",
+        )
+        .expect("create pool-authority sentinel table");
+        conn.execute_raw(insert)
+            .expect("insert pool-authority sentinel");
+    }
+
+    fn read_pool_authority_sentinel(pool: &DbPool) -> String {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build pool-authority runtime");
+        let cx = Cx::for_testing();
+        runtime.block_on(async {
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire pool-authority connection");
+            let rows = conn
+                .query_sync("SELECT value FROM pool_authority_sentinel", &[])
+                .expect("read pool-authority sentinel");
+            assert_eq!(rows.len(), 1, "fixture must contain one sentinel row");
+            rows[0]
+                .get_named::<String>("value")
+                .expect("decode pool-authority sentinel")
+        })
+    }
+
+    #[test]
+    fn relative_sqlite_authority_is_frozen_across_cwd_change() {
+        const CHILD_CWD_A_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_CWD_A";
+        const CHILD_CWD_B_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_CWD_B";
+        const CHILD_STORAGE_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_STORAGE";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::relative_sqlite_authority_is_frozen_across_cwd_change";
+        const CHILD_WITNESS: &str = "relative-pool-authority-frozen";
+
+        if let Some(cwd_b) = std::env::var_os(CHILD_CWD_B_ENV) {
+            let cwd_a = PathBuf::from(
+                std::env::var_os(CHILD_CWD_A_ENV).expect("child cwd A authority"),
+            );
+            let cwd_b = PathBuf::from(cwd_b);
+            let storage_root = PathBuf::from(
+                std::env::var_os(CHILD_STORAGE_ENV).expect("child storage authority"),
+            );
+            assert_eq!(
+                std::env::current_dir().expect("child current directory"),
+                cwd_a,
+                "the child must construct the first pool under cwd A"
+            );
+
+            let config = DbPoolConfig {
+                database_url: "sqlite:///./mail.sqlite3".to_string(),
+                storage_root: Some(storage_root),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let pool_a = get_or_create_pool(&config).expect("construct cwd-A pool");
+            let identity_a = std::fs::canonicalize(cwd_a.join("mail.sqlite3"))
+                .expect("canonical cwd-A database");
+            assert_eq!(pool_a.sqlite_identity.as_deref(), Some(identity_a.as_path()));
+
+            std::env::set_current_dir(&cwd_b).expect("switch child to cwd B");
+            let pool_b = get_or_create_pool(&config).expect("construct cwd-B pool");
+            let identity_b = std::fs::canonicalize(cwd_b.join("mail.sqlite3"))
+                .expect("canonical cwd-B database");
+            assert_eq!(pool_b.sqlite_identity.as_deref(), Some(identity_b.as_path()));
+            assert!(
+                !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
+                "one relative spelling under different cwd authorities must not reuse a pool"
+            );
+            assert!(
+                !Arc::ptr_eq(
+                    &pool_a.message_id_allocator(),
+                    &pool_b.message_id_allocator(),
+                ),
+                "cwd-distinct SQLite files must not share a message-id allocator"
+            );
+            assert_eq!(
+                read_pool_authority_sentinel(&pool_a),
+                "A",
+                "the first pool must continue opening cwd A after the process moves to cwd B"
+            );
+            assert_eq!(read_pool_authority_sentinel(&pool_b), "B");
+
+            retire_cached_runtime_state_after_recovery(&identity_b, "cwd authority test");
+            assert!(pool_b.pool.is_closed(), "retirement must close cwd-B pool");
+            assert!(
+                pool_b.message_id_allocator().is_retired(),
+                "retirement must retire cwd-B allocator"
+            );
+            assert!(!pool_a.pool.is_closed(), "cwd-A pool must remain live");
+            assert!(
+                !pool_a.message_id_allocator().is_retired(),
+                "cwd-A allocator must remain authoritative"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("pool-authority tempdir");
+        let cwd_a = directory.path().join("cwd-a");
+        let cwd_b = directory.path().join("cwd-b");
+        let storage_root = directory.path().join("archive");
+        std::fs::create_dir_all(&cwd_a).expect("create cwd A");
+        std::fs::create_dir_all(&cwd_b).expect("create cwd B");
+        std::fs::create_dir_all(&storage_root).expect("create archive root");
+        seed_pool_authority_sentinel(&cwd_a.join("mail.sqlite3"), "A");
+        seed_pool_authority_sentinel(&cwd_b.join("mail.sqlite3"), "B");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(CHILD_TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .current_dir(&cwd_a)
+        .env(CHILD_CWD_A_ENV, &cwd_a)
+        .env(CHILD_CWD_B_ENV, &cwd_b)
+        .env(CHILD_STORAGE_ENV, &storage_root)
+        .output()
+        .expect("run relative pool-authority child");
+        assert!(
+            output.status.success(),
+            "relative pool-authority child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+            "child filter ran no causal relative-authority proof: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_retarget_cannot_cross_sqlite_authority() {
+        use std::os::unix::fs::symlink;
+
+        const CHILD_ALIAS_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_ALIAS";
+        const CHILD_NEXT_ALIAS_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_NEXT_ALIAS";
+        const CHILD_OLD_ALIAS_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_OLD_ALIAS";
+        const CHILD_DB_A_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_A";
+        const CHILD_DB_B_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_B";
+        const CHILD_STORAGE_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_SYMLINK_STORAGE";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::symlink_retarget_cannot_cross_sqlite_authority";
+        const CHILD_WITNESS: &str = "symlink-pool-authority-frozen";
+
+        if let Some(alias) = std::env::var_os(CHILD_ALIAS_ENV) {
+            let alias = PathBuf::from(alias);
+            let next_alias = PathBuf::from(
+                std::env::var_os(CHILD_NEXT_ALIAS_ENV).expect("replacement alias authority"),
+            );
+            let old_alias = PathBuf::from(
+                std::env::var_os(CHILD_OLD_ALIAS_ENV).expect("preserved alias authority"),
+            );
+            let db_a = PathBuf::from(
+                std::env::var_os(CHILD_DB_A_ENV).expect("database A authority"),
+            );
+            let db_b = PathBuf::from(
+                std::env::var_os(CHILD_DB_B_ENV).expect("database B authority"),
+            );
+            let storage_root = PathBuf::from(
+                std::env::var_os(CHILD_STORAGE_ENV).expect("symlink storage authority"),
+            );
+            let config = DbPoolConfig {
+                database_url: format!("sqlite:///{}", alias.display()),
+                storage_root: Some(storage_root),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+
+            let pool_a = get_or_create_pool(&config).expect("construct symlink-to-A pool");
+            let identity_a = std::fs::canonicalize(&db_a).expect("canonical database A");
+            assert_eq!(pool_a.sqlite_identity.as_deref(), Some(identity_a.as_path()));
+
+            std::fs::rename(&alias, &old_alias).expect("preserve original A alias");
+            std::fs::rename(&next_alias, &alias).expect("publish replacement B alias");
+            let pool_b = get_or_create_pool(&config).expect("construct symlink-to-B pool");
+            let identity_b = std::fs::canonicalize(&db_b).expect("canonical database B");
+            assert_eq!(pool_b.sqlite_identity.as_deref(), Some(identity_b.as_path()));
+            assert!(
+                !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
+                "retargeting a symlink to another file must not reuse the first pool"
+            );
+            assert!(
+                !Arc::ptr_eq(
+                    &pool_a.message_id_allocator(),
+                    &pool_b.message_id_allocator(),
+                ),
+                "symlink-distinct SQLite files must not share a message-id allocator"
+            );
+            assert_eq!(
+                read_pool_authority_sentinel(&pool_a),
+                "A",
+                "the first pool must keep opening database A after alias retarget"
+            );
+            assert_eq!(read_pool_authority_sentinel(&pool_b), "B");
+
+            retire_cached_runtime_state_after_recovery(&identity_b, "symlink authority test");
+            assert!(pool_b.pool.is_closed(), "retirement must close database-B pool");
+            assert!(
+                pool_b.message_id_allocator().is_retired(),
+                "retirement must retire database-B allocator"
+            );
+            assert!(!pool_a.pool.is_closed(), "database-A pool must remain live");
+            assert!(
+                !pool_a.message_id_allocator().is_retired(),
+                "database-A allocator must remain authoritative"
+            );
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("pool-authority tempdir");
+        let target_a = directory.path().join("target-a");
+        let target_b = directory.path().join("target-b");
+        let storage_root = directory.path().join("archive");
+        std::fs::create_dir_all(&target_a).expect("create target A");
+        std::fs::create_dir_all(&target_b).expect("create target B");
+        std::fs::create_dir_all(&storage_root).expect("create archive root");
+        let db_a = target_a.join("mail.sqlite3");
+        let db_b = target_b.join("mail.sqlite3");
+        seed_pool_authority_sentinel(&db_a, "A");
+        seed_pool_authority_sentinel(&db_b, "B");
+        let alias = directory.path().join("mail.sqlite3");
+        let next_alias = directory.path().join("mail-next.sqlite3");
+        let old_alias = directory.path().join("mail-original.sqlite3");
+        symlink(&db_a, &alias).expect("create database-A alias");
+        symlink(&db_b, &next_alias).expect("create database-B replacement alias");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(CHILD_TEST_NAME)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_ALIAS_ENV, &alias)
+        .env(CHILD_NEXT_ALIAS_ENV, &next_alias)
+        .env(CHILD_OLD_ALIAS_ENV, &old_alias)
+        .env(CHILD_DB_A_ENV, &db_a)
+        .env(CHILD_DB_B_ENV, &db_b)
+        .env(CHILD_STORAGE_ENV, &storage_root)
+        .output()
+        .expect("run symlink pool-authority child");
+        assert!(
+            output.status.success(),
+            "symlink pool-authority child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(CHILD_WITNESS),
+            "child filter ran no causal symlink-authority proof: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn independent_file_pools_share_allocator_by_normalized_sqlite_identity() {
         let dir = tempfile::tempdir().expect("tempdir");

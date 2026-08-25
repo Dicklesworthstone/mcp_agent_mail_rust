@@ -2846,6 +2846,11 @@ fn config_file_status_for_action(
     let omp_user_config_drift = omp_user_config_inspection
         .as_ref()
         .filter(|inspection| inspection.disabled || inspection.unsupported);
+    let omp_mcp_alias_inspection = (action.platform == AgentPlatform::Omp)
+        .then(|| inspect_omp_mcp_aliases(params, &action.file_path));
+    let omp_mcp_alias_drift = omp_mcp_alias_inspection
+        .as_ref()
+        .filter(|inspection| inspection.has_drift());
     let omp_settings_inspection = if action.platform == AgentPlatform::Omp
         && params.skip_user_config
     {
@@ -2865,6 +2870,9 @@ fn config_file_status_for_action(
     if let Some(inspection) = &omp_user_config_inspection {
         status_observations.push(inspection.observation.clone());
     }
+    if let Some(inspection) = &omp_mcp_alias_inspection {
+        status_observations.extend(inspection.observations.iter().cloned());
+    }
     if let Some(inspection) = &omp_settings_inspection {
         status_observations.extend(inspection.observations.iter().cloned());
     }
@@ -2873,12 +2881,19 @@ fn config_file_status_for_action(
         if let Some(drift) = &omp_user_config_drift {
             apply_omp_active_user_config_drift(&mut drift_reasons, drift);
         }
+        if omp_mcp_alias_drift.is_some() {
+            push_drift_reason(
+                &mut drift_reasons,
+                ConfigDriftReason::DuplicateServerEntries,
+            );
+        }
         if let Some(drift) = omp_settings_drift {
             apply_omp_settings_authority_drift(&mut drift_reasons, drift);
         }
         return ConfigFileStatus {
             path: action.file_path.display().to_string(),
             omp_active_user_config_drift: omp_user_config_drift.is_some(),
+            omp_mcp_alias_drift: omp_mcp_alias_drift.is_some(),
             omp_settings_config_drift: omp_settings_drift.is_some(),
             status_observations,
             redacted_path,
@@ -2897,6 +2912,7 @@ fn config_file_status_for_action(
                 params,
                 &drift_reasons,
                 omp_user_config_drift,
+                omp_mcp_alias_drift,
                 omp_settings_drift,
             ),
             drift_reasons,
@@ -2937,6 +2953,12 @@ fn config_file_status_for_action(
     if let Some(drift) = &omp_user_config_drift {
         apply_omp_active_user_config_drift(&mut analysis.drift_reasons, drift);
     }
+    if omp_mcp_alias_drift.is_some() {
+        push_drift_reason(
+            &mut analysis.drift_reasons,
+            ConfigDriftReason::DuplicateServerEntries,
+        );
+    }
     if let Some(drift) = omp_settings_drift {
         apply_omp_settings_authority_drift(&mut analysis.drift_reasons, drift);
     }
@@ -2944,6 +2966,7 @@ fn config_file_status_for_action(
     ConfigFileStatus {
         path: action.file_path.display().to_string(),
         omp_active_user_config_drift: omp_user_config_drift.is_some(),
+        omp_mcp_alias_drift: omp_mcp_alias_drift.is_some(),
         omp_settings_config_drift: omp_settings_drift.is_some(),
         status_observations,
         redacted_path,
@@ -2962,6 +2985,7 @@ fn config_file_status_for_action(
             params,
             &analysis.drift_reasons,
             omp_user_config_drift,
+            omp_mcp_alias_drift,
             omp_settings_drift,
         ),
         drift_reasons: analysis.drift_reasons,
@@ -4361,9 +4385,13 @@ fn setup_status_remediation_for_action(
     params: &SetupParams,
     reasons: &[ConfigDriftReason],
     omp_user_config_drift: Option<&OmpActiveUserConfigInspection>,
+    omp_mcp_alias_drift: Option<&OmpMcpAliasInspection>,
     omp_settings_drift: Option<&OmpSettingsAuthorityInspection>,
 ) -> String {
-    if omp_user_config_drift.is_none() && omp_settings_drift.is_none() {
+    if omp_user_config_drift.is_none()
+        && omp_mcp_alias_drift.is_none()
+        && omp_settings_drift.is_none()
+    {
         return setup_status_remediation(action, params, reasons);
     }
     let home = params.home_dir_override.clone().or_else(dirs::home_dir);
@@ -4407,6 +4435,17 @@ fn setup_status_remediation_for_action(
         authorities.push(format!(
             "active OMP user config {} globally disables Agent Mail",
             redact_path_for_status(&drift.path, home.as_deref())
+        ));
+    }
+    if let Some(drift) = omp_mcp_alias_drift {
+        let paths = drift
+            .conflict_paths
+            .iter()
+            .map(|path| redact_path_for_status(path, home.as_deref()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        authorities.push(format!(
+            "OMP loads a distinct noncanonical Agent Mail server alias from {paths}; hand-edit that read-only source to keep only `mcp-agent-mail`"
         ));
     }
     format!("{}; {dry_run}; {fix}", authorities.join("; "))
@@ -7265,6 +7304,82 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(malformed.remediation.starts_with(
             "inspect unsupported active OMP user config ~/.omp/profiles/work/agent/mcp.json"
         ));
+    }
+
+    #[test]
+    fn check_status_omp_secondary_sources_shadow_same_name_but_reject_distinct_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let project_primary = params.project_dir.join(".omp/mcp.json");
+        let project_secondary = params.project_dir.join(".omp/.mcp.json");
+        let user_primary = omp_active_user_config_path(&params);
+        let user_secondary = user_primary.parent().unwrap().join(".mcp.json");
+        for path in [
+            &project_primary,
+            &project_secondary,
+            &user_primary,
+            &user_secondary,
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let canonical = |url: &str| {
+            format!(
+                r#"{{"mcpServers":{{"mcp-agent-mail":{{"type":"http","url":"{url}"}}}}}}"#
+            )
+        };
+        std::fs::write(
+            &project_primary,
+            canonical("http://127.0.0.1:8765/mcp/"),
+        )
+        .unwrap();
+        for path in [&project_secondary, &user_primary, &user_secondary] {
+            std::fs::write(path, canonical("http://stale.example/mcp")).unwrap();
+        }
+
+        let same_name_shadowed = first_setup_status_file(&params);
+        assert!(
+            same_name_shadowed.drift_reasons.is_empty(),
+            "later canonical names are shadowed by the first project mcp.json definition"
+        );
+        assert!(!same_name_shadowed.omp_mcp_alias_drift);
+
+        std::fs::write(
+            &user_secondary,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let hidden_user_alias = first_setup_status_file(&params);
+        assert_eq!(
+            hidden_user_alias.primary_drift_reason,
+            ConfigDriftReason::DuplicateServerEntries
+        );
+        assert!(hidden_user_alias.omp_mcp_alias_drift);
+        assert!(hidden_user_alias.remediation.contains("~/.omp/agent/.mcp.json"));
+        assert!(!hidden_user_alias.remediation.contains("--no-user-config"));
+
+        std::fs::write(&user_secondary, canonical("http://stale.example/mcp")).unwrap();
+        std::fs::write(
+            &user_primary,
+            r#"{"mcpServers":{"agent-mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let primary_user_alias = first_setup_status_file(&params);
+        assert!(primary_user_alias.omp_mcp_alias_drift);
+        assert!(primary_user_alias.remediation.contains("~/.omp/agent/mcp.json"));
+
+        std::fs::write(&user_primary, canonical("http://stale.example/mcp")).unwrap();
+        std::fs::write(
+            &project_secondary,
+            r#"{"mcpServers":{"mcp_agent_mail":{"type":"http","url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let hidden_project_alias = first_setup_status_file(&params);
+        assert!(hidden_project_alias.omp_mcp_alias_drift);
+        assert!(
+            hidden_project_alias
+                .remediation
+                .contains(".omp/.mcp.json")
+        );
     }
 
     #[test]

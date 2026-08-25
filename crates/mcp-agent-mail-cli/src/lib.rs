@@ -8208,7 +8208,9 @@ fn project_only_omp_setup_drift(
                 .config_files
                 .iter()
                 .filter(|file| {
-                    file.omp_active_user_config_drift || file.omp_settings_config_drift
+                    file.omp_active_user_config_drift
+                        || file.omp_mcp_alias_drift
+                        || file.omp_settings_config_drift
                 })
                 .map(|file| setup_status_file_drift_summary(&status.slug, file))
         })
@@ -8283,20 +8285,21 @@ fn collect_setup_self_heal_file_fingerprints(
             }
         }
     }
-    if params.skip_user_config
-        && target_agents.contains(&mcp_agent_mail_core::setup::AgentPlatform::Omp)
-    {
-        // This file is intentionally not a setup action in project-only mode,
-        // but OMP's global disabledServers list still governs project entries.
-        // Fingerprint that read-only authority so the cache cannot bypass a
-        // status check after it changes.
-        let user_config = mcp_agent_mail_core::setup::omp_active_user_config_path(params);
-        if !paths.contains(&user_config) {
-            paths.push(user_config);
+    if target_agents.contains(&mcp_agent_mail_core::setup::AgentPlatform::Omp) {
+        // OMP loads the canonical and hidden native MCP files in both project
+        // and active-user scopes. Setup writes only the canonical primaries,
+        // but every path remains a runtime authority for exact-name shadowing
+        // and distinct-alias conflicts.
+        for mcp_path in mcp_agent_mail_core::setup::omp_mcp_authority_paths(params) {
+            if !paths.contains(&mcp_path) {
+                paths.push(mcp_path);
+            }
         }
-        for settings_path in mcp_agent_mail_core::setup::omp_settings_authority_paths(params) {
-            if !paths.contains(&settings_path) {
-                paths.push(settings_path);
+        if params.skip_user_config {
+            for settings_path in mcp_agent_mail_core::setup::omp_settings_authority_paths(params) {
+                if !paths.contains(&settings_path) {
+                    paths.push(settings_path);
+                }
             }
         }
     }

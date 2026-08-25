@@ -900,6 +900,70 @@ PY
     e2e_assert_eq "installer reuses one bearer token across OMP setup phases" \
       "valid" "${OMP_TOKEN_CONTRACT}"
 
+    OMP_ACTIVE_PRIMARY="${FAKE_HOME}/.omp/profiles/work/agent/mcp.json"
+    OMP_ACTIVE_SECONDARY="${FAKE_HOME}/.omp/profiles/work/agent/.mcp.json"
+    OMP_INACTIVE_PRIMARY="${FAKE_HOME}/.omp/profiles/inactive/agent/mcp.json"
+    OMP_DEFAULT_PRIMARY="${FAKE_HOME}/.omp/agent/mcp.json"
+    OMP_CUSTOM_PRIMARY="${FAKE_HOME}/custom-agent/mcp.json"
+    printf '%s\n' 'active-primary-sentinel' >"${OMP_ACTIVE_PRIMARY}"
+    printf '%s\n' 'active-secondary-sentinel' >"${OMP_ACTIVE_SECONDARY}"
+    printf '%s\n' 'inactive-primary-sentinel' >"${OMP_INACTIVE_PRIMARY}"
+    printf '%s\n' 'default-primary-sentinel' >"${OMP_DEFAULT_PRIMARY}"
+    printf '%s\n' 'custom-primary-sentinel' >"${OMP_CUSTOM_PRIMARY}"
+    OMP_ACTIVE_WRITE_CONTRACT="$(
+      # shellcheck disable=SC1090
+      source "${OMP_DETECT_LIBRARY}"
+      # shellcheck disable=SC1090
+      source "${OMP_SETUP_LIBRARY}"
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'installer-active-token'; }
+      # shellcheck disable=SC2329
+      generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
+      # shellcheck disable=SC2329
+      setup_claude_code_mcp_via_cli() { return 1; }
+      OMP_EFFECTIVE_WRITE_COUNT=0
+      OMP_EFFECTIVE_WRITE_PATH=""
+      # shellcheck disable=SC2329
+      setup_single_mcp_config() {
+        if [ "$1" = "omp" ]; then
+          OMP_EFFECTIVE_WRITE_COUNT=$((OMP_EFFECTIVE_WRITE_COUNT + 1))
+          OMP_EFFECTIVE_WRITE_PATH="$2"
+          printf '%s\n' "$4" >"$2"
+        fi
+        return 0
+      }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      err() { :; }
+      cd "${OMP_INSTALLER_DIR}"
+      export HOME="${FAKE_HOME}"
+      export OMP_PROFILE=work
+      export PI_PROFILE=inactive
+      export PI_CODING_AGENT_DIR="${FAKE_HOME}/custom-agent"
+      unset HTTP_BEARER_TOKEN
+      setup_mcp_configs "/unused/mcp-agent-mail"
+      printf '%s|%s' "${OMP_EFFECTIVE_WRITE_COUNT}" "${OMP_EFFECTIVE_WRITE_PATH}"
+    )"
+    e2e_assert_eq "installer writes only the effective active OMP primary config" \
+      "1|${OMP_ACTIVE_PRIMARY}" "${OMP_ACTIVE_WRITE_CONTRACT}"
+    e2e_assert_eq "active OMP primary receives the selected durable token" \
+      "installer-active-token" "$(cat "${OMP_ACTIVE_PRIMARY}")"
+    e2e_assert_eq "active OMP secondary remains read-only" \
+      "active-secondary-sentinel" "$(cat "${OMP_ACTIVE_SECONDARY}")"
+    e2e_assert_eq "inactive OMP profile remains byte-preserved" \
+      "inactive-primary-sentinel" "$(cat "${OMP_INACTIVE_PRIMARY}")"
+    e2e_assert_eq "default OMP profile remains byte-preserved while named profile is active" \
+      "default-primary-sentinel" "$(cat "${OMP_DEFAULT_PRIMARY}")"
+    e2e_assert_eq "default coding-agent override remains byte-preserved while named profile is active" \
+      "custom-primary-sentinel" "$(cat "${OMP_CUSTOM_PRIMARY}")"
+
     OMP_CONTAINMENT_FAILURE_WRITES="$(
       # An interpreter failure is not proof that an arbitrary config lives
       # outside the project. Shadow python3 to mutation-test the fail-closed
