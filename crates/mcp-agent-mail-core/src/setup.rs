@@ -1984,6 +1984,27 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
             path.display()
         ))
     })?;
+    // Hold one cooperative lock across the tracked-file probe, .gitignore
+    // read/append, and post-write verification. Locking only the individual
+    // Git commands leaves the intervening atomic file rewrite exposed to a
+    // lost-update race between concurrent setup/doctor processes.
+    let _secret_guard = if secure_gitignore {
+        let guard = crate::RepoFlock::acquire(&repo_root).map_err(|error| {
+            SetupError::Other(format!(
+                "cannot serialize secret-config protection in {}: {error}",
+                repo_root.display()
+            ))
+        })?;
+        if !guard.is_real() {
+            return Err(SetupError::Other(format!(
+                "cannot serialize secret-config protection in {} because its Git lock sentinel is unavailable",
+                repo_root.display()
+            )));
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let target = parent.join(file_name);
     let relative = target.strip_prefix(&repo_root).map_err(|_| {
         SetupError::Other(format!(
@@ -1997,11 +2018,11 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
         .env("LC_ALL", "C")
         .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
         .arg(relative.as_os_str());
-    let tracked_probe = if secure_gitignore {
-        tracked_probe
-    } else {
-        tracked_probe.skip_flock()
-    }
+    // The outer guard above owns the flock for mutating calls; dry-run calls
+    // deliberately create no sentinel. In either mode an inner flock would
+    // be redundant (and would deadlock when the outer guard is real).
+    let tracked_probe = tracked_probe
+        .skip_flock()
         .run()
         .map_err(|error| {
             SetupError::Other(format!(
@@ -2063,6 +2084,7 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
                     "--",
                 ])
                 .arg(&representative)
+                .skip_flock()
                 .run()
                 .map_err(|error| {
                     SetupError::Other(format!(
@@ -5187,6 +5209,11 @@ mod tests {
         let initial =
             merge_mcp_server(None, "mcpServers", "test", json!({"url": "http://a"})).unwrap();
         std::fs::write(&path, &initial).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
 
         let action = ConfigAction {
             platform: AgentPlatform::Cursor,
