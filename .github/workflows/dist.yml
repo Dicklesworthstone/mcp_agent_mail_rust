@@ -508,7 +508,6 @@ jobs:
               exit 1
             fi
             read -r sidecar_hash sidecar_name sidecar_extra <<< "${sidecar_lines[0]}"
-            sidecar_name="${sidecar_name#\*}"
             if [[ ! "$sidecar_hash" =~ ^[0-9a-f]{64}$ ]] \
                 || [ "$sidecar_name" != "$artifact" ] || [ -n "$sidecar_extra" ]; then
               echo "${artifact}.sha256 must name exactly ${artifact} with one SHA-256 digest" >&2
@@ -539,7 +538,7 @@ jobs:
           path = sys.argv[1]
           with tarfile.open(path, mode="r:xz") as archive:
               members = archive.getmembers()
-          names = sorted(member.name.removeprefix("./") for member in members)
+          names = sorted(member.name for member in members)
           if names != ["am", "mcp-agent-mail"]:
               raise SystemExit(f"{path} members are {names!r}, expected exactly flat am and mcp-agent-mail")
           if any(not member.isfile() or member.size <= 0 for member in members):
@@ -555,7 +554,7 @@ jobs:
           path = sys.argv[1]
           with zipfile.ZipFile(path) as archive:
               members = archive.infolist()
-          names = sorted(member.filename.removeprefix("./") for member in members)
+          names = sorted(member.filename for member in members)
           if names != ["am.exe", "mcp-agent-mail.exe"]:
               raise SystemExit(f"{path} members are {names!r}, expected exactly flat am.exe and mcp-agent-mail.exe")
           for member in members:

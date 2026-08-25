@@ -358,6 +358,9 @@ mod dist_release_contract {
         if workflow.contains("continue-on-error") {
             return Err("release gates must not continue after errors".to_string());
         }
+        if workflow.contains("sidecar_name=\"${sidecar_name#") {
+            return Err("checksum sidecar names must not be normalized".to_string());
+        }
 
         for (action, expected) in [
             (CHECKOUT_ACTION, 5),
@@ -396,7 +399,9 @@ mod dist_release_contract {
             "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
             "[ \"$sidecar_name\" != \"$artifact\" ]",
             "[ \"${#sums_hashes[@]}\" -ne 1 ]",
+            "names = sorted(member.name for member in members)",
             "names != [\"am\", \"mcp-agent-mail\"]",
+            "names = sorted(member.filename for member in members)",
             "names != [\"am.exe\", \"mcp-agent-mail.exe\"]",
             "expected_bundle_files=(SHA256SUMS)",
             "tag_name: ${{ needs.release_contract.outputs.tag }}",
@@ -499,11 +504,7 @@ mod dist_release_contract {
                 "server_version=\"$(staging/mcp-agent-mail --version)\"",
                 "server_version=\"$(staging/mcp-agent-mail --help)\"",
             ),
-            mutate(
-                &workflow,
-                CHECKOUT_ACTION,
-                "actions/checkout@v4",
-            ),
+            mutate(&workflow, CHECKOUT_ACTION, "actions/checkout@v4"),
             mutate(
                 &workflow,
                 TOOLCHAIN_ACTION,
@@ -532,13 +533,28 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "read -r sidecar_hash sidecar_name sidecar_extra <<< \"${sidecar_lines[0]}\"",
+                "read -r sidecar_hash sidecar_name sidecar_extra <<< \"${sidecar_lines[0]}\"\n            sidecar_name=\"${sidecar_name#\\*}\"",
+            ),
+            mutate(
+                &workflow,
                 "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
                 "[ \"${#sidecar_lines[@]}\" -eq 0 ]",
             ),
             mutate(
                 &workflow,
+                "names = sorted(member.name for member in members)",
+                "names = sorted(member.name.removeprefix(\"./\") for member in members)",
+            ),
+            mutate(
+                &workflow,
                 "names != [\"am\", \"mcp-agent-mail\"]",
                 "names != [\"mcp-agent-mail\"]",
+            ),
+            mutate(
+                &workflow,
+                "names = sorted(member.filename for member in members)",
+                "names = sorted(member.filename.removeprefix(\"./\") for member in members)",
             ),
             mutate(
                 &workflow,

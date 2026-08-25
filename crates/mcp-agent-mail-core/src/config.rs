@@ -5526,16 +5526,185 @@ mod tests {
     }
 
     #[test]
-    fn user_env_file_path_can_resolve_custom_xdg_without_home() {
+    fn user_env_load_can_resolve_custom_xdg_without_home() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let xdg = tmp.path().join("custom-config").join(XDG_APP_DIR);
         std::fs::create_dir_all(&xdg).unwrap();
         std::fs::write(xdg.join("config.env"), "FOO=custom\n").unwrap();
 
+        let load = load_user_env_values_from(None, Some(&xdg));
         assert_eq!(
-            user_env_file_path_from(None, Some(&xdg)),
-            Some(xdg.join("config.env"))
+            load.values.get("FOO").map(String::as_str),
+            Some("custom")
         );
+        assert!(load.authority_error.is_none());
+    }
+
+    #[test]
+    fn user_env_load_allows_legacy_migration_when_canonical_paths_are_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("missing-xdg").join(XDG_APP_DIR);
+        let legacy = tmp.path().join(".mcp_agent_mail");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=legacy\n").unwrap();
+
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert_eq!(
+            load.values.get("FOO").map(String::as_str),
+            Some("legacy")
+        );
+        assert!(load.authority_error.is_none());
+    }
+
+    #[test]
+    fn user_env_load_rejects_canonical_obstruction_without_legacy_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-xdg").join(XDG_APP_DIR);
+        let legacy = tmp.path().join(".mcp_agent_mail");
+        std::fs::create_dir_all(xdg.join("config.env")).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert!(load.values.is_empty());
+        assert!(
+            load.authority_error
+                .as_deref()
+                .is_some_and(|error| error.contains("config.env"))
+        );
+    }
+
+    #[test]
+    fn user_env_load_rejects_invalid_utf8_without_legacy_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-xdg").join(XDG_APP_DIR);
+        let legacy = tmp.path().join(".mcp_agent_mail");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(xdg.join("config.env"), [0xff, 0xfe, 0xfd]).unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert!(load.values.is_empty());
+        assert!(
+            load.authority_error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid utf-8"))
+        );
+    }
+
+    #[test]
+    fn user_env_load_rejects_oversized_file_without_legacy_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-xdg").join(XDG_APP_DIR);
+        let legacy = tmp.path().join(".mcp_agent_mail");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            xdg.join("config.env"),
+            vec![b'x'; usize::try_from(USER_ENV_FILE_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert!(load.values.is_empty());
+        assert!(
+            load.authority_error
+                .as_deref()
+                .is_some_and(|error| error.contains("exceeding"))
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn user_env_load_rejects_leaf_symlink_without_legacy_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-xdg").join(XDG_APP_DIR);
+        let legacy = tmp.path().join(".mcp_agent_mail");
+        let redirected = tmp.path().join("redirected.env");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(&redirected, "FOO=redirected\n").unwrap();
+        symlink(&redirected, xdg.join("config.env")).unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert!(load.values.is_empty());
+        assert!(load.authority_error.is_some());
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn user_env_load_rejects_parent_symlink_without_home_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg_root = tmp.path().join("custom-xdg");
+        let real_parent = tmp.path().join("real-parent");
+        let xdg = xdg_root.join(XDG_APP_DIR);
+        let portable = tmp.path().join(".config").join(XDG_APP_DIR);
+        std::fs::create_dir_all(&xdg_root).unwrap();
+        std::fs::create_dir_all(&real_parent).unwrap();
+        std::fs::create_dir_all(&portable).unwrap();
+        std::fs::write(real_parent.join("config.env"), "FOO=redirected\n").unwrap();
+        std::fs::write(portable.join("config.env"), "FOO=stale-home\n").unwrap();
+        symlink(&real_parent, &xdg).unwrap();
+
+        let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
+        assert!(load.values.is_empty());
+        assert!(load.authority_error.is_some());
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn user_env_parent_handle_remains_bound_across_path_replacement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("authority");
+        let replacement = tmp.path().join("replacement");
+        let detached = tmp.path().join("detached");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(parent.join("config.env"), "FOO=bound\n").unwrap();
+        std::fs::write(replacement.join("config.env"), "FOO=swapped\n").unwrap();
+        let candidate = parent.join("config.env");
+
+        let bytes = read_user_env_candidate_with_hooks(
+            &candidate,
+            || {
+                std::fs::rename(&parent, &detached).unwrap();
+                std::fs::rename(&replacement, &parent).unwrap();
+            },
+            || {},
+        )
+        .unwrap()
+        .expect("bound candidate");
+        assert_eq!(String::from_utf8(bytes).unwrap(), "FOO=bound\n");
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn user_env_leaf_handle_remains_bound_across_path_replacement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("authority");
+        let displaced = tmp.path().join("displaced.env");
+        std::fs::create_dir_all(&parent).unwrap();
+        let candidate = parent.join("config.env");
+        std::fs::write(&candidate, "FOO=bound\n").unwrap();
+
+        let bytes = read_user_env_candidate_with_hooks(
+            &candidate,
+            || {},
+            || {
+                std::fs::rename(&candidate, &displaced).unwrap();
+                std::fs::write(&candidate, "FOO=swapped\n").unwrap();
+            },
+        )
+        .unwrap()
+        .expect("bound candidate");
+        assert_eq!(String::from_utf8(bytes).unwrap(), "FOO=bound\n");
     }
 
     #[test]
@@ -5573,6 +5742,65 @@ mod tests {
             .arg("--exact")
             .arg("config::tests::fresh_process_runtime_prefers_custom_xdg_token_over_home_fallback")
             .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env_remove("HTTP_BEARER_TOKEN")
+            .status()
+            .expect("spawn isolated config child");
+        assert!(status.success(), "isolated config child failed: {status}");
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn fresh_process_runtime_rejects_unsafe_canonical_authority_without_fallback() {
+        use std::os::unix::fs::symlink;
+
+        const CHILD_MARKER: &str = "AM_TEST_UNSAFE_XDG_AUTHORITY_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let config = Config::from_env();
+            assert!(
+                config.http_bearer_token.is_none(),
+                "unsafe user authority must suppress HOME and project-dotenv token fallbacks"
+            );
+            let error = config
+                .validate_user_env_authority()
+                .expect_err("unsafe user authority must reject server startup");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("config.env"));
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("custom-config");
+        let redirected = tmp.path().join("redirected.env");
+        let home_config = home.join(".config").join(XDG_APP_DIR);
+        let xdg_config = xdg.join(XDG_APP_DIR);
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&home_config).unwrap();
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            home_config.join("config.env"),
+            "HTTP_BEARER_TOKEN=stale-home-token\n",
+        )
+        .unwrap();
+        std::fs::write(&redirected, "HTTP_BEARER_TOKEN=redirected-token\n").unwrap();
+        std::fs::write(
+            project.join(".env"),
+            "HTTP_BEARER_TOKEN=stale-project-token\n",
+        )
+        .unwrap();
+        symlink(&redirected, xdg_config.join("config.env")).unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg(
+                "config::tests::fresh_process_runtime_rejects_unsafe_canonical_authority_without_fallback",
+            )
+            .arg("--nocapture")
+            .current_dir(&project)
             .env(CHILD_MARKER, "1")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
