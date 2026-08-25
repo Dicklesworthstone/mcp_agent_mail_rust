@@ -6029,10 +6029,11 @@ pub async fn create_message(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let message_id = match id_allocator
-        .allocate(cx, db_floor, pool.storage_root())
-        .await
-    {
+    let storage_root = match pool.validated_storage_root("message creation archive allocator") {
+        Ok(storage_root) => storage_root,
+        Err(error) => return Outcome::Err(error),
+    };
+    let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
         Outcome::Ok(id) => id,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -6381,10 +6382,12 @@ async fn create_message_with_recipients_impl(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let message_id = match id_allocator
-            .allocate(cx, db_floor, pool.storage_root())
-            .await
-        {
+        let storage_root =
+            match pool.validated_storage_root("message creation archive allocator") {
+                Ok(storage_root) => storage_root,
+                Err(error) => return Outcome::Err(error),
+            };
+        let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
             Outcome::Ok(id) => id,
             Outcome::Err(error) => return Outcome::Err(error),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),

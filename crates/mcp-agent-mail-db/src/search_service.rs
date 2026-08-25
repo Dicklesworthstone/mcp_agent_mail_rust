@@ -938,12 +938,14 @@ fn sanitize_search_index_owner(value: &str) -> String {
         .collect()
 }
 
-fn direct_surface_index_dir(pool: &DbPool) -> PathBuf {
-    let shared = pool.storage_root().join("search_index");
+fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
+    let shared = pool
+        .validated_storage_root("lexical search index selection")?
+        .join("search_index");
     if shared.join("backfill_state.json").exists() || shared.join("meta.json").exists() {
-        return shared;
+        return Ok(shared);
     }
-    stable_direct_surface_index_dir(pool)
+    Ok(stable_direct_surface_index_dir(pool))
 }
 
 /// Read-only snapshot of the lexical Search V3 backfill/index state.
@@ -1077,11 +1079,31 @@ fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBack
 #[must_use]
 pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     let sqlite_key = sqlite_key_for_pool(pool);
-    let index_dir = direct_surface_index_dir(pool);
-    let index_dir_display = index_dir.display().to_string();
     let active_key = lexical_active_db_key()
         .lock()
         .map_or(None, |guard| guard.clone());
+    let index_dir = match direct_surface_index_dir(pool) {
+        Ok(index_dir) => index_dir,
+        Err(error) => {
+            return LexicalBackfillHealth {
+                state: "unavailable".to_string(),
+                db_identity: sqlite_key,
+                index_dir: stable_direct_surface_index_dir(pool).display().to_string(),
+                indexed_messages: 0,
+                source_messages: None,
+                skipped_messages: 0,
+                last_backfill_at_micros: None,
+                rebuild_in_progress: false,
+                active_db_identity: active_key,
+                stale_reason: Some(error.to_string()),
+                safe_remediation: Some(
+                    "Restore the configured storage-root path to its original filesystem authority, then retry lexical health"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+    let index_dir_display = index_dir.display().to_string();
 
     if pool.sqlite_path() == ":memory:" {
         return LexicalBackfillHealth {
@@ -1341,7 +1363,7 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
 
 fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = sqlite_key_for_pool(pool);
-    let index_dir = direct_surface_index_dir(pool);
+    let index_dir = direct_surface_index_dir(pool)?;
     let _guard = lexical_init_guard()
         .lock()
         .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
@@ -4782,7 +4804,7 @@ mod tests {
         let pool = crate::DbPool::new(&config).expect("pool");
 
         assert_eq!(
-            direct_surface_index_dir(&pool),
+            direct_surface_index_dir(&pool).expect("select shared index authority"),
             root.path().join("search_index")
         );
     }
@@ -4797,10 +4819,46 @@ mod tests {
         };
         let pool = crate::DbPool::new(&config).expect("pool");
 
-        let chosen = direct_surface_index_dir(&pool);
+        let chosen =
+            direct_surface_index_dir(&pool).expect("select stable fallback index authority");
         assert_ne!(chosen, root.path().join("search_index"));
         assert!(chosen.starts_with(stable_direct_surface_index_root()));
         assert_eq!(chosen, stable_direct_surface_index_dir(&pool));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_surface_index_dir_rejects_post_construction_storage_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let frozen_storage_root = root.path().join("missing-storage-root");
+        let foreign_storage_root = root.path().join("foreign-storage-root");
+        let foreign_index = foreign_storage_root.join("search_index");
+        std::fs::create_dir_all(&foreign_index).expect("create foreign search index");
+        std::fs::write(foreign_index.join("meta.json"), "{}")
+            .expect("write foreign index marker");
+        let pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", root.path().join("mail.sqlite3").display()),
+            storage_root: Some(frozen_storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("freeze missing storage-root authority");
+
+        symlink(&foreign_storage_root, &frozen_storage_root)
+            .expect("insert foreign storage-root symlink");
+        let error = direct_surface_index_dir(&pool)
+            .expect_err("search index selection must reject retargeted storage authority");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to cross archive authority"),
+            "unexpected authority error: {error}"
+        );
     }
 
     #[test]
