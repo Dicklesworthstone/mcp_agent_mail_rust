@@ -366,6 +366,7 @@ mod dist_release_contract {
             "sigstore/cosign-installer@",
             "cosign-release:",
             "sigstore/cosign/releases/latest",
+            "curl --insecure",
             "--certificate-identity-regexp",
             "--certificate-oidc-issuer-regexp",
             "--insecure-ignore-sct",
@@ -413,6 +414,7 @@ mod dist_release_contract {
             "\"$hash  $zipName`n\"",
             "COSIGN_VERSION: v3.1.3",
             "COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71",
+            "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
             "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
             "actual_sha256=\"$(sha256sum \"$cosign_path\" | awk '{print $1}')\"",
             "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
@@ -603,6 +605,11 @@ mod dist_release_contract {
                 &workflow,
                 "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
                 "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64",
+            ),
+            mutate(
+                &workflow,
+                "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
+                "curl --insecure --location \\",
             ),
             mutate(
                 &workflow,
