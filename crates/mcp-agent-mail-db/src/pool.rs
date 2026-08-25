@@ -4865,8 +4865,8 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
     for pool in &retired_pools {
         pool.close();
     }
+    let namespace = sqlite_identity_cache_namespace(identity);
     for generation in &retired_generations {
-        let namespace = sqlite_identity_cache_namespace(identity);
         crate::cache::read_cache()
             .invalidate_scope(&format!("{namespace}@{generation}"));
     }
@@ -5082,10 +5082,6 @@ fn validate_frozen_sqlite_open_authority(
         return Ok(());
     };
     let open_path = Path::new(sqlite_path);
-    if open_path == expected {
-        return Ok(());
-    }
-
     let observed = normalize_sqlite_identity_path_buf(open_path);
     if observed == expected {
         return Ok(());

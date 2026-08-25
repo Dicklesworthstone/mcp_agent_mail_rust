@@ -7958,6 +7958,19 @@ where
     self_heal(config)
 }
 
+fn require_canonical_setup_config_env_path(path: Option<PathBuf>) -> CliResult<PathBuf> {
+    path.ok_or_else(|| {
+        CliError::Other(
+            "Could not resolve an absolute config.env path; set HOME or set XDG_CONFIG_HOME to an absolute directory"
+                .to_string(),
+        )
+    })
+}
+
+fn canonical_setup_config_env_path() -> CliResult<PathBuf> {
+    require_canonical_setup_config_env_path(mcp_agent_mail_core::canonical_config_env_path())
+}
+
 /// Prepare a server runtime to start against the mailbox by clearing stale
 /// blockers and running doctor-grade database self-heal before boot.
 ///
@@ -7986,12 +7999,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     use mcp_agent_mail_core::setup;
 
     let project_dir = std::env::current_dir().unwrap_or_default();
-    let config_env_file = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("mcp-agent-mail")
-        .join("config.env");
+    let config_env_file = canonical_setup_config_env_path()?;
     // Under `--no-auth` the server runs with no bearer gate
     // (`config.http_bearer_token` is `None`). Do NOT re-resolve and embed the
     // persistent token from `config.env` into the project-local MCP client
@@ -15171,14 +15179,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-            // Canonical config.env path: $XDG_CONFIG_HOME/mcp-agent-mail/config.env
-            // (falls back to ~/.config/mcp-agent-mail/config.env)
-            let config_env_file = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-                .unwrap_or_else(|| PathBuf::from(".config"))
-                .join("mcp-agent-mail")
-                .join("config.env");
+            let config_env_file = canonical_setup_config_env_path()?;
 
             // Resolve token
             let resolved_token = setup::resolve_token(token.as_deref(), &config_env_file)
@@ -15357,12 +15358,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-            let config_env_file = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-                .unwrap_or_else(|| PathBuf::from(".config"))
-                .join("mcp-agent-mail")
-                .join("config.env");
+            let config_env_file = canonical_setup_config_env_path()?;
             let resolved_token = setup::resolve_existing_token(token.as_deref(), &config_env_file)
                 .unwrap_or_default();
             let agents = match agent {

@@ -1711,17 +1711,20 @@ cat > "$tmpfile" <<EOF
 set -euo pipefail
 
 AM_RUST_BIN="${DEST}/${BIN_CLI}"
+AM_HOME_CONFIG_HOME=""
+case "\${HOME:-}" in
+  /*) AM_HOME_CONFIG_HOME="\${HOME}/.config" ;;
+esac
 AM_XDG_CONFIG_HOME="\${XDG_CONFIG_HOME:-}"
 case "\$AM_XDG_CONFIG_HOME" in
   /*) ;;
   *)
-    case "\${HOME:-}" in
-      /*) AM_XDG_CONFIG_HOME="\${HOME}/.config" ;;
-      *)
+    if [ -n "\$AM_HOME_CONFIG_HOME" ]; then
+      AM_XDG_CONFIG_HOME="\$AM_HOME_CONFIG_HOME"
+    else
         printf '%s\n' "Cannot resolve an absolute Agent Mail config.env path." >&2
         exit 1
-        ;;
-    esac
+    fi
     ;;
 esac
 AM_RUST_ENV_FILE_DEFAULT="\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/config.env"
@@ -1729,11 +1732,11 @@ AM_RUST_ENV_FILE="\${AM_RUST_ENV_FILE:-\$AM_RUST_ENV_FILE_DEFAULT}"
 if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/.env" ]; then
   AM_RUST_ENV_FILE="\${AM_XDG_CONFIG_HOME}/mcp-agent-mail/.env"
 fi
-if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${HOME}/.config/mcp-agent-mail/config.env" ]; then
-  AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/config.env"
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -n "\$AM_HOME_CONFIG_HOME" ] && [ -f "\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/config.env" ]; then
+  AM_RUST_ENV_FILE="\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/config.env"
 fi
-if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -f "\${HOME}/.config/mcp-agent-mail/.env" ]; then
-  AM_RUST_ENV_FILE="\${HOME}/.config/mcp-agent-mail/.env"
+if [ ! -f "\$AM_RUST_ENV_FILE" ] && [ -n "\$AM_HOME_CONFIG_HOME" ] && [ -f "\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/.env" ]; then
+  AM_RUST_ENV_FILE="\${AM_HOME_CONFIG_HOME}/mcp-agent-mail/.env"
 fi
 
 trim_ascii_whitespace() {

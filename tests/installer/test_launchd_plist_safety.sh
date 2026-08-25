@@ -66,9 +66,10 @@ extract_function() {
     extract_function repair_launchd_service_env_from_rust_config
     extract_function has_remote_http_client_targets
     extract_function ensure_remote_http_client_readiness
+    sed -n '/^install_legacy_launcher_takeover_shims() {/,/^# T1\.5:/p' "$INSTALL_SH" | sed '$d'
 } >"$extract"
 
-for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config has_remote_http_client_targets ensure_remote_http_client_readiness; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config has_remote_http_client_targets ensure_remote_http_client_readiness install_legacy_launcher_takeover_shims; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -340,5 +341,40 @@ if ! HOME="$readiness_home" PATH="$readiness_path" ensure_remote_http_client_rea
     fail "no-client readiness skip returned failure"
 fi
 [ "$REMOTE_PROBE_CALLS" -eq 0 ] || fail "no-client readiness skip still probed the endpoint"
+
+step "scenario L: generated legacy shim follows the absolute config.env authority contract"
+legacy_clone="$tmp/legacy-clone"
+legacy_rust_bin="$tmp/legacy-rust-bin"
+legacy_home="$tmp/legacy-home"
+legacy_xdg="$tmp/legacy-xdg"
+mkdir -p "$legacy_rust_bin" \
+    "$legacy_home/.config/mcp-agent-mail" \
+    "$legacy_xdg/mcp-agent-mail"
+cat >"$legacy_rust_bin/am" <<'EOF'
+#!/bin/sh
+printf '%s' "${HTTP_BEARER_TOKEN:-missing-token}"
+EOF
+chmod 755 "$legacy_rust_bin/am"
+printf '%s\n' 'HTTP_BEARER_TOKEN=home-fallback-token' \
+    >"$legacy_home/.config/mcp-agent-mail/config.env"
+printf '%s\n' 'HTTP_BEARER_TOKEN=custom-xdg-token' \
+    >"$legacy_xdg/mcp-agent-mail/config.env"
+PYTHON_CLONE_FOUND=1
+PYTHON_CLONE_PATH="$legacy_clone"
+DEST="$legacy_rust_bin"
+BIN_CLI=am
+install_legacy_launcher_takeover_shims \
+    || fail "could not generate isolated legacy takeover shim"
+legacy_shim="$legacy_clone/scripts/run_server_with_token.sh"
+[ -x "$legacy_shim" ] || fail "legacy takeover shim was not executable"
+[ "$(HOME="$legacy_home" XDG_CONFIG_HOME="$legacy_xdg" "$legacy_shim")" = \
+    "custom-xdg-token" ] || fail "legacy shim did not prefer custom XDG credential"
+[ "$(HOME="$legacy_home" XDG_CONFIG_HOME=relative-config "$legacy_shim")" = \
+    "home-fallback-token" ] || fail "legacy shim did not ignore relative XDG credential path"
+[ "$(unset HOME; XDG_CONFIG_HOME="$legacy_xdg" "$legacy_shim")" = \
+    "custom-xdg-token" ] || fail "legacy shim required HOME despite an absolute XDG authority"
+if HOME=relative-home XDG_CONFIG_HOME=relative-config "$legacy_shim" >/dev/null 2>&1; then
+    fail "legacy shim accepted relative HOME and XDG credential authorities"
+fi
 
 step "ALL SCENARIOS PASSED"

@@ -720,13 +720,10 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
     );
 
     ensure_secret_config_not_git_tracked(env_path)?;
-    if existing_content
-        .as_deref()
-        .is_some_and(|existing| existing == content)
-    {
-        return Ok(());
-    }
-
+    // Always replace the destination atomically, even when its bytes already
+    // match.  Content equality says nothing about the credential file's mode
+    // or link topology: an idempotent setup run must still repair a
+    // world-readable file and detach an attacker-controlled hard link.
     write_setup_file_atomic(env_path, content.as_bytes(), 0o600, "token env file")?;
     Ok(())
 }
@@ -6314,6 +6311,26 @@ mod tests {
         assert!(content.ends_with('\n'), "file must end with newline");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn save_token_to_env_file_repairs_exact_content_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = setup_real_tempdir();
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(&env_path, "HTTP_BEARER_TOKEN=exact-token\n").unwrap();
+        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_token_to_env_file(&env_path, "exact-token").unwrap();
+
+        let mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "idempotent setup must repair secret mode");
+        assert_eq!(
+            std::fs::read_to_string(&env_path).unwrap(),
+            "HTTP_BEARER_TOKEN=exact-token\n"
+        );
+    }
+
     #[test]
     fn save_token_to_env_file_refuses_tracked_idempotent_secret() {
         let tmp = setup_real_tempdir();
@@ -6363,6 +6380,34 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&env_path).unwrap(),
             "HTTP_BEARER_TOKEN=new-token\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_token_to_env_file_detaches_exact_content_hard_link() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = setup_real_tempdir();
+        let outside = tmp.path().join("outside.env");
+        let env_path = tmp.path().join("config.env");
+        let original = "HTTP_BEARER_TOKEN=exact-token\n";
+        std::fs::write(&outside, original).unwrap();
+        std::fs::hard_link(&outside, &env_path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().ino(),
+            std::fs::metadata(&env_path).unwrap().ino(),
+            "fixture must begin as one inode"
+        );
+
+        save_token_to_env_file(&env_path, "exact-token").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), original);
+        assert_ne!(
+            std::fs::metadata(&outside).unwrap().ino(),
+            std::fs::metadata(&env_path).unwrap().ino(),
+            "idempotent setup must detach the credential path from its peer"
         );
     }
 
