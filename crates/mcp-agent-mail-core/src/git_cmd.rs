@@ -153,7 +153,9 @@ impl<'a> GitCmd<'a> {
         self
     }
 
-    /// Skip the OS flock acquisition. Use for guard-hook callers only.
+    /// Skip the OS flock acquisition. Use only for guard-hook callers or
+    /// provably read-only probes whose contract forbids creating the flock
+    /// sentinel itself (for example a dry-run safety preflight).
     #[must_use]
     pub const fn skip_flock(mut self) -> Self {
         self.skip_flock = true;

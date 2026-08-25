@@ -1647,7 +1647,11 @@ fn ensure_no_parent_traversal(path: &Path, label: &str) -> Result<(), SetupError
     Ok(())
 }
 
-fn ensure_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupError> {
+fn check_setup_real_directory(
+    path: &Path,
+    label: &str,
+    create_missing: bool,
+) -> Result<(), SetupError> {
     ensure_no_parent_traversal(path, label)?;
 
     let mut current = PathBuf::new();
@@ -1681,8 +1685,17 @@ fn ensure_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupErro
                             ));
                         }
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound && create_missing =>
+                    {
                         std::fs::create_dir(&current)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(invalid_setup_path(
+                            label,
+                            &current,
+                            "directory component does not exist",
+                        ));
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -1690,6 +1703,14 @@ fn ensure_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupErro
         }
     }
     Ok(())
+}
+
+fn ensure_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupError> {
+    check_setup_real_directory(path, label, true)
+}
+
+fn validate_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupError> {
+    check_setup_real_directory(path, label, false)
 }
 
 fn ensure_setup_parent_dir(path: &Path, label: &str) -> Result<(), SetupError> {
@@ -1895,10 +1916,30 @@ fn gitignore_relative_path(path: &Path) -> Result<String, SetupError> {
 /// rules for the live file and every adjacent backup/temp name used by setup
 /// and doctor. If Git cannot answer reliably, it fails closed.
 fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Result<(), SetupError> {
+    const REPOSITORY_SHAPING_GIT_ENV: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+    if let Some(variable) = REPOSITORY_SHAPING_GIT_ENV
+        .iter()
+        .find(|variable| std::env::var_os(variable).is_some())
+    {
+        return Err(SetupError::Other(format!(
+            "cannot verify whether secret config {} is Git-tracked while {variable} changes repository discovery or index authority",
+            path.display()
+        )));
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .ok_or_else(|| invalid_setup_path("secret config", path, "must name a file"))?;
+    validate_setup_real_directory(parent, "secret config parent")?;
+    validate_setup_file_target(path, "secret config")?;
+    let _ = read_setup_file(path, "secret config")?;
     let parent = std::fs::canonicalize(parent).map_err(|error| {
         SetupError::Other(format!(
             "cannot resolve secret config parent {}: {error}",
@@ -1907,7 +1948,12 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     })?;
     let repo_probe = crate::git_cmd::GitCmd::new(&parent)
         .env("LC_ALL", "C")
-        .args(["rev-parse", "--show-toplevel"])
+        .args(["rev-parse", "--show-toplevel"]);
+    let repo_probe = if secure_gitignore {
+        repo_probe
+    } else {
+        repo_probe.skip_flock()
+    }
         .run()
         .map_err(|error| {
             SetupError::Other(format!(
@@ -1926,13 +1972,6 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
             stderr.trim()
         )));
     }
-    if std::env::var_os("GIT_INDEX_FILE").is_some() {
-        return Err(SetupError::Other(format!(
-            "cannot verify whether secret config {} is Git-tracked while GIT_INDEX_FILE selects an alternate index",
-            path.display()
-        )));
-    }
-
     let repo_root_output = String::from_utf8(repo_probe.stdout).map_err(|_| {
         SetupError::Other(format!(
             "cannot verify whether secret config {} is Git-tracked: repository root is not UTF-8",
@@ -1957,7 +1996,12 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     let tracked_probe = crate::git_cmd::GitCmd::new(&repo_root)
         .env("LC_ALL", "C")
         .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
-        .arg(relative.as_os_str())
+        .arg(relative.as_os_str());
+    let tracked_probe = if secure_gitignore {
+        tracked_probe
+    } else {
+        tracked_probe.skip_flock()
+    }
         .run()
         .map_err(|error| {
             SetupError::Other(format!(
@@ -1972,9 +2016,6 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
         )));
     }
     if tracked_probe.status.code() == Some(1) {
-        if !secure_gitignore {
-            return Ok(());
-        }
         let relative = gitignore_relative_path(relative)?;
         let (directory, basename) = relative
             .rsplit_once('/')
@@ -1993,8 +2034,14 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
             format!("{prefix}.{escaped_basename}.*.bak"),
             format!("/{escaped_relative}.bak*"),
         ];
+        let gitignore = repo_root.join(".gitignore");
+        validate_setup_file_target(&gitignore, "gitignore file")?;
+        let _ = read_setup_file(&gitignore, "gitignore file")?;
+        if !secure_gitignore {
+            return Ok(());
+        }
         let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
-        ensure_gitignore_entries(&repo_root.join(".gitignore"), &entry_refs)?;
+        ensure_gitignore_entries(&gitignore, &entry_refs)?;
         let representative_paths = [
             relative.clone(),
             format!("{directory}/.{basename}.probe.tmp")
@@ -2257,6 +2304,19 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
                 ActionOutcome::Failed(format!(
                     "refusing to write a token-bearing project config because .gitignore could not be secured: {error}"
                 ))
+            } else if params.dry_run
+                && contains_literal_secret
+                && action
+                    .file_path
+                    .parent()
+                    .is_some_and(std::path::Path::exists)
+            {
+                match preflight_secret_config_not_git_tracked(&action.file_path) {
+                    Ok(()) => ActionOutcome::Skipped,
+                    Err(error) => ActionOutcome::Failed(format!(
+                        "dry-run preflight refused a token-bearing config: {error}"
+                    )),
+                }
             } else if params.dry_run {
                 ActionOutcome::Skipped
             } else {
@@ -3982,6 +4042,148 @@ mod tests {
     }
 
     #[test]
+    fn run_setup_dry_run_refuses_tracked_omp_config_without_writing() {
+        let tmp = setup_real_tempdir();
+        let config = tmp.path().join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = "{\"mcpServers\":{\"operator-owned\":{\"command\":\"keep\"}}}\n";
+        std::fs::write(&config, original).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["add", "--", ".omp/mcp.json"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
+        assert!(!flock_sentinel.exists());
+        let params = SetupParams {
+            token: "must-not-enter-index".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let results = run_setup(&params);
+        let ActionOutcome::Failed(error) = &results[0].actions[0].outcome else {
+            panic!("tracked OMP config must fail closed in dry-run: {results:?}");
+        };
+        assert!(error.contains("Git-tracked config"), "{error}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(!tmp.path().join(".gitignore").exists());
+        assert!(!flock_sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_setup_dry_run_refuses_symlinked_omp_config_without_writing() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = setup_real_tempdir();
+        let config = tmp.path().join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside-config.json");
+        let original = "{\"operator\":\"owned\"}\n";
+        std::fs::write(&outside, original).unwrap();
+        symlink(&outside, &config).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
+        let params = SetupParams {
+            token: "must-not-reach-symlink".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let results = run_setup(&params);
+        let ActionOutcome::Failed(error) = &results[0].actions[0].outcome else {
+            panic!("symlinked OMP config must fail closed in dry-run: {results:?}");
+        };
+        assert!(error.contains("must not be a symlink"), "{error}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+        assert!(!tmp.path().join(".gitignore").exists());
+        assert!(!flock_sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_setup_dry_run_refuses_symlinked_gitignore_without_writing() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = setup_real_tempdir();
+        let config = tmp.path().join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original_config = "{\"operator\":\"owned\"}\n";
+        std::fs::write(&config, original_config).unwrap();
+        let outside = tmp.path().join("outside-gitignore");
+        let original_gitignore = "operator-owned\n";
+        std::fs::write(&outside, original_gitignore).unwrap();
+        symlink(&outside, tmp.path().join(".gitignore")).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
+        let params = SetupParams {
+            token: "must-not-reach-unsafe-gitignore".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let results = run_setup(&params);
+        let ActionOutcome::Failed(error) = &results[0].actions[0].outcome else {
+            panic!("symlinked .gitignore must fail closed in dry-run: {results:?}");
+        };
+        assert!(error.contains("must not be a symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            original_gitignore
+        );
+        assert!(!flock_sentinel.exists());
+    }
+
+    #[test]
     fn run_setup_token_rotation_keeps_live_config_and_backup_out_of_git_status() {
         let tmp = setup_real_tempdir();
         assert!(
@@ -4129,7 +4331,7 @@ mod tests {
         assert!(
             gitignore
                 .lines()
-                .any(|line| line == "custom-agent/mcp.json")
+                .any(|line| line == "/custom-agent/mcp.json")
         );
         assert!(
             std::fs::read_to_string(override_path)
