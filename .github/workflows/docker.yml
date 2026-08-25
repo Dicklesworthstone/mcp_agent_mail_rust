@@ -518,6 +518,8 @@ jobs:
             [ "$DOCKERFILE" = "./Dockerfile" ]
             [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
             [ "$AM_REF" = "$REVISION" ]
+            grep -Fq 'git fetch --depth 1 origin "${AM_REF}"' "$DOCKERFILE"
+            grep -Fq 'git checkout -q FETCH_HEAD' "$DOCKERFILE"
           fi
 
       - name: Set up Docker Buildx

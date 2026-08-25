@@ -61,6 +61,8 @@ mod container_release_contract {
             "type=raw,value=source-sha-${{ steps.refs.outputs.revision }}",
             "org.opencontainers.image.revision=${{ steps.refs.outputs.revision }}",
             "[ \"$AM_REF\" = \"$REVISION\" ]",
+            "grep -Fq 'git fetch --depth 1 origin \"${AM_REF}\"' \"$DOCKERFILE\"",
+            "grep -Fq 'git checkout -q FETCH_HEAD' \"$DOCKERFILE\"",
             "provenance: mode=max",
             "expected_digest_files=(linux-amd64.digest linux-arm64.digest)",
             "docker buildx imagetools inspect --raw \"$IMAGE@$digest\"",
@@ -189,6 +191,11 @@ mod container_release_contract {
             workflow.replacen(
                 "[ \"$AM_REF\" = \"$REVISION\" ]",
                 "[ -n \"$AM_REF\" ]",
+                1,
+            ),
+            workflow.replacen(
+                "grep -Fq 'git checkout -q FETCH_HEAD' \"$DOCKERFILE\"",
+                "grep -Fq 'git checkout -q main' \"$DOCKERFILE\"",
                 1,
             ),
             workflow.replacen("provenance: mode=max", "provenance: true", 1),
