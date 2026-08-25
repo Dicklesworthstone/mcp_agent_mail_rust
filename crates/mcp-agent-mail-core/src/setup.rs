@@ -10,6 +10,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -1839,6 +1840,89 @@ fn write_setup_backup(
     Ok(())
 }
 
+/// Refuse to place a literal credential in a Git-tracked config file.
+///
+/// Adding a path to `.gitignore` does not make an already tracked file safe:
+/// the next `git diff` or commit would still expose the credential. This check
+/// deliberately asks Git about the exact path immediately before the write.
+/// If the path is inside an apparent worktree but Git cannot answer reliably,
+/// it fails closed.
+pub fn ensure_secret_config_not_git_tracked(path: &Path) -> Result<(), SetupError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid_setup_path("secret config", path, "must name a file"))?;
+    let parent = std::fs::canonicalize(parent).map_err(|error| {
+        SetupError::Other(format!(
+            "cannot resolve secret config parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let has_git_marker = parent
+        .ancestors()
+        .any(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
+
+    let mut repo_probe = Command::new("git");
+    repo_probe
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .arg("-C")
+        .arg(&parent)
+        .args(["rev-parse", "--is-inside-work-tree"]);
+    let repo_probe = match repo_probe.output() {
+        Ok(output) => output,
+        Err(error) if !has_git_marker && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(SetupError::Other(format!(
+                "cannot verify whether secret config {} is Git-tracked: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !repo_probe.status.success() {
+        if has_git_marker {
+            return Err(SetupError::Other(format!(
+                "cannot verify whether secret config {} is Git-tracked: git rev-parse failed",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    if repo_probe.stdout != b"true\n" && repo_probe.stdout != b"true\r\n" {
+        return Ok(());
+    }
+
+    let mut tracked_probe = Command::new("git");
+    tracked_probe
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .arg("-C")
+        .arg(&parent)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(file_name);
+    let tracked_probe = tracked_probe.output().map_err(|error| {
+        SetupError::Other(format!(
+            "cannot verify whether secret config {} is Git-tracked: {error}",
+            path.display()
+        ))
+    })?;
+    if tracked_probe.status.success() {
+        return Err(SetupError::Other(format!(
+            "refusing to write a literal bearer token to Git-tracked config {}; remove it from the index or use an untracked config path",
+            path.display()
+        )));
+    }
+    if tracked_probe.status.code() == Some(1) {
+        return Ok(());
+    }
+    Err(SetupError::Other(format!(
+        "cannot verify whether secret config {} is Git-tracked: git ls-files failed",
+        path.display()
+    )))
+}
+
 /// Execute a single config write action, returning the outcome.
 pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, SetupError> {
     let parent = action.file_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1913,6 +1997,10 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
             key_values,
         } => merge_toml_section(existing.as_deref(), section_header, key_values),
     };
+
+    if new_content.contains("Bearer ") {
+        ensure_secret_config_not_git_tracked(&action.file_path)?;
+    }
 
     // Check if unchanged
     if existing.as_deref() == Some(&new_content) && !permissions_need_tightening {
@@ -3700,6 +3788,54 @@ mod tests {
         ));
         assert!(!tmp.path().join(".omp/mcp.json").exists());
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel\n");
+    }
+
+    #[test]
+    fn run_setup_refuses_literal_bearer_in_git_tracked_omp_config() {
+        let tmp = setup_real_tempdir();
+        let config = tmp.path().join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = r#"{"mcpServers":{"operator-owned":{"command":"keep"}}}\n"#;
+        std::fs::write(&config, original).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["add", "--", ".omp/mcp.json"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let params = SetupParams {
+            token: "must-not-enter-index".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(vec![AgentPlatform::Omp]),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+
+        let results = run_setup(&params);
+        let ActionOutcome::Failed(error) = &results[0].actions[0].outcome else {
+            panic!("tracked OMP config must fail closed: {results:?}");
+        };
+        assert!(error.contains("Git-tracked config"), "{error}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(
+            std::fs::read_dir(config.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".bak"))
+        );
     }
 
     #[test]

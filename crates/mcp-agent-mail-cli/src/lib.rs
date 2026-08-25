@@ -30833,6 +30833,22 @@ fn doctor_mcp_config_bearer_status(
     }
 }
 
+fn doctor_mcp_config_check_status(
+    omp_contract_broken: bool,
+    repair_recommended: bool,
+    has_working_http_entry: bool,
+) -> &'static str {
+    if omp_contract_broken {
+        "fail"
+    } else if repair_recommended {
+        "warn"
+    } else if has_working_http_entry {
+        "ok"
+    } else {
+        "warn"
+    }
+}
+
 fn normalize_mcp_config_status_url_host(host: &str) -> &str {
     if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
         "127.0.0.1"
@@ -32710,12 +32726,24 @@ fn handle_doctor_check_with_target(
                                 }
                             }
                             McpAgentMailEntryKind::Unknown => {
-                                missing_entry += 1;
-                                detail_parts.push(format!(
-                                    "{} ({}) → entry missing or unclassified",
-                                    loc.tool.slug(),
-                                    loc.config_path.display()
-                                ));
+                                if loc.tool
+                                    == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
+                                    && omp_config_needs_native_contract_repair(&content)
+                                {
+                                    omp_contract_issues += 1;
+                                    detail_parts.push(format!(
+                                        "{} ({}) → malformed OMP native entry",
+                                        loc.tool.slug(),
+                                        loc.config_path.display()
+                                    ));
+                                } else {
+                                    missing_entry += 1;
+                                    detail_parts.push(format!(
+                                        "{} ({}) → entry missing or unclassified",
+                                        loc.tool.slug(),
+                                        loc.config_path.display()
+                                    ));
+                                }
                             }
                         }
                     }
@@ -32725,19 +32753,15 @@ fn handle_doctor_check_with_target(
                 }
             }
 
-            let mcp_status = if pointing_to_python > 0
-                || pointing_to_rust > 0
-                || pointing_to_wrong_http_url > 0
-                || codex_startup_timeout_issues > 0
-                || omp_contract_issues > 0
-                || parse_errors > 0
-            {
-                "warn"
-            } else if pointing_to_http_url > 0 {
-                "ok"
-            } else {
-                "warn"
-            };
+            let mcp_status = doctor_mcp_config_check_status(
+                omp_contract_issues > 0,
+                pointing_to_python > 0
+                    || pointing_to_rust > 0
+                    || pointing_to_wrong_http_url > 0
+                    || codex_startup_timeout_issues > 0
+                    || parse_errors > 0,
+                pointing_to_http_url > 0,
+            );
 
             let summary = format!(
                 "{} config(s) found: {} HTTP URL, {} stdio command, {} legacy Python, {} no entry, {} unreadable",
@@ -33697,6 +33721,13 @@ fn fix_mcp_config_entry(
         ));
     }
 
+    if tool != mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
+        && desired_bearer_token.is_some_and(|token| !token.is_empty())
+    {
+        mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
+            .map_err(|error| error.to_string())?;
+    }
+
     if tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp {
         let action = mcp_agent_mail_core::setup::ConfigAction {
             platform: mcp_agent_mail_core::setup::AgentPlatform::Omp,
@@ -34239,6 +34270,9 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                         }
                         None => None,
                     }
+                }
+                McpAgentMailEntryKind::Unknown if omp_contract_fix_needed => {
+                    Some("repair malformed OMP native entry".to_string())
                 }
                 McpAgentMailEntryKind::Unknown => None,
             };
@@ -42670,6 +42704,14 @@ http_headers = { Authorization = "Bearer secret" }
             "secret",
         );
         assert_eq!(status, Some(DoctorMcpConfigBearerStatus::Match));
+    }
+
+    #[test]
+    fn doctor_mcp_config_check_status_makes_omp_contract_drift_unhealthy() {
+        assert_eq!(doctor_mcp_config_check_status(true, false, true), "fail");
+        assert_eq!(doctor_mcp_config_check_status(false, true, true), "warn");
+        assert_eq!(doctor_mcp_config_check_status(false, false, true), "ok");
+        assert_eq!(doctor_mcp_config_check_status(false, false, false), "warn");
     }
 
     #[test]
@@ -52254,6 +52296,45 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn fix_mcp_config_entry_refuses_tracked_omp_config_before_writing_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = r#"{"mcpServers":{"mcp-agent-mail":{"command":"python","args":["-m","mcp_agent_mail"]}}}"#;
+        std::fs::write(&config, original).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", "--", ".omp/mcp.json"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = fix_mcp_config_entry(
+            &config,
+            "http://127.0.0.1:8765/mcp/",
+            Some("must-not-enter-index"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
+        )
+        .expect_err("tracked OMP config must fail before receiving a bearer token");
+
+        assert!(error.contains("Git-tracked config"), "{error}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(!mcp_config_backup_candidate(&config, None).exists());
+    }
+
+    #[test]
     fn fix_mcp_config_entry_restores_the_complete_omp_enablement_contract() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join(".omp").join("mcp.json");
@@ -52346,6 +52427,27 @@ http_headers = { Authorization = "Bearer secret" }
             error.contains("disabledServers must be a JSON array"),
             "{error}"
         );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(!mcp_config_backup_candidate(&config, None).exists());
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_refuses_non_object_omp_entry_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let original = r#"{"mcpServers":{"mcp-agent-mail":false}}"#;
+        std::fs::write(&config, original).unwrap();
+        assert!(omp_config_needs_native_contract_repair(original));
+
+        let error = fix_mcp_config_entry(
+            &config,
+            "http://127.0.0.1:8765/mcp/",
+            Some("new-token"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Omp,
+        )
+        .expect_err("malformed OMP entry must fail closed");
+
+        assert!(error.contains("entry must be a JSON object"), "{error}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
         assert!(!mcp_config_backup_candidate(&config, None).exists());
     }
