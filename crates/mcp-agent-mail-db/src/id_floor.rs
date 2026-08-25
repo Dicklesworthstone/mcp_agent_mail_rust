@@ -569,7 +569,7 @@ async fn scan_archive_floor(cx: &Cx, storage_root: PathBuf) -> Outcome<i64, DbEr
     let scan_result = match cx.spawn_blocking(move |_child_cx| {
         max_message_id_in_archive(&storage_root)
     }) {
-        Ok(handle) => match handle.await {
+        Ok(mut handle) => match handle.join(cx).await {
             Ok(result) => result,
             Err(JoinError::Cancelled(reason)) => return Outcome::Cancelled(reason),
             Err(JoinError::Panicked(payload)) => return Outcome::Panicked(payload),
