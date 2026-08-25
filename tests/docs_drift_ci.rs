@@ -414,8 +414,10 @@ mod dist_release_contract {
             "mapfile -t sidecar_lines < \"dist/${artifact}.sha256\"",
             "[ \"${#sidecar_lines[@]}\" -ne 1 ]",
             "[ \"$sidecar_name\" != \"$artifact\" ]",
+            "cp -- \"dist/$artifact\" \"dist/${artifact}.sha256\" publish/",
             "cp -- install.sh install.ps1 publish/",
-            "expected_payloads=(\"${expected_archives[@]}\" install.sh install.ps1)",
+            "expected_payloads=(install.sh install.ps1)",
+            "expected_payloads+=(\"$artifact\" \"${artifact}.sha256\")",
             "shasum -a 256 \"${expected_payloads[@]}\" > SHA256SUMS",
             "[ \"${#sums_lines[@]}\" -ne \"${#expected_payloads[@]}\" ]",
             "'$2 == payload && NF == 2 {print $1}'",
@@ -619,8 +621,18 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "expected_payloads=(\"${expected_archives[@]}\" install.sh install.ps1)",
-                "expected_payloads=(\"${expected_archives[@]}\" install.sh)",
+                "cp -- \"dist/$artifact\" \"dist/${artifact}.sha256\" publish/",
+                "cp -- \"dist/$artifact\" publish/",
+            ),
+            mutate(
+                &workflow,
+                "expected_payloads=(install.sh install.ps1)",
+                "expected_payloads=(install.sh)",
+            ),
+            mutate(
+                &workflow,
+                "expected_payloads+=(\"$artifact\" \"${artifact}.sha256\")",
+                "expected_payloads+=(\"$artifact\")",
             ),
             mutate(
                 &workflow,
@@ -670,7 +682,7 @@ mod dist_release_contract {
             mutate(
                 &workflow,
                 "cosign verify-blob \\",
-                "cosign version \\",
+                "true \\",
             ),
             mutate(
                 &workflow,

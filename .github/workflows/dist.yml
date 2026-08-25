@@ -556,14 +556,17 @@ jobs:
                 exit 1
                 ;;
             esac
-            cp -- "dist/$artifact" publish/
+            cp -- "dist/$artifact" "dist/${artifact}.sha256" publish/
           done
 
           # Installer scripts are release payloads, so absence is fatal rather
           # than a warning and they enter the same checksum/signature envelope.
           cp -- install.sh install.ps1 publish/
           cd publish
-          expected_payloads=("${expected_archives[@]}" install.sh install.ps1)
+          expected_payloads=(install.sh install.ps1)
+          for artifact in "${expected_archives[@]}"; do
+            expected_payloads+=("$artifact" "${artifact}.sha256")
+          done
           for payload in "${expected_payloads[@]}"; do
             test -f "$payload"
             test -s "$payload"
