@@ -4197,7 +4197,25 @@ impl DbPool {
                 ))
             })?
             .len();
-        ensure_recovery_disk_headroom(primary, source_bytes, "proactive backup")
+        let wal_path = sqlite_sidecar_path(primary, "-wal");
+        let wal_bytes = match std::fs::symlink_metadata(&wal_path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+            Ok(_) => {
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup aborted: WAL companion {} is not a regular file",
+                    wal_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup aborted: failed to stat WAL companion {}: {error}",
+                    wal_path.display()
+                )));
+            }
+        };
+        let expected_write_bytes = proactive_backup_expected_write_bytes(source_bytes, wal_bytes);
+        ensure_recovery_disk_headroom(primary, expected_write_bytes, "proactive backup")
             .map_err(|error| DbError::Sqlite(error.to_string()))?;
 
         let (staged_directory, staged_backup) = create_proactive_backup_stage(primary, &bak_path)?;
@@ -10288,6 +10306,13 @@ pub fn open_guarded_read_only_canonical_sqlite_file(
 
 fn recovery_required_free_bytes(expected_write_bytes: u64) -> u64 {
     RECOVERY_DISK_RESERVE_BYTES.saturating_add(expected_write_bytes)
+}
+
+const fn proactive_backup_expected_write_bytes(main_bytes: u64, wal_bytes: u64) -> u64 {
+    // The guarded export and the canonical standalone snapshot coexist until
+    // publication. Either can contain the main database plus committed WAL
+    // truth, so admission must reserve two complete logical generations.
+    main_bytes.saturating_add(wal_bytes).saturating_mul(2)
 }
 
 fn recovery_disk_headroom_is_sufficient(available: u64, expected_write_bytes: u64) -> bool {
@@ -17675,6 +17700,21 @@ mod tests {
         ));
         assert!(recovery_disk_headroom_is_sufficient(required, copy_bytes));
         assert_eq!(recovery_required_free_bytes(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn proactive_backup_headroom_covers_two_complete_logical_generations() {
+        let main_bytes = 700 * 1024 * 1024;
+        let wal_bytes = 300 * 1024 * 1024;
+        assert_eq!(
+            proactive_backup_expected_write_bytes(main_bytes, wal_bytes),
+            2_000 * 1024 * 1024
+        );
+        assert_eq!(proactive_backup_expected_write_bytes(u64::MAX, 1), u64::MAX);
+        assert_eq!(
+            proactive_backup_expected_write_bytes(u64::MAX / 2 + 1, 0),
+            u64::MAX
+        );
     }
 
     #[test]

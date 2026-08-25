@@ -139,9 +139,9 @@ fn extract_message_id_from_frontmatter(path: &Path) -> Option<i64> {
 /// If the archive is ahead, advance `sqlite_sequence['messages'].seq` so
 /// the next INSERT receives `archive_max_id + 1`.
 ///
-/// Returns the new floor (the seq value persisted) when an advance
-/// happened, or `None` when the database was already at or ahead of the
-/// archive and no change was made.
+/// Returns the resulting persisted floor when the allocator row was advanced
+/// or repaired, or `None` when the database was already at or ahead of the
+/// archive with exactly one authoritative sequence row.
 ///
 /// # Errors
 ///
@@ -160,11 +160,6 @@ pub fn advance_messages_id_floor(
         },
         |sql| {
             conn.execute_raw(sql)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        },
-        |sql, params| {
-            conn.execute_sync(sql, params)
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         },
@@ -188,24 +183,17 @@ pub(crate) fn advance_messages_id_floor_franken(
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         },
-        |sql, params| {
-            conn.execute_sync(sql, params)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        },
     )
 }
 
-fn advance_messages_id_floor_with<Q, E, U>(
+fn advance_messages_id_floor_with<Q, E>(
     archive_max_id: Option<i64>,
     query: Q,
     execute_raw: E,
-    execute_sync: U,
 ) -> DbResult<Option<i64>>
 where
     Q: Fn(&str, &[Value]) -> Result<Vec<sqlmodel_core::Row>, String>,
     E: Fn(&str) -> Result<(), String>,
-    U: Fn(&str, &[Value]) -> Result<(), String>,
 {
     let Some(archive_max) = archive_max_id else {
         return Ok(None);
@@ -214,50 +202,106 @@ where
         return Ok(None);
     }
 
-    let db_max_id: i64 = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
-        .map_err(|e| DbError::Sqlite(format!("id_floor: read MAX(id): {e}")))?
+    let db_rows = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
+        .map_err(|e| DbError::Sqlite(format!("id_floor: read MAX(id): {e}")))?;
+    let db_max_id = db_rows
         .first()
-        .and_then(|row| row.get_named("max_id").ok())
-        .unwrap_or(0);
+        .ok_or_else(|| DbError::Sqlite("id_floor: MAX(id) returned no row".to_string()))?
+        .get_named::<i64>("max_id")
+        .map_err(|e| DbError::Sqlite(format!("id_floor: decode MAX(id): {e}")))?;
 
-    let seq_value: i64 = query(
-        "SELECT COALESCE(seq, 0) AS seq FROM sqlite_sequence WHERE name = 'messages'",
+    let seq_rows = query(
+        "SELECT COUNT(*) AS row_count, COALESCE(MAX(seq), 0) AS seq \
+         FROM sqlite_sequence WHERE name = 'messages'",
         &[],
     )
-    .map_err(|e| DbError::Sqlite(format!("id_floor: read sqlite_sequence: {e}")))?
-    .first()
-    .and_then(|row| row.get_named("seq").ok())
-    .unwrap_or(0);
+    .map_err(|e| DbError::Sqlite(format!("id_floor: read sqlite_sequence: {e}")))?;
+    let seq_row = seq_rows.first().ok_or_else(|| {
+        DbError::Sqlite("id_floor: sqlite_sequence aggregate returned no row".to_string())
+    })?;
+    let seq_row_count = seq_row
+        .get_named::<i64>("row_count")
+        .map_err(|e| DbError::Sqlite(format!("id_floor: decode sequence row count: {e}")))?;
+    let seq_value = seq_row
+        .get_named::<i64>("seq")
+        .map_err(|e| DbError::Sqlite(format!("id_floor: decode sequence value: {e}")))?;
 
     let current_floor = db_max_id.max(seq_value);
-    if current_floor >= archive_max {
+    let desired_floor = current_floor.max(archive_max);
+    if seq_row_count == 1 && seq_value >= desired_floor {
         // DB is already at or ahead of the archive; nothing to do.
         return Ok(None);
     }
 
-    // Advance: ensure the sqlite_sequence row exists, then bump it to
-    // `archive_max` so the next AUTOINCREMENT allocates `archive_max + 1`.
-    // INSERT OR IGNORE first to create the row if missing, then UPDATE
-    // unconditionally — INSERT OR REPLACE would clobber other tables
-    // sharing sqlite_sequence rows.
-    execute_raw("INSERT OR IGNORE INTO sqlite_sequence (name, seq) VALUES ('messages', 0)")
-        .map_err(|e| DbError::Sqlite(format!("id_floor: ensure sqlite_sequence row: {e}")))?;
-    execute_sync(
-        "UPDATE sqlite_sequence SET seq = ? WHERE name = 'messages'",
-        &[Value::BigInt(archive_max)],
+    // sqlite_sequence does not declare `name` UNIQUE, so INSERT OR IGNORE can
+    // create duplicate allocator rows. Repair cardinality and advance the
+    // floor under one write transaction. The aggregate assignment preserves
+    // a higher sequence committed after the reads above but before BEGIN.
+    let repair_sql = format!(
+        "BEGIN IMMEDIATE; \
+         UPDATE sqlite_sequence \
+            SET seq = (SELECT MAX(CASE WHEN seq > {desired_floor} \
+                                       THEN seq ELSE {desired_floor} END) \
+                         FROM sqlite_sequence WHERE name = 'messages') \
+          WHERE name = 'messages'; \
+         DELETE FROM sqlite_sequence \
+          WHERE name = 'messages' \
+            AND rowid <> (SELECT MIN(rowid) FROM sqlite_sequence \
+                           WHERE name = 'messages'); \
+         INSERT INTO sqlite_sequence (name, seq) \
+              SELECT 'messages', {desired_floor} \
+               WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence \
+                                  WHERE name = 'messages'); \
+         UPDATE sqlite_sequence \
+            SET seq = CASE WHEN seq < {desired_floor} \
+                           THEN {desired_floor} ELSE seq END \
+          WHERE name = 'messages'; \
+         COMMIT;"
+    );
+    if let Err(error) = execute_raw(&repair_sql) {
+        let rollback = execute_raw("ROLLBACK;");
+        let rollback_detail = rollback
+            .err()
+            .map_or_else(String::new, |rollback_error| {
+                format!("; rollback also failed: {rollback_error}")
+            });
+        return Err(DbError::Sqlite(format!(
+            "id_floor: repair/advance sqlite_sequence: {error}{rollback_detail}"
+        )));
+    }
+
+    let persisted_rows = query(
+        "SELECT COUNT(*) AS row_count, COALESCE(MAX(seq), 0) AS seq \
+         FROM sqlite_sequence WHERE name = 'messages'",
+        &[],
     )
-    .map_err(|e| DbError::Sqlite(format!("id_floor: advance sqlite_sequence: {e}")))?;
+    .map_err(|e| DbError::Sqlite(format!("id_floor: verify sqlite_sequence repair: {e}")))?;
+    let persisted_row = persisted_rows.first().ok_or_else(|| {
+        DbError::Sqlite("id_floor: repaired sqlite_sequence returned no row".to_string())
+    })?;
+    let persisted_count = persisted_row
+        .get_named::<i64>("row_count")
+        .map_err(|e| DbError::Sqlite(format!("id_floor: decode repaired row count: {e}")))?;
+    let persisted_floor = persisted_row
+        .get_named::<i64>("seq")
+        .map_err(|e| DbError::Sqlite(format!("id_floor: decode repaired sequence: {e}")))?;
+    if persisted_count != 1 || persisted_floor < desired_floor {
+        return Err(DbError::Sqlite(format!(
+            "id_floor: allocator repair verification failed: row_count={persisted_count}, seq={persisted_floor}, required_floor={desired_floor}"
+        )));
+    }
 
     tracing::warn!(
         archive_max,
         db_max_id,
         previous_seq = seq_value,
-        new_seq = archive_max,
+        previous_sequence_rows = seq_row_count,
+        new_seq = persisted_floor,
         "advanced messages id allocator: archive_latest_message_id > db_max(messages); \
          subsequent INSERTs will receive ids strictly greater than the archive (mcp_agent_mail#160)"
     );
 
-    Ok(Some(archive_max))
+    Ok(Some(persisted_floor))
 }
 
 /// Process-wide, per-database monotonic message-id allocator
@@ -481,6 +525,7 @@ mod tests {
                 &[],
             )
             .unwrap();
+        assert_eq!(rows.len(), 1, "messages must have one allocator row");
         let seq = rows[0].get_named::<i64>("seq").unwrap();
         assert_eq!(seq, 25);
 
@@ -494,6 +539,88 @@ mod tests {
             .unwrap();
         let max_id = rows[0].get_named::<i64>("max_id").unwrap();
         assert_eq!(max_id, 26);
+    }
+
+    #[test]
+    fn advance_messages_id_floor_consolidates_duplicate_sequence_rows() {
+        let conn = SqliteConnection::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 subject TEXT NOT NULL
+             );
+             INSERT INTO messages (id, subject) VALUES (10, 'existing');
+             INSERT INTO sqlite_sequence (name, seq) VALUES ('messages', 7);",
+        )
+        .unwrap();
+
+        assert_eq!(
+            advance_messages_id_floor(&conn, Some(25)).unwrap(),
+            Some(25)
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "duplicate allocator rows must be removed");
+        assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 25);
+
+        conn.execute_raw("INSERT INTO messages (subject) VALUES ('next');")
+            .unwrap();
+        let rows = conn
+            .query_sync("SELECT MAX(id) AS max_id FROM messages", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("max_id").unwrap(), 26);
+    }
+
+    #[test]
+    fn stale_id_floor_advance_preserves_newer_committed_sequence() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("stale-floor.db");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 subject TEXT NOT NULL
+             );
+             INSERT INTO messages (id, subject) VALUES (10, 'existing');",
+        )
+        .unwrap();
+        let newer = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
+        let injected = std::cell::Cell::new(false);
+
+        let result = advance_messages_id_floor_with(
+            Some(25),
+            |sql, params| {
+                conn.query_sync(sql, params)
+                    .map_err(|error| error.to_string())
+            },
+            |sql| {
+                if !injected.replace(true) {
+                    newer
+                        .execute_raw(
+                            "UPDATE sqlite_sequence SET seq = 100 WHERE name = 'messages';",
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                conn.execute_raw(sql)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(100));
+        let rows = conn
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 100);
     }
 
     #[test]
