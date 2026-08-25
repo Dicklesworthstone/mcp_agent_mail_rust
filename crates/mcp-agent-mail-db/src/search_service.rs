@@ -4899,16 +4899,11 @@ mod tests {
             .expect("write shared search marker");
 
         let frozen_db = root.path().join("mail.sqlite3");
-        let foreign_db = root.path().join("foreign.sqlite3");
-        let foreign_db_text = foreign_db
-            .to_str()
-            .expect("temporary foreign search database path is UTF-8");
-        let foreign_conn = crate::CanonicalDbConn::open_file(foreign_db_text)
-            .expect("open foreign search database");
-        foreign_conn
-            .execute_raw("CREATE TABLE foreign_search_authority(id INTEGER PRIMARY KEY)")
-            .expect("materialize foreign search database");
-        drop(foreign_conn);
+        let foreign_db = root.path().join("missing-foreign.sqlite3");
+        assert!(
+            !foreign_db.exists(),
+            "search authority fixture requires a dangling symlink target"
+        );
 
         let pool = crate::DbPool::new(&crate::DbPoolConfig {
             database_url: format!("sqlite:///{}", frozen_db.display()),
@@ -4927,7 +4922,7 @@ mod tests {
         );
 
         symlink(&foreign_db, &frozen_db)
-            .expect("insert foreign SQLite symlink before search index admission");
+            .expect("insert dangling SQLite symlink before search index admission");
         let error = direct_surface_index_dir(&pool)
             .expect_err("search index selection must reject retargeted SQLite authority");
         assert!(

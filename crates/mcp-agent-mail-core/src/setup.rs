@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Error
@@ -207,7 +207,7 @@ pub struct OmpConfigPaths {
 /// OMP's profile-name contract.
 pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError> {
     let home = require_absolute_omp_home_dir(dirs::home_dir())?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = std::env::current_dir()?;
     let omp_profile =
         std::env::var_os("OMP_PROFILE").map(|value| value.to_string_lossy().into_owned());
     let pi_profile =
@@ -230,12 +230,76 @@ pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError>
 
 fn require_absolute_omp_home_dir(home: Option<PathBuf>) -> Result<PathBuf, SetupError> {
     match home {
-        Some(home) if home.is_absolute() => Ok(home),
+        Some(home) if omp_path_is_absolute_and_traversal_free(&home) => Ok(home),
         _ => Err(SetupError::Other(
-            "cannot resolve the active OMP user config without an absolute home directory"
+            "cannot resolve the active OMP user config without an absolute, traversal-free home directory"
                 .to_string(),
         )),
     }
+}
+
+fn omp_path_is_absolute_and_traversal_free(path: &Path) -> bool {
+    path.is_absolute() && !path.components().any(|component| component == Component::ParentDir)
+}
+
+fn looks_like_windows_path_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || path.starts_with("\\\\")
+        || path.starts_with("//")
+}
+
+fn validate_omp_relative_config_dir(path: &str) -> Result<&Path, SetupError> {
+    if looks_like_windows_path_prefix(path) {
+        return Err(SetupError::Other(
+            "PI_CONFIG_DIR must be a traversal-free directory rooted beneath the OMP home directory"
+                .to_string(),
+        ));
+    }
+    let path = Path::new(path.trim_start_matches(std::path::is_separator));
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(SetupError::Other(
+            "PI_CONFIG_DIR must be a traversal-free directory rooted beneath the OMP home directory"
+                .to_string(),
+        ));
+    }
+    Ok(path)
+}
+
+fn resolve_omp_agent_dir_override(cwd: &Path, path: &str) -> Result<PathBuf, SetupError> {
+    let path = PathBuf::from(path);
+    if looks_like_windows_path_prefix(path.to_string_lossy().as_ref()) && !path.is_absolute() {
+        return Err(SetupError::Other(
+            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory"
+                .to_string(),
+        ));
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(SetupError::Other(
+            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory"
+                .to_string(),
+        ));
+    }
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    if !omp_path_is_absolute_and_traversal_free(&resolved) {
+        return Err(SetupError::Other(
+            "PI_CODING_AGENT_DIR must resolve to an absolute, traversal-free directory"
+                .to_string(),
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Resolve OMP's ordered `PI_CONFIG_FILES` settings overlays from the live
@@ -299,6 +363,13 @@ fn resolve_omp_config_paths(
     config_dir: Option<&str>,
     agent_dir_override: Option<&str>,
 ) -> Result<OmpConfigPaths, SetupError> {
+    let home = require_absolute_omp_home_dir(Some(home.to_path_buf()))?;
+    if !omp_path_is_absolute_and_traversal_free(cwd) {
+        return Err(SetupError::Other(
+            "cannot resolve OMP configuration without an absolute, traversal-free working directory"
+                .to_string(),
+        ));
+    }
     let explicit_profile = omp_profile.or(pi_profile);
     let profile = match explicit_profile {
         None => None,
@@ -317,8 +388,8 @@ fn resolve_omp_config_paths(
     };
     let config_dir = config_dir
         .filter(|value| !value.is_empty())
-        .unwrap_or(".omp")
-        .trim_start_matches(std::path::is_separator);
+        .unwrap_or(".omp");
+    let config_dir = validate_omp_relative_config_dir(config_dir)?;
     let config_root = home.join(config_dir);
 
     let agent_dir = profile.map_or_else(
@@ -326,23 +397,26 @@ fn resolve_omp_config_paths(
             agent_dir_override
                 .filter(|value| !value.is_empty())
                 .map_or_else(
-                    || config_root.join("agent"),
-                    |override_path| {
-                        let override_path = PathBuf::from(override_path);
-                        if override_path.is_absolute() {
-                            override_path
-                        } else {
-                            cwd.join(override_path)
-                        }
-                    },
+                    || Ok(config_root.join("agent")),
+                    |override_path| resolve_omp_agent_dir_override(cwd, override_path),
                 )
         },
-        |profile| config_root.join("profiles").join(profile).join("agent"),
-    );
+        |profile| Ok(config_root.join("profiles").join(profile).join("agent")),
+    )?;
+
+    let user_mcp_config = agent_dir.join("mcp.json");
+    if !omp_path_is_absolute_and_traversal_free(&config_root)
+        || !omp_path_is_absolute_and_traversal_free(&user_mcp_config)
+    {
+        return Err(SetupError::Other(
+            "OMP configuration paths must resolve to absolute, traversal-free authorities"
+                .to_string(),
+        ));
+    }
 
     Ok(OmpConfigPaths {
         config_root,
-        user_mcp_config: agent_dir.join("mcp.json"),
+        user_mcp_config,
     })
 }
 
@@ -1334,59 +1408,131 @@ fn project_local_action(
     }
 }
 
-/// Return the active OMP user-level MCP config path represented by setup parameters.
+/// Return the absolute active OMP user-level MCP config path represented by setup parameters.
 ///
 /// This is also the cross-file authority for project-only status: OMP applies
 /// its top-level `disabledServers` list to project MCP entries.
-#[must_use]
-pub fn omp_active_user_config_path(params: &SetupParams) -> PathBuf {
-    let home = params
-        .home_dir_override
-        .clone()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("~"));
-    params
+///
+/// # Errors
+///
+/// Returns an error rather than treating a literal `~` or another relative
+/// path as a filesystem authority. OMP setup files can contain bearer tokens,
+/// so a caller must never redirect an unresolved home into its working tree.
+pub fn omp_active_user_config_path(params: &SetupParams) -> Result<PathBuf, SetupError> {
+    let path = params
         .omp_user_config_path_override
         .clone()
-        .unwrap_or_else(|| home.join(".omp").join("agent").join("mcp.json"))
+        .map_or_else(
+            || {
+                require_absolute_omp_home_dir(
+                    params.home_dir_override.clone().or_else(dirs::home_dir),
+                )
+                .map(|home| home.join(".omp").join("agent").join("mcp.json"))
+            },
+            Ok,
+        )?;
+    if !omp_path_is_absolute_and_traversal_free(&path) {
+        return Err(SetupError::Other(
+            "OMP active-profile user config must be an absolute, traversal-free path"
+                .to_string(),
+        ));
+    }
+    Ok(path)
 }
 
-fn omp_active_user_secondary_config_path(params: &SetupParams) -> PathBuf {
-    omp_active_user_config_path(params)
+fn omp_active_user_secondary_config_path(params: &SetupParams) -> Result<PathBuf, SetupError> {
+    Ok(omp_active_user_config_path(params)?
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".mcp.json")
+        .ok_or_else(|| {
+            SetupError::Other(
+                "OMP active-profile user config has no parent directory".to_string(),
+            )
+        })?
+        .join(".mcp.json"))
 }
 
-/// Return OMP's native MCP discovery inputs in exact first-wins load order.
-///
-/// Setup writes only the canonical `mcp.json` files. The `.mcp.json` siblings
-/// remain read-only runtime authorities: a repeated server name is shadowed by
-/// its earlier canonical definition, while a distinct Agent Mail alias remains
-/// a separate live MCP key.
-#[must_use]
-pub fn omp_mcp_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
-    let candidates = [
-        params.project_dir.join(".omp/mcp.json"),
-        params.project_dir.join(".omp/.mcp.json"),
-        omp_active_user_config_path(params),
-        omp_active_user_secondary_config_path(params),
+#[derive(Clone, Copy)]
+enum OmpMcpAuthorityFormat {
+    Native,
+    Standalone,
+}
+
+struct OmpMcpAuthoritySource {
+    path: PathBuf,
+    format: OmpMcpAuthorityFormat,
+}
+
+fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource> {
+    let mut candidates = vec![
+        OmpMcpAuthoritySource {
+            path: params.project_dir.join(".omp/mcp.json"),
+            format: OmpMcpAuthorityFormat::Native,
+        },
+        OmpMcpAuthoritySource {
+            path: params.project_dir.join(".omp/.mcp.json"),
+            format: OmpMcpAuthorityFormat::Native,
+        },
     ];
-    let mut paths = Vec::with_capacity(candidates.len());
-    for path in candidates {
-        if !paths.contains(&path) {
-            paths.push(path);
+    if let Ok(path) = omp_active_user_config_path(params) {
+        candidates.push(OmpMcpAuthoritySource {
+            path,
+            format: OmpMcpAuthorityFormat::Native,
+        });
+    }
+    if let Ok(path) = omp_active_user_secondary_config_path(params) {
+        candidates.push(OmpMcpAuthoritySource {
+            path,
+            format: OmpMcpAuthorityFormat::Native,
+        });
+    }
+    candidates.extend([
+        OmpMcpAuthoritySource {
+            path: params.project_dir.join("mcp.json"),
+            format: OmpMcpAuthorityFormat::Standalone,
+        },
+        OmpMcpAuthoritySource {
+            path: params.project_dir.join(".mcp.json"),
+            format: OmpMcpAuthorityFormat::Standalone,
+        },
+    ]);
+
+    let mut sources = Vec::with_capacity(candidates.len());
+    for source in candidates {
+        if !sources
+            .iter()
+            .any(|existing: &OmpMcpAuthoritySource| existing.path == source.path)
+        {
+            sources.push(source);
         }
     }
-    paths
+    sources
 }
 
-fn omp_active_user_settings_paths(params: &SetupParams) -> (PathBuf, PathBuf) {
-    let user_config = omp_active_user_config_path(params);
+/// Return OMP's stable MCP discovery inputs in exact first-wins load order.
+///
+/// Setup writes only the canonical native `mcp.json` files. Native `.mcp.json`
+/// siblings and project-root `mcp.json` / `.mcp.json` fallback inputs remain
+/// read-only runtime authorities.
+#[must_use]
+pub fn omp_mcp_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
+    omp_mcp_authority_sources(params)
+        .into_iter()
+        .map(|source| source.path)
+        .collect()
+}
+
+fn omp_active_user_settings_paths(
+    params: &SetupParams,
+) -> Result<(PathBuf, PathBuf), SetupError> {
+    let user_config = omp_active_user_config_path(params)?;
     let agent_dir = user_config
         .parent()
-        .unwrap_or_else(|| Path::new("."));
-    (agent_dir.join("config.yml"), agent_dir.join("config.yaml"))
+        .ok_or_else(|| {
+            SetupError::Other(
+                "OMP active-profile user config has no parent directory".to_string(),
+            )
+        })?;
+    Ok((agent_dir.join("config.yml"), agent_dir.join("config.yaml")))
 }
 
 fn omp_project_settings_paths(params: &SetupParams) -> Vec<PathBuf> {
@@ -1405,12 +1551,14 @@ fn omp_project_settings_paths(params: &SetupParams) -> Vec<PathBuf> {
 /// order, then the ordered `PI_CONFIG_FILES` overlays.
 #[must_use]
 pub fn omp_settings_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
-    let (user_yml, user_yaml) = omp_active_user_settings_paths(params);
-    let mut paths = vec![user_yml.clone()];
-    if user_yml.symlink_metadata().is_err_and(|error| {
-        error.kind() == std::io::ErrorKind::NotFound
-    }) {
-        paths.push(user_yaml);
+    let mut paths = Vec::new();
+    if let Ok((user_yml, user_yaml)) = omp_active_user_settings_paths(params) {
+        paths.push(user_yml.clone());
+        if user_yml.symlink_metadata().is_err_and(|error| {
+            error.kind() == std::io::ErrorKind::NotFound
+        }) {
+            paths.push(user_yaml);
+        }
     }
     paths.extend(omp_project_settings_paths(params));
     paths.extend(params.omp_settings_overlay_paths.iter().cloned());
@@ -1662,10 +1810,12 @@ impl AgentPlatform {
             omp_http_server_value(url, token),
             "Oh My Pi (OMP) project-local MCP config",
         )];
-        if !params.skip_user_config {
+        if !params.skip_user_config
+            && let Ok(file_path) = omp_active_user_config_path(params)
+        {
             actions.push(ConfigAction {
                 platform: self,
-                file_path: omp_active_user_config_path(params),
+                file_path,
                 description: "Oh My Pi (OMP) active-profile MCP config".into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
@@ -2467,6 +2617,30 @@ fn project_secret_gitignore_error(
         .map(|error| error.to_string())
 }
 
+fn omp_setup_authority_preflight(
+    params: &SetupParams,
+    platforms: &[AgentPlatform],
+) -> Option<SetupResult> {
+    if !platforms.contains(&AgentPlatform::Omp) {
+        return None;
+    }
+    let error = omp_active_user_config_path(params).err()?;
+    let requested_path = params
+        .omp_user_config_path_override
+        .as_deref()
+        .map_or_else(|| "<unresolved>".to_string(), |path| path.display().to_string());
+    Some(SetupResult {
+        platform: AgentPlatform::Omp.display_name().to_string(),
+        actions: vec![ActionResult {
+            file_path: requested_path,
+            description: "Oh My Pi (OMP) active-profile MCP authority preflight".to_string(),
+            outcome: ActionOutcome::Failed(format!(
+                "refusing OMP setup before writing any config bytes: {error}"
+            )),
+        }],
+    })
+}
+
 /// Run the full setup flow.
 #[must_use]
 pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
@@ -2474,6 +2648,9 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
         .agents
         .clone()
         .unwrap_or_else(|| AgentPlatform::ALL.to_vec());
+    if let Some(failure) = omp_setup_authority_preflight(params, &platforms) {
+        return vec![failure];
+    }
     let project_token_paths = if params.token.is_empty() {
         std::collections::BTreeSet::new()
     } else {

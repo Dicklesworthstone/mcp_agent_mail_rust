@@ -15530,16 +15530,11 @@ mod tests {
         drop(ordinary_conn);
 
         let frozen_alias = redirected_dir.join("mail.sqlite3");
-        let foreign_db = redirected_dir.join("foreign.sqlite3");
-        let foreign_db_text = foreign_db
-            .to_str()
-            .expect("temporary foreign database path is UTF-8");
-        let foreign_seed = crate::DbConn::open_file(foreign_db_text)
-            .expect("open redirected fresh-connection fixture");
-        foreign_seed
-            .execute_raw("CREATE TABLE foreign_authority_sentinel(value TEXT NOT NULL)")
-            .expect("create redirected fresh-connection sentinel");
-        drop(foreign_seed);
+        let foreign_db = redirected_dir.join("missing-foreign.sqlite3");
+        assert!(
+            !foreign_db.exists(),
+            "redirected fresh-connection fixture requires a dangling symlink target"
+        );
         let redirected_storage = redirected_dir.join("archive");
         std::fs::create_dir_all(&redirected_storage).expect("create redirected archive authority");
         let redirected_pool = crate::DbPool::new(&crate::DbPoolConfig {
@@ -15554,7 +15549,7 @@ mod tests {
         .expect("freeze missing fresh-connection authority");
 
         symlink(&foreign_db, &frozen_alias)
-            .expect("insert foreign database symlink before fresh connection admission");
+            .expect("insert dangling database symlink before fresh connection admission");
         let error = match open_fresh_file_backed_conn(&redirected_pool) {
             Ok(_) => panic!("fresh connection must reject an existing authority symlink"),
             Err(error) => error,

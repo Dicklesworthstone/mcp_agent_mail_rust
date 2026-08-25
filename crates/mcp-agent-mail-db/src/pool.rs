@@ -5201,6 +5201,7 @@ fn validate_frozen_sqlite_open_authority(
         return Ok(());
     };
     let open_path = Path::new(sqlite_path);
+    validate_frozen_authority_leaf_not_symlink(open_path, context, "database")?;
     let observed = normalize_sqlite_identity_path_buf(open_path);
     if observed == expected {
         return Ok(());
@@ -5218,6 +5219,7 @@ fn validate_frozen_storage_root_authority(
     storage_root: &Path,
     context: &'static str,
 ) -> Result<(), SqlError> {
+    validate_frozen_authority_leaf_not_symlink(storage_root, context, "archive")?;
     let observed = normalize_sqlite_identity_path_buf(storage_root);
     if observed == storage_root {
         return Ok(());
@@ -5227,6 +5229,26 @@ fn validate_frozen_storage_root_authority(
         storage_root.display(),
         observed.display(),
     )))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_frozen_authority_leaf_not_symlink(
+    path: &Path,
+    context: &'static str,
+    authority_name: &'static str,
+) -> Result<(), SqlError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(SqlError::Custom(format!(
+            "{context}: frozen {authority_name} path {} is now a symbolic link; refusing to cross {authority_name} authority",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SqlError::Custom(format!(
+            "{context}: cannot inspect frozen {authority_name} path {}: {error}; refusing to cross {authority_name} authority",
+            path.display()
+        ))),
+    }
 }
 
 /// Normalize a filesystem identity without converting its platform-native
@@ -28501,15 +28523,14 @@ mod tests {
         let redirected_storage = redirected_dir.join("archive");
         std::fs::create_dir_all(&redirected_storage)
             .expect("create redirected archive authority");
-        let foreign_sidecar = root.path().join("foreign-atc.sqlite3");
-        write_sidecar_fixture(
-            foreign_sidecar
-                .to_str()
-                .expect("temporary foreign ATC path is UTF-8"),
+        let foreign_sidecar = root.path().join("missing-foreign-atc.sqlite3");
+        assert!(
+            !foreign_sidecar.exists(),
+            "redirected ATC fixture requires a dangling symlink target"
         );
         let redirected_sidecar = atc_sidecar_sqlite_path(redirected_primary_text);
         symlink(&foreign_sidecar, &redirected_sidecar)
-            .expect("insert foreign ATC symlink before validation admission");
+            .expect("insert dangling foreign ATC symlink before validation admission");
         let redirected_pool = DbPool::new(&DbPoolConfig {
             database_url: format!("sqlite:///{}", redirected_primary.display()),
             storage_root: Some(redirected_storage),
