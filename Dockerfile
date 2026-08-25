@@ -2,13 +2,11 @@
 #
 # Multi-stage Dockerfile for MCP Agent Mail (Rust).
 #
-# Mirrors the sibling-clone build pattern from .github/workflows/dist.yml:
-# this workspace depends on path-patched local checkouts of frankensearch,
-# franken_agent_detection, asupersync, sqlmodel_rust, frankensqlite,
-# frankentui, beads_rust, fastmcp_rust, toon_rust, and rich_rust (see the
-# `[patch.crates-io]` block in /Cargo.toml). The build clones each of those
-# repos as a sibling of /build/mcp_agent_mail_rust so cargo resolves the
-# patch paths correctly.
+# Mirrors the sibling-clone build pattern from .github/workflows/dist.yml.
+# The current workspace has exactly two out-of-tree path authorities:
+# frankensearch through workspace dependencies and beads_rust through
+# `[patch.crates-io]`. The build clones both as siblings of
+# /build/mcp_agent_mail_rust so Cargo resolves those paths correctly.
 #
 # Build arguments
 # ---------------
