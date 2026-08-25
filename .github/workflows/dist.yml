@@ -110,6 +110,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -175,6 +177,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -254,6 +258,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
 
       - name: Checkout pinned sibling dependencies
         shell: bash
@@ -420,6 +426,25 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release_contract.outputs.revision }}
+          fetch-depth: 0
+
+      - name: Revalidate release tag before publication
+        env:
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          checked_out_revision="$(git rev-parse HEAD)"
+          remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk 'NR == 1 {print $1}')"
+          if [ -z "$remote_revision" ]; then
+            remote_revision="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 {print $1}')"
+          fi
+          if [ "$checked_out_revision" != "$EXPECTED_REVISION" ] || [ "$remote_revision" != "$EXPECTED_REVISION" ]; then
+            echo "Release tag moved after preflight; refusing publication" >&2
+            exit 1
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -484,17 +509,88 @@ jobs:
             test -s "$artifact"
             test -s "${artifact}.sha256"
             test -s "${artifact}.sigstore.json"
-            sidecar_hash="$(awk '{print $1; exit}' "${artifact}.sha256")"
-            sums_hash="$(awk -v artifact="$artifact" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' SHA256SUMS)"
-            if [ -z "$sums_hash" ]; then
-              echo "SHA256SUMS missing entry for ${artifact}" >&2
+
+            mapfile -t sidecar_lines < "${artifact}.sha256"
+            if [ "${#sidecar_lines[@]}" -ne 1 ]; then
+              echo "${artifact}.sha256 must contain exactly one checksum line" >&2
               exit 1
             fi
-            if [ "$sidecar_hash" != "$sums_hash" ]; then
-              echo "Checksum mismatch between ${artifact}.sha256 and SHA256SUMS for ${artifact}" >&2
+            read -r sidecar_hash sidecar_name sidecar_extra <<< "${sidecar_lines[0]}"
+            sidecar_name="${sidecar_name#\*}"
+            if [[ ! "$sidecar_hash" =~ ^[0-9a-f]{64}$ ]] \
+                || [ "$sidecar_name" != "$artifact" ] || [ -n "$sidecar_extra" ]; then
+              echo "${artifact}.sha256 must name exactly ${artifact} with one SHA-256 digest" >&2
               exit 1
             fi
+
+            mapfile -t sums_hashes < <(
+              awk -v artifact="$artifact" \
+                '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1}' \
+                SHA256SUMS
+            )
+            if [ "${#sums_hashes[@]}" -ne 1 ]; then
+              echo "SHA256SUMS must contain exactly one entry for ${artifact}" >&2
+              exit 1
+            fi
+            actual_hash="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+            if [ "$actual_hash" != "$sidecar_hash" ] || [ "$actual_hash" != "${sums_hashes[0]}" ]; then
+              echo "Checksum witnesses disagree with the bytes of ${artifact}" >&2
+              exit 1
+            fi
+
+            case "$artifact" in
+              *.tar.xz)
+                python3 - "$artifact" <<'PY'
+          import sys
+          import tarfile
+
+          path = sys.argv[1]
+          with tarfile.open(path, mode="r:xz") as archive:
+              members = archive.getmembers()
+          names = sorted(member.name.removeprefix("./") for member in members)
+          if names != ["am", "mcp-agent-mail"]:
+              raise SystemExit(f"{path} members are {names!r}, expected exactly flat am and mcp-agent-mail")
+          if any(not member.isfile() or member.size <= 0 for member in members):
+              raise SystemExit(f"{path} contains a non-regular or empty member")
+          PY
+                ;;
+              *.zip)
+                python3 - "$artifact" <<'PY'
+          import stat
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+          with zipfile.ZipFile(path) as archive:
+              members = archive.infolist()
+          names = sorted(member.filename.removeprefix("./") for member in members)
+          if names != ["am.exe", "mcp-agent-mail.exe"]:
+              raise SystemExit(f"{path} members are {names!r}, expected exactly flat am.exe and mcp-agent-mail.exe")
+          for member in members:
+              mode = (member.external_attr >> 16) & 0xFFFF
+              if member.is_dir() or member.file_size <= 0 or stat.S_IFMT(mode) not in (0, stat.S_IFREG):
+                  raise SystemExit(f"{path} contains a non-regular or empty member")
+          PY
+                ;;
+              *)
+                echo "Unexpected archive type: ${artifact}" >&2
+                exit 1
+                ;;
+            esac
           done
+
+          expected_bundle_files=(SHA256SUMS)
+          for artifact in "${expected_archives[@]}"; do
+            expected_bundle_files+=("$artifact" "${artifact}.sha256" "${artifact}.sigstore.json")
+          done
+          mapfile -t expected_bundle_files < <(printf '%s\n' "${expected_bundle_files[@]}" | sort)
+          mapfile -t actual_bundle_files < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [ "${actual_bundle_files[*]}" != "${expected_bundle_files[*]}" ]; then
+            echo "Release bundle contains missing or unexpected files" >&2
+            printf 'Expected: %s\n' "${expected_bundle_files[@]}" >&2
+            printf 'Actual: %s\n' "${actual_bundle_files[@]}" >&2
+            exit 1
+          fi
 
       - name: Copy install scripts to dist
         run: |
@@ -502,12 +598,14 @@ jobs:
           cp install.ps1 dist/ 2>/dev/null || echo "No install.ps1 found"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ needs.release_contract.outputs.tag }}
+          name: ${{ needs.release_contract.outputs.tag }}
           draft: false
-          prerelease: false
+          prerelease: ${{ needs.release_contract.outputs.prerelease }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/*
         env:
