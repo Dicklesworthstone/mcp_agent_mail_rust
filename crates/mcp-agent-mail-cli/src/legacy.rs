@@ -3435,6 +3435,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let progress_path = root.join("progress");
         let mut coherent_snapshots = 0_u32;
+        let mut freshness_checked_snapshots = 0_u32;
         let mut observed_commit_during_capture = false;
         let mut fail_closed_errors = Vec::new();
 
@@ -3485,6 +3486,7 @@ mod tests {
                                     .expect("published generation fits SQLite INTEGER"),
                             "snapshot must not fall back behind the last generation committed before capture"
                         );
+                        freshness_checked_snapshots = freshness_checked_snapshots.saturating_add(1);
                     }
                     coherent_snapshots = coherent_snapshots.saturating_add(1);
                 }
@@ -3498,7 +3500,11 @@ mod tests {
             let exercised_family_races = root.join("grew").exists()
                 && root.join("checkpointed").exists()
                 && root.join("reset").exists();
-            if coherent_snapshots >= 2 && observed_commit_during_capture && exercised_family_races {
+            if coherent_snapshots >= 2
+                && freshness_checked_snapshots >= 2
+                && observed_commit_during_capture
+                && exercised_family_races
+            {
                 break;
             }
         }
@@ -3506,6 +3512,10 @@ mod tests {
         assert!(
             coherent_snapshots >= 2,
             "expected at least two coherent snapshots while racing; fail-closed errors={fail_closed_errors:?}"
+        );
+        assert!(
+            freshness_checked_snapshots >= 2,
+            "expected at least two successful snapshots with a published pre-capture freshness bound; observed {freshness_checked_snapshots}"
         );
         assert!(
             observed_commit_during_capture,
