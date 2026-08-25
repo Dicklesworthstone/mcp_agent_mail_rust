@@ -45,24 +45,12 @@
 #   * mcp-agent-mail (the server, ENTRYPOINT)
 #   * am             (the operator CLI)
 
-# Base image choice is dictated by the release binaries' glibc floor, which is
-# not the same for both architectures:
-#
-#   linux/amd64  needs GLIBC_2.39  (dsr builds it natively on the Linux build
-#                                   host, so it inherits that host's glibc)
-#   linux/arm64  needs GLIBC_2.28  (dsr cross-builds it with `cargo zigbuild`,
-#                                   which targets a deliberately old glibc)
-#
-# debian:bookworm-slim ships glibc 2.36 and therefore CANNOT run the amd64
-# binary — the in-image verification below catches this as
-# `version 'GLIBC_2.38' not found`, which is exactly what it is for.
-# debian:trixie-slim ships glibc 2.41 and satisfies both.
-#
-# Note this is a container-side accommodation, not a fix: the amd64 tarball on
-# the GitHub release has the same 2.39 floor and will not run on Debian 12,
-# Ubuntu 22.04, RHEL 9, or Amazon Linux 2023. That belongs in the build
-# pipeline (build amd64 through zigbuild with a pinned glibc target, the way
-# arm64 already is), not here.
+# The dist matrix builds both GNU artifacts natively: x86_64 on
+# `ubuntu-latest` and aarch64 on `ubuntu-24.04-arm`. Neither lane currently
+# targets an explicitly older glibc baseline, so this file does not promise a
+# minimum glibc version inferred from a runner label. The executable checks
+# below are the fail-closed compatibility gate for the exact release binaries
+# packaged on each architecture.
 FROM debian:trixie-slim AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive

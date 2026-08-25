@@ -32,7 +32,7 @@ on:
         required: false
         default: 'main'
       tag_suffix:
-        description: 'Source-build tag component; always namespaced and suffixed with the workflow SHA.'
+        description: 'Source-build tag component; always namespaced and suffixed with the resolved AM_REF commit SHA.'
         required: false
         default: 'manual'
 
@@ -69,6 +69,7 @@ jobs:
       am_ref: ${{ steps.refs.outputs.am_ref }}
       sibling_ref: ${{ steps.refs.outputs.sibling_ref }}
       sibling_fallback_ref: ${{ steps.refs.outputs.sibling_fallback_ref }}
+      tag_suffix: ${{ steps.refs.outputs.tag_suffix }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
     permissions:
@@ -96,6 +97,7 @@ jobs:
           GITHUB_REF_VALUE: ${{ github.ref }}
           INPUT_AM_REF: ${{ inputs.am_ref }}
           INPUT_SIBLING_REF: ${{ inputs.sibling_ref }}
+          INPUT_TAG_SUFFIX: ${{ inputs.tag_suffix }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -145,20 +147,70 @@ jobs:
             # refs are intentionally inert in Dockerfile.release.
             am_ref="$revision"
             sibling_ref="$revision"
+            tag_suffix=""
           else
             mode="source"
             dockerfile="./Dockerfile"
             release_tag=""
             version="manual"
-            revision="$(git rev-parse HEAD)"
-            am_ref="${INPUT_AM_REF:-main}"
+            requested_am_ref="${INPUT_AM_REF:-main}"
             sibling_ref="${INPUT_SIBLING_REF:-main}"
-            for input_ref in "$am_ref" "$sibling_ref"; do
+            tag_suffix="${INPUT_TAG_SUFFIX:-manual}"
+            for input_ref in "$requested_am_ref" "$sibling_ref" "$tag_suffix"; do
               if [[ "$input_ref" == *$'\n'* || "$input_ref" == *$'\r'* ]]; then
-                echo "Manual source refs must be single-line values" >&2
+                echo "Manual source inputs must be single-line values" >&2
                 exit 1
               fi
             done
+            if [[ ! "$tag_suffix" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+              echo "Manual tag suffix must be 1-64 lowercase tag-safe characters" >&2
+              exit 1
+            fi
+
+            # Resolve the user-facing branch/tag once, then pass only the
+            # immutable commit to Docker. A hexadecimal value shorter than a
+            # full object ID is deliberately not reinterpreted as a branch.
+            if [[ "$requested_am_ref" =~ ^[0-9a-f]{40}$ ]]; then
+              fetch_ref="$requested_am_ref"
+              expected_revision="$requested_am_ref"
+            elif [[ "$requested_am_ref" =~ ^[0-9A-Fa-f]{1,40}$ ]]; then
+              echo "Manual AM_REF must not be a short or non-canonical commit SHA" >&2
+              exit 1
+            else
+              git check-ref-format "refs/heads/${requested_am_ref}" >/dev/null || {
+                echo "Manual AM_REF is not a valid branch or tag name" >&2
+                exit 1
+              }
+              remote_refs="$(git ls-remote --heads --tags origin)"
+              head_revision="$(awk -v target="refs/heads/${requested_am_ref}" '$2 == target {print $1}' <<< "$remote_refs")"
+              tag_revision="$(awk -v target="refs/tags/${requested_am_ref}" '$2 == target {print $1}' <<< "$remote_refs")"
+              peeled_revision="$(awk -v target="refs/tags/${requested_am_ref}^{}" '$2 == target {print $1}' <<< "$remote_refs")"
+
+              if [ -n "$head_revision" ] && [ -n "$tag_revision" ]; then
+                echo "Manual AM_REF is ambiguous: both a branch and tag use that name" >&2
+                exit 1
+              elif [ -n "$head_revision" ]; then
+                fetch_ref="refs/heads/${requested_am_ref}"
+                expected_revision="$head_revision"
+              elif [ -n "$tag_revision" ]; then
+                fetch_ref="refs/tags/${requested_am_ref}"
+                expected_revision="${peeled_revision:-$tag_revision}"
+              else
+                echo "Manual AM_REF does not name a remote branch, tag, or full commit" >&2
+                exit 1
+              fi
+            fi
+
+            git fetch --no-tags --depth=1 origin "$fetch_ref"
+            revision="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$revision" != "$expected_revision" ]; then
+              echo "Fetched AM_REF resolved to ${revision:-missing}, expected ${expected_revision}" >&2
+              exit 1
+            fi
+
+            # Dockerfile's full-SHA lane fetches this exact object and checks
+            # out FETCH_HEAD. Never pass the original moving ref to the build.
+            am_ref="$revision"
           fi
           {
             printf 'mode=%s\n' "$mode"
@@ -169,7 +221,13 @@ jobs:
             printf 'am_ref=%s\n' "$am_ref"
             printf 'sibling_ref=%s\n' "$sibling_ref"
             printf 'sibling_fallback_ref=%s\n' "main"
+            printf 'tag_suffix=%s\n' "$tag_suffix"
           } >> "$GITHUB_OUTPUT"
+          {
+            printf '### Container build contract\n\n'
+            printf -- '- Mode: `%s`\n' "$mode"
+            printf -- '- Source revision: `%s`\n' "$revision"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Download and verify published release binaries
         if: ${{ steps.refs.outputs.mode == 'release' }}
@@ -348,8 +406,11 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-            type=raw,value=source-${{ inputs.tag_suffix }}-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=sha,format=long,prefix=source-sha-,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=source-${{ steps.refs.outputs.tag_suffix }}-${{ steps.refs.outputs.revision }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=source-sha-${{ steps.refs.outputs.revision }},enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.refs.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.refs.outputs.revision }}
 
       - name: Validate publication tag policy
         env:
@@ -358,7 +419,8 @@ jobs:
           RELEASE_TAG: ${{ steps.refs.outputs.release_tag }}
           VERSION: ${{ steps.refs.outputs.version }}
           TAGS: ${{ steps.meta.outputs.tags }}
-          WORKFLOW_SHA: ${{ github.sha }}
+          SOURCE_REVISION: ${{ steps.refs.outputs.revision }}
+          TAG_SUFFIX: ${{ steps.refs.outputs.tag_suffix }}
         run: |
           set -euo pipefail
           mapfile -t published_tags < <(printf '%s\n' "$TAGS" | sed '/^$/d' | sort -u)
@@ -384,13 +446,22 @@ jobs:
               }
             done
           else
-            for published_tag in "${published_tags[@]}"; do
-              tag_name="${published_tag#"${IMAGE}":}"
-              if [[ "$published_tag" != "${IMAGE}:"* ]] \
-                  || [[ "$tag_name" != source-*-${WORKFLOW_SHA} && "$tag_name" != "source-sha-${WORKFLOW_SHA}" ]]; then
-                echo "Manual source build attempted to publish non-namespaced tag ${published_tag}" >&2
+            [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+            expected_tags=(
+              "${IMAGE}:source-${TAG_SUFFIX}-${SOURCE_REVISION}"
+              "${IMAGE}:source-sha-${SOURCE_REVISION}"
+            )
+            mapfile -t expected_tags < <(printf '%s\n' "${expected_tags[@]}" | sort -u)
+            if [ "${#published_tags[@]}" -ne "${#expected_tags[@]}" ]; then
+              echo "Manual source tag set has an unexpected size" >&2
+              printf 'Actual: %s\n' "${published_tags[@]}" >&2
+              exit 1
+            fi
+            for expected_tag in "${expected_tags[@]}"; do
+              printf '%s\n' "${published_tags[@]}" | grep -qxF "$expected_tag" || {
+                echo "Missing source-commit-bound image tag ${expected_tag}" >&2
                 exit 1
-              fi
+              }
             done
           fi
 
@@ -432,6 +503,7 @@ jobs:
           DOCKERFILE: ${{ needs.prepare.outputs.dockerfile }}
           VERSION: ${{ needs.prepare.outputs.version }}
           REVISION: ${{ needs.prepare.outputs.revision }}
+          AM_REF: ${{ needs.prepare.outputs.am_ref }}
         run: |
           set -euo pipefail
           if [ "$MODE" = "release" ]; then
@@ -444,6 +516,8 @@ jobs:
             done
           else
             [ "$DOCKERFILE" = "./Dockerfile" ]
+            [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+            [ "$AM_REF" = "$REVISION" ]
           fi
 
       - name: Set up Docker Buildx
@@ -476,7 +550,9 @@ jobs:
             AM_REF=${{ needs.prepare.outputs.am_ref }}
             SIBLING_REF=${{ needs.prepare.outputs.sibling_ref }}
             SIBLING_FALLBACK_REF=${{ needs.prepare.outputs.sibling_fallback_ref }}
-          provenance: true
+          # Max provenance records the immutable AM_REF build argument rather
+          # than leaving a manual source build identified only by github.sha.
+          provenance: mode=max
           sbom: true
 
       - name: Export digest
@@ -610,7 +686,17 @@ jobs:
           IMAGE: ${{ needs.prepare.outputs.image }}
           DIGEST: ${{ steps.manifest.outputs.digest }}
           TAGS: ${{ needs.prepare.outputs.tags }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          SOURCE_REVISION: ${{ needs.prepare.outputs.revision }}
         run: |
           set -euo pipefail
           printf 'Published image: %s@%s\n' "$IMAGE" "$DIGEST"
+          printf 'Mode: %s\nSource revision: %s\n' "$MODE" "$SOURCE_REVISION"
           printf 'Tags:\n%s\n' "$TAGS"
+          {
+            printf '### Published container\n\n'
+            printf -- '- Digest: `%s@%s`\n' "$IMAGE" "$DIGEST"
+            printf -- '- Mode: `%s`\n' "$MODE"
+            printf -- '- Source revision: `%s`\n' "$SOURCE_REVISION"
+            printf '\nTags:\n```text\n%s\n```\n' "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
