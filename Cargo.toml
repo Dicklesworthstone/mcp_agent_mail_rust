@@ -183,9 +183,15 @@ inherits = "release"     # Benchmarks use same optimizations as release
 #   cleanup trigger fired, so those eight patch lines are gone too.
 # - fastmcp family resolves from crates.io (0.7.1).
 #
-# beads_rust 0.5.0, ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3
-# resolve from crates.io. Their former path patches made builds depend on
-# whatever state each machine's sibling checkout happened to be in.
+# beads_rust: the required 0.5.0 line is not published yet, so it stays
+# path-patched to the ../beads_rust checkout on main. Keep the requirement and
+# checkout version in lockstep; Cargo ignores a patch whose package version
+# does not satisfy the declared dependency requirement.
+# Cleanup trigger: beads_rust 0.5.x published to crates.io.
+beads_rust = { path = "../beads_rust" }
+# ftui 0.5.0, franken-agent-detection 0.2.2, and tru 0.2.3 resolve from
+# crates.io. Their former path patches made builds depend on whatever state
+# each machine's sibling checkout happened to be in.
 # rich_rust resolves from the registry (0.2.3) as of 2026-08-20 —
 # fastmcp-console 0.7.1 pins =0.2.3 and registry 0.2.3 carries the
 # time ^0.3.54 req, so the 0.2.2 gated-clone patch is gone.
