@@ -3094,12 +3094,7 @@ impl DbPool {
         context: &'static str,
         busy_timeout_ms: u64,
     ) -> DbResult<crate::DbConnGuard> {
-        validate_frozen_sqlite_open_authority(
-            &self.sqlite_path,
-            self.sqlite_identity.as_deref(),
-            context,
-        )
-        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        self.validated_sqlite_path(context)?;
         let conn = crate::guard_db_conn(
             open_sqlite_file_with_lock_retry(&self.sqlite_path)
                 .map_err(|error| DbError::Sqlite(format!("{context}: open failed: {error}")))?,
@@ -3299,6 +3294,26 @@ impl DbPool {
     #[must_use]
     pub fn storage_root(&self) -> &std::path::Path {
         &self.storage_root
+    }
+
+    /// Return the frozen SQLite authority after proving its path has not
+    /// become an alias for a different filesystem identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::InvalidArgument`] when the path now resolves through
+    /// a different authority than the one frozen at pool construction.
+    fn validated_sqlite_path(&self, context: &'static str) -> DbResult<&Path> {
+        validate_frozen_sqlite_open_authority(
+            &self.sqlite_path,
+            self.sqlite_identity.as_deref(),
+            context,
+        )
+        .map_err(|error| DbError::InvalidArgument {
+            field: "database_url",
+            message: error.to_string(),
+        })?;
+        Ok(Path::new(&self.sqlite_path))
     }
 
     /// Return the frozen archive authority after proving its path has not
@@ -3741,7 +3756,7 @@ impl DbPool {
         require_source_neutral_preopen_proof: bool,
         cycle: &str,
     ) -> DbResult<bool> {
-        let sqlite_path = Path::new(&self.sqlite_path);
+        let sqlite_path = self.validated_sqlite_path("integrity pre-open classification")?;
         cleanup_truncated_wal_sidecar(sqlite_path).map_err(|error| {
             DbError::Sqlite(format!(
                 "{cycle}: pre-open SQLite-family cleanup failed: {error}"
@@ -3783,11 +3798,12 @@ impl DbPool {
                 kind: integrity::CheckKind::Quick,
             });
         }
+        let sqlite_path = self.validated_sqlite_path("startup/periodic integrity check")?;
         let storage_root =
             self.validated_storage_root("startup/periodic integrity archive recovery")?;
 
         // Check if the file exists first. If missing, it requires recovery (e.g. from archive or backup).
-        if !Path::new(&self.sqlite_path).exists() {
+        if !sqlite_path.exists() {
             return Err(DbError::IntegrityCorruption {
                 message: "Database file is missing".to_string(),
                 details: vec!["File not found on disk".to_string()],
@@ -3829,10 +3845,11 @@ impl DbPool {
                             "startup integrity check failed to open sqlite file; attempting auto-recovery"
                         );
                         recover_sqlite_file_with_storage_root(
-                            Path::new(&self.sqlite_path),
+                            sqlite_path,
                             storage_root,
                         )
                         .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
+                        self.validated_sqlite_path("startup integrity post-recovery open")?;
                         open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                             DbError::Sqlite(format!(
                                 "startup integrity check: open failed after recovery: {reopen}"
@@ -3865,11 +3882,12 @@ impl DbPool {
                     drop(conn);
 
                     if let Err(e) = recover_sqlite_file_with_storage_root(
-                        Path::new(&self.sqlite_path),
+                        sqlite_path,
                         storage_root,
                     ) {
                         return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
                     }
+                    self.validated_sqlite_path("startup integrity post-recovery open")?;
 
                     // Re-open and re-verify. Route post-recovery through the same
                     // canonical fallback: if the bespoke probe's false-positive was
@@ -3901,13 +3919,14 @@ impl DbPool {
                     drop(conn);
 
                     if let Err(recovery_error) = recover_sqlite_file_with_storage_root(
-                        Path::new(&self.sqlite_path),
+                        sqlite_path,
                         storage_root,
                     ) {
                         return Err(DbError::Sqlite(format!(
                             "startup recovery failed: {recovery_error}"
                         )));
                     }
+                    self.validated_sqlite_path("startup integrity post-recovery open")?;
 
                     let conn = crate::guard_db_conn(
                         open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
@@ -3928,7 +3947,7 @@ impl DbPool {
         }
 
         match with_automatic_recovery_admission(
-            Path::new(&self.sqlite_path),
+            sqlite_path,
             "startup integrity pre-open recovery",
             run_live_check,
         ) {
@@ -3960,7 +3979,8 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(None);
         }
-        if !Path::new(&self.sqlite_path).exists() {
+        let sqlite_path = self.validated_sqlite_path("message-id floor database authority")?;
+        if !sqlite_path.exists() {
             return Ok(None);
         }
         let storage_root = self.validated_storage_root("message-id floor archive scan")?;
@@ -4047,9 +4067,10 @@ impl DbPool {
                 kind: integrity::CheckKind::Full,
             });
         }
+        let sqlite_path = self.validated_sqlite_path("full integrity check")?;
         let storage_root = self.validated_storage_root("full integrity archive recovery")?;
 
-        if !Path::new(&self.sqlite_path).exists() {
+        if !sqlite_path.exists() {
             return Err(DbError::IntegrityCorruption {
                 message: "Database file is missing".to_string(),
                 details: vec!["File not found on disk".to_string()],
@@ -4067,7 +4088,7 @@ impl DbPool {
             self.integrity_family_requires_preopen_admission(false, "full integrity check")?;
         let raw_conn = if requires_preopen_admission {
             with_recovery_mutation_admission(
-                Path::new(&self.sqlite_path),
+                sqlite_path,
                 "full integrity pre-open",
                 || open_sqlite_file_with_lock_retry(&self.sqlite_path),
             )
@@ -4091,12 +4112,13 @@ impl DbPool {
                         "full integrity check failed to open sqlite file; attempting auto-recovery"
                     );
                     recover_sqlite_file_with_storage_root(
-                        Path::new(&self.sqlite_path),
+                        sqlite_path,
                         storage_root,
                     )
                     .map_err(|re| {
                         DbError::Sqlite(format!("full integrity recovery failed: {re}"))
                     })?;
+                    self.validated_sqlite_path("full integrity post-recovery open")?;
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                         DbError::Sqlite(format!(
                             "full integrity check: open failed after recovery: {reopen}"
@@ -4106,6 +4128,7 @@ impl DbPool {
             }
         };
         let conn = crate::guard_db_conn(raw_conn, "full integrity check connection");
+        self.validated_sqlite_path("full integrity canonical fallback")?;
 
         reconcile_with_canonical(
             integrity::full_check(&conn),
@@ -4132,7 +4155,8 @@ impl DbPool {
         if self.sqlite_path == ":memory:" {
             return Ok(Vec::new());
         }
-        if !Path::new(&self.sqlite_path).exists() {
+        let sqlite_path = self.validated_sqlite_path("consistency probe")?;
+        if !sqlite_path.exists() {
             return Ok(Vec::new());
         }
 
@@ -4140,7 +4164,7 @@ impl DbPool {
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
         let conn = open_guarded_read_only_franken_existing_file(
-            Path::new(&self.sqlite_path),
+            sqlite_path,
             "consistency probe",
         )
         .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
