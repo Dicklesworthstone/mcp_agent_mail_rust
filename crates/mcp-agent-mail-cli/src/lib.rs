@@ -7972,6 +7972,22 @@ fn canonical_setup_config_env_path() -> CliResult<PathBuf> {
     require_canonical_setup_config_env_path(mcp_agent_mail_core::canonical_config_env_path())
 }
 
+fn require_canonical_omp_user_config_path(path: Option<PathBuf>) -> CliResult<PathBuf> {
+    match path {
+        Some(path) if path.is_absolute() => Ok(path),
+        _ => Err(CliError::Other(
+            "Could not resolve an absolute active OMP user mcp.json path; set HOME to an absolute directory"
+                .to_string(),
+        )),
+    }
+}
+
+fn canonical_omp_user_config_path() -> CliResult<PathBuf> {
+    let paths = mcp_agent_mail_core::setup::omp_config_paths_from_env()
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    require_canonical_omp_user_config_path(paths.map(|paths| paths.user_mcp_config))
+}
+
 /// Prepare a server runtime to start against the mailbox by clearing stale
 /// blockers and running doctor-grade database self-heal before boot.
 ///
@@ -8037,9 +8053,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     let existing_cache = read_setup_self_heal_cache(config, &project_dir);
     let omp_is_targeted = target_agents.contains(&setup::AgentPlatform::Omp);
     let omp_user_config_path_override = if omp_is_targeted {
-        setup::omp_config_paths_from_env()
-            .map_err(|error| CliError::Other(error.to_string()))?
-            .map(|paths| paths.user_mcp_config)
+        Some(canonical_omp_user_config_path()?)
     } else {
         None
     };
@@ -15250,9 +15264,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
 
             let omp_user_config_path_override =
                 if target_agents.contains(&setup::AgentPlatform::Omp) {
-                    setup::omp_config_paths_from_env()
-                        .map_err(|error| CliError::Other(error.to_string()))?
-                        .map(|paths| paths.user_mcp_config)
+                    Some(canonical_omp_user_config_path()?)
                 } else {
                     None
                 };
@@ -15373,9 +15385,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 .as_ref()
                 .is_none_or(|agents| agents.contains(&setup::AgentPlatform::Omp))
             {
-                setup::omp_config_paths_from_env()
-                    .map_err(|error| CliError::Other(error.to_string()))?
-                    .map(|paths| paths.user_mcp_config)
+                Some(canonical_omp_user_config_path()?)
             } else {
                 None
             };
@@ -43646,6 +43656,25 @@ http_headers = { Authorization = "Bearer secret" }
         let missing = require_canonical_setup_config_env_path(None)
             .expect_err("missing absolute config authority must fail closed");
         assert!(missing.to_string().contains("absolute config.env path"));
+    }
+
+    #[test]
+    fn setup_omp_user_config_path_fails_closed_without_absolute_authority() {
+        let relative =
+            require_canonical_omp_user_config_path(Some(PathBuf::from("~/.omp/agent/mcp.json")))
+                .expect_err("relative OMP user config must be rejected");
+        assert!(relative.to_string().contains("absolute active OMP user"));
+
+        let missing = require_canonical_omp_user_config_path(None)
+            .expect_err("missing OMP user config authority must fail closed");
+        assert!(missing.to_string().contains("absolute active OMP user"));
+
+        let temp = canonical_test_tempdir("am-omp-config-path-");
+        let absolute = temp.path().join(".omp/agent/mcp.json");
+        assert_eq!(
+            require_canonical_omp_user_config_path(Some(absolute.clone())).unwrap(),
+            absolute
+        );
     }
 
     #[test]

@@ -202,12 +202,11 @@ pub struct OmpConfigPaths {
 ///
 /// # Errors
 ///
-/// Returns an error when the explicitly selected `OMP_PROFILE` or legacy
-/// `PI_PROFILE` does not satisfy OMP's profile-name contract.
+/// Returns an error when no absolute home directory is available, or when the
+/// explicitly selected `OMP_PROFILE` or legacy `PI_PROFILE` does not satisfy
+/// OMP's profile-name contract.
 pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError> {
-    let Some(home) = dirs::home_dir() else {
-        return Ok(None);
-    };
+    let home = require_absolute_omp_home_dir(dirs::home_dir())?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let omp_profile =
         std::env::var_os("OMP_PROFILE").map(|value| value.to_string_lossy().into_owned());
@@ -227,6 +226,16 @@ pub fn omp_config_paths_from_env() -> Result<Option<OmpConfigPaths>, SetupError>
         agent_dir.as_deref(),
     )
     .map(Some)
+}
+
+fn require_absolute_omp_home_dir(home: Option<PathBuf>) -> Result<PathBuf, SetupError> {
+    match home {
+        Some(home) if home.is_absolute() => Ok(home),
+        _ => Err(SetupError::Other(
+            "cannot resolve the active OMP user config without an absolute home directory"
+                .to_string(),
+        )),
+    }
 }
 
 /// Resolve OMP's ordered `PI_CONFIG_FILES` settings overlays from the live
@@ -5694,6 +5703,24 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[1].file_path, active_profile_config);
         assert!(actions[1].description.contains("active-profile"));
+    }
+
+    #[test]
+    fn omp_home_authority_must_be_absolute() {
+        let missing = require_absolute_omp_home_dir(None)
+            .expect_err("missing OMP home must fail closed");
+        assert!(missing.to_string().contains("absolute home directory"));
+
+        let relative = require_absolute_omp_home_dir(Some(PathBuf::from("home")))
+            .expect_err("relative OMP home must fail closed");
+        assert!(relative.to_string().contains("absolute home directory"));
+
+        let temp = setup_real_tempdir();
+        let absolute = temp.path().join("home");
+        assert_eq!(
+            require_absolute_omp_home_dir(Some(absolute.clone())).unwrap(),
+            absolute
+        );
     }
 
     #[test]
