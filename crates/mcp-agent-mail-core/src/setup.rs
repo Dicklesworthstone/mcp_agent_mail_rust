@@ -5034,10 +5034,7 @@ fn json_entry_authorization(entry: &Value) -> Option<&str> {
 }
 
 fn json_entry_authorization_matches(entry: &Value, expected: Option<&str>) -> bool {
-    let Some(headers) = entry
-        .get("headers")
-        .or_else(|| entry.get("http_headers"))
-    else {
+    let Some(headers) = entry.get("headers").or_else(|| entry.get("http_headers")) else {
         return expected.is_none();
     };
     let Some(headers) = headers.as_object() else {
@@ -9868,6 +9865,117 @@ http_headers = { Authorization = "Bearer tok" }
                 .and_then(Value::as_str),
             Some("mcpServers")
         );
+    }
+
+    #[test]
+    fn check_status_omp_requires_expected_live_http_transport() {
+        let cases = [
+            (
+                "inferred HTTP",
+                r#"{"url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}"#,
+                false,
+                true,
+            ),
+            (
+                "explicit HTTP",
+                r#"{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}"#,
+                false,
+                true,
+            ),
+            (
+                "unknown URL transport",
+                r#"{"type":"future-http","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}"#,
+                true,
+                true,
+            ),
+            (
+                "stdio with URL",
+                r#"{"type":"stdio","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}"#,
+                true,
+                true,
+            ),
+            (
+                "SSE with URL",
+                r#"{"type":"sse","url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}"#,
+                true,
+                true,
+            ),
+            (
+                "non-string transport",
+                r#"{"type":7,"url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"},"enabled":true}"#,
+                true,
+                true,
+            ),
+            (
+                "non-string URL",
+                r#"{"type":"http","url":7,"headers":{"Authorization":"Bearer tok"},"enabled":true}"#,
+                true,
+                false,
+            ),
+        ];
+
+        for (label, entry, expect_unsupported, expect_url_match) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+            let config = params.project_dir.join(".omp/mcp.json");
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(
+                config,
+                format!(r#"{{"mcpServers":{{"mcp-agent-mail":{entry}}}}}"#),
+            )
+            .unwrap();
+
+            let file = first_setup_status_file(&params);
+
+            assert_eq!(file.url_matches, expect_url_match, "{label}");
+            assert_eq!(
+                file.drift_reasons
+                    .contains(&ConfigDriftReason::UnsupportedConfig),
+                expect_unsupported,
+                "{label} must reflect the transport OMP will actually open"
+            );
+            if !expect_unsupported {
+                assert!(file.drift_reasons.is_empty(), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn check_status_omp_rejects_duplicate_case_insensitive_authorization_headers() {
+        let cases = [
+            r#""Authorization":"Bearer tok","authorization":"Bearer stale""#,
+            r#""authorization":"Bearer stale","Authorization":"Bearer tok""#,
+            r#""Authorization":"Bearer tok","authorization":7"#,
+        ];
+
+        for headers in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+            let config = params.project_dir.join(".omp/mcp.json");
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(
+                config,
+                format!(
+                    r#"{{"mcpServers":{{"mcp-agent-mail":{{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{{{headers}}},"enabled":true}}}}}}"#
+                ),
+            )
+            .unwrap();
+
+            let file = first_setup_status_file(&params);
+
+            assert!(file.url_matches);
+            assert_eq!(
+                file.primary_drift_reason,
+                ConfigDriftReason::WrongBearerHeader
+            );
+            assert!(
+                file.drift_reasons
+                    .contains(&ConfigDriftReason::WrongBearerHeader)
+            );
+            let serialized = serde_json::to_string(&file).unwrap();
+            assert!(!serialized.contains("Bearer tok"));
+            assert!(!serialized.contains("Bearer stale"));
+        }
     }
 
     #[test]
