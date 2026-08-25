@@ -3073,6 +3073,9 @@ detect_mcp_configs() {
   local path
   local key
   local exists_flag
+  local omp_agent_component
+  local omp_agent_cursor
+  local omp_agent_path_error=0
   local omp_config_name
   local omp_config_component
   local omp_config_cursor
@@ -3084,6 +3087,7 @@ detect_mcp_configs() {
   local omp_profiles_root
   local omp_profile_error=0
   local -a candidates=()
+  local -a omp_agent_components=()
   local -a omp_config_components=()
 
   if [ -n "$home_dir" ]; then
@@ -3181,12 +3185,38 @@ detect_mcp_configs() {
     elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
       case "$PI_CODING_AGENT_DIR" in
         /*)
-          if [ -L "$PI_CODING_AGENT_DIR" ]; then
-            err "PI_CODING_AGENT_DIR is a symlink; refusing OMP authority: ${PI_CODING_AGENT_DIR}"
-            omp_profile_error=2
-          else
+          omp_agent_cursor="/"
+          IFS='/' read -r -a omp_agent_components <<< "$PI_CODING_AGENT_DIR"
+          for omp_agent_component in "${omp_agent_components[@]}"; do
+            case "$omp_agent_component" in
+              "" | .) continue ;;
+              ..)
+                err "PI_CODING_AGENT_DIR contains parent traversal; refusing OMP authority: ${PI_CODING_AGENT_DIR}"
+                omp_agent_path_error=2
+                break
+                ;;
+            esac
+            if [ "$omp_agent_cursor" = "/" ]; then
+              omp_agent_cursor="/${omp_agent_component}"
+            else
+              omp_agent_cursor="${omp_agent_cursor}/${omp_agent_component}"
+            fi
+            if [ -L "$omp_agent_cursor" ]; then
+              err "PI_CODING_AGENT_DIR contains a symlinked component; refusing OMP authority: ${omp_agent_cursor}"
+              omp_agent_path_error=2
+              break
+            fi
+            if [ -e "$omp_agent_cursor" ] && [ ! -d "$omp_agent_cursor" ]; then
+              err "PI_CODING_AGENT_DIR contains a non-directory component; refusing OMP authority: ${omp_agent_cursor}"
+              omp_agent_path_error=2
+              break
+            fi
+          done
+          if [ "$omp_agent_path_error" -eq 0 ]; then
             candidates+=("omp|${PI_CODING_AGENT_DIR}/mcp.json")
             candidates+=("omp|${PI_CODING_AGENT_DIR}/.mcp.json")
+          else
+            omp_profile_error=2
           fi
           ;;
         *)

@@ -345,6 +345,44 @@ absolute_agent_targets="$(
 [ "$absolute_agent_targets" = "omp" ] \
     || fail "production detector rejected an absolute PI_CODING_AGENT_DIR authority"
 
+symlink_agent_root="$tmp/symlink-agent-root"
+symlink_agent_target="$tmp/symlink-agent-target"
+mkdir -p "$symlink_agent_root" "$symlink_agent_target/agent"
+printf '%s\n' '{}' >"$symlink_agent_target/agent/mcp.json"
+ln -s "$symlink_agent_target" "$symlink_agent_root/linked-parent"
+set +e
+symlink_agent_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" \
+        PI_CODING_AGENT_DIR="$symlink_agent_root/linked-parent/agent" \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+symlink_agent_rc=$?
+set -e
+[ "$symlink_agent_rc" -eq 2 ] \
+    || fail "symlinked PI_CODING_AGENT_DIR ancestry returned $symlink_agent_rc instead of 2"
+[ -z "$symlink_agent_targets" ] \
+    || fail "production detector emitted an OMP target through symlinked PI_CODING_AGENT_DIR ancestry"
+
+non_directory_agent_root="$tmp/non-directory-agent-root"
+mkdir -p "$non_directory_agent_root"
+printf '%s\n' 'not a directory' >"$non_directory_agent_root/file-parent"
+set +e
+non_directory_agent_targets="$(
+    cd "$relative_agent_root"
+    unset APPDATA OMP_PROFILE PI_PROFILE PI_CONFIG_DIR
+    HOME="$relative_agent_home" \
+        PI_CODING_AGENT_DIR="$non_directory_agent_root/file-parent/agent" \
+        PATH="$relative_home_path" remote_http_client_target_tools
+)"
+non_directory_agent_rc=$?
+set -e
+[ "$non_directory_agent_rc" -eq 2 ] \
+    || fail "non-directory PI_CODING_AGENT_DIR ancestry returned $non_directory_agent_rc instead of 2"
+[ -z "$non_directory_agent_targets" ] \
+    || fail "production detector emitted an OMP target through non-directory PI_CODING_AGENT_DIR ancestry"
+
 symlink_config_home="$tmp/symlink-config-home"
 symlink_config_target="$tmp/symlink-config-target"
 mkdir -p "$symlink_config_home" "$symlink_config_target/nested/agent"
