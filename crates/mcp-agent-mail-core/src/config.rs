@@ -3434,6 +3434,7 @@ fn read_open_user_env_file_bounded(
     Ok(bytes)
 }
 
+#[cfg(not(all(unix, not(target_os = "redox"))))]
 fn revalidate_open_user_env_leaf(path: &Path, file: std::fs::File) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -3460,8 +3461,8 @@ fn read_user_env_candidate_with_hooks(
     after_file_open: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
     use nix::errno::Errno;
-    use nix::fcntl::{OFlag, open, openat};
-    use nix::sys::stat::Mode;
+    use nix::fcntl::{AtFlags, OFlag, open, openat};
+    use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
 
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -3497,18 +3498,57 @@ fn read_user_env_candidate_with_hooks(
     after_file_open();
     let mut file = std::fs::File::from(file_fd);
     let bytes = read_open_user_env_file_bounded(&mut file, path)?;
-    revalidate_open_user_env_leaf(path, file)?;
-
-    let parent_metadata = fs::symlink_metadata(parent)?;
-    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+    let opened_file = fstat(&file).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} could not revalidate its open file identity: {error}", path.display()),
+        )
+    })?;
+    let observed_file = fstatat(&parent_fd, file_name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(
+        |error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} changed file identity during read: {error}", path.display()),
+            )
+        },
+    )?;
+    if !SFlag::from_bits_truncate(observed_file.st_mode).contains(SFlag::S_IFREG)
+        || opened_file.st_dev != observed_file.st_dev
+        || opened_file.st_ino != observed_file.st_ino
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} changed directory authority during read", parent.display()),
+            format!("{} changed file identity during read", path.display()),
         ));
     }
-    let opened_parent = same_file::Handle::from_file(std::fs::File::from(parent_fd))?;
-    let observed_parent = same_file::Handle::from_path(parent)?;
-    if opened_parent != observed_parent {
+
+    let opened_parent = fstat(&parent_fd).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} could not revalidate its open directory identity: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+    let observed_parent_fd = open(parent, directory_flags, Mode::empty()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} changed directory authority during read: {error}", parent.display()),
+        )
+    })?;
+    let observed_parent = fstat(&observed_parent_fd).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} could not revalidate its directory identity: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+    if opened_parent.st_dev != observed_parent.st_dev
+        || opened_parent.st_ino != observed_parent.st_ino
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} changed directory identity during read", parent.display()),
