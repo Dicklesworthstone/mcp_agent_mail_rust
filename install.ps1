@@ -478,75 +478,219 @@ function Test-InstalledReleaseVersion {
     }
 }
 
+function Assert-SafeInstallDirectory {
+    param([string]$InstallDir)
+
+    $fullPath = [System.IO.Path]::GetFullPath($InstallDir)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        throw "Install directory has no filesystem root: $InstallDir"
+    }
+    $current = $root
+    $relative = $fullPath.Substring($root.Length)
+    foreach ($segment in ($relative -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+        $current = Join-Path $current $segment
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (-not $item.PSIsContainer -or
+                ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Install directory component is not a real directory: $current"
+            }
+        } else {
+            $null = New-Item -ItemType Directory -Path $current
+        }
+    }
+    return $fullPath
+}
+
+function Enter-InstallerMutex {
+    param(
+        [string]$InstallDir,
+        [int]$TimeoutMilliseconds = 30000
+    )
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($InstallDir.ToLowerInvariant())
+        $digest = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
+    } finally {
+        $sha.Dispose()
+    }
+    $mutex = [Threading.Mutex]::new($false, "Local\mcp-agent-mail-install-$digest")
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne($TimeoutMilliseconds)
+        } catch [Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            throw "Another installer is operating on $InstallDir. Wait for it to finish and retry."
+        }
+        return $mutex
+    } catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-InstallerMutex {
+    param([Threading.Mutex]$Mutex)
+    if ($null -eq $Mutex) {
+        return
+    }
+    try { $Mutex.ReleaseMutex() } catch { }
+    $Mutex.Dispose()
+}
+
 function Install-BinariesAtomically {
     param(
         [string]$AmSource,
         [string]$ServerSource,
-        [string]$InstallDir
+        [string]$InstallDir,
+        [scriptblock]$PostInstallVerifier,
+        [switch]$FailAfterFirstReplaceForTest
     )
 
-    if (-not (Test-Path -LiteralPath $AmSource)) {
+    if (-not (Test-Path -LiteralPath $AmSource -PathType Leaf)) {
         throw "Atomic install source missing: $AmSource. Release archive may be incomplete; retry download or pin a known-good -Version."
     }
-    if (-not (Test-Path -LiteralPath $ServerSource)) {
+    if (-not (Test-Path -LiteralPath $ServerSource -PathType Leaf)) {
         throw "Atomic install source missing: $ServerSource. Release archive may be incomplete; retry download or pin a known-good -Version."
     }
+    foreach ($source in @($AmSource, $ServerSource)) {
+        $sourceItem = Get-Item -LiteralPath $source -Force
+        if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $sourceItem.Length -le 0) {
+            throw "Atomic install source is empty or is a reparse point: $source"
+        }
+    }
 
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    $InstallDir = Assert-SafeInstallDirectory -InstallDir $InstallDir
 
     $amDest = Join-Path $InstallDir "am.exe"
     $serverDest = Join-Path $InstallDir "mcp-agent-mail.exe"
+    foreach ($destination in @($amDest, $serverDest)) {
+        if (Test-Path -LiteralPath $destination) {
+            $destinationItem = Get-Item -LiteralPath $destination -Force
+            if ($destinationItem.PSIsContainer -or
+                ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Existing install target is not a regular file: $destination"
+            }
+        }
+    }
+
     $nonce = [Guid]::NewGuid().ToString("N")
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-
     $amTemp = "$amDest.tmp.$nonce"
     $serverTemp = "$serverDest.tmp.$nonce"
-    $amBackup = $null
-    $serverBackup = $null
+    $amBackup = "$amDest.bak.preinstall-$stamp-$nonce"
+    $serverBackup = "$serverDest.bak.preinstall-$stamp-$nonce"
+    $amHash = Get-Sha256Hex -FilePath $AmSource
+    $serverHash = Get-Sha256Hex -FilePath $ServerSource
+    $amBackedUp = $false
+    $serverBackedUp = $false
+    $amInstalled = $false
+    $serverInstalled = $false
+    $committed = $false
 
     try {
         Copy-Item -LiteralPath $AmSource -Destination $amTemp -Force
         Copy-Item -LiteralPath $ServerSource -Destination $serverTemp -Force
+        if ((Get-Sha256Hex -FilePath $amTemp) -cne $amHash -or
+            (Get-Sha256Hex -FilePath $serverTemp) -cne $serverHash) {
+            throw "Destination staging changed binary bytes."
+        }
 
         if (Test-Path -LiteralPath $amDest) {
-            $amBackup = "$amDest.bak.preinstall-$stamp-$nonce"
             Move-Item -LiteralPath $amDest -Destination $amBackup -Force
+            $amBackedUp = $true
         }
         if (Test-Path -LiteralPath $serverDest) {
-            $serverBackup = "$serverDest.bak.preinstall-$stamp-$nonce"
             Move-Item -LiteralPath $serverDest -Destination $serverBackup -Force
+            $serverBackedUp = $true
         }
 
         Move-Item -LiteralPath $amTemp -Destination $amDest -Force
+        $amInstalled = $true
+        if ($FailAfterFirstReplaceForTest) {
+            throw "injected failure after first binary replacement"
+        }
         Move-Item -LiteralPath $serverTemp -Destination $serverDest -Force
+        $serverInstalled = $true
 
-        if ($null -ne $amBackup -and (Test-Path -LiteralPath $amBackup)) {
-            Remove-Item -LiteralPath $amBackup -Force -ErrorAction SilentlyContinue
+        if ((Get-Sha256Hex -FilePath $amDest) -cne $amHash -or
+            (Get-Sha256Hex -FilePath $serverDest) -cne $serverHash) {
+            throw "Installed binary bytes differ from the verified staged pair."
         }
-        if ($null -ne $serverBackup -and (Test-Path -LiteralPath $serverBackup)) {
-            Remove-Item -LiteralPath $serverBackup -Force -ErrorAction SilentlyContinue
+        if ($null -ne $PostInstallVerifier) {
+            & $PostInstallVerifier $InstallDir
         }
+        $committed = $true
     } catch {
         $installError = $_.Exception.Message
-        if (Test-Path -LiteralPath $amDest) {
-            Remove-Item -LiteralPath $amDest -Force -ErrorAction SilentlyContinue
+        $rollbackErrors = @()
+        $states = @(
+            @{
+                Label = "mcp-agent-mail.exe"; Dest = $serverDest; Backup = $serverBackup
+                Hash = $serverHash; BackedUp = $serverBackedUp; Installed = $serverInstalled
+            },
+            @{
+                Label = "am.exe"; Dest = $amDest; Backup = $amBackup
+                Hash = $amHash; BackedUp = $amBackedUp; Installed = $amInstalled
+            }
+        )
+        foreach ($state in $states) {
+            if ($state.Installed -and (Test-Path -LiteralPath $state.Dest)) {
+                try {
+                    $currentItem = Get-Item -LiteralPath $state.Dest -Force
+                    if ($currentItem.PSIsContainer -or
+                        ($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                        (Get-Sha256Hex -FilePath $state.Dest) -cne $state.Hash) {
+                        throw "destination was concurrently modified"
+                    }
+                    Remove-Item -LiteralPath $state.Dest -Force
+                } catch {
+                    $rollbackErrors += "$($state.Label): refusing to remove unexpected destination ($($_.Exception.Message))"
+                }
+            }
+            if ($state.BackedUp) {
+                if (Test-Path -LiteralPath $state.Dest) {
+                    $rollbackErrors += "$($state.Label): destination occupied; backup retained at $($state.Backup)"
+                } elseif (-not (Test-Path -LiteralPath $state.Backup -PathType Leaf)) {
+                    $rollbackErrors += "$($state.Label): backup missing at $($state.Backup)"
+                } else {
+                    try {
+                        Move-Item -LiteralPath $state.Backup -Destination $state.Dest
+                    } catch {
+                        $rollbackErrors += "$($state.Label): backup restore failed ($($_.Exception.Message))"
+                    }
+                }
+            }
         }
-        if (Test-Path -LiteralPath $serverDest) {
-            Remove-Item -LiteralPath $serverDest -Force -ErrorAction SilentlyContinue
+        $rollbackDetail = if ($rollbackErrors.Count -eq 0) {
+            "The previous binary pair was restored."
+        } else {
+            "Rollback was incomplete: $($rollbackErrors -join '; ')"
         }
-        if ($null -ne $amBackup -and (Test-Path -LiteralPath $amBackup)) {
-            Move-Item -LiteralPath $amBackup -Destination $amDest -Force -ErrorAction SilentlyContinue
-        }
-        if ($null -ne $serverBackup -and (Test-Path -LiteralPath $serverBackup)) {
-            Move-Item -LiteralPath $serverBackup -Destination $serverDest -Force -ErrorAction SilentlyContinue
-        }
-        throw "Atomic binary replacement failed. Rollback attempted. Close any running am/mcp-agent-mail processes and re-run with -Force. Root error: $installError"
+        throw "Atomic binary replacement failed. $rollbackDetail Close running am/mcp-agent-mail processes and inspect the destination before retrying. Root error: $installError"
     } finally {
         if (Test-Path -LiteralPath $amTemp) {
             Remove-Item -LiteralPath $amTemp -Force -ErrorAction SilentlyContinue
         }
         if (Test-Path -LiteralPath $serverTemp) {
             Remove-Item -LiteralPath $serverTemp -Force -ErrorAction SilentlyContinue
+        }
+        if ($committed) {
+            if ($amBackedUp -and (Test-Path -LiteralPath $amBackup)) {
+                Remove-Item -LiteralPath $amBackup -Force -ErrorAction SilentlyContinue
+            }
+            if ($serverBackedUp -and (Test-Path -LiteralPath $serverBackup)) {
+                Remove-Item -LiteralPath $serverBackup -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
