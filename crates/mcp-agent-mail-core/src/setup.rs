@@ -3834,7 +3834,11 @@ mod tests {
         assert!(
             std::fs::read_dir(config.parent().unwrap())
                 .unwrap()
-                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".bak"))
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".bak"))
         );
     }
 
@@ -4246,9 +4250,8 @@ mod tests {
                 "unexpected error for {invalid:?}: {error}"
             );
 
-            let legacy_error =
-                resolve_omp_config_paths(home, cwd, None, Some(invalid), None, None)
-                    .expect_err("invalid legacy PI_PROFILE must also fail closed");
+            let legacy_error = resolve_omp_config_paths(home, cwd, None, Some(invalid), None, None)
+                .expect_err("invalid legacy PI_PROFILE must also fail closed");
             assert!(
                 legacy_error.to_string().contains("invalid OMP profile"),
                 "unexpected PI_PROFILE error for {invalid:?}: {legacy_error}"

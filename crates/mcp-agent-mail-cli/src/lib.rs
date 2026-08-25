@@ -32726,8 +32726,7 @@ fn handle_doctor_check_with_target(
                                 }
                             }
                             McpAgentMailEntryKind::Unknown => {
-                                if loc.tool
-                                    == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
+                                if loc.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp
                                     && omp_config_needs_native_contract_repair(&content)
                                 {
                                     omp_contract_issues += 1;
