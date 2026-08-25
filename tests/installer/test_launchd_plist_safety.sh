@@ -62,6 +62,11 @@ extract_function() {
     extract_function plist_env_entry
     extract_function ensure_real_directory_tree
     extract_function ensure_real_file_target_path
+    extract_function private_file_identity
+    extract_function private_file_link_count
+    extract_function private_file_security_identity
+    extract_function ensure_private_file_target_path
+    extract_function write_private_file_atomic
     extract_function write_launchd_service_plist
     extract_function repair_launchd_service_env_from_rust_config
     extract_function detect_mcp_configs
@@ -72,7 +77,7 @@ extract_function() {
     sed -n '/^install_legacy_launcher_takeover_shims() {/,/^# T1\.5:/p' "$INSTALL_SH" | sed '$d'
 } >"$extract"
 
-for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path write_launchd_service_plist repair_launchd_service_env_from_rust_config detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -404,7 +409,38 @@ if grep -Eq 'configure_mcp_clients(_for_install)? .*\|\| true' "$INSTALL_SH"; th
     fail "production installer still suppresses MCP configuration failure"
 fi
 
-step "scenario K4: private atomic writer verifies publication without path chmod"
+step "scenario K4: private atomic writer publishes one secure inode and refuses symlinks"
+private_writer_dir="$tmp/private-writer"
+private_writer_path="$private_writer_dir/config.env"
+private_writer_peer="$private_writer_dir/config.env.peer"
+private_writer_victim="$private_writer_dir/victim.env"
+private_writer_symlink="$private_writer_dir/symlink.env"
+mkdir -p "$private_writer_dir"
+printf '%s\n' 'OLD=preserved' >"$private_writer_path"
+chmod 600 "$private_writer_path"
+ln "$private_writer_path" "$private_writer_peer"
+printf '%s\n' 'NEW=private' \
+    | write_private_file_atomic "$private_writer_path" "private writer control" \
+    || fail "private writer ordinary hardlink-detaching replacement failed"
+[ "$(cat "$private_writer_path")" = 'NEW=private' ] \
+    || fail "private writer published the wrong content"
+[ "$(cat "$private_writer_peer")" = 'OLD=preserved' ] \
+    || fail "private writer modified the outside hardlink peer"
+private_file_security_identity "$private_writer_path" >/dev/null \
+    || fail "private writer did not publish a mode-600 single-link regular file"
+printf '%s\n' 'VICTIM=unchanged' >"$private_writer_victim"
+chmod 600 "$private_writer_victim"
+ln -s "$private_writer_victim" "$private_writer_symlink"
+if printf '%s\n' 'VICTIM=clobbered' \
+    | write_private_file_atomic "$private_writer_symlink" "private writer symlink control"; then
+    fail "private writer followed a symlink destination"
+fi
+[ "$(cat "$private_writer_victim")" = 'VICTIM=unchanged' ] \
+    || fail "private writer changed a symlink target"
+[ -L "$private_writer_symlink" ] \
+    || fail "private writer replaced the planted symlink"
+
+step "scenario K5: private atomic writer statically binds publication without path chmod"
 private_security_body="$(extract_function private_file_security_identity)"
 private_writer_body="$(extract_function write_private_file_atomic)"
 printf '%s\n' "$private_security_body" | grep -Fq "stat -f '%d:%i:%HT:%Lp:%l'" \

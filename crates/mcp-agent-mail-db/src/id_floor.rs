@@ -1081,6 +1081,59 @@ mod tests {
         assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 100);
     }
 
+    #[test]
+    fn id_floor_transaction_observes_newer_row_with_regressed_sequence() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("stale-row-floor.db");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 subject TEXT NOT NULL
+             );
+             INSERT INTO messages (id, subject) VALUES (10, 'existing');",
+        )
+        .unwrap();
+        let newer = SqliteConnection::open_file(db.to_string_lossy().as_ref()).unwrap();
+        let injected = std::cell::Cell::new(false);
+
+        let result = advance_messages_id_floor_with(
+            Some(25),
+            |sql, params| {
+                conn.query_sync(sql, params)
+                    .map_err(|error| error.to_string())
+            },
+            |sql| {
+                // Deterministically commit a newer explicit-id row at the
+                // transaction-admission seam, then model the degraded engine
+                // that failed to retain its corresponding sequence advance.
+                // Moving BEGIN below the floor reads makes this test repair to
+                // 25 and exposes the stale-read bug.
+                if sql == "BEGIN IMMEDIATE;" && !injected.replace(true) {
+                    newer
+                        .execute_raw(
+                            "INSERT INTO messages (id, subject) VALUES (100, 'newer');
+                             UPDATE sqlite_sequence SET seq = 10 WHERE name = 'messages';",
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                conn.execute_raw(sql).map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(100));
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS row_count, MAX(seq) AS seq FROM sqlite_sequence \
+                 WHERE name = 'messages'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("row_count").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 100);
+    }
+
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
