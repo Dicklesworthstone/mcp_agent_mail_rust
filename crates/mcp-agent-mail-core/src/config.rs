@@ -3436,15 +3436,12 @@ fn read_open_user_env_file_bounded(
 
 #[cfg(not(all(unix, not(target_os = "redox"))))]
 fn revalidate_open_user_env_leaf(path: &Path, file: std::fs::File) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} changed regular-file authority during read", path.display()),
-        ));
-    }
     let opened = same_file::Handle::from_file(file)?;
-    let observed = same_file::Handle::from_path(path)?;
+    // Reopen the observed path through the platform's no-follow primitive.
+    // On Windows this rejects every reparse point, including uncommon
+    // non-name-surrogate reparse points.
+    let observed_file = crate::disk::open_regular_file_no_follow(path)?;
+    let observed = same_file::Handle::from_file(observed_file)?;
     if opened != observed {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3583,13 +3580,11 @@ fn read_user_env_candidate_with_hooks(
 fn user_env_parent_metadata_is_safe(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::FileTypeExt as _;
+        use std::os::windows::fs::MetadataExt as _;
 
-        let file_type = metadata.file_type();
-        file_type.is_dir()
-            && !file_type.is_symlink()
-            && !file_type.is_symlink_dir()
-            && !file_type.is_symlink_file()
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_type().is_dir()
+            && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
     }
     #[cfg(not(windows))]
     {
@@ -3597,19 +3592,54 @@ fn user_env_parent_metadata_is_safe(metadata: &fs::Metadata) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn bind_user_env_parent(parent: &Path) -> io::Result<same_file::Handle> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?;
+    if !user_env_parent_metadata_is_safe(&directory.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular directory authority", parent.display()),
+        ));
+    }
+    same_file::Handle::from_file(directory)
+}
+
+#[cfg(all(
+    not(windows),
+    not(all(unix, not(target_os = "redox")))
+))]
+fn bind_user_env_parent(parent: &Path) -> io::Result<same_file::Handle> {
+    let metadata = fs::symlink_metadata(parent)?;
+    if !user_env_parent_metadata_is_safe(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular directory authority", parent.display()),
+        ));
+    }
+    same_file::Handle::from_path(parent)
+}
+
 #[cfg(not(all(unix, not(target_os = "redox"))))]
 fn revalidate_user_env_parent(
     parent: &Path,
     expected: &same_file::Handle,
 ) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(parent)?;
-    if !user_env_parent_metadata_is_safe(&metadata) {
-        return Err(io::Error::new(
+    let observed = bind_user_env_parent(parent).map_err(|error| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} changed directory authority during read", parent.display()),
-        ));
-    }
-    let observed = same_file::Handle::from_path(parent)?;
+            format!(
+                "{} changed directory authority during read: {error}",
+                parent.display()
+            ),
+        )
+    })?;
     if expected != &observed {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3631,23 +3661,16 @@ fn read_user_env_candidate_with_hooks(
             format!("{} has no parent directory", path.display()),
         )
     })?;
-    let parent_metadata = match fs::symlink_metadata(parent) {
-        Ok(metadata) => metadata,
+    let parent_before = match bind_user_env_parent(parent) {
+        Ok(handle) => handle,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !user_env_parent_metadata_is_safe(&parent_metadata) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a regular directory authority", parent.display()),
-        ));
-    }
 
-    // `same_file::Handle` binds the platform file identity. The non-Unix
-    // implementation cannot open the leaf relative to that directory handle,
-    // so it revalidates the parent identity immediately after the bounded leaf
-    // read and rejects any observed replacement.
-    let parent_before = same_file::Handle::from_path(parent)?;
+    // `same_file::Handle` binds the platform directory identity. The non-Unix
+    // implementation cannot open the leaf relative to that handle, so it
+    // revalidates the parent immediately after the bounded leaf read and
+    // rejects any observed replacement.
     after_parent_open();
     let mut file = match crate::disk::open_regular_file_no_follow(path) {
         Ok(file) => file,
@@ -3668,9 +3691,13 @@ fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
     read_user_env_candidate_with_hooks(path, || {}, || {})
 }
 
-fn load_user_env_values_from(home: Option<&Path>, xdg_config_dir: Option<&Path>) -> UserEnvLoad {
+fn load_user_env_values_from_with_reader(
+    home: Option<&Path>,
+    xdg_config_dir: Option<&Path>,
+    mut read_candidate: impl FnMut(&Path) -> io::Result<Option<Vec<u8>>>,
+) -> UserEnvLoad {
     for path in user_env_file_candidates(home, xdg_config_dir) {
-        let bytes = match read_user_env_candidate(&path) {
+        let bytes = match read_candidate(&path) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => continue,
             Err(error) => return UserEnvLoad::rejected(&path, &error),
@@ -3685,6 +3712,10 @@ fn load_user_env_values_from(home: Option<&Path>, xdg_config_dir: Option<&Path>)
         return UserEnvLoad::loaded(parse_dotenv_contents(&contents));
     }
     UserEnvLoad::absent()
+}
+
+fn load_user_env_values_from(home: Option<&Path>, xdg_config_dir: Option<&Path>) -> UserEnvLoad {
+    load_user_env_values_from_with_reader(home, xdg_config_dir, read_user_env_candidate)
 }
 
 fn user_env_load() -> &'static UserEnvLoad {
@@ -5778,6 +5809,40 @@ mod tests {
         assert!(load.authority_error.is_some());
     }
 
+    #[test]
+    fn user_env_load_permission_error_deterministically_suppresses_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let xdg = tmp.path().join("custom-xdg").join(XDG_APP_DIR);
+        let legacy = tmp.path().join(".mcp_agent_mail");
+        let canonical = xdg.join("config.env");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(&canonical, "FOO=canonical\n").unwrap();
+        std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
+
+        let load = load_user_env_values_from_with_reader(
+            Some(tmp.path()),
+            Some(&xdg),
+            |path| {
+                if path == canonical {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected unreadable authority",
+                    ))
+                } else {
+                    read_user_env_candidate(path)
+                }
+            },
+        );
+
+        assert!(load.values.is_empty());
+        assert!(
+            load.authority_error
+                .as_deref()
+                .is_some_and(|error| error.contains("injected unreadable authority"))
+        );
+    }
+
     #[cfg(all(unix, not(target_os = "redox")))]
     #[test]
     fn user_env_load_rejects_leaf_symlink_without_legacy_fallback() {
@@ -5901,6 +5966,7 @@ mod tests {
                 Some("new-custom-xdg-token"),
                 "fresh runtime must load the same custom-XDG credential setup writes"
             );
+            println!("{CHILD_MARKER}:executed");
             return;
         }
 
@@ -5922,7 +5988,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .arg("--exact")
             .arg("config::tests::fresh_process_runtime_prefers_custom_xdg_token_over_home_fallback")
             .arg("--nocapture")
@@ -5930,9 +5996,20 @@ mod tests {
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
             .env_remove("HTTP_BEARER_TOKEN")
-            .status()
+            .output()
             .expect("spawn isolated config child");
-        assert!(status.success(), "isolated config child failed: {status}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated config child failed: {}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(&format!("{CHILD_MARKER}:executed"))
+                || stderr.contains(&format!("{CHILD_MARKER}:executed")),
+            "isolated child exited successfully without executing the exact test\nstdout: {stdout}\nstderr: {stderr}"
+        );
     }
 
     #[cfg(all(unix, not(target_os = "redox")))]
@@ -5952,6 +6029,7 @@ mod tests {
                 .expect_err("unsafe user authority must reject server startup");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             assert!(error.to_string().contains("config.env"));
+            println!("{CHILD_MARKER}:executed");
             return;
         }
 
@@ -5978,7 +6056,7 @@ mod tests {
         .unwrap();
         symlink(&redirected, xdg_config.join("config.env")).unwrap();
 
-        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .arg("--exact")
             .arg(
                 "config::tests::fresh_process_runtime_rejects_unsafe_canonical_authority_without_fallback",
@@ -5989,9 +6067,20 @@ mod tests {
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
             .env_remove("HTTP_BEARER_TOKEN")
-            .status()
+            .output()
             .expect("spawn isolated config child");
-        assert!(status.success(), "isolated config child failed: {status}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated config child failed: {}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(&format!("{CHILD_MARKER}:executed"))
+                || stderr.contains(&format!("{CHILD_MARKER}:executed")),
+            "isolated child exited successfully without executing the exact test\nstdout: {stdout}\nstderr: {stderr}"
+        );
     }
 
     #[test]
