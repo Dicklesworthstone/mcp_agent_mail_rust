@@ -29,7 +29,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -2854,9 +2854,9 @@ pub struct DbPool {
     open_mode: DbPoolOpenMode,
     stats_sampler: Arc<DbPoolStatsSampler>,
     /// Shared, process-wide monotonic message-id allocator for this database
-    /// (mcp_agent_mail#176). Resolved once at construction so all `DbPool`
-    /// wrappers of the same underlying connection pool share one high-water
-    /// mark; see [`shared_message_id_allocator`].
+    /// (mcp_agent_mail#176). File-backed pools resolve by normalized SQLite
+    /// identity; `:memory:` pools resolve by their underlying pool `Arc`. See
+    /// [`shared_message_id_allocator`].
     message_id_allocator: Arc<crate::id_floor::MessageIdAllocator>,
 }
 
@@ -2866,24 +2866,38 @@ enum DbPoolOpenMode {
     QueryOnlyStrict,
 }
 
-/// Registry of per-database message-id allocators, keyed by the shared
-/// connection pool's `Arc` pointer identity (mcp_agent_mail#176).
+/// Registry of pool generations and their resolved message-id allocators,
+/// keyed by the shared connection pool's `Arc` pointer identity
+/// (mcp_agent_mail#176).
 ///
-/// All `DbPool` wrappers of the same underlying `Arc<Pool<DbConn>>` resolve to
-/// the same allocator, so the in-process high-water mark is shared "across
-/// pool connections". Independent pools — including each fresh `:memory:` test
-/// pool — get their own. Entries are pruned by `Weak` liveness on every
-/// resolve, so a pointer address reused by a *new* pool after the old one is
-/// dropped never inherits a stale high-water mark.
+/// Pool generation remains scoped to the underlying `Arc`: read-cache
+/// invalidation must never bleed across a replacement pool. The allocator is
+/// selected separately below so independent file-backed pools for one
+/// normalized SQLite identity share a high-water mark, while each fresh
+/// `:memory:` pool remains isolated.
 /// Registry value: a weak handle to the shared pool (for liveness pruning),
 /// that pool's message-id allocator, and its process-unique cache generation.
-type MessageIdAllocatorEntry = (
-    Weak<Pool<DbConn>>,
-    Arc<crate::id_floor::MessageIdAllocator>,
-    u64,
-);
+struct MessageIdAllocatorEntry {
+    pool: Weak<Pool<DbConn>>,
+    allocator: Arc<crate::id_floor::MessageIdAllocator>,
+    cache_generation: u64,
+    storage_root_identity: PathBuf,
+}
+
+struct FileMessageIdAllocatorEntry {
+    allocator: Weak<crate::id_floor::MessageIdAllocator>,
+    storage_root_identity: PathBuf,
+}
 
 static MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<usize, MessageIdAllocatorEntry>>> =
+    OnceLock::new();
+/// Logical file-backed allocator registry. Each live database identity binds
+/// exactly one archive-root authority; a conflicting root fails closed rather
+/// than reusing a floor scanned from the wrong archive. Weak allocator values
+/// disappear once no pool wrapper retains them. Recovery retires the old
+/// allocator and removes the identity before a replacement pool opens, so
+/// surviving old wrappers cannot diverge from the new generation.
+static FILE_MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<String, FileMessageIdAllocatorEntry>>> =
     OnceLock::new();
 static NEXT_POOL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -2896,21 +2910,124 @@ const JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE: u64 = 1 << 63;
 
 fn shared_message_id_allocator(
     pool: &Arc<Pool<DbConn>>,
-) -> (Arc<crate::id_floor::MessageIdAllocator>, u64) {
-    let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    sqlite_path: &str,
+    storage_root: &Path,
+) -> DbResult<(Arc<crate::id_floor::MessageIdAllocator>, u64)> {
+    let file_identity = (sqlite_path != ":memory:")
+        .then(|| normalize_sqlite_identity_path(sqlite_path));
+    let storage_root_identity = normalize_sqlite_identity_path_buf(storage_root);
+    let per_pool_registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut per_pool_entries = per_pool_registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // Drop entries whose pool has been freed so a reused address cannot
     // resurrect a stale allocator.
-    guard.retain(|_, (weak, _, _)| weak.strong_count() > 0);
+    per_pool_entries.retain(|_, entry| entry.pool.strong_count() > 0);
     let key = Arc::as_ptr(pool) as usize;
-    if let Some((_, allocator, generation)) = guard.get(&key) {
-        return (allocator.clone(), *generation);
+    if let Some(entry) = per_pool_entries.get(&key) {
+        if entry.storage_root_identity != storage_root_identity {
+            return Err(message_id_storage_root_conflict(
+                file_identity.as_deref().unwrap_or(":memory:"),
+                entry.storage_root_identity.as_path(),
+                storage_root_identity.as_path(),
+            ));
+        }
+        return Ok((entry.allocator.clone(), entry.cache_generation));
     }
-    let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
+    let allocator = match file_identity.as_deref() {
+        None => Arc::new(crate::id_floor::MessageIdAllocator::new()),
+        Some(identity) => {
+            let logical_registry =
+                FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut logical_entries = logical_registry
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            logical_entries.retain(|_, entry| entry.allocator.strong_count() > 0);
+            let existing = logical_entries.get(identity).map(|entry| {
+                (
+                    entry.storage_root_identity.clone(),
+                    entry.allocator.clone(),
+                )
+            });
+            if let Some((established_root, weak_allocator)) = existing {
+                if established_root != storage_root_identity {
+                    return Err(message_id_storage_root_conflict(
+                        identity,
+                        established_root.as_path(),
+                        storage_root_identity.as_path(),
+                    ));
+                }
+                if let Some(allocator) = weak_allocator.upgrade() {
+                    allocator
+                } else {
+                    let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
+                    logical_entries.insert(
+                        identity.to_string(),
+                        FileMessageIdAllocatorEntry {
+                            allocator: Arc::downgrade(&allocator),
+                            storage_root_identity: storage_root_identity.clone(),
+                        },
+                    );
+                    allocator
+                }
+            } else {
+                let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
+                logical_entries.insert(
+                    identity.to_string(),
+                    FileMessageIdAllocatorEntry {
+                        allocator: Arc::downgrade(&allocator),
+                        storage_root_identity: storage_root_identity.clone(),
+                    },
+                );
+                allocator
+            }
+        }
+    };
     let generation = NEXT_POOL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
-    guard.insert(key, (Arc::downgrade(pool), allocator.clone(), generation));
-    drop(guard);
-    (allocator, generation)
+    per_pool_entries.insert(
+        key,
+        MessageIdAllocatorEntry {
+            pool: Arc::downgrade(pool),
+            allocator: allocator.clone(),
+            cache_generation: generation,
+            storage_root_identity,
+        },
+    );
+    drop(per_pool_entries);
+    Ok((allocator, generation))
+}
+
+fn message_id_storage_root_conflict(
+    sqlite_identity: &str,
+    established_root: &Path,
+    requested_root: &Path,
+) -> DbError {
+    DbError::InvalidArgument {
+        field: "storage_root",
+        message: format!(
+            "SQLite identity {sqlite_identity} already has live message-id authority at {}; \
+             refusing conflicting authority at {}",
+            established_root.display(),
+            requested_root.display()
+        ),
+    }
+}
+
+fn invalidate_file_message_id_allocator(normalized_identity: &str) -> bool {
+    if normalized_identity == ":memory:" {
+        return false;
+    }
+    let registry = FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(entry) = guard.remove(normalized_identity) else {
+        return false;
+    };
+    if let Some(allocator) = entry.allocator.upgrade() {
+        allocator.retire();
+    }
+    true
 }
 
 fn shared_journal_size_limit(pool: &Arc<Pool<DbConn>>, configured_bytes: u64) -> Arc<AtomicU64> {
@@ -3017,7 +3134,8 @@ impl DbPool {
             checked_journal_size_limit(journal_size_limit)?,
         );
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
-        let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
+        let (message_id_allocator, cache_generation) =
+            shared_message_id_allocator(&pool, &sqlite_path, &storage_root)?;
 
         Ok(Self {
             pool,
@@ -3064,7 +3182,8 @@ impl DbPool {
         let journal_size_limit_state =
             shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
         let init_sql = Self::connection_init_sql(config, query_only, configured_journal_size_limit);
-        let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
+        let (message_id_allocator, cache_generation) =
+            shared_message_id_allocator(&pool, &sqlite_path, &storage_root)?;
 
         Ok(Self {
             pool,
@@ -3730,7 +3849,7 @@ impl DbPool {
         if !Path::new(&self.sqlite_path).exists() {
             return Ok(None);
         }
-        let archive_max = crate::id_floor::max_message_id_in_archive(&self.storage_root);
+        let archive_max = crate::id_floor::max_message_id_in_archive(&self.storage_root)?;
         if archive_max.is_none() {
             return Ok(None);
         }
@@ -3742,14 +3861,12 @@ impl DbPool {
     /// The shared, process-wide monotonic message-id allocator for this
     /// database (mcp_agent_mail#176).
     ///
-    /// Keyed by the shared connection pool's `Arc` identity so that every
-    /// `DbPool` wrapper of the same underlying pool resolves to one allocator
-    /// — guaranteeing that consecutive message creations can never be handed
-    /// the same id even when the live SQLite's durable `AUTOINCREMENT` state
-    /// fails to advance (the suspect / canonical-fallback mode that defeats
-    /// the startup-only `id_floor` advance). Independent pools, including each
-    /// fresh `:memory:` test pool, get their own isolated allocator. Resolved
-    /// once at construction (see [`shared_message_id_allocator`]); this
+    /// File-backed pools are keyed by normalized SQLite identity, so even
+    /// independent pool `Arc`s for the same live file resolve to one allocator.
+    /// This guarantees consecutive message creations cannot receive the same
+    /// id when durable `AUTOINCREMENT` state fails to advance. Each fresh
+    /// `:memory:` pool remains isolated by underlying pool `Arc`. Resolution
+    /// happens once at construction (see [`shared_message_id_allocator`]); this
     /// accessor is a cheap clone with no locking on the message hot path.
     #[must_use]
     pub fn message_id_allocator(&self) -> Arc<crate::id_floor::MessageIdAllocator> {
@@ -4723,10 +4840,11 @@ fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str
             .iter()
             .filter_map(|pool| {
                 let key = Arc::as_ptr(pool) as usize;
-                guard.get(&key).map(|(_, _, generation)| *generation)
+                guard.get(&key).map(|entry| entry.cache_generation)
             })
             .collect::<Vec<_>>()
     };
+    let message_id_allocator_invalidated = invalidate_file_message_id_allocator(&identity);
 
     for pool in &retired_pools {
         pool.close();
@@ -4765,6 +4883,7 @@ fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str
         trigger,
         retired_pools = retired_pools.len(),
         retired_generations = retired_generations.len(),
+        message_id_allocator_invalidated,
         init_gates_cleared,
         "retired all cached SQLite generations after durable database promotion"
     );
@@ -4778,20 +4897,62 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
     if let Some(cached) = sqlite_identity_path_cache_get(path) {
         return cached;
     }
-    let as_path = Path::new(path);
-    let normalized = std::fs::canonicalize(as_path).map_or_else(
-        |_| {
-            if as_path.is_absolute() {
-                as_path.to_string_lossy().into_owned()
-            } else if let Ok(cwd) = std::env::current_dir() {
-                cwd.join(as_path).to_string_lossy().into_owned()
-            } else {
-                path.to_string()
-            }
-        },
-        |canonical| canonical.to_string_lossy().into_owned(),
-    );
+    let normalized = normalize_sqlite_identity_path_buf(Path::new(path))
+        .to_string_lossy()
+        .into_owned();
     sqlite_identity_path_cache_insert(path, &normalized);
+    normalized
+}
+
+/// Resolve aliases even before the SQLite leaf exists. Canonicalize the
+/// deepest existing prefix from the original absolute spelling first, then
+/// normalize only its unresolved suffix. Resolving `..` before the existing
+/// prefix would change kernel semantics when the prefix contains a symlink
+/// (for example, `link/../missing.db`).
+fn normalize_sqlite_identity_path_buf(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let mut existing_prefix = absolute.as_path();
+    loop {
+        if let Ok(canonical_prefix) = std::fs::canonicalize(existing_prefix) {
+            let unresolved_suffix = absolute
+                .strip_prefix(existing_prefix)
+                .unwrap_or(Path::new(""));
+            let canonical_prefix =
+                mcp_agent_mail_core::disk::simplify_verbatim_path(&canonical_prefix);
+            return normalize_lexical_path(
+                &canonical_prefix.join(normalize_lexical_path(unresolved_suffix)),
+            );
+        }
+        match existing_prefix.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing_prefix = parent,
+            _ => return normalize_lexical_path(&absolute),
+        }
+    }
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(normalized.components().next_back(), Some(Component::Normal(_))) {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
     normalized
 }
 
@@ -13953,6 +14114,22 @@ mod tests {
     }
 
     #[test]
+    fn normalize_sqlite_identity_path_collapses_dotdot_before_missing_leaf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = dir.path().join("existing-child");
+        std::fs::create_dir_all(&child).expect("create existing child");
+        let direct = dir.path().join("not-created-yet.sqlite3");
+        let dotdot_alias = child.join("..").join("not-created-yet.sqlite3");
+        assert!(!direct.exists(), "fixture requires a missing SQLite leaf");
+
+        assert_eq!(
+            normalize_sqlite_identity_path(&direct.to_string_lossy()),
+            normalize_sqlite_identity_path(&dotdot_alias.to_string_lossy()),
+            "dotdot aliases must converge before the SQLite leaf exists"
+        );
+    }
+
+    #[test]
     fn sqlite_identity_path_cache_entries_expire_after_test_freshness_window() {
         let raw_path = "relative/cache-expiry.db";
         let normalized = "/tmp/cache-expiry.db";
@@ -16042,9 +16219,9 @@ mod tests {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
 
         let (project_id, sender_id) = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project =
                 crate::queries::ensure_project(&cx, &pool, "/data/projects/am-id-floor-repro")
                     .await
@@ -16094,6 +16271,7 @@ mod tests {
         );
 
         let next = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             crate::queries::create_message(
                 &cx,
                 &pool,
@@ -16209,6 +16387,242 @@ mod tests {
     }
 
     #[test]
+    fn independent_file_pools_share_allocator_by_normalized_sqlite_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("shared-allocator.sqlite3");
+        std::fs::File::create(&db_path).expect("create allocator identity fixture");
+        let aliased_path = dir.path().join(".").join("shared-allocator.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let base = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let aliased = DbPoolConfig {
+            database_url: format!("sqlite:///{}", aliased_path.display()),
+            ..base.clone()
+        };
+        let first_pool = DbPool::new(&base).expect("create first independent pool");
+        let second_pool = DbPool::new(&aliased).expect("create second independent pool");
+
+        assert!(
+            !Arc::ptr_eq(&first_pool.pool, &second_pool.pool),
+            "the fixture must use distinct underlying pool Arcs"
+        );
+        assert_ne!(
+            first_pool.cache_generation, second_pool.cache_generation,
+            "read-cache generation remains scoped to each underlying pool"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &first_pool.message_id_allocator(),
+                &second_pool.message_id_allocator()
+            ),
+            "normalized aliases of one SQLite file must share an allocator"
+        );
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let first_allocator = first_pool.message_id_allocator();
+        let first_id = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs allocator context");
+            first_allocator.allocate(&cx, 0, &storage_root).await
+        });
+        let second_allocator = second_pool.message_id_allocator();
+        let second_id = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs allocator context");
+            second_allocator.allocate(&cx, 0, &storage_root).await
+        });
+        assert!(matches!(first_id, Outcome::Ok(1)));
+        assert!(matches!(second_id, Outcome::Ok(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_sqlite_leaf_aliases_share_allocator_by_existing_parent_identity() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_parent = dir.path().join("real-parent");
+        let aliased_parent = dir.path().join("aliased-parent");
+        std::fs::create_dir_all(&real_parent).expect("create real parent");
+        symlink(&real_parent, &aliased_parent).expect("create parent alias");
+        let direct_db = real_parent.join("not-created-yet.sqlite3");
+        let aliased_db = aliased_parent.join("not-created-yet.sqlite3");
+        assert!(!direct_db.exists(), "fixture requires a missing SQLite leaf");
+        assert!(!aliased_db.exists(), "fixture requires a missing SQLite leaf");
+
+        let storage_root = real_parent.join("storage");
+        let direct_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", direct_db.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let aliased_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", aliased_db.display()),
+            ..direct_config.clone()
+        };
+
+        let direct_pool = DbPool::new(&direct_config).expect("create direct first-run pool");
+        let aliased_pool = DbPool::new(&aliased_config).expect("create aliased first-run pool");
+        assert!(
+            Arc::ptr_eq(
+                &direct_pool.message_id_allocator(),
+                &aliased_pool.message_id_allocator()
+            ),
+            "a missing leaf below aliased existing parents is one SQLite identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_sqlite_leaf_preserves_symlink_sensitive_dotdot_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let authority_parent = dir.path().join("authority-parent");
+        let symlink_target = authority_parent.join("child");
+        std::fs::create_dir_all(&symlink_target).expect("create symlink target");
+        let link = dir.path().join("linked-child");
+        symlink(&symlink_target, &link).expect("create directory alias");
+
+        let direct_db = authority_parent.join("not-created-yet.sqlite3");
+        let symlink_dotdot_db = link.join("..").join("not-created-yet.sqlite3");
+        assert!(!direct_db.exists(), "fixture requires a missing SQLite leaf");
+        assert!(
+            !symlink_dotdot_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
+        assert_eq!(
+            normalize_sqlite_identity_path(&direct_db.to_string_lossy()),
+            normalize_sqlite_identity_path(&symlink_dotdot_db.to_string_lossy()),
+            "the existing symlink prefix must resolve before its dotdot component"
+        );
+
+        let storage_root = dir.path().join("storage");
+        let direct_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", direct_db.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let alias_config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", symlink_dotdot_db.display()),
+            ..direct_config.clone()
+        };
+        let direct_pool = DbPool::new(&direct_config).expect("create direct first-run pool");
+        let alias_pool = DbPool::new(&alias_config).expect("create dotdot first-run pool");
+        assert!(Arc::ptr_eq(
+            &direct_pool.message_id_allocator(),
+            &alias_pool.message_id_allocator()
+        ));
+    }
+
+    #[test]
+    fn independent_memory_pools_keep_allocator_and_cache_generation_isolated() {
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: None,
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let first_pool = DbPool::new(&config).expect("create first memory pool");
+        let second_pool = DbPool::new(&config).expect("create second memory pool");
+
+        assert!(!Arc::ptr_eq(&first_pool.pool, &second_pool.pool));
+        assert_ne!(first_pool.cache_generation, second_pool.cache_generation);
+        assert!(
+            !Arc::ptr_eq(
+                &first_pool.message_id_allocator(),
+                &second_pool.message_id_allocator()
+            ),
+            "distinct in-memory databases must never share an allocator"
+        );
+    }
+
+    #[test]
+    fn recovery_invalidation_retires_old_live_allocator_before_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("recovered-allocator.sqlite3");
+        std::fs::File::create(&db_path).expect("create allocator identity fixture");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let old_pool = DbPool::new(&config).expect("create pre-recovery pool");
+        let old_allocator = old_pool.message_id_allocator();
+        let identity = normalize_sqlite_identity_path(&db_path.to_string_lossy());
+        assert!(
+            invalidate_file_message_id_allocator(&identity),
+            "the live file identity must be present before invalidation"
+        );
+
+        let replacement = DbPool::new(&config).expect("create replacement pool");
+        assert!(
+            !Arc::ptr_eq(&old_allocator, &replacement.message_id_allocator()),
+            "post-recovery pools must not inherit the old archive seed/high-water state"
+        );
+        assert_ne!(old_pool.cache_generation, replacement.cache_generation);
+
+        let replacement_allocator = replacement.message_id_allocator();
+        let storage_root = config.resolved_storage_root();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let old_barrier = Arc::clone(&barrier);
+        let old_storage_root = storage_root.clone();
+        let old_handle = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build old allocator runtime");
+            old_barrier.wait();
+            runtime.block_on(async move {
+                let cx = Cx::current().expect("runtime installs allocator context");
+                old_allocator.allocate(&cx, 0, &old_storage_root).await
+            })
+        });
+        let replacement_barrier = Arc::clone(&barrier);
+        let replacement_handle = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build replacement allocator runtime");
+            replacement_barrier.wait();
+            runtime.block_on(async move {
+                let cx = Cx::current().expect("runtime installs allocator context");
+                replacement_allocator.allocate(&cx, 0, &storage_root).await
+            })
+        });
+        barrier.wait();
+
+        assert!(matches!(
+            old_handle.join().expect("join old allocator"),
+            Outcome::Err(error) if error.to_string().contains("retired after database recovery")
+        ));
+        assert!(matches!(
+            replacement_handle.join().expect("join replacement allocator"),
+            Outcome::Ok(1)
+        ));
+    }
+
+    #[test]
     fn message_creation_routes_through_shared_reuse_proof_allocator() {
         // mcp_agent_mail#176: message creation must allocate ids through the
         // shared monotonic allocator (so a regressed durable sequence cannot
@@ -16235,9 +16649,9 @@ mod tests {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project =
                 crate::queries::ensure_project(&cx, &pool, "/data/projects/am-alloc-route")
                     .await
@@ -19201,8 +19615,8 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = Cx::for_testing();
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = crate::queries::ensure_project(&cx, &pool, "/tmp/orphan-proj")
                 .await
                 .into_result()
@@ -19311,7 +19725,7 @@ mod tests {
     }
 
     #[test]
-    fn get_or_create_pool_keeps_distinct_storage_roots_isolated_for_same_sqlite_path() {
+    fn get_or_create_pool_rejects_conflicting_archive_roots_for_same_sqlite_path() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("shared.sqlite3");
         let storage_a = dir.path().join("storage-a");
@@ -19330,13 +19744,69 @@ mod tests {
             ..Default::default()
         };
 
-        let pool_a = get_or_create_pool(&cfg_a).expect("pool a");
-        let pool_b = get_or_create_pool(&cfg_b).expect("pool b");
-
+        let pool_a = get_or_create_pool(&cfg_a).expect("establish archive authority");
+        let conflicting = get_or_create_pool(&cfg_b);
+        let Err(error) = conflicting else {
+            panic!("one live SQLite identity must reject a second archive authority")
+        };
+        assert!(matches!(
+            error,
+            DbError::InvalidArgument {
+                field: "storage_root",
+                ..
+            }
+        ));
         assert!(
-            !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
-            "pool cache must not alias the same sqlite file across distinct storage roots"
+            !pool_a.message_id_allocator().is_retired(),
+            "a rejected conflicting root must not disturb established authority"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_byte_archive_roots_remain_distinct_allocator_authorities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("invalid-byte-roots.sqlite3");
+        let storage_a = dir
+            .path()
+            .join(OsString::from_vec(b"storage-\xff".to_vec()));
+        let storage_b = dir
+            .path()
+            .join(OsString::from_vec(b"storage-\xfe".to_vec()));
+        std::fs::create_dir_all(&storage_a).expect("create first invalid-byte root");
+        std::fs::create_dir_all(&storage_b).expect("create second invalid-byte root");
+        assert_ne!(storage_a, storage_b);
+        assert_eq!(
+            storage_a.to_string_lossy(),
+            storage_b.to_string_lossy(),
+            "fixture must collide under the former lossy String identity"
+        );
+
+        let base = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_a),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let conflicting = DbPoolConfig {
+            storage_root: Some(storage_b),
+            ..base.clone()
+        };
+        let established = DbPool::new(&base).expect("establish first archive authority");
+        let Err(error) = DbPool::new(&conflicting) else {
+            panic!("losslessly distinct roots must not reuse one archive authority")
+        };
+        assert!(matches!(
+            error,
+            DbError::InvalidArgument {
+                field: "storage_root",
+                ..
+            }
+        ));
+        assert!(!established.message_id_allocator().is_retired());
     }
 
     #[test]

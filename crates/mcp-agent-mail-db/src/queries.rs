@@ -6029,11 +6029,14 @@ pub async fn create_message(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let message_id = match id_allocator.allocate(db_floor, || {
-        crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
-    }) {
-        Ok(id) => id,
-        Err(error) => return Outcome::Err(error),
+    let message_id = match id_allocator
+        .allocate(cx, db_floor, pool.storage_root())
+        .await
+    {
+        Outcome::Ok(id) => id,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
@@ -6136,12 +6139,13 @@ fn index_created_message_best_effort(
 }
 
 /// Read the messages-table allocator floor: the larger of `MAX(id)` and the
-/// `sqlite_sequence` row for `messages`.
+/// maximum `sqlite_sequence` row for `messages`.
 ///
 /// Used to seed/advance the process-wide [`MessageIdAllocator`](crate::id_floor::MessageIdAllocator)
-/// (mcp_agent_mail#176). A missing `sqlite_sequence` row (or table, on a
-/// brand-new database) is treated as `0` so it can never block message
-/// creation.
+/// (mcp_agent_mail#176). A missing `sqlite_sequence` row is represented by the
+/// aggregate as `0`; a missing table, query failure, cancellation, panic, or
+/// malformed aggregate result is propagated rather than silently publishing a
+/// lower allocator floor.
 async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<i64, DbError> {
     // This read runs OUTSIDE the caller's retried write transaction, and the
     // fsqlite 0.3.4 registry engine can answer a bare read with
@@ -6149,38 +6153,50 @@ async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Out
     // pre-registry engine never surfaced busy on this path). Give it the same
     // bounded contention retry the write body gets, so a transient busy here
     // cannot fail message creation before the transaction even begins.
-    let db_max = match run_with_mvcc_retry(cx, "read_messages_id_floor", || async {
+    let outcome = run_with_mvcc_retry(cx, "read_messages_id_floor", || async {
         map_sql_outcome(
             traw_query(
                 cx,
                 tracked,
-                "SELECT COALESCE(MAX(id), 0) AS v FROM messages",
+                "SELECT MAX(v) AS v FROM (\
+                    SELECT COALESCE(MAX(id), 0) AS v FROM messages \
+                    UNION ALL \
+                    SELECT COALESCE(MAX(seq), 0) AS v \
+                      FROM sqlite_sequence WHERE name = 'messages'\
+                 )",
                 &[],
             )
             .await,
         )
     })
-    .await
-    {
-        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    .await;
+    decode_messages_id_floor_outcome(outcome)
+}
+
+fn decode_messages_id_floor_outcome(
+    outcome: Outcome<Vec<SqlRow>, DbError>,
+) -> Outcome<i64, DbError> {
+    let rows = match outcome {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    let seq_val = match map_sql_outcome(
-        traw_query(
-            cx,
-            tracked,
-            "SELECT COALESCE(seq, 0) AS v FROM sqlite_sequence WHERE name = 'messages'",
-            &[],
-        )
-        .await,
-    ) {
-        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
-        // sqlite_sequence may be absent on a fresh DB; not an error here.
-        Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => 0,
-    };
-    Outcome::Ok(db_max.max(seq_val))
+    if rows.len() != 1 {
+        return Outcome::Err(DbError::Internal(format!(
+            "read_messages_id_floor: aggregate returned {} rows instead of exactly one",
+            rows.len()
+        )));
+    }
+    match rows.first().and_then(row_first_i64) {
+        Some(floor) if floor >= 0 => Outcome::Ok(floor),
+        Some(floor) => Outcome::Err(DbError::Internal(format!(
+            "read_messages_id_floor: aggregate returned negative floor {floor}"
+        ))),
+        None => Outcome::Err(DbError::Internal(
+            "read_messages_id_floor: aggregate row did not contain an i64 floor".to_string(),
+        )),
+    }
 }
 
 /// Create a message AND insert all recipients in a single `SQLite` transaction.
@@ -6365,11 +6381,14 @@ async fn create_message_with_recipients_impl(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let message_id = match id_allocator.allocate(db_floor, || {
-            crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
-        }) {
-            Ok(id) => id,
-            Err(error) => return Outcome::Err(error),
+        let message_id = match id_allocator
+            .allocate(cx, db_floor, pool.storage_root())
+            .await
+        {
+            Outcome::Ok(id) => id,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
 
         let created_outcome =
@@ -16119,6 +16138,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn messages_id_floor_uses_maximum_across_duplicate_sequence_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("message-id-floor-duplicate-sequence.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_raw(
+                "DELETE FROM sqlite_sequence WHERE name = 'messages'; \
+                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 7); \
+                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 42); \
+                 INSERT INTO sqlite_sequence(name, seq) VALUES ('messages', 19);",
+            )
+            .expect("seed duplicate sequence rows");
+            let tracked = tracked(&*conn);
+
+            let outcome = read_messages_id_floor(&cx, &tracked).await;
+            assert!(
+                matches!(&outcome, Outcome::Ok(42)),
+                "the aggregate must use MAX(seq) across every duplicate row; got {outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn messages_id_floor_never_coerces_failure_outcomes_or_empty_rows_to_zero() {
+        let error = decode_messages_id_floor_outcome(Outcome::Err(DbError::Sqlite(
+            "injected floor query failure".to_string(),
+        )));
+        assert!(matches!(
+            error,
+            Outcome::Err(DbError::Sqlite(message))
+                if message == "injected floor query failure"
+        ));
+
+        let expected_cancel = CancelReason::user("injected floor cancellation");
+        let cancelled = decode_messages_id_floor_outcome(Outcome::Cancelled(
+            expected_cancel.clone(),
+        ));
+        assert!(matches!(
+            cancelled,
+            Outcome::Cancelled(reason) if reason == expected_cancel
+        ));
+
+        let expected_panic = asupersync::PanicPayload::new("injected floor panic");
+        let panicked =
+            decode_messages_id_floor_outcome(Outcome::Panicked(expected_panic.clone()));
+        assert!(matches!(
+            panicked,
+            Outcome::Panicked(payload) if payload == expected_panic
+        ));
+
+        let empty = decode_messages_id_floor_outcome(Outcome::Ok(Vec::new()));
+        assert!(matches!(empty, Outcome::Err(DbError::Internal(message)) if message.contains(
+            "exactly one"
+        )));
+    }
+
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -18670,8 +18753,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("register_then_get_agent.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -19857,9 +19938,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_limit_latest_window.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_limit_latest_window.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-limit-{base}"))
                 .await
@@ -19937,9 +20019,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("dedupe_duplicate_recipients.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("dedupe_duplicate_recipients.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-dedupe-recip-{base}"))
                 .await
@@ -20046,9 +20129,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recipients_json_request_order.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recipients_json_request_order.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recip-order-{base}"))
                 .await
@@ -20145,9 +20229,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_no_limit_order.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_no_limit_order.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-no-limit-{base}"))
                 .await
@@ -20225,9 +20310,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -20313,9 +20399,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("thread_roots_with_replies.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_roots_with_replies.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -21330,7 +21417,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
 
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("message_recipient_durability_guard.db");
@@ -21388,6 +21474,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project_id = 1_i64;
             let sender_id = 1_i64;
             let recipients = [(2_i64, "to")];
@@ -21742,9 +21829,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("create_message_rebuild_inbox_stats_chunks.db");
+        let (_setup_cx, pool, _dir) =
+            setup_test_pool("create_message_rebuild_inbox_stats_chunks.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
                 .expect("open sqlite connection for inbox_stats setup");
             create_inbox_stats_table_for_test(&conn);
@@ -23161,7 +23250,7 @@ mod tests {
                 let pool = crate::create_pool(&cfg).expect("create pool");
 
                 rt.block_on(async {
-                    let cx = Cx::for_testing();
+                    let cx = Cx::current().expect("runtime installs message test context");
                     let project = ensure_project(
                         &cx,
                         &pool,
@@ -23264,9 +23353,9 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = Cx::for_testing();
 
         let (project_id, sender_id, recipient_id) = rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-concurrent-message-durability")
                 .await
                 .into_result()
@@ -23321,10 +23410,11 @@ mod tests {
                         .expect("build thread runtime");
                     start_barrier.wait();
                     for message_idx in 0..messages_per_thread {
-                        let cx = Cx::for_testing();
                         let subject = format!("writer-{thread_idx}-message-{message_idx}");
                         let body = format!("body-{thread_idx}-{message_idx}");
                         match rt.block_on(async {
+                            let cx =
+                                Cx::current().expect("runtime installs message test context");
                             create_message_with_recipients(
                                 &cx,
                                 &pool,
@@ -23383,6 +23473,7 @@ mod tests {
         drop(failures);
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let rows = durability_probe_query(
                 &cx,
                 &pool,
@@ -23990,9 +24081,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_union_matches_legacy.db");
+        let (_setup_cx, pool, _dir) =
+            setup_test_pool("recent_contact_union_matches_legacy.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-union-{base}"))
                 .await
@@ -24234,9 +24327,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_bidirectional_dedup.db");
+        let (_setup_cx, pool, _dir) =
+            setup_test_pool("recent_contact_bidirectional_dedup.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-dedup-{base}"))
                 .await
@@ -24345,9 +24440,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_received_alias.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_received_alias.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-alias-{base}"))
                 .await
@@ -24440,9 +24536,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("recent_contact_candidate_cap.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_candidate_cap.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-recent-cap-{base}"))
                 .await
@@ -24549,8 +24646,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("like_fallback_100_terms.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -24574,6 +24669,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-like-fallback-{base}"))
                 .await
@@ -24645,8 +24741,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("like_fallback_union.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -24670,6 +24764,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-like-union-{base}"))
                 .await
@@ -24781,9 +24876,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("search_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("search_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-search-orphaned-{base}"))
                 .await
@@ -24907,9 +25003,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("product_search_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("product_search_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -25331,9 +25428,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("product_inbox_global_fan_in.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("product_inbox_global_fan_in.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-product-inbox-a-{base}"))
                 .await
@@ -25613,8 +25711,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("product_search_across_projects.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -25638,6 +25734,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-prod-search-a-{base}"))
                 .await
@@ -25944,8 +26041,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_inbox_case_insensitive.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -25969,6 +26064,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-global-case-{base}"))
                 .await
@@ -26040,9 +26136,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("global_inbox_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("global_inbox_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project =
                 ensure_project(&cx, &pool, &format!("/tmp/am-global-inbox-orphaned-{base}"))
@@ -26129,9 +26226,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("global_inbox_orphaned_project.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("global_inbox_orphaned_project.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -26219,9 +26317,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("unacked_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("unacked_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-unacked-orphaned-{base}"))
                 .await
@@ -26307,9 +26406,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("inbox_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-orphaned-{base}"))
                 .await
@@ -26394,9 +26494,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("inbox_ack_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_ack_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-ack-orphaned-{base}"))
                 .await
@@ -26481,9 +26582,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("recipient_lookup_orphaned_agent.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("recipient_lookup_orphaned_agent.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -26674,8 +26776,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let cx = asupersync::Cx::for_testing();
-
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("global_unread_case_insensitive.db");
         let init_conn = crate::DbConn::open_file(db_path.display().to_string())
@@ -26699,6 +26799,7 @@ mod tests {
         let pool = crate::create_pool(&cfg).expect("create pool");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-unread-case-{base}"))
                 .await
@@ -26770,9 +26871,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("global_unread_orphaned_project.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("global_unread_orphaned_project.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -26953,9 +27055,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("global_search_orphaned_sender.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("global_search_orphaned_sender.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -27026,9 +27129,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, dir) = setup_test_pool("global_search_orphaned_project.db");
+        let (_setup_cx, pool, dir) = setup_test_pool("global_search_orphaned_project.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let base = now_micros();
             let project = ensure_project(
                 &cx,
@@ -27610,9 +27714,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("acknowledge_messages_batch_large_wave.db");
+        let (_setup_cx, pool, _dir) =
+            setup_test_pool("acknowledge_messages_batch_large_wave.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project_a = ensure_project(&cx, &pool, "/tmp/am-batch-ack-project-a")
                 .await
                 .into_result()
@@ -27858,9 +27964,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("mark_message_read_keeps_ack_pending.db");
+        let (_setup_cx, pool, _dir) =
+            setup_test_pool("mark_message_read_keeps_ack_pending.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-keeps-ack-pending")
                 .await
                 .into_result()
@@ -27953,9 +28061,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("mark_message_read_missing_inbox_stats.db");
+        let (_setup_cx, pool, _dir) =
+            setup_test_pool("mark_message_read_missing_inbox_stats.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-missing-inbox-stats")
                 .await
                 .into_result()
@@ -28029,9 +28139,10 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (cx, pool, _dir) = setup_test_pool("mark_message_read_inbox_stats_view.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("mark_message_read_inbox_stats_view.db");
 
         rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
             let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
                 .expect("open sqlite connection");
             create_inbox_stats_table_for_test(&conn);
