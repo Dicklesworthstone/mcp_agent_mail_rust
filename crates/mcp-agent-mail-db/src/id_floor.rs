@@ -349,93 +349,129 @@ where
         return Ok(None);
     }
 
-    let db_rows = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
-        .map_err(|e| DbError::Sqlite(format!("id_floor: read MAX(id): {e}")))?;
-    let db_max_id = db_rows
-        .first()
-        .ok_or_else(|| DbError::Sqlite("id_floor: MAX(id) returned no row".to_string()))?
-        .get_named::<i64>("max_id")
-        .map_err(|e| DbError::Sqlite(format!("id_floor: decode MAX(id): {e}")))?;
+    // Take the writer reservation before observing either durable floor. A
+    // pre-transaction read can become stale before the repair starts: if a
+    // concurrent explicit-id INSERT commits while a degraded engine fails to
+    // advance sqlite_sequence, repairing from the earlier snapshot can leave
+    // the sequence below a row that is already durable.
+    execute_raw("BEGIN IMMEDIATE;")
+        .map_err(|e| DbError::Sqlite(format!("id_floor: begin allocator repair: {e}")))?;
 
-    let seq_rows = query(
-        "SELECT COUNT(*) AS row_count, COALESCE(MAX(seq), 0) AS seq \
-         FROM sqlite_sequence WHERE name = 'messages'",
-        &[],
-    )
-    .map_err(|e| DbError::Sqlite(format!("id_floor: read sqlite_sequence: {e}")))?;
-    let seq_row = seq_rows.first().ok_or_else(|| {
-        DbError::Sqlite("id_floor: sqlite_sequence aggregate returned no row".to_string())
-    })?;
-    let seq_row_count = seq_row
-        .get_named::<i64>("row_count")
-        .map_err(|e| DbError::Sqlite(format!("id_floor: decode sequence row count: {e}")))?;
-    let seq_value = seq_row
-        .get_named::<i64>("seq")
-        .map_err(|e| DbError::Sqlite(format!("id_floor: decode sequence value: {e}")))?;
+    let repair_result = (|| -> DbResult<Option<(i64, i64, i64, i64)>> {
+        let db_rows = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
+            .map_err(|e| DbError::Sqlite(format!("id_floor: read MAX(id): {e}")))?;
+        let db_max_id = db_rows
+            .first()
+            .ok_or_else(|| DbError::Sqlite("id_floor: MAX(id) returned no row".to_string()))?
+            .get_named::<i64>("max_id")
+            .map_err(|e| DbError::Sqlite(format!("id_floor: decode MAX(id): {e}")))?;
 
-    let current_floor = db_max_id.max(seq_value);
-    let desired_floor = current_floor.max(archive_max);
-    if seq_row_count == 1 && seq_value >= desired_floor {
-        // DB is already at or ahead of the archive; nothing to do.
+        let seq_rows = query(
+            "SELECT COUNT(*) AS row_count, COALESCE(MAX(seq), 0) AS seq \
+             FROM sqlite_sequence WHERE name = 'messages'",
+            &[],
+        )
+        .map_err(|e| DbError::Sqlite(format!("id_floor: read sqlite_sequence: {e}")))?;
+        let seq_row = seq_rows.first().ok_or_else(|| {
+            DbError::Sqlite("id_floor: sqlite_sequence aggregate returned no row".to_string())
+        })?;
+        let seq_row_count = seq_row
+            .get_named::<i64>("row_count")
+            .map_err(|e| DbError::Sqlite(format!("id_floor: decode sequence row count: {e}")))?;
+        let seq_value = seq_row
+            .get_named::<i64>("seq")
+            .map_err(|e| DbError::Sqlite(format!("id_floor: decode sequence value: {e}")))?;
+
+        let current_floor = db_max_id.max(seq_value);
+        let desired_floor = current_floor.max(archive_max);
+        if seq_row_count == 1 && seq_value >= desired_floor {
+            // DB is already at or ahead of the archive; nothing to do.
+            return Ok(None);
+        }
+
+        // sqlite_sequence does not declare `name` UNIQUE, so INSERT OR IGNORE can
+        // create duplicate allocator rows. Repair cardinality and advance the
+        // floor under the writer transaction acquired above.
+        let repair_sql = format!(
+            "UPDATE sqlite_sequence \
+                SET seq = (SELECT MAX(CASE WHEN seq > {desired_floor} \
+                                           THEN seq ELSE {desired_floor} END) \
+                             FROM sqlite_sequence WHERE name = 'messages') \
+              WHERE name = 'messages'; \
+             DELETE FROM sqlite_sequence \
+              WHERE name = 'messages' \
+                AND rowid <> (SELECT MIN(rowid) FROM sqlite_sequence \
+                               WHERE name = 'messages'); \
+             INSERT INTO sqlite_sequence (name, seq) \
+                  SELECT 'messages', {desired_floor} \
+                   WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence \
+                                      WHERE name = 'messages'); \
+             UPDATE sqlite_sequence \
+                SET seq = CASE WHEN seq < {desired_floor} \
+                               THEN {desired_floor} ELSE seq END \
+              WHERE name = 'messages';"
+        );
+        execute_raw(&repair_sql).map_err(|error| {
+            DbError::Sqlite(format!(
+                "id_floor: repair/advance sqlite_sequence: {error}"
+            ))
+        })?;
+
+        let persisted_rows = query(
+            "SELECT COUNT(*) AS row_count, COALESCE(MAX(seq), 0) AS seq \
+             FROM sqlite_sequence WHERE name = 'messages'",
+            &[],
+        )
+        .map_err(|e| DbError::Sqlite(format!("id_floor: verify sqlite_sequence repair: {e}")))?;
+        let persisted_row = persisted_rows.first().ok_or_else(|| {
+            DbError::Sqlite("id_floor: repaired sqlite_sequence returned no row".to_string())
+        })?;
+        let persisted_count = persisted_row
+            .get_named::<i64>("row_count")
+            .map_err(|e| DbError::Sqlite(format!("id_floor: decode repaired row count: {e}")))?;
+        let persisted_floor = persisted_row
+            .get_named::<i64>("seq")
+            .map_err(|e| DbError::Sqlite(format!("id_floor: decode repaired sequence: {e}")))?;
+        if persisted_count != 1 || persisted_floor < desired_floor {
+            return Err(DbError::Sqlite(format!(
+                "id_floor: allocator repair verification failed: row_count={persisted_count}, seq={persisted_floor}, required_floor={desired_floor}"
+            )));
+        }
+
+        Ok(Some((
+            persisted_floor,
+            db_max_id,
+            seq_value,
+            seq_row_count,
+        )))
+    })();
+
+    let repaired = match repair_result {
+        Ok(repaired) => repaired,
+        Err(error) => {
+            let rollback_detail = execute_raw("ROLLBACK;").err().map_or_else(
+                String::new,
+                |rollback_error| format!("; rollback also failed: {rollback_error}"),
+            );
+            if rollback_detail.is_empty() {
+                return Err(error);
+            }
+            return Err(DbError::Sqlite(format!("{error}{rollback_detail}")));
+        }
+    };
+    if let Err(error) = execute_raw("COMMIT;") {
+        let rollback_detail = execute_raw("ROLLBACK;").err().map_or_else(
+            String::new,
+            |rollback_error| format!("; rollback also failed: {rollback_error}"),
+        );
+        return Err(DbError::Sqlite(format!(
+            "id_floor: commit allocator repair: {error}{rollback_detail}"
+        )));
+    }
+
+    let Some((persisted_floor, db_max_id, seq_value, seq_row_count)) = repaired else {
         return Ok(None);
-    }
-
-    // sqlite_sequence does not declare `name` UNIQUE, so INSERT OR IGNORE can
-    // create duplicate allocator rows. Repair cardinality and advance the
-    // floor under one write transaction. The aggregate assignment preserves
-    // a higher sequence committed after the reads above but before BEGIN.
-    let repair_sql = format!(
-        "BEGIN IMMEDIATE; \
-         UPDATE sqlite_sequence \
-            SET seq = (SELECT MAX(CASE WHEN seq > {desired_floor} \
-                                       THEN seq ELSE {desired_floor} END) \
-                         FROM sqlite_sequence WHERE name = 'messages') \
-          WHERE name = 'messages'; \
-         DELETE FROM sqlite_sequence \
-          WHERE name = 'messages' \
-            AND rowid <> (SELECT MIN(rowid) FROM sqlite_sequence \
-                           WHERE name = 'messages'); \
-         INSERT INTO sqlite_sequence (name, seq) \
-              SELECT 'messages', {desired_floor} \
-               WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence \
-                                  WHERE name = 'messages'); \
-         UPDATE sqlite_sequence \
-            SET seq = CASE WHEN seq < {desired_floor} \
-                           THEN {desired_floor} ELSE seq END \
-          WHERE name = 'messages'; \
-         COMMIT;"
-    );
-    if let Err(error) = execute_raw(&repair_sql) {
-        let rollback = execute_raw("ROLLBACK;");
-        let rollback_detail = rollback.err().map_or_else(String::new, |rollback_error| {
-            format!("; rollback also failed: {rollback_error}")
-        });
-        return Err(DbError::Sqlite(format!(
-            "id_floor: repair/advance sqlite_sequence: {error}{rollback_detail}"
-        )));
-    }
-
-    let persisted_rows = query(
-        "SELECT COUNT(*) AS row_count, COALESCE(MAX(seq), 0) AS seq \
-         FROM sqlite_sequence WHERE name = 'messages'",
-        &[],
-    )
-    .map_err(|e| DbError::Sqlite(format!("id_floor: verify sqlite_sequence repair: {e}")))?;
-    let persisted_row = persisted_rows.first().ok_or_else(|| {
-        DbError::Sqlite("id_floor: repaired sqlite_sequence returned no row".to_string())
-    })?;
-    let persisted_count = persisted_row
-        .get_named::<i64>("row_count")
-        .map_err(|e| DbError::Sqlite(format!("id_floor: decode repaired row count: {e}")))?;
-    let persisted_floor = persisted_row
-        .get_named::<i64>("seq")
-        .map_err(|e| DbError::Sqlite(format!("id_floor: decode repaired sequence: {e}")))?;
-    if persisted_count != 1 || persisted_floor < desired_floor {
-        return Err(DbError::Sqlite(format!(
-            "id_floor: allocator repair verification failed: row_count={persisted_count}, seq={persisted_floor}, required_floor={desired_floor}"
-        )));
-    }
-
+    };
     tracing::warn!(
         archive_max,
         db_max_id,
@@ -444,7 +480,6 @@ where
         new_seq = persisted_floor,
         "repaired or advanced the messages id allocator; subsequent INSERTs will remain strictly above the durable database/archive floor (mcp_agent_mail#160)"
     );
-
     Ok(Some(persisted_floor))
 }
 

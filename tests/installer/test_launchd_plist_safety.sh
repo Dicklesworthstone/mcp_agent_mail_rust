@@ -412,12 +412,12 @@ printf '%s\n' "$private_security_body" | grep -Fq "stat -f '%d:%i:%HT:%Lp:%l'" \
 printf '%s\n' "$private_security_body" | grep -Fq "stat -c '%d:%i:%F:%a:%h'" \
     || fail "private writer lacks GNU no-follow type/mode/link identity"
 printf '%s\n' "$private_writer_body" | grep -Fq \
-    'published_security_identity=$(private_file_security_identity "$path")' \
+    "published_security_identity=\$(private_file_security_identity \"\$path\")" \
     || fail "private writer does not validate the published path identity"
 printf '%s\n' "$private_writer_body" | grep -Fq \
-    '[ "$published_security_identity" != "$tmp_security_identity" ]' \
+    "[ \"\$published_security_identity\" != \"\$tmp_security_identity\" ]" \
     || fail "private writer does not bind publication to the validated tempfile"
-if printf '%s\n' "$private_writer_body" | grep -Fq 'chmod 600 "$path"'; then
+if printf '%s\n' "$private_writer_body" | grep -Fq "chmod 600 \"\$path\""; then
     fail "private writer reopens a symlink-follow chmod race after publication"
 fi
 
