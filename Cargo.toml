@@ -127,11 +127,11 @@ signal-hook = "0.4.4"
 # Do not enable frankensearch's aggregate `hybrid`/`semantic` features here:
 # those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
 # Downstream crates opt into the exact no-Tokio subfeatures they need.
-frankensearch = { version = "0.3.2", path = "../frankensearch/frankensearch", default-features = false, features = ["lexical-tantivy"] }
-frankensearch-core = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
-frankensearch-index = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-fusion" }
+frankensearch = { version = "0.4.0", path = "../frankensearch/frankensearch", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-core" }
+frankensearch-embed = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
+frankensearch-index = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-index" }
+frankensearch-fusion = { version = "0.2.2", path = "../frankensearch/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
