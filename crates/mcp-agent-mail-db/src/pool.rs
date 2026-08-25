@@ -16634,8 +16634,11 @@ mod tests {
                 std::env::var_os(CHILD_STORAGE_ENV).expect("child storage authority"),
             );
             assert_eq!(
-                std::env::current_dir().expect("child current directory"),
-                cwd_a,
+                std::fs::canonicalize(
+                    std::env::current_dir().expect("child current directory"),
+                )
+                .expect("canonical child current directory"),
+                std::fs::canonicalize(&cwd_a).expect("canonical child cwd A"),
                 "the child must construct the first pool under cwd A"
             );
 
@@ -16761,13 +16764,28 @@ mod tests {
             );
             let config = DbPoolConfig {
                 database_url: format!("sqlite:///{}", alias.display()),
-                storage_root: Some(storage_root),
+                storage_root: Some(storage_root.clone()),
                 min_connections: 0,
                 max_connections: 1,
                 run_migrations: false,
                 warmup_connections: 0,
                 ..Default::default()
             };
+            let unopened_path = alias.with_file_name("mail-unopened.sqlite3");
+            assert!(
+                !unopened_path.exists(),
+                "late-symlink fixture requires a missing SQLite leaf"
+            );
+            let unopened_pool = DbPool::new(&DbPoolConfig {
+                database_url: format!("sqlite:///{}", unopened_path.display()),
+                storage_root: Some(storage_root),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("freeze missing-leaf SQLite authority");
 
             let pool_a = get_or_create_pool(&config).expect("construct symlink-to-A pool");
             let identity_a = std::fs::canonicalize(&db_a).expect("canonical database A");
@@ -16795,6 +16813,23 @@ mod tests {
                 "the first pool must keep opening database A after alias retarget"
             );
             assert_eq!(read_pool_authority_sentinel(&pool_b), "B");
+
+            symlink(&db_b, &unopened_path).expect("replace missing leaf with database-B symlink");
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build late-symlink runtime");
+            let cx = Cx::for_testing();
+            let late_open = runtime.block_on(async {
+                unopened_pool.acquire(&cx).await.into_result()
+            });
+            assert!(
+                late_open.is_err_and(|error| {
+                    error
+                        .to_string()
+                        .contains("refusing to cross database authority")
+                }),
+                "a symlink inserted after construction must fail closed before the lazy open"
+            );
 
             retire_cached_runtime_state_after_recovery(&identity_b, "symlink authority test");
             assert!(pool_b.pool.is_closed(), "retirement must close database-B pool");

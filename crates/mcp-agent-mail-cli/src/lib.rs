@@ -43643,14 +43643,9 @@ http_headers = { Authorization = "Bearer secret" }
             .expect_err("relative config path must be rejected");
         assert!(relative.to_string().contains("absolute config.env path"));
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("XDG_CONFIG_HOME", ""), ("HOME", "")],
-            || {
-                let missing = canonical_setup_config_env_path()
-                    .expect_err("missing absolute config authority must fail closed");
-                assert!(missing.to_string().contains("absolute config.env path"));
-            },
-        );
+        let missing = require_canonical_setup_config_env_path(None)
+            .expect_err("missing absolute config authority must fail closed");
+        assert!(missing.to_string().contains("absolute config.env path"));
     }
 
     #[test]
