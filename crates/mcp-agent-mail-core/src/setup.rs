@@ -5954,6 +5954,59 @@ mod tests {
             require_absolute_omp_home_dir(Some(absolute.clone())).unwrap(),
             absolute
         );
+
+        let traversing = temp.path().join("home/../outside");
+        let error = require_absolute_omp_home_dir(Some(traversing))
+            .expect_err("an absolute path with parent traversal must fail closed");
+        assert!(error.to_string().contains("traversal-free"));
+    }
+
+    #[test]
+    fn run_setup_omp_fails_before_writes_without_absolute_user_authority() {
+        let temp = setup_real_tempdir();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sentinel = project.join("operator-owned");
+        std::fs::write(&sentinel, "sentinel\n").unwrap();
+
+        for mut params in [
+            SetupParams {
+                project_dir: project.clone(),
+                agents: Some(vec![AgentPlatform::Omp]),
+                token: "must-not-be-written".to_string(),
+                skip_hooks: true,
+                ..SetupParams::default()
+            },
+            SetupParams {
+                project_dir: project.clone(),
+                home_dir_override: Some(PathBuf::from("relative-home")),
+                agents: Some(vec![AgentPlatform::Omp]),
+                token: "must-not-be-written".to_string(),
+                skip_hooks: true,
+                ..SetupParams::default()
+            },
+            SetupParams {
+                project_dir: project.clone(),
+                omp_user_config_path_override: Some(
+                    temp.path().join("user/../escaped/mcp.json"),
+                ),
+                agents: Some(vec![AgentPlatform::Omp]),
+                token: "must-not-be-written".to_string(),
+                skip_hooks: true,
+                ..SetupParams::default()
+            },
+        ] {
+            params.skip_user_config = true;
+            let results = run_setup(&params);
+            assert_eq!(results.len(), 1);
+            let ActionOutcome::Failed(error) = &results[0].actions[0].outcome else {
+                panic!("unresolved OMP authority must fail closed: {results:?}");
+            };
+            assert!(error.contains("before writing any config bytes"));
+            assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "sentinel\n");
+            assert!(!project.join(".omp").exists());
+            assert!(!project.join(".gitignore").exists());
+        }
     }
 
     #[test]
@@ -6004,6 +6057,49 @@ mod tests {
             legacy.user_mcp_config,
             PathBuf::from("/home/alice/.omp/profiles/legacy/agent/mcp.json")
         );
+    }
+
+    #[test]
+    fn resolve_omp_config_paths_rejects_traversal_and_ambiguous_prefixes() {
+        let home = Path::new("/home/alice");
+        let cwd = Path::new("/work/repo");
+
+        for config_dir in ["../escape", ".omp/../../escape", "C:\\escape", "\\\\host\\share"] {
+            let error = resolve_omp_config_paths(
+                home,
+                cwd,
+                None,
+                None,
+                Some(config_dir),
+                None,
+            )
+            .expect_err("unsafe PI_CONFIG_DIR must fail closed");
+            assert!(error.to_string().contains("PI_CONFIG_DIR"));
+        }
+
+        for agent_dir in ["../escape", "agent/../../escape", "C:\\escape"] {
+            let error = resolve_omp_config_paths(
+                home,
+                cwd,
+                None,
+                None,
+                None,
+                Some(agent_dir),
+            )
+            .expect_err("unsafe PI_CODING_AGENT_DIR must fail closed");
+            assert!(error.to_string().contains("PI_CODING_AGENT_DIR"));
+        }
+
+        let relative_cwd = resolve_omp_config_paths(
+            home,
+            Path::new("relative-cwd"),
+            None,
+            None,
+            None,
+            Some("agent"),
+        )
+        .expect_err("relative working directory must fail closed");
+        assert!(relative_cwd.to_string().contains("working directory"));
     }
 
     #[test]
@@ -7617,7 +7713,7 @@ http_headers = { Authorization = "Bearer tok" }
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
         let project_primary = params.project_dir.join(".omp/mcp.json");
         let project_secondary = params.project_dir.join(".omp/.mcp.json");
-        let user_primary = omp_active_user_config_path(&params);
+        let user_primary = omp_active_user_config_path(&params).unwrap();
         let user_secondary = user_primary.parent().unwrap().join(".mcp.json");
         for path in [
             &project_primary,
