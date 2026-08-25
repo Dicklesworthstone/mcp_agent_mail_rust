@@ -154,7 +154,10 @@ pub fn advance_messages_id_floor(
 ) -> DbResult<Option<i64>> {
     advance_messages_id_floor_with(
         archive_max_id,
-        |sql, params| conn.query_sync(sql, params).map_err(|error| error.to_string()),
+        |sql, params| {
+            conn.query_sync(sql, params)
+                .map_err(|error| error.to_string())
+        },
         |sql| {
             conn.execute_raw(sql)
                 .map(|_| ())
@@ -176,7 +179,10 @@ pub(crate) fn advance_messages_id_floor_franken(
 ) -> DbResult<Option<i64>> {
     advance_messages_id_floor_with(
         archive_max_id,
-        |sql, params| conn.query_sync(sql, params).map_err(|error| error.to_string()),
+        |sql, params| {
+            conn.query_sync(sql, params)
+                .map_err(|error| error.to_string())
+        },
         |sql| {
             conn.execute_raw(sql)
                 .map(|_| ())
@@ -218,10 +224,10 @@ where
         "SELECT COALESCE(seq, 0) AS seq FROM sqlite_sequence WHERE name = 'messages'",
         &[],
     )
-        .map_err(|e| DbError::Sqlite(format!("id_floor: read sqlite_sequence: {e}")))?
-        .first()
-        .and_then(|row| row.get_named("seq").ok())
-        .unwrap_or(0);
+    .map_err(|e| DbError::Sqlite(format!("id_floor: read sqlite_sequence: {e}")))?
+    .first()
+    .and_then(|row| row.get_named("seq").ok())
+    .unwrap_or(0);
 
     let current_floor = db_max_id.max(seq_value);
     if current_floor >= archive_max {

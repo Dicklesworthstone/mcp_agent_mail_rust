@@ -16034,6 +16034,89 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_id_floor_advance_preserves_same_process_writer_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ID_FLOOR_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool::tests::archive_id_floor_advance_preserves_same_process_writer_lock";
+        const CHILD_WITNESS: &str = "id-floor-child-observed-busy";
+
+        if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("id-floor-lock.sqlite3");
+        let storage_root = directory.path().join("archive");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open Franken id-floor fixture"),
+            "clean up id-floor lock fixture",
+        );
+        writer
+            .execute_raw(
+                "PRAGMA journal_mode = DELETE; \
+                 PRAGMA autocommit_retain = OFF; \
+                 CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT); \
+                 INSERT INTO messages DEFAULT VALUES;",
+            )
+            .expect("seed id-floor lock fixture");
+        write_id_floor_canonical_message(&storage_root, "archived-project", 9001);
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create id-floor test pool");
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent id-floor writer lock");
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+        let error = pool
+            .advance_message_id_floor_from_archive()
+            .expect_err("id-floor advance must respect the active same-engine writer fence");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "fenced id-floor advance should report lock/busy contention: {error}"
+        );
+        assert_maintenance_child_observes_busy(
+            CHILD_TEST_NAME,
+            CHILD_PATH_ENV,
+            CHILD_WITNESS,
+            &db_path,
+        );
+
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("release parent id-floor writer lock");
+        assert_eq!(
+            pool.advance_message_id_floor_from_archive()
+                .expect("advance id floor after writer rollback"),
+            Some(9001)
+        );
+        let rows = writer
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .expect("read advanced id-floor sequence");
+        assert_eq!(
+            rows[0].get_named::<i64>("seq").expect("decode sequence"),
+            9001
+        );
+    }
+
     #[test]
     fn message_creation_routes_through_shared_reuse_proof_allocator() {
         // mcp_agent_mail#176: message creation must allocate ids through the
