@@ -3724,20 +3724,27 @@ fn apply_omp_native_entries_contract(
             continue;
         };
         if let Some(enabled) = entry.get("enabled") {
-            let recognized_false_string = enabled.as_str().is_some_and(|value| {
-                matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0")
-            });
-            if enabled == &Value::Bool(false) || recognized_false_string {
-                push_drift_reason(
+            match enabled {
+                Value::Bool(false) => push_drift_reason(
                     &mut analysis.drift_reasons,
                     ConfigDriftReason::DisabledServer,
-                );
-            }
-            if !enabled.is_boolean() && !recognized_false_string {
-                push_drift_reason(
+                ),
+                Value::Bool(true) => {}
+                Value::String(value) => match value.to_ascii_lowercase().as_str() {
+                    "false" | "0" => push_drift_reason(
+                        &mut analysis.drift_reasons,
+                        ConfigDriftReason::DisabledServer,
+                    ),
+                    "true" | "1" => {}
+                    _ => push_drift_reason(
+                        &mut analysis.drift_reasons,
+                        ConfigDriftReason::UnsupportedConfig,
+                    ),
+                },
+                _ => push_drift_reason(
                     &mut analysis.drift_reasons,
                     ConfigDriftReason::UnsupportedConfig,
-                );
+                ),
             }
         }
     }
@@ -8545,6 +8552,30 @@ http_headers = { Authorization = "Bearer tok" }
         );
         assert_eq!(file.primary_drift_reason, ConfigDriftReason::Ok);
         assert_eq!(file.risk, ConfigDriftRisk::None);
+    }
+
+    #[test]
+    fn check_status_accepts_native_omp_enabled_true_string_coercions() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let config = params.project_dir.join(".omp/mcp.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+
+        for enabled in ["true", "1"] {
+            std::fs::write(
+                &config,
+                format!(
+                    r#"{{"mcpServers":{{"mcp-agent-mail":{{"type":"http","url":"http://127.0.0.1:8765/mcp/","headers":{{"Authorization":"Bearer tok"}},"enabled":"{enabled}"}}}}}}"#
+                ),
+            )
+            .unwrap();
+
+            let file = first_setup_status_file(&params);
+            assert!(
+                file.drift_reasons.is_empty(),
+                "OMP-native enabled={enabled:?} is coerced to true by the runtime: {file:?}"
+            );
+        }
     }
 
     #[test]
