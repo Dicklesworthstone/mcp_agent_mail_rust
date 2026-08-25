@@ -1908,14 +1908,10 @@ fn gitignore_relative_path(path: &Path) -> Result<String, SetupError> {
     Ok(segments.join("/"))
 }
 
-/// Secure a literal-credential config before writing it in a Git worktree.
-///
-/// Adding a path to `.gitignore` does not make an already tracked file safe:
-/// the next `git diff` or commit would still expose the credential. This check
-/// therefore refuses tracked targets, then atomically appends anchored ignore
-/// rules for the live file and every adjacent backup/temp name used by setup
-/// and doctor. If Git cannot answer reliably, it fails closed.
-fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Result<(), SetupError> {
+fn resolve_secret_git_context(
+    path: &Path,
+    secure_gitignore: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, SetupError> {
     const REPOSITORY_SHAPING_GIT_ENV: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -1964,7 +1960,7 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     if !repo_probe.status.success() {
         let stderr = String::from_utf8_lossy(&repo_probe.stderr);
         if stderr.contains("not a git repository") {
-            return Ok(());
+            return Ok(None);
         }
         return Err(SetupError::Other(format!(
             "cannot verify whether secret config {} is Git-tracked: git rev-parse failed: {}",
@@ -1984,6 +1980,140 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
             path.display()
         ))
     })?;
+    let target = parent.join(file_name);
+    let relative = target.strip_prefix(&repo_root).map_err(|_| {
+        SetupError::Other(format!(
+            "secret config {} is outside the resolved Git worktree {}",
+            path.display(),
+            repo_root.display()
+        ))
+    })?;
+    Ok(Some((repo_root, relative.to_path_buf())))
+}
+
+fn verify_secret_gitignore_protection(
+    repo_root: &Path,
+    representative_paths: [String; 4],
+) -> Result<(), SetupError> {
+    for representative in representative_paths {
+        // `git check-ignore` does not accept the global `--literal-pathspecs`
+        // option. Feed the one pathname through its NUL-delimited stdin mode
+        // so Git treats metacharacters as pathname bytes, not pathspec magic.
+        let mut pathname = representative.as_bytes().to_vec();
+        pathname.push(0);
+        let ignored = crate::git_cmd::GitCmd::new(repo_root)
+            .env("LC_ALL", "C")
+            .args(["check-ignore", "--no-index", "--stdin", "-z"])
+            .stdin(pathname)
+            .skip_flock()
+            .skip_mutex()
+            .run()
+            .map_err(|error| {
+                SetupError::Other(format!(
+                    "cannot verify .gitignore protection for secret artifact {representative}: {error}"
+                ))
+            })?;
+        if !ignored.status.success() {
+            let stderr = String::from_utf8_lossy(&ignored.stderr);
+            return Err(SetupError::Other(format!(
+                "refusing secret write because .gitignore does not protect artifact {representative} (git status {}; {})",
+                ignored.status,
+                stderr.trim()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn protect_untracked_secret_config(
+    repo_root: &Path,
+    relative: &Path,
+    secure_gitignore: bool,
+) -> Result<(), SetupError> {
+    let relative = gitignore_relative_path(relative)?;
+    let (directory, basename) = relative.rsplit_once('/').unwrap_or(("", relative.as_str()));
+    let escaped_directory = escape_gitignore_literal(directory);
+    let escaped_basename = escape_gitignore_literal(basename);
+    let escaped_relative = escape_gitignore_literal(&relative);
+    let prefix = if escaped_directory.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{escaped_directory}/")
+    };
+    let entries = [
+        format!("/{escaped_relative}"),
+        format!("{prefix}.{escaped_basename}.*.tmp"),
+        format!("{prefix}.{escaped_basename}.*.bak"),
+        format!("/{escaped_relative}.bak*"),
+    ];
+    let gitignore = repo_root.join(".gitignore");
+    validate_setup_file_target(&gitignore, "gitignore file")?;
+    let _ = read_setup_file(&gitignore, "gitignore file")?;
+    if !secure_gitignore {
+        return Ok(());
+    }
+    let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
+    ensure_gitignore_entries(&gitignore, &entry_refs)?;
+    verify_secret_gitignore_protection(
+        repo_root,
+        [
+            relative.clone(),
+            format!("{directory}/.{basename}.probe.tmp")
+                .trim_start_matches('/')
+                .to_string(),
+            format!("{directory}/.{basename}.probe.bak")
+                .trim_start_matches('/')
+                .to_string(),
+            format!("{relative}.bak"),
+        ],
+    )
+}
+
+fn check_secret_config_git_exposure_locked(
+    path: &Path,
+    repo_root: &Path,
+    relative: &Path,
+    secure_gitignore: bool,
+) -> Result<(), SetupError> {
+    let tracked_probe = crate::git_cmd::GitCmd::new(repo_root)
+        .env("LC_ALL", "C")
+        .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
+        .arg(relative.as_os_str())
+        .skip_flock()
+        .skip_mutex()
+        .run()
+        .map_err(|error| {
+            SetupError::Other(format!(
+                "cannot verify whether secret config {} is Git-tracked: {error}",
+                path.display()
+            ))
+        })?;
+    if tracked_probe.status.success() {
+        return Err(SetupError::Other(format!(
+            "refusing to write a literal bearer token to Git-tracked config {}; remove it from the index or use an untracked config path",
+            path.display()
+        )));
+    }
+    if tracked_probe.status.code() == Some(1) {
+        return protect_untracked_secret_config(repo_root, relative, secure_gitignore);
+    }
+    Err(SetupError::Other(format!(
+        "cannot verify whether secret config {} is Git-tracked: git ls-files failed",
+        path.display()
+    )))
+}
+
+/// Secure a literal-credential config before writing it in a Git worktree.
+///
+/// Adding a path to `.gitignore` does not make an already tracked file safe:
+/// the next `git diff` or commit would still expose the credential. This check
+/// therefore refuses tracked targets, then atomically appends anchored ignore
+/// rules for the live file and every adjacent backup/temp name used by setup
+/// and doctor. If Git cannot answer reliably, it fails closed.
+fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Result<(), SetupError> {
+    let Some((repo_root, relative)) = resolve_secret_git_context(path, secure_gitignore)? else {
+        return Ok(());
+    };
     // Hold one cooperative lock across the tracked-file probe, .gitignore
     // read/append, and post-write verification. Locking only the individual
     // Git commands leaves the intervening atomic file rewrite exposed to a
@@ -2011,109 +2141,10 @@ fn check_secret_config_git_exposure(path: &Path, secure_gitignore: bool) -> Resu
     } else {
         None
     };
-    let target = parent.join(file_name);
-    let relative = target.strip_prefix(&repo_root).map_err(|_| {
-        SetupError::Other(format!(
-            "secret config {} is outside the resolved Git worktree {}",
-            path.display(),
-            repo_root.display()
-        ))
-    })?;
-
-    let tracked_probe = crate::git_cmd::GitCmd::new(&repo_root)
-        .env("LC_ALL", "C")
-        .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
-        .arg(relative.as_os_str());
     // The outer guard above owns the flock for mutating calls; dry-run calls
     // deliberately create no sentinel. In either mode an inner flock would
     // be redundant (and would deadlock when the outer guard is real).
-    let tracked_probe = tracked_probe
-        .skip_flock()
-        .skip_mutex()
-        .run()
-        .map_err(|error| {
-            SetupError::Other(format!(
-                "cannot verify whether secret config {} is Git-tracked: {error}",
-                path.display()
-            ))
-        })?;
-    if tracked_probe.status.success() {
-        return Err(SetupError::Other(format!(
-            "refusing to write a literal bearer token to Git-tracked config {}; remove it from the index or use an untracked config path",
-            path.display()
-        )));
-    }
-    if tracked_probe.status.code() == Some(1) {
-        let relative = gitignore_relative_path(relative)?;
-        let (directory, basename) = relative
-            .rsplit_once('/')
-            .map_or(("", relative.as_str()), |parts| parts);
-        let escaped_directory = escape_gitignore_literal(directory);
-        let escaped_basename = escape_gitignore_literal(basename);
-        let escaped_relative = escape_gitignore_literal(&relative);
-        let prefix = if escaped_directory.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{escaped_directory}/")
-        };
-        let entries = [
-            format!("/{escaped_relative}"),
-            format!("{prefix}.{escaped_basename}.*.tmp"),
-            format!("{prefix}.{escaped_basename}.*.bak"),
-            format!("/{escaped_relative}.bak*"),
-        ];
-        let gitignore = repo_root.join(".gitignore");
-        validate_setup_file_target(&gitignore, "gitignore file")?;
-        let _ = read_setup_file(&gitignore, "gitignore file")?;
-        if !secure_gitignore {
-            return Ok(());
-        }
-        let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
-        ensure_gitignore_entries(&gitignore, &entry_refs)?;
-        let representative_paths = [
-            relative.clone(),
-            format!("{directory}/.{basename}.probe.tmp")
-                .trim_start_matches('/')
-                .to_string(),
-            format!("{directory}/.{basename}.probe.bak")
-                .trim_start_matches('/')
-                .to_string(),
-            format!("{relative}.bak"),
-        ];
-        for representative in representative_paths {
-            // `git check-ignore` does not accept the global
-            // `--literal-pathspecs` option. Feed the one pathname through its
-            // NUL-delimited stdin mode instead so Git treats metacharacters as
-            // pathname bytes rather than command-line pathspec magic.
-            let mut pathname = representative.as_bytes().to_vec();
-            pathname.push(0);
-            let ignored = crate::git_cmd::GitCmd::new(&repo_root)
-                .env("LC_ALL", "C")
-                .args(["check-ignore", "--no-index", "--stdin", "-z"])
-                .stdin(pathname)
-                .skip_flock()
-                .skip_mutex()
-                .run()
-                .map_err(|error| {
-                    SetupError::Other(format!(
-                        "cannot verify .gitignore protection for secret artifact {representative}: {error}"
-                    ))
-                })?;
-            if !ignored.status.success() {
-                let stderr = String::from_utf8_lossy(&ignored.stderr);
-                return Err(SetupError::Other(format!(
-                    "refusing secret write because .gitignore does not protect artifact {representative} (git status {}; {})",
-                    ignored.status,
-                    stderr.trim()
-                )));
-            }
-        }
-        return Ok(());
-    }
-    Err(SetupError::Other(format!(
-        "cannot verify whether secret config {} is Git-tracked: git ls-files failed",
-        path.display()
-    )))
+    check_secret_config_git_exposure_locked(path, &repo_root, &relative, secure_gitignore)
 }
 
 /// Read-only preflight for a secret-bearing config write.
@@ -2255,6 +2286,43 @@ pub fn write_config_atomic(
 // Orchestration
 // ---------------------------------------------------------------------------
 
+fn project_secret_gitignore_error(
+    params: &SetupParams,
+    platforms: &[AgentPlatform],
+    project_token_paths: &std::collections::BTreeSet<PathBuf>,
+) -> Option<String> {
+    if params.dry_run {
+        return None;
+    }
+    let gitignore = params.project_dir.join(".gitignore");
+    let mut entries = vec![".env".to_string()];
+    for platform in platforms {
+        for file in platform.project_local_secret_files() {
+            let entry = (*file).to_string();
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    for path in project_token_paths {
+        let Ok(relative) = path.strip_prefix(&params.project_dir) else {
+            continue;
+        };
+        let relative = match gitignore_relative_path(relative) {
+            Ok(relative) => relative,
+            Err(error) => return Some(error.to_string()),
+        };
+        let entry = format!("/{}", escape_gitignore_literal(&relative));
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
+    ensure_gitignore_entries(&gitignore, &entry_refs)
+        .err()
+        .map(|error| error.to_string())
+}
+
 /// Run the full setup flow.
 #[must_use]
 pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
@@ -2280,46 +2348,7 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
     // client config. Reporting success after a symlinked, unreadable, or
     // otherwise unmodifiable `.gitignore` would leave a live bearer token
     // exposed to the next `git add -A`.
-    let gitignore_error = if params.dry_run {
-        None
-    } else {
-        let gitignore = params.project_dir.join(".gitignore");
-        let mut entries = vec![".env".to_string()];
-        for platform in &platforms {
-            for file in platform.project_local_secret_files() {
-                let entry = (*file).to_string();
-                if !entries.contains(&entry) {
-                    entries.push(entry);
-                }
-            }
-        }
-        let mut path_error = None;
-        for path in &project_token_paths {
-            let Ok(relative) = path.strip_prefix(&params.project_dir) else {
-                continue;
-            };
-            match gitignore_relative_path(relative) {
-                Ok(relative) => {
-                    let entry = format!("/{}", escape_gitignore_literal(&relative));
-                    if !entries.contains(&entry) {
-                        entries.push(entry);
-                    }
-                }
-                Err(error) => {
-                    path_error = Some(error.to_string());
-                    break;
-                }
-            }
-        }
-        if path_error.is_some() {
-            path_error
-        } else {
-            let entry_refs = entries.iter().map(String::as_str).collect::<Vec<_>>();
-            ensure_gitignore_entries(&gitignore, &entry_refs)
-                .err()
-                .map(|error| error.to_string())
-        }
-    };
+    let gitignore_error = project_secret_gitignore_error(params, &platforms, &project_token_paths);
 
     let mut results = Vec::new();
 
