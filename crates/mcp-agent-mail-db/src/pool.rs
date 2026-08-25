@@ -5201,7 +5201,15 @@ fn validate_frozen_sqlite_open_authority(
         return Ok(());
     };
     let open_path = Path::new(sqlite_path);
-    validate_frozen_authority_leaf_not_symlink(open_path, context, "database")?;
+    // A UTF-8 alias can be the only string API route to an already-frozen
+    // non-UTF-8 target. Such an unchanged alias is validated by the identity
+    // comparison below. Reject a leaf symlink here only when the frozen
+    // identity is the lexical leaf itself: that is the missing/regular-leaf
+    // case where a newly inserted dangling symlink would otherwise look
+    // indistinguishable from the still-missing path.
+    if expected == open_path {
+        validate_frozen_authority_leaf_not_symlink(open_path, context, "database")?;
+    }
     let observed = normalize_sqlite_identity_path_buf(open_path);
     if observed == expected {
         return Ok(());
@@ -28521,8 +28529,7 @@ mod tests {
             .expect("materialize redirected primary fixture");
         drop(redirected_primary_conn);
         let redirected_storage = redirected_dir.join("archive");
-        std::fs::create_dir_all(&redirected_storage)
-            .expect("create redirected archive authority");
+        std::fs::create_dir_all(&redirected_storage).expect("create redirected archive authority");
         let foreign_sidecar = root.path().join("missing-foreign-atc.sqlite3");
         assert!(
             !foreign_sidecar.exists(),

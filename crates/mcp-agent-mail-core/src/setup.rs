@@ -1425,7 +1425,7 @@ pub fn omp_active_user_config_path(params: &SetupParams) -> Result<PathBuf, Setu
         .map_or_else(
             || {
                 require_absolute_omp_home_dir(
-                    params.home_dir_override.clone().or_else(dirs::home_dir),
+                    params.home_dir_override.clone(),
                 )
                 .map(|home| home.join(".omp").join("agent").join("mcp.json"))
             },
@@ -3020,7 +3020,7 @@ fn config_file_status_for_action(
     let expected_timeout = expected_startup_timeout_for_action(action);
     let redacted_path = redact_path_for_status(&action.file_path, home.as_deref());
     let omp_user_config_inspection = if action.platform == AgentPlatform::Omp
-        && params.skip_user_config
+        && (params.skip_user_config || omp_active_user_config_path(params).is_err())
     {
         Some(inspect_omp_active_user_config(params))
     } else {
@@ -3415,7 +3415,25 @@ fn inspect_omp_disabled_servers_contract(
 }
 
 fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigInspection {
-    let path = omp_active_user_config_path(params);
+    let path = match omp_active_user_config_path(params) {
+        Ok(path) => path,
+        Err(_) => {
+            let path = params
+                .omp_user_config_path_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("<unresolved-omp-user-config>"));
+            return OmpActiveUserConfigInspection {
+                observation: ConfigStatusFileObservation {
+                    path: path.display().to_string(),
+                    exists: false,
+                    content_sha256: None,
+                },
+                path,
+                disabled: false,
+                unsupported: true,
+            };
+        }
+    };
     let content = read_setup_file(&path, "OMP active-profile user config");
     let observation = config_status_file_observation(&path, &content);
     let content = match content {
@@ -3458,10 +3476,38 @@ fn inspect_omp_active_user_config(params: &SetupParams) -> OmpActiveUserConfigIn
     }
 }
 
-fn omp_mcp_entry_can_claim_runtime_key(entry: &Value) -> bool {
-    entry.as_object().is_some_and(|entry| {
-        entry.get("command").is_some() || entry.get("url").is_some()
-    })
+fn omp_mcp_entry_can_claim_runtime_key(
+    entry: &Value,
+    format: OmpMcpAuthorityFormat,
+) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    let disabled = match entry.get("enabled") {
+        Some(Value::Bool(false)) => true,
+        Some(Value::String(value)) if matches!(format, OmpMcpAuthorityFormat::Native) => {
+            matches!(value.to_ascii_lowercase().as_str(), "false" | "0")
+        }
+        _ => false,
+    };
+    if disabled {
+        return false;
+    }
+
+    let command = entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    let url = entry
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    match entry.get("type") {
+        None | Some(Value::Null) => command || url,
+        Some(Value::String(transport)) if transport == "stdio" => command,
+        Some(Value::String(transport)) if matches!(transport.as_str(), "http" | "sse") => url,
+        Some(_) => false,
+    }
 }
 
 fn inspect_omp_mcp_aliases(
@@ -3472,14 +3518,14 @@ fn inspect_omp_mcp_aliases(
         observations: Vec::new(),
         conflict_paths: Vec::new(),
     };
-    for path in omp_mcp_authority_paths(params) {
-        if path == action_path {
+    for source in omp_mcp_authority_sources(params) {
+        if source.path == action_path {
             continue;
         }
-        let content = read_setup_file(&path, "OMP native MCP authority");
+        let content = read_setup_file(&source.path, "OMP MCP discovery authority");
         inspection
             .observations
-            .push(config_status_file_observation(&path, &content));
+            .push(config_status_file_observation(&source.path, &content));
         let Ok(Some((content, _))) = content else {
             // Discovery skips missing, unreadable, and malformed secondary
             // native files. The canonical action and user denylist have their
@@ -3495,10 +3541,12 @@ fn inspect_omp_mcp_aliases(
         let has_distinct_alias = OMP_SERVER_ALIASES[1..].iter().any(|alias| {
             servers
                 .get(*alias)
-                .is_some_and(omp_mcp_entry_can_claim_runtime_key)
+                .is_some_and(|entry| {
+                    omp_mcp_entry_can_claim_runtime_key(entry, source.format)
+                })
         });
         if has_distinct_alias {
-            inspection.conflict_paths.push(path);
+            inspection.conflict_paths.push(source.path);
         }
     }
     inspection
@@ -3810,7 +3858,15 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
         effective_source: None,
         unsupported_path: None,
     };
-    let (user_yml, user_yaml) = omp_active_user_settings_paths(params);
+    let Ok((user_yml, user_yaml)) = omp_active_user_settings_paths(params) else {
+        inspection.unsupported_path = Some(
+            params
+                .omp_user_config_path_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("<unresolved-omp-user-config>")),
+        );
+        return inspection;
+    };
     let preferred = merge_omp_settings_file(
         &mut inspection,
         &user_yml,

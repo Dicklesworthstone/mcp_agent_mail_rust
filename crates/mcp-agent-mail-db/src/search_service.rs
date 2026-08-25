@@ -4895,8 +4895,7 @@ mod tests {
         let storage_root = root.path().join("archive");
         let shared_index = storage_root.join("search_index");
         std::fs::create_dir_all(&shared_index).expect("create shared search authority");
-        std::fs::write(shared_index.join("meta.json"), "{}")
-            .expect("write shared search marker");
+        std::fs::write(shared_index.join("meta.json"), "{}").expect("write shared search marker");
 
         let frozen_db = root.path().join("mail.sqlite3");
         let foreign_db = root.path().join("missing-foreign.sqlite3");
