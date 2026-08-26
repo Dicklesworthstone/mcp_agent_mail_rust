@@ -815,18 +815,15 @@ jobs:
             local release_id="$1"
             local assets_json asset_count
             local asset_id asset_name asset_size local_size local_hash remote_hash
+            local asset_is_duplicate asset_is_expected expected_name seen_name
             local expected_names
-            declare -A expected_set=()
-            declare -A seen=()
+            local -a seen_names=()
 
             mapfile -t expected_names < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
             if [ "${#expected_names[@]}" -ne 30 ]; then
               echo "Local release envelope must contain exactly 30 assets" >&2
               exit 1
             fi
-            for asset_name in "${expected_names[@]}"; do
-              expected_set["$asset_name"]=1
-            done
 
             assets_json="$(gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases/${release_id}/assets?per_page=100" | jq -sc 'add // []')"
             asset_count="$(jq -r 'length' <<< "$assets_json")"
@@ -840,11 +837,25 @@ jobs:
                 echo "Existing draft returned malformed asset metadata" >&2
                 exit 1
               fi
-              if [ -z "${expected_set[$asset_name]+present}" ] || [ -n "${seen[$asset_name]+present}" ]; then
+              asset_is_expected=false
+              for expected_name in "${expected_names[@]}"; do
+                if [ "$asset_name" = "$expected_name" ]; then
+                  asset_is_expected=true
+                  break
+                fi
+              done
+              asset_is_duplicate=false
+              for seen_name in "${seen_names[@]}"; do
+                if [ "$asset_name" = "$seen_name" ]; then
+                  asset_is_duplicate=true
+                  break
+                fi
+              done
+              if [ "$asset_is_expected" != true ] || [ "$asset_is_duplicate" = true ]; then
                 echo "Existing draft contains an unexpected or duplicate asset: ${asset_name}" >&2
                 exit 1
               fi
-              seen["$asset_name"]=1
+              seen_names+=("$asset_name")
               local_size="$(stat --format='%s' "publish/$asset_name")"
               if [ "$asset_size" != "$local_size" ]; then
                 echo "Existing draft asset size differs from local ${asset_name}" >&2

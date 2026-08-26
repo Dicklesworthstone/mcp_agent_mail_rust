@@ -320,21 +320,9 @@ resolve_version() {
       fi
     fi
 
-    # Try git tags API as last resort (works even without releases)
-    local tags_url="https://api.github.com/repos/${OWNER}/${REPO}/tags?per_page=10"
-    if tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$tags_url" 2>/dev/null \
-         | grep '"name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/'); then
-      if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]]; then
-        VERSION="$tag"
-        verbose "resolve_version:tags_api tag=${VERSION}"
-        info "Resolved latest version via tags: $VERSION"
-        return 0
-      fi
-    fi
-
-    VERSION="v0.1.0"
-    verbose "resolve_version:fallback_default tag=${VERSION}"
-    warn "Could not resolve latest version; defaulting to $VERSION"
+    err "Could not resolve the latest published GitHub release."
+    err "Check network/API access or pass an exact --version vX.Y.Z."
+    return 1
   fi
   verbose "resolve_version:done resolved=${VERSION}"
 }
@@ -6931,7 +6919,10 @@ if [ "$QUIET" -eq 0 ]; then
   fi
 fi
 
-resolve_version
+if ! resolve_version; then
+  error_usage_hint
+  exit 1
+fi
 if ! establish_release_contract; then
   error_usage_hint
   exit 2
@@ -7306,13 +7297,16 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     exit 1
   fi
 
-  if ! (cd "$TMP/src" && cargo build --locked --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
+  source_target_dir="$TMP/source-target"
+  if ! (cd "$TMP/src" && \
+      CARGO_TARGET_DIR="$source_target_dir" \
+      cargo build --locked --release -p mcp-agent-mail -p mcp-agent-mail-cli); then
     err "Build failed. Check compiler output above for details."
     error_support_hint
     exit 1
   fi
-  SERVER_BIN="$TMP/src/target/release/$BIN_SERVER"
-  CLI_BIN="$TMP/src/target/release/$BIN_CLI"
+  SERVER_BIN="$source_target_dir/release/$BIN_SERVER"
+  CLI_BIN="$source_target_dir/release/$BIN_CLI"
   [ -x "$SERVER_BIN" ] || {
     err "Build failed: $BIN_SERVER not found"
     err "Retry with --verbose and ensure cargo build completed successfully."

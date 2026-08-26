@@ -863,6 +863,7 @@ for source_control in \
     'release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT' \
     'release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT' \
     'release_dependency_pin "$TMP/src" BEADS_RUST_COMMIT' \
+    'CARGO_TARGET_DIR="$source_target_dir"' \
     'cargo build --locked --release -p mcp-agent-mail -p mcp-agent-mail-cli' \
     'The installer will not silently substitute a source build.'; do
     if ! grep -Fq "$source_control" "$INSTALL_SH"; then
@@ -872,6 +873,16 @@ for source_control in \
 done
 if grep -Fq 'binary-download:fallback_to_source' "$INSTALL_SH"; then
     echo "FAIL: release archive failure still silently changes into a source build" >&2
+    exit 1
+fi
+if [ "$(grep -cF 'FROM_SOURCE=1' "$INSTALL_SH")" -ne 1 ] || \
+    ! grep -Fq -- '--from-source) FROM_SOURCE=1; shift;;' "$INSTALL_SH"; then
+    echo "FAIL: source execution can be enabled without the explicit --from-source option" >&2
+    exit 1
+fi
+if grep -Fq 'resolve_version:fallback_default' "$INSTALL_SH" || \
+    grep -Fq 'defaulting to $VERSION' "$INSTALL_SH"; then
+    echo "FAIL: latest-release resolution still fails open to a hard-coded version" >&2
     exit 1
 fi
 
