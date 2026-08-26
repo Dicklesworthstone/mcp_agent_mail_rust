@@ -632,6 +632,10 @@ public static class McpAgentMailInstallerNativeMethods
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool MoveFileExW(string existingPath, string newPath, uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CreateDirectoryW(string path, IntPtr securityAttributes);
 }
 "@
 }
@@ -693,7 +697,7 @@ function Assert-InstallerOwnedEntry {
         throw "$Label is a reparse point: $Path"
     }
     $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
-    if ($Directory -ne $isDirectory) {
+    if ($Directory.IsPresent -ne $isDirectory) {
         throw "$Label has the wrong filesystem type: $Path"
     }
     if ((Get-InstallerLinkCount -Path $Path) -ne 1) {
@@ -706,6 +710,26 @@ function Assert-InstallerOwnedEntry {
             throw "$Label is owned by $owner instead of the current user: $Path"
         }
     }
+}
+
+function New-InstallerDirectoryNoReplace {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+    if (Test-InstallerEntryExists -Path $Path) {
+        throw "$Label already exists: $Path"
+    }
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        Initialize-InstallerNativeMethods
+        if (-not [McpAgentMailInstallerNativeMethods]::CreateDirectoryW($Path, [IntPtr]::Zero)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw [ComponentModel.Win32Exception]::new($errorCode, "$Label could not be created without replacement")
+        }
+    } else {
+        [System.IO.Directory]::CreateDirectory($Path) | Out-Null
+    }
+    Assert-InstallerOwnedEntry -Path $Path -Label $Label -Directory
 }
 
 function Write-InstallerFileExclusive {
@@ -821,7 +845,8 @@ function Write-BinaryTransactionPhase {
         [string]$Journal,
         [string]$Phase,
         [string]$MetadataHash,
-        [switch]$PartialBeforePublishForTest
+        [switch]$PartialBeforePublishForTest,
+        [switch]$InterruptBeforePublishForTest
     )
     $validPhases = @(
         "00-prepared", "10-preserve-server", "20-preserve-cli",
@@ -844,6 +869,9 @@ function Write-BinaryTransactionPhase {
             throw "injected interruption before atomic phase-marker publication"
         }
         Write-InstallerFileExclusive -Path $pending -Bytes $bytes
+        if ($InterruptBeforePublishForTest) {
+            throw "injected interruption at the phase-marker publication boundary"
+        }
         $pendingText = [System.IO.File]::ReadAllText($pending, [Text.UTF8Encoding]::new($false, $true))
         if ($pendingText -cne $text) { throw "Prepared phase marker changed before publication: $pending" }
         Move-InstallerEntryNoReplaceDurable -Source $pending -Destination $marker `
@@ -1243,8 +1271,7 @@ function New-BinaryPairTransaction {
     if ($metadata.HadCli -ceq "1") { $metadata.OldCliHash = Get-Sha256Hex -FilePath $cliDestination }
     $preparing = Join-Path $InstallDir ".mcp-agent-mail-install-transaction.preparing.$($metadata.Nonce)"
     if (Test-InstallerEntryExists -Path $preparing) { throw "Preparing transaction path already exists: $preparing" }
-    [System.IO.Directory]::CreateDirectory($preparing) | Out-Null
-    Assert-InstallerOwnedEntry -Path $preparing -Label "Preparing binary transaction" -Directory
+    New-InstallerDirectoryNoReplace -Path $preparing -Label "Preparing binary transaction"
     Copy-InstallerFileExclusive -Source $ServerSource -Destination (Join-Path $preparing "new-server")
     Copy-InstallerFileExclusive -Source $AmSource -Destination (Join-Path $preparing "new-cli")
     Assert-BinaryTransactionHash -Path (Join-Path $preparing "new-server") `
@@ -1270,8 +1297,8 @@ function New-BinaryPairTransaction {
     Write-BinaryTransactionPhase -Journal $preparing -Phase "00-prepared" -MetadataHash $metadataHash
     Move-InstallerEntryNoReplaceDurable -Source $preparing -Destination $active `
         -Label "Publish binary transaction authority"
-    Assert-InstallerOwnedEntry -Path $active -Label "Binary transaction authority" -Directory
     $script:ActiveBinaryTransactionInstallDir = $InstallDir
+    Assert-InstallerOwnedEntry -Path $active -Label "Binary transaction authority" -Directory
     return [pscustomobject]@{ Journal = $active; Metadata = (Read-BinaryTransactionMetadata -Journal $active) }
 }
 

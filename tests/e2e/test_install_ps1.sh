@@ -217,9 +217,36 @@ function Load-InstallFunction([string]$Name) {
     }
     Invoke-Expression ("function global:{0} {1}" -f $Name, $fnAst.Body.Extent.Text)
 }
-Load-InstallFunction "Get-Sha256Hex"
-Load-InstallFunction "Assert-SafeInstallDirectory"
-Load-InstallFunction "Install-BinariesAtomically"
+foreach ($name in @(
+    "Get-Sha256Hex",
+    "Assert-SafeInstallDirectory",
+    "Initialize-InstallerNativeMethods",
+    "Test-InstallerEntryExists",
+    "Get-InstallerLinkCount",
+    "Assert-InstallerOwnedEntry",
+    "New-InstallerDirectoryNoReplace",
+    "Write-InstallerFileExclusive",
+    "Copy-InstallerFileExclusive",
+    "Move-InstallerEntryNoReplaceDurable",
+    "Assert-BinaryTransactionHash",
+    "Get-BinaryTransactionActivePath",
+    "Write-BinaryTransactionPhase",
+    "Read-BinaryTransactionMetadata",
+    "Assert-BinaryTransactionPhaseMarker",
+    "Get-BinaryTransactionPhaseState",
+    "Get-BinaryTransactionForwardTargetState",
+    "Assert-BinaryTransactionForwardWindow",
+    "Restore-BinaryTransactionTarget",
+    "Archive-BinaryTransaction",
+    "Invoke-BinaryPairRecoveryCore",
+    "Recover-BinaryPairTransaction",
+    "New-BinaryPairTransaction",
+    "Move-BinaryTransactionOriginal",
+    "Move-BinaryTransactionNew",
+    "Install-BinariesAtomically"
+)) {
+    Load-InstallFunction $name
+}
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("am-atomic-test-" + [Guid]::NewGuid().ToString("N"))
 $srcDir = Join-Path $root "src"

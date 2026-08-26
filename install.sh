@@ -3007,7 +3007,7 @@ persist_binary_transaction_phase() {
     *) err "Unknown binary transaction phase: $phase"; return 1 ;;
   esac
   if [ "${journal##*/}" = ".mcp-agent-mail-install-transaction.active" ]; then
-    pending="$(dirname "$journal")/.mcp-agent-mail-install-transaction.phase.${TXN_NONCE}.${phase}.preparing"
+    pending="$(dirname "$journal")/.mcp-agent-mail-install-transaction.phase.${TXN_NONCE}.${phase}.preparing.$$.$RANDOM.$RANDOM"
     if [ "$partial_before_publish_for_test" = "1" ]; then
       printf 'phase=%s\nmetadata_sha' "$phase" \
         | write_binary_transaction_file_exclusive "$pending" 600 || return 1
@@ -3116,13 +3116,17 @@ read_binary_transaction_metadata() {
 
 validate_binary_transaction_inventory_and_phases() {
   local journal="$1"
-  local entry="" name="" phase="" missing_phase=0
+  local entry="" name="" phase="" missing_phase=0 inventory_complete=0
   local forward_phases=(
     00-prepared 10-preserve-server 20-preserve-cli
     30-publish-server 40-publish-cli 50-commit-ready
   )
 
-  while IFS= read -r entry; do
+  while IFS= read -r -d '' entry; do
+    if [ "$entry" = "__MCP_AGENT_MAIL_INVENTORY_COMPLETE__" ]; then
+      inventory_complete=1
+      continue
+    fi
     name="${entry##*/}"
     case "$name" in
       metadata|metadata.sha256|new-server|new-cli|old-server|old-cli|rollback-new-server|rollback-new-cli|\
@@ -3130,7 +3134,15 @@ validate_binary_transaction_inventory_and_phases() {
       phase.30-publish-server|phase.40-publish-cli|phase.45-rollback|phase.50-commit-ready) ;;
       *) err "Unexpected entry in binary transaction authority: $entry"; return 1 ;;
     esac
-  done < <(find "$journal" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+  done < <(
+    if find "$journal" -mindepth 1 -maxdepth 1 -print0 2>/dev/null; then
+      printf '__MCP_AGENT_MAIL_INVENTORY_COMPLETE__\0'
+    fi
+  )
+  if [ "$inventory_complete" -ne 1 ]; then
+    err "Could not enumerate the complete binary transaction inventory."
+    return 1
+  fi
 
   TXN_FORWARD_PHASE=""
   for phase in "${forward_phases[@]}"; do
