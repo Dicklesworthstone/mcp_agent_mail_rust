@@ -149,7 +149,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
         with:
           toolchain: ${{ needs.release_contract.outputs.toolchain }}
           components: rustfmt, clippy
@@ -220,7 +220,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
         with:
           toolchain: ${{ needs.release_contract.outputs.toolchain }}
 
@@ -303,7 +303,7 @@ jobs:
           checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
         with:
           toolchain: ${{ needs.release_contract.outputs.toolchain }}
           targets: ${{ matrix.target }}
@@ -426,13 +426,13 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/*
 
-  release:
+  sign:
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     needs: [release_contract, lint, test, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
-      contents: write
+      contents: read
       id-token: write
 
     steps:
@@ -620,17 +620,20 @@ jobs:
           expected_certificate_identity="https://github.com/${expected_workflow_ref}"
           signed_subjects=("${expected_payloads[@]}" SHA256SUMS)
           for subject in "${signed_subjects[@]}"; do
-            "$COSIGN_BIN" sign-blob --yes --bundle "${subject}.sigstore.json" "$subject"
-            test -s "${subject}.sigstore.json"
-            "$COSIGN_BIN" verify-blob \
-              --bundle "${subject}.sigstore.json" \
-              --certificate-identity "$expected_certificate_identity" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
-              --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
-              --certificate-github-workflow-sha "$EXPECTED_REVISION" \
-              --certificate-github-workflow-trigger "push" \
-              "$subject"
+            (
+              unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE
+              "$COSIGN_BIN" sign-blob --yes --bundle "${subject}.sigstore.json" "$subject"
+              test -s "${subject}.sigstore.json"
+              "$COSIGN_BIN" verify-blob \
+                --bundle "${subject}.sigstore.json" \
+                --certificate-identity "$expected_certificate_identity" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
+                --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
+                --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+                --certificate-github-workflow-trigger "push" \
+                "$subject"
+            )
           done
 
           # Bundles are verification material and are not recursively signed;
@@ -645,6 +648,10 @@ jobs:
             echo "Release asset directory contains missing or unexpected entries" >&2
             printf 'Expected: %s\n' "${expected_release_assets[@]}" >&2
             printf 'Actual: %s\n' "${actual_release_assets[@]}" >&2
+            exit 1
+          fi
+          if [ "${#expected_release_assets[@]}" -ne 30 ]; then
+            echo "Release envelope must contain exactly 30 assets" >&2
             exit 1
           fi
 
@@ -664,15 +671,363 @@ jobs:
             exit 1
           fi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
+      - name: Upload signed release envelope
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
+          name: signed-release-${{ needs.release_contract.outputs.revision }}
+          path: publish/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [release_contract, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download signed release envelope
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-release-${{ needs.release_contract.outputs.revision }}
+          path: publish
+
+      - name: Install verified Cosign
+        env:
+          COSIGN_VERSION: v3.1.3
+          COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
+        run: |
+          set -euo pipefail
+          cosign_dir="${RUNNER_TEMP}/cosign-bin"
+          cosign_path="${cosign_dir}/cosign"
+          mkdir -p "$cosign_dir"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --output "$cosign_path" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+
+          actual_sha256="$(sha256sum "$cosign_path" | awk '{print $1}')"
+          if [ "$actual_sha256" != "$COSIGN_LINUX_AMD64_SHA256" ]; then
+            echo "Cosign checksum mismatch: expected ${COSIGN_LINUX_AMD64_SHA256}, got ${actual_sha256}" >&2
+            exit 1
+          fi
+          chmod 0755 "$cosign_path"
+
+          mapfile -t cosign_versions < <("$cosign_path" version | awk '$1 == "GitVersion:" {print $2}')
+          if [ "${#cosign_versions[@]}" -ne 1 ] || [ "${cosign_versions[0]}" != "$COSIGN_VERSION" ]; then
+            echo "Cosign version mismatch: expected ${COSIGN_VERSION}" >&2
+            exit 1
+          fi
+          printf 'COSIGN_BIN=%s\n' "$cosign_path" >> "$GITHUB_ENV"
+
+      - name: Re-census and verify signed release envelope
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          expected_archives=(
+            mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-unknown-linux-musl.tar.xz
+            mcp-agent-mail-aarch64-unknown-linux-gnu.tar.xz
+            mcp-agent-mail-x86_64-apple-darwin.tar.xz
+            mcp-agent-mail-aarch64-apple-darwin.tar.xz
+            mcp-agent-mail-x86_64-pc-windows-msvc.zip
+          )
+          expected_payloads=(install.sh install.ps1)
+          for artifact in "${expected_archives[@]}"; do
+            expected_payloads+=("$artifact" "${artifact}.sha256")
+          done
+          signed_subjects=("${expected_payloads[@]}" SHA256SUMS)
+          expected_release_assets=("${signed_subjects[@]}")
+          for subject in "${signed_subjects[@]}"; do
+            expected_release_assets+=("${subject}.sigstore.json")
+          done
+          mapfile -t expected_release_assets < <(printf '%s\n' "${expected_release_assets[@]}" | sort)
+          mapfile -t actual_release_assets < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${#expected_release_assets[@]}" -ne 30 ]; then
+            echo "Release envelope must contain exactly 30 assets" >&2
+            exit 1
+          fi
+          if [ "${actual_release_assets[*]}" != "${expected_release_assets[*]}" ]; then
+            echo "Downloaded signed envelope contains missing or unexpected entries" >&2
+            printf 'Expected: %s\n' "${expected_release_assets[@]}" >&2
+            printf 'Actual: %s\n' "${actual_release_assets[@]}" >&2
+            exit 1
+          fi
+          for asset in "${expected_release_assets[@]}"; do
+            if [ ! -f "publish/$asset" ] || [ -L "publish/$asset" ] || [ ! -s "publish/$asset" ]; then
+              echo "Release envelope entry is not a nonempty regular file: ${asset}" >&2
+              exit 1
+            fi
+          done
+
+          expected_certificate_identity="https://github.com/${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}"
+          cd publish
+          for subject in "${signed_subjects[@]}"; do
+            (
+              unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE
+              "$COSIGN_BIN" verify-blob \
+                --bundle "${subject}.sigstore.json" \
+                --certificate-identity "$expected_certificate_identity" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
+                --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
+                --certificate-github-workflow-sha "$EXPECTED_REVISION" \
+                --certificate-github-workflow-trigger "push" \
+                "$subject"
+            )
+          done
+
+      - name: Revalidate tag and prepare isolated draft
+        id: draft_preflight
+        env:
+          EXPECTED_PRERELEASE: ${{ needs.release_contract.outputs.prerelease }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          assert_tag_revision() {
+            local resolved_revision
+            resolved_revision="$(gh api "/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha')"
+            if [ "$resolved_revision" != "$EXPECTED_REVISION" ]; then
+              echo "Release tag ${RELEASE_TAG} resolves to ${resolved_revision:-missing}, expected ${EXPECTED_REVISION}" >&2
+              exit 1
+            fi
+          }
+
+          list_matching_releases() {
+            gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases?per_page=100" \
+              | jq -sc --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]'
+          }
+
+          verify_existing_assets_are_matching_subset() {
+            local release_id="$1"
+            local assets_json asset_count
+            local asset_id asset_name asset_size local_size local_hash remote_hash
+            local expected_names
+            declare -A expected_set=()
+            declare -A seen=()
+
+            mapfile -t expected_names < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+            if [ "${#expected_names[@]}" -ne 30 ]; then
+              echo "Local release envelope must contain exactly 30 assets" >&2
+              exit 1
+            fi
+            for asset_name in "${expected_names[@]}"; do
+              expected_set["$asset_name"]=1
+            done
+
+            assets_json="$(gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases/${release_id}/assets?per_page=100" | jq -sc 'add // []')"
+            asset_count="$(jq -r 'length' <<< "$assets_json")"
+            if [ "$asset_count" -gt 30 ]; then
+              echo "Existing draft has too many assets: ${asset_count}" >&2
+              exit 1
+            fi
+            while IFS=$'\t' read -r asset_id asset_name asset_size; do
+              [ -n "$asset_id" ] || continue
+              if [[ ! "$asset_id" =~ ^[0-9]+$ ]] || [[ ! "$asset_size" =~ ^[0-9]+$ ]]; then
+                echo "Existing draft returned malformed asset metadata" >&2
+                exit 1
+              fi
+              if [ -z "${expected_set[$asset_name]+present}" ] || [ -n "${seen[$asset_name]+present}" ]; then
+                echo "Existing draft contains an unexpected or duplicate asset: ${asset_name}" >&2
+                exit 1
+              fi
+              seen["$asset_name"]=1
+              local_size="$(stat --format='%s' "publish/$asset_name")"
+              if [ "$asset_size" != "$local_size" ]; then
+                echo "Existing draft asset size differs from local ${asset_name}" >&2
+                exit 1
+              fi
+              local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+              remote_hash="$(gh api \
+                -H 'Accept: application/octet-stream' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+                | sha256sum | awk '{print $1}')"
+              if [ "$remote_hash" != "$local_hash" ]; then
+                echo "Existing draft asset bytes differ from local ${asset_name}" >&2
+                exit 1
+              fi
+            done < <(jq -r '.[] | [.id, .name, .size] | @tsv' <<< "$assets_json")
+          }
+
+          assert_tag_revision
+          releases_json="$(list_matching_releases)"
+          release_count="$(jq -r 'length' <<< "$releases_json")"
+          case "$release_count" in
+            0)
+              create_payload="$(jq -n \
+                --arg tag "$RELEASE_TAG" \
+                --arg revision "$EXPECTED_REVISION" \
+                --argjson prerelease "$EXPECTED_PRERELEASE" \
+                '{tag_name: $tag, target_commitish: $revision, name: $tag, draft: true, prerelease: $prerelease, generate_release_notes: true}')"
+              created_release="$(gh api --method POST "/repos/${EXPECTED_REPOSITORY}/releases" --input - <<< "$create_payload")"
+              release_id="$(jq -r '.id' <<< "$created_release")"
+              ;;
+            1)
+              release_json="$(jq -c '.[0]' <<< "$releases_json")"
+              if ! jq -e \
+                  --arg tag "$RELEASE_TAG" \
+                  --argjson prerelease "$EXPECTED_PRERELEASE" \
+                  '.draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+                  >/dev/null <<< "$release_json"; then
+                echo "Refusing to mutate a published or metadata-mismatched release for ${RELEASE_TAG}" >&2
+                exit 1
+              fi
+              release_id="$(jq -r '.id' <<< "$release_json")"
+              ;;
+            *)
+              echo "Refusing ambiguous release state: ${release_count} releases match ${RELEASE_TAG}" >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Draft release id is malformed: ${release_id}" >&2
+            exit 1
+          fi
+
+          releases_json="$(list_matching_releases)"
+          if [ "$(jq -r 'length' <<< "$releases_json")" -ne 1 ]; then
+            echo "Expected exactly one draft after preflight" >&2
+            exit 1
+          fi
+          release_json="$(jq -c '.[0]' <<< "$releases_json")"
+          if ! jq -e \
+              --argjson id "$release_id" \
+              --arg tag "$RELEASE_TAG" \
+              --argjson prerelease "$EXPECTED_PRERELEASE" \
+              '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
+              >/dev/null <<< "$release_json"; then
+            echo "Draft state changed during preflight" >&2
+            exit 1
+          fi
+          direct_release="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [ "$(jq -r '.id' <<< "$direct_release")" != "$release_id" ] \
+              || [ "$(jq -r '.draft' <<< "$direct_release")" != true ]; then
+            echo "Draft is not uniquely discoverable by its release tag" >&2
+            exit 1
+          fi
+          verify_existing_assets_are_matching_subset "$release_id"
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact assets to draft release
+        id: stage_release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          token: ${{ github.token }}
           tag_name: ${{ needs.release_contract.outputs.tag }}
           name: ${{ needs.release_contract.outputs.tag }}
-          draft: false
+          draft: true
           prerelease: ${{ needs.release_contract.outputs.prerelease }}
-          generate_release_notes: true
+          preserve_order: true
+          overwrite_files: false
           fail_on_unmatched_files: true
           files: publish/*
+
+      - name: Verify draft bytes, finalize, and verify public census
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_PRERELEASE: ${{ needs.release_contract.outputs.prerelease }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft_preflight.outputs.release_id }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}
+          STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}
+        run: |
+          set -euo pipefail
+
+          assert_tag_revision() {
+            local resolved_revision
+            resolved_revision="$(gh api "/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha')"
+            if [ "$resolved_revision" != "$EXPECTED_REVISION" ]; then
+              echo "Release tag ${RELEASE_TAG} resolves to ${resolved_revision:-missing}, expected ${EXPECTED_REVISION}" >&2
+              exit 1
+            fi
+          }
+
+          load_remote_assets() {
+            gh api --paginate "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" \
+              | jq -sc 'add // []'
+          }
+
+          assert_release_state_and_census() {
+            local expected_draft="$1"
+            local release_json assets_json
+            local expected_names actual_names
+
+            release_json="$(gh api "/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+            if ! jq -e \
+                --argjson id "$EXPECTED_RELEASE_ID" \
+                --arg tag "$RELEASE_TAG" \
+                --argjson draft "$expected_draft" \
+                --argjson prerelease "$EXPECTED_PRERELEASE" \
+                '.id == $id and .tag_name == $tag and .draft == $draft and .prerelease == $prerelease' \
+                >/dev/null <<< "$release_json"; then
+              echo "Release state does not match the expected tag, id, draft, and prerelease contract" >&2
+              exit 1
+            fi
+            assets_json="$(load_remote_assets)"
+            if [ "$(jq -r 'length' <<< "$assets_json")" -ne 30 ]; then
+              echo "Remote release must contain exactly 30 assets" >&2
+              exit 1
+            fi
+            expected_names="$(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+            actual_names="$(jq -r '.[].name' <<< "$assets_json" | sort)"
+            if [ "$actual_names" != "$expected_names" ]; then
+              echo "Remote release asset census differs from the local signed envelope" >&2
+              exit 1
+            fi
+            printf '%s' "$assets_json"
+          }
+
+          if [ "$STAGED_RELEASE_ID" != "$EXPECTED_RELEASE_ID" ]; then
+            echo "Release action selected ${STAGED_RELEASE_ID}, expected isolated draft ${EXPECTED_RELEASE_ID}" >&2
+            exit 1
+          fi
+          assert_tag_revision
+          draft_assets="$(assert_release_state_and_census true)"
+          while IFS=$'\t' read -r asset_id asset_name asset_size; do
+            local_size="$(stat --format='%s' "publish/$asset_name")"
+            if [ "$asset_size" != "$local_size" ]; then
+              echo "Draft asset size differs from local ${asset_name}" >&2
+              exit 1
+            fi
+            local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+            remote_hash="$(gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+              | sha256sum | awk '{print $1}')"
+            if [ "$remote_hash" != "$local_hash" ]; then
+              echo "Draft asset bytes differ from local ${asset_name}" >&2
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.id, .name, .size] | @tsv' <<< "$draft_assets")
+
+          assert_tag_revision
+          finalized_release="$(gh api --method PATCH \
+            "/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
+            -F draft=false)"
+          if [ "$(jq -r '.draft' <<< "$finalized_release")" != false ]; then
+            echo "GitHub did not finalize the verified draft" >&2
+            exit 1
+          fi
+          assert_tag_revision
+          published_assets="$(assert_release_state_and_census false)"
+          while IFS=$'\t' read -r asset_name asset_size; do
+            local_size="$(stat --format='%s' "publish/$asset_name")"
+            if [ "$asset_size" != "$local_size" ]; then
+              echo "Published asset size differs from local ${asset_name}" >&2
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.name, .size] | @tsv' <<< "$published_assets")

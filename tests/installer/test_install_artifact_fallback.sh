@@ -52,6 +52,7 @@ extract_function() {
     echo 'VERBOSE_DUMP_LINES=20'
     echo 'LOG_FILE=/tmp/unused-installer-verification-test.log'
     echo 'ISSUES_URL=https://example.invalid/issues'
+    echo 'COSIGN_BIN='
     extract_function info
     extract_function ok
     extract_function warn
@@ -78,16 +79,24 @@ extract_function() {
     extract_function persist_installer_copy
     extract_function verify_checksum
     extract_function resolve_and_verify_archive_checksum
+    extract_function require_safe_cosign
     extract_function verify_sigstore_bundle
     extract_function verify_release_archive
     extract_function verify_archive_members_exact
     extract_function binary_version_matches_exact
     extract_function verify_release_binaries_exact
+    extract_function ensure_real_directory_tree
+    extract_function ensure_real_file_target_path
+    extract_function file_sha256_hex
+    extract_function rollback_binary_install_target
+    extract_function rollback_binary_pair_install
+    extract_function install_binary_pair_transactional
 } >"$extract"
 
 for required in establish_release_contract set_artifact_url check_network \
     select_linux_x86_64_gnu_artifact_if_available verify_release_archive \
-    verify_archive_members_exact verify_release_binaries_exact; do
+    verify_archive_members_exact verify_release_binaries_exact require_safe_cosign \
+    install_binary_pair_transactional; do
     if ! grep -q "^${required}()" "$extract"; then
         echo "FATAL: could not extract ${required} from install.sh" >&2
         exit 2
@@ -138,9 +147,15 @@ cat >"$tmp/bin/cosign" <<'SHIM'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${1:-}" = "version" ]; then
-    echo 'GitVersion: v3.0.0'
+    printf '%s\n' "${COSIGN_VERSION_OUTPUT:-GitVersion: v3.1.3}"
     exit 0
 fi
+for trust_name in SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE; do
+    if [ -n "${!trust_name:-}" ]; then
+        echo "custom trust environment leaked into cosign: $trust_name" >&2
+        exit 43
+    fi
+done
 if [ -n "${COSIGN_LOG:-}" ]; then
     printf '%s\n' "$@" >>"$COSIGN_LOG"
 fi
@@ -470,8 +485,12 @@ run_verification_case() {
         ARTIFACT_URL="$artifact_url" COSIGN_LOG="$tmp/$name.cosign.log" \
         CHECKSUM_OVERRIDE="${CHECKSUM_OVERRIDE:-}" WITNESS_MODE="${WITNESS_MODE:-valid}" \
         REQUESTED_VERSION="${REQUESTED_VERSION:-v9.9.9}" \
+        COSIGN_VERSION_OUTPUT="${COSIGN_VERSION_OUTPUT:-GitVersion: v3.1.3}" \
         COSIGN_CERTIFICATE_IDENTITY="${COSIGN_CERTIFICATE_IDENTITY:-https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9}" \
         COSIGN_VERIFY_RC="${COSIGN_VERIFY_RC:-0}" \
+        SIGSTORE_ROOT_FILE="${SIGSTORE_ROOT_FILE:-}" \
+        SIGSTORE_REKOR_PUBLIC_KEY="${SIGSTORE_REKOR_PUBLIC_KEY:-}" \
+        SIGSTORE_CT_LOG_PUBLIC_KEY_FILE="${SIGSTORE_CT_LOG_PUBLIC_KEY_FILE:-}" \
         PATH="$tmp/bin:$PATH" "$@" "$verification_harness" \
         >"$tmp/$name.out" 2>&1
 }
@@ -539,6 +558,46 @@ if ! grep -q 'cosign is required' "$tmp/verify_no_cosign.out"; then
     exit 1
 fi
 
+for unsafe_version_case in \
+    'v3_1_2|GitVersion: v3.1.2' \
+    'v2_6_5|GitVersion: v2.6.5' \
+    'v4_0_0|GitVersion: v4.0.0' \
+    'prerelease|GitVersion: v3.1.3-rc.1' \
+    'multiple|GitVersion: v3.1.3
+GitVersion: v3.2.0' \
+    'malformed|cosign version 3.1.3'; do
+    unsafe_name="${unsafe_version_case%%|*}"
+    unsafe_output="${unsafe_version_case#*|}"
+    if CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE=valid \
+        COSIGN_VERSION_OUTPUT="$unsafe_output" \
+        run_verification_case "verify_unsafe_cosign_$unsafe_name" bash; then
+        echo "FAIL: unsafe or ambiguous cosign version was accepted: $unsafe_name" >&2
+        exit 1
+    fi
+    if ! grep -Eq 'Unsafe or unsupported cosign version|Could not parse exactly one stable GitVersion' \
+        "$tmp/verify_unsafe_cosign_$unsafe_name.out"; then
+        echo "FAIL: cosign rejection was not actionable: $unsafe_name" >&2
+        cat "$tmp/verify_unsafe_cosign_$unsafe_name.out" >&2
+        exit 1
+    fi
+done
+
+for safe_version in 'GitVersion: v3.1.3' 'GitVersion: v3.99.0'; do
+    safe_name="${safe_version##*v}"
+    safe_name="${safe_name//./_}"
+    CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE=valid \
+        COSIGN_VERSION_OUTPUT="$safe_version" \
+        run_verification_case "verify_safe_cosign_$safe_name" bash
+done
+
+# The shim exits 43 if any custom trust setting reaches it. Success therefore
+# proves the installer clears all three overrides for the verifier subprocess.
+CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE=valid \
+    SIGSTORE_ROOT_FILE="$tmp/attacker-root.json" \
+    SIGSTORE_REKOR_PUBLIC_KEY="$tmp/attacker-rekor.pub" \
+    SIGSTORE_CT_LOG_PUBLIC_KEY_FILE="$tmp/attacker-ctfe.pub" \
+    run_verification_case verify_trust_isolation bash
+
 for failure_mode in malformed_bundle invalid_signature; do
     witness_mode=valid
     [ "$failure_mode" = "malformed_bundle" ] && witness_mode=malformed_bundle
@@ -558,6 +617,7 @@ CHECKSUM_OVERRIDE='' WITNESS_MODE=valid COSIGN_VERIFY_RC=0 run_verification_case
 expected_cosign_log="$tmp/verify_success.cosign.expected"
 printf '%s\n' \
     'verify-blob' \
+    '--new-bundle-format' \
     '--bundle' \
     "$tmp/verify_success/release.sigstore.json" \
     '--certificate-identity' \
@@ -714,16 +774,104 @@ for bad_versions in wrong-cli wrong-server; do
     fi
 done
 
-staged_version_line=$(grep -nF 'verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"' "$INSTALL_SH" | cut -d: -f1)
-replace_line=$(grep -nF 'atomic_install "$SERVER_BIN" "$DEST/$BIN_SERVER"' "$INSTALL_SH" | cut -d: -f1)
-installed_version_line=$(grep -nF 'verify_release_binaries_exact "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI" "Installed"' "$INSTALL_SH" | cut -d: -f1)
-if [ -z "$staged_version_line" ] || [ -z "$replace_line" ] || [ -z "$installed_version_line" ] || \
-    [ "$staged_version_line" -ge "$replace_line" ] || [ "$replace_line" -ge "$installed_version_line" ]; then
-    echo "FAIL: Unix exact version checks must bracket binary replacement" >&2
+step "scenario J: Unix pair replacement is digest-bound and rolls back as one unit"
+transaction_root="$tmp/transaction-fixtures"
+mkdir -p "$transaction_root/old" "$transaction_root/new" \
+    "$transaction_root/wrong" "$transaction_root/install"
+make_version_fixture "$transaction_root/old/am" 'am 9.9.8'
+make_version_fixture "$transaction_root/old/mcp-agent-mail" 'mcp-agent-mail 9.9.8'
+make_version_fixture "$transaction_root/new/am" 'am 9.9.9'
+make_version_fixture "$transaction_root/new/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
+make_version_fixture "$transaction_root/wrong/am" 'am 9.9.9'
+make_version_fixture "$transaction_root/wrong/mcp-agent-mail" 'mcp-agent-mail 9.9.8'
+cp "$transaction_root/old/am" "$transaction_root/install/am"
+cp "$transaction_root/old/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"
+
+run_transaction_case() {
+    local source_dir="$1"
+    local fault_after_first_replace="${2:-0}"
+    EXTRACT="$extract" TX_ROOT="$transaction_root" SOURCE_DIR="$source_dir" \
+        FAULT_AFTER_FIRST_REPLACE="$fault_after_first_replace" bash -c '
+            set -euo pipefail
+            source "$EXTRACT"
+            TMP="$TX_ROOT"
+            BIN_CLI=am
+            BIN_SERVER=mcp-agent-mail
+            VERSION=v9.9.9
+            EXPECTED_RELEASE_VERSION=9.9.9
+            install_binary_pair_transactional \
+                "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" \
+                "$TX_ROOT/install" "$FAULT_AFTER_FIRST_REPLACE"
+        '
+}
+
+if run_transaction_case "$transaction_root/new" 1; then
+    echo "FAIL: injected failure after the first replacement must abort the pair transaction" >&2
+    exit 1
+fi
+if ! cmp -s "$transaction_root/old/am" "$transaction_root/install/am" || \
+    ! cmp -s "$transaction_root/old/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"; then
+    echo "FAIL: first-replacement failure did not restore the old binary pair byte-for-byte" >&2
     exit 1
 fi
 
-step "scenario J: PowerShell installer statically enforces the same exact-release contract"
+run_transaction_case "$transaction_root/new"
+if ! cmp -s "$transaction_root/new/am" "$transaction_root/install/am" || \
+    ! cmp -s "$transaction_root/new/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"; then
+    echo "FAIL: successful pair transaction did not preserve staged bytes exactly" >&2
+    exit 1
+fi
+
+if run_transaction_case "$transaction_root/wrong"; then
+    echo "FAIL: installed version mismatch must abort the pair transaction" >&2
+    exit 1
+fi
+if ! cmp -s "$transaction_root/new/am" "$transaction_root/install/am" || \
+    ! cmp -s "$transaction_root/new/mcp-agent-mail" "$transaction_root/install/mcp-agent-mail"; then
+    echo "FAIL: post-install version failure did not restore the prior binary pair" >&2
+    exit 1
+fi
+if find "$transaction_root/install" -maxdepth 1 -name '*.bak.preinstall-*' -print -quit | grep -q .; then
+    echo "FAIL: completed or successfully rolled-back transaction retained an unexpected backup" >&2
+    exit 1
+fi
+
+staged_version_line=$(grep -nF 'verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"' "$INSTALL_SH" | cut -d: -f1)
+replace_line=$(grep -nF 'install_binary_pair_transactional "$SERVER_BIN" "$CLI_BIN" "$DEST"' "$INSTALL_SH" | cut -d: -f1)
+transaction_start_line=$(grep -nF 'install_binary_pair_transactional() {' "$INSTALL_SH" | cut -d: -f1)
+transaction_end_line=$(awk -v first="$transaction_start_line" 'NR > first && $0 == "}" { print NR; exit }' "$INSTALL_SH")
+installed_version_line=$(grep -nF '! verify_release_binaries_exact "$server_dest" "$cli_dest" "Installed"' "$INSTALL_SH" | cut -d: -f1)
+if [ -z "$staged_version_line" ] || [ -z "$replace_line" ] || \
+    [ -z "$transaction_start_line" ] || [ -z "$transaction_end_line" ] || \
+    [ -z "$installed_version_line" ] || [ "$staged_version_line" -ge "$replace_line" ] || \
+    [ "$installed_version_line" -le "$transaction_start_line" ] || \
+    [ "$installed_version_line" -ge "$transaction_end_line" ]; then
+    echo "FAIL: Unix exact staged/installed version checks do not enclose the pair transaction" >&2
+    exit 1
+fi
+if grep -Fq 'atomic_install "$SERVER_BIN"' "$INSTALL_SH"; then
+    echo "FAIL: Unix main flow still performs independent per-binary replacement" >&2
+    exit 1
+fi
+
+for source_control in \
+    'fetch --quiet --depth 1 origin "refs/tags/${release_tag}"' \
+    'release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT' \
+    'release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT' \
+    'release_dependency_pin "$TMP/src" BEADS_RUST_COMMIT' \
+    'cargo build --locked --release -p mcp-agent-mail -p mcp-agent-mail-cli' \
+    'The installer will not silently substitute a source build.'; do
+    if ! grep -Fq "$source_control" "$INSTALL_SH"; then
+        echo "FAIL: exact-tag source-build control missing: $source_control" >&2
+        exit 1
+    fi
+done
+if grep -Fq 'binary-download:fallback_to_source' "$INSTALL_SH"; then
+    echo "FAIL: release archive failure still silently changes into a source build" >&2
+    exit 1
+fi
+
+step "scenario K: PowerShell installer statically enforces the same exact-release contract"
 if ! grep -Fq 'COSIGN_IDENTITY="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/${VERSION}"' "$INSTALL_SH" || \
     ! grep -Fq 'CertificateIdentity = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/$normalizedTag"' "$INSTALL_PS1"; then
     echo "FAIL: installers do not derive the certificate identity from the exact normalized tag" >&2
@@ -748,8 +896,11 @@ ps_extract_line=$(grep -nF 'Expand-Archive -LiteralPath $zipPath' "$INSTALL_PS1"
 ps_gate_end_line=$(awk -v first="$ps_sigstore_line" -v last="$ps_members_line" \
     'NR > first && NR < last && $0 == "    }" { line = NR } END { print line }' "$INSTALL_PS1")
 ps_staged_version_line=$(grep -nF 'Assert-ExactBinaryVersion -BinaryPath $amSource -ExpectedOutput "am $requestedNormalized" -Phase "Staged"' "$INSTALL_PS1" | cut -d: -f1)
-ps_replace_line=$(grep -nF 'Install-BinariesAtomically -AmSource $amSource -ServerSource $serverSource -InstallDir $Dest' "$INSTALL_PS1" | cut -d: -f1)
+ps_replace_line=$(grep -nF '    Install-BinariesAtomically `' "$INSTALL_PS1" | cut -d: -f1)
 ps_post_version_line=$(grep -nF 'Verify-Install -InstallDir $Dest -ExpectedVersion $requestedNormalized' "$INSTALL_PS1" | cut -d: -f1)
+ps_callback_line=$(grep -nF '& $PostInstallVerifier $InstallDir' "$INSTALL_PS1" | cut -d: -f1)
+ps_commit_line=$(grep -nF '        $committed = $true' "$INSTALL_PS1" | cut -d: -f1)
+ps_backup_cleanup_line=$(grep -nF '        if ($committed) {' "$INSTALL_PS1" | cut -d: -f1)
 if ! grep -Fq '$ShouldVerifyArchive = if ($NoVerify) { $false } else { $true }' "$INSTALL_PS1"; then
     echo "FAIL: PowerShell archive verification must default on and require an explicit -NoVerify escape" >&2
     exit 1
@@ -762,14 +913,23 @@ if [ -z "$ps_gate_line" ] || [ -z "$ps_sigstore_line" ] || [ -z "$ps_gate_end_li
     exit 1
 fi
 if [ -z "$ps_staged_version_line" ] || [ -z "$ps_replace_line" ] || \
-    [ -z "$ps_post_version_line" ] || [ "$ps_staged_version_line" -ge "$ps_replace_line" ] || \
-    [ "$ps_replace_line" -ge "$ps_post_version_line" ]; then
-    echo "FAIL: PowerShell exact version checks must bracket binary replacement" >&2
+    [ -z "$ps_post_version_line" ] || [ -z "$ps_callback_line" ] || \
+    [ -z "$ps_commit_line" ] || [ -z "$ps_backup_cleanup_line" ] || \
+    [ "$ps_staged_version_line" -ge "$ps_post_version_line" ] || \
+    [ "$ps_post_version_line" -ge "$ps_replace_line" ] || \
+    [ "$ps_callback_line" -ge "$ps_commit_line" ] || \
+    [ "$ps_commit_line" -ge "$ps_backup_cleanup_line" ]; then
+    echo "FAIL: PowerShell post-install verification must commit before backup cleanup" >&2
     exit 1
 fi
 for required_text in \
     'Get-Command Get-FileHash -ErrorAction SilentlyContinue' \
     'Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue' \
+    'require >=v3.1.3 and <v4.0.0' \
+    '"--new-bundle-format"' \
+    '"SIGSTORE_ROOT_FILE"' \
+    '"SIGSTORE_REKOR_PUBLIC_KEY"' \
+    '"SIGSTORE_CT_LOG_PUBLIC_KEY_FILE"' \
     'ConvertFrom-Json -ErrorAction Stop' \
     '"--certificate-identity", $CosignIdentity' \
     "'^v?(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'" \
@@ -778,8 +938,12 @@ for required_text in \
     '$versionLines.Count -ne 1' \
     'Assert-ExactBinaryVersion -BinaryPath $serverSource -ExpectedOutput "mcp-agent-mail $requestedNormalized" -Phase "Staged"' \
     'Assert-ExactBinaryVersion -BinaryPath $serverExe -ExpectedOutput "mcp-agent-mail $ExpectedVersion" -Phase "Post-install"' \
+    '$installerMutex = Enter-InstallerMutex -InstallDir $Dest' \
+    '-PostInstallVerifier $postInstallVerifier' \
+    'Installed binary bytes differ from the verified staged pair.' \
     'Archive-member and exact-version checks remain mandatory.' \
-    'UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)'; do
+    'UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)' \
+    'malicious bytes can run arbitrary code.'; do
     if ! grep -Fq "$required_text" "$INSTALL_PS1"; then
         echo "FAIL: PowerShell fail-closed control missing: $required_text" >&2
         exit 1
