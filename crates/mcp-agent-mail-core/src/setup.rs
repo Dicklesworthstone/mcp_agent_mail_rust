@@ -702,7 +702,7 @@ pub fn constant_time_str_eq(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 thread_local! {
-    static TEST_ENV_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, Option<String>>> =
+    static TEST_ENV_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, Option<OsString>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     static TEST_RANDOM_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -722,21 +722,11 @@ fn home_dir_for_omp_setup() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-fn env_value_for_setup(key: &str) -> Option<String> {
-    #[cfg(test)]
-    {
-        if let Some(value) = TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned()) {
-            return value;
-        }
-    }
-    std::env::var(key).ok()
-}
-
 fn os_env_value_for_setup(key: &str) -> Option<OsString> {
     #[cfg(test)]
     {
         if let Some(value) = TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned()) {
-            return value.map(OsString::from);
+            return value;
         }
     }
     std::env::var_os(key)
@@ -746,13 +736,19 @@ fn utf8_env_value_for_setup(key: &str) -> Result<Option<String>, SetupError> {
     #[cfg(test)]
     {
         if let Some(value) = TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned()) {
-            return Ok(value);
+            return value.map_or(Ok(None), |value| {
+                value.into_string().map(Some).map_err(|_| {
+                    SetupError::Other(format!(
+                        "{key} must contain valid UTF-8; refusing to guess a setup authority"
+                    ))
+                })
+            });
         }
     }
     std::env::var_os(key).map_or(Ok(None), |value| {
         value.into_string().map(Some).map_err(|_| {
             SetupError::Other(format!(
-                "{key} must contain valid UTF-8; refusing to guess an OMP credential authority"
+                "{key} must contain valid UTF-8; refusing to guess a setup authority"
             ))
         })
     })
@@ -769,7 +765,7 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
     if let Some(t) = read_env_file_token(env_file)? {
         return Ok(t);
     }
-    if let Some(t) = env_value_for_setup("HTTP_BEARER_TOKEN")
+    if let Some(t) = utf8_env_value_for_setup("HTTP_BEARER_TOKEN")?
         && !t.is_empty()
     {
         return Ok(t);
@@ -787,9 +783,10 @@ pub fn resolve_existing_token(
     {
         return Ok(Some(token.to_string()));
     }
-    let file_token = read_env_file_token(env_file)?;
-    Ok(file_token
-        .or_else(|| env_value_for_setup("HTTP_BEARER_TOKEN").filter(|token| !token.is_empty())))
+    if let Some(file_token) = read_env_file_token(env_file)? {
+        return Ok(Some(file_token));
+    }
+    Ok(utf8_env_value_for_setup("HTTP_BEARER_TOKEN")?.filter(|token| !token.is_empty()))
 }
 
 /// Read `HTTP_BEARER_TOKEN=...` from a .env file.
@@ -5758,9 +5755,23 @@ mod tests {
             .expect("setup temp directory")
     }
 
+    #[cfg(unix)]
+    fn non_utf8_os_string() -> OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        OsString::from_vec(vec![0xff])
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_os_string() -> OsString {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        OsString::from_wide(&[0xd800])
+    }
+
     enum EnvVarPrevious {
         Missing,
-        Present(Option<String>),
+        Present(Option<OsString>),
     }
 
     struct EnvVarGuard {
@@ -5773,14 +5784,18 @@ mod tests {
     }
 
     impl EnvVarGuard {
-        fn set(key: &str, value: impl Into<String>) -> Self {
+        fn set(key: &str, value: impl Into<OsString>) -> Self {
+            Self::set_os(key, value.into())
+        }
+
+        fn set_os(key: &str, value: OsString) -> Self {
             let previous = TEST_ENV_OVERRIDES.with(|cell| {
                 let mut map = cell.borrow_mut();
                 let previous = map
                     .get(key)
                     .cloned()
                     .map_or(EnvVarPrevious::Missing, EnvVarPrevious::Present);
-                map.insert(key.to_string(), Some(value.into()));
+                map.insert(key.to_string(), Some(value));
                 previous
             });
             Self {
@@ -5886,6 +5901,42 @@ mod tests {
         assert_eq!(t.len(), 64);
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn token_resolution_rejects_non_utf8_process_authority() {
+        let _env = EnvVarGuard::set_os("HTTP_BEARER_TOKEN", non_utf8_os_string());
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-env");
+
+        let generated_error = resolve_token(None, &missing)
+            .expect_err("invalid process token bytes must not degrade to token generation");
+        let existing_error = resolve_existing_token(None, &missing)
+            .expect_err("invalid process token bytes must not degrade to an absent token");
+
+        for error in [generated_error, existing_error] {
+            let message = error.to_string();
+            assert!(message.contains("HTTP_BEARER_TOKEN"), "{message}");
+            assert!(message.contains("valid UTF-8"), "{message}");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn higher_priority_tokens_bypass_non_utf8_process_authority() {
+        let _env = EnvVarGuard::set_os("HTTP_BEARER_TOKEN", non_utf8_os_string());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "HTTP_BEARER_TOKEN=file-token\n").unwrap();
+
+        assert_eq!(
+            resolve_token(Some("explicit-token"), file.path()).unwrap(),
+            "explicit-token"
+        );
+        assert_eq!(
+            resolve_existing_token(None, file.path()).unwrap().as_deref(),
+            Some("file-token")
+        );
+    }
+
     #[test]
     fn resolve_token_reads_env_file() {
         let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
@@ -5944,7 +5995,7 @@ mod tests {
         let _env = EnvVarGuard::set("HTTP_BEARER_TOKEN", "stale-fallback-token");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let oversized_len =
-            usize::try_from(crate::config::USER_ENV_FILE_MAX_BYTES).unwrap() + 1;
+            usize::try_from(crate::config::ENV_AUTHORITY_FILE_MAX_BYTES).unwrap() + 1;
         std::fs::write(tmp.path(), vec![b'x'; oversized_len]).unwrap();
 
         let error = resolve_token(None, tmp.path())

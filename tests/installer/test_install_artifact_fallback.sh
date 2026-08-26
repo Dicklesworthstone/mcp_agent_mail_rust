@@ -74,7 +74,11 @@ extract_function() {
     extract_function select_same_target_gzip_artifact
     extract_function select_linux_x86_64_gnu_artifact
     extract_function select_linux_x86_64_gnu_artifact_if_available
+    extract_function installer_path_owner_uid
     extract_function remove_installer_lock_dir
+    extract_function check_existing_install
+    extract_function preflight_checks
+    extract_function preflight_destination_checks
     extract_function check_network
     extract_function persist_installer_copy
     extract_function verify_checksum
@@ -96,7 +100,8 @@ extract_function() {
 for required in establish_release_contract set_artifact_url check_network \
     select_linux_x86_64_gnu_artifact_if_available verify_release_archive \
     verify_archive_members_exact verify_release_binaries_exact require_safe_cosign \
-    install_binary_pair_transactional; do
+    install_binary_pair_transactional installer_path_owner_uid preflight_checks \
+    preflight_destination_checks; do
     if ! grep -q "^${required}()" "$extract"; then
         echo "FATAL: could not extract ${required} from install.sh" >&2
         exit 2
@@ -147,6 +152,10 @@ cat >"$tmp/bin/cosign" <<'SHIM'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${1:-}" = "version" ]; then
+    if [ "${COSIGN_VERSION_MODE:-normal}" = "hang" ]; then
+        sleep 30 &
+        wait
+    fi
     printf '%s\n' "${COSIGN_VERSION_OUTPUT:-GitVersion: v3.1.3}"
     exit 0
 fi
@@ -345,13 +354,124 @@ if [ -e "$lock_dir" ]; then
     exit 1
 fi
 
+lock_victim_dir="$tmp/installer-lock-victim"
+lock_victim_expected="$tmp/installer-lock-victim.expected"
+symlink_lock_dir="$tmp/symlink-installer.lock.d"
+mkdir "$lock_victim_dir"
+printf '%s\n' 'victim-pid-bytes-must-survive' >"$lock_victim_dir/pid"
+printf '%s\n' 'victim-pid-bytes-must-survive' >"$lock_victim_expected"
+ln -s "$lock_victim_dir" "$symlink_lock_dir"
+if bash -c "source '$extract'; remove_installer_lock_dir '$symlink_lock_dir'"; then
+    echo "FAIL: symlinked installer lock was accepted for cleanup" >&2
+    exit 1
+fi
+if [ ! -L "$symlink_lock_dir" ]; then
+    echo "FAIL: symlinked installer lock itself was removed" >&2
+    exit 1
+fi
+if [ ! -d "$lock_victim_dir" ] || ! cmp -s "$lock_victim_expected" "$lock_victim_dir/pid"; then
+    echo "FAIL: symlinked installer lock cleanup modified the victim directory" >&2
+    exit 1
+fi
+
+changed_owner_lock_dir="$tmp/changed-owner-installer.lock.d"
+mkdir "$changed_owner_lock_dir"
+printf '%s\n' '222222' >"$changed_owner_lock_dir/pid"
+if bash -c "source '$extract'; remove_installer_lock_dir '$changed_owner_lock_dir' 111111"; then
+    echo "FAIL: stale-lock cleanup removed a lock whose observed pid changed" >&2
+    exit 1
+fi
+if [ ! -d "$changed_owner_lock_dir" ] || [ "$(cat "$changed_owner_lock_dir/pid")" != '222222' ]; then
+    echo "FAIL: stale-lock cleanup failed to preserve the new lock owner" >&2
+    exit 1
+fi
+
 # shellcheck disable=SC2016 # grep patterns intentionally match literal shell source.
 if grep -q 'rm -rf "${LOCK_DIR' "$INSTALL_SH" || grep -q 'rm -rf "$LOCK_DIR' "$INSTALL_SH"; then
     echo "FAIL: installer lock cleanup must not use rm -rf" >&2
     exit 1
 fi
 
-step "scenario F: piped installer persistence is complete-or-untouched"
+step "scenario F: dry-run preserves install state and --force skips installed probes"
+dry_run_dest="$tmp/dry-run-dest/nested"
+dry_run_skip_marker="$tmp/dry-run-python-migration-skipped"
+dry_run_log="$tmp/dry-run-installer.log"
+dry_run_log_expected="$tmp/dry-run-installer.expected"
+printf '%s\n' 'pre-existing-log-must-not-be-truncated' >"$dry_run_log"
+printf '%s\n' 'pre-existing-log-must-not-be-truncated' >"$dry_run_log_expected"
+if ! HOME="$tmp/dry-run-home" AM_OFFLINE=1 \
+    LOG_FILE="$dry_run_log" \
+    PYTHON_MIGRATION_SKIP_MARKER="$dry_run_skip_marker" \
+    bash "$INSTALL_SH" --version v9.9.9 --dest "$dry_run_dest" --force \
+        --no-migrate --no-easy --no-gum --dry-run >"$tmp/dry-run.out" 2>&1; then
+    echo "FAIL: installer dry-run did not exit successfully" >&2
+    cat "$tmp/dry-run.out" >&2
+    exit 1
+fi
+if [ -e "$dry_run_dest" ] || [ -L "$dry_run_dest" ]; then
+    echo "FAIL: installer dry-run created its destination" >&2
+    exit 1
+fi
+if [ -e "$dry_run_skip_marker" ] || [ -L "$dry_run_skip_marker" ]; then
+    echo "FAIL: installer dry-run persisted Python migration state" >&2
+    exit 1
+fi
+if ! cmp -s "$dry_run_log_expected" "$dry_run_log"; then
+    echo "FAIL: installer dry-run created or truncated its persistent diagnostic log" >&2
+    exit 1
+fi
+if ! grep -q 'Dry run complete' "$tmp/dry-run.out"; then
+    echo "FAIL: installer dry-run did not report completion" >&2
+    exit 1
+fi
+
+force_probe_dir="$tmp/force-probe-dest"
+force_probe_marker="$tmp/force-probe.marker"
+mkdir -p "$force_probe_dir"
+for binary in am mcp-agent-mail; do
+    cat >"$force_probe_dir/$binary" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$0" >>"${PROBE_MARKER:?}"
+printf '%s\n' "unexpected installed binary probe"
+SHIM
+    chmod +x "$force_probe_dir/$binary"
+done
+
+PROBE_MARKER="$force_probe_marker" bash -c "
+    source '$extract'
+    check_disk_space() { :; }
+    check_write_permissions() { :; }
+    check_network() { :; }
+    check_git_version_known_bad() { :; }
+    DEST='$force_probe_dir'
+    BIN_CLI=am
+    BIN_SERVER=mcp-agent-mail
+    FORCE_INSTALL=1
+    preflight_checks
+"
+if [ -e "$force_probe_marker" ]; then
+    echo "FAIL: --force executed an installed binary during preflight" >&2
+    exit 1
+fi
+
+PROBE_MARKER="$force_probe_marker" bash -c "
+    source '$extract'
+    check_disk_space() { :; }
+    check_write_permissions() { :; }
+    check_network() { :; }
+    check_git_version_known_bad() { :; }
+    DEST='$force_probe_dir'
+    BIN_CLI=am
+    BIN_SERVER=mcp-agent-mail
+    FORCE_INSTALL=0
+    preflight_checks
+"
+if [ "$(wc -l <"$force_probe_marker" | tr -d '[:space:]')" != "2" ]; then
+    echo "FAIL: non-forced preflight did not execute both installed-binary probes" >&2
+    exit 1
+fi
+
+step "scenario G: piped installer persistence is complete-or-untouched"
 piped_home="$tmp/piped-home"
 mkdir -p "$piped_home"
 {
@@ -408,7 +528,7 @@ if [ "$(cat "$saved_installer")" != "known-good-installer" ]; then
     exit 1
 fi
 
-step "scenario G: release archive verification is fail-closed and precedes extraction"
+step "scenario H: release archive verification is fail-closed and precedes extraction"
 verification_harness="$tmp/verification_harness.sh"
 cat >"$verification_harness" <<'HARNESS'
 #!/usr/bin/env bash
@@ -485,6 +605,7 @@ run_verification_case() {
         ARTIFACT_URL="$artifact_url" COSIGN_LOG="$tmp/$name.cosign.log" \
         CHECKSUM_OVERRIDE="${CHECKSUM_OVERRIDE:-}" WITNESS_MODE="${WITNESS_MODE:-valid}" \
         REQUESTED_VERSION="${REQUESTED_VERSION:-v9.9.9}" \
+        COSIGN_VERSION_MODE="${COSIGN_VERSION_MODE:-normal}" \
         COSIGN_VERSION_OUTPUT="${COSIGN_VERSION_OUTPUT:-GitVersion: v3.1.3}" \
         COSIGN_CERTIFICATE_IDENTITY="${COSIGN_CERTIFICATE_IDENTITY:-https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.9.9}" \
         COSIGN_VERIFY_RC="${COSIGN_VERIFY_RC:-0}" \
@@ -555,6 +676,21 @@ if EXTRACT="$extract" CASE_TMP="$tmp/verify_no_cosign" ARCHIVE_FILE="$archive_fi
 fi
 if ! grep -q 'cosign is required' "$tmp/verify_no_cosign.out"; then
     echo "FAIL: missing cosign failure was not actionable" >&2
+    exit 1
+fi
+
+if CHECKSUM_OVERRIDE="$archive_sha256" WITNESS_MODE=valid COSIGN_VERSION_MODE=hang \
+    run_verification_case verify_hanging_cosign bash; then
+    echo "FAIL: a hanging cosign version probe must abort signature verification" >&2
+    exit 1
+fi
+if ! grep -q 'bounded probe' "$tmp/verify_hanging_cosign.out"; then
+    echo "FAIL: hanging cosign rejection was not actionable" >&2
+    cat "$tmp/verify_hanging_cosign.out" >&2
+    exit 1
+fi
+if [ -s "$tmp/verify_hanging_cosign.cosign.log" ]; then
+    echo "FAIL: verify-blob ran after the cosign version probe timed out" >&2
     exit 1
 fi
 
@@ -631,7 +767,7 @@ if ! cmp -s "$expected_cosign_log" "$tmp/verify_success.cosign.log"; then
     exit 1
 fi
 
-step "scenario H: release tags normalize narrowly and another tag cannot authenticate"
+step "scenario I: release tags normalize narrowly and another tag cannot authenticate"
 contract_output=$(EXTRACT="$extract" REQUESTED_VERSION='9.9.9-rc.1' bash -c '
     set -euo pipefail
     source "$EXTRACT"
@@ -694,7 +830,7 @@ if [ -z "$no_verify_line" ] || [ -z "$verify_call_line" ] || [ -z "$verify_gate_
     exit 1
 fi
 
-step "scenario I: archive inventory and staged versions are exact before replacement"
+step "scenario J: archive inventory and staged versions are exact before replacement"
 member_root="$tmp/archive-member-fixtures"
 mkdir -p "$member_root/exact" "$member_root/extra" "$member_root/nested/bundle" \
     "$member_root/missing" "$member_root/symlink"
@@ -781,7 +917,7 @@ for bad_versions in wrong-cli wrong-server extra-lines nul-byte; do
     fi
 done
 
-step "scenario J: Unix pair replacement is digest-bound and rolls back as one unit"
+step "scenario K: Unix pair replacement is digest-bound and rolls back as one unit"
 transaction_root="$tmp/transaction-fixtures"
 mkdir -p "$transaction_root/old" "$transaction_root/new" \
     "$transaction_root/wrong" "$transaction_root/install"
@@ -889,7 +1025,7 @@ if grep -Fq 'resolve_version:fallback_default' "$INSTALL_SH" || \
     exit 1
 fi
 
-step "scenario K: PowerShell installer statically enforces the same exact-release contract"
+step "scenario L: PowerShell installer statically enforces the same exact-release contract"
 if ! grep -Fq 'COSIGN_IDENTITY="https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/${VERSION}"' "$INSTALL_SH" || \
     ! grep -Fq 'CertificateIdentity = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/$normalizedTag"' "$INSTALL_PS1"; then
     echo "FAIL: installers do not derive the certificate identity from the exact normalized tag" >&2

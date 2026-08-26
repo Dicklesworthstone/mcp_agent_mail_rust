@@ -761,18 +761,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
             source_db.display()
         )));
     }
-    if !source_storage.exists() {
-        return Err(CliError::InvalidArgument(format!(
-            "source storage root missing: {}",
-            source_storage.display()
-        )));
-    }
-    if !source_storage.is_dir() {
-        return Err(CliError::InvalidArgument(format!(
-            "source storage root must be a directory: {}",
-            source_storage.display()
-        )));
-    }
+    require_storage_directory(&source_storage, "source storage root", false)?;
 
     let mode = ImportMode::Copy;
     let target_db = opts
@@ -803,12 +792,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
                 .to_string(),
         ));
     }
-    if target_storage.exists() && !target_storage.is_dir() {
-        return Err(CliError::InvalidArgument(format!(
-            "legacy import requires target storage root to be a directory path: {}",
-            target_storage.display()
-        )));
-    }
+    require_storage_directory(&target_storage, "target storage root", true)?;
     if paths_overlap(&source_storage, &target_storage) {
         return Err(CliError::InvalidArgument(
             "legacy import requires target storage root to be outside source storage root"
@@ -964,7 +948,7 @@ fn execute_import_body(
 /// attempt whose partial artifacts were staged aside). Anything else is
 /// refused so an unrelated directory is never merged into.
 fn ensure_target_storage_root_usable(target_storage_root: &Path) -> CliResult<()> {
-    if !target_storage_root.exists() {
+    if !require_storage_directory(target_storage_root, "target storage root", true)? {
         return Ok(());
     }
     for entry in fs::read_dir(target_storage_root)? {
@@ -1703,7 +1687,9 @@ fn resolve_database_path_from_snapshot(
     snapshot: &LegacyEnvSnapshot,
 ) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let normalized = normalize_input_path(&path.to_string_lossy(), search_root);
+        let raw = path.to_string_lossy();
+        require_nonblank_legacy_authority("DATABASE_URL", &raw)?;
+        let normalized = normalize_input_path(&raw, search_root);
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -1763,7 +1749,9 @@ fn resolve_storage_root_from_snapshot(
     snapshot: &LegacyEnvSnapshot,
 ) -> CliResult<ResolvedPath> {
     if let Some(path) = explicit {
-        let normalized = normalize_input_path(&path.to_string_lossy(), search_root);
+        let raw = path.to_string_lossy();
+        require_nonblank_legacy_authority("STORAGE_ROOT", &raw)?;
+        let normalized = normalize_input_path(&raw, search_root);
         return Ok(ResolvedPath {
             exists: normalized.exists(),
             path: normalized,
@@ -1773,13 +1761,7 @@ fn resolve_storage_root_from_snapshot(
     }
 
     if let Some(value) = process_value {
-        let path = normalize_input_path(value, search_root);
-        return Ok(ResolvedPath {
-            exists: path.exists(),
-            path,
-            source: ResolvedSource::ProcessEnv,
-            raw_value: Some(value.to_string()),
-        });
+        return parse_storage_value(value, search_root, ResolvedSource::ProcessEnv);
     }
 
     if let Some(value) = snapshot
@@ -1787,13 +1769,7 @@ fn resolve_storage_root_from_snapshot(
         .as_ref()
         .and_then(|authority| authority.values.get("STORAGE_ROOT"))
     {
-        let path = normalize_input_path(value, search_root);
-        return Ok(ResolvedPath {
-            exists: path.exists(),
-            path,
-            source: ResolvedSource::ProjectEnv,
-            raw_value: Some(value.clone()),
-        });
+        return parse_storage_value(value, search_root, ResolvedSource::ProjectEnv);
     }
 
     if let Some(value) = snapshot
@@ -1801,23 +1777,11 @@ fn resolve_storage_root_from_snapshot(
         .as_ref()
         .and_then(|authority| authority.values.get("STORAGE_ROOT"))
     {
-        let path = normalize_input_path(value, search_root);
-        return Ok(ResolvedPath {
-            exists: path.exists(),
-            path,
-            source: ResolvedSource::UserEnv,
-            raw_value: Some(value.clone()),
-        });
+        return parse_storage_value(value, search_root, ResolvedSource::UserEnv);
     }
 
     let value = "~/.mcp_agent_mail_git_mailbox_repo";
-    let path = normalize_input_path(value, search_root);
-    Ok(ResolvedPath {
-        exists: path.exists(),
-        path,
-        source: ResolvedSource::Default,
-        raw_value: Some(value.to_string()),
-    })
+    parse_storage_value(value, search_root, ResolvedSource::Default)
 }
 
 fn resolve_legacy_authorities(
@@ -1898,6 +1862,7 @@ fn parse_database_value(
     search_root: &Path,
     source: ResolvedSource,
 ) -> CliResult<ResolvedPath> {
+    require_nonblank_legacy_authority("DATABASE_URL", value)?;
     if is_sqlite_memory_database_url(value) {
         return Err(CliError::InvalidArgument(
             "in-memory DATABASE_URL is not supported for legacy import".to_string(),
@@ -1920,6 +1885,30 @@ fn parse_database_value(
         source,
         raw_value: Some(value.to_string()),
     })
+}
+
+fn parse_storage_value(
+    value: &str,
+    search_root: &Path,
+    source: ResolvedSource,
+) -> CliResult<ResolvedPath> {
+    require_nonblank_legacy_authority("STORAGE_ROOT", value)?;
+    let path = normalize_input_path(value, search_root);
+    Ok(ResolvedPath {
+        exists: path.exists(),
+        path,
+        source,
+        raw_value: Some(value.to_string()),
+    })
+}
+
+fn require_nonblank_legacy_authority(key: &str, value: &str) -> CliResult<()> {
+    if value.trim().is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "legacy {key} authority must not be empty or whitespace"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_env_file_map(text: &str) -> BTreeMap<String, String> {
@@ -2118,7 +2107,14 @@ fn expand_tilde(raw: &str) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    #[cfg(windows)]
+    {
+        dirs::home_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
 }
 
 fn default_copy_target_db(source_db: &Path) -> PathBuf {
@@ -2342,19 +2338,21 @@ fn copy_db_via_sqlite_backup(
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
-    if !src.exists() {
-        return Err(CliError::InvalidArgument(format!(
-            "source directory does not exist: {}",
-            src.display()
-        )));
+    require_storage_directory(src, "source storage directory", false)?;
+    if !require_storage_directory(dst, "target storage directory", true)? {
+        fs::create_dir_all(dst)?;
+        // Revalidate the created path before placing any source entry under
+        // it. This catches an immediately substituted symlink/reparse point;
+        // descriptor-relative copying remains part of the open capability-VFS
+        // redesign rather than being implied by this path-based guard.
+        require_storage_directory(dst, "target storage directory", false)?;
     }
-    fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
         let target = dst.join(entry.file_name());
         let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
+        if storage_metadata_is_link_like(&metadata) {
             if path.is_dir() {
                 return Err(CliError::InvalidArgument(format!(
                     "symlinked directories are not supported during recursive copy: {}",
@@ -2372,16 +2370,68 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
                 path.display()
             )));
         }
-        if path.is_dir() {
+        if metadata.file_type().is_dir() {
             copy_dir_recursive(&path, &target)?;
-        } else if path.is_file() {
+        } else if metadata.file_type().is_file() {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&path, &target)?;
+        } else {
+            return Err(CliError::InvalidArgument(format!(
+                "unsupported special file encountered during recursive copy: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
+}
+
+fn require_storage_directory(
+    path: &Path,
+    label: &str,
+    allow_missing: bool,
+) -> CliResult<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CliError::InvalidArgument(format!(
+                "{label} missing: {}",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if storage_metadata_is_link_like(&metadata) {
+        return Err(CliError::InvalidArgument(format!(
+            "{label} must not be a symlink or reparse point: {}",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(CliError::InvalidArgument(format!(
+            "{label} must be a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn storage_metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn confirm_with_prompt(prompt: &str, default: bool) -> CliResult<bool> {
@@ -2618,6 +2668,32 @@ mod tests {
     }
 
     #[test]
+    fn blank_project_authority_fails_closed_without_user_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = LegacyEnvSnapshot {
+            project: Some(EnvAuthoritySnapshot {
+                path: tmp.path().join(".env"),
+                values: parse_env_file_map("DATABASE_URL=\nSTORAGE_ROOT='   '\n"),
+            }),
+            user: Some(EnvAuthoritySnapshot {
+                path: tmp.path().join("user.env"),
+                values: parse_env_file_map(
+                    "DATABASE_URL=sqlite:///fallback.sqlite3\nSTORAGE_ROOT=./fallback-storage\n",
+                ),
+            }),
+        };
+
+        let database_error =
+            resolve_database_path_from_snapshot(tmp.path(), None, None, &snapshot)
+                .expect_err("blank project DATABASE_URL must not fall through");
+        let storage_error =
+            resolve_storage_root_from_snapshot(tmp.path(), None, None, &snapshot)
+                .expect_err("blank project STORAGE_ROOT must not fall through");
+        assert!(database_error.to_string().contains("DATABASE_URL authority"));
+        assert!(storage_error.to_string().contains("STORAGE_ROOT authority"));
+    }
+
+    #[test]
     fn legacy_env_snapshot_rejects_project_leaf_content_drift() {
         let tmp = tempfile::tempdir().unwrap();
         let project_env = tmp.path().join(".env");
@@ -2818,6 +2894,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, tmp.path().join("legacy.db"));
+    }
+
+    #[test]
+    fn legacy_database_authorities_reject_empty_or_whitespace_values() {
+        let root = tempfile::tempdir().unwrap();
+        for value in ["", " ", "\t\r\n"] {
+            let error = parse_database_value(value, root.path(), ResolvedSource::ProcessEnv)
+                .expect_err("blank DATABASE_URL authority must fail closed");
+            assert!(
+                error.to_string().contains("DATABASE_URL authority must not be empty"),
+                "{error}"
+            );
+        }
+
+        let error = resolve_database_path_from_snapshot(
+            root.path(),
+            Some(Path::new("   ")),
+            None,
+            &LegacyEnvSnapshot::default(),
+        )
+        .expect_err("blank explicit database authority must fail closed");
+        assert!(error.to_string().contains("DATABASE_URL authority must not be empty"));
+    }
+
+    #[test]
+    fn legacy_storage_authorities_reject_empty_or_whitespace_values() {
+        let root = tempfile::tempdir().unwrap();
+        for source in [
+            ResolvedSource::ProcessEnv,
+            ResolvedSource::ProjectEnv,
+            ResolvedSource::UserEnv,
+        ] {
+            for value in ["", " ", "\t\r\n"] {
+                let error = parse_storage_value(value, root.path(), source)
+                    .expect_err("blank STORAGE_ROOT authority must fail closed");
+                assert!(
+                    error.to_string().contains("STORAGE_ROOT authority must not be empty"),
+                    "{error}"
+                );
+            }
+        }
+
+        let error = resolve_storage_root_from_snapshot(
+            root.path(),
+            Some(Path::new("   ")),
+            None,
+            &LegacyEnvSnapshot::default(),
+        )
+        .expect_err("blank explicit storage authority must fail closed");
+        assert!(error.to_string().contains("STORAGE_ROOT authority must not be empty"));
     }
 
     #[test]
@@ -3521,6 +3647,71 @@ mod tests {
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_symlinked_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_source = tmp.path().join("real-source");
+        let linked_source = tmp.path().join("linked-source");
+        let destination = tmp.path().join("destination");
+        fs::create_dir(&real_source).unwrap();
+        fs::write(real_source.join("message.txt"), "payload").unwrap();
+        symlink(&real_source, &linked_source).unwrap();
+
+        let error = copy_dir_recursive(&linked_source, &destination)
+            .expect_err("source storage root symlink must not be followed");
+        assert!(error.to_string().contains("must not be a symlink"), "{error}");
+        assert!(
+            fs::symlink_metadata(&destination).is_err(),
+            "rejected source authority must not create a destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_symlinked_target_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let outside = tmp.path().join("outside");
+        let linked_destination = tmp.path().join("linked-destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(source.join("message.txt"), "payload").unwrap();
+        symlink(&outside, &linked_destination).unwrap();
+
+        let error = copy_dir_recursive(&source, &linked_destination)
+            .expect_err("target storage root symlink must not be followed");
+        assert!(error.to_string().contains("must not be a symlink"), "{error}");
+        assert!(
+            !outside.join("message.txt").exists(),
+            "rejected target authority must not receive source bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_unix_socket_entries() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        let socket_path = source.join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+
+        let error = copy_dir_recursive(&source, &destination)
+            .expect_err("socket entries must not be silently skipped");
+        assert!(
+            error.to_string().contains("unsupported special file"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]

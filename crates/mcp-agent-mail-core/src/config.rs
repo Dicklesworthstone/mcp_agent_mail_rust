@@ -3598,10 +3598,17 @@ fn user_env_parent_metadata_is_safe(metadata: &fs::Metadata) -> bool {
 fn bind_user_env_parent(parent: &Path) -> io::Result<same_file::Handle> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     let directory = std::fs::OpenOptions::new()
         .read(true)
+        // Keep the selected directory authority rename-bound for the whole
+        // read. Rust's Windows default also grants FILE_SHARE_DELETE, which
+        // lets another process rename or replace the directory while this
+        // handle is retained and defeats the identity revalidation below.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(parent)?;
     if !user_env_parent_metadata_is_safe(&directory.metadata()?) {
@@ -6043,6 +6050,24 @@ mod tests {
         )
         .expect_err("an absent leaf in a detached authority must not permit fallback");
         assert!(error.to_string().contains("identity"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_user_env_parent_denies_rename_until_handle_closes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("authority");
+        let renamed = tmp.path().join("renamed-authority");
+        std::fs::create_dir(&parent).unwrap();
+
+        let bound = bind_user_env_parent(&parent).expect("bind parent authority");
+        let error = std::fs::rename(&parent, &renamed)
+            .expect_err("FILE_SHARE_DELETE must remain disabled while authority is bound");
+        assert!(error.raw_os_error().is_some(), "{error}");
+
+        drop(bound);
+        std::fs::rename(&parent, &renamed)
+            .expect("closing the authority handle must release the rename lock");
     }
 
     #[cfg(all(unix, not(target_os = "redox")))]

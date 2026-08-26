@@ -161,6 +161,14 @@ init_verbose_log() {
 }
 
 verbose() {
+  # A dry-run must not create or truncate even the persistent diagnostic log.
+  # Verbose previews still surface diagnostics on stdout.
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    if [ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ]; then
+      echo "[VERBOSE] $*"
+    fi
+    return 0
+  fi
   init_verbose_log
   local ts msg
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -3028,11 +3036,22 @@ install_binary_pair_transactional() {
 
 preflight_checks() {
   info "Running preflight checks"
-  check_disk_space
-  check_write_permissions
-  check_existing_install
+  if [ "$FORCE_INSTALL" -eq 0 ]; then
+    check_existing_install
+  else
+    verbose "preflight_checks: skipping installed-binary probes because --force was requested"
+  fi
   check_network
   check_git_version_known_bad
+}
+
+# These checks can create the destination and therefore must run only after a
+# dry-run/confirmation boundary and while the installer lock is held. Keeping
+# them separate lets the read-only preflight above select the real artifact URL
+# before print_install_plan renders it.
+preflight_destination_checks() {
+  check_disk_space
+  check_write_permissions
 }
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -6420,11 +6439,17 @@ require_safe_cosign() {
     err "Install cosign v3.1.3 or newer in the v3 line, or use --no-verify only for a trusted local artifact."
     return 1
   fi
-  if ! version_output=$("$COSIGN_BIN" version 2>/dev/null); then
-    err "Could not determine the installed cosign version."
+  if ! capture_command_with_timeout 3 "$COSIGN_BIN" version; then
+    err "Could not determine the installed cosign version with a bounded probe (status ${CAPTURED_CMD_STATUS})."
     err "Release verification requires a parseable stable cosign v3.1.3 or newer, below v4."
     return 1
   fi
+  if [ "$CAPTURED_CMD_OUTPUT_LOSSLESS" -ne 1 ]; then
+    err "Could not determine the installed cosign version without losing output bytes."
+    err "Release verification requires a parseable stable cosign v3.1.3 or newer, below v4."
+    return 1
+  fi
+  version_output="$CAPTURED_CMD_OUTPUT_EXACT"
 
   parsed_versions=$(printf '%s\n' "$version_output" | sed -n \
     's/^[[:space:]]*GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)[[:space:]]*$/\1/p')
@@ -6844,8 +6869,6 @@ EOFU
 
 trap 'on_error $LINENO' ERR
 trap early_exit_dump EXIT
-init_verbose_log
-verbose "argv=${ORIGINAL_ARGS[*]:-(none)}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -6916,6 +6939,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Initialize persistent diagnostics only after option parsing establishes that
+# this is not a dry-run. verbose() remains stdout-only for dry-run previews.
+verbose "argv=${ORIGINAL_ARGS[*]:-(none)}"
+
 if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
   err "Cannot combine --migrate and --no-migrate"
   err "Choose one behavior: --migrate (force migration) OR --no-migrate (skip migration)."
@@ -6965,12 +6992,6 @@ if ! set_artifact_url; then
   exit 1
 fi
 
-# Ensure the destination directory hierarchy exists before preflight checks
-if ! ensure_real_directory_tree "$DEST" "install destination"; then
-  err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
-  exit 1
-fi
-
 preflight_checks
 
 # Detect existing Python installation (T1.1, T1.2, T1.3)
@@ -6981,10 +7002,6 @@ detect_python
 # report the match but continue through download, verification, and replacement.
 if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   if existing_install_can_skip; then
-    if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ] && \
-       [ "$FORCE_MIGRATE" -ne 1 ] && [ ! -f "$PYTHON_MIGRATION_SKIP_MARKER" ]; then
-      write_python_migration_skip_marker "explicit --no-migrate"
-    fi
     info "mcp-agent-mail $VERSION already reports the requested version at $DEST."
     info "Continuing with authenticated download and byte-for-byte replacement; a version string alone is not release provenance."
   else
@@ -7139,16 +7156,48 @@ if [ "$EASY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 1 ] && [ -e /dev/tty ]; 
   esac
 fi
 
+installer_path_owner_uid() {
+  local path="$1"
+  local owner=""
+  owner=$(stat -c '%u' -- "$path" 2>/dev/null) \
+    || owner=$(stat -f '%u' "$path" 2>/dev/null) \
+    || return 1
+  [[ "$owner" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$owner"
+}
+
 remove_installer_lock_dir() {
   local lock_dir="$1"
+  local expected_pid="${2:-}"
+  local lock_owner="" current_uid="" observed_pid=""
   [ -n "$lock_dir" ] || return 0
-  [ -d "$lock_dir" ] || return 0
+  if [ -L "$lock_dir" ]; then
+    warn "Installer lock path is a symlink; refusing cleanup: ${lock_dir}"
+    return 1
+  fi
+  if [ ! -e "$lock_dir" ]; then
+    return 0
+  fi
+  if [ ! -d "$lock_dir" ]; then
+    warn "Installer lock path is not a directory; refusing cleanup: ${lock_dir}"
+    return 1
+  fi
   case "$lock_dir" in
     "/"|"$HOME"|"/tmp"|"/var/tmp")
       warn "Refusing unsafe installer lock cleanup path: ${lock_dir}"
       return 1
       ;;
   esac
+
+  current_uid=$(id -u 2>/dev/null) || return 1
+  lock_owner=$(installer_path_owner_uid "$lock_dir") || {
+    warn "Could not verify installer lock ownership; refusing cleanup: ${lock_dir}"
+    return 1
+  }
+  if [ "$lock_owner" != "$current_uid" ]; then
+    warn "Installer lock belongs to uid ${lock_owner}, not current uid ${current_uid}; refusing cleanup: ${lock_dir}"
+    return 1
+  fi
 
   local unexpected
   unexpected=$(find "$lock_dir" -mindepth 1 ! -name pid -print -quit 2>/dev/null || true)
@@ -7157,12 +7206,25 @@ remove_installer_lock_dir() {
     return 1
   fi
 
-  if [ -e "$lock_dir/pid" ]; then
-    if [ ! -f "$lock_dir/pid" ] && [ ! -L "$lock_dir/pid" ]; then
+  if [ -e "$lock_dir/pid" ] || [ -L "$lock_dir/pid" ]; then
+    if [ -L "$lock_dir/pid" ] || [ ! -f "$lock_dir/pid" ]; then
       warn "Installer lock ${lock_dir}/pid is not a regular file; refusing automatic cleanup"
       return 1
     fi
+    if [ -n "$expected_pid" ]; then
+      if ! observed_pid=$(cat "$lock_dir/pid" 2>/dev/null); then
+        warn "Could not re-read installer lock ownership; refusing cleanup: ${lock_dir}/pid"
+        return 1
+      fi
+      if [ "$observed_pid" != "$expected_pid" ]; then
+        warn "Installer lock owner changed from pid ${expected_pid} to ${observed_pid:-<empty>}; refusing cleanup"
+        return 1
+      fi
+    fi
     rm -f "$lock_dir/pid" || return 1
+  elif [ -n "$expected_pid" ]; then
+    warn "Installer lock pid disappeared before cleanup; refusing to remove the directory: ${lock_dir}"
+    return 1
   fi
   rmdir "$lock_dir"
 }
@@ -7199,39 +7261,13 @@ PY
   rmdir "$tmp_dir"
 }
 
-# Cross-platform locking using mkdir (atomic on all POSIX systems)
-LOCK_DIR="${LOCK_FILE}.d"
-LOCKED=0
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-  LOCKED=1
-  echo $$ > "$LOCK_DIR/pid"
-else
-  if [ -f "$LOCK_DIR/pid" ]; then
-    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
-      remove_installer_lock_dir "$LOCK_DIR" || true
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1
-        echo $$ > "$LOCK_DIR/pid"
-      fi
-    fi
-  fi
-  if [ "$LOCKED" -eq 0 ]; then
-    err "Another installer is running (lock $LOCK_DIR)"
-    err "Wait for the other install to finish, or remove a stale lock after confirming no installer is active."
-    err "Check lock owner with: cat \"$LOCK_DIR/pid\" && ps -p \"\$(cat \"$LOCK_DIR/pid\" 2>/dev/null)\""
-    err "Stale-lock cleanup: rmdir \"$LOCK_DIR\""
-    exit 1
-  fi
-fi
-
 cleanup() {
   local rc=$?
   if [ -n "${TMP:-}" ]; then
     remove_installer_tmp_dir "$TMP" || true
   fi
   if [ "${LOCKED:-0}" -eq 1 ]; then
-    remove_installer_lock_dir "${LOCK_DIR:-}" || true
+    remove_installer_lock_dir "${LOCK_DIR:-}" "$$" || true
   fi
   if [ "$rc" -ne 0 ]; then
     dump_verbose_tail
@@ -7239,9 +7275,67 @@ cleanup() {
   return "$rc"
 }
 
+# Cross-platform locking using mkdir (atomic on all POSIX systems). Install the
+# cleanup trap before acquisition so every later preflight failure releases a
+# lock this invocation actually owns.
+LOCK_DIR="${LOCK_FILE}.d"
+LOCKED=0
+TMP=""
+trap cleanup EXIT
+
+publish_installer_lock_pid() {
+  chmod 700 "$LOCK_DIR" || return 1
+  (umask 077; printf '%s\n' "$$" >"$LOCK_DIR/pid")
+}
+
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  LOCKED=1
+  if ! publish_installer_lock_pid; then
+    err "Could not publish installer lock ownership at $LOCK_DIR"
+    exit 1
+  fi
+else
+  lock_owner=""
+  current_uid=$(id -u 2>/dev/null || printf '')
+  if [ ! -L "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+    lock_owner=$(installer_path_owner_uid "$LOCK_DIR" 2>/dev/null || printf '')
+  fi
+  if [ -n "$current_uid" ] && [ "$lock_owner" = "$current_uid" ] && \
+     [ -f "$LOCK_DIR/pid" ] && [ ! -L "$LOCK_DIR/pid" ]; then
+    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || printf '')
+    case "$OLD_PID" in
+      ''|0|*[!0-9]*) ;;
+      *)
+        if ! kill -0 "$OLD_PID" 2>/dev/null; then
+          if remove_installer_lock_dir "$LOCK_DIR" "$OLD_PID" && mkdir "$LOCK_DIR" 2>/dev/null; then
+            LOCKED=1
+            if ! publish_installer_lock_pid; then
+              err "Could not publish installer lock ownership at $LOCK_DIR"
+              exit 1
+            fi
+          fi
+        fi
+        ;;
+    esac
+  fi
+  if [ "$LOCKED" -eq 0 ]; then
+    err "Another installer is running or the lock authority is unsafe (lock $LOCK_DIR)"
+    err "Wait for the other install to finish, or inspect the stale lock without following symlinks."
+    err "Check lock owner with: ls -ld \"$LOCK_DIR\" \"$LOCK_DIR/pid\""
+    exit 1
+  fi
+fi
+
+# Persistent install-state writes begin only after dry-run/confirmation and
+# while the installer lock is held.
+if ! ensure_real_directory_tree "$DEST" "install destination"; then
+  err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
+  exit 1
+fi
+preflight_destination_checks
+
 TMP_PARENT="${TMPDIR:-/tmp}"
 TMP=$(mktemp -d "${TMP_PARENT%/}/mcp-agent-mail-install.XXXXXX")
-trap cleanup EXIT
 
 SERVER_BIN=""
 CLI_BIN=""

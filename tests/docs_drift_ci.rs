@@ -264,8 +264,6 @@ mod dist_release_contract {
         "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
-    const RELEASE_ACTION: &str =
-        "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65";
     const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
     const RELEASE_TARGETS: [&str; 6] = [
         "x86_64-unknown-linux-gnu",
@@ -358,8 +356,8 @@ mod dist_release_contract {
                 return Err(format!("action on line {} has an empty pin comment", line_index + 1));
             }
         }
-        if action_count != 13 {
-            return Err(format!("expected 13 pinned actions, found {action_count}"));
+        if action_count != 12 {
+            return Err(format!("expected 12 pinned actions, found {action_count}"));
         }
         Ok(())
     }
@@ -389,7 +387,9 @@ mod dist_release_contract {
             "SIGSTORE_ROOT_FILE:",
             "SIGSTORE_REKOR_PUBLIC_KEY:",
             "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE:",
-            "overwrite_files: true",
+            "softprops/action-gh-release@",
+            "overwrite_files:",
+            "--show-error --location",
             "--method DELETE",
             "deleteRelease",
             "|| true",
@@ -406,14 +406,9 @@ mod dist_release_contract {
             (TOOLCHAIN_ACTION, 3),
             (UPLOAD_ACTION, 2),
             (DOWNLOAD_ACTION, 2),
-            (RELEASE_ACTION, 1),
         ] {
             require_exactly(workflow, action, expected)?;
         }
-        require_once(
-            workflow,
-            "uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2",
-        )?;
 
         let exact_matrix = concat!(
             "        include:\n",
@@ -514,53 +509,75 @@ mod dist_release_contract {
             "list_matching_releases() {",
             "verify_existing_assets_are_matching_subset() {",
             "case \"$release_count\" in",
-            "[ \"${#expected_names[@]}\" -ne 30 ]",
-            "[ \"$asset_count\" -gt 30 ]",
-            "local -a expected_names=() seen_names=()",
-            "asset_is_expected=false",
-            "[ \"$asset_name\" = \"$expected_name\" ]",
-            "asset_is_duplicate=false",
-            "[ \"$asset_name\" = \"$seen_name\" ]",
-            "[ \"$asset_is_expected\" != true ] || [ \"$asset_is_duplicate\" = true ]",
-            "seen_names+=(\"$asset_name\")",
             "Existing draft asset size differs from local ${asset_name}",
             "Existing draft asset bytes differ from local ${asset_name}",
             "'{tag_name: $tag, target_commitish: $revision, name: $tag, draft: true, prerelease: $prerelease, generate_release_notes: true}'",
             "Refusing to mutate a published or metadata-mismatched release for ${RELEASE_TAG}",
             "Refusing ambiguous release state: ${release_count} releases match ${RELEASE_TAG}",
             "Expected exactly one draft after preflight",
-            "'.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
             "direct_release=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${release_id}\")\"",
             "Draft id no longer resolves to the isolated release contract",
             "verify_existing_assets_are_matching_subset \"$release_id\"",
             "printf 'release_id=%s\\n' \"$release_id\" >> \"$GITHUB_OUTPUT\"",
-            "token: ${{ github.token }}",
-            "tag_name: ${{ needs.release_contract.outputs.tag }}",
-            "          name: ${{ needs.release_contract.outputs.tag }}",
-            "prerelease: ${{ needs.release_contract.outputs.prerelease }}",
-            "preserve_order: true",
-            "overwrite_files: false",
-            "fail_on_unmatched_files: true",
-            "files: publish/*",
-            "STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}",
-            "load_remote_assets() {",
+            "- name: Upload missing exact assets to isolated draft",
+            "assert_isolated_draft() {",
+            "expected_upload_url=\"https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets{?name,label}\"",
+            "Numeric release id no longer resolves to the isolated draft upload contract",
+            "validate_remote_subset() {",
+            "Repository name cannot be embedded safely in an upload URL",
+            "Release asset name cannot be embedded safely in an upload URL: ${asset_name}",
+            "matching_count=\"$(jq -r --arg name \"$asset_name\" '[.[] | select(.name == $name)] | length' <<< \"$staged_assets\")\"",
+            "[ \"$matching_count\" -eq 1 ]",
+            "[ \"$matching_count\" -ne 0 ]",
+            "--connect-timeout 30 --max-time 1800 \\",
+            "--request POST \\",
+            "-H \"Authorization: Bearer ${GH_TOKEN}\" \\",
+            "-H 'Content-Type: application/octet-stream' \\",
+            "--data-binary \"@publish/$asset_name\" \\",
+            "https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?name=${asset_name}",
+            "'(.id | type == \"number\") and .name == $name and .size == $size and .digest == $digest and .state == \"uploaded\"'",
+            "GitHub returned an invalid upload receipt for ${asset_name}",
+            "[ \"$(jq -r 'length' <<< \"$staged_assets\")\" -ne 30 ]",
+            "printf 'release_id=%s\\n' \"$EXPECTED_RELEASE_ID\" >> \"$GITHUB_OUTPUT\"",
+            "STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.release_id }}",
             "assert_release_state_and_census() {",
-            "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
-            "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
             "[ \"$(jq -r 'length' <<< \"$assets_json\")\" -ne 30 ]",
             "[ \"$actual_names\" != \"$expected_names\" ]",
             "[ \"$STAGED_RELEASE_ID\" != \"$EXPECTED_RELEASE_ID\" ]",
             "draft_assets=\"$(assert_release_state_and_census true)\"",
+            "Draft asset digest or state differs from local ${asset_name}",
             "Draft asset bytes differ from local ${asset_name}",
+            "resolve_acfs_public_main() {",
+            "resolve_mcp_public_main() {",
+            "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup.git",
+            "https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git",
+            "-H 'Accept: application/vnd.github.raw+json' \\",
+            "Signed installer differs from install.sh at the release revision",
+            "if ! cmp --silent \"$tag_installer\" publish/install.sh; then",
+            "installer_hash=\"$(sha256sum \"$tag_installer\" | awk '{print $1}')\"",
+            "mcp_agent_mail_rust/${mcp_main_revision}/install.sh?cache_bust=${mcp_main_revision}",
+            "if ! cmp --silent \"$tag_installer\" \"$main_installer\"; then",
+            "Public MCP Agent Mail main does not serve the signed release installer",
+            "agentic_coding_flywheel_setup/${acfs_revision}/checksums.yaml?cache_bust=${acfs_revision}",
+            "marker = \"  mcp_agent_mail:\"",
+            "ACFS checksums must contain exactly one mcp_agent_mail entry",
+            "url: \"https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/refs/heads/main/install.sh\"",
+            "sha256: \"{expected_hash}\"",
+            "ACFS public main does not bind mcp_agent_mail to this release installer",
+            "[ \"$acfs_revision_after\" != \"$acfs_revision\" ]",
+            "[ \"$mcp_main_revision_after\" != \"$mcp_main_revision\" ]",
+            "ACFS public main moved during checksum verification; refusing publication",
+            "MCP Agent Mail public main moved during checksum verification; refusing publication",
             "gh api --method PATCH \\",
             "-F draft=false)",
             "[ \"$(jq -r '.draft' <<< \"$finalized_release\")\" != false ]",
             "published_assets=\"$(assert_release_state_and_census false)\"",
             "Published asset size differs from local ${asset_name}",
+            "Published asset digest or state differs from local ${asset_name}",
             "Published asset bytes differ from local ${asset_name}",
             "published_by_tag=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
-            "'.id == $id and .draft == false and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
-            "Published release is not discoverable by the expected tag and metadata",
+            "'.id == $id and .draft == false and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
+            "Published release is not discoverable by the expected tag, target, and metadata",
         ];
         for needle in required_once {
             require_once(workflow, needle)?;
@@ -571,7 +588,7 @@ mod dist_release_contract {
             "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
             2,
         )?;
-        require_exactly(workflow, "set -euo pipefail", 15)?;
+        require_exactly(workflow, "set -euo pipefail", 16)?;
         require_exactly(workflow, "contents: read", 2)?;
         require_exactly(workflow, "contents: write", 1)?;
         require_exactly(workflow, "id-token: write", 1)?;
@@ -628,19 +645,17 @@ mod dist_release_contract {
         require_once(
             workflow,
             concat!(
-                "      - name: Upload exact assets to draft release\n",
+                "      - name: Upload missing exact assets to isolated draft\n",
                 "        id: stage_release\n",
-                "        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2\n",
-                "        with:\n",
-                "          token: ${{ github.token }}\n",
-                "          tag_name: ${{ needs.release_contract.outputs.tag }}\n",
-                "          name: ${{ needs.release_contract.outputs.tag }}\n",
-                "          draft: true\n",
-                "          prerelease: ${{ needs.release_contract.outputs.prerelease }}\n",
-                "          preserve_order: true\n",
-                "          overwrite_files: false\n",
-                "          fail_on_unmatched_files: true\n",
-                "          files: publish/*",
+                "        env:\n",
+                "          EXPECTED_PRERELEASE: ${{ needs.release_contract.outputs.prerelease }}\n",
+                "          EXPECTED_RELEASE_ID: ${{ steps.draft_preflight.outputs.release_id }}\n",
+                "          EXPECTED_REPOSITORY: ${{ github.repository }}\n",
+                "          EXPECTED_REVISION: ${{ needs.release_contract.outputs.revision }}\n",
+                "          GH_TOKEN: ${{ github.token }}\n",
+                "          RELEASE_TAG: ${{ needs.release_contract.outputs.tag }}\n",
+                "        run: |\n",
+                "          set -euo pipefail",
             ),
         )?;
         require_exactly(workflow, "persist-credentials: false", 5)?;
@@ -660,7 +675,6 @@ mod dist_release_contract {
             "- name: Install verified Cosign",
             "COSIGN_VERSION: v3.1.3",
             "COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71",
-            "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
             "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64",
             "actual_sha256=\"$(sha256sum \"$cosign_path\" | awk '{print $1}')\"",
             "[ \"$actual_sha256\" != \"$COSIGN_LINUX_AMD64_SHA256\" ]",
@@ -686,13 +700,18 @@ mod dist_release_contract {
         ] {
             require_exactly(workflow, needle, 2)?;
         }
-        require_exactly(workflow, "[ \"$remote_hash\" != \"$local_hash\" ]", 3)?;
+        require_exactly(workflow, "[ \"$remote_hash\" != \"$local_hash\" ]", 4)?;
+        require_exactly(
+            workflow,
+            "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
+            4,
+        )?;
         require_exactly(
             workflow,
             "name: signed-release-${{ needs.release_contract.outputs.revision }}",
             2,
         )?;
-        require_exactly(workflow, "GH_TOKEN: ${{ github.token }}", 2)?;
+        require_exactly(workflow, "GH_TOKEN: ${{ github.token }}", 3)?;
         require_exactly(workflow, "SIGSTORE_", 6)?;
         require_exactly(workflow, "assert_tag_revision() {", 2)?;
         require_exactly(
@@ -700,11 +719,44 @@ mod dist_release_contract {
             "gh api \"/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}\" --jq '.sha'",
             2,
         )?;
-        require_exactly(workflow, "draft: true", 2)?;
+        require_exactly(workflow, "draft: true", 1)?;
         require_exactly(
             workflow,
             "if [[ ! \"$asset_id\" =~ ^[0-9]+$ ]] || [[ ! \"$asset_size\" =~ ^[0-9]+$ ]]; then",
-            3,
+            4,
+        )?;
+        for needle in [
+            "load_remote_assets() {",
+            "[ \"${#expected_names[@]}\" -ne 30 ]",
+            "[ \"$asset_count\" -gt 30 ]",
+            "local -a expected_names=() seen_names=()",
+            "asset_is_expected=false",
+            "[ \"$asset_name\" = \"$expected_name\" ]",
+            "asset_is_duplicate=false",
+            "[ \"$asset_name\" = \"$seen_name\" ]",
+            "[ \"$asset_is_expected\" != true ] || [ \"$asset_is_duplicate\" = true ]",
+            "seen_names+=(\"$asset_name\")",
+            "EXPECTED_RELEASE_ID: ${{ steps.draft_preflight.outputs.release_id }}",
+            "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
+        ] {
+            require_exactly(workflow, needle, 2)?;
+        }
+        require_once(
+            workflow,
+            "'.draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
+        )?;
+        require_exactly(
+            workflow,
+            "'.id == $id and .draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
+            2,
+        )?;
+        require_once(
+            workflow,
+            "'.id == $id and .draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease and .upload_url == $upload_url'",
+        )?;
+        require_once(
+            workflow,
+            "'.id == $id and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
         )?;
         require_once(
             workflow,
@@ -743,10 +795,15 @@ mod dist_release_contract {
                 "- name: Download signed release envelope",
                 "- name: Re-census and verify signed release envelope",
                 "- name: Revalidate tag and prepare isolated draft",
-                "- name: Upload exact assets to draft release",
-                "overwrite_files: false",
+                "- name: Upload missing exact assets to isolated draft",
+                "https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?name=${asset_name}",
                 "- name: Verify draft bytes, finalize, and verify public census",
                 "draft_assets=\"$(assert_release_state_and_census true)\"",
+                "tag_installer=\"${RUNNER_TEMP}/tag-install-${EXPECTED_REVISION}.sh\"",
+                "mcp_main_revision=\"$(resolve_mcp_public_main)\"",
+                "if ! cmp --silent \"$tag_installer\" \"$main_installer\"; then",
+                "acfs_revision=\"$(resolve_acfs_public_main)\"",
+                "[ \"$acfs_revision_after\" != \"$acfs_revision\" ]",
                 "gh api --method PATCH \\",
                 "published_assets=\"$(assert_release_state_and_census false)\"",
             ],
@@ -805,11 +862,6 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "prerelease: ${{ needs.release_contract.outputs.prerelease }}",
-                "prerelease: false",
-            ),
-            mutate(
-                &workflow,
                 "cli_version=\"$(staging/am --version)\"",
                 "cli_version=\"$(staging/am --help)\"",
             ),
@@ -828,16 +880,6 @@ mod dist_release_contract {
                 &workflow,
                 TOOLCHAIN_ACTION,
                 "dtolnay/rust-toolchain@nightly",
-            ),
-            mutate(
-                &workflow,
-                RELEASE_ACTION,
-                "softprops/action-gh-release@v2.6.2",
-            ),
-            mutate(
-                &workflow,
-                "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2",
-                "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.4.2",
             ),
             mutate(
                 &workflow,
@@ -1086,7 +1128,6 @@ mod dist_release_contract {
                 "name: signed-release-${{ needs.release_contract.outputs.revision }}",
                 "name: signed-release-${{ github.sha }}",
             ),
-            mutate(&workflow, "files: publish/*", "files: dist/*"),
             mutate(
                 &workflow,
                 "ref: ${{ needs.release_contract.outputs.revision }}",
@@ -1096,11 +1137,6 @@ mod dist_release_contract {
                 &workflow,
                 "if [ \"$checked_out_revision\" != \"$EXPECTED_REVISION\" ] || [ \"$remote_revision\" != \"$EXPECTED_REVISION\" ]; then",
                 "if [ -z \"$remote_revision\" ]; then",
-            ),
-            mutate(
-                &workflow,
-                "tag_name: ${{ needs.release_contract.outputs.tag }}",
-                "tag_name: ${{ github.ref_name }}",
             ),
             mutate(
                 &workflow,
@@ -1119,13 +1155,34 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "'.draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
+                "'.draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
                 "'.tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
             ),
             mutate(
                 &workflow,
                 "direct_release=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${release_id}\")\"",
                 "direct_release=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
+            ),
+            mutate(
+                &workflow,
+                "https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?name=${asset_name}",
+                "https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${RELEASE_TAG}/assets?name=${asset_name}",
+            ),
+            mutate(&workflow, "--request POST \\", "--request PUT \\"),
+            mutate(
+                &workflow,
+                "[ \"$matching_count\" -eq 1 ]",
+                "[ \"$matching_count\" -ge 1 ]",
+            ),
+            mutate(
+                &workflow,
+                "--connect-timeout 30 --max-time 1800 \\",
+                "--connect-timeout 30 \\",
+            ),
+            mutate(
+                &workflow,
+                "'(.id | type == \"number\") and .name == $name and .size == $size and .digest == $digest and .state == \"uploaded\"'",
+                "'(.id | type == \"number\") and .name == $name and .size == $size'",
             ),
             mutate(
                 &workflow,
@@ -1139,17 +1196,7 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "          draft: true",
-                "          draft: false",
-            ),
-            mutate(
-                &workflow,
-                "overwrite_files: false",
-                "overwrite_files: true",
-            ),
-            mutate(
-                &workflow,
-                "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
+                "'.id == $id and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
                 "'.id == $id and .tag_name == $tag and .draft == $draft and .prerelease == $prerelease'",
             ),
             mutate(
@@ -1161,6 +1208,51 @@ mod dist_release_contract {
                 &workflow,
                 "[ \"$actual_names\" != \"$expected_names\" ]",
                 "[ -z \"$actual_names\" ]",
+            ),
+            mutate(
+                &workflow,
+                "if ! cmp --silent \"$tag_installer\" publish/install.sh; then",
+                "if [ ! -s publish/install.sh ]; then",
+            ),
+            mutate(
+                &workflow,
+                "mcp_agent_mail_rust/${mcp_main_revision}/install.sh?cache_bust=${mcp_main_revision}",
+                "mcp_agent_mail_rust/main/install.sh",
+            ),
+            mutate(
+                &workflow,
+                "if ! cmp --silent \"$tag_installer\" \"$main_installer\"; then",
+                "if [ ! -s \"$main_installer\" ]; then",
+            ),
+            mutate(
+                &workflow,
+                "agentic_coding_flywheel_setup/${acfs_revision}/checksums.yaml?cache_bust=${acfs_revision}",
+                "agentic_coding_flywheel_setup/main/checksums.yaml",
+            ),
+            mutate(
+                &workflow,
+                "marker = \"  mcp_agent_mail:\"",
+                "marker = \"  mcp_agent_mail_old:\"",
+            ),
+            mutate(
+                &workflow,
+                "url: \"https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/refs/heads/main/install.sh\"",
+                "url: \"https://example.invalid/install.sh\"",
+            ),
+            mutate(
+                &workflow,
+                "sha256: \"{expected_hash}\"",
+                "sha256: \"{'0' * 64}\"",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$acfs_revision_after\" != \"$acfs_revision\" ]",
+                "[ -z \"$acfs_revision_after\" ]",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$mcp_main_revision_after\" != \"$mcp_main_revision\" ]",
+                "[ -z \"$mcp_main_revision_after\" ]",
             ),
             mutate(
                 &workflow,
