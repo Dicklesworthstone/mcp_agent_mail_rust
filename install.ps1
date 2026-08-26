@@ -584,150 +584,799 @@ function Exit-InstallerMutex {
     $Mutex.Dispose()
 }
 
+$script:ActiveBinaryTransactionInstallDir = $null
+$script:BinaryTransactionRecoveryActive = $false
+
+function Initialize-InstallerNativeMethods {
+    if ($null -ne ("McpAgentMailInstallerNativeMethods" -as [type])) {
+        return
+    }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class McpAgentMailInstallerNativeMethods
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool FlushFileBuffers(SafeFileHandle handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandle(
+        SafeFileHandle handle,
+        out BY_HANDLE_FILE_INFORMATION information);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool MoveFileExW(string existingPath, string newPath, uint flags);
+}
+"@
+}
+
+function Test-InstallerEntryExists {
+    param([string]$Path)
+    try {
+        $null = [System.IO.File]::GetAttributes($Path)
+        return $true
+    } catch [System.IO.FileNotFoundException] {
+        return $false
+    } catch [System.IO.DirectoryNotFoundException] {
+        return $false
+    }
+}
+
+function Get-InstallerLinkCount {
+    param([string]$Path)
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return 1
+    }
+    Initialize-InstallerNativeMethods
+    $shareAll = [uint32]0x00000007
+    $openExisting = [uint32]3
+    $openReparsePoint = [uint32]0x00200000
+    $backupSemantics = [uint32]0x02000000
+    $handle = [McpAgentMailInstallerNativeMethods]::CreateFileW(
+        $Path, 0, $shareAll, [IntPtr]::Zero, $openExisting,
+        ($openReparsePoint -bor $backupSemantics), [IntPtr]::Zero
+    )
+    if ($handle.IsInvalid) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $handle.Dispose()
+        throw [ComponentModel.Win32Exception]::new($errorCode, "Could not inspect link count for $Path")
+    }
+    try {
+        $information = [McpAgentMailInstallerNativeMethods+BY_HANDLE_FILE_INFORMATION]::new()
+        if (-not [McpAgentMailInstallerNativeMethods]::GetFileInformationByHandle($handle, [ref]$information)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw [ComponentModel.Win32Exception]::new($errorCode, "Could not inspect link count for $Path")
+        }
+        return [uint32]$information.NumberOfLinks
+    } finally {
+        $handle.Dispose()
+    }
+}
+
+function Assert-InstallerOwnedEntry {
+    param(
+        [string]$Path,
+        [string]$Label,
+        [switch]$Directory
+    )
+    if (-not (Test-InstallerEntryExists -Path $Path)) {
+        throw "$Label is missing: $Path"
+    }
+    $attributes = [System.IO.File]::GetAttributes($Path)
+    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Label is a reparse point: $Path"
+    }
+    $isDirectory = ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+    if ($Directory -ne $isDirectory) {
+        throw "$Label has the wrong filesystem type: $Path"
+    }
+    if ((Get-InstallerLinkCount -Path $Path) -ne 1) {
+        throw "$Label has an unsafe hard-link count: $Path"
+    }
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        $current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        if ($owner -cne $current) {
+            throw "$Label is owned by $owner instead of the current user: $Path"
+        }
+    }
+}
+
+function Flush-InstallerDirectory {
+    param([string]$Path)
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return
+    }
+    Initialize-InstallerNativeMethods
+    $genericWrite = [uint32]0x40000000
+    $shareAll = [uint32]0x00000007
+    $openExisting = [uint32]3
+    $backupSemantics = [uint32]0x02000000
+    $handle = [McpAgentMailInstallerNativeMethods]::CreateFileW(
+        $Path, $genericWrite, $shareAll, [IntPtr]::Zero, $openExisting,
+        $backupSemantics, [IntPtr]::Zero
+    )
+    if ($handle.IsInvalid) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $handle.Dispose()
+        throw [ComponentModel.Win32Exception]::new($errorCode, "Could not open directory for durable flush: $Path")
+    }
+    try {
+        if (-not [McpAgentMailInstallerNativeMethods]::FlushFileBuffers($handle)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw [ComponentModel.Win32Exception]::new($errorCode, "Could not durably flush directory: $Path")
+        }
+    } finally {
+        $handle.Dispose()
+    }
+}
+
+function Write-InstallerFileExclusive {
+    param(
+        [string]$Path,
+        [byte[]]$Bytes
+    )
+    if (Test-InstallerEntryExists -Path $Path) {
+        throw "Refusing to replace transaction entry: $Path"
+    }
+    $stream = [System.IO.FileStream]::new(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::WriteThrough
+    )
+    try {
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    Assert-InstallerOwnedEntry -Path $Path -Label "Binary transaction file"
+    Flush-InstallerDirectory -Path (Split-Path -LiteralPath $Path -Parent)
+}
+
+function Copy-InstallerFileExclusive {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+    if (Test-InstallerEntryExists -Path $Destination) {
+        throw "Refusing to replace transaction payload: $Destination"
+    }
+    $inputStream = [System.IO.File]::Open(
+        $Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    $outputStream = $null
+    try {
+        $outputStream = [System.IO.FileStream]::new(
+            $Destination,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            65536,
+            [System.IO.FileOptions]::WriteThrough
+        )
+        $inputStream.CopyTo($outputStream)
+        $outputStream.Flush($true)
+    } finally {
+        if ($null -ne $outputStream) { $outputStream.Dispose() }
+        $inputStream.Dispose()
+    }
+    Assert-InstallerOwnedEntry -Path $Destination -Label "Binary transaction payload"
+    Flush-InstallerDirectory -Path (Split-Path -LiteralPath $Destination -Parent)
+}
+
+function Move-InstallerEntryNoReplaceDurable {
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [string]$Label
+    )
+    if (-not (Test-InstallerEntryExists -Path $Source)) {
+        throw "$Label source is missing: $Source"
+    }
+    if (Test-InstallerEntryExists -Path $Destination) {
+        throw "$Label destination already exists: $Destination"
+    }
+    $sourceParent = Split-Path -LiteralPath $Source -Parent
+    $destinationParent = Split-Path -LiteralPath $Destination -Parent
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        Initialize-InstallerNativeMethods
+        # MOVEFILE_WRITE_THROUGH only. MOVEFILE_REPLACE_EXISTING is
+        # intentionally omitted so an occupied path is never clobbered.
+        if (-not [McpAgentMailInstallerNativeMethods]::MoveFileExW($Source, $Destination, [uint32]0x8)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw [ComponentModel.Win32Exception]::new($errorCode, "$Label failed")
+        }
+    } else {
+        $attributes = [System.IO.File]::GetAttributes($Source)
+        if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+            [System.IO.Directory]::Move($Source, $Destination)
+        } else {
+            [System.IO.File]::Move($Source, $Destination)
+        }
+    }
+    if ((Test-InstallerEntryExists -Path $Source) -or
+        -not (Test-InstallerEntryExists -Path $Destination)) {
+        throw "$Label did not satisfy no-replace move postconditions."
+    }
+    Flush-InstallerDirectory -Path $sourceParent
+    if ($destinationParent -cne $sourceParent) {
+        Flush-InstallerDirectory -Path $destinationParent
+    }
+}
+
+function Assert-BinaryTransactionHash {
+    param(
+        [string]$Path,
+        [string]$ExpectedHash,
+        [string]$Label
+    )
+    Assert-InstallerOwnedEntry -Path $Path -Label $Label
+    $actual = Get-Sha256Hex -FilePath $Path
+    if ($actual -cne $ExpectedHash) {
+        throw "$Label hash changed (expected $ExpectedHash, got $actual): $Path"
+    }
+}
+
+function Get-BinaryTransactionActivePath {
+    param([string]$InstallDir)
+    return (Join-Path $InstallDir ".mcp-agent-mail-install-transaction.active")
+}
+
+function Write-BinaryTransactionPhase {
+    param(
+        [string]$Journal,
+        [string]$Phase,
+        [string]$MetadataHash
+    )
+    $validPhases = @(
+        "00-prepared", "10-preserve-server", "20-preserve-cli",
+        "30-publish-server", "40-publish-cli", "45-rollback", "50-commit-ready"
+    )
+    if ($Phase -cnotin $validPhases) {
+        throw "Unknown binary transaction phase: $Phase"
+    }
+    $text = "phase=$Phase`nmetadata_sha256=$MetadataHash`n"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    Write-InstallerFileExclusive -Path (Join-Path $Journal "phase.$Phase") -Bytes $bytes
+}
+
+function Read-BinaryTransactionMetadata {
+    param([string]$Journal)
+    Assert-InstallerOwnedEntry -Path $Journal -Label "Binary transaction authority" -Directory
+    $metadataPath = Join-Path $Journal "metadata"
+    $witnessPath = Join-Path $Journal "metadata.sha256"
+    Assert-InstallerOwnedEntry -Path $metadataPath -Label "Binary transaction metadata"
+    Assert-InstallerOwnedEntry -Path $witnessPath -Label "Binary transaction metadata witness"
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $witnessText = [System.IO.File]::ReadAllText($witnessPath, $utf8)
+    if ($witnessText -cnotmatch '^[a-f0-9]{64}\n$') {
+        throw "Binary transaction metadata witness is malformed: $witnessPath"
+    }
+    $witness = $witnessText.Substring(0, 64)
+    if ((Get-Sha256Hex -FilePath $metadataPath) -cne $witness) {
+        throw "Binary transaction metadata hash witness does not match: $metadataPath"
+    }
+    $metadataText = [System.IO.File]::ReadAllText($metadataPath, $utf8)
+    $lines = $metadataText.Split("`n")
+    if ($lines.Count -ne 9 -or $lines[8] -cne "" -or $lines[0] -cne "schema=1") {
+        throw "Binary transaction metadata is malformed: $metadataPath"
+    }
+    $expectedKeys = @(
+        "nonce", "had_server", "old_server_sha256", "had_cli",
+        "old_cli_sha256", "new_server_sha256", "new_cli_sha256"
+    )
+    $values = @{}
+    for ($index = 0; $index -lt $expectedKeys.Count; $index++) {
+        $prefix = $expectedKeys[$index] + "="
+        $line = $lines[$index + 1]
+        if (-not $line.StartsWith($prefix, [StringComparison]::Ordinal)) {
+            throw "Binary transaction metadata key order is invalid: $metadataPath"
+        }
+        $values[$expectedKeys[$index]] = $line.Substring($prefix.Length)
+    }
+    if ($values.nonce -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+        throw "Binary transaction nonce is invalid."
+    }
+    foreach ($stem in @("server", "cli")) {
+        $had = $values["had_$stem"]
+        $oldHash = $values["old_${stem}_sha256"]
+        if (($had -ceq "0" -and $oldHash -cne "absent") -or
+            ($had -ceq "1" -and $oldHash -cnotmatch '^[a-f0-9]{64}$') -or
+            ($had -cnotin @("0", "1"))) {
+            throw "Binary transaction old-$stem witness is invalid."
+        }
+    }
+    if ($values.new_server_sha256 -cnotmatch '^[a-f0-9]{64}$' -or
+        $values.new_cli_sha256 -cnotmatch '^[a-f0-9]{64}$') {
+        throw "Binary transaction new-binary witness is invalid."
+    }
+    return [pscustomobject]@{
+        Nonce = $values.nonce
+        HadServer = $values.had_server
+        OldServerHash = $values.old_server_sha256
+        HadCli = $values.had_cli
+        OldCliHash = $values.old_cli_sha256
+        NewServerHash = $values.new_server_sha256
+        NewCliHash = $values.new_cli_sha256
+        MetadataHash = $witness
+    }
+}
+
+function Assert-BinaryTransactionPhaseMarker {
+    param(
+        [string]$Journal,
+        [string]$Phase,
+        [string]$MetadataHash
+    )
+    $path = Join-Path $Journal "phase.$Phase"
+    Assert-InstallerOwnedEntry -Path $path -Label "Binary transaction phase marker"
+    $actual = [System.IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true))
+    $expected = "phase=$Phase`nmetadata_sha256=$MetadataHash`n"
+    if ($actual -cne $expected) {
+        throw "Binary transaction phase marker is malformed: $path"
+    }
+}
+
+function Get-BinaryTransactionPhaseState {
+    param(
+        [string]$Journal,
+        [string]$MetadataHash
+    )
+    $allowed = @{
+        "metadata" = $true; "metadata.sha256" = $true
+        "new-server" = $true; "new-cli" = $true
+        "old-server" = $true; "old-cli" = $true
+        "rollback-new-server" = $true; "rollback-new-cli" = $true
+        "phase.00-prepared" = $true; "phase.10-preserve-server" = $true
+        "phase.20-preserve-cli" = $true; "phase.30-publish-server" = $true
+        "phase.40-publish-cli" = $true; "phase.45-rollback" = $true
+        "phase.50-commit-ready" = $true
+    }
+    foreach ($entry in Get-ChildItem -LiteralPath $Journal -Force) {
+        if (-not $allowed.ContainsKey($entry.Name)) {
+            throw "Unexpected entry in binary transaction authority: $($entry.FullName)"
+        }
+    }
+    $forward = @(
+        "00-prepared", "10-preserve-server", "20-preserve-cli",
+        "30-publish-server", "40-publish-cli", "50-commit-ready"
+    )
+    $latest = $null
+    $missing = $false
+    foreach ($phase in $forward) {
+        $marker = Join-Path $Journal "phase.$phase"
+        if (Test-InstallerEntryExists -Path $marker) {
+            if ($missing) {
+                throw "Binary transaction phase sequence has a gap before $phase."
+            }
+            Assert-BinaryTransactionPhaseMarker -Journal $Journal -Phase $phase -MetadataHash $MetadataHash
+            $latest = $phase
+        } else {
+            $missing = $true
+        }
+    }
+    if ($null -eq $latest) {
+        throw "Binary transaction has no prepared phase marker."
+    }
+    $rollbackMarker = Join-Path $Journal "phase.45-rollback"
+    $hasRollback = Test-InstallerEntryExists -Path $rollbackMarker
+    if ($hasRollback) {
+        Assert-BinaryTransactionPhaseMarker -Journal $Journal -Phase "45-rollback" -MetadataHash $MetadataHash
+    }
+    if ($hasRollback -and $latest -ceq "50-commit-ready") {
+        throw "Binary transaction contains both rollback and commit-ready markers."
+    }
+    return [pscustomobject]@{ Forward = $latest; HasRollback = $hasRollback }
+}
+
+function Get-BinaryTransactionForwardTargetState {
+    param(
+        [string]$Journal,
+        [string]$Destination,
+        [string]$Stem,
+        [string]$HadOriginal,
+        [string]$OldHash,
+        [string]$NewHash
+    )
+    $staged = Join-Path $Journal "new-$Stem"
+    $backup = Join-Path $Journal "old-$Stem"
+    $quarantined = Join-Path $Journal "rollback-new-$Stem"
+    if (Test-InstallerEntryExists -Path $quarantined) {
+        throw "Rollback residue exists without a rollback phase: $quarantined"
+    }
+    $hasStaged = Test-InstallerEntryExists -Path $staged
+    $hasBackup = Test-InstallerEntryExists -Path $backup
+    $hasDestination = Test-InstallerEntryExists -Path $Destination
+    if ($hasStaged) { Assert-BinaryTransactionHash -Path $staged -ExpectedHash $NewHash -Label "Staged $Stem binary" }
+    if ($hasBackup) {
+        if ($HadOriginal -cne "1") { throw "Unexpected old-$Stem backup." }
+        Assert-BinaryTransactionHash -Path $backup -ExpectedHash $OldHash -Label "Preserved $Stem binary"
+    }
+    $destinationHash = if ($hasDestination) {
+        Assert-InstallerOwnedEntry -Path $Destination -Label "$Stem install target"
+        Get-Sha256Hex -FilePath $Destination
+    } else { "" }
+
+    if ($hasStaged) {
+        if ($hasBackup) {
+            if ($hasDestination) { throw "Preserved $Stem destination is occupied." }
+            return "preserved"
+        }
+        if ($HadOriginal -ceq "1") {
+            if ($destinationHash -cne $OldHash) { throw "Original $Stem destination changed." }
+            return "original"
+        }
+        if ($hasDestination) { throw "Absent $Stem destination appeared." }
+        return "absent-unpublished"
+    }
+    if ($destinationHash -cne $NewHash) { throw "Published $Stem destination hash is invalid." }
+    if (($HadOriginal -ceq "1") -ne $hasBackup) { throw "Published $Stem backup state is invalid." }
+    return "published"
+}
+
+function Assert-BinaryTransactionForwardWindow {
+    param(
+        [string]$Journal,
+        [string]$InstallDir,
+        [pscustomobject]$Metadata,
+        [string]$Phase
+    )
+    $serverState = Get-BinaryTransactionForwardTargetState `
+        -Journal $Journal -Destination (Join-Path $InstallDir "mcp-agent-mail.exe") `
+        -Stem "server" -HadOriginal $Metadata.HadServer `
+        -OldHash $Metadata.OldServerHash -NewHash $Metadata.NewServerHash
+    $cliState = Get-BinaryTransactionForwardTargetState `
+        -Journal $Journal -Destination (Join-Path $InstallDir "am.exe") `
+        -Stem "cli" -HadOriginal $Metadata.HadCli `
+        -OldHash $Metadata.OldCliHash -NewHash $Metadata.NewCliHash
+    $valid = switch ($Phase) {
+        "00-prepared" {
+            $serverState -cin @("original", "absent-unpublished") -and
+                $cliState -cin @("original", "absent-unpublished")
+        }
+        "10-preserve-server" {
+            $serverState -cin @("original", "preserved", "absent-unpublished") -and
+                $cliState -cin @("original", "absent-unpublished")
+        }
+        "20-preserve-cli" {
+            $serverState -cin @("preserved", "absent-unpublished") -and
+                $cliState -cin @("original", "preserved", "absent-unpublished")
+        }
+        "30-publish-server" {
+            $serverState -cin @("preserved", "published", "absent-unpublished") -and
+                $cliState -cin @("preserved", "absent-unpublished")
+        }
+        "40-publish-cli" {
+            $serverState -ceq "published" -and
+                $cliState -cin @("preserved", "published", "absent-unpublished")
+        }
+        default { $false }
+    }
+    if (-not $valid) {
+        throw "Binary transaction contents do not match phase $Phase (server=$serverState cli=$cliState)."
+    }
+}
+
+function Restore-BinaryTransactionTarget {
+    param(
+        [string]$Journal,
+        [string]$InstallDir,
+        [string]$Stem,
+        [string]$BinaryName,
+        [string]$HadOriginal,
+        [string]$OldHash,
+        [string]$NewHash
+    )
+    $destination = Join-Path $InstallDir $BinaryName
+    $staged = Join-Path $Journal "new-$Stem"
+    $backup = Join-Path $Journal "old-$Stem"
+    $quarantined = Join-Path $Journal "rollback-new-$Stem"
+    $hasStaged = Test-InstallerEntryExists -Path $staged
+    $hasBackup = Test-InstallerEntryExists -Path $backup
+    $hasQuarantined = Test-InstallerEntryExists -Path $quarantined
+    $hasDestination = Test-InstallerEntryExists -Path $destination
+    if ($hasStaged) { Assert-BinaryTransactionHash -Path $staged -ExpectedHash $NewHash -Label "Staged $Stem binary" }
+    if ($hasBackup) {
+        if ($HadOriginal -cne "1") { throw "Unexpected old-$Stem backup." }
+        Assert-BinaryTransactionHash -Path $backup -ExpectedHash $OldHash -Label "Preserved $Stem binary"
+    }
+    if ($hasQuarantined) {
+        Assert-BinaryTransactionHash -Path $quarantined -ExpectedHash $NewHash -Label "Quarantined new $Stem binary"
+        if ($hasStaged) { throw "Duplicate staged and quarantined new $Stem payloads." }
+    }
+    $destinationHash = if ($hasDestination) {
+        Assert-InstallerOwnedEntry -Path $destination -Label "$Stem install target"
+        Get-Sha256Hex -FilePath $destination
+    } else { "" }
+
+    if (-not $hasStaged -and -not $hasQuarantined) {
+        if ($destinationHash -cne $NewHash) { throw "Rollback cannot identify the exact new $Stem destination." }
+        if (($HadOriginal -ceq "1") -ne $hasBackup) { throw "Rollback $Stem backup state is invalid." }
+        Move-InstallerEntryNoReplaceDurable -Source $destination -Destination $quarantined -Label "Quarantine new $Stem binary"
+        $hasDestination = $false
+        $destinationHash = ""
+    }
+    if ($hasStaged) {
+        if ($hasBackup -and $hasDestination) { throw "Preserved $Stem destination is occupied." }
+        if (-not $hasBackup -and $HadOriginal -ceq "1" -and $destinationHash -cne $OldHash) {
+            throw "Original $Stem destination changed."
+        }
+        if ($HadOriginal -ceq "0" -and $hasDestination) { throw "Absent $Stem destination appeared." }
+    }
+    if ($HadOriginal -ceq "1") {
+        if ($hasBackup) {
+            if (Test-InstallerEntryExists -Path $destination) { throw "Rollback $Stem destination is occupied." }
+            Move-InstallerEntryNoReplaceDurable -Source $backup -Destination $destination -Label "Restore old $Stem binary"
+        } else {
+            Assert-BinaryTransactionHash -Path $destination -ExpectedHash $OldHash -Label "Restored $Stem binary"
+        }
+    } elseif ((Test-InstallerEntryExists -Path $backup) -or (Test-InstallerEntryExists -Path $destination)) {
+        throw "Rollback expected no original $Stem destination."
+    }
+}
+
+function Archive-BinaryTransaction {
+    param(
+        [string]$Journal,
+        [string]$InstallDir,
+        [string]$Outcome,
+        [string]$Nonce
+    )
+    if ($Outcome -cnotin @("committed", "rolled-back")) { throw "Invalid transaction outcome." }
+    $history = Join-Path $InstallDir ".mcp-agent-mail-install-transaction.$Outcome.$Nonce"
+    Move-InstallerEntryNoReplaceDurable -Source $Journal -Destination $history -Label "Archive $Outcome binary transaction"
+    $script:ActiveBinaryTransactionInstallDir = $null
+}
+
+function Invoke-BinaryPairRecoveryCore {
+    param(
+        [string]$InstallDir,
+        [string]$InterruptAfterPhaseForTest = ""
+    )
+    $journal = Get-BinaryTransactionActivePath -InstallDir $InstallDir
+    if (-not (Test-InstallerEntryExists -Path $journal)) { return }
+    $metadata = Read-BinaryTransactionMetadata -Journal $journal
+    $phaseState = Get-BinaryTransactionPhaseState -Journal $journal -MetadataHash $metadata.MetadataHash
+    if ($phaseState.Forward -ceq "50-commit-ready") {
+        foreach ($unexpected in @("new-server", "new-cli", "rollback-new-server", "rollback-new-cli")) {
+            if (Test-InstallerEntryExists -Path (Join-Path $journal $unexpected)) {
+                throw "Commit-ready transaction contains unexpected payload: $unexpected"
+            }
+        }
+        Assert-BinaryTransactionHash -Path (Join-Path $InstallDir "mcp-agent-mail.exe") `
+            -ExpectedHash $metadata.NewServerHash -Label "Committed server binary"
+        Assert-BinaryTransactionHash -Path (Join-Path $InstallDir "am.exe") `
+            -ExpectedHash $metadata.NewCliHash -Label "Committed CLI binary"
+        foreach ($entry in @(
+            @{ Stem = "server"; Had = $metadata.HadServer; Hash = $metadata.OldServerHash },
+            @{ Stem = "cli"; Had = $metadata.HadCli; Hash = $metadata.OldCliHash }
+        )) {
+            $backup = Join-Path $journal "old-$($entry.Stem)"
+            if ($entry.Had -ceq "1") {
+                Assert-BinaryTransactionHash -Path $backup -ExpectedHash $entry.Hash -Label "Committed $($entry.Stem) backup"
+            } elseif (Test-InstallerEntryExists -Path $backup) {
+                throw "Commit-ready transaction contains an unexpected old-$($entry.Stem) backup."
+            }
+        }
+        Archive-BinaryTransaction -Journal $journal -InstallDir $InstallDir -Outcome "committed" -Nonce $metadata.Nonce
+        return
+    }
+    if (-not $phaseState.HasRollback) {
+        Assert-BinaryTransactionForwardWindow -Journal $journal -InstallDir $InstallDir `
+            -Metadata $metadata -Phase $phaseState.Forward
+        Write-BinaryTransactionPhase -Journal $journal -Phase "45-rollback" -MetadataHash $metadata.MetadataHash
+        if ($InterruptAfterPhaseForTest -ceq "rollback-ready") {
+            throw "injected interruption after durable rollback intent"
+        }
+    }
+    Restore-BinaryTransactionTarget -Journal $journal -InstallDir $InstallDir -Stem "cli" `
+        -BinaryName "am.exe" -HadOriginal $metadata.HadCli `
+        -OldHash $metadata.OldCliHash -NewHash $metadata.NewCliHash
+    Restore-BinaryTransactionTarget -Journal $journal -InstallDir $InstallDir -Stem "server" `
+        -BinaryName "mcp-agent-mail.exe" -HadOriginal $metadata.HadServer `
+        -OldHash $metadata.OldServerHash -NewHash $metadata.NewServerHash
+    Archive-BinaryTransaction -Journal $journal -InstallDir $InstallDir -Outcome "rolled-back" -Nonce $metadata.Nonce
+}
+
+function Recover-BinaryPairTransaction {
+    param(
+        [string]$InstallDir,
+        [string]$InterruptAfterPhaseForTest = ""
+    )
+    if ($script:BinaryTransactionRecoveryActive) {
+        throw "Binary transaction recovery is already active."
+    }
+    $script:BinaryTransactionRecoveryActive = $true
+    try {
+        Invoke-BinaryPairRecoveryCore -InstallDir $InstallDir `
+            -InterruptAfterPhaseForTest $InterruptAfterPhaseForTest
+    } finally {
+        $script:BinaryTransactionRecoveryActive = $false
+    }
+}
+
+function New-BinaryPairTransaction {
+    param(
+        [string]$AmSource,
+        [string]$ServerSource,
+        [string]$InstallDir
+    )
+    $active = Get-BinaryTransactionActivePath -InstallDir $InstallDir
+    if (Test-InstallerEntryExists -Path $active) { throw "An unrecovered binary transaction already exists: $active" }
+    foreach ($source in @($AmSource, $ServerSource)) {
+        Assert-InstallerOwnedEntry -Path $source -Label "Binary transaction source"
+        if ((Get-Item -LiteralPath $source -Force).Length -le 0) { throw "Binary transaction source is empty: $source" }
+    }
+    $serverDestination = Join-Path $InstallDir "mcp-agent-mail.exe"
+    $cliDestination = Join-Path $InstallDir "am.exe"
+    foreach ($destination in @($serverDestination, $cliDestination)) {
+        if (Test-InstallerEntryExists -Path $destination) {
+            Assert-InstallerOwnedEntry -Path $destination -Label "Existing install target"
+        }
+    }
+    $metadata = [ordered]@{
+        Nonce = [Guid]::NewGuid().ToString("N")
+        HadServer = if (Test-InstallerEntryExists -Path $serverDestination) { "1" } else { "0" }
+        OldServerHash = "absent"
+        HadCli = if (Test-InstallerEntryExists -Path $cliDestination) { "1" } else { "0" }
+        OldCliHash = "absent"
+        NewServerHash = Get-Sha256Hex -FilePath $ServerSource
+        NewCliHash = Get-Sha256Hex -FilePath $AmSource
+    }
+    if ($metadata.HadServer -ceq "1") { $metadata.OldServerHash = Get-Sha256Hex -FilePath $serverDestination }
+    if ($metadata.HadCli -ceq "1") { $metadata.OldCliHash = Get-Sha256Hex -FilePath $cliDestination }
+    $preparing = Join-Path $InstallDir ".mcp-agent-mail-install-transaction.preparing.$($metadata.Nonce)"
+    if (Test-InstallerEntryExists -Path $preparing) { throw "Preparing transaction path already exists: $preparing" }
+    [System.IO.Directory]::CreateDirectory($preparing) | Out-Null
+    Assert-InstallerOwnedEntry -Path $preparing -Label "Preparing binary transaction" -Directory
+    Flush-InstallerDirectory -Path $InstallDir
+    Copy-InstallerFileExclusive -Source $ServerSource -Destination (Join-Path $preparing "new-server")
+    Copy-InstallerFileExclusive -Source $AmSource -Destination (Join-Path $preparing "new-cli")
+    Assert-BinaryTransactionHash -Path (Join-Path $preparing "new-server") `
+        -ExpectedHash $metadata.NewServerHash -Label "Journaled server binary"
+    Assert-BinaryTransactionHash -Path (Join-Path $preparing "new-cli") `
+        -ExpectedHash $metadata.NewCliHash -Label "Journaled CLI binary"
+    $metadataText = @(
+        "schema=1",
+        "nonce=$($metadata.Nonce)",
+        "had_server=$($metadata.HadServer)",
+        "old_server_sha256=$($metadata.OldServerHash)",
+        "had_cli=$($metadata.HadCli)",
+        "old_cli_sha256=$($metadata.OldCliHash)",
+        "new_server_sha256=$($metadata.NewServerHash)",
+        "new_cli_sha256=$($metadata.NewCliHash)"
+    ) -join "`n"
+    $metadataText += "`n"
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    Write-InstallerFileExclusive -Path (Join-Path $preparing "metadata") -Bytes $utf8.GetBytes($metadataText)
+    $metadataHash = Get-Sha256Hex -FilePath (Join-Path $preparing "metadata")
+    Write-InstallerFileExclusive -Path (Join-Path $preparing "metadata.sha256") `
+        -Bytes $utf8.GetBytes("$metadataHash`n")
+    Write-BinaryTransactionPhase -Journal $preparing -Phase "00-prepared" -MetadataHash $metadataHash
+    Move-InstallerEntryNoReplaceDurable -Source $preparing -Destination $active `
+        -Label "Publish binary transaction authority"
+    Assert-InstallerOwnedEntry -Path $active -Label "Binary transaction authority" -Directory
+    $script:ActiveBinaryTransactionInstallDir = $InstallDir
+    return [pscustomobject]@{ Journal = $active; Metadata = (Read-BinaryTransactionMetadata -Journal $active) }
+}
+
+function Move-BinaryTransactionOriginal {
+    param(
+        [string]$Journal, [string]$InstallDir, [string]$Stem,
+        [string]$BinaryName, [string]$HadOriginal, [string]$OldHash
+    )
+    $destination = Join-Path $InstallDir $BinaryName
+    if ($HadOriginal -ceq "0") {
+        if (Test-InstallerEntryExists -Path $destination) { throw "A $Stem destination appeared after preparation." }
+        return
+    }
+    Assert-BinaryTransactionHash -Path $destination -ExpectedHash $OldHash -Label "Original $Stem binary"
+    Move-InstallerEntryNoReplaceDurable -Source $destination -Destination (Join-Path $Journal "old-$Stem") `
+        -Label "Preserve old $Stem binary"
+}
+
+function Move-BinaryTransactionNew {
+    param(
+        [string]$Journal, [string]$InstallDir, [string]$Stem,
+        [string]$BinaryName, [string]$NewHash
+    )
+    $destination = Join-Path $InstallDir $BinaryName
+    $staged = Join-Path $Journal "new-$Stem"
+    if (Test-InstallerEntryExists -Path $destination) { throw "The $Stem destination is occupied before publication." }
+    Assert-BinaryTransactionHash -Path $staged -ExpectedHash $NewHash -Label "Staged $Stem binary"
+    Move-InstallerEntryNoReplaceDurable -Source $staged -Destination $destination -Label "Publish new $Stem binary"
+}
+
 function Install-BinariesAtomically {
     param(
         [string]$AmSource,
         [string]$ServerSource,
         [string]$InstallDir,
         [scriptblock]$PostInstallVerifier,
-        [switch]$FailAfterFirstReplaceForTest
+        [string]$InterruptAfterPhaseForTest = ""
     )
-
-    if (-not (Test-Path -LiteralPath $AmSource -PathType Leaf)) {
-        throw "Atomic install source missing: $AmSource. Release archive may be incomplete; retry download or pin a known-good -Version."
-    }
-    if (-not (Test-Path -LiteralPath $ServerSource -PathType Leaf)) {
-        throw "Atomic install source missing: $ServerSource. Release archive may be incomplete; retry download or pin a known-good -Version."
-    }
-    foreach ($source in @($AmSource, $ServerSource)) {
-        $sourceItem = Get-Item -LiteralPath $source -Force
-        if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
-            $sourceItem.Length -le 0) {
-            throw "Atomic install source is empty or is a reparse point: $source"
-        }
-    }
-
     $InstallDir = Assert-SafeInstallDirectory -InstallDir $InstallDir
-
-    $amDest = Join-Path $InstallDir "am.exe"
-    $serverDest = Join-Path $InstallDir "mcp-agent-mail.exe"
-    foreach ($destination in @($amDest, $serverDest)) {
-        if (Test-Path -LiteralPath $destination) {
-            $destinationItem = Get-Item -LiteralPath $destination -Force
-            if ($destinationItem.PSIsContainer -or
-                ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Existing install target is not a regular file: $destination"
-            }
-        }
-    }
-
-    $nonce = [Guid]::NewGuid().ToString("N")
-    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $amTemp = "$amDest.tmp.$nonce"
-    $serverTemp = "$serverDest.tmp.$nonce"
-    $amBackup = "$amDest.bak.preinstall-$stamp-$nonce"
-    $serverBackup = "$serverDest.bak.preinstall-$stamp-$nonce"
-    $amHash = Get-Sha256Hex -FilePath $AmSource
-    $serverHash = Get-Sha256Hex -FilePath $ServerSource
-    $amBackedUp = $false
-    $serverBackedUp = $false
-    $amInstalled = $false
-    $serverInstalled = $false
-    $committed = $false
-
+    Recover-BinaryPairTransaction -InstallDir $InstallDir
+    $leaveJournalForTest = $false
     try {
-        Copy-Item -LiteralPath $AmSource -Destination $amTemp -Force
-        Copy-Item -LiteralPath $ServerSource -Destination $serverTemp -Force
-        if ((Get-Sha256Hex -FilePath $amTemp) -cne $amHash -or
-            (Get-Sha256Hex -FilePath $serverTemp) -cne $serverHash) {
-            throw "Destination staging changed binary bytes."
-        }
-
-        if (Test-Path -LiteralPath $amDest) {
-            Move-Item -LiteralPath $amDest -Destination $amBackup -Force
-            $amBackedUp = $true
-        }
-        if (Test-Path -LiteralPath $serverDest) {
-            Move-Item -LiteralPath $serverDest -Destination $serverBackup -Force
-            $serverBackedUp = $true
-        }
-
-        Move-Item -LiteralPath $amTemp -Destination $amDest -Force
-        $amInstalled = $true
-        if ($FailAfterFirstReplaceForTest) {
-            throw "injected failure after first binary replacement"
-        }
-        Move-Item -LiteralPath $serverTemp -Destination $serverDest -Force
-        $serverInstalled = $true
-
-        if ((Get-Sha256Hex -FilePath $amDest) -cne $amHash -or
-            (Get-Sha256Hex -FilePath $serverDest) -cne $serverHash) {
+        $transaction = New-BinaryPairTransaction -AmSource $AmSource -ServerSource $ServerSource -InstallDir $InstallDir
+        $journal = $transaction.Journal
+        $metadata = $transaction.Metadata
+        if ($InterruptAfterPhaseForTest -ceq "prepared") { $leaveJournalForTest = $true; throw "injected interruption" }
+        Write-BinaryTransactionPhase -Journal $journal -Phase "10-preserve-server" -MetadataHash $metadata.MetadataHash
+        if ($InterruptAfterPhaseForTest -ceq "preserve-server") { $leaveJournalForTest = $true; throw "injected interruption" }
+        Move-BinaryTransactionOriginal -Journal $journal -InstallDir $InstallDir -Stem "server" `
+            -BinaryName "mcp-agent-mail.exe" -HadOriginal $metadata.HadServer -OldHash $metadata.OldServerHash
+        Write-BinaryTransactionPhase -Journal $journal -Phase "20-preserve-cli" -MetadataHash $metadata.MetadataHash
+        if ($InterruptAfterPhaseForTest -ceq "preserve-cli") { $leaveJournalForTest = $true; throw "injected interruption" }
+        Move-BinaryTransactionOriginal -Journal $journal -InstallDir $InstallDir -Stem "cli" `
+            -BinaryName "am.exe" -HadOriginal $metadata.HadCli -OldHash $metadata.OldCliHash
+        Write-BinaryTransactionPhase -Journal $journal -Phase "30-publish-server" -MetadataHash $metadata.MetadataHash
+        if ($InterruptAfterPhaseForTest -ceq "publish-server") { $leaveJournalForTest = $true; throw "injected interruption" }
+        Move-BinaryTransactionNew -Journal $journal -InstallDir $InstallDir -Stem "server" `
+            -BinaryName "mcp-agent-mail.exe" -NewHash $metadata.NewServerHash
+        Write-BinaryTransactionPhase -Journal $journal -Phase "40-publish-cli" -MetadataHash $metadata.MetadataHash
+        if ($InterruptAfterPhaseForTest -ceq "publish-cli") { $leaveJournalForTest = $true; throw "injected interruption" }
+        Move-BinaryTransactionNew -Journal $journal -InstallDir $InstallDir -Stem "cli" `
+            -BinaryName "am.exe" -NewHash $metadata.NewCliHash
+        if ((Get-Sha256Hex -FilePath (Join-Path $InstallDir "am.exe")) -cne $metadata.NewCliHash -or
+            (Get-Sha256Hex -FilePath (Join-Path $InstallDir "mcp-agent-mail.exe")) -cne $metadata.NewServerHash) {
             throw "Installed binary bytes differ from the verified staged pair."
         }
         if ($null -ne $PostInstallVerifier) {
             & $PostInstallVerifier $InstallDir
         }
-        $committed = $true
+        Flush-InstallerDirectory -Path $InstallDir
+        Write-BinaryTransactionPhase -Journal $journal -Phase "50-commit-ready" -MetadataHash $metadata.MetadataHash
+        if ($InterruptAfterPhaseForTest -ceq "commit-ready") { $leaveJournalForTest = $true; throw "injected interruption" }
+        Archive-BinaryTransaction -Journal $journal -InstallDir $InstallDir -Outcome "committed" -Nonce $metadata.Nonce
     } catch {
         $installError = $_.Exception.Message
-        $rollbackErrors = @()
-        $states = @(
-            @{
-                Label = "mcp-agent-mail.exe"; Dest = $serverDest; Backup = $serverBackup
-                Hash = $serverHash; BackedUp = $serverBackedUp; Installed = $serverInstalled
-            },
-            @{
-                Label = "am.exe"; Dest = $amDest; Backup = $amBackup
-                Hash = $amHash; BackedUp = $amBackedUp; Installed = $amInstalled
-            }
-        )
-        foreach ($state in $states) {
-            if ($state.Installed -and (Test-Path -LiteralPath $state.Dest)) {
-                try {
-                    $currentItem = Get-Item -LiteralPath $state.Dest -Force
-                    if ($currentItem.PSIsContainer -or
-                        ($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
-                        (Get-Sha256Hex -FilePath $state.Dest) -cne $state.Hash) {
-                        throw "destination was concurrently modified"
-                    }
-                    Remove-Item -LiteralPath $state.Dest -Force
-                } catch {
-                    $rollbackErrors += "$($state.Label): refusing to remove unexpected destination ($($_.Exception.Message))"
-                }
-            }
-            if ($state.BackedUp) {
-                if (Test-Path -LiteralPath $state.Dest) {
-                    $rollbackErrors += "$($state.Label): destination occupied; backup retained at $($state.Backup)"
-                } elseif (-not (Test-Path -LiteralPath $state.Backup -PathType Leaf)) {
-                    $rollbackErrors += "$($state.Label): backup missing at $($state.Backup)"
-                } else {
-                    try {
-                        Move-Item -LiteralPath $state.Backup -Destination $state.Dest
-                    } catch {
-                        $rollbackErrors += "$($state.Label): backup restore failed ($($_.Exception.Message))"
-                    }
-                }
-            }
+        if ($leaveJournalForTest) { throw }
+        try {
+            Recover-BinaryPairTransaction -InstallDir $InstallDir
+        } catch {
+            $script:ActiveBinaryTransactionInstallDir = $InstallDir
+            throw "Atomic binary replacement failed and recovery failed closed; active journal retained. Recovery error: $($_.Exception.Message). Root error: $installError"
         }
-        $rollbackDetail = if ($rollbackErrors.Count -eq 0) {
-            "The previous binary pair was restored."
-        } else {
-            "Rollback was incomplete: $($rollbackErrors -join '; ')"
-        }
-        throw "Atomic binary replacement failed. $rollbackDetail Close running am/mcp-agent-mail processes and inspect the destination before retrying. Root error: $installError"
-    } finally {
-        if (Test-Path -LiteralPath $amTemp) {
-            Remove-Item -LiteralPath $amTemp -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path -LiteralPath $serverTemp) {
-            Remove-Item -LiteralPath $serverTemp -Force -ErrorAction SilentlyContinue
-        }
-        if ($committed) {
-            if ($amBackedUp -and (Test-Path -LiteralPath $amBackup)) {
-                Remove-Item -LiteralPath $amBackup -Force -ErrorAction SilentlyContinue
-            }
-            if ($serverBackedUp -and (Test-Path -LiteralPath $serverBackup)) {
-                Remove-Item -LiteralPath $serverBackup -Force -ErrorAction SilentlyContinue
+        throw "Atomic binary replacement failed. The previous binary pair was restored without deleting transaction evidence. Root error: $installError"
+    }
+}
             }
         }
     }
