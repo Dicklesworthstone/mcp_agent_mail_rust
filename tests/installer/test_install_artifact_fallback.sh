@@ -53,6 +53,19 @@ extract_function() {
     echo 'LOG_FILE=/tmp/unused-installer-verification-test.log'
     echo 'ISSUES_URL=https://example.invalid/issues'
     echo 'COSIGN_BIN='
+    echo 'BINARY_TRANSACTION_ACTIVE_INSTALL_DIR='
+    echo 'BINARY_TRANSACTION_RECOVERY_ACTIVE=0'
+    echo 'TXN_NONCE='
+    echo 'TXN_HAD_SERVER='
+    echo 'TXN_HAD_CLI='
+    echo 'TXN_OLD_SERVER_HASH='
+    echo 'TXN_OLD_CLI_HASH='
+    echo 'TXN_NEW_SERVER_HASH='
+    echo 'TXN_NEW_CLI_HASH='
+    echo 'TXN_METADATA_HASH='
+    echo 'TXN_FORWARD_PHASE='
+    echo 'TXN_HAS_ROLLBACK_PHASE=0'
+    echo 'TXN_TARGET_STATE='
     extract_function info
     extract_function ok
     extract_function warn
@@ -92,15 +105,39 @@ extract_function() {
     extract_function ensure_real_directory_tree
     extract_function ensure_real_file_target_path
     extract_function file_sha256_hex
-    extract_function rollback_binary_install_target
-    extract_function rollback_binary_pair_install
+    extract_function installer_path_mode
+    extract_function installer_path_link_count
+    extract_function installer_entry_exists
+    extract_function validate_installer_owned_regular_file
+    extract_function validate_binary_transaction_directory
+    extract_function sync_installer_paths_durably
+    extract_function move_installer_entry_no_replace
+    extract_function write_binary_transaction_file_exclusive
+    extract_function validate_binary_transaction_hash
+    extract_function binary_transaction_active_path
+    extract_function persist_binary_transaction_phase
+    extract_function validate_binary_transaction_phase_file
+    extract_function validate_binary_transaction_phase_marker
+    extract_function read_binary_transaction_metadata
+    extract_function validate_binary_transaction_inventory_and_phases
+    extract_function inspect_binary_transaction_forward_target
+    extract_function validate_binary_transaction_forward_window
+    extract_function rollback_binary_transaction_target
+    extract_function archive_binary_transaction
+    extract_function recover_binary_pair_transaction_impl
+    extract_function recover_binary_pair_transaction
+    extract_function preserve_binary_transaction_original
+    extract_function publish_binary_transaction_new
+    extract_function prepare_binary_pair_transaction
+    extract_function abort_binary_pair_transaction
     extract_function install_binary_pair_transactional
 } >"$extract"
 
 for required in establish_release_contract set_artifact_url check_network \
     select_linux_x86_64_gnu_artifact_if_available verify_release_archive \
     verify_archive_members_exact verify_release_binaries_exact require_safe_cosign \
-    install_binary_pair_transactional installer_path_owner_uid preflight_checks \
+    install_binary_pair_transactional recover_binary_pair_transaction \
+    installer_path_owner_uid preflight_checks \
     preflight_destination_checks; do
     if ! grep -q "^${required}()" "$extract"; then
         echo "FATAL: could not extract ${required} from install.sh" >&2

@@ -3011,11 +3011,15 @@ persist_binary_transaction_phase() {
     if [ "$partial_before_publish_for_test" = "1" ]; then
       printf 'phase=%s\nmetadata_sha' "$phase" \
         | write_binary_transaction_file_exclusive "$pending" 600 || return 1
-      warn "Injected interruption before atomic phase-marker publication."
+      warn "Injected interruption with a partial non-authoritative phase marker."
       return 97
     fi
     printf 'phase=%s\nmetadata_sha256=%s\n' "$phase" "$TXN_METADATA_HASH" \
       | write_binary_transaction_file_exclusive "$pending" 600 || return 1
+    if [ "$partial_before_publish_for_test" = "2" ]; then
+      warn "Injected interruption at the phase-marker publication boundary."
+      return 98
+    fi
     validate_binary_transaction_phase_file "$pending" "$phase" || return 1
     move_installer_entry_no_replace "$pending" "$marker" "Publish binary transaction phase $phase" || return 1
     sync_installer_paths_durably "$marker" "$journal" "$(dirname "$journal")" || return 1
@@ -3575,6 +3579,7 @@ install_binary_pair_transactional() {
     abort_binary_pair_transaction "$install_dir" "Could not preserve the existing server binary."
     return 1
   fi
+  if [ "$inject_after_phase_for_test" = "preserve-server-moved" ]; then return 97; fi
 
   if ! persist_binary_transaction_phase "$journal" "20-preserve-cli"; then
     abort_binary_pair_transaction "$install_dir" "Could not persist CLI-preservation intent."
@@ -3586,6 +3591,7 @@ install_binary_pair_transactional() {
     abort_binary_pair_transaction "$install_dir" "Could not preserve the existing CLI binary."
     return 1
   fi
+  if [ "$inject_after_phase_for_test" = "preserve-cli-moved" ]; then return 97; fi
 
   if ! persist_binary_transaction_phase "$journal" "30-publish-server"; then
     abort_binary_pair_transaction "$install_dir" "Could not persist server-publication intent."
@@ -3597,6 +3603,7 @@ install_binary_pair_transactional() {
     abort_binary_pair_transaction "$install_dir" "Could not publish the new server binary."
     return 1
   fi
+  if [ "$inject_after_phase_for_test" = "publish-server-moved" ]; then return 97; fi
 
   if ! persist_binary_transaction_phase "$journal" "40-publish-cli"; then
     abort_binary_pair_transaction "$install_dir" "Could not persist CLI-publication intent."
@@ -3608,6 +3615,7 @@ install_binary_pair_transactional() {
     abort_binary_pair_transaction "$install_dir" "Could not publish the new CLI binary."
     return 1
   fi
+  if [ "$inject_after_phase_for_test" = "publish-cli-moved" ]; then return 97; fi
 
   installed_server_hash=$(file_sha256_hex "$install_dir/$BIN_SERVER" 2>/dev/null || true)
   installed_cli_hash=$(file_sha256_hex "$install_dir/$BIN_CLI" 2>/dev/null || true)
