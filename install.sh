@@ -2999,19 +2999,38 @@ binary_transaction_active_path() {
 persist_binary_transaction_phase() {
   local journal="$1"
   local phase="$2"
+  local partial_before_publish_for_test="${3:-0}"
   local marker="$journal/phase.$phase"
+  local pending=""
   case "$phase" in
     00-prepared|10-preserve-server|20-preserve-cli|30-publish-server|40-publish-cli|45-rollback|50-commit-ready) ;;
     *) err "Unknown binary transaction phase: $phase"; return 1 ;;
   esac
+  if [ "${journal##*/}" = ".mcp-agent-mail-install-transaction.active" ]; then
+    pending="$(dirname "$journal")/.mcp-agent-mail-install-transaction.phase.${TXN_NONCE}.${phase}.preparing"
+    if [ "$partial_before_publish_for_test" = "1" ]; then
+      printf 'phase=%s\nmetadata_sha' "$phase" \
+        | write_binary_transaction_file_exclusive "$pending" 600 || return 1
+      warn "Injected interruption before atomic phase-marker publication."
+      return 97
+    fi
+    printf 'phase=%s\nmetadata_sha256=%s\n' "$phase" "$TXN_METADATA_HASH" \
+      | write_binary_transaction_file_exclusive "$pending" 600 || return 1
+    validate_binary_transaction_phase_file "$pending" "$phase" || return 1
+    move_installer_entry_no_replace "$pending" "$marker" "Publish binary transaction phase $phase" || return 1
+    sync_installer_paths_durably "$marker" "$journal" "$(dirname "$journal")" || return 1
+    validate_binary_transaction_phase_file "$marker" "$phase"
+    return $?
+  fi
+  # phase 00 is built inside a non-authoritative preparing directory; the
+  # directory itself is published atomically only after this file is durable.
   printf 'phase=%s\nmetadata_sha256=%s\n' "$phase" "$TXN_METADATA_HASH" \
     | write_binary_transaction_file_exclusive "$marker" 600
 }
 
-validate_binary_transaction_phase_marker() {
-  local journal="$1"
+validate_binary_transaction_phase_file() {
+  local marker="$1"
   local phase="$2"
-  local marker="$journal/phase.$phase"
   local first="" second="" extra="" line_count=""
   validate_installer_owned_regular_file "$marker" "Binary transaction phase marker" 600 || return 1
   IFS= read -r first <"$marker" || return 1
@@ -3024,6 +3043,12 @@ validate_binary_transaction_phase_marker() {
     err "Binary transaction phase marker is malformed: $marker"
     return 1
   fi
+}
+
+validate_binary_transaction_phase_marker() {
+  local journal="$1"
+  local phase="$2"
+  validate_binary_transaction_phase_file "$journal/phase.$phase" "$phase"
 }
 
 read_binary_transaction_metadata() {

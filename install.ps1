@@ -625,10 +625,6 @@ public static class McpAgentMailInstallerNativeMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool FlushFileBuffers(SafeFileHandle handle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetFileInformationByHandle(
         SafeFileHandle handle,
         out BY_HANDLE_FILE_INFORMATION information);
@@ -712,35 +708,6 @@ function Assert-InstallerOwnedEntry {
     }
 }
 
-function Flush-InstallerDirectory {
-    param([string]$Path)
-    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
-        return
-    }
-    Initialize-InstallerNativeMethods
-    $genericWrite = [uint32]0x40000000
-    $shareAll = [uint32]0x00000007
-    $openExisting = [uint32]3
-    $backupSemantics = [uint32]0x02000000
-    $handle = [McpAgentMailInstallerNativeMethods]::CreateFileW(
-        $Path, $genericWrite, $shareAll, [IntPtr]::Zero, $openExisting,
-        $backupSemantics, [IntPtr]::Zero
-    )
-    if ($handle.IsInvalid) {
-        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        $handle.Dispose()
-        throw [ComponentModel.Win32Exception]::new($errorCode, "Could not open directory for durable flush: $Path")
-    }
-    try {
-        if (-not [McpAgentMailInstallerNativeMethods]::FlushFileBuffers($handle)) {
-            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-            throw [ComponentModel.Win32Exception]::new($errorCode, "Could not durably flush directory: $Path")
-        }
-    } finally {
-        $handle.Dispose()
-    }
-}
-
 function Write-InstallerFileExclusive {
     param(
         [string]$Path,
@@ -764,7 +731,6 @@ function Write-InstallerFileExclusive {
         $stream.Dispose()
     }
     Assert-InstallerOwnedEntry -Path $Path -Label "Binary transaction file"
-    Flush-InstallerDirectory -Path (Split-Path -LiteralPath $Path -Parent)
 }
 
 function Copy-InstallerFileExclusive {
@@ -796,7 +762,6 @@ function Copy-InstallerFileExclusive {
         $inputStream.Dispose()
     }
     Assert-InstallerOwnedEntry -Path $Destination -Label "Binary transaction payload"
-    Flush-InstallerDirectory -Path (Split-Path -LiteralPath $Destination -Parent)
 }
 
 function Move-InstallerEntryNoReplaceDurable {
@@ -811,8 +776,6 @@ function Move-InstallerEntryNoReplaceDurable {
     if (Test-InstallerEntryExists -Path $Destination) {
         throw "$Label destination already exists: $Destination"
     }
-    $sourceParent = Split-Path -LiteralPath $Source -Parent
-    $destinationParent = Split-Path -LiteralPath $Destination -Parent
     if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
         Initialize-InstallerNativeMethods
         # MOVEFILE_WRITE_THROUGH only. MOVEFILE_REPLACE_EXISTING is
@@ -832,10 +795,6 @@ function Move-InstallerEntryNoReplaceDurable {
     if ((Test-InstallerEntryExists -Path $Source) -or
         -not (Test-InstallerEntryExists -Path $Destination)) {
         throw "$Label did not satisfy no-replace move postconditions."
-    }
-    Flush-InstallerDirectory -Path $sourceParent
-    if ($destinationParent -cne $sourceParent) {
-        Flush-InstallerDirectory -Path $destinationParent
     }
 }
 
@@ -861,7 +820,8 @@ function Write-BinaryTransactionPhase {
     param(
         [string]$Journal,
         [string]$Phase,
-        [string]$MetadataHash
+        [string]$MetadataHash,
+        [switch]$PartialBeforePublishForTest
     )
     $validPhases = @(
         "00-prepared", "10-preserve-server", "20-preserve-cli",
@@ -872,7 +832,28 @@ function Write-BinaryTransactionPhase {
     }
     $text = "phase=$Phase`nmetadata_sha256=$MetadataHash`n"
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
-    Write-InstallerFileExclusive -Path (Join-Path $Journal "phase.$Phase") -Bytes $bytes
+    $marker = Join-Path $Journal "phase.$Phase"
+    if ((Split-Path -Leaf $Journal) -ceq ".mcp-agent-mail-install-transaction.active") {
+        $installDir = Split-Path -LiteralPath $Journal -Parent
+        $pending = Join-Path $installDir (
+            ".mcp-agent-mail-install-transaction.phase.$Phase.preparing." + [Guid]::NewGuid().ToString("N")
+        )
+        if ($PartialBeforePublishForTest) {
+            $partial = [Text.UTF8Encoding]::new($false).GetBytes("phase=$Phase`nmetadata_sha")
+            Write-InstallerFileExclusive -Path $pending -Bytes $partial
+            throw "injected interruption before atomic phase-marker publication"
+        }
+        Write-InstallerFileExclusive -Path $pending -Bytes $bytes
+        $pendingText = [System.IO.File]::ReadAllText($pending, [Text.UTF8Encoding]::new($false, $true))
+        if ($pendingText -cne $text) { throw "Prepared phase marker changed before publication: $pending" }
+        Move-InstallerEntryNoReplaceDurable -Source $pending -Destination $marker `
+            -Label "Publish binary transaction phase $Phase"
+        Assert-BinaryTransactionPhaseMarker -Journal $Journal -Phase $Phase -MetadataHash $MetadataHash
+        return
+    }
+    # phase 00 is created inside a non-authoritative preparing directory; the
+    # directory itself is published only after all of its bytes are durable.
+    Write-InstallerFileExclusive -Path $marker -Bytes $bytes
 }
 
 function Read-BinaryTransactionMetadata {
@@ -1264,7 +1245,6 @@ function New-BinaryPairTransaction {
     if (Test-InstallerEntryExists -Path $preparing) { throw "Preparing transaction path already exists: $preparing" }
     [System.IO.Directory]::CreateDirectory($preparing) | Out-Null
     Assert-InstallerOwnedEntry -Path $preparing -Label "Preparing binary transaction" -Directory
-    Flush-InstallerDirectory -Path $InstallDir
     Copy-InstallerFileExclusive -Source $ServerSource -Destination (Join-Path $preparing "new-server")
     Copy-InstallerFileExclusive -Source $AmSource -Destination (Join-Path $preparing "new-cli")
     Assert-BinaryTransactionHash -Path (Join-Path $preparing "new-server") `
@@ -1361,7 +1341,10 @@ function Install-BinariesAtomically {
         if ($null -ne $PostInstallVerifier) {
             & $PostInstallVerifier $InstallDir
         }
-        Flush-InstallerDirectory -Path $InstallDir
+        # Both destination contents were flushed with FileStream.Flush(true)
+        # before publication, and each no-replace rename used
+        # MOVEFILE_WRITE_THROUGH. The commit marker therefore follows the
+        # final Windows durability barrier as well as both hash/version checks.
         Write-BinaryTransactionPhase -Journal $journal -Phase "50-commit-ready" -MetadataHash $metadata.MetadataHash
         if ($InterruptAfterPhaseForTest -ceq "commit-ready") { $leaveJournalForTest = $true; throw "injected interruption" }
         Archive-BinaryTransaction -Journal $journal -InstallDir $InstallDir -Outcome "committed" -Nonce $metadata.Nonce
@@ -1375,10 +1358,6 @@ function Install-BinariesAtomically {
             throw "Atomic binary replacement failed and recovery failed closed; active journal retained. Recovery error: $($_.Exception.Message). Root error: $installError"
         }
         throw "Atomic binary replacement failed. The previous binary pair was restored without deleting transaction evidence. Root error: $installError"
-    }
-}
-            }
-        }
     }
 }
 
