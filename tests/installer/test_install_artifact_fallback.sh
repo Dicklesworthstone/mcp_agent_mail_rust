@@ -745,7 +745,7 @@ done
 
 version_root="$tmp/version-fixtures"
 mkdir -p "$version_root/good" "$version_root/wrong-cli" "$version_root/wrong-server" \
-    "$version_root/extra-lines"
+    "$version_root/extra-lines" "$version_root/nul-byte"
 make_version_fixture "$version_root/good/am" 'am 9.9.9'
 make_version_fixture "$version_root/good/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
 make_version_fixture "$version_root/wrong-cli/am" 'am 9.9.8'
@@ -755,6 +755,9 @@ make_version_fixture "$version_root/wrong-server/mcp-agent-mail" 'mcp-agent-mail
 printf '#!/usr/bin/env bash\nprintf "am 9.9.9\\n\\n"\n' >"$version_root/extra-lines/am"
 chmod +x "$version_root/extra-lines/am"
 make_version_fixture "$version_root/extra-lines/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
+printf '#!/usr/bin/env bash\nprintf "am 9.9.9\\0"\n' >"$version_root/nul-byte/am"
+chmod +x "$version_root/nul-byte/am"
+make_version_fixture "$version_root/nul-byte/mcp-agent-mail" 'mcp-agent-mail 9.9.9'
 
 run_version_case() {
     local fixture_dir="$1"
@@ -771,7 +774,7 @@ run_version_case() {
 }
 
 run_version_case "$version_root/good"
-for bad_versions in wrong-cli wrong-server extra-lines; do
+for bad_versions in wrong-cli wrong-server extra-lines nul-byte; do
     if run_version_case "$version_root/$bad_versions"; then
         echo "FAIL: $bad_versions fixture must be rejected before replacement" >&2
         exit 1
@@ -940,6 +943,8 @@ fi
 for required_text in \
     'Get-Command Get-FileHash -ErrorAction SilentlyContinue' \
     'Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue' \
+    '[System.Threading.Tasks.Task]::WaitAll($ioTasks, $remaining)' \
+    'Stop-VersionProbeProcessTree -Process $process' \
     'require >=v3.1.3 and <v4.0.0' \
     '"--new-bundle-format"' \
     '"SIGSTORE_ROOT_FILE"' \

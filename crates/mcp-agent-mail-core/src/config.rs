@@ -3515,12 +3515,10 @@ fn read_user_env_candidate_with_hooks(
     use nix::fcntl::{AtFlags, OFlag, open, openat};
     use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
 
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} has no parent directory", path.display()),
-        )
-    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3662,12 +3660,10 @@ fn read_user_env_candidate_with_hooks(
     after_parent_open: impl FnOnce(),
     after_file_open: impl FnOnce(),
 ) -> io::Result<Option<Vec<u8>>> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} has no parent directory", path.display()),
-        )
-    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let parent_before = match bind_user_env_parent(parent) {
         Ok(handle) => handle,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -5881,6 +5877,14 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("exceeding"))
         );
+    }
+
+    #[test]
+    fn env_authority_reader_accepts_bare_relative_regular_file() {
+        let text = read_env_authority_text(Path::new("Cargo.toml"))
+            .expect("read bare relative env authority")
+            .expect("Cargo.toml should exist in the test working directory");
+        assert!(!text.is_empty());
     }
 
     #[cfg(unix)]
