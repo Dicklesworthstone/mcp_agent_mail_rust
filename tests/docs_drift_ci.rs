@@ -587,8 +587,8 @@ mod dist_release_contract {
             "Published asset digest or state differs from local ${asset_name}",
             "Published asset bytes differ from local ${asset_name}",
             "published_by_tag=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
-            "'.id == $id and .draft == false and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
-            "Published release is not discoverable by the expected tag, target, and metadata",
+            "'.id == $id and .draft == false and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
+            "Published release is not discoverable by the expected tag and metadata",
         ];
         for needle in required_once {
             require_once(workflow, needle)?;
@@ -758,20 +758,20 @@ mod dist_release_contract {
         require_once(workflow, "local -a expected_names=() seen_names=()")?;
         require_once(
             workflow,
-            "'.draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
+            "'.draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
         )?;
         require_exactly(
             workflow,
-            "'.id == $id and .draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
+            "'.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
             2,
         )?;
         require_once(
             workflow,
-            "'.id == $id and .draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease and .upload_url == $upload_url'",
+            "'.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease and .upload_url == $upload_url'",
         )?;
         require_once(
             workflow,
-            "'.id == $id and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
+            "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
         )?;
         require_once(
             workflow,
@@ -819,7 +819,7 @@ mod dist_release_contract {
                 "if ! cmp --silent \"$tag_installer\" \"$main_installer\"; then",
                 "acfs_revision=\"$(resolve_acfs_public_main)\"",
                 "[ \"$acfs_revision_after\" != \"$acfs_revision\" ]",
-                "gh api --method PATCH \\",
+                "assert_tag_revision\n          finalized_release=\"$(gh api --method PATCH \\",
                 "published_assets=\"$(assert_release_state_and_census false)\"",
             ],
         )?;
@@ -1165,12 +1165,17 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "target_commitish: $revision",
+                "target_commitish: \"main\"",
+            ),
+            mutate(
+                &workflow,
                 "[ \"$asset_is_expected\" != true ] || [ \"$asset_is_duplicate\" = true ]",
                 "[ \"$asset_is_expected\" != true ]",
             ),
             mutate(
                 &workflow,
-                "'.draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
+                "'.draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
                 "'.tag_name == $tag and .name == $tag and .prerelease == $prerelease'",
             ),
             mutate(
@@ -1226,7 +1231,7 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "'.id == $id and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
+                "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
                 "'.id == $id and .tag_name == $tag and .draft == $draft and .prerelease == $prerelease'",
             ),
             mutate(

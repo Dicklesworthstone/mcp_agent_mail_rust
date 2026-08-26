@@ -892,9 +892,8 @@ jobs:
               release_json="$(jq -c '.[0]' <<< "$releases_json")"
               if ! jq -e \
                   --arg tag "$RELEASE_TAG" \
-                  --arg revision "$EXPECTED_REVISION" \
                   --argjson prerelease "$EXPECTED_PRERELEASE" \
-                  '.draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease' \
+                  '.draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
                   >/dev/null <<< "$release_json"; then
                 echo "Refusing to mutate a published or metadata-mismatched release for ${RELEASE_TAG}" >&2
                 exit 1
@@ -920,9 +919,8 @@ jobs:
           if ! jq -e \
               --argjson id "$release_id" \
               --arg tag "$RELEASE_TAG" \
-              --arg revision "$EXPECTED_REVISION" \
               --argjson prerelease "$EXPECTED_PRERELEASE" \
-              '.id == $id and .draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease' \
+              '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
               >/dev/null <<< "$release_json"; then
             echo "Draft state changed during preflight" >&2
             exit 1
@@ -931,9 +929,8 @@ jobs:
           if ! jq -e \
               --argjson id "$release_id" \
               --arg tag "$RELEASE_TAG" \
-              --arg revision "$EXPECTED_REVISION" \
               --argjson prerelease "$EXPECTED_PRERELEASE" \
-              '.id == $id and .draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease' \
+              '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
               >/dev/null <<< "$direct_release"; then
             echo "Draft id no longer resolves to the isolated release contract" >&2
             exit 1
@@ -974,10 +971,9 @@ jobs:
             if ! jq -e \
                 --argjson id "$EXPECTED_RELEASE_ID" \
                 --arg tag "$RELEASE_TAG" \
-                --arg revision "$EXPECTED_REVISION" \
                 --arg upload_url "$expected_upload_url" \
                 --argjson prerelease "$EXPECTED_PRERELEASE" \
-                '.id == $id and .draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease and .upload_url == $upload_url' \
+                '.id == $id and .draft == true and .tag_name == $tag and .name == $tag and .prerelease == $prerelease and .upload_url == $upload_url' \
                 >/dev/null <<< "$release_json"; then
               echo "Numeric release id no longer resolves to the isolated draft upload contract" >&2
               exit 1
@@ -1162,12 +1158,11 @@ jobs:
             if ! jq -e \
                 --argjson id "$EXPECTED_RELEASE_ID" \
                 --arg tag "$RELEASE_TAG" \
-                --arg revision "$EXPECTED_REVISION" \
                 --argjson draft "$expected_draft" \
                 --argjson prerelease "$EXPECTED_PRERELEASE" \
-                '.id == $id and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .draft == $draft and .prerelease == $prerelease' \
+                '.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease' \
                 >/dev/null <<< "$release_json"; then
-              echo "Release state does not match the expected tag, target, id, draft, and prerelease contract" >&2
+              echo "Release state does not match the expected tag, id, draft, and prerelease contract" >&2
               exit 1
             fi
             assets_json="$(load_remote_assets)"
@@ -1379,11 +1374,10 @@ jobs:
           if ! jq -e \
               --argjson id "$EXPECTED_RELEASE_ID" \
               --arg tag "$RELEASE_TAG" \
-              --arg revision "$EXPECTED_REVISION" \
               --argjson prerelease "$EXPECTED_PRERELEASE" \
-              '.id == $id and .draft == false and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease' \
+              '.id == $id and .draft == false and .tag_name == $tag and .name == $tag and .prerelease == $prerelease' \
               >/dev/null <<< "$published_by_tag"; then
-            echo "Published release is not discoverable by the expected tag, target, and metadata" >&2
+            echo "Published release is not discoverable by the expected tag and metadata" >&2
             exit 1
           fi
           assert_tag_revision
