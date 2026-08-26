@@ -424,13 +424,14 @@ fn contact_enforcement_db_outage_fail_open() {
          Expected at least 1 increment from fail-open handlers."
     );
 
-    // 4c. The counter should reflect the 3 fail-open sites that were hit:
-    //   - list_thread_messages (fail-open site #1, triggers because thread_id is set)
-    //   - list_message_recipient_names_for_messages (fail-open site #2, follows site #1)
-    //   - get_active_reservations (fail-open site #3, file_reservations table is dropped)
+    // 4c. The counter should reflect the fail-open sites that were hit:
+    //   - list_thread_participant_names (fail-open site #1, triggers because
+    //     thread_id is set; GH#260 collapsed the old thread-messages +
+    //     recipient-names pair into this single narrow lookup)
+    //   - get_active_reservations (fail-open site #2, file_reservations table is dropped)
     //
-    // Note: Sites #1 and #2 may or may not fail depending on whether thread_messages
-    // query succeeds (it reads from `messages` which is intact). Site #3 always fails
+    // Note: Site #1 may or may not fail depending on whether the thread queries
+    // succeed (they read from `messages` which is intact). Site #2 always fails
     // because file_reservations is dropped. The counter delta should be >= 1.
     eprintln!(
         "[br-1i11.2.6] Contact enforcement bypass counter delta: {delta} \

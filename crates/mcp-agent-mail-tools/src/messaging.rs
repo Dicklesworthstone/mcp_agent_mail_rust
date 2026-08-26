@@ -1722,6 +1722,7 @@ pub async fn send_message(
     importance: Option<String>,
     ack_required: Option<bool>,
     thread_id: Option<String>,
+    #[doc = "Reserved: topic tags are not implemented yet. Non-blank values are rejected with a typed INVALID_PARAMS error until topic persistence and filtering land; omit this field."]
     topic: Option<String>,
     broadcast: Option<bool>,
     auto_contact_if_blocked: Option<bool>,
@@ -2099,19 +2100,26 @@ effective_free_bytes={free}"
         if let Some(thread) = thread_id.as_deref() {
             let thread = thread.trim();
             if !thread.is_empty() {
-                let thread_rows = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_thread_messages(
+                // GH#260: join-free, body-free participant lookup. The previous
+                // `list_thread_messages` + `list_message_recipient_names_for_messages`
+                // pair materialized full bodies and used OR-disjunct / IN+JOIN
+                // query shapes that FrankenSQLite executes as whole-table nested
+                // loops, so one send into a ≥500-message thread on a large
+                // mailbox burned CPU for minutes behind the global message-write
+                // serializer and wedged every other send.
+                let participants = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::list_thread_participant_names(
                         ctx.cx(),
                         &pool,
                         project_id,
                         thread,
-                        Some(500),
+                        500,
                     )
                     .await,
                 )
                 .unwrap_or_else(|e| {
                     tracing::warn!(
-                        "contact enforcement: list_thread_messages failed (fail-open): {e}"
+                        "contact enforcement: list_thread_participant_names failed (fail-open): {e}"
                     );
                     mcp_agent_mail_core::global_metrics()
                         .tools
@@ -2119,31 +2127,7 @@ effective_free_bytes={free}"
                         .inc();
                     Vec::new()
                 });
-                let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
-                for row in &thread_rows {
-                    auto_ok_names.insert(row.from.clone());
-                    message_ids.push(row.id);
-                }
-                let recipients = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_message_recipient_names_for_messages(
-                        ctx.cx(),
-                        &pool,
-                        project_id,
-                        &message_ids,
-                    )
-                    .await,
-                )
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "contact enforcement: list_message_recipient_names failed (fail-open): {e}"
-                    );
-                    mcp_agent_mail_core::global_metrics()
-                        .tools
-                        .contact_enforcement_bypass_total
-                        .inc();
-                    Vec::new()
-                });
-                for name in recipients {
+                for name in participants {
                     auto_ok_names.insert(name);
                 }
             }
@@ -3142,41 +3126,20 @@ effective_free_bytes={free}"
         let mut auto_ok_names: HashSet<String> = HashSet::new();
 
         if !thread_id.is_empty() {
-            let thread_rows = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_thread_messages(
+            // GH#260: see send_message — narrow join-free participant lookup.
+            let participants = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_thread_participant_names(
                     ctx.cx(),
                     &pool,
                     project_id,
                     &thread_id,
-                    Some(500),
-                )
-                .await,
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("contact enforcement: list_thread_messages failed (fail-open): {e}");
-                mcp_agent_mail_core::global_metrics()
-                    .tools
-                    .contact_enforcement_bypass_total
-                    .inc();
-                Vec::new()
-            });
-            let mut message_ids: Vec<i64> = Vec::with_capacity(thread_rows.len());
-            for row in &thread_rows {
-                auto_ok_names.insert(row.from.clone());
-                message_ids.push(row.id);
-            }
-            let recipients = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_message_recipient_names_for_messages(
-                    ctx.cx(),
-                    &pool,
-                    project_id,
-                    &message_ids,
+                    500,
                 )
                 .await,
             )
             .unwrap_or_else(|e| {
                 tracing::warn!(
-                    "contact enforcement: list_message_recipient_names failed (fail-open): {e}"
+                    "contact enforcement: list_thread_participant_names failed (fail-open): {e}"
                 );
                 mcp_agent_mail_core::global_metrics()
                     .tools
@@ -3184,7 +3147,7 @@ effective_free_bytes={free}"
                     .inc();
                 Vec::new()
             });
-            for name in recipients {
+            for name in participants {
                 auto_ok_names.insert(name);
             }
         }
@@ -3671,6 +3634,7 @@ pub async fn fetch_inbox(
     include_bodies: Option<bool>,
     unread_only: Option<bool>,
     ack_overdue_only: Option<bool>,
+    #[doc = "Reserved: topic tags are not implemented yet. Non-blank values are rejected with a typed INVALID_PARAMS error until topic persistence and filtering land; omit this field."]
     topic: Option<String>,
     mark_read: Option<bool>,
 ) -> McpResult<String> {

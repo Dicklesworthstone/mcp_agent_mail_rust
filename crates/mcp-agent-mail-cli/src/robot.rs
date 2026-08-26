@@ -2575,7 +2575,13 @@ pub enum RobotSubcommand {
     },
 
     /// Cross-project unified summary (per-project unread/urgent/ack counts).
-    Overview,
+    Overview {
+        /// Emit only the aggregate cross-project totals (hot-poller mode):
+        /// `{project_count, unread, urgent, ack_overdue}` with no per-project
+        /// array (GH#266).
+        #[arg(long)]
+        counts: bool,
+    },
 
     // ── Track 3: Context & Discovery ────────────────────────────────────
     /// Full conversation rendering for a thread.
@@ -2737,7 +2743,7 @@ impl RobotSubcommand {
             Self::TuiDump => "tui-dump",
             Self::Inbox { .. } => "robot inbox",
             Self::Timeline { .. } => "robot timeline",
-            Self::Overview => "robot overview",
+            Self::Overview { .. } => "robot overview",
             Self::Thread { .. } => "robot thread",
             Self::Search { .. } => "robot search",
             Self::Message { .. } => "robot message",
@@ -9042,6 +9048,21 @@ fn build_timeline(
 
 // ── Overview command implementation ─────────────────────────────────────────
 
+/// Sum per-project overview counters into cross-project totals
+/// `(unread, urgent, ack_overdue)` for `robot overview --counts` (GH#266).
+fn overview_totals(projects: &[OverviewProject]) -> (usize, usize, usize) {
+    projects.iter().fold(
+        (0_usize, 0_usize, 0_usize),
+        |(unread, urgent, ack_overdue), project| {
+            (
+                unread.saturating_add(project.unread),
+                urgent.saturating_add(project.urgent),
+                ack_overdue.saturating_add(project.ack_overdue),
+            )
+        },
+    )
+}
+
 fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
     fn decode_count(row: &sqlmodel_core::Row, label: &str) -> Result<i64, CliError> {
         row.get_by_name("cnt")
@@ -15232,26 +15253,52 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             env._meta.project = Some(scope.project_slug);
             format_output(&env, format)?
         }
-        RobotSubcommand::Overview => {
+        RobotSubcommand::Overview { counts } => {
             let conn = crate::open_db_sync_robot()?;
             let projects = build_overview_with_snapshot_cache(&conn, None)?;
-
-            #[derive(Serialize)]
-            struct OverviewData {
-                project_count: usize,
-                projects: Vec<OverviewProject>,
-            }
-
             let project_count = projects.len();
-            let env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                OverviewData {
-                    project_count,
-                    projects,
-                },
-            );
-            format_output(&env, format)?
+
+            if counts {
+                // GH#266: hot-poller mode — deterministic coordinators polling
+                // on a tight loop only need three integers; skip the
+                // per-project array (which dominates the payload) entirely.
+                #[derive(Serialize)]
+                struct OverviewCountsData {
+                    project_count: usize,
+                    unread: usize,
+                    urgent: usize,
+                    ack_overdue: usize,
+                }
+
+                let (unread, urgent, ack_overdue) = overview_totals(&projects);
+                let env = RobotEnvelope::new(
+                    cmd_name,
+                    format,
+                    OverviewCountsData {
+                        project_count,
+                        unread,
+                        urgent,
+                        ack_overdue,
+                    },
+                );
+                format_output(&env, format)?
+            } else {
+                #[derive(Serialize)]
+                struct OverviewData {
+                    project_count: usize,
+                    projects: Vec<OverviewProject>,
+                }
+
+                let env = RobotEnvelope::new(
+                    cmd_name,
+                    format,
+                    OverviewData {
+                        project_count,
+                        projects,
+                    },
+                );
+                format_output(&env, format)?
+            }
         }
         RobotSubcommand::Analytics => {
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
@@ -20036,6 +20083,58 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["project_count"], 2);
         assert_eq!(v["total_unread"], 5);
+    }
+
+    #[test]
+    fn test_overview_counts_mode_totals_and_payload_shape() {
+        // GH#266: `robot overview --counts` returns cross-project totals only.
+        let projects = vec![
+            OverviewProject {
+                slug: "proj1".into(),
+                unread: 3,
+                urgent: 1,
+                ack_overdue: 0,
+                reservations: 4,
+            },
+            OverviewProject {
+                slug: "proj2".into(),
+                unread: 2,
+                urgent: 0,
+                ack_overdue: 1,
+                reservations: 0,
+            },
+        ];
+        assert_eq!(overview_totals(&projects), (5, 1, 1));
+        assert_eq!(overview_totals(&[]), (0, 0, 0));
+
+        #[derive(Serialize)]
+        struct OverviewCountsData {
+            project_count: usize,
+            unread: usize,
+            urgent: usize,
+            ack_overdue: usize,
+        }
+        let (unread, urgent, ack_overdue) = overview_totals(&projects);
+        let env = RobotEnvelope::new(
+            "robot overview",
+            OutputFormat::Json,
+            OverviewCountsData {
+                project_count: projects.len(),
+                unread,
+                urgent,
+                ack_overdue,
+            },
+        );
+        let out = format_output(&env, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["project_count"], 2);
+        assert_eq!(v["unread"], 5);
+        assert_eq!(v["urgent"], 1);
+        assert_eq!(v["ack_overdue"], 1);
+        assert!(
+            v.get("projects").is_none(),
+            "counts mode must omit the per-project array"
+        );
     }
 
     #[test]
