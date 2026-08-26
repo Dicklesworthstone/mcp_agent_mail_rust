@@ -386,8 +386,9 @@ detect_platform() {
   esac
 
   if [ -z "$TARGET" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ]; then
-    warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-    FROM_SOURCE=1
+    err "No prebuilt artifact is defined for ${OS}/${ARCH}."
+    err "The installer will not execute a source build unless --from-source is explicit."
+    return 1
   fi
   verbose "detect_platform:normalized os=${OS} arch=${ARCH} target=${TARGET:-<none>} from_source=${FROM_SOURCE}"
 }
@@ -403,8 +404,9 @@ set_artifact_url() {
     elif [ -n "$TARGET" ]; then
       set_target_artifact "$TARGET"
     else
-      warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-      FROM_SOURCE=1
+      err "No prebuilt artifact is defined for ${OS}/${ARCH}."
+      err "Pass --from-source explicitly to authorize a source build."
+      return 1
     fi
   fi
   verbose "set_artifact_url:done tar=${TAR:-<none>} url=${URL:-<none>} from_source=${FROM_SOURCE}"
@@ -576,33 +578,35 @@ output_path = sys.argv[2]
 status_path = sys.argv[3]
 cmd = sys.argv[4:]
 
-proc = subprocess.Popen(
-    cmd,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-    start_new_session=True,
-)
+with open(output_path, "wb") as output_handle:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=output_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
 
-deadline = time.time() + timeout_secs
-timed_out = False
-while time.time() < deadline:
-    if proc.poll() is not None:
-        break
-    time.sleep(0.05)
+    deadline = time.monotonic() + timeout_secs
+    timed_out = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
 
-if proc.poll() is None:
-    timed_out = True
-    try:
-        import os
-        import signal
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        proc.kill()
+    if proc.poll() is None:
+        timed_out = True
+        try:
+            import os
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            proc.kill()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1)
 
-output, _ = proc.communicate()
-with open(output_path, "w", encoding="utf-8") as handle:
-    handle.write(output or "")
 with open(status_path, "w", encoding="utf-8") as handle:
     handle.write("124" if timed_out else str(proc.returncode))
 
@@ -6932,8 +6936,14 @@ if ! establish_release_contract; then
   error_usage_hint
   exit 2
 fi
-detect_platform
-set_artifact_url
+if ! detect_platform; then
+  error_usage_hint
+  exit 1
+fi
+if ! set_artifact_url; then
+  error_usage_hint
+  exit 1
+fi
 
 # Ensure the destination directory hierarchy exists before preflight checks
 if ! ensure_real_directory_tree "$DEST" "install destination"; then

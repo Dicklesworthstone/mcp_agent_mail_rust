@@ -1678,6 +1678,7 @@ fn inspect_db_signature(snapshot: &LegacySourceSnapshot) -> LegacyDbSignature {
     }
 }
 
+#[cfg(test)]
 fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResult<ResolvedPath> {
     let process_value = if explicit.is_none() {
         process_env_value_for_legacy("DATABASE_URL")?
