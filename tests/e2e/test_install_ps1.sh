@@ -250,20 +250,14 @@ foreach ($name in @(
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("am-atomic-test-" + [Guid]::NewGuid().ToString("N"))
 $srcDir = Join-Path $root "src"
-$destDir = Join-Path $root "dest"
 New-Item -ItemType Directory -Path $srcDir -Force | Out-Null
-New-Item -ItemType Directory -Path $destDir -Force | Out-Null
 try {
-    $normalizedDest = Assert-SafeInstallDirectory -InstallDir ($destDir + [IO.Path]::DirectorySeparatorChar)
-    if ($normalizedDest -cne $destDir) {
-        throw "install directory normalization retained a trailing separator"
-    }
+    $script:ActiveBinaryTransactionInstallDir = $null
+    $script:BinaryTransactionRecoveryActive = $false
     $amSrc = Join-Path $srcDir "am.exe"
     $serverSrc = Join-Path $srcDir "mcp-agent-mail.exe"
     Set-Content -LiteralPath $amSrc -Value "new-am" -NoNewline
     Set-Content -LiteralPath $serverSrc -Value "new-server" -NoNewline
-    Set-Content -LiteralPath (Join-Path $destDir "am.exe") -Value "old-am" -NoNewline
-    Set-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Value "old-server" -NoNewline
 
     $contentVerifier = {
         param([string]$VerifiedInstallDir)
@@ -274,83 +268,171 @@ try {
             throw "post-install server content mismatch"
         }
     }
-    Install-BinariesAtomically `
-        -AmSource $amSrc `
-        -ServerSource $serverSrc `
-        -InstallDir $destDir `
-        -PostInstallVerifier $contentVerifier
 
-    if ((Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw) -ne "new-am") {
-        throw "am.exe was not atomically replaced"
-    }
-    if ((Get-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Raw) -ne "new-server") {
-        throw "mcp-agent-mail.exe was not atomically replaced"
-    }
-    $amDigestMatches = (Get-Sha256Hex -FilePath $amSrc) -ceq
-        (Get-Sha256Hex -FilePath (Join-Path $destDir "am.exe"))
-    $serverDigestMatches = (Get-Sha256Hex -FilePath $serverSrc) -ceq
-        (Get-Sha256Hex -FilePath (Join-Path $destDir "mcp-agent-mail.exe"))
-    if (-not $amDigestMatches -or -not $serverDigestMatches) {
-        throw "installed bytes differ from staged bytes"
+    function New-TransactionCase([string]$Name, [bool]$Upgrade) {
+        $caseDir = Join-Path $root $Name
+        New-Item -ItemType Directory -Path $caseDir -Force | Out-Null
+        if ($Upgrade) {
+            Set-Content -LiteralPath (Join-Path $caseDir "am.exe") -Value "old-am" -NoNewline
+            Set-Content -LiteralPath (Join-Path $caseDir "mcp-agent-mail.exe") -Value "old-server" -NoNewline
+        }
+        return $caseDir
     }
 
-    Set-Content -LiteralPath (Join-Path $destDir "am.exe") -Value "rollback-am" -NoNewline
-    Set-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Value "rollback-server" -NoNewline
+    function Assert-OldPair([string]$CaseDir) {
+        if ((Get-Content -LiteralPath (Join-Path $CaseDir "am.exe") -Raw) -cne "old-am" -or
+            (Get-Content -LiteralPath (Join-Path $CaseDir "mcp-agent-mail.exe") -Raw) -cne "old-server") {
+            throw "case did not converge to old-old: $CaseDir"
+        }
+    }
+
+    function Assert-NewPair([string]$CaseDir) {
+        if ((Get-Content -LiteralPath (Join-Path $CaseDir "am.exe") -Raw) -cne "new-am" -or
+            (Get-Content -LiteralPath (Join-Path $CaseDir "mcp-agent-mail.exe") -Raw) -cne "new-server") {
+            throw "case did not converge to new-new: $CaseDir"
+        }
+    }
+
+    $interruptions = @(
+        "prepared",
+        "preserve-server", "preserve-server-moved",
+        "preserve-cli", "preserve-cli-moved",
+        "publish-server", "publish-server-moved",
+        "publish-cli", "publish-cli-moved",
+        "commit-ready"
+    )
+    foreach ($kind in @("upgrade", "fresh")) {
+        foreach ($phase in $interruptions) {
+            $caseDir = New-TransactionCase -Name "$kind-$phase" -Upgrade ($kind -ceq "upgrade")
+            $threw = $false
+            try {
+                Install-BinariesAtomically `
+                    -AmSource $amSrc -ServerSource $serverSrc -InstallDir $caseDir `
+                    -PostInstallVerifier $contentVerifier -InterruptAfterPhaseForTest $phase
+            } catch { $threw = $true }
+            if (-not $threw) { throw "$kind/$phase interruption did not throw" }
+            $active = Get-BinaryTransactionActivePath -InstallDir $caseDir
+            if (-not (Test-InstallerEntryExists -Path $active)) { throw "$kind/$phase did not retain active authority" }
+            Recover-BinaryPairTransaction -InstallDir $caseDir
+            if (Test-InstallerEntryExists -Path $active) { throw "$kind/$phase did not archive active authority" }
+            if ($phase -ceq "commit-ready") {
+                Assert-NewPair -CaseDir $caseDir
+                $outcome = "committed"
+            } else {
+                if ($kind -ceq "upgrade") {
+                    Assert-OldPair -CaseDir $caseDir
+                } elseif ((Test-InstallerEntryExists -Path (Join-Path $caseDir "am.exe")) -or
+                          (Test-InstallerEntryExists -Path (Join-Path $caseDir "mcp-agent-mail.exe"))) {
+                    throw "fresh/$phase did not converge to absent-absent"
+                }
+                $outcome = "rolled-back"
+            }
+            $history = @(Get-ChildItem -LiteralPath $caseDir -Force |
+                Where-Object { $_.Name -like ".mcp-agent-mail-install-transaction.$outcome.*" })
+            if ($history.Count -ne 1) { throw "$kind/$phase did not retain exactly one $outcome journal" }
+            Recover-BinaryPairTransaction -InstallDir $caseDir
+        }
+    }
+
+    $normalDir = New-TransactionCase -Name "normal" -Upgrade $true
+    Install-BinariesAtomically -AmSource $amSrc -ServerSource $serverSrc `
+        -InstallDir $normalDir -PostInstallVerifier $contentVerifier
+    Assert-NewPair -CaseDir $normalDir
+
+    foreach ($fault in @("partial", "publish-boundary")) {
+        $caseDir = New-TransactionCase -Name "marker-$fault" -Upgrade $true
+        try {
+            Install-BinariesAtomically -AmSource $amSrc -ServerSource $serverSrc `
+                -InstallDir $caseDir -PostInstallVerifier $contentVerifier `
+                -InterruptAfterPhaseForTest "prepared"
+        } catch { }
+        $active = Get-BinaryTransactionActivePath -InstallDir $caseDir
+        $metadata = Read-BinaryTransactionMetadata -Journal $active
+        $threw = $false
+        try {
+            if ($fault -ceq "partial") {
+                Write-BinaryTransactionPhase -Journal $active -Phase "10-preserve-server" `
+                    -MetadataHash $metadata.MetadataHash -PartialBeforePublishForTest
+            } else {
+                Write-BinaryTransactionPhase -Journal $active -Phase "10-preserve-server" `
+                    -MetadataHash $metadata.MetadataHash -InterruptBeforePublishForTest
+            }
+        } catch { $threw = $true }
+        if (-not $threw) { throw "$fault marker interruption did not throw" }
+        if (Test-InstallerEntryExists -Path (Join-Path $active "phase.10-preserve-server")) {
+            throw "$fault marker became authoritative before publication"
+        }
+        Recover-BinaryPairTransaction -InstallDir $caseDir
+        Assert-OldPair -CaseDir $caseDir
+    }
+
+    $rollbackDir = New-TransactionCase -Name "rollback-interrupt" -Upgrade $true
+    try {
+        Install-BinariesAtomically -AmSource $amSrc -ServerSource $serverSrc `
+            -InstallDir $rollbackDir -PostInstallVerifier $contentVerifier `
+            -InterruptAfterPhaseForTest "publish-server-moved"
+    } catch { }
     $threw = $false
     try {
-        Install-BinariesAtomically `
-            -AmSource $amSrc `
-            -ServerSource $serverSrc `
-            -InstallDir $destDir `
-            -PostInstallVerifier $contentVerifier `
-            -FailAfterFirstReplaceForTest
-    } catch {
-        $threw = $true
-    }
-    if (-not $threw) {
-        throw "expected first-replacement fault to throw"
-    }
-    if ((Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw) -cne "rollback-am" -or
-        (Get-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Raw) -cne "rollback-server") {
-        throw "first-replacement fault did not restore the old pair"
-    }
+        Recover-BinaryPairTransaction -InstallDir $rollbackDir -InterruptAfterPhaseForTest "rollback-ready"
+    } catch { $threw = $true }
+    if (-not $threw) { throw "rollback interruption did not throw" }
+    Recover-BinaryPairTransaction -InstallDir $rollbackDir
+    Assert-OldPair -CaseDir $rollbackDir
+    Recover-BinaryPairTransaction -InstallDir $rollbackDir
 
+    $verifyDir = New-TransactionCase -Name "verify-failure" -Upgrade $true
     $threw = $false
     try {
-        Install-BinariesAtomically `
-            -AmSource $amSrc `
-            -ServerSource $serverSrc `
-            -InstallDir $destDir `
-            -PostInstallVerifier { throw "injected post-install verification failure" }
-    } catch {
-        $threw = $true
-    }
-    if (-not $threw) {
-        throw "expected post-install verifier failure to throw"
-    }
-    if ((Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw) -cne "rollback-am" -or
-        (Get-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Raw) -cne "rollback-server") {
-        throw "post-install verifier failure did not restore the old pair"
-    }
+        Install-BinariesAtomically -AmSource $amSrc -ServerSource $serverSrc `
+            -InstallDir $verifyDir -PostInstallVerifier { throw "injected verifier failure" }
+    } catch { $threw = $true }
+    if (-not $threw) { throw "post-install verifier failure did not throw" }
+    Assert-OldPair -CaseDir $verifyDir
 
-    $before = Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw
+    $corruptDir = New-TransactionCase -Name "corrupt-journal" -Upgrade $true
+    try {
+        Install-BinariesAtomically -AmSource $amSrc -ServerSource $serverSrc `
+            -InstallDir $corruptDir -PostInstallVerifier $contentVerifier `
+            -InterruptAfterPhaseForTest "prepared"
+    } catch { }
+    $corruptActive = Get-BinaryTransactionActivePath -InstallDir $corruptDir
+    Add-Content -LiteralPath (Join-Path $corruptActive "metadata") -Value "tampered"
+    $threw = $false
+    try { Recover-BinaryPairTransaction -InstallDir $corruptDir } catch { $threw = $true }
+    if (-not $threw) { throw "corrupted journal did not fail closed" }
+    Assert-OldPair -CaseDir $corruptDir
+    if (-not (Test-InstallerEntryExists -Path $corruptActive)) { throw "corrupted active journal was not retained" }
+
+    $unexpectedDir = New-TransactionCase -Name "unexpected-destination" -Upgrade $true
+    try {
+        Install-BinariesAtomically -AmSource $amSrc -ServerSource $serverSrc `
+            -InstallDir $unexpectedDir -PostInstallVerifier $contentVerifier `
+            -InterruptAfterPhaseForTest "publish-server"
+    } catch { }
+    Set-Content -LiteralPath (Join-Path $unexpectedDir "mcp-agent-mail.exe") `
+        -Value "user-modified-server" -NoNewline
+    $unexpectedActive = Get-BinaryTransactionActivePath -InstallDir $unexpectedDir
+    $threw = $false
+    try { Recover-BinaryPairTransaction -InstallDir $unexpectedDir } catch { $threw = $true }
+    if (-not $threw) { throw "unexpected destination did not fail closed" }
+    if ((Get-Content -LiteralPath (Join-Path $unexpectedDir "mcp-agent-mail.exe") -Raw) -cne "user-modified-server") {
+        throw "recovery clobbered unexpected destination bytes"
+    }
+    if (-not (Test-InstallerEntryExists -Path $unexpectedActive)) { throw "ambiguous active journal was not retained" }
+
+    $missingDir = New-TransactionCase -Name "missing-source" -Upgrade $true
+    $before = Get-Content -LiteralPath (Join-Path $missingDir "am.exe") -Raw
     $missingSrc = Join-Path $srcDir "missing-server.exe"
     $threw = $false
     try {
-        Install-BinariesAtomically -AmSource $amSrc -ServerSource $missingSrc -InstallDir $destDir
-    } catch {
-        $threw = $true
-    }
-    if (-not $threw) {
-        throw "expected missing source to throw"
-    }
-    $after = Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw
-    if ($before -ne $after) {
-        throw "destination mutated on missing source failure"
-    }
-    $backupResidue = @(Get-ChildItem -LiteralPath $destDir -Filter "*.bak.preinstall-*" -Force)
-    if ($backupResidue.Count -ne 0) {
-        throw "completed rollback retained unexpected backup residue: $($backupResidue.FullName -join ", ")"
+        Install-BinariesAtomically -AmSource $amSrc -ServerSource $missingSrc -InstallDir $missingDir
+    } catch { $threw = $true }
+    if (-not $threw) { throw "missing source did not throw" }
+    $after = Get-Content -LiteralPath (Join-Path $missingDir "am.exe") -Raw
+    if ($before -cne $after) { throw "missing source failure mutated destination" }
+    if (Test-InstallerEntryExists -Path (Get-BinaryTransactionActivePath -InstallDir $missingDir)) {
+        throw "missing source failure left an active authority"
     }
 } finally {
     if (Test-Path -LiteralPath $root) {
