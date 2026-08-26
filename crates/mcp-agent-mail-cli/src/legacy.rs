@@ -1229,8 +1229,7 @@ fn build_detect_report(
     explicit_db: Option<&Path>,
     explicit_storage_root: Option<&Path>,
 ) -> CliResult<LegacyDetectReport> {
-    let resolved =
-        resolve_legacy_authorities(search_root, explicit_db, explicit_storage_root)?;
+    let resolved = resolve_legacy_authorities(search_root, explicit_db, explicit_storage_root)?;
     build_detect_report_from_resolved(search_root, &resolved, None)
 }
 
@@ -1670,14 +1669,8 @@ fn resolve_database_path(search_root: &Path, explicit: Option<&Path>) -> CliResu
         None
     };
     let needs_database_authority = explicit.is_none() && process_value.is_none();
-    let snapshot =
-        capture_legacy_env_snapshot(search_root, needs_database_authority, false)?;
-    resolve_database_path_from_snapshot(
-        search_root,
-        explicit,
-        process_value.as_deref(),
-        &snapshot,
-    )
+    let snapshot = capture_legacy_env_snapshot(search_root, needs_database_authority, false)?;
+    resolve_database_path_from_snapshot(search_root, explicit, process_value.as_deref(), &snapshot)
 }
 
 fn resolve_database_path_from_snapshot(
@@ -1732,14 +1725,8 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
         None
     };
     let needs_storage_authority = explicit.is_none() && process_value.is_none();
-    let snapshot =
-        capture_legacy_env_snapshot(search_root, false, needs_storage_authority)?;
-    resolve_storage_root_from_snapshot(
-        search_root,
-        explicit,
-        process_value.as_deref(),
-        &snapshot,
-    )
+    let snapshot = capture_legacy_env_snapshot(search_root, false, needs_storage_authority)?;
+    resolve_storage_root_from_snapshot(search_root, explicit, process_value.as_deref(), &snapshot)
 }
 
 fn resolve_storage_root_from_snapshot(
@@ -1994,11 +1981,7 @@ fn capture_legacy_env_snapshot_with_reader(
     // drifting path lookups. Re-probe every authority that influenced
     // precedence before returning the parsed snapshot. The low-level reader
     // independently binds each present file and its parent while reading it.
-    require_unchanged_env_authority(
-        &project_path,
-        project_text.as_deref(),
-        &mut read_authority,
-    )?;
+    require_unchanged_env_authority(&project_path, project_text.as_deref(), &mut read_authority)?;
     let user_probe_len = if include_user_authority {
         selected_user
             .as_ref()
@@ -2375,11 +2358,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
     Ok(())
 }
 
-fn require_storage_directory(
-    path: &Path,
-    label: &str,
-    allow_missing: bool,
-) -> CliResult<bool> {
+fn require_storage_directory(path: &Path, label: &str, allow_missing: bool) -> CliResult<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
@@ -2578,9 +2557,7 @@ mod tests {
 
     #[test]
     fn parse_env_file_map_parses_export_with_tabs() {
-        let map = parse_env_file_map(
-            "export\tDATABASE_URL=sqlite+aiosqlite:///./tabbed.sqlite3\n",
-        );
+        let map = parse_env_file_map("export\tDATABASE_URL=sqlite+aiosqlite:///./tabbed.sqlite3\n");
         assert_eq!(
             map.get("DATABASE_URL").unwrap(),
             "sqlite+aiosqlite:///./tabbed.sqlite3"
@@ -2671,13 +2648,15 @@ mod tests {
             }),
         };
 
-        let database_error =
-            resolve_database_path_from_snapshot(tmp.path(), None, None, &snapshot)
-                .expect_err("blank project DATABASE_URL must not fall through");
-        let storage_error =
-            resolve_storage_root_from_snapshot(tmp.path(), None, None, &snapshot)
-                .expect_err("blank project STORAGE_ROOT must not fall through");
-        assert!(database_error.to_string().contains("DATABASE_URL authority"));
+        let database_error = resolve_database_path_from_snapshot(tmp.path(), None, None, &snapshot)
+            .expect_err("blank project DATABASE_URL must not fall through");
+        let storage_error = resolve_storage_root_from_snapshot(tmp.path(), None, None, &snapshot)
+            .expect_err("blank project STORAGE_ROOT must not fall through");
+        assert!(
+            database_error
+                .to_string()
+                .contains("DATABASE_URL authority")
+        );
         assert!(storage_error.to_string().contains("STORAGE_ROOT authority"));
     }
 
@@ -2688,19 +2667,13 @@ mod tests {
         fs::write(&project_env, "DATABASE_URL=sqlite:///first.sqlite3\n").unwrap();
         let changed = std::cell::Cell::new(false);
 
-        let error = capture_legacy_env_snapshot_with_reader(
-            tmp.path(),
-            &[],
-            true,
-            false,
-            |path| {
-                let observed = read_env_authority_text(path)?;
-                if path == project_env && observed.is_some() && !changed.replace(true) {
-                    fs::write(path, "DATABASE_URL=sqlite:///second.sqlite3\n")?;
-                }
-                Ok(observed)
-            },
-        )
+        let error = capture_legacy_env_snapshot_with_reader(tmp.path(), &[], true, false, |path| {
+            let observed = read_env_authority_text(path)?;
+            if path == project_env && observed.is_some() && !changed.replace(true) {
+                fs::write(path, "DATABASE_URL=sqlite:///second.sqlite3\n")?;
+            }
+            Ok(observed)
+        })
         .expect_err("a drifting project authority must be rejected");
         assert!(error.to_string().contains("changed while capturing"));
     }
@@ -2720,11 +2693,13 @@ mod tests {
         assert!(invalid_error.to_string().contains("valid UTF-8"));
 
         let oversized_root = tempfile::tempdir().unwrap();
-        let oversized_len = usize::try_from(
-            mcp_agent_mail_core::config::ENV_AUTHORITY_FILE_MAX_BYTES + 1,
+        let oversized_len =
+            usize::try_from(mcp_agent_mail_core::config::ENV_AUTHORITY_FILE_MAX_BYTES + 1).unwrap();
+        fs::write(
+            oversized_root.path().join(".env"),
+            vec![b'x'; oversized_len],
         )
         .unwrap();
-        fs::write(oversized_root.path().join(".env"), vec![b'x'; oversized_len]).unwrap();
         let oversized_error = capture_legacy_env_snapshot_with_reader(
             oversized_root.path(),
             &[],
@@ -2781,7 +2756,11 @@ mod tests {
             read_env_authority_text,
         )
         .expect_err("a symlinked project authority must be rejected");
-        assert!(error.to_string().contains("unsafe legacy environment authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
+        );
     }
 
     #[cfg(unix)]
@@ -2797,22 +2776,20 @@ mod tests {
         fs::write(&project_env, "DATABASE_URL=sqlite:///source.sqlite3\n").unwrap();
         let swapped = std::cell::Cell::new(false);
 
-        let error = capture_legacy_env_snapshot_with_reader(
-            &project,
-            &[],
-            true,
-            false,
-            |path| {
-                let observed = read_env_authority_text(path)?;
-                if path == project_env && observed.is_some() && !swapped.replace(true) {
-                    fs::rename(&project, &moved_project)?;
-                    symlink(&moved_project, &project)?;
-                }
-                Ok(observed)
-            },
-        )
+        let error = capture_legacy_env_snapshot_with_reader(&project, &[], true, false, |path| {
+            let observed = read_env_authority_text(path)?;
+            if path == project_env && observed.is_some() && !swapped.replace(true) {
+                fs::rename(&project, &moved_project)?;
+                symlink(&moved_project, &project)?;
+            }
+            Ok(observed)
+        })
         .expect_err("a swapped project parent must be rejected");
-        assert!(error.to_string().contains("unsafe legacy environment authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
+        );
     }
 
     #[cfg(unix)]
@@ -2838,7 +2815,11 @@ mod tests {
             read_env_authority_text,
         )
         .expect_err("an unsafe higher-priority user authority must stop fallback");
-        assert!(error.to_string().contains("unsafe legacy environment authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
+        );
     }
 
     #[cfg(unix)]
@@ -2869,7 +2850,11 @@ mod tests {
             },
         )
         .expect_err("a swapped user authority parent must be rejected");
-        assert!(error.to_string().contains("unsafe legacy environment authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe legacy environment authority")
+        );
     }
 
     #[test]
@@ -2891,7 +2876,9 @@ mod tests {
             let error = parse_database_value(value, root.path(), ResolvedSource::ProcessEnv)
                 .expect_err("blank DATABASE_URL authority must fail closed");
             assert!(
-                error.to_string().contains("DATABASE_URL authority must not be empty"),
+                error
+                    .to_string()
+                    .contains("DATABASE_URL authority must not be empty"),
                 "{error}"
             );
         }
@@ -2903,7 +2890,11 @@ mod tests {
             &LegacyEnvSnapshot::default(),
         )
         .expect_err("blank explicit database authority must fail closed");
-        assert!(error.to_string().contains("DATABASE_URL authority must not be empty"));
+        assert!(
+            error
+                .to_string()
+                .contains("DATABASE_URL authority must not be empty")
+        );
     }
 
     #[test]
@@ -2918,7 +2909,9 @@ mod tests {
                 let error = parse_storage_value(value, root.path(), source)
                     .expect_err("blank STORAGE_ROOT authority must fail closed");
                 assert!(
-                    error.to_string().contains("STORAGE_ROOT authority must not be empty"),
+                    error
+                        .to_string()
+                        .contains("STORAGE_ROOT authority must not be empty"),
                     "{error}"
                 );
             }
@@ -2931,7 +2924,11 @@ mod tests {
             &LegacyEnvSnapshot::default(),
         )
         .expect_err("blank explicit storage authority must fail closed");
-        assert!(error.to_string().contains("STORAGE_ROOT authority must not be empty"));
+        assert!(
+            error
+                .to_string()
+                .contains("STORAGE_ROOT authority must not be empty")
+        );
     }
 
     #[test]
@@ -3652,7 +3649,10 @@ mod tests {
 
         let error = copy_dir_recursive(&linked_source, &destination)
             .expect_err("source storage root symlink must not be followed");
-        assert!(error.to_string().contains("must not be a symlink"), "{error}");
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "{error}"
+        );
         assert!(
             fs::symlink_metadata(&destination).is_err(),
             "rejected source authority must not create a destination"
@@ -3675,7 +3675,10 @@ mod tests {
 
         let error = copy_dir_recursive(&source, &linked_destination)
             .expect_err("target storage root symlink must not be followed");
-        assert!(error.to_string().contains("must not be a symlink"), "{error}");
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "{error}"
+        );
         assert!(
             !outside.join("message.txt").exists(),
             "rejected target authority must not receive source bytes"

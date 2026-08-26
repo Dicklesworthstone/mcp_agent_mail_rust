@@ -661,10 +661,7 @@ fn validate_then_decide_reuse_preflight(
     probe_port: impl FnOnce() -> PortStatus,
 ) -> std::io::Result<ReusePreflightDecision> {
     config.validate_user_env_authority()?;
-    Ok(decide_reuse_preflight(
-        reuse_running_enabled,
-        probe_port(),
-    ))
+    Ok(decide_reuse_preflight(reuse_running_enabled, probe_port()))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -812,17 +809,16 @@ fn main() {
                 env_value("AM_REUSE_RUNNING").as_deref(),
             );
 
-            let preflight_decision = match validate_then_decide_reuse_preflight(
-                &config,
-                reuse_running_enabled,
-                || startup_checks::check_port_status(&config.http_host, config.http_port),
-            ) {
-                Ok(decision) => decision,
-                Err(err) => {
-                    tracing::error!("startup configuration rejected: {err}");
-                    std::process::exit(1);
-                }
-            };
+            let preflight_decision =
+                match validate_then_decide_reuse_preflight(&config, reuse_running_enabled, || {
+                    startup_checks::check_port_status(&config.http_host, config.http_port)
+                }) {
+                    Ok(decision) => decision,
+                    Err(err) => {
+                        tracing::error!("startup configuration rejected: {err}");
+                        std::process::exit(1);
+                    }
+                };
             match preflight_decision {
                 ReusePreflightDecision::Proceed => {}
                 ReusePreflightDecision::ReusedExistingServer => {
@@ -1341,7 +1337,10 @@ mod tests {
         .expect_err("unsafe user authority must reject before probing the listener");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(!probe_called, "port probe must not run after authority rejection");
+        assert!(
+            !probe_called,
+            "port probe must not run after authority rejection"
+        );
     }
 
     #[test]

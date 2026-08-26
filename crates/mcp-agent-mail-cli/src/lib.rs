@@ -3603,7 +3603,11 @@ fn execute(cli: Cli) -> CliResult<()> {
     let requires_trusted_user_env = command_requires_trusted_user_env(command.as_ref());
     dispatch_after_user_env_guard(
         requires_trusted_user_env,
-        || Config::from_env().validate_user_env_authority().map_err(Into::into),
+        || {
+            Config::from_env()
+                .validate_user_env_authority()
+                .map_err(Into::into)
+        },
         || match command {
             Some(command) => dispatch_command(command),
             None => handle_default_launch(),
@@ -8446,8 +8450,7 @@ fn verify_setup_status_snapshot_with<F>(
 where
     F: FnOnce() -> Vec<mcp_agent_mail_core::setup::AgentConfigStatus>,
 {
-    let fingerprints_before =
-        collect_setup_self_heal_file_fingerprints(params, target_agents);
+    let fingerprints_before = collect_setup_self_heal_file_fingerprints(params, target_agents);
     let statuses = status_check();
     let residual_drift = setup_status_drift_summaries(&statuses, None);
     let fingerprints_after = collect_setup_self_heal_file_fingerprints(params, target_agents);
@@ -15333,13 +15336,12 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 } else {
                     None
                 };
-            let omp_settings_overlay_paths =
-                if target_agents.contains(&setup::AgentPlatform::Omp) {
-                    setup::omp_settings_overlay_paths_from_env(&pdir)
-                        .map_err(|error| CliError::Other(error.to_string()))?
-                } else {
-                    Vec::new()
-                };
+            let omp_settings_overlay_paths = if target_agents.contains(&setup::AgentPlatform::Omp) {
+                setup::omp_settings_overlay_paths_from_env(&pdir)
+                    .map_err(|error| CliError::Other(error.to_string()))?
+            } else {
+                Vec::new()
+            };
 
             let params = setup::SetupParams {
                 host,
@@ -41342,7 +41344,9 @@ mod tests {
 
         let report = trusted_mailbox_owner_report_with(&config, |_| {
             inspection_called.set(true);
-            Err(CliError::Other("inspection should be unreachable".to_string()))
+            Err(CliError::Other(
+                "inspection should be unreachable".to_string(),
+            ))
         });
 
         assert!(report.is_none());
@@ -44254,9 +44258,11 @@ http_headers = { Authorization = "Bearer secret" }
         }
         assert_eq!(settings_authorities.len(), 12);
         for settings_path in settings_authorities {
-            assert!(first.iter().any(|fingerprint| {
-                fingerprint.path == settings_path.display().to_string()
-            }));
+            assert!(
+                first
+                    .iter()
+                    .any(|fingerprint| { fingerprint.path == settings_path.display().to_string() })
+            );
         }
 
         std::fs::write(&user_config, "mcp_agent_mail").expect("replace user config");
@@ -44395,12 +44401,11 @@ http_headers = { Authorization = "Bearer secret" }
             r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:8765/mcp/"}}}"#,
         )
         .expect("write stable healthy config");
-        let (drift, stable) = verify_setup_status_snapshot_with(
-            &params,
-            &[AgentPlatform::Cline],
-            || mcp_agent_mail_core::setup::check_status(&params),
-        )
-        .expect("unchanged snapshot");
+        let (drift, stable) =
+            verify_setup_status_snapshot_with(&params, &[AgentPlatform::Cline], || {
+                mcp_agent_mail_core::setup::check_status(&params)
+            })
+            .expect("unchanged snapshot");
         assert!(drift.is_empty());
         assert_eq!(
             stable,
