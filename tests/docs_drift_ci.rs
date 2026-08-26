@@ -527,6 +527,11 @@ mod dist_release_contract {
             "local verify_bytes=\"$2\"",
             "[ \"$verify_bytes\" != true ] && [ \"$verify_bytes\" != false ]",
             "if [ \"$verify_bytes\" = true ]; then",
+            "mapfile -t local_assets < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\\n' | sort)",
+            "[ \"${#local_assets[@]}\" -ne 30 ]",
+            "declare -A local_sizes=() local_hashes=()",
+            "local_sizes[\"$asset_name\"]=\"$(stat --format='%s' \"publish/$asset_name\")\"",
+            "local_hashes[\"$asset_name\"]=\"$(sha256sum \"publish/$asset_name\" | awk '{print $1}')\"",
             "Repository name cannot be embedded safely in an upload URL",
             "Release asset name cannot be embedded safely in an upload URL: ${asset_name}",
             "matching_count=\"$(jq -r --arg name \"$asset_name\" '[.[] | select(.name == $name)] | length' <<< \"$staged_assets\")\"",
@@ -734,9 +739,7 @@ mod dist_release_contract {
         )?;
         for needle in [
             "load_remote_assets() {",
-            "[ \"${#expected_names[@]}\" -ne 30 ]",
             "[ \"$asset_count\" -gt 30 ]",
-            "local -a expected_names=() seen_names=()",
             "asset_is_expected=false",
             "[ \"$asset_name\" = \"$expected_name\" ]",
             "asset_is_duplicate=false",
@@ -746,9 +749,13 @@ mod dist_release_contract {
             "EXPECTED_RELEASE_ID: ${{ steps.draft_preflight.outputs.release_id }}",
             "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
             "validate_remote_subset \"$staged_assets\" false",
+            "local_size=\"${local_sizes[$asset_name]}\"",
+            "local_hash=\"${local_hashes[$asset_name]}\"",
         ] {
             require_exactly(workflow, needle, 2)?;
         }
+        require_once(workflow, "[ \"${#expected_names[@]}\" -ne 30 ]")?;
+        require_once(workflow, "local -a expected_names=() seen_names=()")?;
         require_once(
             workflow,
             "'.draft == true and .tag_name == $tag and .target_commitish == $revision and .name == $tag and .prerelease == $prerelease'",
@@ -1196,6 +1203,11 @@ mod dist_release_contract {
                 &workflow,
                 "validate_remote_subset \"$staged_assets\" false",
                 "validate_remote_subset \"$staged_assets\" true",
+            ),
+            mutate(
+                &workflow,
+                "local_hash=\"${local_hashes[$asset_name]}\"",
+                "local_hash=\"$(sha256sum \"publish/$asset_name\" | awk '{print $1}')\"",
             ),
             mutate(
                 &workflow,

@@ -990,18 +990,13 @@ jobs:
             local asset_count asset_id asset_name asset_size asset_digest asset_state
             local local_size local_hash remote_hash expected_digest expected_name seen_name
             local asset_is_duplicate asset_is_expected
-            local -a expected_names=() seen_names=()
+            local -a seen_names=()
 
             if [ "$verify_bytes" != true ] && [ "$verify_bytes" != false ]; then
               echo "Internal error: remote asset byte-verification mode is invalid" >&2
               exit 1
             fi
 
-            mapfile -t expected_names < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
-            if [ "${#expected_names[@]}" -ne 30 ]; then
-              echo "Local release envelope must contain exactly 30 assets" >&2
-              exit 1
-            fi
             asset_count="$(jq -r 'length' <<< "$assets_json")"
             if [ "$asset_count" -gt 30 ]; then
               echo "Isolated draft has too many assets: ${asset_count}" >&2
@@ -1014,7 +1009,7 @@ jobs:
                 exit 1
               fi
               asset_is_expected=false
-              for expected_name in "${expected_names[@]}"; do
+              for expected_name in "${local_assets[@]}"; do
                 if [ "$asset_name" = "$expected_name" ]; then
                   asset_is_expected=true
                   break
@@ -1032,8 +1027,8 @@ jobs:
                 exit 1
               fi
               seen_names+=("$asset_name")
-              local_size="$(stat --format='%s' "publish/$asset_name")"
-              local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+              local_size="${local_sizes[$asset_name]}"
+              local_hash="${local_hashes[$asset_name]}"
               expected_digest="sha256:${local_hash}"
               if [ "$asset_size" != "$local_size" ] || [ "$asset_digest" != "$expected_digest" ] || [ "$asset_state" != uploaded ]; then
                 echo "Existing isolated-draft asset metadata differs from local ${asset_name}" >&2
@@ -1053,15 +1048,29 @@ jobs:
             done < <(jq -r '.[] | [.id, .name, .size, .digest, .state] | @tsv' <<< "$assets_json")
           }
 
-          assert_isolated_draft
-          staged_assets="$(load_remote_assets)"
-          validate_remote_subset "$staged_assets" true
           mapfile -t local_assets < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "${#local_assets[@]}" -ne 30 ]; then
+            echo "Local release envelope must contain exactly 30 assets" >&2
+            exit 1
+          fi
+          declare -A local_sizes=() local_hashes=()
           for asset_name in "${local_assets[@]}"; do
             if [[ ! "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]]; then
               echo "Release asset name cannot be embedded safely in an upload URL: ${asset_name}" >&2
               exit 1
             fi
+            if [ ! -f "publish/$asset_name" ] || [ -L "publish/$asset_name" ] || [ ! -s "publish/$asset_name" ]; then
+              echo "Local release asset is not a nonempty regular file: ${asset_name}" >&2
+              exit 1
+            fi
+            local_sizes["$asset_name"]="$(stat --format='%s' "publish/$asset_name")"
+            local_hashes["$asset_name"]="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+          done
+
+          assert_isolated_draft
+          staged_assets="$(load_remote_assets)"
+          validate_remote_subset "$staged_assets" true
+          for asset_name in "${local_assets[@]}"; do
             matching_count="$(jq -r --arg name "$asset_name" '[.[] | select(.name == $name)] | length' <<< "$staged_assets")"
             if [ "$matching_count" -eq 1 ]; then
               continue
@@ -1072,8 +1081,8 @@ jobs:
             fi
 
             assert_isolated_draft
-            local_size="$(stat --format='%s' "publish/$asset_name")"
-            local_hash="$(sha256sum "publish/$asset_name" | awk '{print $1}')"
+            local_size="${local_sizes[$asset_name]}"
+            local_hash="${local_hashes[$asset_name]}"
             expected_digest="sha256:${local_hash}"
             upload_response="$(curl \
               --fail-with-body --silent --show-error \

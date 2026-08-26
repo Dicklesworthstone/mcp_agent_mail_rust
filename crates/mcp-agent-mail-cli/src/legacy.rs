@@ -2353,20 +2353,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
         let target = dst.join(entry.file_name());
         let metadata = fs::symlink_metadata(&path)?;
         if storage_metadata_is_link_like(&metadata) {
-            if path.is_dir() {
-                return Err(CliError::InvalidArgument(format!(
-                    "symlinked directories are not supported during recursive copy: {}",
-                    path.display()
-                )));
-            }
-            if path.is_file() {
-                return Err(CliError::InvalidArgument(format!(
-                    "symlinked files are not supported during recursive copy: {}",
-                    path.display()
-                )));
-            }
             return Err(CliError::InvalidArgument(format!(
-                "broken symlink encountered during recursive copy: {}",
+                "symlink or reparse-point entry is not supported during recursive copy: {}",
                 path.display()
             )));
         }
@@ -2668,7 +2656,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_project_authority_fails_closed_without_user_fallback() {
+    fn legacy_hardening_blank_project_authority_fails_closed_without_user_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = LegacyEnvSnapshot {
             project: Some(EnvAuthoritySnapshot {
@@ -2897,7 +2885,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_database_authorities_reject_empty_or_whitespace_values() {
+    fn legacy_hardening_database_authorities_reject_empty_or_whitespace_values() {
         let root = tempfile::tempdir().unwrap();
         for value in ["", " ", "\t\r\n"] {
             let error = parse_database_value(value, root.path(), ResolvedSource::ProcessEnv)
@@ -2919,7 +2907,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_storage_authorities_reject_empty_or_whitespace_values() {
+    fn legacy_hardening_storage_authorities_reject_empty_or_whitespace_values() {
         let root = tempfile::tempdir().unwrap();
         for source in [
             ResolvedSource::ProcessEnv,
@@ -3609,7 +3597,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_symlinked_directories() {
+    fn legacy_hardening_copy_rejects_symlinked_directories() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3623,7 +3611,7 @@ mod tests {
         let err = copy_dir_recursive(&src, &dst).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("symlinked directories are not supported"));
+                assert!(msg.contains("symlink or reparse-point entry"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
@@ -3631,7 +3619,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_broken_symlinks() {
+    fn legacy_hardening_copy_rejects_broken_symlinks() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3643,7 +3631,7 @@ mod tests {
         let err = copy_dir_recursive(&src, &dst).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("broken symlink encountered"));
+                assert!(msg.contains("symlink or reparse-point entry"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
@@ -3651,7 +3639,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_symlinked_source_root() {
+    fn legacy_hardening_copy_rejects_symlinked_source_root() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3673,7 +3661,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_symlinked_target_root() {
+    fn legacy_hardening_copy_rejects_symlinked_target_root() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3696,7 +3684,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_unix_socket_entries() {
+    fn legacy_hardening_copy_rejects_unix_socket_entries() {
         use std::os::unix::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4372,7 +4360,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copy_dir_recursive_rejects_symlinked_files() {
+    fn legacy_hardening_copy_rejects_symlinked_files() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4386,7 +4374,7 @@ mod tests {
         let err = copy_dir_recursive(&src, &dst).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
-                assert!(msg.contains("symlinked files are not supported"));
+                assert!(msg.contains("symlink or reparse-point entry"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }
