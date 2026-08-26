@@ -2351,9 +2351,7 @@ fn check_setup_real_directory(
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) => {
                         let link_like = setup_metadata_is_link_like(&metadata);
-                        if link_like
-                            && crate::disk::is_trusted_system_directory_alias(&current)
-                        {
+                        if link_like && crate::disk::is_trusted_system_directory_alias(&current) {
                             continue;
                         }
                         if link_like {
@@ -2482,11 +2480,8 @@ fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectory
     use rustix::fs::{CWD, Mode, OFlags, openat};
 
     let path = setup_directory_authority_path(path);
-    let flags = OFlags::RDONLY
-        | OFlags::CLOEXEC
-        | OFlags::DIRECTORY
-        | OFlags::NOFOLLOW
-        | OFlags::NONBLOCK;
+    let flags =
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
     let anchor = if path.is_absolute() {
         Path::new("/")
     } else {
@@ -2509,8 +2504,7 @@ fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectory
                 ));
             }
             std::path::Component::Normal(segment) => {
-                fd = openat(&fd, segment, flags, Mode::empty())
-                    .map_err(std::io::Error::from)?;
+                fd = openat(&fd, segment, flags, Mode::empty()).map_err(std::io::Error::from)?;
             }
         }
     }
@@ -2564,9 +2558,8 @@ fn snapshot_open_setup_file(
         ));
     }
 
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(metadata.len().min(64 * 1024)).unwrap_or(64 * 1024),
-    );
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.len().min(64 * 1024)).unwrap_or(64 * 1024));
     Read::by_ref(&mut file)
         .take(SETUP_CONFIG_FILE_MAX_BYTES + 1)
         .read_to_end(&mut bytes)?;
@@ -2621,8 +2614,7 @@ fn read_setup_file_with_authority(
         let authority = if let Some(authority) = authority {
             authority
         } else {
-            if !parent.as_os_str().is_empty()
-                && !check_setup_real_directory(parent, label, false)?
+            if !parent.as_os_str().is_empty() && !check_setup_real_directory(parent, label, false)?
             {
                 return Ok(None);
             }
@@ -2639,9 +2631,7 @@ fn read_setup_file_with_authority(
     #[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
     {
         let _ = authority;
-        if !parent.as_os_str().is_empty()
-            && !check_setup_real_directory(parent, label, false)?
-        {
+        if !parent.as_os_str().is_empty() && !check_setup_real_directory(parent, label, false)? {
             return Ok(None);
         }
         let file = match crate::disk::open_regular_file_no_follow(path) {
@@ -2696,11 +2686,7 @@ fn create_unique_setup_file_at(
         match openat(
             &authority.fd,
             candidate.as_str(),
-            OFlags::WRONLY
-                | OFlags::CREATE
-                | OFlags::EXCL
-                | OFlags::CLOEXEC
-                | OFlags::NOFOLLOW,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::from_raw_mode(permissions),
         ) {
             Ok(fd) => {
@@ -2758,7 +2744,8 @@ fn revalidate_setup_directory_authority(
     let observed = open_setup_directory_authority(path)?;
     let expected_stat = fstat(&authority.fd).map_err(std::io::Error::from)?;
     let observed_stat = fstat(&observed.fd).map_err(std::io::Error::from)?;
-    if expected_stat.st_dev != observed_stat.st_dev || expected_stat.st_ino != observed_stat.st_ino {
+    if expected_stat.st_dev != observed_stat.st_dev || expected_stat.st_ino != observed_stat.st_ino
+    {
         return Err(invalid_setup_path(
             "setup directory authority",
             path,
@@ -2847,11 +2834,7 @@ fn write_setup_file_atomic_bound(
     )
 }
 
-#[cfg(all(
-    test,
-    unix,
-    any(target_vendor = "apple", target_os = "linux")
-))]
+#[cfg(all(test, unix, any(target_vendor = "apple", target_os = "linux")))]
 fn write_setup_file_atomic_bound_with_hook(
     path: &Path,
     content: &[u8],
@@ -2922,12 +2905,8 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
             RenameFlags::EXCHANGE,
         )
         .map_err(std::io::Error::from)?;
-        let observed = snapshot_setup_authority_leaf(
-            authority,
-            std::ffi::OsStr::new(&temp_name),
-            path,
-            label,
-        );
+        let observed =
+            snapshot_setup_authority_leaf(authority, std::ffi::OsStr::new(&temp_name), path, label);
         let observed = match observed {
             Ok(Some(observed)) if setup_snapshots_match(expected, &observed) => observed,
             Ok(Some(_) | None) | Err(_) => {
@@ -2966,12 +2945,9 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
             fsync(&authority.fd).map_err(std::io::Error::from)?;
             return Err(error);
         }
-        if let Err(error) = retain_exchanged_setup_file(
-            authority,
-            &temp_name,
-            &display_name,
-            "replaced",
-        ) {
+        if let Err(error) =
+            retain_exchanged_setup_file(authority, &temp_name, &display_name, "replaced")
+        {
             renameat_with(
                 &authority.fd,
                 temp_name.as_str(),
@@ -3055,15 +3031,8 @@ fn write_setup_file_atomic_with_authority(
         file.sync_all()?;
         drop(file);
 
-        if backup_existing
-            && let Some(existing) = expected
-        {
-            write_setup_backup(
-                existing.content.as_bytes(),
-                parent,
-                &file_name,
-                permissions,
-            )?;
+        if backup_existing && let Some(existing) = expected {
+            write_setup_backup(existing.content.as_bytes(), parent, &file_name, permissions)?;
         }
 
         #[cfg(unix)]
@@ -6591,7 +6560,9 @@ mod tests {
             "explicit-token"
         );
         assert_eq!(
-            resolve_existing_token(None, file.path()).unwrap().as_deref(),
+            resolve_existing_token(None, file.path())
+                .unwrap()
+                .as_deref(),
             Some("file-token")
         );
     }
@@ -8457,7 +8428,10 @@ mod tests {
         .expect_err("a parent pathname swap must make the transaction report failure");
 
         assert!(!attacker_parent.join("config.json").exists(), "{error}");
-        assert!(!path.exists(), "the swapped pathname must not receive the secret");
+        assert!(
+            !path.exists(),
+            "the swapped pathname must not receive the secret"
+        );
         let bound_target = displaced_parent.join("config.json");
         assert!(
             std::fs::read_to_string(&bound_target)
@@ -8465,7 +8439,11 @@ mod tests {
                 .contains("bound-secret")
         );
         assert_eq!(
-            std::fs::metadata(bound_target).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(bound_target)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
     }
@@ -8524,7 +8502,11 @@ mod tests {
         })
         .unwrap();
 
-        assert!(std::fs::read_to_string(&path).unwrap().contains("test-secret"));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("test-secret")
+        );
         assert!(
             !Command::new("git")
                 .arg("-C")
@@ -8977,7 +8959,10 @@ mod tests {
         );
         for artifact_entry in GITIGNORE_ATOMIC_ARTIFACT_ENTRIES {
             assert_eq!(
-                content.lines().filter(|line| *line == artifact_entry).count(),
+                content
+                    .lines()
+                    .filter(|line| *line == artifact_entry)
+                    .count(),
                 1,
                 "the gitignore writer must protect its own {artifact_entry} artifacts exactly once"
             );
@@ -10147,10 +10132,7 @@ http_headers = { Authorization = "Bearer tok" }
         .unwrap();
         let deny_wins = first_setup_status_file(&params);
         assert!(!deny_wins.omp_mcp_alias_drift);
-        assert_eq!(
-            deny_wins.drift_reasons,
-            Vec::<ConfigDriftReason>::new()
-        );
+        assert_eq!(deny_wins.drift_reasons, Vec::<ConfigDriftReason>::new());
 
         std::fs::write(&user, r#"{"enabledServers":["mcp_agent_mail"]}"#).unwrap();
         let forced_live = first_setup_status_file(&params);

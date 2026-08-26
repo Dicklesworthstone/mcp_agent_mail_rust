@@ -6399,11 +6399,10 @@ async fn create_message_with_recipients_impl(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let storage_root =
-            match pool.validated_storage_root("message creation archive allocator") {
-                Ok(storage_root) => storage_root,
-                Err(error) => return Outcome::Err(error),
-            };
+        let storage_root = match pool.validated_storage_root("message creation archive allocator") {
+            Ok(storage_root) => storage_root,
+            Err(error) => return Outcome::Err(error),
+        };
         let message_id = match id_allocator.allocate(cx, db_floor, storage_root).await {
             Outcome::Ok(id) => id,
             Outcome::Err(error) => return Outcome::Err(error),
@@ -7426,6 +7425,181 @@ pub async fn list_message_recipient_names_for_messages(
     out.sort();
     out.dedup();
     Outcome::Ok(out)
+}
+
+/// List the distinct agent names that have participated in a thread, capped to
+/// the `limit` most recent thread messages (the numeric root message, when the
+/// thread id parses as one, is always included).
+///
+/// GH#260: purpose-built for `send_message`/`reply_message` contact
+/// enforcement, which only needs participant *names*. The general
+/// `list_thread_messages` + `list_message_recipient_names_for_messages` pair
+/// materializes full `body_md` for every row and uses `OR`-disjunct and
+/// `IN (…) + JOIN` shapes that FrankenSQLite's planner executes as whole-table
+/// nested loops — on a ~47k-row mailbox one send into a ≥500-message thread
+/// burned CPU for minutes behind the global message-write serializer. This
+/// variant issues only narrow, single-predicate, join-free queries:
+///
+/// 1. `messages(project_id, thread_id)` scan via `idx_msg_thread_created`,
+///    projecting `(id, sender_id)` only — no `OR m.id = ?` disjunct, no join,
+///    no bodies;
+/// 2. a primary-key point lookup for the numeric thread root, when applicable;
+/// 3. `message_recipients.message_id IN (…)` over the table's
+///    `(message_id, agent_id)` primary key — no join back onto `messages`
+///    (the ids are already project-scoped by query 1/2);
+/// 4. one `agents.id IN (…)` pass to resolve names.
+pub async fn list_thread_participant_names(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    thread_id: &str,
+    limit: usize,
+) -> Outcome<Vec<String>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let mut message_ids: Vec<i64> = Vec::new();
+    let mut agent_ids: Vec<i64> = Vec::new();
+
+    let member_sql = "SELECT m.id AS id, m.sender_id AS sender_id \
+         FROM messages m \
+         WHERE m.project_id = ? AND m.thread_id = ? \
+         ORDER BY m.created_ts DESC, m.id DESC \
+         LIMIT ?";
+    let member_params = [
+        Value::BigInt(project_id),
+        Value::Text(thread_id.to_string()),
+        Value::BigInt(limit_i64),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, member_sql, &member_params).await) {
+        Outcome::Ok(rows) => {
+            for row in rows {
+                let id: i64 = match row.get_named("id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let sender_id: i64 = match row.get_named("sender_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                message_ids.push(id);
+                agent_ids.push(sender_id);
+            }
+        }
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
+    // Numeric thread ids are reply-seeded threads rooted at that message id:
+    // fetch the root by primary key instead of folding it into the thread scan
+    // as an `OR` disjunct (which defeats the thread index).
+    if let Ok(root_id) = thread_id.parse::<i64>()
+        && !message_ids.contains(&root_id)
+    {
+        let root_sql = "SELECT m.id AS id, m.sender_id AS sender_id \
+                 FROM messages m WHERE m.project_id = ? AND m.id = ?";
+        let root_params = [Value::BigInt(project_id), Value::BigInt(root_id)];
+        match map_sql_outcome(traw_query(cx, &tracked, root_sql, &root_params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let id: i64 = match row.get_named("id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let sender_id: i64 = match row.get_named("sender_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    message_ids.push(id);
+                    agent_ids.push(sender_id);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+
+    if message_ids.is_empty() {
+        return Outcome::Ok(vec![]);
+    }
+
+    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT r.agent_id AS agent_id FROM message_recipients r \
+             WHERE r.message_id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params: Vec<Value> = chunk.iter().map(|id| Value::BigInt(*id)).collect();
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let agent_id: i64 = match row.get_named("agent_id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    agent_ids.push(agent_id);
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+
+    agent_ids.sort_unstable();
+    agent_ids.dedup();
+
+    let mut names: Vec<String> = Vec::with_capacity(agent_ids.len());
+    let mut name_by_id: HashMap<i64, String> = HashMap::with_capacity(agent_ids.len());
+    for chunk in agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT a.id AS id, a.name AS name FROM agents a WHERE a.id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params: Vec<Value> = chunk.iter().map(|id| Value::BigInt(*id)).collect();
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let id: i64 = match row.get_named("id") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    let name: Option<String> = match row.get_named("name") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    name_by_id.insert(id, resolved_agent_display(id, name));
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+    for id in &agent_ids {
+        names.push(
+            name_by_id
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| unknown_agent_display(*id)),
+        );
+    }
+
+    names.sort();
+    names.dedup();
+    Outcome::Ok(names)
 }
 
 /// List recipients for a single message, preserving delivery kind ordering.
@@ -16284,26 +16458,26 @@ mod tests {
         ));
 
         let expected_cancel = CancelReason::user("injected floor cancellation");
-        let cancelled = decode_messages_id_floor_outcome(Outcome::Cancelled(
-            expected_cancel.clone(),
-        ));
+        let cancelled =
+            decode_messages_id_floor_outcome(Outcome::Cancelled(expected_cancel.clone()));
         assert!(matches!(
             cancelled,
             Outcome::Cancelled(reason) if reason == expected_cancel
         ));
 
         let expected_panic = asupersync::PanicPayload::new("injected floor panic");
-        let panicked =
-            decode_messages_id_floor_outcome(Outcome::Panicked(expected_panic.clone()));
+        let panicked = decode_messages_id_floor_outcome(Outcome::Panicked(expected_panic.clone()));
         assert!(matches!(
             panicked,
             Outcome::Panicked(payload) if payload == expected_panic
         ));
 
         let empty = decode_messages_id_floor_outcome(Outcome::Ok(Vec::new()));
-        assert!(matches!(empty, Outcome::Err(DbError::Internal(message)) if message.contains(
-            "exactly one"
-        )));
+        assert!(
+            matches!(empty, Outcome::Err(DbError::Internal(message)) if message.contains(
+                "exactly one"
+            ))
+        );
     }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {
@@ -24186,8 +24360,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (_setup_cx, pool, _dir) =
-            setup_test_pool("recent_contact_union_matches_legacy.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_union_matches_legacy.db");
 
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
@@ -24432,8 +24605,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (_setup_cx, pool, _dir) =
-            setup_test_pool("recent_contact_bidirectional_dedup.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("recent_contact_bidirectional_dedup.db");
 
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
@@ -26826,6 +26998,131 @@ mod tests {
     }
 
     #[test]
+    fn list_thread_participant_names_covers_senders_recipients_and_numeric_root() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("thread_participant_names.db");
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-thread-participants-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let mut agent_ids = Vec::new();
+            for name in ["GreenStone", "BlueLake", "RedFox"] {
+                let agent = register_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "codex-cli",
+                    "gpt-5",
+                    Some("participant"),
+                    Some("auto"),
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("register agent");
+                agent_ids.push(agent.id.expect("agent id"));
+            }
+            let (green_id, blue_id, red_id) = (agent_ids[0], agent_ids[1], agent_ids[2]);
+
+            // Numeric (reply-seeded) thread: root message without a thread id,
+            // then a reply carrying the root id as its thread id.
+            let root = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                green_id,
+                "Thread root",
+                "Body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(blue_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create root message");
+            let root_id = root.id.expect("root message id");
+            let thread = root_id.to_string();
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                red_id,
+                "Reply",
+                "Body",
+                Some(&thread),
+                "normal",
+                false,
+                "[]",
+                &[(green_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create reply");
+
+            let names = list_thread_participant_names(&cx, &pool, project_id, &thread, 500)
+                .await
+                .into_result()
+                .expect("list numeric-thread participants");
+            assert_eq!(
+                names,
+                vec![
+                    "BlueLake".to_string(),
+                    "GreenStone".to_string(),
+                    "RedFox".to_string()
+                ],
+                "numeric thread must include the root's sender/recipients and the reply's"
+            );
+
+            // Alphanumeric thread id.
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                green_id,
+                "Alpha thread",
+                "Body",
+                Some("alpha-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(blue_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create alpha-thread message");
+            let names = list_thread_participant_names(&cx, &pool, project_id, "alpha-thread", 500)
+                .await
+                .into_result()
+                .expect("list alpha-thread participants");
+            assert_eq!(
+                names,
+                vec!["BlueLake".to_string(), "GreenStone".to_string()]
+            );
+
+            // Unknown thread id resolves to no participants.
+            let names =
+                list_thread_participant_names(&cx, &pool, project_id, "no-such-thread", 500)
+                    .await
+                    .into_result()
+                    .expect("list unknown-thread participants");
+            assert!(names.is_empty());
+        });
+    }
+
+    #[test]
     fn count_unread_global_empty_returns_empty() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -27819,8 +28116,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (_setup_cx, pool, _dir) =
-            setup_test_pool("acknowledge_messages_batch_large_wave.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("acknowledge_messages_batch_large_wave.db");
 
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
@@ -28069,8 +28365,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (_setup_cx, pool, _dir) =
-            setup_test_pool("mark_message_read_keeps_ack_pending.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("mark_message_read_keeps_ack_pending.db");
 
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
@@ -28166,8 +28461,7 @@ mod tests {
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let (_setup_cx, pool, _dir) =
-            setup_test_pool("mark_message_read_missing_inbox_stats.db");
+        let (_setup_cx, pool, _dir) = setup_test_pool("mark_message_read_missing_inbox_stats.db");
 
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");

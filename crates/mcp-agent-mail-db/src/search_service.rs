@@ -1292,10 +1292,24 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
         last_backfill_at_micros: Some(state.updated_at_micros),
         rebuild_in_progress: false,
         active_db_identity: active_key,
-        stale_reason,
         safe_remediation: (health_state != "fresh").then(|| {
-            "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string()
+            if stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("process-global lexical bridge"))
+            {
+                // GH#261: the active-bridge key is process-global state inside
+                // the daemon; an external `am robot search` runs in a different
+                // process and can never clear it, so hinting it sends
+                // operators in circles.
+                "Restart the server process so the lexical bridge rebinds to this database \
+                 (the active-bridge key is process-global; an external `am robot search` \
+                 cannot clear it)"
+                    .to_string()
+            } else {
+                "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string()
+            }
         }),
+        stale_reason,
     }
 }
 
@@ -1369,6 +1383,31 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
     if crate::search_v3::get_bridge().is_none() {
         return Ok(());
     }
+    let _guard = lexical_init_guard()
+        .lock()
+        .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
+    record_lexical_bootstrap_success(&sqlite_key)
+}
+
+/// Record startup lexical backfill completion under the live pool's identity.
+///
+/// GH#261: the URL-based [`note_startup_lexical_backfill_completed`] derives a
+/// *bare path* key, while `lexical_backfill_health` and
+/// `ensure_lexical_bridge_initialized` compare against
+/// `pool.sqlite_identity_key()` (`path@generation`). Those strings can never be
+/// equal, so a daemon whose startup backfill completed before its first search
+/// marked its own (only) database as "a different database" and silently served
+/// the plain-SQL fallback for its entire lifetime. Callers that have (or can
+/// resolve) the live pool must use this variant so completion is recorded under
+/// exactly the identity the health probe checks.
+pub fn note_startup_lexical_backfill_completed_for_pool(pool: &DbPool) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    if crate::search_v3::get_bridge().is_none() {
+        return Ok(());
+    }
+    let sqlite_key = sqlite_key_for_pool(pool);
     let _guard = lexical_init_guard()
         .lock()
         .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
@@ -4861,8 +4900,7 @@ mod tests {
         let foreign_storage_root = root.path().join("foreign-storage-root");
         let foreign_index = foreign_storage_root.join("search_index");
         std::fs::create_dir_all(&foreign_index).expect("create foreign search index");
-        std::fs::write(foreign_index.join("meta.json"), "{}")
-            .expect("write foreign index marker");
+        std::fs::write(foreign_index.join("meta.json"), "{}").expect("write foreign index marker");
         let pool = crate::DbPool::new(&crate::DbPoolConfig {
             database_url: format!("sqlite:///{}", root.path().join("mail.sqlite3").display()),
             storage_root: Some(frozen_storage_root.clone()),
@@ -5492,6 +5530,55 @@ mod tests {
             assert!(cached.is_none());
             assert!(active_key.is_none());
             assert!(!has_run_lexical_backfill(&sqlite_key).expect("backfill marker"));
+        }
+
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn startup_lexical_backfill_completion_for_pool_binds_pool_identity() {
+        // GH#261: recording completion under the URL-derived bare path while
+        // the health probe compares `pool.sqlite_identity_key()`
+        // ("path@generation") permanently marked a daemon's only database as
+        // foreign. The pool-keyed recording must bind exactly the identity the
+        // health probe checks.
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        let bridge_ready = crate::search_v3::get_bridge().is_some();
+
+        note_startup_lexical_backfill_completed_for_pool(&pool)
+            .expect("record pool-keyed startup bootstrap");
+
+        let active_key = lexical_active_db_key()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        if bridge_ready {
+            let pool_key = pool.sqlite_identity_key();
+            assert_eq!(
+                active_key.as_deref(),
+                Some(pool_key.as_str()),
+                "startup completion must be recorded under the pool identity the health probe compares"
+            );
+            assert!(has_run_lexical_backfill(&pool_key).expect("backfill marker"));
+            let health = lexical_backfill_health(&pool);
+            assert!(
+                !health
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("process-global lexical bridge"),
+                "the daemon's own database must not be reported as a different database: {:?}",
+                health.stale_reason
+            );
+        } else {
+            assert!(active_key.is_none());
         }
 
         reset_lexical_bootstrap_tracking();

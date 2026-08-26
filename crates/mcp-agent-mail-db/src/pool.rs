@@ -2961,12 +2961,9 @@ fn shared_message_id_allocator(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             logical_entries.retain(|_, entry| entry.allocator.strong_count() > 0);
-            let existing = logical_entries.get(identity).map(|entry| {
-                (
-                    entry.storage_root_identity.clone(),
-                    entry.allocator.clone(),
-                )
-            });
+            let existing = logical_entries
+                .get(identity)
+                .map(|entry| (entry.storage_root_identity.clone(), entry.allocator.clone()));
             if let Some((established_root, weak_allocator)) = existing {
                 if established_root != storage_root_identity {
                     return Err(message_id_storage_root_conflict(
@@ -3037,10 +3034,11 @@ fn message_id_storage_root_conflict(
 
 fn invalidate_file_message_id_allocator(normalized_identity: &Path) -> bool {
     let registry = FILE_MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = registry
+    let entry = registry
         .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let Some(entry) = guard.remove(normalized_identity) else {
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(normalized_identity);
+    let Some(entry) = entry else {
         return false;
     };
     if let Some(allocator) = entry.allocator.upgrade() {
@@ -3331,15 +3329,11 @@ impl DbPool {
         let Some(atc_path) = self.atc_sqlite_path() else {
             return Ok(None);
         };
-        validate_frozen_sqlite_open_authority(
-            &atc_path,
-            Some(Path::new(&atc_path)),
-            context,
-        )
-        .map_err(|error| DbError::InvalidArgument {
-            field: "database_url",
-            message: error.to_string(),
-        })?;
+        validate_frozen_sqlite_open_authority(&atc_path, Some(Path::new(&atc_path)), context)
+            .map_err(|error| DbError::InvalidArgument {
+                field: "database_url",
+                message: error.to_string(),
+            })?;
         Ok(Some(atc_path))
     }
 
@@ -3447,10 +3441,9 @@ impl DbPool {
     #[allow(clippy::too_many_lines)]
     async fn acquire_once(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
         let start = Instant::now();
-        if let Err(error) = validate_frozen_storage_root_authority(
-            &self.storage_root,
-            "pooled connection checkout",
-        ) {
+        if let Err(error) =
+            validate_frozen_storage_root_authority(&self.storage_root, "pooled connection checkout")
+        {
             let dur_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
                 .unwrap_or(u64::MAX);
             let metrics = mcp_agent_mail_core::global_metrics();
@@ -3872,11 +3865,9 @@ impl DbPool {
                             error = %e,
                             "startup integrity check failed to open sqlite file; attempting auto-recovery"
                         );
-                        recover_sqlite_file_with_storage_root(
-                            sqlite_path,
-                            storage_root,
-                        )
-                        .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
+                        recover_sqlite_file_with_storage_root(sqlite_path, storage_root).map_err(
+                            |re| DbError::Sqlite(format!("startup recovery failed: {re}")),
+                        )?;
                         self.validated_sqlite_path("startup integrity post-recovery open")?;
                         open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                             DbError::Sqlite(format!(
@@ -3909,10 +3900,8 @@ impl DbPool {
                     // Close connection before attempting restore (Windows/locking safety)
                     drop(conn);
 
-                    if let Err(e) = recover_sqlite_file_with_storage_root(
-                        sqlite_path,
-                        storage_root,
-                    ) {
+                    if let Err(e) = recover_sqlite_file_with_storage_root(sqlite_path, storage_root)
+                    {
                         return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
                     }
                     self.validated_sqlite_path("startup integrity post-recovery open")?;
@@ -3946,10 +3935,9 @@ impl DbPool {
 
                     drop(conn);
 
-                    if let Err(recovery_error) = recover_sqlite_file_with_storage_root(
-                        sqlite_path,
-                        storage_root,
-                    ) {
+                    if let Err(recovery_error) =
+                        recover_sqlite_file_with_storage_root(sqlite_path, storage_root)
+                    {
                         return Err(DbError::Sqlite(format!(
                             "startup recovery failed: {recovery_error}"
                         )));
@@ -4116,11 +4104,9 @@ impl DbPool {
         let requires_preopen_admission =
             self.integrity_family_requires_preopen_admission(false, "full integrity check")?;
         let raw_conn = if requires_preopen_admission {
-            with_recovery_mutation_admission(
-                sqlite_path,
-                "full integrity pre-open",
-                || open_sqlite_file_with_lock_retry(&self.sqlite_path),
-            )
+            with_recovery_mutation_admission(sqlite_path, "full integrity pre-open", || {
+                open_sqlite_file_with_lock_retry(&self.sqlite_path)
+            })
             .map_err(|error| {
                 DbError::Sqlite(format!(
                     "full integrity check: admitted pre-open failed: {error}"
@@ -4140,13 +4126,9 @@ impl DbPool {
                         error = %e,
                         "full integrity check failed to open sqlite file; attempting auto-recovery"
                     );
-                    recover_sqlite_file_with_storage_root(
-                        sqlite_path,
-                        storage_root,
-                    )
-                    .map_err(|re| {
-                        DbError::Sqlite(format!("full integrity recovery failed: {re}"))
-                    })?;
+                    recover_sqlite_file_with_storage_root(sqlite_path, storage_root).map_err(
+                        |re| DbError::Sqlite(format!("full integrity recovery failed: {re}")),
+                    )?;
                     self.validated_sqlite_path("full integrity post-recovery open")?;
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                         DbError::Sqlite(format!(
@@ -4192,11 +4174,8 @@ impl DbPool {
         // Keep consistency sampling read-only and avoid JOIN-heavy scans:
         // 1) fetch recent envelopes
         // 2) resolve slugs/names via batched point lookups
-        let conn = open_guarded_read_only_franken_existing_file(
-            sqlite_path,
-            "consistency probe",
-        )
-        .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
+        let conn = open_guarded_read_only_franken_existing_file(sqlite_path, "consistency probe")
+            .map_err(|e| DbError::Sqlite(format!("consistency probe: open failed: {e}")))?;
         // This two-phase strategy is materially faster than a three-way JOIN on
         // large mailboxes and reduces startup probe lock contention.
         let message_rows = conn
@@ -4931,9 +4910,8 @@ struct SqliteInitGateKey {
     storage_root_identity: PathBuf,
 }
 
-static SQLITE_INIT_GATES: OnceLock<
-    OrderedRwLock<HashMap<SqliteInitGateKey, Arc<SqliteInitGate>>>,
-> = OnceLock::new();
+static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<SqliteInitGateKey, Arc<SqliteInitGate>>>> =
+    OnceLock::new();
 static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, Weak<Pool<DbConn>>>>> =
     OnceLock::new();
 
@@ -4986,8 +4964,7 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
     }
     let namespace = sqlite_identity_cache_namespace(identity);
     for generation in &retired_generations {
-        crate::cache::read_cache()
-            .invalidate_scope(&format!("{namespace}@{generation}"));
+        crate::cache::read_cache().invalidate_scope(&format!("{namespace}@{generation}"));
     }
 
     let init_gates_cleared = {
@@ -5037,6 +5014,7 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
 /// Return the lossless normalized identity for a file-backed SQLite path.
 /// `None` is the in-memory sentinel, which must remain isolated by underlying
 /// pool identity rather than entering any file-backed registry.
+#[cfg(test)]
 fn normalize_file_sqlite_identity(path: &str) -> Option<PathBuf> {
     (path != ":memory:").then(|| normalize_sqlite_identity_path_buf(Path::new(path)))
 }
@@ -5063,7 +5041,7 @@ fn normalize_sqlite_identity_path_buf_uncached(path: &Path) -> PathBuf {
         if let Ok(canonical_prefix) = std::fs::canonicalize(existing_prefix) {
             let unresolved_suffix = absolute
                 .strip_prefix(existing_prefix)
-                .unwrap_or(Path::new(""));
+                .unwrap_or_else(|_| Path::new(""));
             let canonical_prefix =
                 mcp_agent_mail_core::disk::simplify_verbatim_path(&canonical_prefix);
             return normalize_lexical_path(
@@ -5085,7 +5063,10 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if matches!(normalized.components().next_back(), Some(Component::Normal(_))) {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
                     normalized.pop();
                 } else if !normalized.has_root() {
                     normalized.push(component.as_os_str());
@@ -5104,7 +5085,7 @@ fn sqlite_identity_cache_namespace(path: &Path) -> String {
 
     #[cfg(unix)]
     {
-        return format!("unix-hex:{}", hex::encode(path.as_os_str().as_bytes()));
+        format!("unix-hex:{}", hex::encode(path.as_os_str().as_bytes()))
     }
 
     #[cfg(windows)]
@@ -5114,7 +5095,7 @@ fn sqlite_identity_cache_namespace(path: &Path) -> String {
             .encode_wide()
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
-        return format!("windows-utf16le-hex:{}", hex::encode(bytes));
+        format!("windows-utf16le-hex:{}", hex::encode(bytes))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -5171,10 +5152,8 @@ impl DbPoolAuthority {
         let (sqlite_identity, sqlite_path) = if selected_sqlite_path == ":memory:" {
             (None, ":memory:".to_string())
         } else {
-            let absolute_alias = absolute_lexical_authority_path(
-                Path::new(&selected_sqlite_path),
-                "database_url",
-            )?;
+            let absolute_alias =
+                absolute_lexical_authority_path(Path::new(&selected_sqlite_path), "database_url")?;
             let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
             let open_path = sqlite_open_path_for_identity(&absolute_alias, &identity)?;
             (Some(identity), open_path)
@@ -5278,6 +5257,7 @@ fn normalize_sqlite_identity_path_lossless(path: &Path) -> PathBuf {
     })
 }
 
+#[cfg(test)]
 fn pool_cache_key(config: &DbPoolConfig) -> DbResult<PoolCacheKey> {
     let authority = DbPoolAuthority::resolve(config)?;
     Ok(pool_cache_key_from_authority(
@@ -9377,8 +9357,7 @@ pub fn normalize_sqlite_path_for_pool_key(sqlite_path: &str) -> String {
     if selected == ":memory:" {
         return selected;
     }
-    let Ok(absolute_alias) =
-        absolute_lexical_authority_path(Path::new(&selected), "database_url")
+    let Ok(absolute_alias) = absolute_lexical_authority_path(Path::new(&selected), "database_url")
     else {
         return selected;
     };
@@ -13376,12 +13355,7 @@ fn get_or_create_pool_with_authority(
             && let Some(shared_pool) = pool.upgrade()
             && !shared_pool.is_closed()
         {
-            return DbPool::from_shared_pool_with_authority(
-                config,
-                shared_pool,
-                false,
-                authority,
-            );
+            return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
         }
     }
 
@@ -13410,12 +13384,7 @@ fn get_or_create_pool_with_authority(
         && !shared_pool.is_closed()
     {
         drop(guard);
-        return DbPool::from_shared_pool_with_authority(
-            config,
-            shared_pool,
-            false,
-            authority,
-        );
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
     }
     guard.insert(cache_key, Arc::downgrade(&pool.pool));
     drop(guard);
@@ -13453,9 +13422,9 @@ pub fn get_cached_pool(config: &DbPoolConfig) -> Option<DbPool> {
 
 fn compatible_cached_memory_pool(
     authority: &DbPoolAuthority,
-) -> DbResult<Option<Arc<Pool<DbConn>>>> {
+) -> Option<Arc<Pool<DbConn>>> {
     if authority.sqlite_identity.is_some() {
-        return Ok(None);
+        return None;
     }
 
     let cache =
@@ -13464,9 +13433,7 @@ fn compatible_cached_memory_pool(
 
     let mut candidate: Option<Arc<Pool<DbConn>>> = None;
     for (key, weak) in guard.iter() {
-        if key.sqlite_identity.is_some()
-            || key.storage_root_identity != authority.storage_root
-        {
+        if key.sqlite_identity.is_some() || key.storage_root_identity != authority.storage_root {
             continue;
         }
         let Some(shared_pool) = weak.upgrade() else {
@@ -13478,12 +13445,12 @@ fn compatible_cached_memory_pool(
         match &candidate {
             None => candidate = Some(shared_pool),
             Some(existing) if Arc::ptr_eq(existing, &shared_pool) => {}
-            Some(_) => return Ok(None),
+            Some(_) => return None,
         }
     }
     drop(guard);
 
-    Ok(candidate)
+    candidate
 }
 
 /// Get a pool for the given config, reusing an existing compatible in-memory
@@ -13495,13 +13462,8 @@ fn compatible_cached_memory_pool(
 /// SQLite file.
 pub fn get_or_reuse_compatible_memory_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let authority = DbPoolAuthority::resolve(config)?;
-    if let Some(shared_pool) = compatible_cached_memory_pool(&authority)? {
-        return DbPool::from_shared_pool_with_authority(
-            config,
-            shared_pool,
-            false,
-            authority,
-        );
+    if let Some(shared_pool) = compatible_cached_memory_pool(&authority) {
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
     }
     get_or_create_pool_with_authority(config, authority)
 }
@@ -16760,10 +16722,8 @@ mod tests {
             .expect("use standalone journal mode for pool-authority fixture");
         conn.execute_raw(&crate::schema::init_schema_sql_base())
             .expect("initialize pool-authority mailbox schema");
-        conn.execute_raw(
-            "CREATE TABLE pool_authority_sentinel(value TEXT NOT NULL UNIQUE)",
-        )
-        .expect("create pool-authority sentinel table");
+        conn.execute_raw("CREATE TABLE pool_authority_sentinel(value TEXT NOT NULL UNIQUE)")
+            .expect("create pool-authority sentinel table");
         conn.execute_raw(insert)
             .expect("insert pool-authority sentinel");
     }
@@ -16799,18 +16759,15 @@ mod tests {
         const CHILD_WITNESS: &str = "relative-pool-authority-frozen";
 
         if let Some(cwd_b) = std::env::var_os(CHILD_CWD_B_ENV) {
-            let cwd_a = PathBuf::from(
-                std::env::var_os(CHILD_CWD_A_ENV).expect("child cwd A authority"),
-            );
+            let cwd_a =
+                PathBuf::from(std::env::var_os(CHILD_CWD_A_ENV).expect("child cwd A authority"));
             let cwd_b = PathBuf::from(cwd_b);
             let storage_root = PathBuf::from(
                 std::env::var_os(CHILD_STORAGE_ENV).expect("child storage authority"),
             );
             assert_eq!(
-                std::fs::canonicalize(
-                    std::env::current_dir().expect("child current directory"),
-                )
-                .expect("canonical child current directory"),
+                std::fs::canonicalize(std::env::current_dir().expect("child current directory"),)
+                    .expect("canonical child current directory"),
                 std::fs::canonicalize(&cwd_a).expect("canonical child cwd A"),
                 "the child must construct the first pool under cwd A"
             );
@@ -16827,13 +16784,19 @@ mod tests {
             let pool_a = get_or_create_pool(&config).expect("construct cwd-A pool");
             let identity_a = std::fs::canonicalize(cwd_a.join("mail.sqlite3"))
                 .expect("canonical cwd-A database");
-            assert_eq!(pool_a.sqlite_identity.as_deref(), Some(identity_a.as_path()));
+            assert_eq!(
+                pool_a.sqlite_identity.as_deref(),
+                Some(identity_a.as_path())
+            );
 
             std::env::set_current_dir(&cwd_b).expect("switch child to cwd B");
             let pool_b = get_or_create_pool(&config).expect("construct cwd-B pool");
             let identity_b = std::fs::canonicalize(cwd_b.join("mail.sqlite3"))
                 .expect("canonical cwd-B database");
-            assert_eq!(pool_b.sqlite_identity.as_deref(), Some(identity_b.as_path()));
+            assert_eq!(
+                pool_b.sqlite_identity.as_deref(),
+                Some(identity_b.as_path())
+            );
             assert!(
                 !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
                 "one relative spelling under different cwd authorities must not reuse a pool"
@@ -16914,8 +16877,7 @@ mod tests {
         const CHILD_DB_A_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_A";
         const CHILD_DB_B_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_B";
         const CHILD_STORAGE_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_SYMLINK_STORAGE";
-        const CHILD_TEST_NAME: &str =
-            "pool::tests::symlink_retarget_cannot_cross_sqlite_authority";
+        const CHILD_TEST_NAME: &str = "pool::tests::symlink_retarget_cannot_cross_sqlite_authority";
         const CHILD_WITNESS: &str = "symlink-pool-authority-frozen";
 
         if let Some(alias) = std::env::var_os(CHILD_ALIAS_ENV) {
@@ -16926,12 +16888,10 @@ mod tests {
             let old_alias = PathBuf::from(
                 std::env::var_os(CHILD_OLD_ALIAS_ENV).expect("preserved alias authority"),
             );
-            let db_a = PathBuf::from(
-                std::env::var_os(CHILD_DB_A_ENV).expect("database A authority"),
-            );
-            let db_b = PathBuf::from(
-                std::env::var_os(CHILD_DB_B_ENV).expect("database B authority"),
-            );
+            let db_a =
+                PathBuf::from(std::env::var_os(CHILD_DB_A_ENV).expect("database A authority"));
+            let db_b =
+                PathBuf::from(std::env::var_os(CHILD_DB_B_ENV).expect("database B authority"));
             let storage_root = PathBuf::from(
                 std::env::var_os(CHILD_STORAGE_ENV).expect("symlink storage authority"),
             );
@@ -16976,13 +16936,19 @@ mod tests {
 
             let pool_a = get_or_create_pool(&config).expect("construct symlink-to-A pool");
             let identity_a = std::fs::canonicalize(&db_a).expect("canonical database A");
-            assert_eq!(pool_a.sqlite_identity.as_deref(), Some(identity_a.as_path()));
+            assert_eq!(
+                pool_a.sqlite_identity.as_deref(),
+                Some(identity_a.as_path())
+            );
 
             std::fs::rename(&alias, &old_alias).expect("preserve original A alias");
             std::fs::rename(&next_alias, &alias).expect("publish replacement B alias");
             let pool_b = get_or_create_pool(&config).expect("construct symlink-to-B pool");
             let identity_b = std::fs::canonicalize(&db_b).expect("canonical database B");
-            assert_eq!(pool_b.sqlite_identity.as_deref(), Some(identity_b.as_path()));
+            assert_eq!(
+                pool_b.sqlite_identity.as_deref(),
+                Some(identity_b.as_path())
+            );
             assert!(
                 !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
                 "retargeting a symlink to another file must not reuse the first pool"
@@ -17006,9 +16972,8 @@ mod tests {
                 .build()
                 .expect("build late-symlink runtime");
             let cx = Cx::for_testing();
-            let late_open = runtime.block_on(async {
-                unopened_pool.acquire(&cx).await.into_result()
-            });
+            let late_open =
+                runtime.block_on(async { unopened_pool.acquire(&cx).await.into_result() });
             assert!(
                 late_open.is_err_and(|error| {
                     error
@@ -17031,9 +16996,8 @@ mod tests {
                 &unopened_storage_root,
             )
             .expect("replace missing storage root with foreign symlink");
-            let late_storage_open = runtime.block_on(async {
-                unopened_storage_pool.acquire(&cx).await.into_result()
-            });
+            let late_storage_open =
+                runtime.block_on(async { unopened_storage_pool.acquire(&cx).await.into_result() });
             assert!(
                 late_storage_open.is_err_and(|error| {
                     error
@@ -17048,7 +17012,10 @@ mod tests {
             );
 
             retire_cached_runtime_state_after_recovery(&identity_b, "symlink authority test");
-            assert!(pool_b.pool.is_closed(), "retirement must close database-B pool");
+            assert!(
+                pool_b.pool.is_closed(),
+                "retirement must close database-B pool"
+            );
             assert!(
                 pool_b.message_id_allocator().is_retired(),
                 "retirement must retire database-B allocator"
@@ -17175,8 +17142,14 @@ mod tests {
         symlink(&real_parent, &aliased_parent).expect("create parent alias");
         let direct_db = real_parent.join("not-created-yet.sqlite3");
         let aliased_db = aliased_parent.join("not-created-yet.sqlite3");
-        assert!(!direct_db.exists(), "fixture requires a missing SQLite leaf");
-        assert!(!aliased_db.exists(), "fixture requires a missing SQLite leaf");
+        assert!(
+            !direct_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
+        assert!(
+            !aliased_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
 
         let storage_root = real_parent.join("storage");
         let direct_config = DbPoolConfig {
@@ -17218,7 +17191,10 @@ mod tests {
 
         let direct_db = authority_parent.join("not-created-yet.sqlite3");
         let symlink_dotdot_db = link.join("..").join("not-created-yet.sqlite3");
-        assert!(!direct_db.exists(), "fixture requires a missing SQLite leaf");
+        assert!(
+            !direct_db.exists(),
+            "fixture requires a missing SQLite leaf"
+        );
         assert!(
             !symlink_dotdot_db.exists(),
             "fixture requires a missing SQLite leaf"
@@ -17338,7 +17314,9 @@ mod tests {
             Outcome::Err(error) if error.to_string().contains("retired after database recovery")
         ));
         assert!(matches!(
-            replacement_handle.join().expect("join replacement allocator"),
+            replacement_handle
+                .join()
+                .expect("join replacement allocator"),
             Outcome::Ok(1)
         ));
     }
@@ -20689,9 +20667,8 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
-            let has_pool_entry = guard.contains_key(
-                &pool_cache_key(&config).expect("resolve cached pool authority"),
-            );
+            let has_pool_entry = guard
+                .contains_key(&pool_cache_key(&config).expect("resolve cached pool authority"));
             drop(guard);
             assert!(
                 has_pool_entry,
@@ -20764,9 +20741,8 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
-            let has_pool_entry = guard.contains_key(
-                &pool_cache_key(&config).expect("resolve cached pool authority"),
-            );
+            let has_pool_entry = guard
+                .contains_key(&pool_cache_key(&config).expect("resolve cached pool authority"));
             drop(guard);
             assert!(
                 !has_pool_entry,
@@ -21634,10 +21610,9 @@ mod tests {
             ..DbPoolConfig::default()
         })
         .expect("construct lazy pool");
-        let frozen_relative_identity =
-            normalize_sqlite_identity_path_buf(&missing_relative_path)
-                .to_string_lossy()
-                .into_owned();
+        let frozen_relative_identity = normalize_sqlite_identity_path_buf(&missing_relative_path)
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(mailbox_path.canonical_path, frozen_relative_identity);
         assert_eq!(
             pool.sqlite_path, mailbox_path.canonical_path,

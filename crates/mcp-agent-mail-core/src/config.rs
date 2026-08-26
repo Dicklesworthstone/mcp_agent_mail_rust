@@ -2911,12 +2911,14 @@ impl Config {
     /// turn the default loopback HTTP listener into an unauthenticated control
     /// plane.
     pub fn validate_user_env_authority(&self) -> io::Result<()> {
-        self.user_env_authority_error.as_ref().map_or(Ok(()), |error| {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                error.clone(),
-            ))
-        })
+        self.user_env_authority_error
+            .as_ref()
+            .map_or(Ok(()), |error| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    error.clone(),
+                ))
+            })
     }
 
     /// Returns whether running in production mode
@@ -3385,10 +3387,7 @@ fn push_user_env_candidate_dir(candidates: &mut Vec<PathBuf>, dir: &Path) {
     }
 }
 
-fn user_env_file_candidates(
-    home: Option<&Path>,
-    xdg_config_dir: Option<&Path>,
-) -> Vec<PathBuf> {
+fn user_env_file_candidates(home: Option<&Path>, xdg_config_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(6);
     if let Some(xdg) = xdg_config_dir {
         push_user_env_candidate_dir(&mut candidates, xdg);
@@ -3401,10 +3400,7 @@ fn user_env_file_candidates(
     candidates
 }
 
-fn read_open_user_env_file_bounded(
-    file: &mut std::fs::File,
-    path: &Path,
-) -> io::Result<Vec<u8>> {
+fn read_open_user_env_file_bounded(file: &mut std::fs::File, path: &Path) -> io::Result<Vec<u8>> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -3424,8 +3420,8 @@ fn read_open_user_env_file_bounded(
         ));
     }
 
-    let allocation = usize::try_from(metadata.len().min(USER_ENV_FILE_MAX_BYTES))
-        .unwrap_or(1024 * 1024);
+    let allocation =
+        usize::try_from(metadata.len().min(USER_ENV_FILE_MAX_BYTES)).unwrap_or(1024 * 1024);
     let mut bytes = Vec::with_capacity(allocation);
     file.by_ref()
         .take(USER_ENV_FILE_MAX_BYTES + 1)
@@ -3501,7 +3497,10 @@ fn revalidate_open_user_env_parent(
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} changed directory identity during read", parent.display()),
+            format!(
+                "{} changed directory identity during read",
+                parent.display()
+            ),
         ));
     }
     Ok(())
@@ -3536,8 +3535,7 @@ fn read_user_env_candidate_with_hooks(
     };
     after_parent_open();
 
-    let file_flags =
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
+    let file_flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
     let file_fd = match openat(&parent_fd, file_name, file_flags, Mode::empty()) {
         Ok(fd) => fd,
         Err(Errno::ENOENT) => {
@@ -3555,17 +3553,22 @@ fn read_user_env_candidate_with_hooks(
     let opened_file = fstat(&file).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} could not revalidate its open file identity: {error}", path.display()),
+            format!(
+                "{} could not revalidate its open file identity: {error}",
+                path.display()
+            ),
         )
     })?;
-    let observed_file = fstatat(&parent_fd, file_name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(
-        |error| {
+    let observed_file =
+        fstatat(&parent_fd, file_name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{} changed file identity during read: {error}", path.display()),
+                format!(
+                    "{} changed file identity during read: {error}",
+                    path.display()
+                ),
             )
-        },
-    )?;
+        })?;
     if !SFlag::from_bits_truncate(observed_file.st_mode).contains(SFlag::S_IFREG)
         || opened_file.st_dev != observed_file.st_dev
         || opened_file.st_ino != observed_file.st_ino
@@ -3622,10 +3625,7 @@ fn bind_user_env_parent(parent: &Path) -> io::Result<same_file::Handle> {
     same_file::Handle::from_file(directory)
 }
 
-#[cfg(all(
-    not(windows),
-    not(all(unix, not(target_os = "redox")))
-))]
+#[cfg(all(not(windows), not(all(unix, not(target_os = "redox")))))]
 fn bind_user_env_parent(parent: &Path) -> io::Result<same_file::Handle> {
     let metadata = fs::symlink_metadata(parent)?;
     if !user_env_parent_metadata_is_safe(&metadata) {
@@ -3638,10 +3638,7 @@ fn bind_user_env_parent(parent: &Path) -> io::Result<same_file::Handle> {
 }
 
 #[cfg(not(all(unix, not(target_os = "redox"))))]
-fn revalidate_user_env_parent(
-    parent: &Path,
-    expected: &same_file::Handle,
-) -> io::Result<()> {
+fn revalidate_user_env_parent(parent: &Path, expected: &same_file::Handle) -> io::Result<()> {
     let observed = bind_user_env_parent(parent).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3654,7 +3651,10 @@ fn revalidate_user_env_parent(
     if expected != &observed {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} changed directory identity during read", parent.display()),
+            format!(
+                "{} changed directory identity during read",
+                parent.display()
+            ),
         ));
     }
     Ok(())
@@ -5654,10 +5654,7 @@ mod tests {
         std::fs::write(custom_xdg.join("config.env"), "FOO=custom\n").unwrap();
 
         let load = load_user_env_values_from(Some(tmp.path()), Some(&custom_xdg));
-        assert_eq!(
-            load.values.get("FOO").map(String::as_str),
-            Some("custom")
-        );
+        assert_eq!(load.values.get("FOO").map(String::as_str), Some("custom"));
         assert!(load.authority_error.is_none());
     }
 
@@ -5687,24 +5684,20 @@ mod tests {
         let lower = xdg.join(".env");
         let mut higher_reads = 0_u8;
 
-        let load = load_user_env_values_from_with_reader(
-            Some(tmp.path()),
-            Some(&xdg),
-            |path| {
-                if path == higher {
-                    higher_reads += 1;
-                    return if higher_reads == 1 {
-                        Ok(None)
-                    } else {
-                        Ok(Some(b"FOO=higher\n".to_vec()))
-                    };
-                }
-                if path == lower {
-                    return Ok(Some(b"FOO=lower\n".to_vec()));
-                }
-                Ok(None)
-            },
-        );
+        let load = load_user_env_values_from_with_reader(Some(tmp.path()), Some(&xdg), |path| {
+            if path == higher {
+                higher_reads += 1;
+                return if higher_reads == 1 {
+                    Ok(None)
+                } else {
+                    Ok(Some(b"FOO=higher\n".to_vec()))
+                };
+            }
+            if path == lower {
+                return Ok(Some(b"FOO=lower\n".to_vec()));
+            }
+            Ok(None)
+        });
 
         assert_eq!(higher_reads, 2, "higher authority must be re-probed");
         assert!(load.values.is_empty());
@@ -5761,10 +5754,8 @@ mod tests {
     fn canonical_config_env_path_treats_empty_xdg_as_unset() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home_text = tmp.path().to_string_lossy();
-        let _env = TestEnvOverrideGuard::set(&[
-            ("XDG_CONFIG_HOME", ""),
-            ("HOME", home_text.as_ref()),
-        ]);
+        let _env =
+            TestEnvOverrideGuard::set(&[("XDG_CONFIG_HOME", ""), ("HOME", home_text.as_ref())]);
 
         assert_eq!(
             canonical_config_env_path(),
@@ -5805,10 +5796,7 @@ mod tests {
         std::fs::write(xdg.join("config.env"), "FOO=custom\n").unwrap();
 
         let load = load_user_env_values_from(None, Some(&xdg));
-        assert_eq!(
-            load.values.get("FOO").map(String::as_str),
-            Some("custom")
-        );
+        assert_eq!(load.values.get("FOO").map(String::as_str), Some("custom"));
         assert!(load.authority_error.is_none());
     }
 
@@ -5821,10 +5809,7 @@ mod tests {
         std::fs::write(legacy.join(".env"), "FOO=legacy\n").unwrap();
 
         let load = load_user_env_values_from(Some(tmp.path()), Some(&xdg));
-        assert_eq!(
-            load.values.get("FOO").map(String::as_str),
-            Some("legacy")
-        );
+        assert_eq!(load.values.get("FOO").map(String::as_str), Some("legacy"));
         assert!(load.authority_error.is_none());
     }
 
@@ -5940,20 +5925,16 @@ mod tests {
         std::fs::write(&canonical, "FOO=canonical\n").unwrap();
         std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
 
-        let load = load_user_env_values_from_with_reader(
-            Some(tmp.path()),
-            Some(&xdg),
-            |path| {
-                if path == canonical {
-                    Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "injected unreadable authority",
-                    ))
-                } else {
-                    read_user_env_candidate(path)
-                }
-            },
-        );
+        let load = load_user_env_values_from_with_reader(Some(tmp.path()), Some(&xdg), |path| {
+            if path == canonical {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected unreadable authority",
+                ))
+            } else {
+                read_user_env_candidate(path)
+            }
+        });
 
         assert!(load.values.is_empty());
         assert!(

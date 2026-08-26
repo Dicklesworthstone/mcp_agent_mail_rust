@@ -966,11 +966,7 @@ fn add_project_candidates(
         project_dir.join("gemini.mcp.json"),
     );
     push_omp_candidate_if_safe(out, seen, project_dir.join(".omp").join("mcp.json"));
-    push_omp_candidate_if_safe(
-        out,
-        seen,
-        project_dir.join(".omp").join(".mcp.json"),
-    );
+    push_omp_candidate_if_safe(out, seen, project_dir.join(".omp").join(".mcp.json"));
     push_omp_candidate_if_safe(out, seen, project_dir.join("mcp.json"));
     push_omp_candidate_if_safe(out, seen, project_dir.join(".mcp.json"));
     push_candidate(

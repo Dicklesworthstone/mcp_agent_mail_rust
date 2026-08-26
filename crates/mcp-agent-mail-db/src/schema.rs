@@ -582,19 +582,7 @@ pub fn schema_migrations() -> Vec<Migration> {
     // The Python schema used SQLAlchemy DATETIME columns that store ISO-8601 strings
     // like "2026-02-04 22:13:11.079199", but the Rust port expects i64 microseconds.
     // The conversion: strftime('%s', text) * 1000000 + fractional_micros
-    let ts_conversion = |col: &str| -> String {
-        format!(
-            "CASE \
-                 WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
-                 THEN CAST(trim({col}) AS INTEGER) \
-                 ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
-                      CASE WHEN instr({col}, '.') > 0 \
-                           THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
-                           ELSE 0 \
-                      END \
-             END"
-        )
-    };
+    let ts_conversion = legacy_text_timestamp_to_micros_sql;
 
     // projects.created_at
     migrations.push(Migration::new(
@@ -4062,6 +4050,86 @@ pub async fn migration_status<C: Connection>(
     migration_runner().status(cx, conn).await
 }
 
+/// SQL expression converting one legacy TEXT timestamp column to i64
+/// microseconds.
+///
+/// Handles both numeric strings (returned verbatim as integers) and ISO-8601
+/// datetime strings ("2026-02-04 22:13:11.079199"), preserving fractional
+/// microseconds. Shared by the one-shot v3 text-timestamp migrations and the
+/// per-boot `file_reservations` repair (GH#265).
+#[must_use]
+pub fn legacy_text_timestamp_to_micros_sql(col: &str) -> String {
+    format!(
+        "CASE \
+             WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
+             THEN CAST(trim({col}) AS INTEGER) \
+             ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
+                  CASE WHEN instr({col}, '.') > 0 \
+                       THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
+                       ELSE 0 \
+                  END \
+         END"
+    )
+}
+
+/// GH#265: normalize TEXT timestamps in `file_reservations` on every startup,
+/// not only in the one-shot `v3_fix_file_reservations_text_timestamps`
+/// migration.
+///
+/// The one-shot migration repairs contamination that exists when it first
+/// runs, but it is recorded as applied and never runs again — so TEXT
+/// timestamps introduced *after* that point (e.g. a legacy import into an
+/// already-migrated database) survive indefinitely. A TEXT `expires_ts` in the
+/// INTEGER-affinity column numerically coerces to its leading digits
+/// ("2026-08-…" -> 2026) under `expires_ts > <now_micros>`, so `active`/`list`
+/// reads silently hide a still-held reservation while `release` (which does
+/// not apply that predicate) still finds it.
+///
+/// The probe is a read-only scan of the small `file_reservations` table; the
+/// UPDATE only runs when contamination is actually present, so clean databases
+/// pay one cheap SELECT per startup and no write.
+///
+/// Returns the number of repaired rows.
+pub async fn repair_file_reservation_text_timestamps<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<u64, SqlError> {
+    const PROBE_SQL: &str = "SELECT COUNT(*) AS contaminated FROM file_reservations \
+         WHERE typeof(created_ts) = 'text' \
+            OR typeof(expires_ts) = 'text' \
+            OR typeof(released_ts) = 'text'";
+    let contaminated = match conn.query(cx, PROBE_SQL, &[]).await {
+        Outcome::Ok(rows) => rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("contaminated").ok())
+            .unwrap_or(0),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    if contaminated <= 0 {
+        return Outcome::Ok(0);
+    }
+    let update_sql = format!(
+        "UPDATE file_reservations SET \
+         created_ts = CASE WHEN typeof(created_ts) = 'text' THEN ({}) ELSE created_ts END, \
+         expires_ts = CASE WHEN typeof(expires_ts) = 'text' THEN ({}) ELSE expires_ts END, \
+         released_ts = CASE WHEN typeof(released_ts) = 'text' THEN ({}) ELSE released_ts END \
+         WHERE typeof(created_ts) = 'text' \
+            OR typeof(expires_ts) = 'text' \
+            OR typeof(released_ts) = 'text'",
+        legacy_text_timestamp_to_micros_sql("created_ts"),
+        legacy_text_timestamp_to_micros_sql("expires_ts"),
+        legacy_text_timestamp_to_micros_sql("released_ts")
+    );
+    match conn.execute(cx, &update_sql, &[]).await {
+        Outcome::Ok(affected) => Outcome::Ok(affected),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<String>, SqlError> {
     match init_migrations_table(cx, conn).await {
         Outcome::Ok(()) => {}
@@ -4086,6 +4154,22 @@ pub async fn migrate_to_latest<C: Connection>(cx: &Cx, conn: &C) -> Outcome<Vec<
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         }
     };
+    // GH#265: runs every startup (idempotent, cheap read-only probe on clean
+    // databases) so TEXT-timestamp contamination introduced after the one-shot
+    // v3 migration cannot silently hide still-held reservations from
+    // `active`/`list` reads.
+    match repair_file_reservation_text_timestamps(cx, conn).await {
+        Outcome::Ok(0) => {}
+        Outcome::Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "normalized legacy TEXT timestamps in file_reservations at startup (GH#265)"
+            );
+        }
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
     match ensure_inbox_stats_insert_trigger_compat(cx, conn).await {
         Outcome::Ok(()) => Outcome::Ok(applied),
         Outcome::Err(e) => Outcome::Err(e),
@@ -4129,6 +4213,22 @@ pub async fn migrate_to_latest_base<C: Connection>(
 
     match enforce_base_mode_cleanup_async(cx, conn).await {
         Outcome::Ok(()) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    // GH#265: runs every startup (idempotent, cheap read-only probe on clean
+    // databases) so TEXT-timestamp contamination introduced after the one-shot
+    // v3 migration cannot silently hide still-held reservations from
+    // `active`/`list` reads.
+    match repair_file_reservation_text_timestamps(cx, conn).await {
+        Outcome::Ok(0) => {}
+        Outcome::Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "normalized legacy TEXT timestamps in file_reservations at startup (GH#265)"
+            );
+        }
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
@@ -4432,6 +4532,123 @@ mod tests {
         assert_eq!(
             rows[0].get_named::<String>("slug").unwrap_or_default(),
             "proj"
+        );
+    }
+
+    #[test]
+    fn repair_normalizes_text_file_reservation_timestamps_every_boot() {
+        // GH#265: TEXT timestamps introduced AFTER the one-shot v3 migration
+        // ran (e.g. by a legacy import into an already-migrated database) must
+        // be normalized on the next startup, restoring the schema's INTEGER
+        // invariant that the `active`/`list` predicates rely on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("gh265_text_expires_repair.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+
+        // First boot: full schema + migrations. The one-shot text-timestamp
+        // migration is recorded as applied from here on.
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("gh265-proj".to_string()),
+                Value::Text("/tmp/gh265-proj".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (1, 'CoralMarsh', 'test', 'test', '', 1, 1, 'auto', 'auto')",
+            &[],
+        )
+        .expect("insert agent");
+        // Contaminated row: ISO-8601 TEXT in the INTEGER-affinity columns.
+        conn.execute_raw(
+            "INSERT INTO file_reservations \
+             (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+             VALUES (1, 1, 'src/**', 1, 'gh265', '2026-02-24 15:33:00', '2027-12-24 15:33:00.500000', NULL)",
+        )
+        .expect("insert contaminated reservation");
+
+        // Reproduce the read bug: under numeric comparison the TEXT value
+        // coerces to its leading digits (2027), so an un-expired reservation
+        // is invisible to `expires_ts > now_micros`.
+        let hidden = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE expires_ts > ?",
+                &[Value::BigInt(1_700_000_000_000_000)],
+            )
+            .expect("probe hidden reservation");
+        assert_eq!(
+            hidden[0].get_named::<i64>("c").unwrap_or(-1),
+            0,
+            "TEXT expires_ts must reproduce the hidden-reservation read bug before repair"
+        );
+
+        // Second boot: the migration set is already complete, but the per-boot
+        // repair must still normalize the contaminated row.
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_ts) AS t_created, typeof(expires_ts) AS t_expires, \
+                 expires_ts FROM file_reservations",
+                &[],
+            )
+            .expect("query repaired reservation");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("t_created").unwrap_or_default(),
+            "integer"
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("t_expires").unwrap_or_default(),
+            "integer"
+        );
+        let expires = rows[0].get_named::<i64>("expires_ts").unwrap_or(0);
+        assert!(
+            (1_820_000_000_000_000..1_860_000_000_000_000).contains(&expires),
+            "repaired expires_ts should be 2027-12-24 in epoch micros, got {expires}"
+        );
+        assert_eq!(
+            expires % 1_000_000,
+            500_000,
+            "fractional microseconds must be preserved, got {expires}"
+        );
+
+        // The active-reservation read predicate now sees the held reservation.
+        let visible = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE expires_ts > ?",
+                &[Value::BigInt(1_700_000_000_000_000)],
+            )
+            .expect("probe repaired reservation");
+        assert_eq!(
+            visible[0].get_named::<i64>("c").unwrap_or(-1),
+            1,
+            "repaired reservation must be visible to the active predicate"
         );
     }
 
