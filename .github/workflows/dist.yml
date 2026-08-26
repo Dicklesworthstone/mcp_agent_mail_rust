@@ -816,8 +816,7 @@ jobs:
             local assets_json asset_count
             local asset_id asset_name asset_size local_size local_hash remote_hash
             local asset_is_duplicate asset_is_expected expected_name seen_name
-            local expected_names
-            local -a seen_names=()
+            local -a expected_names=() seen_names=()
 
             mapfile -t expected_names < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
             if [ "${#expected_names[@]}" -ne 30 ]; then

@@ -516,7 +516,7 @@ mod dist_release_contract {
             "case \"$release_count\" in",
             "[ \"${#expected_names[@]}\" -ne 30 ]",
             "[ \"$asset_count\" -gt 30 ]",
-            "local -a seen_names=()",
+            "local -a expected_names=() seen_names=()",
             "asset_is_expected=false",
             "[ \"$asset_name\" = \"$expected_name\" ]",
             "asset_is_duplicate=false",
