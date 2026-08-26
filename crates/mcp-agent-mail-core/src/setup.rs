@@ -3415,44 +3415,150 @@ pub fn write_config_atomic(
     action: &ConfigAction,
     contains_literal_secret: bool,
 ) -> Result<ActionOutcome, SetupError> {
-    write_config_atomic_inner(action, contains_literal_secret, None)
+    write_config_atomic_inner(action, contains_literal_secret)
 }
 
-#[allow(clippy::too_many_lines)]
+/// Atomically transform a config file from the bytes read through the bound
+/// file authority used for publication.
+///
+/// The transform receives the current UTF-8 contents, or `None` when the file
+/// is absent. It may be invoked more than once when a credential-bearing write
+/// must acquire the repository protection lock; callers must therefore keep it
+/// deterministic and free of external side effects. Re-running the transform
+/// after the lock is acquired prevents a stale pre-lock parse from overwriting
+/// a concurrent serialized update.
+///
+/// # Errors
+///
+/// Returns an error when the target or parent authority is unsafe, the current
+/// file is not a bounded regular UTF-8 file, the transform rejects the input,
+/// Git exposure cannot be ruled out for secret material, or atomic publication
+/// fails.
+pub fn transform_config_atomic(
+    path: &Path,
+    permissions: u32,
+    backup: bool,
+    contains_literal_secret: bool,
+    transform: impl Fn(Option<&str>) -> Result<String, SetupError>,
+) -> Result<ActionOutcome, SetupError> {
+    transform_config_atomic_inner(
+        path,
+        permissions,
+        backup,
+        contains_literal_secret,
+        None,
+        false,
+        &transform,
+    )
+}
+
 fn write_config_atomic_inner(
     action: &ConfigAction,
     contains_literal_secret: bool,
-    authority: Option<&SetupDirectoryAuthority>,
 ) -> Result<ActionOutcome, SetupError> {
-    ensure_setup_parent_dir(&action.file_path, "config file")?;
-    validate_setup_file_target(&action.file_path, "config file")?;
+    transform_config_atomic_inner(
+        &action.file_path,
+        action.permissions,
+        action.backup,
+        contains_literal_secret,
+        None,
+        false,
+        &|existing| match &action.content {
+            ConfigContent::JsonMerge {
+                servers_key,
+                server_name,
+                server_value,
+                reconcile_omp_user_runtime_lists,
+            } => {
+                if action.platform == AgentPlatform::Omp {
+                    debug_assert_eq!(*servers_key, "mcpServers");
+                    merge_omp_mcp_server(
+                        existing,
+                        server_name,
+                        server_value.clone(),
+                        *reconcile_omp_user_runtime_lists,
+                    )
+                } else {
+                    merge_mcp_server(existing, servers_key, server_name, server_value.clone())
+                }
+            }
+            ConfigContent::ClaudeLocalScopeMcp {
+                project_path,
+                server_name,
+                server_value,
+            } => merge_claude_local_scope_mcp(
+                existing,
+                project_path,
+                server_name,
+                server_value.clone(),
+            ),
+            ConfigContent::JsonFull(val) => Ok(serde_json::to_string_pretty(val)? + "\n"),
+            ConfigContent::HooksMerge {
+                project_slug,
+                agent_name,
+            } => merge_claude_hooks(existing, project_slug, agent_name),
+            ConfigContent::TomlSection {
+                section_header,
+                key_values,
+            } => Ok(merge_toml_section(existing, section_header, key_values)),
+        },
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn transform_config_atomic_inner(
+    path: &Path,
+    permissions: u32,
+    backup: bool,
+    contains_literal_secret: bool,
+    authority: Option<&SetupDirectoryAuthority>,
+    secret_protected: bool,
+    transform: &impl Fn(Option<&str>) -> Result<String, SetupError>,
+) -> Result<ActionOutcome, SetupError> {
+    ensure_setup_parent_dir(path, "config file")?;
+    validate_setup_file_target(path, "config file")?;
+    let Some(authority) = authority else {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let authority = open_setup_directory_authority(parent)?;
+        revalidate_setup_directory_authority(parent, &authority)?;
+        return transform_config_atomic_inner(
+            path,
+            permissions,
+            backup,
+            contains_literal_secret,
+            Some(&authority),
+            secret_protected,
+            transform,
+        );
+    };
 
     // Read through the same no-follow discipline as the write path. Treating
     // an arbitrary read failure as "missing" would let setup overwrite an
     // unreadable or non-UTF config without a backup.
-    let existing_file =
-        read_setup_file_with_authority(&action.file_path, "config file", authority)?;
+    let existing_file = read_setup_file_with_authority(path, "config file", Some(authority))?;
     let existing = existing_file
         .as_ref()
-        .map(|snapshot| snapshot.content.clone());
+        .map(|snapshot| snapshot.content.as_str());
+    let new_content = transform(existing)?;
 
     // Never widen an existing config's permissions. Conversely, when setup is
-    // adding a secret to a previously broad file, tighten it to the action's
-    // requested mode. Backups use the same effective mode so they cannot leak
-    // the pre-update contents.
-    let effective_permissions = existing_file
-        .as_ref()
-        .map_or(action.permissions, |snapshot| {
-            #[cfg(unix)]
-            {
-                snapshot.permissions & action.permissions
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = snapshot;
-                action.permissions
-            }
-        });
+    // adding a secret to a previously broad file, tighten it to the requested
+    // mode. Backups use the same effective mode so they cannot leak the
+    // pre-update contents.
+    let effective_permissions = existing_file.as_ref().map_or(permissions, |snapshot| {
+        #[cfg(unix)]
+        {
+            snapshot.permissions & permissions
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = snapshot;
+            permissions
+        }
+    });
     #[cfg(unix)]
     let permissions_need_tightening = existing_file
         .as_ref()
@@ -3463,68 +3569,31 @@ fn write_config_atomic_inner(
         .as_ref()
         .is_some_and(|snapshot| snapshot.link_count != 1);
 
-    let new_content = match &action.content {
-        ConfigContent::JsonMerge {
-            servers_key,
-            server_name,
-            server_value,
-            reconcile_omp_user_runtime_lists,
-        } => {
-            if action.platform == AgentPlatform::Omp {
-                debug_assert_eq!(*servers_key, "mcpServers");
-                merge_omp_mcp_server(
-                    existing.as_deref(),
-                    server_name,
-                    server_value.clone(),
-                    *reconcile_omp_user_runtime_lists,
-                )?
-            } else {
-                merge_mcp_server(
-                    existing.as_deref(),
-                    servers_key,
-                    server_name,
-                    server_value.clone(),
-                )?
-            }
-        }
-        ConfigContent::ClaudeLocalScopeMcp {
-            project_path,
-            server_name,
-            server_value,
-        } => merge_claude_local_scope_mcp(
-            existing.as_deref(),
-            project_path,
-            server_name,
-            server_value.clone(),
-        )?,
-        ConfigContent::JsonFull(val) => serde_json::to_string_pretty(val)? + "\n",
-        ConfigContent::HooksMerge {
-            project_slug,
-            agent_name,
-        } => merge_claude_hooks(existing.as_deref(), project_slug, agent_name)?,
-        ConfigContent::TomlSection {
-            section_header,
-            key_values,
-        } => merge_toml_section(existing.as_deref(), section_header, key_values),
-    };
-
-    let existing_may_contain_secret = existing.as_deref().is_some_and(|content| {
+    let existing_may_contain_secret = existing.is_some_and(|content| {
         content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN")
     });
     let output_contains_literal_secret = new_content.contains("Bearer ");
     let secret_write =
         contains_literal_secret || existing_may_contain_secret || output_contains_literal_secret;
-    if secret_write && authority.is_none() {
-        return with_secret_config_git_protection(&action.file_path, |authority| {
+    if secret_write && !secret_protected {
+        return with_secret_config_git_protection(path, |authority| {
             // Re-read and re-render after acquiring the repository authority.
             // Otherwise the caller could carry stale bytes across the lock
             // boundary and overwrite a concurrent, serialized config update.
-            write_config_atomic_inner(action, contains_literal_secret, Some(authority))
+            transform_config_atomic_inner(
+                path,
+                permissions,
+                backup,
+                contains_literal_secret,
+                Some(authority),
+                true,
+                transform,
+            )
         });
     }
 
     // Check if unchanged
-    if existing.as_deref() == Some(&new_content)
+    if existing == Some(new_content.as_str())
         && !permissions_need_tightening
         && !topology_needs_detaching
     {
@@ -3534,13 +3603,13 @@ fn write_config_atomic_inner(
     let was_existing = existing.is_some();
 
     write_setup_file_atomic_with_authority(
-        &action.file_path,
+        path,
         new_content.as_bytes(),
         effective_permissions,
         "config file",
         existing_file.as_ref(),
-        action.backup,
-        authority,
+        backup,
+        Some(authority),
     )?;
 
     if was_existing {
@@ -8218,6 +8287,46 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".bak"))
             .collect();
         assert_eq!(entries.len(), 1, "should have one backup file");
+    }
+
+    #[test]
+    fn transform_config_atomic_rereads_before_secret_publication() {
+        use std::cell::Cell;
+
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "owner=original\n").unwrap();
+        let calls = Cell::new(0_u8);
+
+        let outcome = transform_config_atomic(&path, 0o600, true, false, |existing| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                std::fs::write(&path, "owner=concurrent\n")?;
+            }
+            Ok(format!(
+                "{}Authorization=Bearer transformed\n",
+                existing.unwrap_or_default()
+            ))
+        })
+        .expect("secret transform should re-read after acquiring its authority");
+
+        assert_eq!(outcome, ActionOutcome::Updated);
+        assert_eq!(calls.get(), 2, "secret transform must be rendered again");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "owner=concurrent\nAuthorization=Bearer transformed\n"
+        );
+        let backups = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            "owner=concurrent\n"
+        );
     }
 
     #[test]

@@ -33938,37 +33938,66 @@ fn fix_mcp_config_entry(
     desired_bearer_token: Option<&str>,
     tool: mcp_agent_mail_core::mcp_config::McpConfigTool,
 ) -> Result<String, String> {
-    validate_real_file_target_path(config_path, "MCP config").map_err(|error| error.to_string())?;
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
-    let existing_secret_material =
-        content.contains("Bearer ") || content.contains("HTTP_BEARER_TOKEN");
+    let contains_literal_secret =
+        desired_bearer_token.is_some_and(|token| !token.trim().is_empty());
+    let outcome = mcp_agent_mail_core::setup::transform_config_atomic(
+        config_path,
+        0o600,
+        true,
+        contains_literal_secret,
+        |content| {
+            let content = content.ok_or_else(|| {
+                mcp_agent_mail_core::setup::SetupError::Other(format!(
+                    "cannot read {}: file does not exist",
+                    config_path.display()
+                ))
+            })?;
+            repaired_mcp_config_content(
+                config_path,
+                content,
+                desired_url,
+                desired_bearer_token,
+                tool,
+            )
+            .map_err(mcp_agent_mail_core::setup::SetupError::Other)
+        },
+    )
+    .map_err(|error| format!("atomic MCP config transform failed: {error}"))?;
 
+    Ok(match outcome {
+        mcp_agent_mail_core::setup::ActionOutcome::Created => {
+            format!("Created {} atomically", config_path.display())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Updated => {
+            format!("Updated {} with an atomic backup", config_path.display())
+        }
+        mcp_agent_mail_core::setup::ActionOutcome::Unchanged => {
+            format!("Verified {} is already current", config_path.display())
+        }
+        other => format!("{}: {other}", config_path.display()),
+    })
+}
+
+fn repaired_mcp_config_content(
+    config_path: &Path,
+    content: &str,
+    desired_url: &str,
+    desired_bearer_token: Option<&str>,
+    tool: mcp_agent_mail_core::mcp_config::McpConfigTool,
+) -> Result<String, String> {
     if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
-        let fixed = fix_mcp_config_toml_text(&content, desired_url, desired_bearer_token)
-            .ok_or_else(|| {
+        return fix_mcp_config_toml_text(content, desired_url, desired_bearer_token).ok_or_else(
+            || {
                 format!(
                     "No mcp-agent-mail TOML section found in {}",
                     config_path.display()
                 )
-            })?;
-        let secret_write = existing_secret_material || fixed.contains("Bearer ");
-        if secret_write {
-            mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
-                .map_err(|error| error.to_string())?;
-        }
-        let backup_path =
-            create_mcp_config_backup(config_path).map_err(|e| format!("backup failed: {e}"))?;
-        std::fs::write(config_path, fixed).map_err(|e| format!("write failed: {e}"))?;
-        return Ok(format!(
-            "Updated {} (backup: {})",
-            config_path.display(),
-            backup_path.display()
-        ));
+            },
+        );
     }
 
-    let mut doc: serde_json::Value = serde_json::from_str(&content)
-        .or_else(|_| json5::from_str(&content))
+    let mut doc: serde_json::Value = serde_json::from_str(content)
+        .or_else(|_| json5::from_str(content))
         .map_err(|e| format!("cannot parse {}: {e}", config_path.display()))?;
 
     let updated = if tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp {
@@ -34002,48 +34031,9 @@ fn fix_mcp_config_entry(
         ));
     }
 
-    let serialized = serde_json::to_string(&doc).map_err(|error| {
-        format!(
-            "cannot inspect repaired config {} for credentials: {error}",
-            config_path.display()
-        )
-    })?;
-    let secret_write = existing_secret_material || serialized.contains("Bearer ");
-
-    if tool != mcp_agent_mail_core::mcp_config::McpConfigTool::Omp && secret_write {
-        mcp_agent_mail_core::setup::ensure_secret_config_not_git_tracked(config_path)
-            .map_err(|error| error.to_string())?;
-    }
-
-    if tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp {
-        let action = mcp_agent_mail_core::setup::ConfigAction {
-            platform: mcp_agent_mail_core::setup::AgentPlatform::Omp,
-            file_path: config_path.to_path_buf(),
-            description: "Repair OMP MCP config".to_string(),
-            content: mcp_agent_mail_core::setup::ConfigContent::JsonFull(doc),
-            permissions: 0o600,
-            backup: true,
-        };
-        mcp_agent_mail_core::setup::write_config_atomic(&action, secret_write)
-            .map_err(|error| format!("atomic OMP config write failed: {error}"))?;
-        return Ok(format!(
-            "Updated {} with an atomic backup",
-            config_path.display()
-        ));
-    }
-
-    // Write back with pretty formatting, preserving backup.
-    let backup_path =
-        create_mcp_config_backup(config_path).map_err(|e| format!("backup failed: {e}"))?;
     let formatted =
         serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize failed: {e}"))?;
-    std::fs::write(config_path, format!("{formatted}\n"))
-        .map_err(|e| format!("write failed: {e}"))?;
-    Ok(format!(
-        "Updated {} (backup: {})",
-        config_path.display(),
-        backup_path.display()
-    ))
+    Ok(format!("{formatted}\n"))
 }
 
 fn rewrite_json_mcp_entry_to_http_url(
@@ -34136,44 +34126,6 @@ fn rewrite_json_mcp_entry_to_http_url(
     }
 }
 
-fn create_mcp_config_backup(config_path: &Path) -> Result<PathBuf, std::io::Error> {
-    let mut suffix = None;
-    loop {
-        let backup_path = mcp_config_backup_candidate(config_path, suffix);
-        match copy_file_without_overwrite(config_path, &backup_path) {
-            Ok(()) => return Ok(backup_path),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                suffix = Some(suffix.map_or(1, |suffix| suffix + 1));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn copy_file_without_overwrite(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-    let mut source_file = std::fs::File::open(source)?;
-    let permissions = source_file.metadata()?.permissions();
-    let mut destination_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    std::io::copy(&mut source_file, &mut destination_file)?;
-    std::fs::set_permissions(destination, permissions)
-}
-
-fn mcp_config_backup_candidate(config_path: &Path, suffix: Option<u64>) -> PathBuf {
-    let file_name = config_path.file_name().map_or_else(
-        || OsString::from("mcp-config"),
-        std::ffi::OsStr::to_os_string,
-    );
-    let mut backup_name = file_name;
-    backup_name.push(".bak");
-    if let Some(suffix) = suffix {
-        backup_name.push(format!(".{suffix:02}"));
-    }
-    config_path.with_file_name(backup_name)
-}
-
 fn fix_mcp_config_toml_text(
     content: &str,
     desired_url: &str,
@@ -34186,14 +34138,19 @@ fn fix_mcp_config_toml_text(
     let mut saw_startup_timeout_in_section = false;
     let mut saw_http_headers_in_section = false;
     let mut replaced_section = false;
-    let desired_http_headers =
-        desired_bearer_token.map(|token| format!("{{ Authorization = \"Bearer {token}\" }}"));
+    let desired_url_literal = toml_edit::Value::from(desired_url).to_string();
+    let desired_http_headers = desired_bearer_token
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| {
+            let authorization = toml_edit::Value::from(format!("Bearer {token}")).to_string();
+            format!("{{ Authorization = {authorization} }}")
+        });
 
     for raw_line in content.lines() {
         if let Some(section) = parse_toml_section_header(raw_line) {
             if in_target_section {
                 if !saw_url_in_section {
-                    output.push(format!("url = \"{desired_url}\""));
+                    output.push(format!("url = {desired_url_literal}"));
                     replaced_section = true;
                 }
                 if !saw_startup_timeout_in_section {
@@ -34235,7 +34192,7 @@ fn fix_mcp_config_toml_text(
         if parse_simple_toml_key(raw_line, "url").is_some()
             || parse_simple_toml_key(raw_line, "httpUrl").is_some()
         {
-            output.push(format!("url = \"{desired_url}\""));
+            output.push(format!("url = {desired_url_literal}"));
             saw_url_in_section = true;
             replaced_section = true;
             continue;
@@ -34274,7 +34231,7 @@ fn fix_mcp_config_toml_text(
 
     if in_target_section {
         if !saw_url_in_section {
-            output.push(format!("url = \"{desired_url}\""));
+            output.push(format!("url = {desired_url_literal}"));
             replaced_section = true;
         }
         if !saw_startup_timeout_in_section {
@@ -53196,6 +53153,28 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(result.unwrap().contains("already contains"));
     }
 
+    fn mcp_config_atomic_backups(config_path: &Path) -> Vec<PathBuf> {
+        let Some(parent) = config_path.parent() else {
+            return Vec::new();
+        };
+        let Some(file_name) = config_path.file_name() else {
+            return Vec::new();
+        };
+        let prefix = format!(".{}.", file_name.to_string_lossy());
+        let mut backups = std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with(&prefix) && name.ends_with(".bak")).then(|| entry.path())
+            })
+            .collect::<Vec<_>>();
+        backups.sort();
+        backups
+    }
+
     #[test]
     fn fix_mcp_config_entry_updates_json_to_http_url() {
         let dir = tempfile::tempdir().unwrap();
@@ -53213,7 +53192,7 @@ http_headers = { Authorization = "Bearer secret" }
             mcp_agent_mail_core::mcp_config::McpConfigTool::Claude,
         );
         assert!(result.is_ok(), "{result:?}");
-        assert!(config.with_extension("json.bak").exists());
+        assert_eq!(mcp_config_atomic_backups(&config).len(), 1);
         let content = std::fs::read_to_string(&config).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(doc["mcpServers"]["mcp-agent-mail"]["url"], desired_url);
@@ -53299,7 +53278,7 @@ http_headers = { Authorization = "Bearer secret" }
 
         assert!(error.contains("Git-tracked config"), "{error}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
-        assert!(!mcp_config_backup_candidate(&config, None).exists());
+        assert!(mcp_config_atomic_backups(&config).is_empty());
     }
 
     #[test]
@@ -53340,7 +53319,7 @@ url = "http://127.0.0.1:9999/mcp/"
 
         assert!(error.contains("Git-tracked config"), "{error}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
-        assert!(!mcp_config_backup_candidate(&config, None).exists());
+        assert!(mcp_config_atomic_backups(&config).is_empty());
     }
 
     #[test]
@@ -53437,7 +53416,7 @@ url = "http://127.0.0.1:9999/mcp/"
             "{error}"
         );
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
-        assert!(!mcp_config_backup_candidate(&config, None).exists());
+        assert!(mcp_config_atomic_backups(&config).is_empty());
     }
 
     #[test]
@@ -53458,7 +53437,7 @@ url = "http://127.0.0.1:9999/mcp/"
 
         assert!(error.contains("entry must be a JSON object"), "{error}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
-        assert!(!mcp_config_backup_candidate(&config, None).exists());
+        assert!(mcp_config_atomic_backups(&config).is_empty());
     }
 
     #[cfg(unix)]
@@ -53496,11 +53475,11 @@ url = "http://127.0.0.1:9999/mcp/"
                 .file_type()
                 .is_symlink()
         );
-        assert!(!mcp_config_backup_candidate(&outside, None).exists());
+        assert!(mcp_config_atomic_backups(&linked).is_empty());
     }
 
     #[test]
-    fn fix_mcp_config_entry_preserves_existing_backup_candidate() {
+    fn fix_mcp_config_entry_preserves_legacy_backup_file() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("mcp.json");
         let desired_url = "http://127.0.0.1:8765/api/";
@@ -53509,7 +53488,7 @@ url = "http://127.0.0.1:9999/mcp/"
             r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"]}}}"#,
         )
         .unwrap();
-        let first_backup = mcp_config_backup_candidate(&config, None);
+        let first_backup = config.with_extension("json.bak");
         std::fs::write(&first_backup, "older backup").unwrap();
 
         let result = fix_mcp_config_entry(
@@ -53520,11 +53499,9 @@ url = "http://127.0.0.1:9999/mcp/"
         )
         .unwrap();
 
-        let second_backup = mcp_config_backup_candidate(&config, Some(1));
-        assert!(
-            result.contains(&second_backup.display().to_string()),
-            "result should report the collision-safe backup path: {result}"
-        );
+        let atomic_backups = mcp_config_atomic_backups(&config);
+        assert_eq!(atomic_backups.len(), 1, "{result}");
+        let second_backup = &atomic_backups[0];
         assert_eq!(
             std::fs::read_to_string(first_backup).unwrap(),
             "older backup"
@@ -53538,7 +53515,7 @@ url = "http://127.0.0.1:9999/mcp/"
 
     #[cfg(unix)]
     #[test]
-    fn fix_mcp_config_entry_skips_symlinked_backup_candidate() {
+    fn fix_mcp_config_entry_ignores_symlinked_legacy_backup_file() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -53551,7 +53528,8 @@ url = "http://127.0.0.1:9999/mcp/"
         )
         .unwrap();
         std::fs::write(&symlink_target, "must stay intact").unwrap();
-        symlink(&symlink_target, mcp_config_backup_candidate(&config, None)).unwrap();
+        let legacy_backup = config.with_extension("json.bak");
+        symlink(&symlink_target, &legacy_backup).unwrap();
 
         let result = fix_mcp_config_entry(
             &config,
@@ -53561,19 +53539,97 @@ url = "http://127.0.0.1:9999/mcp/"
         )
         .unwrap();
 
-        let real_backup = mcp_config_backup_candidate(&config, Some(1));
-        assert!(
-            result.contains(&real_backup.display().to_string()),
-            "result should report the non-symlink backup path: {result}"
-        );
+        let atomic_backups = mcp_config_atomic_backups(&config);
+        assert_eq!(atomic_backups.len(), 1, "{result}");
+        let real_backup = &atomic_backups[0];
         assert_eq!(
             std::fs::read_to_string(symlink_target).unwrap(),
             "must stay intact"
         );
         assert!(
+            std::fs::symlink_metadata(legacy_backup)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
             std::fs::read_to_string(real_backup)
                 .unwrap()
                 .contains(r#""command": "python""#)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix_mcp_config_entry_detaches_hard_link_from_tracked_project_file() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let external = dir.path().join("external");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        let tracked = repo.join("tracked.json");
+        let config = external.join("mcp.json");
+        let original = r#"{"mcpServers":{"mcp-agent-mail":{"command":"python","args":["-m","mcp_agent_mail"]}}}"#;
+        std::fs::write(&tracked, original).unwrap();
+        std::fs::set_permissions(&tracked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["add", "--", "tracked.json"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::hard_link(&tracked, &config).unwrap();
+        let tracked_inode = std::fs::metadata(&tracked).unwrap().ino();
+
+        let result = fix_mcp_config_entry(
+            &config,
+            "http://127.0.0.1:8765/mcp/",
+            Some("external-only-token"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Claude,
+        );
+        assert!(result.is_ok(), "{result:?}");
+
+        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&tracked).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(std::fs::metadata(&tracked).unwrap().ino(), tracked_inode);
+        let repaired = std::fs::read_to_string(&config).unwrap();
+        assert!(repaired.contains("Bearer external-only-token"));
+        assert!(
+            !std::fs::read_to_string(&tracked)
+                .unwrap()
+                .contains("external-only-token")
+        );
+        assert_ne!(
+            std::fs::metadata(&config).unwrap().ino(),
+            std::fs::metadata(&tracked).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let backups = mcp_config_atomic_backups(&config);
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 
@@ -53671,7 +53727,7 @@ url = "http://127.0.0.1:9999/mcp/"
 
         assert!(error.contains("Git-tracked config"), "{error}");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
-        assert!(!mcp_config_backup_candidate(&config, None).exists());
+        assert!(mcp_config_atomic_backups(&config).is_empty());
     }
 
     #[test]
@@ -53719,7 +53775,7 @@ command = "mcp-agent-mail"
             mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
         );
         assert!(result.is_ok(), "{result:?}");
-        assert!(config.with_extension("toml.bak").exists());
+        assert_eq!(mcp_config_atomic_backups(&config).len(), 1);
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(content.contains("[mcp_servers.mcp_agent_mail]"));
         assert!(content.contains(&format!("url = \"{desired_url}\"")));
@@ -53729,6 +53785,46 @@ command = "mcp-agent-mail"
         )));
         assert!(content.contains("http_headers = { Authorization = \"Bearer testtoken\" }"));
         assert!(!content.contains("command = "));
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_escapes_toml_url_and_bearer_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let desired_url = "http://127.0.0.1:8765/mcp/?label=\"quoted\"";
+        let desired_token = "quote\"slash\\line\nnext";
+        std::fs::write(
+            &config,
+            r#"[mcp_servers.mcp_agent_mail]
+command = "mcp-agent-mail"
+"#,
+        )
+        .unwrap();
+
+        fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some(desired_token),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Codex,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config).unwrap();
+        let parsed = content
+            .parse::<toml_edit::DocumentMut>()
+            .expect("the repaired config must remain valid TOML");
+        let section = &parsed["mcp_servers"]["mcp_agent_mail"];
+        assert_eq!(section["url"].as_str(), Some(desired_url));
+        let headers = section["http_headers"]
+            .as_inline_table()
+            .expect("http_headers must remain an inline table");
+        let expected_authorization = format!("Bearer {desired_token}");
+        assert_eq!(
+            headers
+                .get("Authorization")
+                .and_then(toml_edit::Value::as_str),
+            Some(expected_authorization.as_str())
+        );
     }
 
     #[test]
