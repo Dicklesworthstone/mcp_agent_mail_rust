@@ -55,6 +55,7 @@ extract_function() {
     echo 'COSIGN_BIN='
     echo 'BINARY_TRANSACTION_ACTIVE_INSTALL_DIR='
     echo 'BINARY_TRANSACTION_RECOVERY_ACTIVE=0'
+    echo 'BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0'
     echo 'TXN_NONCE='
     echo 'TXN_HAD_SERVER='
     echo 'TXN_HAD_CLI='
@@ -1275,8 +1276,8 @@ ps_staged_version_line=$(grep -nF 'Assert-ExactBinaryVersion -BinaryPath $amSour
 ps_replace_line=$(grep -nF '    Install-BinariesAtomically `' "$INSTALL_PS1" | cut -d: -f1)
 ps_post_version_line=$(grep -nF 'Verify-Install -InstallDir $VerifiedInstallDir -ExpectedVersion $requestedNormalized' "$INSTALL_PS1" | cut -d: -f1)
 ps_callback_line=$(grep -nF '& $PostInstallVerifier $InstallDir' "$INSTALL_PS1" | cut -d: -f1)
-ps_commit_line=$(grep -nF '        $committed = $true' "$INSTALL_PS1" | cut -d: -f1)
-ps_backup_cleanup_line=$(grep -nF '        if ($committed) {' "$INSTALL_PS1" | cut -d: -f1)
+ps_commit_line=$(grep -nF 'Write-BinaryTransactionPhase -Journal $journal -Phase "50-commit-ready"' "$INSTALL_PS1" | cut -d: -f1)
+ps_archive_line=$(grep -nF 'Archive-BinaryTransaction -Journal $journal -InstallDir $InstallDir -Outcome "committed"' "$INSTALL_PS1" | cut -d: -f1)
 if ! grep -Fq '$ShouldVerifyArchive = if ($NoVerify) { $false } else { $true }' "$INSTALL_PS1"; then
     echo "FAIL: PowerShell archive verification must default on and require an explicit -NoVerify escape" >&2
     exit 1
@@ -1290,12 +1291,12 @@ if [ -z "$ps_gate_line" ] || [ -z "$ps_sigstore_line" ] || [ -z "$ps_gate_end_li
 fi
 if [ -z "$ps_staged_version_line" ] || [ -z "$ps_replace_line" ] || \
     [ -z "$ps_post_version_line" ] || [ -z "$ps_callback_line" ] || \
-    [ -z "$ps_commit_line" ] || [ -z "$ps_backup_cleanup_line" ] || \
+    [ -z "$ps_commit_line" ] || [ -z "$ps_archive_line" ] || \
     [ "$ps_staged_version_line" -ge "$ps_post_version_line" ] || \
     [ "$ps_post_version_line" -ge "$ps_replace_line" ] || \
     [ "$ps_callback_line" -ge "$ps_commit_line" ] || \
-    [ "$ps_commit_line" -ge "$ps_backup_cleanup_line" ]; then
-    echo "FAIL: PowerShell post-install verification must commit before backup cleanup" >&2
+    [ "$ps_commit_line" -ge "$ps_archive_line" ]; then
+    echo "FAIL: PowerShell post-install verification must precede commit-ready and retained-history archival" >&2
     exit 1
 fi
 for required_text in \
@@ -1318,6 +1319,10 @@ for required_text in \
     'Assert-ExactBinaryVersion -BinaryPath $serverExe -ExpectedOutput "mcp-agent-mail $ExpectedVersion" -Phase "Post-install"' \
     '$installerMutex = Enter-InstallerMutex -InstallDir $Dest' \
     '"Global\mcp-agent-mail-install-$digest"' \
+    '[McpAgentMailInstallerNativeMethods]::MoveFileExW($Source, $Destination, [uint32]0x8)' \
+    'MOVEFILE_REPLACE_EXISTING is' \
+    'Recover-BinaryPairTransaction -InstallDir $Dest' \
+    'phase "50-commit-ready"' \
     '-PostInstallVerifier $postInstallVerifier' \
     'Installed binary bytes differ from the verified staged pair.' \
     'Archive-member and exact-version checks remain mandatory.' \
@@ -1328,5 +1333,18 @@ for required_text in \
         exit 1
     fi
 done
+
+unix_pair_block=$(sed -n '/^install_binary_pair_transactional() {/,/^}/p' "$INSTALL_SH")
+if grep -Eq '(^|[[:space:]])rm([[:space:]]|$)' <<<"$unix_pair_block"; then
+    echo "FAIL: Unix binary pair path still deletes transaction evidence" >&2
+    exit 1
+fi
+ps_pair_start=$(grep -nF 'function Install-BinariesAtomically {' "$INSTALL_PS1" | cut -d: -f1)
+ps_pair_end=$(awk -v first="$ps_pair_start" 'NR > first && $0 == "}" { print NR; exit }' "$INSTALL_PS1")
+if [ -z "$ps_pair_start" ] || [ -z "$ps_pair_end" ] || \
+   sed -n "${ps_pair_start},${ps_pair_end}p" "$INSTALL_PS1" | grep -Fq 'Remove-Item'; then
+    echo "FAIL: PowerShell binary pair path still deletes transaction evidence" >&2
+    exit 1
+fi
 
 step "ALL SCENARIOS PASSED"

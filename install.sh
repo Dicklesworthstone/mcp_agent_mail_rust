@@ -2849,6 +2849,7 @@ file_sha256_hex() {
 # to replace or delete an earlier entry.
 BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
 BINARY_TRANSACTION_RECOVERY_ACTIVE=0
+BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0
 TXN_NONCE=""
 TXN_HAD_SERVER=""
 TXN_HAD_CLI=""
@@ -7892,6 +7893,7 @@ handle_binary_transaction_signal() {
   # A second signal must not recursively enter recovery. SIGKILL and power
   # loss remain next-run recovery cases by construction.
   trap - HUP INT QUIT TERM
+  BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=1
   if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
      [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ]; then
     if ! recover_binary_pair_transaction "$BINARY_TRANSACTION_ACTIVE_INSTALL_DIR"; then
@@ -7905,7 +7907,9 @@ cleanup() {
   local rc=$?
   trap - HUP INT QUIT TERM
   if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
-     [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ]; then
+     [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ] && \
+     [ "${BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED:-0}" -eq 0 ]; then
+    BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=1
     if ! recover_binary_pair_transaction "$BINARY_TRANSACTION_ACTIVE_INSTALL_DIR"; then
       err "Exit-time binary transaction recovery failed closed; the active journal was retained."
       [ "$rc" -ne 0 ] || rc=1
