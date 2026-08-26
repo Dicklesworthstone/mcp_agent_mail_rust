@@ -4556,6 +4556,270 @@ pub async fn list_project_rows(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow
 }
 
 // =============================================================================
+// Project sibling suggestions
+// =============================================================================
+
+/// Persisted review state for a project-sibling suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSiblingStatus {
+    Suggested,
+    Confirmed,
+    Dismissed,
+}
+
+impl ProjectSiblingStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suggested => "suggested",
+            Self::Confirmed => "confirmed",
+            Self::Dismissed => "dismissed",
+        }
+    }
+
+    fn from_persisted(raw: &str) -> std::result::Result<Self, DbError> {
+        match raw {
+            "suggested" => Ok(Self::Suggested),
+            "confirmed" => Ok(Self::Confirmed),
+            "dismissed" => Ok(Self::Dismissed),
+            _ => Err(DbError::Internal(format!(
+                "invalid project sibling suggestion status '{raw}'"
+            ))),
+        }
+    }
+}
+
+/// Project identity embedded in a sibling-suggestion response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSiblingPeer {
+    pub id: i64,
+    pub slug: String,
+    pub human_key: String,
+}
+
+/// A sibling suggestion joined with both project identities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSiblingSuggestion {
+    pub id: i64,
+    pub status: ProjectSiblingStatus,
+    pub score: f64,
+    pub rationale: String,
+    pub project_a: ProjectSiblingPeer,
+    pub project_b: ProjectSiblingPeer,
+    pub evaluated_ts: i64,
+    pub confirmed_ts: Option<i64>,
+    pub dismissed_ts: Option<i64>,
+}
+
+const PROJECT_SIBLING_SELECT: &str =
+    "SELECT s.id, s.status, s.score, s.rationale, s.evaluated_ts, \
+            s.confirmed_ts, s.dismissed_ts, \
+            a.id, a.slug, a.human_key, b.id, b.slug, b.human_key \
+     FROM project_sibling_suggestions AS s \
+     JOIN projects AS a ON a.id = s.project_a_id \
+     JOIN projects AS b ON b.id = s.project_b_id";
+
+fn decode_project_sibling_suggestion(
+    row: &SqlRow,
+) -> std::result::Result<ProjectSiblingSuggestion, DbError> {
+    let status_raw: String = row.get_as(1).map_err(|error| map_sql_error(&error))?;
+    Ok(ProjectSiblingSuggestion {
+        id: row.get_as(0).map_err(|error| map_sql_error(&error))?,
+        status: ProjectSiblingStatus::from_persisted(&status_raw)?,
+        score: row.get_as(2).map_err(|error| map_sql_error(&error))?,
+        rationale: row.get_as(3).map_err(|error| map_sql_error(&error))?,
+        evaluated_ts: row.get_as(4).map_err(|error| map_sql_error(&error))?,
+        confirmed_ts: row.get_as(5).map_err(|error| map_sql_error(&error))?,
+        dismissed_ts: row.get_as(6).map_err(|error| map_sql_error(&error))?,
+        project_a: ProjectSiblingPeer {
+            id: row.get_as(7).map_err(|error| map_sql_error(&error))?,
+            slug: row.get_as(8).map_err(|error| map_sql_error(&error))?,
+            human_key: row.get_as(9).map_err(|error| map_sql_error(&error))?,
+        },
+        project_b: ProjectSiblingPeer {
+            id: row.get_as(10).map_err(|error| map_sql_error(&error))?,
+            slug: row.get_as(11).map_err(|error| map_sql_error(&error))?,
+            human_key: row.get_as(12).map_err(|error| map_sql_error(&error))?,
+        },
+    })
+}
+
+/// List all sibling suggestions with their project identities.
+pub async fn list_project_sibling_suggestions(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<Vec<ProjectSiblingSuggestion>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let sql = format!("{PROJECT_SIBLING_SELECT} ORDER BY s.score DESC, s.id ASC");
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &[]).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut suggestions = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match decode_project_sibling_suggestion(row) {
+            Ok(suggestion) => suggestions.push(suggestion),
+            Err(error) => return Outcome::Err(error),
+        }
+    }
+    Outcome::Ok(suggestions)
+}
+
+/// Atomically transition an existing sibling suggestion to a new review state.
+///
+/// Project pairs are canonicalized so callers may supply either orientation.
+/// Resetting to `suggested` clears both prior-decision timestamps.
+pub async fn update_project_sibling_status(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    other_id: i64,
+    status: ProjectSiblingStatus,
+) -> Outcome<ProjectSiblingSuggestion, DbError> {
+    if project_id <= 0 || other_id <= 0 {
+        return Outcome::Err(DbError::invalid(
+            "project_id",
+            "Project identifiers must be positive integers",
+        ));
+    }
+    if project_id == other_id {
+        return Outcome::Err(DbError::invalid(
+            "other_id",
+            "A project cannot be its own sibling",
+        ));
+    }
+
+    let (project_a_id, project_b_id) = if project_id < other_id {
+        (project_id, other_id)
+    } else {
+        (other_id, project_id)
+    };
+    let now = now_micros();
+    let confirmed_ts = if status == ProjectSiblingStatus::Confirmed {
+        Value::BigInt(now)
+    } else {
+        Value::Null
+    };
+    let dismissed_ts = if status == ProjectSiblingStatus::Dismissed {
+        Value::BigInt(now)
+    } else {
+        Value::Null
+    };
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "update_project_sibling_status", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        let project_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT COUNT(*) FROM projects WHERE id IN (?, ?)",
+                    &[Value::BigInt(project_a_id), Value::BigInt(project_b_id)],
+                )
+                .await
+            )
+        );
+        let project_count = project_rows
+            .first()
+            .and_then(row_first_i64)
+            .unwrap_or_default();
+        if project_count != 2 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Project pair",
+                format!("{project_a_id},{project_b_id}"),
+            ));
+        }
+
+        let update_params = [
+            Value::Text(status.as_str().to_string()),
+            Value::BigInt(now),
+            confirmed_ts.clone(),
+            dismissed_ts.clone(),
+            Value::BigInt(project_a_id),
+            Value::BigInt(project_b_id),
+        ];
+        let changed = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE project_sibling_suggestions \
+                     SET status = ?, evaluated_ts = ?, confirmed_ts = ?, dismissed_ts = ? \
+                     WHERE project_a_id = ? AND project_b_id = ?",
+                    &update_params,
+                )
+                .await
+            )
+        );
+        if changed == 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Project sibling suggestion",
+                format!("{project_a_id},{project_b_id}"),
+            ));
+        }
+
+        let select_sql = format!(
+            "{PROJECT_SIBLING_SELECT} WHERE s.project_a_id = ? AND s.project_b_id = ? LIMIT 1"
+        );
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    &select_sql,
+                    &[Value::BigInt(project_a_id), Value::BigInt(project_b_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "sibling suggestion update succeeded but re-select failed".to_string(),
+            ));
+        };
+        let suggestion = match decode_project_sibling_suggestion(row) {
+            Ok(suggestion) => suggestion,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(suggestion)
+    })
+    .await
+}
+
+// =============================================================================
 // Database generation identity (br-n8qh6)
 // =============================================================================
 
@@ -16107,6 +16371,212 @@ mod tests {
         )
         .into_result()
         .expect("insert project row");
+    }
+
+    async fn insert_project_sibling_for_test(
+        cx: &Cx,
+        pool: &DbPool,
+        project_a_id: i64,
+        project_b_id: i64,
+        score: f64,
+    ) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "INSERT INTO project_sibling_suggestions \
+                 (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts) \
+                 VALUES (?, ?, ?, 'suggested', 'shared workspace', 10, 10)",
+                &[
+                    Value::BigInt(project_a_id),
+                    Value::BigInt(project_b_id),
+                    Value::Double(score),
+                ],
+            )
+            .await,
+        )
+        .into_result()
+        .expect("insert project sibling suggestion");
+    }
+
+    #[test]
+    fn project_sibling_transitions_are_canonical_atomic_and_durable() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-transition");
+
+        rt.block_on(async {
+            let project_a = ProjectRow {
+                id: Some(101),
+                slug: "project-a".to_string(),
+                human_key: "/workspace/project-a".to_string(),
+                created_at: 1,
+            };
+            let project_b = ProjectRow {
+                id: Some(202),
+                slug: "project-b".to_string(),
+                human_key: "/workspace/project-b".to_string(),
+                created_at: 2,
+            };
+            insert_project_row_for_test(&cx, &pool, &project_a).await;
+            insert_project_row_for_test(&cx, &pool, &project_b).await;
+            insert_project_sibling_for_test(&cx, &pool, 101, 202, 0.97).await;
+
+            let confirmed = update_project_sibling_status(
+                &cx,
+                &pool,
+                202,
+                101,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await
+            .into_result()
+            .expect("confirm from reverse orientation");
+            assert_eq!(confirmed.status, ProjectSiblingStatus::Confirmed);
+            assert_eq!(confirmed.project_a.id, 101);
+            assert_eq!(confirmed.project_b.id, 202);
+            assert!(confirmed.confirmed_ts.is_some());
+            assert_eq!(confirmed.dismissed_ts, None);
+            assert!(confirmed.evaluated_ts > 10);
+
+            let dismissed = update_project_sibling_status(
+                &cx,
+                &pool,
+                101,
+                202,
+                ProjectSiblingStatus::Dismissed,
+            )
+            .await
+            .into_result()
+            .expect("dismiss suggestion");
+            assert_eq!(dismissed.status, ProjectSiblingStatus::Dismissed);
+            assert_eq!(dismissed.confirmed_ts, None);
+            assert!(dismissed.dismissed_ts.is_some());
+
+            let reset = update_project_sibling_status(
+                &cx,
+                &pool,
+                202,
+                101,
+                ProjectSiblingStatus::Suggested,
+            )
+            .await
+            .into_result()
+            .expect("reset suggestion");
+            assert_eq!(reset.status, ProjectSiblingStatus::Suggested);
+            assert_eq!(reset.confirmed_ts, None);
+            assert_eq!(reset.dismissed_ts, None);
+
+            let listed = list_project_sibling_suggestions(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list sibling suggestions");
+            assert_eq!(listed, vec![reset]);
+        });
+
+        let fresh = crate::DbConn::open_file(pool.sqlite_path()).expect("open independent reader");
+        let rows = fresh
+            .query_sync(
+                "SELECT status, confirmed_ts, dismissed_ts \
+                 FROM project_sibling_suggestions \
+                 WHERE project_a_id = 101 AND project_b_id = 202",
+                &[],
+            )
+            .expect("read transition from independent connection");
+        let row = rows.first().expect("durable sibling suggestion row");
+        assert_eq!(
+            row.get_named::<String>("status").expect("decode status"),
+            "suggested"
+        );
+        assert_eq!(
+            row.get_named::<Option<i64>>("confirmed_ts")
+                .expect("decode confirmed_ts"),
+            None
+        );
+        assert_eq!(
+            row.get_named::<Option<i64>>("dismissed_ts")
+                .expect("decode dismissed_ts"),
+            None
+        );
+    }
+
+    #[test]
+    fn project_sibling_transition_rejects_invalid_and_missing_pairs() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let (_dir, pool) = create_file_pool_with_schema_for_test("project-sibling-errors");
+
+        rt.block_on(async {
+            let project_a = ProjectRow {
+                id: Some(301),
+                slug: "project-a".to_string(),
+                human_key: "/workspace/project-a".to_string(),
+                created_at: 1,
+            };
+            let project_b = ProjectRow {
+                id: Some(302),
+                slug: "project-b".to_string(),
+                human_key: "/workspace/project-b".to_string(),
+                created_at: 2,
+            };
+            insert_project_row_for_test(&cx, &pool, &project_a).await;
+            insert_project_row_for_test(&cx, &pool, &project_b).await;
+
+            let self_pair = update_project_sibling_status(
+                &cx,
+                &pool,
+                301,
+                301,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await;
+            assert!(matches!(self_pair, Outcome::Err(DbError::InvalidArgument { .. })));
+
+            let missing_project = update_project_sibling_status(
+                &cx,
+                &pool,
+                301,
+                999,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await;
+            assert!(matches!(
+                missing_project,
+                Outcome::Err(DbError::NotFound {
+                    entity: "Project pair",
+                    ..
+                })
+            ));
+
+            let missing_suggestion = update_project_sibling_status(
+                &cx,
+                &pool,
+                301,
+                302,
+                ProjectSiblingStatus::Confirmed,
+            )
+            .await;
+            assert!(matches!(
+                missing_suggestion,
+                Outcome::Err(DbError::NotFound {
+                    entity: "Project sibling suggestion",
+                    ..
+                })
+            ));
+        });
     }
 
     #[test]

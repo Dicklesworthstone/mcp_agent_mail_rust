@@ -2673,22 +2673,102 @@ struct IndexCtx {
 
 #[derive(Serialize)]
 struct IndexProject {
+    id: i64,
     slug: String,
     human_key: String,
     created_at: String,
     agent_count: usize,
+    confirmed_siblings: Vec<IndexSibling>,
+    suggested_siblings: Vec<IndexSibling>,
+}
+
+#[derive(Clone, Serialize)]
+struct IndexSibling {
+    suggestion_id: i64,
+    score: f64,
+    rationale: String,
+    peer: IndexSiblingPeer,
+}
+
+#[derive(Clone, Serialize)]
+struct IndexSiblingPeer {
+    id: i64,
+    human_key: String,
+}
+
+#[derive(Default)]
+struct IndexSiblingBuckets {
+    confirmed: Vec<IndexSibling>,
+    suggested: Vec<IndexSibling>,
 }
 
 fn render_index(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
+    let sibling_suggestions =
+        block_on_outcome(cx, queries::list_project_sibling_suggestions(cx, pool))?;
+    let mut sibling_buckets: BTreeMap<i64, IndexSiblingBuckets> = BTreeMap::new();
+    for suggestion in sibling_suggestions {
+        let for_a = IndexSibling {
+            suggestion_id: suggestion.id,
+            score: suggestion.score,
+            rationale: suggestion.rationale.clone(),
+            peer: IndexSiblingPeer {
+                id: suggestion.project_b.id,
+                human_key: suggestion.project_b.human_key.clone(),
+            },
+        };
+        let for_b = IndexSibling {
+            suggestion_id: suggestion.id,
+            score: suggestion.score,
+            rationale: suggestion.rationale,
+            peer: IndexSiblingPeer {
+                id: suggestion.project_a.id,
+                human_key: suggestion.project_a.human_key,
+            },
+        };
+        match suggestion.status {
+            queries::ProjectSiblingStatus::Confirmed => {
+                sibling_buckets
+                    .entry(suggestion.project_a.id)
+                    .or_default()
+                    .confirmed
+                    .push(for_a);
+                sibling_buckets
+                    .entry(suggestion.project_b.id)
+                    .or_default()
+                    .confirmed
+                    .push(for_b);
+            }
+            queries::ProjectSiblingStatus::Suggested if suggestion.score >= 0.92 => {
+                sibling_buckets
+                    .entry(suggestion.project_a.id)
+                    .or_default()
+                    .suggested
+                    .push(for_a);
+                sibling_buckets
+                    .entry(suggestion.project_b.id)
+                    .or_default()
+                    .suggested
+                    .push(for_b);
+            }
+            queries::ProjectSiblingStatus::Suggested
+            | queries::ProjectSiblingStatus::Dismissed => {}
+        }
+    }
+
     let mut items: Vec<IndexProject> = Vec::with_capacity(projects.len());
     for p in &projects {
-        let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
+        let project_id = p.id.unwrap_or(0);
+        let agents = block_on_outcome(cx, queries::list_agents(cx, pool, project_id))?;
+        let siblings = sibling_buckets.remove(&project_id).unwrap_or_default();
         items.push(IndexProject {
+            id: project_id,
             slug: p.slug.clone(),
             human_key: p.human_key.clone(),
             created_at: ts_display(p.created_at),
             agent_count: agents.len(),
+            confirmed_siblings: siblings.confirmed,
+            suggested_siblings: siblings.suggested,
         });
     }
     render("mail_index.html", IndexCtx { projects: items })
@@ -5472,10 +5552,10 @@ fn handle_overseer_send(
 // ---------------------------------------------------------------------------
 
 fn handle_sibling_update(
-    _cx: &Cx,
-    _pool: &DbPool,
-    _project_id: i64,
-    _other_id: i64,
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    other_id: i64,
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
     let payload: serde_json::Value =
@@ -5483,17 +5563,60 @@ fn handle_sibling_update(
 
     let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
-    if !action.eq_ignore_ascii_case("confirm")
-        && !action.eq_ignore_ascii_case("dismiss")
-        && !action.eq_ignore_ascii_case("reset")
-    {
+    let status = if action.eq_ignore_ascii_case("confirm") {
+        queries::ProjectSiblingStatus::Confirmed
+    } else if action.eq_ignore_ascii_case("dismiss") {
+        queries::ProjectSiblingStatus::Dismissed
+    } else if action.eq_ignore_ascii_case("reset") {
+        queries::ProjectSiblingStatus::Suggested
+    } else {
         return json_err(400, "Invalid action");
-    }
+    };
 
-    json_err(
-        501,
-        "Sibling suggestion updates are not implemented in the Rust server yet",
-    )
+    match spin_block_on(queries::update_project_sibling_status(
+        cx, pool, project_id, other_id, status,
+    )) {
+        asupersync::Outcome::Ok(suggestion) => json_ok(&serde_json::json!({
+            "status": suggestion.status.as_str(),
+            "suggestion": suggestion,
+        })),
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
+            message,
+            ..
+        }) => json_err(400, &message),
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+            json_err(404, "Project or sibling suggestion not found")
+        }
+        asupersync::Outcome::Err(error) => {
+            let status = if error.is_retryable() { 503 } else { 500 };
+            tracing::error!(
+                project_id,
+                other_id,
+                error = %error,
+                "project_sibling_update_failed"
+            );
+            json_err(
+                status,
+                if status == 503 {
+                    "Sibling suggestion update is temporarily unavailable"
+                } else {
+                    "Internal server error"
+                },
+            )
+        }
+        asupersync::Outcome::Cancelled(_) => {
+            json_err(503, "Sibling suggestion update was cancelled")
+        }
+        asupersync::Outcome::Panicked(payload) => {
+            tracing::error!(
+                project_id,
+                other_id,
+                panic = %payload.message(),
+                "project_sibling_update_panicked"
+            );
+            json_err(500, "Internal server error")
+        }
+    }
 }
 
 /// Render an error page.
@@ -5527,6 +5650,30 @@ mod fresh_eyes_regression_tests {
             Outcome::Cancelled(_) => panic!("db operation cancelled"),
             Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
         }
+    }
+
+    fn seed_project_sibling(
+        cx: &Cx,
+        pool: &DbPool,
+        project_a_id: i64,
+        project_b_id: i64,
+        score: f64,
+    ) {
+        let conn = match block_on(pool.acquire(cx)) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => panic!("pool error: {error}"),
+            Outcome::Cancelled(_) => panic!("pool acquisition cancelled"),
+            Outcome::Panicked(panic) => {
+                panic!("pool acquisition panicked: {}", panic.message())
+            }
+        };
+        conn.execute_raw(&format!(
+            "INSERT INTO project_sibling_suggestions \
+             (project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts) \
+             VALUES ({project_a_id}, {project_b_id}, {score}, 'suggested', \
+                     'shared workspace roots', 10, 10)"
+        ))
+        .expect("seed project sibling suggestion");
     }
 
     #[test]
@@ -5984,18 +6131,97 @@ mod fresh_eyes_regression_tests {
     }
 
     #[test]
-    fn sibling_update_route_reports_not_implemented() {
+    fn sibling_update_route_persists_and_index_renders_both_orientations() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-sibling");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let project_a = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/workspace/mail-ui-sibling-a-{nonce}"),
+        )));
+        let project_b = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/workspace/mail-ui-sibling-b-{nonce}"),
+        )));
+        let project_a_id = project_a.id.expect("project a id");
+        let project_b_id = project_b.id.expect("project b id");
+        seed_project_sibling(&cx, &pool, project_a_id, project_b_id, 0.97);
 
-        let (status, payload) = handle_sibling_update(&cx, &pool, 1, 2, r#"{"action":"confirm"}"#)
-            .expect_err("route should not pretend to succeed");
-
-        assert_eq!(status, 501);
-        assert!(
-            payload.contains("not implemented"),
-            "unexpected payload: {payload}"
+        let suggested_html = render_index(&cx, &pool)
+            .expect("suggested index should render")
+            .expect("suggested index html");
+        assert_eq!(
+            suggested_html.matches("data-suggestion-id=\"").count(),
+            2,
+            "the same canonical suggestion must render on both project cards"
         );
+        assert!(suggested_html.contains(&format!(
+            "data-project=\"{project_a_id}\"\n                   data-other=\"{project_b_id}\""
+        )));
+        assert!(suggested_html.contains(&format!(
+            "data-project=\"{project_b_id}\"\n                   data-other=\"{project_a_id}\""
+        )));
+
+        let payload = handle_sibling_update(
+            &cx,
+            &pool,
+            project_b_id,
+            project_a_id,
+            r#"{"action":"confirm"}"#,
+        )
+        .expect("confirm route should succeed")
+        .expect("confirm route json");
+        let response: serde_json::Value =
+            serde_json::from_str(&payload).expect("confirm response should parse");
+        assert_eq!(response["status"], "confirmed");
+        assert_eq!(response["suggestion"]["project_a"]["id"], project_a_id);
+        assert_eq!(response["suggestion"]["project_b"]["id"], project_b_id);
+        assert!(response["suggestion"]["confirmed_ts"].is_number());
+        assert!(response["suggestion"]["dismissed_ts"].is_null());
+
+        let confirmed_html = render_index(&cx, &pool)
+            .expect("confirmed index should render")
+            .expect("confirmed index html");
+        assert!(confirmed_html.contains(&format!(
+            "data-sibling-action=\"reset\"\n                      data-project=\"{project_a_id}\"\n                      data-other=\"{project_b_id}\""
+        )));
+        assert!(confirmed_html.contains(&format!(
+            "data-sibling-action=\"reset\"\n                      data-project=\"{project_b_id}\"\n                      data-other=\"{project_a_id}\""
+        )));
+    }
+
+    #[test]
+    fn sibling_update_route_maps_validation_and_lookup_failures() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-sibling-errors");
+
+        let (status, payload) = handle_sibling_update(
+            &cx,
+            &pool,
+            1,
+            2,
+            r#"{"action":"unsupported"}"#,
+        )
+        .expect_err("invalid action must fail");
+        assert_eq!(status, 400);
+        assert!(payload.contains("Invalid action"));
+
+        let (status, payload) =
+            handle_sibling_update(&cx, &pool, 1, 1, r#"{"action":"confirm"}"#)
+                .expect_err("self-pair must fail");
+        assert_eq!(status, 400);
+        assert!(payload.contains("cannot be its own sibling"));
+
+        let (status, payload) =
+            handle_sibling_update(&cx, &pool, 1, 2, r#"{"action":"confirm"}"#)
+                .expect_err("missing pair must fail");
+        assert_eq!(status, 404);
+        assert!(payload.contains("not found"));
     }
 }
 
