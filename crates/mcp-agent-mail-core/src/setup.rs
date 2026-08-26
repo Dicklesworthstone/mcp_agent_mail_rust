@@ -2436,7 +2436,7 @@ fn validate_setup_file_target(path: &Path, label: &str) -> Result<(), SetupError
     Ok(())
 }
 
-#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
 fn setup_new_file_options(permissions: u32) -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -2455,7 +2455,14 @@ struct SetupDirectoryAuthority {
     fd: std::os::fd::OwnedFd,
 }
 
-#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+#[cfg(windows)]
+struct SetupDirectoryAuthority {
+    dir: cap_std::fs::Dir,
+    _ancestors: Vec<cap_std::fs::Dir>,
+    path: PathBuf,
+}
+
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
 struct SetupDirectoryAuthority;
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -2511,7 +2518,71 @@ fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectory
     Ok(SetupDirectoryAuthority { fd })
 }
 
-#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+#[cfg(windows)]
+fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectoryAuthority> {
+    use cap_fs_ext::DirExt as _;
+
+    let absolute = std::path::absolute(path)?;
+    if !absolute.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Windows setup directory authority must be absolute: {}",
+                absolute.display()
+            ),
+        ));
+    }
+
+    let mut anchor = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            std::path::Component::RootDir => anchor.push(component.as_os_str()),
+            _ => break,
+        }
+    }
+    if anchor.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Windows setup directory authority has no rooted anchor: {}",
+                absolute.display()
+            ),
+        ));
+    }
+
+    let mut current = cap_std::fs::Dir::open_ambient_dir(&anchor, cap_std::ambient_authority())?;
+    let mut ancestors = Vec::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "parent traversal in Windows setup directory {}",
+                        absolute.display()
+                    ),
+                ));
+            }
+            std::path::Component::Normal(segment) => {
+                let next = current.open_dir_nofollow(segment)?;
+                ancestors.push(current);
+                current = next;
+            }
+        }
+    }
+
+    Ok(SetupDirectoryAuthority {
+        dir: current,
+        _ancestors: ancestors,
+        path: absolute,
+    })
+}
+
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
 fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectoryAuthority> {
     let _ = path;
     Ok(SetupDirectoryAuthority)
@@ -2525,6 +2596,10 @@ struct SetupFileSnapshot {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    device: u64,
+    #[cfg(windows)]
     inode: u64,
 }
 
@@ -2544,7 +2619,9 @@ fn snapshot_open_setup_file(
 
         metadata.nlink()
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let link_count = cap_fs_ext::MetadataExt::nlink(&metadata);
+    #[cfg(not(any(unix, windows)))]
     let link_count = 1;
     if metadata.len() > SETUP_CONFIG_FILE_MAX_BYTES {
         return Err(invalid_setup_path(
@@ -2599,6 +2676,10 @@ fn snapshot_open_setup_file(
             use std::os::unix::fs::MetadataExt as _;
             metadata.ino()
         },
+        #[cfg(windows)]
+        device: cap_fs_ext::MetadataExt::dev(&metadata),
+        #[cfg(windows)]
+        inode: cap_fs_ext::MetadataExt::ino(&metadata),
     })
 }
 
@@ -2628,7 +2709,27 @@ fn read_setup_file_with_authority(
         snapshot_setup_authority_leaf(authority, file_name, path, label)
     }
 
-    #[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+    #[cfg(windows)]
+    {
+        let owned_authority;
+        let authority = if let Some(authority) = authority {
+            authority
+        } else {
+            if !parent.as_os_str().is_empty() && !check_setup_real_directory(parent, label, false)?
+            {
+                return Ok(None);
+            }
+            owned_authority = open_setup_directory_authority(parent)?;
+            &owned_authority
+        };
+        revalidate_setup_directory_authority(parent, authority)?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| invalid_setup_path(label, path, "must name a file"))?;
+        snapshot_setup_authority_leaf(authority, file_name, path, label)
+    }
+
+    #[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
     {
         let _ = authority;
         if !parent.as_os_str().is_empty() && !check_setup_real_directory(parent, label, false)? {
@@ -2647,7 +2748,7 @@ fn read_setup_file(path: &Path, label: &str) -> Result<Option<SetupFileSnapshot>
     read_setup_file_with_authority(path, label, None)
 }
 
-#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
 fn create_unique_setup_file(
     parent: &Path,
     file_name: &str,
@@ -2725,7 +2826,26 @@ fn snapshot_setup_authority_leaf(
     snapshot_open_setup_file(std::fs::File::from(fd), display_path, label).map(Some)
 }
 
-#[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(windows)]
+fn snapshot_setup_authority_leaf(
+    authority: &SetupDirectoryAuthority,
+    file_name: &std::ffi::OsStr,
+    display_path: &Path,
+    label: &str,
+) -> Result<Option<SetupFileSnapshot>, SetupError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = match authority.dir.open_with(file_name, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    snapshot_open_setup_file(file.into_std(), display_path, label).map(Some)
+}
+
+#[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
 fn setup_snapshots_match(expected: &SetupFileSnapshot, observed: &SetupFileSnapshot) -> bool {
     expected.content == observed.content
         && expected.permissions == observed.permissions
@@ -2755,7 +2875,29 @@ fn revalidate_setup_directory_authority(
     Ok(())
 }
 
-#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+#[cfg(windows)]
+fn revalidate_setup_directory_authority(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+) -> Result<(), SetupError> {
+    let observed = open_setup_directory_authority(&authority.path)?;
+    let expected_metadata = authority.dir.dir_metadata()?;
+    let observed_metadata = observed.dir.dir_metadata()?;
+    if cap_fs_ext::MetadataExt::dev(&expected_metadata)
+        != cap_fs_ext::MetadataExt::dev(&observed_metadata)
+        || cap_fs_ext::MetadataExt::ino(&expected_metadata)
+            != cap_fs_ext::MetadataExt::ino(&observed_metadata)
+    {
+        return Err(invalid_setup_path(
+            "setup directory authority",
+            path,
+            "changed identity during the config transaction",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
 fn revalidate_setup_directory_authority(
     path: &Path,
     authority: &SetupDirectoryAuthority,
@@ -2810,6 +2952,293 @@ fn write_setup_backup_at(
     drop(output);
     fsync(&authority.fd).map_err(std::io::Error::from)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_setup_path_string(path: &Path, label: &str) -> Result<String, SetupError> {
+    let path = path.to_str().ok_or_else(|| {
+        invalid_setup_path(
+            label,
+            path,
+            "must be valid Unicode for the Windows publication API",
+        )
+    })?;
+    if path.contains('\0') {
+        return Err(invalid_setup_path(
+            label,
+            Path::new(path),
+            "must not contain a NUL byte",
+        ));
+    }
+    Ok(path.to_owned())
+}
+
+#[cfg(windows)]
+fn windows_setup_io_error(error: winsafe::co::ERROR) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error.raw().cast_signed())
+}
+
+#[cfg(windows)]
+fn unique_windows_setup_sibling(
+    authority: &SetupDirectoryAuthority,
+    file_name: &str,
+    suffix: &str,
+) -> Result<(String, String), SetupError> {
+    for _ in 0..1024 {
+        let name = format!(".{file_name}.{}.{suffix}", generate_token()?);
+        match authority.dir.symlink_metadata(&name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let path = windows_setup_path_string(
+                    &authority.path.join(&name),
+                    "Windows setup retention path",
+                )?;
+                return Ok((name, path));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(SetupError::Other(format!(
+        "could not allocate a unique Windows setup {suffix} path"
+    )))
+}
+
+#[cfg(windows)]
+fn create_persistent_windows_setup_temp(
+    authority: &SetupDirectoryAuthority,
+    file_name: &str,
+) -> Result<(std::fs::File, PathBuf), SetupError> {
+    let mut builder = tempfile::Builder::new();
+    let prefix = format!(".{file_name}.");
+    builder.prefix(&prefix).suffix(".tmp").disable_cleanup(true);
+    let temp = builder.tempfile_in(&authority.path)?;
+    temp.keep().map_err(|error| SetupError::Io(error.error))
+}
+
+#[cfg(windows)]
+fn replace_windows_setup_file_retaining_displaced(
+    authority: &SetupDirectoryAuthority,
+    file_name: &str,
+    replaced_path: &str,
+    replacement_path: &str,
+    suffix: &str,
+) -> Result<(String, String), SetupError> {
+    replace_windows_setup_file_retaining_displaced_with(
+        authority,
+        file_name,
+        replaced_path,
+        replacement_path,
+        suffix,
+        |replaced, replacement, retained| {
+            winsafe::ReplaceFile(
+                replaced,
+                replacement,
+                Some(retained),
+                winsafe::co::REPLACEFILE::WRITE_THROUGH,
+            )
+        },
+        |existing, new| {
+            winsafe::MoveFileEx(existing, Some(new), winsafe::co::MOVEFILE::WRITE_THROUGH)
+        },
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn replace_windows_setup_file_retaining_displaced_with(
+    authority: &SetupDirectoryAuthority,
+    file_name: &str,
+    replaced_path: &str,
+    replacement_path: &str,
+    suffix: &str,
+    mut replace_file: impl FnMut(&str, &str, &str) -> Result<(), winsafe::co::ERROR>,
+    mut move_file_no_replace: impl FnMut(&str, &str) -> Result<(), winsafe::co::ERROR>,
+) -> Result<(String, String), SetupError> {
+    let mut recovered_partial_moves = 0_u8;
+    for _ in 0..1024 {
+        let (retained_name, retained_path) =
+            unique_windows_setup_sibling(authority, file_name, suffix)?;
+        match replace_file(replaced_path, replacement_path, &retained_path) {
+            Ok(()) => return Ok((retained_name, retained_path)),
+            Err(error)
+                if error == winsafe::co::ERROR::FILE_EXISTS
+                    || error == winsafe::co::ERROR::ALREADY_EXISTS => {}
+            Err(error) if error == winsafe::co::ERROR::UNABLE_TO_MOVE_REPLACEMENT_2 => {
+                let replace_error = windows_setup_io_error(error);
+                match move_file_no_replace(&retained_path, replaced_path) {
+                    Ok(()) if recovered_partial_moves < 2 => {
+                        recovered_partial_moves += 1;
+                    }
+                    Ok(()) => return Err(replace_error.into()),
+                    Err(restore_error) => {
+                        return Err(SetupError::Other(format!(
+                            "Windows setup replacement failed ({replace_error}) and restoring the displaced file failed ({}); both files were retained",
+                            windows_setup_io_error(restore_error)
+                        )));
+                    }
+                }
+            }
+            Err(error) => return Err(windows_setup_io_error(error).into()),
+        }
+    }
+    Err(SetupError::Other(format!(
+        "could not retain the displaced Windows setup file as {suffix}"
+    )))
+}
+
+#[cfg(windows)]
+fn write_setup_file_atomic_bound(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
+    authority: Option<&SetupDirectoryAuthority>,
+) -> Result<(), SetupError> {
+    write_setup_file_atomic_bound_with_windows_hooks(
+        path,
+        content,
+        permissions,
+        label,
+        expected,
+        backup_existing,
+        authority,
+        || Ok(()),
+        || Ok(()),
+    )
+}
+
+#[cfg(all(test, windows))]
+fn write_setup_file_atomic_bound_with_hook(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
+    before_publish: impl FnOnce() -> Result<(), SetupError>,
+) -> Result<(), SetupError> {
+    write_setup_file_atomic_bound_with_windows_hooks(
+        path,
+        content,
+        permissions,
+        label,
+        expected,
+        backup_existing,
+        None,
+        before_publish,
+        || Ok(()),
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn write_setup_file_atomic_bound_with_windows_hooks(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+    expected: Option<&SetupFileSnapshot>,
+    backup_existing: bool,
+    authority: Option<&SetupDirectoryAuthority>,
+    before_publish: impl FnOnce() -> Result<(), SetupError>,
+    before_replace: impl FnOnce() -> Result<(), SetupError>,
+) -> Result<(), SetupError> {
+    let _ = permissions;
+    ensure_setup_parent_dir(path, label)?;
+    validate_setup_file_target(path, label)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid_setup_path(label, path, "must name a file"))?;
+    let owned_authority;
+    let authority = if let Some(authority) = authority {
+        authority
+    } else {
+        owned_authority = open_setup_directory_authority(parent)?;
+        &owned_authority
+    };
+    revalidate_setup_directory_authority(parent, authority)?;
+    let target_path = windows_setup_path_string(&authority.path.join(file_name), label)?;
+    let file_name = file_name.to_str().ok_or_else(|| {
+        invalid_setup_path(
+            label,
+            path,
+            "must have a valid Unicode file name for the Windows publication API",
+        )
+    })?;
+
+    let (mut temp_file, temp_path) = create_persistent_windows_setup_temp(authority, file_name)?;
+    temp_file.write_all(content)?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+    revalidate_setup_directory_authority(parent, authority)?;
+    before_publish()?;
+
+    if let Some(expected) = expected {
+        let observed =
+            snapshot_setup_authority_leaf(authority, OsStr::new(file_name), path, label)?;
+        if !observed
+            .as_ref()
+            .is_some_and(|observed| setup_snapshots_match(expected, observed))
+        {
+            return Err(invalid_setup_path(
+                label,
+                path,
+                "changed identity, content, permissions, or link topology before publication",
+            ));
+        }
+    }
+    before_replace()?;
+
+    let temp_path = windows_setup_path_string(&temp_path, "Windows setup temporary file")?;
+    if let Some(expected) = expected {
+        let suffix = if backup_existing { "bak" } else { "replaced" };
+        let (retained_name, retained_path) = replace_windows_setup_file_retaining_displaced(
+            authority,
+            file_name,
+            &target_path,
+            &temp_path,
+            suffix,
+        )?;
+        let retained_display_path = PathBuf::from(&retained_path);
+        let retained = snapshot_setup_authority_leaf(
+            authority,
+            OsStr::new(&retained_name),
+            &retained_display_path,
+            "Windows setup retained file",
+        );
+        if !matches!(retained, Ok(Some(ref observed)) if setup_snapshots_match(expected, observed))
+        {
+            let rollback = replace_windows_setup_file_retaining_displaced(
+                authority,
+                file_name,
+                &target_path,
+                &retained_path,
+                "replaced",
+            );
+            revalidate_setup_directory_authority(parent, authority)?;
+            rollback?;
+            return Err(invalid_setup_path(
+                label,
+                path,
+                "changed identity, content, permissions, or link topology at publication; the attempted replacement was retained and the displaced file restored",
+            ));
+        }
+    } else {
+        winsafe::MoveFileEx(
+            &temp_path,
+            Some(&target_path),
+            winsafe::co::MOVEFILE::WRITE_THROUGH,
+        )
+        .map_err(windows_setup_io_error)?;
+    }
+
+    revalidate_setup_directory_authority(parent, authority)
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3015,7 +3444,20 @@ fn write_setup_file_atomic_with_authority(
         )
     }
 
-    #[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+    #[cfg(windows)]
+    {
+        write_setup_file_atomic_bound(
+            path,
+            content,
+            permissions,
+            label,
+            expected,
+            backup_existing,
+            authority,
+        )
+    }
+
+    #[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
     {
         let _ = authority;
         ensure_setup_parent_dir(path, label)?;
@@ -3049,7 +3491,7 @@ fn write_setup_file_atomic_with_authority(
     }
 }
 
-#[cfg(not(all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
 fn write_setup_backup(
     content: &[u8],
     backup_parent: &Path,
@@ -8382,11 +8824,9 @@ mod tests {
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn write_config_atomic_detaches_hard_linked_existing_config() {
-        use std::os::unix::fs::MetadataExt as _;
-
         let tmp = setup_real_tempdir();
         let outside = tmp.path().join("outside.json");
         let linked = tmp.path().join("config.json");
@@ -8408,16 +8848,16 @@ mod tests {
         assert_eq!(outcome, ActionOutcome::Updated);
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
         assert_eq!(std::fs::read_to_string(&linked).unwrap(), original);
-        assert_ne!(
-            std::fs::metadata(&outside).unwrap().ino(),
-            std::fs::metadata(&linked).unwrap().ino(),
-            "the rewritten config must no longer share the peer inode"
+        assert!(
+            !same_file::is_same_file(&outside, &linked).unwrap(),
+            "the rewritten config must no longer share the peer file identity"
         );
     }
 
-    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    #[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
     #[test]
     fn write_setup_file_atomic_detects_same_content_leaf_replacement() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = setup_real_tempdir();
@@ -8425,6 +8865,7 @@ mod tests {
         let displaced = tmp.path().join("concurrent-displaced.json");
         let original = b"{\n  \"owner\": \"concurrent\"\n}\n";
         std::fs::write(&path, original).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let expected = read_setup_file(&path, "config file").unwrap().unwrap();
 
@@ -8438,6 +8879,7 @@ mod tests {
             || {
                 std::fs::rename(&path, &displaced)?;
                 std::fs::write(&path, original)?;
+                #[cfg(unix)]
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
                 Ok(())
             },
@@ -8457,15 +8899,17 @@ mod tests {
                 .unwrap()
                 .contains("attempted-secret")
         );
+        #[cfg(unix)]
         assert_eq!(
             retained_temp.metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
 
-    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    #[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
     #[test]
     fn write_setup_file_atomic_refuses_absent_to_present_race() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = setup_real_tempdir();
@@ -8481,6 +8925,7 @@ mod tests {
             false,
             || {
                 std::fs::write(&path, concurrent)?;
+                #[cfg(unix)]
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
                 Ok(())
             },
@@ -8502,6 +8947,7 @@ mod tests {
                 .unwrap()
                 .contains("attempted-secret")
         );
+        #[cfg(unix)]
         assert_eq!(
             retained_temp.metadata().unwrap().permissions().mode() & 0o777,
             0o600
@@ -8555,6 +9001,141 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_setup_file_atomic_blocks_parent_swap_while_authority_is_live() {
+        let tmp = setup_real_tempdir();
+        let live_parent = tmp.path().join("live");
+        let displaced_parent = tmp.path().join("displaced");
+        std::fs::create_dir(&live_parent).unwrap();
+        let path = live_parent.join("config.json");
+
+        let error = write_setup_file_atomic_bound_with_hook(
+            &path,
+            b"{\n  \"Authorization\": \"Bearer bound-secret\"\n}\n",
+            0o600,
+            "config file",
+            None,
+            false,
+            || {
+                let error = std::fs::rename(&live_parent, &displaced_parent)
+                    .expect_err("the live directory authority must deny a parent rename");
+                Err(error.into())
+            },
+        )
+        .expect_err("a blocked parent swap must abort publication");
+
+        assert!(matches!(error, SetupError::Io(_)), "{error}");
+        assert!(live_parent.is_dir());
+        assert!(!displaced_parent.exists());
+        assert!(!path.exists(), "the blocked transaction must not publish");
+        let retained_temp = std::fs::read_dir(&live_parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .expect("the no-deletion contract retains the unpublished tempfile");
+        assert!(
+            std::fs::read_to_string(retained_temp.path())
+                .unwrap()
+                .contains("bound-secret")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_setup_file_atomic_rolls_back_leaf_swap_at_replace_seam() {
+        let tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        let displaced = tmp.path().join("original-displaced.json");
+        let original = b"{\n  \"owner\": \"expected\"\n}\n";
+        let concurrent = b"{\n  \"owner\": \"concurrent\"\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let expected = read_setup_file(&path, "config file").unwrap().unwrap();
+
+        let error = write_setup_file_atomic_bound_with_windows_hooks(
+            &path,
+            b"{\n  \"Authorization\": \"Bearer attempted-secret\"\n}\n",
+            0o600,
+            "config file",
+            Some(&expected),
+            false,
+            None,
+            || Ok(()),
+            || {
+                std::fs::rename(&path, &displaced)?;
+                std::fs::write(&path, concurrent)?;
+                Ok(())
+            },
+        )
+        .expect_err("a leaf swap at the ReplaceFile seam must roll back");
+
+        assert!(error.to_string().contains("at publication"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        assert_eq!(std::fs::read(&displaced).unwrap(), original);
+        let rejected = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".replaced"))
+            .expect("rollback must retain the rejected replacement without deleting it");
+        assert!(
+            std::fs::read_to_string(rejected.path())
+                .unwrap()
+                .contains("attempted-secret")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacefile_partial_move_restores_before_retry() {
+        let tmp = setup_real_tempdir();
+        let target = tmp.path().join("config.json");
+        let replacement = tmp.path().join(".config.json.test.tmp");
+        let original = b"{\n  \"owner\": \"expected\"\n}\n";
+        let updated = b"{\n  \"owner\": \"updated\"\n}\n";
+        std::fs::write(&target, original).unwrap();
+        std::fs::write(&replacement, updated).unwrap();
+        let authority = open_setup_directory_authority(tmp.path()).unwrap();
+        let target_string = windows_setup_path_string(&target, "test target").unwrap();
+        let replacement_string =
+            windows_setup_path_string(&replacement, "test replacement").unwrap();
+        let replace_attempts = std::cell::Cell::new(0_u8);
+        let restore_attempts = std::cell::Cell::new(0_u8);
+
+        let (retained_name, retained_path) = replace_windows_setup_file_retaining_displaced_with(
+            &authority,
+            "config.json",
+            &target_string,
+            &replacement_string,
+            "replaced",
+            |replaced, replacement, retained| {
+                let attempt = replace_attempts.get();
+                replace_attempts.set(attempt + 1);
+                std::fs::rename(replaced, retained).unwrap();
+                if attempt == 0 {
+                    return Err(winsafe::co::ERROR::UNABLE_TO_MOVE_REPLACEMENT_2);
+                }
+                std::fs::rename(replacement, replaced).unwrap();
+                Ok(())
+            },
+            |existing, new| {
+                restore_attempts.set(restore_attempts.get() + 1);
+                assert!(!Path::new(new).exists());
+                std::fs::rename(existing, new).unwrap();
+                Ok(())
+            },
+        )
+        .expect("the documented partial-move state must be restored before retry");
+
+        assert_eq!(replace_attempts.get(), 2);
+        assert_eq!(restore_attempts.get(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), updated);
+        assert_eq!(std::fs::read(&retained_path).unwrap(), original);
+        assert!(!replacement.exists());
+        assert!(retained_name.starts_with(".config.json."));
+        assert!(retained_name.ends_with(".replaced"));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
     }
 
     #[test]

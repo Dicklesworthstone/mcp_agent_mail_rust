@@ -36,6 +36,12 @@ nix = { workspace = true, features = ["fs"] }
 rustix.workspace = true
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+tempfile.workspace = true
+winsafe.workspace = true
+
 [features]
 # Optional local filesystem probes for installed coding-agent CLIs.
 agent-detect = ["franken-agent-detection"]

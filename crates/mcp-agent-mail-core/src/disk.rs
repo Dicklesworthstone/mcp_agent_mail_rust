@@ -281,6 +281,10 @@ pub fn set_private_writable_file_permissions(file: &std::fs::File) -> io::Result
     #[cfg(windows)]
     {
         let mut permissions = file.metadata()?.permissions();
+        #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows set_readonly changes only the readonly file attribute, not Unix mode bits"
+        )]
         permissions.set_readonly(false);
         file.set_permissions(permissions)
     }

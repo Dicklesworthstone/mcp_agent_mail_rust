@@ -398,7 +398,7 @@ fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
 fn classify_exit(status: std::process::ExitStatus) -> GitRunOutcome {
     // Windows STATUS_ACCESS_VIOLATION = 0xC0000005. Treat as segfault-like.
     if let Some(code) = status.code()
-        && code as u32 == 0xC000_0005
+        && code.cast_unsigned() == 0xC000_0005
     {
         return GitRunOutcome::SegfaultLike { signal: 11 };
     }

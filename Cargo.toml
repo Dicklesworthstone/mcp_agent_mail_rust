@@ -78,6 +78,8 @@ mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
 franken-agent-detection = "0.2.2"
+cap-fs-ext = "=4.0.3"
+cap-std = "=4.0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9.42"
@@ -122,6 +124,7 @@ nix = "0.31.3"
 rustix = { version = "1.1.4", features = ["fs"] }
 url = "2.5.8"
 signal-hook = "0.4.4"
+winsafe = { version = "=0.0.28", features = ["kernel"] }
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.
 #
