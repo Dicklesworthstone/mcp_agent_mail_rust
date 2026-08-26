@@ -2842,88 +2842,593 @@ file_sha256_hex() {
   printf '%s' "$digest" | tr '[:upper:]' '[:lower:]'
 }
 
-# Restore one binary after a failed pair replacement. We remove a newly
-# installed destination only when its digest proves that it is the byte string
-# this invocation wrote; an unexpected concurrent replacement is never
-# clobbered during rollback.
-rollback_binary_install_target() {
-  local dest="$1"
-  local backup="$2"
-  local had_original="$3"
-  local installed_new="$4"
-  local expected_new_hash="$5"
-  local label="$6"
-  local current_hash=""
+# A pair install is a small write-ahead transaction. Its fixed active directory
+# is the only recovery authority; unique preparing/history directories are
+# retained evidence and are never treated as live state. All journal metadata
+# is immutable and all phase markers are append-only, so no journal write needs
+# to replace or delete an earlier entry.
+BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
+BINARY_TRANSACTION_RECOVERY_ACTIVE=0
+TXN_NONCE=""
+TXN_HAD_SERVER=""
+TXN_HAD_CLI=""
+TXN_OLD_SERVER_HASH=""
+TXN_OLD_CLI_HASH=""
+TXN_NEW_SERVER_HASH=""
+TXN_NEW_CLI_HASH=""
+TXN_METADATA_HASH=""
+TXN_FORWARD_PHASE=""
+TXN_HAS_ROLLBACK_PHASE=0
+TXN_TARGET_STATE=""
 
-  if [ "$installed_new" -eq 1 ] && { [ -e "$dest" ] || [ -L "$dest" ]; }; then
-    if [ ! -f "$dest" ] || [ -L "$dest" ]; then
-      err "Rollback refused to remove an unexpected $label target: $dest"
-      return 1
-    fi
-    current_hash=$(file_sha256_hex "$dest" 2>/dev/null || true)
-    if [ "$current_hash" != "$expected_new_hash" ]; then
-      err "Rollback refused to clobber a concurrently modified $label target: $dest"
-      return 1
-    fi
-    rm -f "$dest" || return 1
+installer_path_mode() {
+  local path="$1"
+  local mode=""
+  mode=$(stat -c '%a' -- "$path" 2>/dev/null) \
+    || mode=$(stat -f '%Lp' "$path" 2>/dev/null) \
+    || return 1
+  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+  printf '%s' "$mode"
+}
+
+installer_path_link_count() {
+  local path="$1"
+  local count=""
+  count=$(stat -c '%h' -- "$path" 2>/dev/null) \
+    || count=$(stat -f '%l' "$path" 2>/dev/null) \
+    || return 1
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$count"
+}
+
+installer_entry_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+validate_installer_owned_regular_file() {
+  local path="$1"
+  local label="$2"
+  local required_mode="${3:-}"
+  local owner="" current_uid="" links="" mode=""
+
+  [ -f "$path" ] && [ ! -L "$path" ] || {
+    err "$label is not a non-symlink regular file: $path"
+    return 1
+  }
+  current_uid=$(id -u 2>/dev/null) || return 1
+  owner=$(installer_path_owner_uid "$path") || return 1
+  links=$(installer_path_link_count "$path") || return 1
+  if [ "$owner" != "$current_uid" ] || [ "$links" != "1" ]; then
+    err "$label has unsafe ownership or link count: $path"
+    return 1
   fi
-
-  if [ "$had_original" -eq 1 ]; then
-    if [ -e "$dest" ] || [ -L "$dest" ]; then
-      err "Rollback cannot restore $label because its destination is occupied: $dest"
+  if [ -n "$required_mode" ]; then
+    mode=$(installer_path_mode "$path") || return 1
+    if [ "$mode" != "$required_mode" ]; then
+      err "$label has mode $mode; expected $required_mode: $path"
       return 1
     fi
-    if [ ! -e "$backup" ] && [ ! -L "$backup" ]; then
-      err "Rollback backup for $label is missing: $backup"
-      return 1
-    fi
-    # mv operates on the directory entry itself, so restoring a raced symlink
-    # or other original entry does not dereference it.
-    mv -f "$backup" "$dest" || return 1
   fi
 }
 
-rollback_binary_pair_install() {
-  local server_dest="$1"
-  local cli_dest="$2"
-  local server_backup="$3"
-  local cli_backup="$4"
-  local had_server="$5"
-  local had_cli="$6"
-  local installed_server="$7"
-  local installed_cli="$8"
-  local server_hash="$9"
-  local cli_hash="${10}"
-  local rollback_failed=0
-
-  rollback_binary_install_target \
-    "$cli_dest" "$cli_backup" "$had_cli" "$installed_cli" "$cli_hash" "$BIN_CLI" \
-    || rollback_failed=1
-  rollback_binary_install_target \
-    "$server_dest" "$server_backup" "$had_server" "$installed_server" "$server_hash" "$BIN_SERVER" \
-    || rollback_failed=1
-  return "$rollback_failed"
+validate_binary_transaction_directory() {
+  local path="$1"
+  local owner="" current_uid="" links="" mode=""
+  [ -d "$path" ] && [ ! -L "$path" ] || {
+    err "Binary transaction authority is not a non-symlink directory: $path"
+    return 1
+  }
+  current_uid=$(id -u 2>/dev/null) || return 1
+  owner=$(installer_path_owner_uid "$path") || return 1
+  links=$(installer_path_link_count "$path") || return 1
+  mode=$(installer_path_mode "$path") || return 1
+  if [ "$owner" != "$current_uid" ] || [ "$links" != "2" ] || [ "$mode" != "700" ]; then
+    err "Binary transaction authority has unsafe owner, mode, or link count: $path"
+    return 1
+  fi
 }
 
-# Replace the server and CLI as one rollback domain. Individual renames are
-# atomic, while pair-level failure is transactionally restored. Backups remain
-# present until both installed digests and both exact version lines pass.
-install_binary_pair_transactional() {
+# GNU sync accepts paths and fsyncs them. BSD sync accepts no operands, so the
+# fallback is a filesystem-wide durability barrier. Failure of both forms is
+# fatal: a transaction never advances on a best-effort flush.
+sync_installer_paths_durably() {
+  command -v sync >/dev/null 2>&1 || {
+    err "The sync utility is required for durable binary installation."
+    return 1
+  }
+  if [ "$#" -gt 0 ] && sync "$@" 2>/dev/null; then
+    return 0
+  fi
+  sync >/dev/null 2>&1
+}
+
+move_installer_entry_no_replace() {
+  local source="$1"
+  local destination="$2"
+  local label="$3"
+  installer_entry_exists "$source" || {
+    err "$label source is missing: $source"
+    return 1
+  }
+  if installer_entry_exists "$destination"; then
+    err "$label destination already exists: $destination"
+    return 1
+  fi
+  # Both GNU and BSD mv support -n. It may report success when it skips an
+  # occupied target, so the postconditions are authoritative.
+  mv -n "$source" "$destination" 2>/dev/null || return 1
+  if installer_entry_exists "$source" || ! installer_entry_exists "$destination"; then
+    err "$label was not moved without replacement."
+    return 1
+  fi
+}
+
+write_binary_transaction_file_exclusive() {
+  local destination="$1"
+  local mode="$2"
+  if installer_entry_exists "$destination"; then
+    err "Refusing to replace binary transaction entry: $destination"
+    return 1
+  fi
+  if ! (umask 077; set -o noclobber; exec 9>"$destination"; cat >&9); then
+    err "Could not create binary transaction entry exclusively: $destination"
+    return 1
+  fi
+  chmod "$mode" "$destination" || return 1
+  validate_installer_owned_regular_file "$destination" "Binary transaction entry" "$mode" || return 1
+  sync_installer_paths_durably "$destination" "$(dirname "$destination")"
+}
+
+validate_binary_transaction_hash() {
+  local path="$1"
+  local expected="$2"
+  local label="$3"
+  local actual=""
+  validate_installer_owned_regular_file "$path" "$label" || return 1
+  actual=$(file_sha256_hex "$path" 2>/dev/null || true)
+  if [ "$actual" != "$expected" ]; then
+    err "$label hash changed (expected $expected, got ${actual:-unavailable}): $path"
+    return 1
+  fi
+}
+
+binary_transaction_active_path() {
+  printf '%s/.mcp-agent-mail-install-transaction.active' "${1%/}"
+}
+
+persist_binary_transaction_phase() {
+  local journal="$1"
+  local phase="$2"
+  local marker="$journal/phase.$phase"
+  case "$phase" in
+    00-prepared|10-preserve-server|20-preserve-cli|30-publish-server|40-publish-cli|45-rollback|50-commit-ready) ;;
+    *) err "Unknown binary transaction phase: $phase"; return 1 ;;
+  esac
+  printf 'phase=%s\nmetadata_sha256=%s\n' "$phase" "$TXN_METADATA_HASH" \
+    | write_binary_transaction_file_exclusive "$marker" 600
+}
+
+validate_binary_transaction_phase_marker() {
+  local journal="$1"
+  local phase="$2"
+  local marker="$journal/phase.$phase"
+  local first="" second="" extra=""
+  validate_installer_owned_regular_file "$marker" "Binary transaction phase marker" 600 || return 1
+  IFS= read -r first <"$marker" || return 1
+  second=$(sed -n '2p' "$marker") || return 1
+  extra=$(sed -n '3p' "$marker") || return 1
+  if [ "$first" != "phase=$phase" ] || \
+     [ "$second" != "metadata_sha256=$TXN_METADATA_HASH" ] || [ -n "$extra" ]; then
+    err "Binary transaction phase marker is malformed: $marker"
+    return 1
+  fi
+}
+
+read_binary_transaction_metadata() {
+  local journal="$1"
+  local metadata="$journal/metadata"
+  local witness_file="$journal/metadata.sha256"
+  local witness="" extra="" actual=""
+  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8=""
+
+  validate_binary_transaction_directory "$journal" || return 1
+  validate_installer_owned_regular_file "$metadata" "Binary transaction metadata" 600 || return 1
+  validate_installer_owned_regular_file "$witness_file" "Binary transaction metadata witness" 600 || return 1
+  IFS= read -r witness <"$witness_file" || return 1
+  extra=$(sed -n '2p' "$witness_file") || return 1
+  [[ "$witness" =~ ^[a-f0-9]{64}$ ]] && [ -z "$extra" ] || {
+    err "Binary transaction metadata witness is malformed: $witness_file"
+    return 1
+  }
+  actual=$(file_sha256_hex "$metadata" 2>/dev/null || true)
+  if [ "$actual" != "$witness" ]; then
+    err "Binary transaction metadata hash witness does not match: $metadata"
+    return 1
+  fi
+
+  {
+    IFS= read -r l1 || return 1
+    IFS= read -r l2 || return 1
+    IFS= read -r l3 || return 1
+    IFS= read -r l4 || return 1
+    IFS= read -r l5 || return 1
+    IFS= read -r l6 || return 1
+    IFS= read -r l7 || return 1
+    if IFS= read -r l8; then return 1; fi
+  } <"$metadata"
+  [ "$l1" = "schema=1" ] || return 1
+  case "$l2" in nonce=*) TXN_NONCE="${l2#nonce=}" ;; *) return 1 ;; esac
+  case "$l3" in had_server=*) TXN_HAD_SERVER="${l3#had_server=}" ;; *) return 1 ;; esac
+  case "$l4" in old_server_sha256=*) TXN_OLD_SERVER_HASH="${l4#old_server_sha256=}" ;; *) return 1 ;; esac
+  case "$l5" in had_cli=*) TXN_HAD_CLI="${l5#had_cli=}" ;; *) return 1 ;; esac
+  case "$l6" in old_cli_sha256=*) TXN_OLD_CLI_HASH="${l6#old_cli_sha256=}" ;; *) return 1 ;; esac
+  case "$l7" in new_server_sha256=*) TXN_NEW_SERVER_HASH="${l7#new_server_sha256=}" ;; *) return 1 ;; esac
+  case "$l8" in new_cli_sha256=*) TXN_NEW_CLI_HASH="${l8#new_cli_sha256=}" ;; *) return 1 ;; esac
+
+  [[ "$TXN_NONCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  case "$TXN_HAD_SERVER:$TXN_OLD_SERVER_HASH" in
+    0:absent) ;;
+    1:*) [[ "$TXN_OLD_SERVER_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$TXN_HAD_CLI:$TXN_OLD_CLI_HASH" in
+    0:absent) ;;
+    1:*) [[ "$TXN_OLD_CLI_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ "$TXN_NEW_SERVER_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
+  [[ "$TXN_NEW_CLI_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
+  TXN_METADATA_HASH="$witness"
+}
+
+validate_binary_transaction_inventory_and_phases() {
+  local journal="$1"
+  local entry="" name="" phase="" missing_phase=0
+  local forward_phases=(
+    00-prepared 10-preserve-server 20-preserve-cli
+    30-publish-server 40-publish-cli 50-commit-ready
+  )
+
+  while IFS= read -r entry; do
+    name="${entry##*/}"
+    case "$name" in
+      metadata|metadata.sha256|new-server|new-cli|old-server|old-cli|rollback-new-server|rollback-new-cli|\
+      phase.00-prepared|phase.10-preserve-server|phase.20-preserve-cli|\
+      phase.30-publish-server|phase.40-publish-cli|phase.45-rollback|phase.50-commit-ready) ;;
+      *) err "Unexpected entry in binary transaction authority: $entry"; return 1 ;;
+    esac
+  done < <(find "$journal" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+
+  TXN_FORWARD_PHASE=""
+  for phase in "${forward_phases[@]}"; do
+    if installer_entry_exists "$journal/phase.$phase"; then
+      if [ "$missing_phase" -eq 1 ]; then
+        err "Binary transaction phase sequence has a gap before $phase."
+        return 1
+      fi
+      validate_binary_transaction_phase_marker "$journal" "$phase" || return 1
+      TXN_FORWARD_PHASE="$phase"
+    else
+      missing_phase=1
+    fi
+  done
+  [ -n "$TXN_FORWARD_PHASE" ] || {
+    err "Binary transaction has no prepared phase marker."
+    return 1
+  }
+
+  TXN_HAS_ROLLBACK_PHASE=0
+  if installer_entry_exists "$journal/phase.45-rollback"; then
+    validate_binary_transaction_phase_marker "$journal" "45-rollback" || return 1
+    TXN_HAS_ROLLBACK_PHASE=1
+  fi
+  if [ "$TXN_HAS_ROLLBACK_PHASE" -eq 1 ] && [ "$TXN_FORWARD_PHASE" = "50-commit-ready" ]; then
+    err "Binary transaction contains both rollback and commit-ready markers."
+    return 1
+  fi
+}
+
+inspect_binary_transaction_forward_target() {
+  local journal="$1"
+  local dest="$2"
+  local stem="$3"
+  local had_original="$4"
+  local old_hash="$5"
+  local new_hash="$6"
+  local staged="$journal/new-$stem"
+  local backup="$journal/old-$stem"
+  local quarantined="$journal/rollback-new-$stem"
+  local dest_hash=""
+
+  if installer_entry_exists "$quarantined"; then
+    err "Rollback residue exists without a rollback phase: $quarantined"
+    return 1
+  fi
+  if installer_entry_exists "$staged"; then
+    validate_binary_transaction_hash "$staged" "${new_hash}" "Staged $stem binary" || return 1
+  fi
+  if installer_entry_exists "$backup"; then
+    [ "$had_original" = "1" ] || return 1
+    validate_binary_transaction_hash "$backup" "$old_hash" "Preserved $stem binary" || return 1
+  fi
+  if installer_entry_exists "$dest"; then
+    validate_installer_owned_regular_file "$dest" "$stem install target" || return 1
+    dest_hash=$(file_sha256_hex "$dest" 2>/dev/null || true)
+  fi
+
+  if installer_entry_exists "$staged"; then
+    if installer_entry_exists "$backup"; then
+      installer_entry_exists "$dest" && return 1
+      TXN_TARGET_STATE="preserved"
+    elif [ "$had_original" = "1" ]; then
+      [ "$dest_hash" = "$old_hash" ] || return 1
+      TXN_TARGET_STATE="original"
+    else
+      installer_entry_exists "$dest" && return 1
+      TXN_TARGET_STATE="absent-unpublished"
+    fi
+    return 0
+  fi
+
+  [ "$dest_hash" = "$new_hash" ] || return 1
+  if [ "$had_original" = "1" ]; then
+    installer_entry_exists "$backup" || return 1
+  else
+    installer_entry_exists "$backup" && return 1
+  fi
+  TXN_TARGET_STATE="published"
+}
+
+validate_binary_transaction_forward_window() {
+  local journal="$1"
+  local install_dir="$2"
+  local server_state="" cli_state=""
+  inspect_binary_transaction_forward_target "$journal" "$install_dir/$BIN_SERVER" \
+    server "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH" "$TXN_NEW_SERVER_HASH" || return 1
+  server_state="$TXN_TARGET_STATE"
+  inspect_binary_transaction_forward_target "$journal" "$install_dir/$BIN_CLI" \
+    cli "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH" "$TXN_NEW_CLI_HASH" || return 1
+  cli_state="$TXN_TARGET_STATE"
+
+  case "$TXN_FORWARD_PHASE" in
+    00-prepared)
+      [[ "$server_state" =~ ^(original|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(original|absent-unpublished)$ ]]
+      ;;
+    10-preserve-server)
+      [[ "$server_state" =~ ^(original|preserved|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(original|absent-unpublished)$ ]]
+      ;;
+    20-preserve-cli)
+      [[ "$server_state" =~ ^(preserved|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(original|preserved|absent-unpublished)$ ]]
+      ;;
+    30-publish-server)
+      [[ "$server_state" =~ ^(preserved|published|absent-unpublished)$ ]] &&
+        [[ "$cli_state" =~ ^(preserved|absent-unpublished)$ ]]
+      ;;
+    40-publish-cli)
+      [ "$server_state" = "published" ] &&
+        [[ "$cli_state" =~ ^(preserved|published|absent-unpublished)$ ]]
+      ;;
+    *) return 1 ;;
+  esac || {
+    err "Binary transaction contents do not match persisted phase $TXN_FORWARD_PHASE (server=$server_state cli=$cli_state)."
+    return 1
+  }
+}
+
+rollback_binary_transaction_target() {
+  local journal="$1"
+  local install_dir="$2"
+  local stem="$3"
+  local binary_name="$4"
+  local had_original="$5"
+  local old_hash="$6"
+  local new_hash="$7"
+  local dest="$install_dir/$binary_name"
+  local staged="$journal/new-$stem"
+  local backup="$journal/old-$stem"
+  local quarantined="$journal/rollback-new-$stem"
+  local dest_hash=""
+
+  if installer_entry_exists "$staged"; then
+    validate_binary_transaction_hash "$staged" "$new_hash" "Staged $stem binary" || return 1
+  fi
+  if installer_entry_exists "$backup"; then
+    [ "$had_original" = "1" ] || return 1
+    validate_binary_transaction_hash "$backup" "$old_hash" "Preserved $stem binary" || return 1
+  fi
+  if installer_entry_exists "$quarantined"; then
+    validate_binary_transaction_hash "$quarantined" "$new_hash" "Quarantined new $stem binary" || return 1
+    installer_entry_exists "$staged" && return 1
+  fi
+  if installer_entry_exists "$dest"; then
+    validate_installer_owned_regular_file "$dest" "$stem install target" || return 1
+    dest_hash=$(file_sha256_hex "$dest" 2>/dev/null || true)
+  fi
+
+  if ! installer_entry_exists "$staged" && ! installer_entry_exists "$quarantined"; then
+    [ "$dest_hash" = "$new_hash" ] || {
+      err "Rollback cannot identify the exact new $stem destination."
+      return 1
+    }
+    if [ "$had_original" = "1" ]; then
+      installer_entry_exists "$backup" || return 1
+    else
+      installer_entry_exists "$backup" && return 1
+    fi
+    move_installer_entry_no_replace "$dest" "$quarantined" "Quarantine new $stem binary" || return 1
+    sync_installer_paths_durably "$quarantined" "$journal" "$install_dir" || return 1
+    dest_hash=""
+  fi
+
+  if installer_entry_exists "$staged"; then
+    installer_entry_exists "$quarantined" && return 1
+    if installer_entry_exists "$backup"; then
+      installer_entry_exists "$dest" && return 1
+    elif [ "$had_original" = "1" ]; then
+      [ "$dest_hash" = "$old_hash" ] || return 1
+    else
+      installer_entry_exists "$dest" && return 1
+    fi
+  fi
+
+  if [ "$had_original" = "1" ]; then
+    if installer_entry_exists "$backup"; then
+      installer_entry_exists "$dest" && {
+        err "Rollback destination is occupied before restoring $stem."
+        return 1
+      }
+      move_installer_entry_no_replace "$backup" "$dest" "Restore old $stem binary" || return 1
+      sync_installer_paths_durably "$dest" "$journal" "$install_dir" || return 1
+    else
+      validate_binary_transaction_hash "$dest" "$old_hash" "Restored $stem binary" || return 1
+    fi
+  elif installer_entry_exists "$backup" || installer_entry_exists "$dest"; then
+    err "Rollback expected no original $stem destination, but one is present."
+    return 1
+  fi
+}
+
+archive_binary_transaction() {
+  local journal="$1"
+  local install_dir="$2"
+  local outcome="$3"
+  local history="$install_dir/.mcp-agent-mail-install-transaction.${outcome}.${TXN_NONCE}"
+  case "$outcome" in committed|rolled-back) ;; *) return 1 ;; esac
+  if installer_entry_exists "$history"; then
+    err "Binary transaction history destination already exists: $history"
+    return 1
+  fi
+  move_installer_entry_no_replace "$journal" "$history" "Archive $outcome binary transaction" || return 1
+  sync_installer_paths_durably "$history" "$install_dir" || return 1
+  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
+}
+
+recover_binary_pair_transaction_impl() {
+  local install_dir="$1"
+  local inject_after_phase_for_test="${2:-}"
+  local journal=""
+  journal=$(binary_transaction_active_path "$install_dir")
+  if ! installer_entry_exists "$journal"; then
+    return 0
+  fi
+  read_binary_transaction_metadata "$journal" || return 1
+  validate_binary_transaction_inventory_and_phases "$journal" || return 1
+
+  if [ "$TXN_FORWARD_PHASE" = "50-commit-ready" ]; then
+    installer_entry_exists "$journal/new-server" && return 1
+    installer_entry_exists "$journal/new-cli" && return 1
+    installer_entry_exists "$journal/rollback-new-server" && return 1
+    installer_entry_exists "$journal/rollback-new-cli" && return 1
+    validate_binary_transaction_hash "$install_dir/$BIN_SERVER" "$TXN_NEW_SERVER_HASH" \
+      "Committed server binary" || return 1
+    validate_binary_transaction_hash "$install_dir/$BIN_CLI" "$TXN_NEW_CLI_HASH" \
+      "Committed CLI binary" || return 1
+    if [ "$TXN_HAD_SERVER" = "1" ]; then
+      validate_binary_transaction_hash "$journal/old-server" "$TXN_OLD_SERVER_HASH" \
+        "Committed server backup" || return 1
+    elif installer_entry_exists "$journal/old-server"; then
+      return 1
+    fi
+    if [ "$TXN_HAD_CLI" = "1" ]; then
+      validate_binary_transaction_hash "$journal/old-cli" "$TXN_OLD_CLI_HASH" \
+        "Committed CLI backup" || return 1
+    elif installer_entry_exists "$journal/old-cli"; then
+      return 1
+    fi
+    archive_binary_transaction "$journal" "$install_dir" committed
+    return $?
+  fi
+
+  if [ "$TXN_HAS_ROLLBACK_PHASE" -eq 0 ]; then
+    validate_binary_transaction_forward_window "$journal" "$install_dir" || return 1
+    persist_binary_transaction_phase "$journal" "45-rollback" || return 1
+    TXN_HAS_ROLLBACK_PHASE=1
+    if [ "$inject_after_phase_for_test" = "rollback-ready" ]; then
+      warn "Injected interruption after durable rollback intent."
+      return 97
+    fi
+  fi
+
+  rollback_binary_transaction_target "$journal" "$install_dir" cli "$BIN_CLI" \
+    "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH" "$TXN_NEW_CLI_HASH" || return 1
+  rollback_binary_transaction_target "$journal" "$install_dir" server "$BIN_SERVER" \
+    "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH" "$TXN_NEW_SERVER_HASH" || return 1
+  archive_binary_transaction "$journal" "$install_dir" rolled-back
+}
+
+recover_binary_pair_transaction() {
+  local install_dir="$1"
+  local inject_after_phase_for_test="${2:-}"
+  local rc=0
+  if [ "$BINARY_TRANSACTION_RECOVERY_ACTIVE" -eq 1 ]; then
+    err "Binary transaction recovery is already active."
+    return 1
+  fi
+  BINARY_TRANSACTION_RECOVERY_ACTIVE=1
+  recover_binary_pair_transaction_impl "$install_dir" "$inject_after_phase_for_test" || rc=$?
+  BINARY_TRANSACTION_RECOVERY_ACTIVE=0
+  return "$rc"
+}
+
+preserve_binary_transaction_original() {
+  local journal="$1"
+  local install_dir="$2"
+  local stem="$3"
+  local binary_name="$4"
+  local had_original="$5"
+  local old_hash="$6"
+  local dest="$install_dir/$binary_name"
+  local backup="$journal/old-$stem"
+
+  if [ "$had_original" = "0" ]; then
+    installer_entry_exists "$dest" && {
+      err "A $stem destination appeared after transaction preparation."
+      return 1
+    }
+    return 0
+  fi
+  validate_binary_transaction_hash "$dest" "$old_hash" "Original $stem binary" || return 1
+  move_installer_entry_no_replace "$dest" "$backup" "Preserve old $stem binary" || return 1
+  sync_installer_paths_durably "$backup" "$journal" "$install_dir"
+}
+
+publish_binary_transaction_new() {
+  local journal="$1"
+  local install_dir="$2"
+  local stem="$3"
+  local binary_name="$4"
+  local new_hash="$5"
+  local staged="$journal/new-$stem"
+  local dest="$install_dir/$binary_name"
+  installer_entry_exists "$dest" && {
+    err "The $stem destination is occupied before publication."
+    return 1
+  }
+  validate_binary_transaction_hash "$staged" "$new_hash" "Staged $stem binary" || return 1
+  move_installer_entry_no_replace "$staged" "$dest" "Publish new $stem binary" || return 1
+  sync_installer_paths_durably "$dest" "$journal" "$install_dir"
+}
+
+prepare_binary_pair_transaction() {
   local server_src="$1"
   local cli_src="$2"
   local install_dir="$3"
-  local fault_after_first_replace_for_test="${4:-0}"
   local nonce="$$.${RANDOM}.${RANDOM}"
+  local preparing="$install_dir/.mcp-agent-mail-install-transaction.preparing.${nonce}"
+  local active=""
   local server_dest="$install_dir/$BIN_SERVER"
   local cli_dest="$install_dir/$BIN_CLI"
-  local server_tmp="${server_dest}.tmp.${nonce}"
-  local cli_tmp="${cli_dest}.tmp.${nonce}"
-  local server_backup="${server_dest}.bak.preinstall-${nonce}"
-  local cli_backup="${cli_dest}.bak.preinstall-${nonce}"
-  local server_hash="" cli_hash="" installed_server_hash="" installed_cli_hash=""
-  local had_server=0 had_cli=0 installed_server=0 installed_cli=0
-  local source_path=""
+  local metadata="" source_path=""
 
+  active=$(binary_transaction_active_path "$install_dir")
+  installer_entry_exists "$active" && {
+    err "An unrecovered binary transaction already exists: $active"
+    return 1
+  }
+  installer_entry_exists "$preparing" && return 1
   for source_path in "$server_src" "$cli_src"; do
     if [ ! -f "$source_path" ] || [ -L "$source_path" ] || \
        [ ! -s "$source_path" ] || [ ! -x "$source_path" ]; then
@@ -2933,102 +3438,137 @@ install_binary_pair_transactional() {
   done
   ensure_real_file_target_path "$server_dest" "$BIN_SERVER install target" || return 1
   ensure_real_file_target_path "$cli_dest" "$BIN_CLI install target" || return 1
+  validate_installer_owned_regular_file "$server_src" "Staged server source" || return 1
+  validate_installer_owned_regular_file "$cli_src" "Staged CLI source" || return 1
 
-  if ! server_hash=$(file_sha256_hex "$server_src") || \
-     ! cli_hash=$(file_sha256_hex "$cli_src"); then
-    err "A SHA256 implementation is required to bind staged and installed binaries."
+  TXN_NONCE="$nonce"
+  TXN_NEW_SERVER_HASH=$(file_sha256_hex "$server_src") || return 1
+  TXN_NEW_CLI_HASH=$(file_sha256_hex "$cli_src") || return 1
+  TXN_HAD_SERVER=0
+  TXN_HAD_CLI=0
+  TXN_OLD_SERVER_HASH=absent
+  TXN_OLD_CLI_HASH=absent
+  if installer_entry_exists "$server_dest"; then
+    validate_installer_owned_regular_file "$server_dest" "Existing server binary" || return 1
+    TXN_HAD_SERVER=1
+    TXN_OLD_SERVER_HASH=$(file_sha256_hex "$server_dest") || return 1
+  fi
+  if installer_entry_exists "$cli_dest"; then
+    validate_installer_owned_regular_file "$cli_dest" "Existing CLI binary" || return 1
+    TXN_HAD_CLI=1
+    TXN_OLD_CLI_HASH=$(file_sha256_hex "$cli_dest") || return 1
+  fi
+
+  mkdir "$preparing" || return 1
+  chmod 700 "$preparing" || return 1
+  validate_binary_transaction_directory "$preparing" || return 1
+  sync_installer_paths_durably "$preparing" "$install_dir" || return 1
+  if ! (umask 077; set -o noclobber; exec 9>"$preparing/new-server"; cat "$server_src" >&9) || \
+     ! (umask 077; set -o noclobber; exec 9>"$preparing/new-cli"; cat "$cli_src" >&9); then
+    err "Could not stage both binaries in the durable transaction journal."
     return 1
   fi
+  chmod 755 "$preparing/new-server" "$preparing/new-cli" || return 1
+  validate_binary_transaction_hash "$preparing/new-server" "$TXN_NEW_SERVER_HASH" \
+    "Journaled server binary" || return 1
+  validate_binary_transaction_hash "$preparing/new-cli" "$TXN_NEW_CLI_HASH" \
+    "Journaled CLI binary" || return 1
+  sync_installer_paths_durably "$preparing/new-server" "$preparing/new-cli" "$preparing" || return 1
 
-  if ! install -m 0755 "$server_src" "$server_tmp" || \
-     ! install -m 0755 "$cli_src" "$cli_tmp"; then
-    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-    err "Could not stage both binaries in the destination directory."
+  metadata="schema=1
+nonce=$TXN_NONCE
+had_server=$TXN_HAD_SERVER
+old_server_sha256=$TXN_OLD_SERVER_HASH
+had_cli=$TXN_HAD_CLI
+old_cli_sha256=$TXN_OLD_CLI_HASH
+new_server_sha256=$TXN_NEW_SERVER_HASH
+new_cli_sha256=$TXN_NEW_CLI_HASH"
+  printf '%s\n' "$metadata" | write_binary_transaction_file_exclusive "$preparing/metadata" 600 || return 1
+  TXN_METADATA_HASH=$(file_sha256_hex "$preparing/metadata") || return 1
+  printf '%s\n' "$TXN_METADATA_HASH" \
+    | write_binary_transaction_file_exclusive "$preparing/metadata.sha256" 600 || return 1
+  persist_binary_transaction_phase "$preparing" "00-prepared" || return 1
+  validate_binary_transaction_directory "$preparing" || return 1
+  move_installer_entry_no_replace "$preparing" "$active" "Publish binary transaction authority" || return 1
+  sync_installer_paths_durably "$active" "$install_dir" || return 1
+  validate_binary_transaction_directory "$active" || return 1
+  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$install_dir"
+}
+
+abort_binary_pair_transaction() {
+  local install_dir="$1"
+  local reason="$2"
+  err "$reason"
+  if ! recover_binary_pair_transaction "$install_dir"; then
+    err "Binary transaction recovery failed closed; retained active journal for inspection."
+  fi
+  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
+  return 1
+}
+
+# Replace the server and CLI as one durable rollback domain. The fourth
+# argument is test-only: it names a persisted phase after which the function
+# returns without recovery, simulating an uncatchable interruption.
+install_binary_pair_transactional() {
+  local server_src="$1"
+  local cli_src="$2"
+  local install_dir="$3"
+  local inject_after_phase_for_test="${4:-}"
+  local journal=""
+  local installed_server_hash="" installed_cli_hash=""
+
+  if ! recover_binary_pair_transaction "$install_dir"; then
+    err "Could not recover the previous binary transaction; refusing a new install."
     return 1
   fi
-  if [ "$(file_sha256_hex "$server_tmp" 2>/dev/null || true)" != "$server_hash" ] || \
-     [ "$(file_sha256_hex "$cli_tmp" 2>/dev/null || true)" != "$cli_hash" ]; then
-    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-    err "Destination staging changed binary bytes; refusing replacement."
+  prepare_binary_pair_transaction "$server_src" "$cli_src" "$install_dir" || return 1
+  journal=$(binary_transaction_active_path "$install_dir")
+  if [ "$inject_after_phase_for_test" = "prepared" ]; then
+    warn "Injected interruption after durable prepared phase."
+    return 97
+  fi
+
+  persist_binary_transaction_phase "$journal" "10-preserve-server" \
+    || abort_binary_pair_transaction "$install_dir" "Could not persist server-preservation intent."
+  if [ "$inject_after_phase_for_test" = "preserve-server" ]; then return 97; fi
+  preserve_binary_transaction_original "$journal" "$install_dir" server "$BIN_SERVER" \
+    "$TXN_HAD_SERVER" "$TXN_OLD_SERVER_HASH" \
+    || abort_binary_pair_transaction "$install_dir" "Could not preserve the existing server binary."
+
+  persist_binary_transaction_phase "$journal" "20-preserve-cli" \
+    || abort_binary_pair_transaction "$install_dir" "Could not persist CLI-preservation intent."
+  if [ "$inject_after_phase_for_test" = "preserve-cli" ]; then return 97; fi
+  preserve_binary_transaction_original "$journal" "$install_dir" cli "$BIN_CLI" \
+    "$TXN_HAD_CLI" "$TXN_OLD_CLI_HASH" \
+    || abort_binary_pair_transaction "$install_dir" "Could not preserve the existing CLI binary."
+
+  persist_binary_transaction_phase "$journal" "30-publish-server" \
+    || abort_binary_pair_transaction "$install_dir" "Could not persist server-publication intent."
+  if [ "$inject_after_phase_for_test" = "publish-server" ]; then return 97; fi
+  publish_binary_transaction_new "$journal" "$install_dir" server "$BIN_SERVER" "$TXN_NEW_SERVER_HASH" \
+    || abort_binary_pair_transaction "$install_dir" "Could not publish the new server binary."
+
+  persist_binary_transaction_phase "$journal" "40-publish-cli" \
+    || abort_binary_pair_transaction "$install_dir" "Could not persist CLI-publication intent."
+  if [ "$inject_after_phase_for_test" = "publish-cli" ]; then return 97; fi
+  publish_binary_transaction_new "$journal" "$install_dir" cli "$BIN_CLI" "$TXN_NEW_CLI_HASH" \
+    || abort_binary_pair_transaction "$install_dir" "Could not publish the new CLI binary."
+
+  installed_server_hash=$(file_sha256_hex "$install_dir/$BIN_SERVER" 2>/dev/null || true)
+  installed_cli_hash=$(file_sha256_hex "$install_dir/$BIN_CLI" 2>/dev/null || true)
+  if [ "$installed_server_hash" != "$TXN_NEW_SERVER_HASH" ] || \
+     [ "$installed_cli_hash" != "$TXN_NEW_CLI_HASH" ] || \
+     ! verify_release_binaries_exact "$install_dir/$BIN_SERVER" "$install_dir/$BIN_CLI" "Installed"; then
+    abort_binary_pair_transaction "$install_dir" \
+      "Post-install verification failed; recovery will restore the previous binary pair."
     return 1
   fi
-  sync "$server_tmp" "$cli_tmp" 2>/dev/null || sync 2>/dev/null || true
-
-  if [ -e "$server_dest" ] || [ -L "$server_dest" ]; then
-    if ! mv "$server_dest" "$server_backup"; then
-      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-      err "Could not preserve the existing $BIN_SERVER binary."
-      return 1
-    fi
-    had_server=1
-    if [ ! -f "$server_backup" ] || [ -L "$server_backup" ]; then
-      rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
-        "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
-      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-      err "Existing $BIN_SERVER changed type during replacement; rollback attempted."
-      return 1
-    fi
-  fi
-  if [ -e "$cli_dest" ] || [ -L "$cli_dest" ]; then
-    if ! mv "$cli_dest" "$cli_backup"; then
-      rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
-        "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
-      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-      err "Could not preserve the existing $BIN_CLI binary; rollback attempted."
-      return 1
-    fi
-    had_cli=1
-    if [ ! -f "$cli_backup" ] || [ -L "$cli_backup" ]; then
-      rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
-        "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
-      rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-      err "Existing $BIN_CLI changed type during replacement; rollback attempted."
-      return 1
-    fi
-  fi
-
-  if ! mv "$server_tmp" "$server_dest"; then
-    rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
-      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
-    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-    err "Could not replace $BIN_SERVER; rollback attempted."
-    return 1
-  fi
-  installed_server=1
-
-  if [ "$fault_after_first_replace_for_test" = "1" ]; then
-    rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
-      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
-    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-    err "Injected failure after first binary replacement; rollback attempted."
-    return 1
-  fi
-
-  if ! mv "$cli_tmp" "$cli_dest"; then
-    rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
-      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash" || true
-    rm -f "$server_tmp" "$cli_tmp" 2>/dev/null || true
-    err "Could not replace $BIN_CLI; rollback attempted."
-    return 1
-  fi
-  installed_cli=1
-
-  installed_server_hash=$(file_sha256_hex "$server_dest" 2>/dev/null || true)
-  installed_cli_hash=$(file_sha256_hex "$cli_dest" 2>/dev/null || true)
-  if [ "$installed_server_hash" != "$server_hash" ] || [ "$installed_cli_hash" != "$cli_hash" ] || \
-     ! verify_release_binaries_exact "$server_dest" "$cli_dest" "Installed"; then
-    if ! rollback_binary_pair_install "$server_dest" "$cli_dest" "$server_backup" "$cli_backup" \
-      "$had_server" "$had_cli" "$installed_server" "$installed_cli" "$server_hash" "$cli_hash"; then
-      err "Post-install verification failed and rollback was incomplete; inspect $install_dir before retrying."
-      return 1
-    fi
-    err "Post-install verification failed; the previous binary pair was restored."
-    return 1
-  fi
-
-  sync "$server_dest" "$cli_dest" 2>/dev/null || sync 2>/dev/null || true
-  [ "$had_server" -eq 0 ] || rm -f "$server_backup" 2>/dev/null || warn "Retained old server backup: $server_backup"
-  [ "$had_cli" -eq 0 ] || rm -f "$cli_backup" 2>/dev/null || warn "Retained old CLI backup: $cli_backup"
+  sync_installer_paths_durably "$install_dir/$BIN_SERVER" "$install_dir/$BIN_CLI" "$install_dir" \
+    || abort_binary_pair_transaction "$install_dir" "Could not durably flush the verified binary pair."
+  persist_binary_transaction_phase "$journal" "50-commit-ready" \
+    || abort_binary_pair_transaction "$install_dir" "Could not persist binary transaction commit intent."
+  if [ "$inject_after_phase_for_test" = "commit-ready" ]; then return 97; fi
+  archive_binary_transaction "$journal" "$install_dir" committed || return 1
   return 0
 }
 
