@@ -1437,7 +1437,7 @@ mod tests {
         let mutation_locations = detect_mcp_config_mutation_locations(&McpConfigDetectParams {
             home_dir: Some(tmp.path().join("home")),
             project_dir: Some(tmp.path().join("project")),
-            omp_config_root: Some(omp_root.clone()),
+            omp_config_root: Some(omp_root),
             omp_user_mcp_config: Some(active_config.clone()),
             ..McpConfigDetectParams::default()
         });

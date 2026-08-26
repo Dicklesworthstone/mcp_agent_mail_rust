@@ -1212,6 +1212,16 @@ pub fn merge_claude_hooks(
 // .gitignore management
 // ---------------------------------------------------------------------------
 
+// Atomic `.gitignore` replacement retains the displaced inode beside the
+// live file under the no-deletion policy. The newly published ignore file
+// must therefore protect its own unpublished/retained transaction artifacts,
+// not only the secret config artifacts that prompted the update.
+const GITIGNORE_ATOMIC_ARTIFACT_ENTRIES: [&str; 3] = [
+    "/..gitignore.*.tmp",
+    "/..gitignore.*.bak",
+    "/..gitignore.*.replaced",
+];
+
 /// Ensure the given entries are present in the .gitignore file.
 /// Does not duplicate existing entries.
 pub fn ensure_gitignore_entries(
@@ -1227,9 +1237,13 @@ pub fn ensure_gitignore_entries(
     let existing_lines: Vec<&str> = existing.lines().collect();
 
     let mut new_lines = Vec::new();
-    for entry in entries {
-        if !existing_lines.iter().any(|l| l.trim() == *entry) {
-            new_lines.push(*entry);
+    for entry in entries
+        .iter()
+        .copied()
+        .chain(GITIGNORE_ATOMIC_ARTIFACT_ENTRIES)
+    {
+        if !existing_lines.iter().any(|line| line.trim() == entry) {
+            new_lines.push(entry);
         }
     }
 
@@ -8961,6 +8975,13 @@ mod tests {
             1,
             "entry should appear exactly once"
         );
+        for artifact_entry in GITIGNORE_ATOMIC_ARTIFACT_ENTRIES {
+            assert_eq!(
+                content.lines().filter(|line| *line == artifact_entry).count(),
+                1,
+                "the gitignore writer must protect its own {artifact_entry} artifacts exactly once"
+            );
+        }
     }
 
     #[cfg(unix)]

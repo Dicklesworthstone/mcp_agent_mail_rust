@@ -2911,10 +2911,12 @@ impl Config {
     /// turn the default loopback HTTP listener into an unauthenticated control
     /// plane.
     pub fn validate_user_env_authority(&self) -> io::Result<()> {
-        match &self.user_env_authority_error {
-            Some(error) => Err(io::Error::new(io::ErrorKind::PermissionDenied, error.clone())),
-            None => Ok(()),
-        }
+        self.user_env_authority_error.as_ref().map_or(Ok(()), |error| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                error.clone(),
+            ))
+        })
     }
 
     /// Returns whether running in production mode
@@ -3259,7 +3261,7 @@ impl UserEnvLoad {
         }
     }
 
-    fn loaded(values: HashMap<String, String>) -> Self {
+    const fn loaded(values: HashMap<String, String>) -> Self {
         Self {
             values,
             authority_error: None,
@@ -3698,7 +3700,7 @@ fn read_user_env_candidate(path: &Path) -> io::Result<Option<Vec<u8>>> {
 fn env_authority_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// Read one explicitly selected environment-file authority as bounded UTF-8.
@@ -3776,7 +3778,7 @@ fn load_user_env_values_from_with_reader(
             Ok(contents) => contents,
             Err(error) => {
                 let error = io::Error::new(io::ErrorKind::InvalidData, error);
-                return UserEnvLoad::rejected(&path, &error);
+                return UserEnvLoad::rejected(path, &error);
             }
         };
         return UserEnvLoad::loaded(parse_dotenv_contents(&contents));
@@ -5912,7 +5914,7 @@ mod tests {
         std::fs::write(&candidate, "FOO=canonical\n").unwrap();
         std::fs::write(legacy.join(".env"), "FOO=stale\n").unwrap();
         let original_permissions = std::fs::metadata(&candidate).unwrap().permissions();
-        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         // A privileged test runner may retain read access despite mode 000. In
         // that environment the kernel cannot provide the unreadable control;
