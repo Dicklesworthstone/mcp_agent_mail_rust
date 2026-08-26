@@ -3507,8 +3507,9 @@ abort_binary_pair_transaction() {
   err "$reason"
   if ! recover_binary_pair_transaction "$install_dir"; then
     err "Binary transaction recovery failed closed; retained active journal for inspection."
+    BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$install_dir"
+    return 1
   fi
-  BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
   return 1
 }
 
@@ -7840,8 +7841,31 @@ PY
   rmdir "$tmp_dir"
 }
 
+handle_binary_transaction_signal() {
+  local signal_name="$1"
+  local signal_exit="$2"
+  # A second signal must not recursively enter recovery. SIGKILL and power
+  # loss remain next-run recovery cases by construction.
+  trap - HUP INT QUIT TERM
+  if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
+     [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ]; then
+    if ! recover_binary_pair_transaction "$BINARY_TRANSACTION_ACTIVE_INSTALL_DIR"; then
+      err "Recovery after $signal_name failed closed; the active journal was retained."
+    fi
+  fi
+  exit "$signal_exit"
+}
+
 cleanup() {
   local rc=$?
+  trap - HUP INT QUIT TERM
+  if [ -n "${BINARY_TRANSACTION_ACTIVE_INSTALL_DIR:-}" ] && \
+     [ "${BINARY_TRANSACTION_RECOVERY_ACTIVE:-0}" -eq 0 ]; then
+    if ! recover_binary_pair_transaction "$BINARY_TRANSACTION_ACTIVE_INSTALL_DIR"; then
+      err "Exit-time binary transaction recovery failed closed; the active journal was retained."
+      [ "$rc" -ne 0 ] || rc=1
+    fi
+  fi
   if [ -n "${TMP:-}" ]; then
     remove_installer_tmp_dir "$TMP" || true
   fi
@@ -7861,6 +7885,10 @@ LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
 TMP=""
 trap cleanup EXIT
+trap 'handle_binary_transaction_signal HUP 129' HUP
+trap 'handle_binary_transaction_signal INT 130' INT
+trap 'handle_binary_transaction_signal QUIT 131' QUIT
+trap 'handle_binary_transaction_signal TERM 143' TERM
 
 publish_installer_lock_pid() {
   chmod 700 "$LOCK_DIR" || return 1
@@ -7911,6 +7939,16 @@ if ! ensure_real_directory_tree "$DEST" "install destination"; then
   err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
   exit 1
 fi
+# Only the fixed active path is authoritative. A crash before its no-replace
+# publication can leave `.preparing.*` evidence, but those unique directories
+# neither trigger recovery nor block a later transaction.
+BINARY_TRANSACTION_ACTIVE_INSTALL_DIR="$DEST"
+if ! recover_binary_pair_transaction "$DEST"; then
+  err "A previous binary transaction is ambiguous or user-modified; refusing to continue."
+  err "Inspect $(binary_transaction_active_path "$DEST") without moving or deleting its evidence."
+  exit 1
+fi
+BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
 preflight_destination_checks
 
 TMP_PARENT="${TMPDIR:-/tmp}"
