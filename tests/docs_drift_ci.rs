@@ -96,9 +96,7 @@ mod container_release_contract {
         if workflow.contains("file: ./Dockerfile\n") {
             return Err("a hard-coded source Dockerfile publication lane remains".to_string());
         }
-        if workflow.contains("value=latest-${{ github.sha }}")
-            || workflow.contains("prefix=sha-")
-        {
+        if workflow.contains("value=latest-${{ github.sha }}") || workflow.contains("prefix=sha-") {
             return Err("source and release tag namespaces can collide".to_string());
         }
         if workflow.contains("source-${{ inputs.tag_suffix }}-${{ github.sha }}")
@@ -220,11 +218,7 @@ mod container_release_contract {
 
         let release_dockerfile_mutations = [
             release_dockerfile.replacen("ARG AM_REVISION", "ARG SOURCE_REF", 1),
-            release_dockerfile.replacen(
-                "mcp-agent-mail --version)",
-                "mcp-agent-mail --help)",
-                1,
-            ),
+            release_dockerfile.replacen("mcp-agent-mail --version)", "mcp-agent-mail --help)", 1),
             release_dockerfile.replacen(
                 "test \"${#AM_REVISION}\" -eq 40",
                 "test -n \"${AM_REVISION}\"",
@@ -256,12 +250,10 @@ mod dist_release_contract {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    const CHECKOUT_ACTION: &str =
-        "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
+    const CHECKOUT_ACTION: &str = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
     const TOOLCHAIN_ACTION: &str =
         "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
-    const UPLOAD_ACTION: &str =
-        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
+    const UPLOAD_ACTION: &str = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
     const BEADS_RUST_COMMIT: &str = "a3f89e6624661259ffa73f876d105656c5b5246e";
@@ -340,7 +332,10 @@ mod dist_release_contract {
                 ));
             };
             let Some((_, revision)) = action.rsplit_once('@') else {
-                return Err(format!("action on line {} lacks a revision", line_index + 1));
+                return Err(format!(
+                    "action on line {} lacks a revision",
+                    line_index + 1
+                ));
             };
             if revision.len() != 40
                 || !revision
@@ -353,7 +348,10 @@ mod dist_release_contract {
                 ));
             }
             if comment.trim().is_empty() {
-                return Err(format!("action on line {} has an empty pin comment", line_index + 1));
+                return Err(format!(
+                    "action on line {} has an empty pin comment",
+                    line_index + 1
+                ));
             }
         }
         if action_count != 12 {
@@ -773,10 +771,7 @@ mod dist_release_contract {
             workflow,
             "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
         )?;
-        require_once(
-            workflow,
-            &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"),
-        )?;
+        require_once(workflow, &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"))?;
         require_exactly(
             workflow,
             "# Cargo.lock resolves beads_rust 0.5.2, so the workspace patch",
@@ -832,8 +827,8 @@ mod dist_release_contract {
                 "cargo test ",
                 "cargo build ",
             ]
-                .iter()
-                .any(|command| line.contains(command))
+            .iter()
+            .any(|command| line.contains(command))
                 && !line.contains("--locked")
             {
                 return Err(format!("release Cargo command is not locked: {line}"));
@@ -859,7 +854,11 @@ mod dist_release_contract {
     fn dist_contract_guard_rejects_causal_mutations() {
         let workflow = read_workflow();
         let mutations = [
-            mutate(&workflow, "on:\n  push:", "on:\n  workflow_dispatch:\n  push:"),
+            mutate(
+                &workflow,
+                "on:\n  push:",
+                "on:\n  workflow_dispatch:\n  push:",
+            ),
             mutate(
                 &workflow,
                 "[ \"$GITHUB_REF_VALUE\" != \"refs/tags/${REF_NAME}\" ]",
@@ -1083,11 +1082,7 @@ mod dist_release_contract {
                 "\"$COSIGN_BIN\" sign-blob --yes --bundle \"${subject}.sigstore.json\" \"$subject\"",
                 "\"$COSIGN_BIN\" sign-blob --yes \"$subject\"",
             ),
-            mutate(
-                &workflow,
-                "\"$COSIGN_BIN\" verify-blob \\",
-                "true \\",
-            ),
+            mutate(&workflow, "\"$COSIGN_BIN\" verify-blob \\", "true \\"),
             mutate(
                 &workflow,
                 "--new-bundle-format \\",
@@ -1158,11 +1153,7 @@ mod dist_release_contract {
                 "gh api \"/repos/${EXPECTED_REPOSITORY}/commits/${RELEASE_TAG}\" --jq '.sha'",
                 "gh api \"/repos/${EXPECTED_REPOSITORY}/commits/main\" --jq '.sha'",
             ),
-            mutate(
-                &workflow,
-                "case \"$release_count\" in",
-                "case 0 in",
-            ),
+            mutate(&workflow, "case \"$release_count\" in", "case 0 in"),
             mutate(
                 &workflow,
                 "target_commitish: $revision",
@@ -1339,8 +1330,7 @@ mod notify_acfs_contract {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    const CHECKOUT_ACTION: &str =
-        "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
+    const CHECKOUT_ACTION: &str = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1399,7 +1389,9 @@ mod notify_acfs_contract {
             "ACFS_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
         ] {
             if workflow.contains(forbidden) {
-                return Err(format!("forbidden ACFS notification fallback remains: {forbidden}"));
+                return Err(format!(
+                    "forbidden ACFS notification fallback remains: {forbidden}"
+                ));
             }
         }
 
@@ -1407,9 +1399,7 @@ mod notify_acfs_contract {
             .lines()
             .filter_map(|line| line.trim().strip_prefix("uses: "))
             .collect::<Vec<_>>();
-        if uses
-            != ["actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2"]
-        {
+        if uses != ["actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2"] {
             return Err(format!("unexpected ACFS workflow action census: {uses:?}"));
         }
         require_once(workflow, CHECKOUT_ACTION)?;

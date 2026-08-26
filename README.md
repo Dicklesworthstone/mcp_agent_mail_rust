@@ -299,6 +299,8 @@ Downloads the right binary for your platform, installs to `~/.local/bin`, option
 
 Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify` (run an additional post-install self-test), `--no-verify` (**unsafe** explicit escape that skips the checksum and Sigstore checks), `--easy-mode` (auto-update PATH), `--force`, `--no-service` (never install/modify/restart the background service; also implied automatically by a non-default `--dest`), `--uninstall`, `--yes`, `--purge`. **`--no-verify` allows unauthenticated downloaded binaries to execute during mandatory version probes before installation; malicious archive bytes can therefore run arbitrary code as the installer user.** Archive verification applies to downloaded release archives, not source builds. Every downloaded archive must still contain exactly the two expected flat, non-empty regular-file members, and both staged binaries and both installed binaries must report the exact requested version. Those member/version checks are mandatory even with `--no-verify`; the flag also does not disable the optional broader `--verify` post-install self-test. A failed archive download never silently changes into a source build. Explicit `--from-source` checks out the exact requested tag, obtains immutable sibling revisions from that tag's release workflow, builds with `cargo --locked`, and subjects the staged and installed pair to the same exact-version and byte-preserving transactional replacement gates.
 
+A successful source install prints the path of a mode-private `source-receipt` retained inside its committed transaction-history directory. The hash-witnessed receipt binds the normalized release tag, the exact Agent Mail/frankensearch/fast_cmaes/beads_rust commits, and both installed binary SHA-256 digests. Release tags that predate the immutable dependency-pin record fail closed rather than building mutable sibling branches. Interrupted or rolled-back transactions retain their evidence under an explicitly non-committed history name and are never reported as installed source provenance.
+
 ### Windows One-Liner (PowerShell)
 
 ```powershell
@@ -764,7 +766,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot status` | Dashboard synthesis | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
 | `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
-| `am robot overview` | Cross-project summary | `--format`, `--project`, `--agent` |
+| `am robot overview` | Cross-project summary | `--format`, `--project`, `--agent`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
 | `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--agent` |

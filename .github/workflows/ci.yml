@@ -355,12 +355,29 @@ jobs:
               raise SystemExit(1)
           PY
 
+      - name: Run Unix installer integrity and recovery suite
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          AM_E2E_KEEP_TMP: "1"
+        run: bash tests/installer/test_install_artifact_fallback.sh
+
+      - name: Run PowerShell installer transaction suite
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          AM_E2E_KEEP_TMP: "1"
+          AM_E2E_INSTALL_PS1_REQUIRE_PWSH: "1"
+        run: target/debug/am e2e run --keep-tmp --project . install_ps1
+
       - name: Upload native matrix artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-command-matrix-${{ matrix.os }}
-          path: tests/artifacts/cli/native_command_matrix/${{ matrix.os }}/
+          path: |
+            tests/artifacts/cli/native_command_matrix/${{ matrix.os }}/
+            tests/artifacts/install_ps1/
           retention-days: 14
           if-no-files-found: error
 

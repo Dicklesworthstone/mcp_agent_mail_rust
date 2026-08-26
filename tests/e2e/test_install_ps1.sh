@@ -10,6 +10,12 @@ e2e_init_artifacts
 e2e_banner "PowerShell Installer Helper Suite"
 
 if ! command -v pwsh >/dev/null 2>&1; then
+    if [ "${AM_E2E_INSTALL_PS1_REQUIRE_PWSH:-0}" = "1" ]; then
+        e2e_case_banner "0) PowerShell runtime is available"
+        e2e_fail "pwsh is required for the strict install.ps1 lane"
+        e2e_summary
+        exit 1
+    fi
     e2e_skip "pwsh not found; skipping install.ps1 helper checks"
     e2e_summary
     exit 0

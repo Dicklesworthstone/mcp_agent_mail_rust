@@ -11,9 +11,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
 INSTALL_PS1="$REPO_ROOT/install.ps1"
+CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
 
-if [ ! -f "$INSTALL_SH" ] || [ ! -f "$INSTALL_PS1" ]; then
-    echo "FATAL: installer source not found ($INSTALL_SH or $INSTALL_PS1)" >&2
+if [ ! -f "$INSTALL_SH" ] || [ ! -f "$INSTALL_PS1" ] || [ ! -f "$CI_YML" ]; then
+    echo "FATAL: installer or CI source not found ($INSTALL_SH, $INSTALL_PS1, or $CI_YML)" >&2
     exit 2
 fi
 
@@ -60,6 +61,13 @@ extract_function() {
     echo 'BINARY_TRANSACTION_ACTIVE_INSTALL_DIR='
     echo 'BINARY_TRANSACTION_RECOVERY_ACTIVE=0'
     echo 'BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0'
+    echo 'BINARY_TRANSACTION_LAST_ARCHIVE_PATH='
+    echo 'SOURCE_INSTALL_RECEIPT_ENABLED=0'
+    echo 'SOURCE_INSTALL_RELEASE_TAG='
+    echo 'SOURCE_INSTALL_COMMIT='
+    echo 'SOURCE_INSTALL_FRANKENSEARCH_COMMIT='
+    echo 'SOURCE_INSTALL_FAST_CMAES_COMMIT='
+    echo 'SOURCE_INSTALL_BEADS_RUST_COMMIT='
     echo 'TXN_NONCE='
     echo 'TXN_HAD_SERVER='
     echo 'TXN_HAD_CLI='
@@ -67,6 +75,7 @@ extract_function() {
     echo 'TXN_OLD_CLI_HASH='
     echo 'TXN_NEW_SERVER_HASH='
     echo 'TXN_NEW_CLI_HASH='
+    echo 'TXN_SOURCE_RECEIPT_HASH='
     echo 'TXN_METADATA_HASH='
     echo 'TXN_FORWARD_PHASE='
     echo 'TXN_HAS_ROLLBACK_PHASE=0'
@@ -123,6 +132,8 @@ extract_function() {
     extract_function persist_binary_transaction_phase
     extract_function validate_binary_transaction_phase_file
     extract_function validate_binary_transaction_phase_marker
+    extract_function validate_binary_transaction_source_receipt
+    extract_function write_binary_transaction_source_receipt
     extract_function read_binary_transaction_metadata
     extract_function validate_binary_transaction_inventory_and_phases
     extract_function inspect_binary_transaction_forward_target
@@ -144,6 +155,7 @@ for required in establish_release_contract set_artifact_url check_network \
     select_linux_x86_64_gnu_artifact_if_available verify_release_archive \
     verify_archive_members_exact verify_release_binaries_exact require_safe_cosign \
     install_binary_pair_transactional recover_binary_pair_transaction \
+    validate_binary_transaction_source_receipt \
     installer_path_owner_uid preflight_checks \
     preflight_destination_checks; do
     if ! grep -q "^${required}()" "$extract"; then
@@ -882,20 +894,21 @@ if ! grep -q 'Sigstore verification failed' "$tmp/verify_wrong_tag.out"; then
 fi
 
 no_verify_line=$(grep -nF 'if [ "$NO_VERIFY" -eq 1 ]; then' "$INSTALL_SH" | tail -1 | cut -d: -f1)
-verify_call_line=$(grep -nF 'verify_release_archive "$TMP/$TAR" "$URL" "$TAR"' "$INSTALL_SH" | cut -d: -f1)
+verify_call_line=$(grep -nFx '  elif ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then' "$INSTALL_SH" | cut -d: -f1)
 members_line=$(grep -nF 'verify_archive_members_exact "$TMP/$TAR"' "$INSTALL_SH" | cut -d: -f1)
 extract_line=$(grep -nF 'tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"' "$INSTALL_SH" | cut -d: -f1)
 verify_gate_end_line=$(awk -v first="$verify_call_line" -v last="$members_line" \
-    'NR > first && NR < last && $0 == "fi" { line = NR } END { print line }' "$INSTALL_SH")
+    'NR > first && NR < last && $0 ~ /^[[:space:]]*fi[[:space:]]*$/ { line = NR } END { print line }' "$INSTALL_SH")
 verify_gate_fi_count=$(awk -v first="$verify_call_line" -v last="$members_line" \
-    'NR > first && NR < last && $0 == "fi" { count++ } END { print count + 0 }' "$INSTALL_SH")
+    'NR > first && NR < last && $0 ~ /^[[:space:]]*fi[[:space:]]*$/ { count++ } END { print count + 0 }' "$INSTALL_SH")
 if ! grep -Fxq 'NO_VERIFY=0' "$INSTALL_SH" || \
-    ! grep -Fq -- '--no-verify) NO_VERIFY=1; shift;;' "$INSTALL_SH"; then
+    ! grep -Fq -- '--no-verify) NO_VERIFY=1; shift;;' "$INSTALL_SH" || \
+    ! grep -Fxq '  elif ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then' "$INSTALL_SH"; then
     echo "FAIL: Unix archive verification must default on and require an explicit --no-verify escape" >&2
     exit 1
 fi
 if [ -z "$no_verify_line" ] || [ -z "$verify_call_line" ] || [ -z "$verify_gate_end_line" ] || \
-    [ "$verify_gate_fi_count" -ne 2 ] || [ -z "$members_line" ] || [ -z "$extract_line" ] || \
+    [ "$verify_gate_fi_count" -ne 1 ] || [ -z "$members_line" ] || [ -z "$extract_line" ] || \
     [ "$no_verify_line" -ge "$verify_call_line" ] || \
     [ "$verify_call_line" -ge "$verify_gate_end_line" ] || [ "$verify_gate_end_line" -ge "$members_line" ] || \
     [ "$members_line" -ge "$extract_line" ]; then
@@ -1046,6 +1059,40 @@ assert_new_pair() {
         cmp -s "$transaction_root/new/mcp-agent-mail" "$install_dir/mcp-agent-mail"
 }
 
+rewrite_active_transaction_as_schema1() {
+    local install_dir="$1"
+    local trailing_without_newline="${2:-}"
+    local journal="$install_dir/.mcp-agent-mail-install-transaction.active"
+    local metadata_retained="$install_dir/metadata.schema2.retained"
+    local witness_retained="$install_dir/metadata.sha256.schema2.retained"
+    local marker="" phase="" marker_retained="" metadata_hash=""
+
+    mv "$journal/metadata" "$metadata_retained"
+    mv "$journal/metadata.sha256" "$witness_retained"
+    {
+        printf 'schema=1\n'
+        sed -n '2,8p' "$metadata_retained"
+    } >"$journal/metadata"
+    if [ -n "$trailing_without_newline" ]; then
+        printf '%s' "$trailing_without_newline" >>"$journal/metadata"
+    fi
+    chmod 600 "$journal/metadata"
+    metadata_hash=$(EXTRACT="$extract" SOURCE_PATH="$journal/metadata" bash -c '
+        source "$EXTRACT"
+        file_sha256_hex "$SOURCE_PATH"
+    ')
+    printf '%s\n' "$metadata_hash" >"$journal/metadata.sha256"
+    chmod 600 "$journal/metadata.sha256"
+
+    for marker in "$journal"/phase.*; do
+        phase="${marker##*/phase.}"
+        marker_retained="$install_dir/phase.${phase}.schema2.retained"
+        mv "$marker" "$marker_retained"
+        printf 'phase=%s\nmetadata_sha256=%s\n' "$phase" "$metadata_hash" >"$marker"
+        chmod 600 "$marker"
+    done
+}
+
 transaction_interruptions=(
     prepared
     preserve-server preserve-server-moved
@@ -1104,6 +1151,46 @@ for install_kind in upgrade fresh; do
     done
 done
 
+# The public pre-receipt installer can leave a schema-1 authority during a
+# crash. A later schema-2 installer must recover that exact journal rather
+# than strand the prior or committed pair. The superseded fixture bytes stay
+# outside the active authority for inspection; nothing is deleted.
+for phase in prepared commit-ready; do
+    schema1_dir="$transaction_root/cases/schema1-${phase}"
+    mkdir -p "$schema1_dir"
+    cp "$transaction_root/old/am" "$schema1_dir/am"
+    cp "$transaction_root/old/mcp-agent-mail" "$schema1_dir/mcp-agent-mail"
+    run_transaction_interrupt "$transaction_root/new" "$schema1_dir" "$phase"
+    rewrite_active_transaction_as_schema1 "$schema1_dir"
+    run_transaction_recovery "$schema1_dir"
+    if [ "$phase" = "commit-ready" ]; then
+        assert_new_pair "$schema1_dir" || {
+            echo "FAIL: schema-1 commit-ready recovery did not converge to new-new" >&2
+            exit 1
+        }
+    else
+        assert_old_pair "$schema1_dir" || {
+            echo "FAIL: schema-1 prepared recovery did not converge to old-old" >&2
+            exit 1
+        }
+    fi
+done
+
+schema1_extra_dir="$transaction_root/cases/schema1-extra-field"
+mkdir -p "$schema1_extra_dir"
+cp "$transaction_root/old/am" "$schema1_extra_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$schema1_extra_dir/mcp-agent-mail"
+run_transaction_interrupt "$transaction_root/new" "$schema1_extra_dir" prepared
+rewrite_active_transaction_as_schema1 "$schema1_extra_dir" 'source_receipt_sha256=absent'
+if run_transaction_recovery "$schema1_extra_dir"; then
+    echo "FAIL: schema-1 recovery accepted a trailing field without a newline" >&2
+    exit 1
+fi
+if [ ! -d "$schema1_extra_dir/.mcp-agent-mail-install-transaction.active" ]; then
+    echo "FAIL: malformed schema-1 recovery did not retain the active authority" >&2
+    exit 1
+fi
+
 normal_dir="$transaction_root/cases/normal"
 mkdir -p "$normal_dir"
 cp "$transaction_root/old/am" "$normal_dir/am"
@@ -1118,6 +1205,174 @@ EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$normal_dir" 
     install_binary_pair_transactional "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR"
 '
 assert_new_pair "$normal_dir" || { echo "FAIL: normal transaction did not commit new-new" >&2; exit 1; }
+if find "$normal_dir" -maxdepth 2 -name 'source-receipt*' | grep -q .; then
+    echo "FAIL: release-archive transaction unexpectedly claimed source provenance" >&2
+    exit 1
+fi
+
+source_receipt_dir="$transaction_root/cases/source-receipt"
+source_receipt_archive_path_file="$transaction_root/cases/source-receipt-archive-path"
+mkdir -p "$source_receipt_dir"
+cp "$transaction_root/old/am" "$source_receipt_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$source_receipt_dir/mcp-agent-mail"
+EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_receipt_dir" \
+    ARCHIVE_PATH_FILE="$source_receipt_archive_path_file" bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        VERSION=v9.9.9
+        EXPECTED_RELEASE_VERSION=9.9.9
+        SOURCE_INSTALL_RECEIPT_ENABLED=1
+        SOURCE_INSTALL_RELEASE_TAG=v9.9.9
+        SOURCE_INSTALL_COMMIT=1111111111111111111111111111111111111111
+        SOURCE_INSTALL_FRANKENSEARCH_COMMIT=2222222222222222222222222222222222222222
+        SOURCE_INSTALL_FAST_CMAES_COMMIT=3333333333333333333333333333333333333333
+        SOURCE_INSTALL_BEADS_RUST_COMMIT=4444444444444444444444444444444444444444
+        install_binary_pair_transactional "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR"
+        validate_binary_transaction_source_receipt "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH"
+        printf "%s\n" "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH" >"$ARCHIVE_PATH_FILE"
+    '
+assert_new_pair "$source_receipt_dir" || {
+    echo "FAIL: source receipt transaction did not commit new-new" >&2
+    exit 1
+}
+source_receipt_archive=$(cat "$source_receipt_archive_path_file")
+case "$source_receipt_archive" in
+    "$source_receipt_dir"/.mcp-agent-mail-install-transaction.committed.*) ;;
+    *) echo "FAIL: source receipt did not resolve to committed transaction history" >&2; exit 1 ;;
+esac
+source_server_hash=$(EXTRACT="$extract" SOURCE_PATH="$transaction_root/new/mcp-agent-mail" bash -c '
+    source "$EXTRACT"
+    file_sha256_hex "$SOURCE_PATH"
+')
+source_cli_hash=$(EXTRACT="$extract" SOURCE_PATH="$transaction_root/new/am" bash -c '
+    source "$EXTRACT"
+    file_sha256_hex "$SOURCE_PATH"
+')
+source_receipt_expected="$transaction_root/cases/source-receipt.expected"
+printf '%s\n' \
+    'schema=1' \
+    'install_method=exact-tag-source' \
+    'release_tag=v9.9.9' \
+    'source_commit=1111111111111111111111111111111111111111' \
+    'frankensearch_commit=2222222222222222222222222222222222222222' \
+    'fast_cmaes_commit=3333333333333333333333333333333333333333' \
+    'beads_rust_commit=4444444444444444444444444444444444444444' \
+    "server_sha256=$source_server_hash" \
+    "cli_sha256=$source_cli_hash" >"$source_receipt_expected"
+if ! cmp -s "$source_receipt_expected" "$source_receipt_archive/source-receipt"; then
+    echo "FAIL: committed source receipt did not bind the exact tag, revisions, and pair hashes" >&2
+    exit 1
+fi
+
+source_receipt_extra_dir="$transaction_root/cases/source-receipt-extra-field"
+mkdir -p "$source_receipt_extra_dir"
+cp "$source_receipt_archive/source-receipt" "$source_receipt_extra_dir/source-receipt"
+printf 'trailing-data' >>"$source_receipt_extra_dir/source-receipt"
+source_receipt_extra_hash=$(
+    EXTRACT="$extract" SOURCE_PATH="$source_receipt_extra_dir/source-receipt" bash -c '
+        source "$EXTRACT"
+        file_sha256_hex "$SOURCE_PATH"
+    '
+)
+printf '%s\n' "$source_receipt_extra_hash" >"$source_receipt_extra_dir/source-receipt.sha256"
+chmod 600 "$source_receipt_extra_dir/source-receipt" \
+    "$source_receipt_extra_dir/source-receipt.sha256"
+if EXTRACT="$extract" RECEIPT_DIR="$source_receipt_extra_dir" \
+    RECEIPT_HASH="$source_receipt_extra_hash" SERVER_HASH="$source_server_hash" \
+    CLI_HASH="$source_cli_hash" bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        TXN_SOURCE_RECEIPT_HASH="$RECEIPT_HASH"
+        TXN_NEW_SERVER_HASH="$SERVER_HASH"
+        TXN_NEW_CLI_HASH="$CLI_HASH"
+        validate_binary_transaction_source_receipt "$RECEIPT_DIR"
+    '; then
+    echo "FAIL: source receipt validation accepted a trailing field without a newline" >&2
+    exit 1
+fi
+
+source_receipt_corrupt_dir="$transaction_root/cases/source-receipt-corrupt"
+mkdir -p "$source_receipt_corrupt_dir"
+cp "$transaction_root/old/am" "$source_receipt_corrupt_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$source_receipt_corrupt_dir/mcp-agent-mail"
+if EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_receipt_corrupt_dir" \
+    bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        VERSION=v9.9.9
+        EXPECTED_RELEASE_VERSION=9.9.9
+        SOURCE_INSTALL_RECEIPT_ENABLED=1
+        SOURCE_INSTALL_RELEASE_TAG=v9.9.9
+        SOURCE_INSTALL_COMMIT=1111111111111111111111111111111111111111
+        SOURCE_INSTALL_FRANKENSEARCH_COMMIT=2222222222222222222222222222222222222222
+        SOURCE_INSTALL_FAST_CMAES_COMMIT=3333333333333333333333333333333333333333
+        SOURCE_INSTALL_BEADS_RUST_COMMIT=4444444444444444444444444444444444444444
+        install_binary_pair_transactional \
+            "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR" prepared
+    '; then
+    echo "FAIL: source receipt interruption fixture unexpectedly committed" >&2
+    exit 1
+fi
+printf 'tampered\n' >>"$source_receipt_corrupt_dir/.mcp-agent-mail-install-transaction.active/source-receipt"
+source_receipt_corrupt_hash=$(
+    EXTRACT="$extract" \
+        SOURCE_PATH="$source_receipt_corrupt_dir/.mcp-agent-mail-install-transaction.active/source-receipt" \
+        bash -c '
+            source "$EXTRACT"
+            file_sha256_hex "$SOURCE_PATH"
+        '
+)
+printf '%s\n' "$source_receipt_corrupt_hash" \
+    >"$source_receipt_corrupt_dir/.mcp-agent-mail-install-transaction.active/source-receipt.sha256"
+if run_transaction_recovery "$source_receipt_corrupt_dir"; then
+    echo "FAIL: recovery accepted a rehashed source receipt that no longer matched transaction metadata" >&2
+    exit 1
+fi
+if [ ! -d "$source_receipt_corrupt_dir/.mcp-agent-mail-install-transaction.active" ]; then
+    echo "FAIL: ambiguous source receipt recovery did not retain the active authority" >&2
+    exit 1
+fi
+
+source_receipt_missing_dir="$transaction_root/cases/source-receipt-missing"
+mkdir -p "$source_receipt_missing_dir"
+cp "$transaction_root/old/am" "$source_receipt_missing_dir/am"
+cp "$transaction_root/old/mcp-agent-mail" "$source_receipt_missing_dir/mcp-agent-mail"
+if EXTRACT="$extract" SOURCE_DIR="$transaction_root/new" INSTALL_DIR="$source_receipt_missing_dir" \
+    bash -c '
+        set -euo pipefail
+        source "$EXTRACT"
+        BIN_CLI=am
+        BIN_SERVER=mcp-agent-mail
+        VERSION=v9.9.9
+        EXPECTED_RELEASE_VERSION=9.9.9
+        SOURCE_INSTALL_RECEIPT_ENABLED=1
+        SOURCE_INSTALL_RELEASE_TAG=v9.9.9
+        SOURCE_INSTALL_COMMIT=1111111111111111111111111111111111111111
+        SOURCE_INSTALL_FRANKENSEARCH_COMMIT=2222222222222222222222222222222222222222
+        SOURCE_INSTALL_FAST_CMAES_COMMIT=3333333333333333333333333333333333333333
+        SOURCE_INSTALL_BEADS_RUST_COMMIT=4444444444444444444444444444444444444444
+        install_binary_pair_transactional \
+            "$SOURCE_DIR/mcp-agent-mail" "$SOURCE_DIR/am" "$INSTALL_DIR" prepared
+    '; then
+    echo "FAIL: missing source receipt interruption fixture unexpectedly committed" >&2
+    exit 1
+fi
+mv "$source_receipt_missing_dir/.mcp-agent-mail-install-transaction.active/source-receipt" \
+    "$source_receipt_missing_dir/source-receipt.retained"
+mv "$source_receipt_missing_dir/.mcp-agent-mail-install-transaction.active/source-receipt.sha256" \
+    "$source_receipt_missing_dir/source-receipt.sha256.retained"
+if run_transaction_recovery "$source_receipt_missing_dir"; then
+    echo "FAIL: recovery accepted missing source receipt files despite the metadata binding" >&2
+    exit 1
+fi
+if [ ! -d "$source_receipt_missing_dir/.mcp-agent-mail-install-transaction.active" ]; then
+    echo "FAIL: missing source receipt recovery did not retain the active authority" >&2
+    exit 1
+fi
 
 # Exercise the production TERM and EXIT traps after a real persisted mutation
 # window. The signal path must preserve its conventional 128+signal exit code,
@@ -1324,7 +1579,7 @@ staged_version_line=$(grep -nF 'verify_release_binaries_exact "$SERVER_BIN" "$CL
 replace_line=$(grep -nF 'install_binary_pair_transactional "$SERVER_BIN" "$CLI_BIN" "$DEST"' "$INSTALL_SH" | cut -d: -f1)
 transaction_start_line=$(grep -nF 'install_binary_pair_transactional() {' "$INSTALL_SH" | cut -d: -f1)
 transaction_end_line=$(awk -v first="$transaction_start_line" 'NR > first && $0 == "}" { print NR; exit }' "$INSTALL_SH")
-installed_version_line=$(grep -nF '! verify_release_binaries_exact "$server_dest" "$cli_dest" "Installed"' "$INSTALL_SH" | cut -d: -f1)
+installed_version_line=$(grep -nF '! verify_release_binaries_exact "$install_dir/$BIN_SERVER" "$install_dir/$BIN_CLI" "Installed"' "$INSTALL_SH" | cut -d: -f1)
 if [ -z "$staged_version_line" ] || [ -z "$replace_line" ] || \
     [ -z "$transaction_start_line" ] || [ -z "$transaction_end_line" ] || \
     [ -z "$installed_version_line" ] || [ "$staged_version_line" -ge "$replace_line" ] || \
@@ -1395,7 +1650,7 @@ ps_replace_line=$(grep -nF '    Install-BinariesAtomically `' "$INSTALL_PS1" | c
 ps_post_version_line=$(grep -nF 'Verify-Install -InstallDir $VerifiedInstallDir -ExpectedVersion $requestedNormalized' "$INSTALL_PS1" | cut -d: -f1)
 ps_callback_line=$(grep -nF '& $PostInstallVerifier $InstallDir' "$INSTALL_PS1" | cut -d: -f1)
 ps_commit_line=$(grep -nF 'Write-BinaryTransactionPhase -Journal $journal -Phase "50-commit-ready"' "$INSTALL_PS1" | cut -d: -f1)
-ps_archive_line=$(grep -nF 'Archive-BinaryTransaction -Journal $journal -InstallDir $InstallDir -Outcome "committed"' "$INSTALL_PS1" | cut -d: -f1)
+ps_archive_line=$(grep -nF 'Archive-BinaryTransaction -Journal $journal -InstallDir $InstallDir -Outcome "committed"' "$INSTALL_PS1" | tail -1 | cut -d: -f1)
 if ! grep -Fq '$ShouldVerifyArchive = if ($NoVerify) { $false } else { $true }' "$INSTALL_PS1"; then
     echo "FAIL: PowerShell archive verification must default on and require an explicit -NoVerify escape" >&2
     exit 1
@@ -1417,6 +1672,11 @@ if [ -z "$ps_staged_version_line" ] || [ -z "$ps_replace_line" ] || \
     echo "FAIL: PowerShell post-install verification must precede commit-ready and retained-history archival" >&2
     exit 1
 fi
+if ! grep -Fq 'AM_E2E_INSTALL_PS1_REQUIRE_PWSH: "1"' "$CI_YML" || \
+    ! grep -Fq 'target/debug/am e2e run --keep-tmp --project . install_ps1' "$CI_YML"; then
+    echo "FAIL: Windows CI must require a real PowerShell runtime and preserve installer E2E evidence" >&2
+    exit 1
+fi
 for required_text in \
     'Get-Command Get-FileHash -ErrorAction SilentlyContinue' \
     'Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue' \
@@ -1432,7 +1692,7 @@ for required_text in \
     "'^v?(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$'" \
     '$CosignIdentity = $releaseContract.CertificateIdentity' \
     '$entries.Count -eq 2' \
-    '$versionLines.Count -ne 1' \
+    '$versions.Count -ne 1' \
     'Assert-ExactBinaryVersion -BinaryPath $serverSource -ExpectedOutput "mcp-agent-mail $requestedNormalized" -Phase "Staged"' \
     'Assert-ExactBinaryVersion -BinaryPath $serverExe -ExpectedOutput "mcp-agent-mail $ExpectedVersion" -Phase "Post-install"' \
     '$installerMutex = Enter-InstallerMutex -InstallDir $Dest' \
@@ -1446,7 +1706,7 @@ for required_text in \
     'Archive-member and exact-version checks remain mandatory.' \
     'UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)' \
     'malicious bytes can run arbitrary code.'; do
-    if ! grep -Fq "$required_text" "$INSTALL_PS1"; then
+    if ! grep -Fq -- "$required_text" "$INSTALL_PS1"; then
         echo "FAIL: PowerShell fail-closed control missing: $required_text" >&2
         exit 1
     fi

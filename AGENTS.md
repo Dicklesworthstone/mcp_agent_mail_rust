@@ -706,7 +706,7 @@ Use it when you need structured snapshots quickly (especially in automated loops
 | `am robot status` | Dashboard synthesis across health, inbox, activity, reservations, top threads | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
 | `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
-| `am robot overview` | Cross-project summary of actionable state | `--format`, `--project`, `--agent` |
+| `am robot overview` | Cross-project summary of actionable state | `--format`, `--project`, `--agent`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
 | `am robot message <id>` | Single-message deep view with context | `--format`, `--project`, `--agent` |

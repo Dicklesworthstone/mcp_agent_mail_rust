@@ -2850,6 +2850,13 @@ file_sha256_hex() {
 BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
 BINARY_TRANSACTION_RECOVERY_ACTIVE=0
 BINARY_TRANSACTION_EXIT_RECOVERY_ATTEMPTED=0
+BINARY_TRANSACTION_LAST_ARCHIVE_PATH=""
+SOURCE_INSTALL_RECEIPT_ENABLED=0
+SOURCE_INSTALL_RELEASE_TAG=""
+SOURCE_INSTALL_COMMIT=""
+SOURCE_INSTALL_FRANKENSEARCH_COMMIT=""
+SOURCE_INSTALL_FAST_CMAES_COMMIT=""
+SOURCE_INSTALL_BEADS_RUST_COMMIT=""
 TXN_NONCE=""
 TXN_HAD_SERVER=""
 TXN_HAD_CLI=""
@@ -2857,6 +2864,7 @@ TXN_OLD_SERVER_HASH=""
 TXN_OLD_CLI_HASH=""
 TXN_NEW_SERVER_HASH=""
 TXN_NEW_CLI_HASH=""
+TXN_SOURCE_RECEIPT_HASH=""
 TXN_METADATA_HASH=""
 TXN_FORWARD_PHASE=""
 TXN_HAS_ROLLBACK_PHASE=0
@@ -3056,12 +3064,111 @@ validate_binary_transaction_phase_marker() {
   validate_binary_transaction_phase_file "$journal/phase.$phase" "$phase"
 }
 
+validate_binary_transaction_source_receipt() {
+  local journal="$1"
+  local receipt="$journal/source-receipt"
+  local witness_file="$journal/source-receipt.sha256"
+  local witness="" extra="" actual="" witness_lines=""
+  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8="" l9="" l10=""
+  local release_tag="" source_commit="" frankensearch_commit=""
+  local fast_cmaes_commit="" beads_rust_commit="" server_hash="" cli_hash=""
+
+  if [ "$TXN_SOURCE_RECEIPT_HASH" = "absent" ] && \
+     ! installer_entry_exists "$receipt" && ! installer_entry_exists "$witness_file"; then
+    return 0
+  fi
+  [[ "$TXN_SOURCE_RECEIPT_HASH" =~ ^[a-f0-9]{64}$ ]] || {
+    err "Binary transaction source receipt authority is inconsistent with metadata: $journal"
+    return 1
+  }
+  if ! installer_entry_exists "$receipt" || ! installer_entry_exists "$witness_file"; then
+    err "Binary transaction source receipt is incomplete: $journal"
+    return 1
+  fi
+  validate_installer_owned_regular_file "$receipt" "Binary transaction source receipt" 600 || return 1
+  validate_installer_owned_regular_file "$witness_file" \
+    "Binary transaction source receipt witness" 600 || return 1
+  IFS= read -r witness <"$witness_file" || return 1
+  extra=$(sed -n '2p' "$witness_file") || return 1
+  witness_lines=$(wc -l <"$witness_file" 2>/dev/null | tr -d '[:space:]') || return 1
+  [ "$witness" = "$TXN_SOURCE_RECEIPT_HASH" ] && [ -z "$extra" ] && \
+    [ "$witness_lines" = "1" ] || {
+    err "Binary transaction source receipt witness is malformed: $witness_file"
+    return 1
+  }
+  actual=$(file_sha256_hex "$receipt" 2>/dev/null || true)
+  if [ "$actual" != "$witness" ]; then
+    err "Binary transaction source receipt hash witness does not match: $receipt"
+    return 1
+  fi
+
+  {
+    IFS= read -r l1 || return 1
+    IFS= read -r l2 || return 1
+    IFS= read -r l3 || return 1
+    IFS= read -r l4 || return 1
+    IFS= read -r l5 || return 1
+    IFS= read -r l6 || return 1
+    IFS= read -r l7 || return 1
+    IFS= read -r l8 || return 1
+    IFS= read -r l9 || return 1
+    if IFS= read -r l10 || [ -n "$l10" ]; then return 1; fi
+  } <"$receipt"
+  [ "$l1" = "schema=1" ] || return 1
+  [ "$l2" = "install_method=exact-tag-source" ] || return 1
+  case "$l3" in release_tag=*) release_tag="${l3#release_tag=}" ;; *) return 1 ;; esac
+  case "$l4" in source_commit=*) source_commit="${l4#source_commit=}" ;; *) return 1 ;; esac
+  case "$l5" in frankensearch_commit=*) frankensearch_commit="${l5#frankensearch_commit=}" ;; *) return 1 ;; esac
+  case "$l6" in fast_cmaes_commit=*) fast_cmaes_commit="${l6#fast_cmaes_commit=}" ;; *) return 1 ;; esac
+  case "$l7" in beads_rust_commit=*) beads_rust_commit="${l7#beads_rust_commit=}" ;; *) return 1 ;; esac
+  case "$l8" in server_sha256=*) server_hash="${l8#server_sha256=}" ;; *) return 1 ;; esac
+  case "$l9" in cli_sha256=*) cli_hash="${l9#cli_sha256=}" ;; *) return 1 ;; esac
+
+  [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
+  [[ "$source_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$frankensearch_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$fast_cmaes_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$beads_rust_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [ "$server_hash" = "$TXN_NEW_SERVER_HASH" ] || return 1
+  [ "$cli_hash" = "$TXN_NEW_CLI_HASH" ] || return 1
+}
+
+write_binary_transaction_source_receipt() {
+  local journal="$1"
+  local receipt=""
+  local witness=""
+
+  [ "$SOURCE_INSTALL_RECEIPT_ENABLED" -eq 1 ] || return 0
+  [[ "$SOURCE_INSTALL_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
+  [[ "$SOURCE_INSTALL_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$SOURCE_INSTALL_FRANKENSEARCH_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$SOURCE_INSTALL_FAST_CMAES_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$SOURCE_INSTALL_BEADS_RUST_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+
+  receipt="schema=1
+install_method=exact-tag-source
+release_tag=$SOURCE_INSTALL_RELEASE_TAG
+source_commit=$SOURCE_INSTALL_COMMIT
+frankensearch_commit=$SOURCE_INSTALL_FRANKENSEARCH_COMMIT
+fast_cmaes_commit=$SOURCE_INSTALL_FAST_CMAES_COMMIT
+beads_rust_commit=$SOURCE_INSTALL_BEADS_RUST_COMMIT
+server_sha256=$TXN_NEW_SERVER_HASH
+cli_sha256=$TXN_NEW_CLI_HASH"
+  printf '%s\n' "$receipt" \
+    | write_binary_transaction_file_exclusive "$journal/source-receipt" 600 || return 1
+  witness=$(file_sha256_hex "$journal/source-receipt") || return 1
+  TXN_SOURCE_RECEIPT_HASH="$witness"
+  printf '%s\n' "$witness" \
+    | write_binary_transaction_file_exclusive "$journal/source-receipt.sha256" 600 || return 1
+  validate_binary_transaction_source_receipt "$journal"
+}
+
 read_binary_transaction_metadata() {
   local journal="$1"
   local metadata="$journal/metadata"
   local witness_file="$journal/metadata.sha256"
   local witness="" extra="" actual="" witness_lines=""
-  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8="" l9=""
+  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8="" l9="" l10=""
 
   validate_binary_transaction_directory "$journal" || return 1
   validate_installer_owned_regular_file "$metadata" "Binary transaction metadata" 600 || return 1
@@ -3088,9 +3195,21 @@ read_binary_transaction_metadata() {
     IFS= read -r l6 || return 1
     IFS= read -r l7 || return 1
     IFS= read -r l8 || return 1
-    if IFS= read -r l9; then return 1; fi
+    case "$l1" in
+      schema=1)
+        # Schema 1 is accepted only as crash-recovery authority written by
+        # the immediately preceding public installer. New transactions are
+        # always schema 2 and bind an explicit receipt-presence decision.
+        if IFS= read -r l9 || [ -n "$l9" ]; then return 1; fi
+        TXN_SOURCE_RECEIPT_HASH=absent
+        ;;
+      schema=2)
+        IFS= read -r l9 || return 1
+        if IFS= read -r l10 || [ -n "$l10" ]; then return 1; fi
+        ;;
+      *) return 1 ;;
+    esac
   } <"$metadata"
-  [ "$l1" = "schema=1" ] || return 1
   case "$l2" in nonce=*) TXN_NONCE="${l2#nonce=}" ;; *) return 1 ;; esac
   case "$l3" in had_server=*) TXN_HAD_SERVER="${l3#had_server=}" ;; *) return 1 ;; esac
   case "$l4" in old_server_sha256=*) TXN_OLD_SERVER_HASH="${l4#old_server_sha256=}" ;; *) return 1 ;; esac
@@ -3098,6 +3217,9 @@ read_binary_transaction_metadata() {
   case "$l6" in old_cli_sha256=*) TXN_OLD_CLI_HASH="${l6#old_cli_sha256=}" ;; *) return 1 ;; esac
   case "$l7" in new_server_sha256=*) TXN_NEW_SERVER_HASH="${l7#new_server_sha256=}" ;; *) return 1 ;; esac
   case "$l8" in new_cli_sha256=*) TXN_NEW_CLI_HASH="${l8#new_cli_sha256=}" ;; *) return 1 ;; esac
+  if [ "$l1" = "schema=2" ]; then
+    case "$l9" in source_receipt_sha256=*) TXN_SOURCE_RECEIPT_HASH="${l9#source_receipt_sha256=}" ;; *) return 1 ;; esac
+  fi
 
   [[ "$TXN_NONCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
   case "$TXN_HAD_SERVER:$TXN_OLD_SERVER_HASH" in
@@ -3112,6 +3234,8 @@ read_binary_transaction_metadata() {
   esac
   [[ "$TXN_NEW_SERVER_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ "$TXN_NEW_CLI_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
+  [ "$TXN_SOURCE_RECEIPT_HASH" = "absent" ] || \
+    [[ "$TXN_SOURCE_RECEIPT_HASH" =~ ^[a-f0-9]{64}$ ]] || return 1
   TXN_METADATA_HASH="$witness"
 }
 
@@ -3130,7 +3254,7 @@ validate_binary_transaction_inventory_and_phases() {
     fi
     name="${entry##*/}"
     case "$name" in
-      metadata|metadata.sha256|new-server|new-cli|old-server|old-cli|rollback-new-server|rollback-new-cli|\
+      metadata|metadata.sha256|source-receipt|source-receipt.sha256|new-server|new-cli|old-server|old-cli|rollback-new-server|rollback-new-cli|\
       phase.00-prepared|phase.10-preserve-server|phase.20-preserve-cli|\
       phase.30-publish-server|phase.40-publish-cli|phase.45-rollback|phase.50-commit-ready) ;;
       *) err "Unexpected entry in binary transaction authority: $entry"; return 1 ;;
@@ -3353,7 +3477,9 @@ archive_binary_transaction() {
   move_installer_entry_no_replace "$journal" "$history" "Archive $outcome binary transaction" || return 1
   sync_installer_paths_durably "$history" "$install_dir" || return 1
   validate_binary_transaction_directory "$history" || return 1
+  validate_binary_transaction_source_receipt "$history" || return 1
   BINARY_TRANSACTION_ACTIVE_INSTALL_DIR=""
+  BINARY_TRANSACTION_LAST_ARCHIVE_PATH="$history"
 }
 
 recover_binary_pair_transaction_impl() {
@@ -3366,6 +3492,7 @@ recover_binary_pair_transaction_impl() {
   fi
   read_binary_transaction_metadata "$journal" || return 1
   validate_binary_transaction_inventory_and_phases "$journal" || return 1
+  validate_binary_transaction_source_receipt "$journal" || return 1
 
   if [ "$TXN_FORWARD_PHASE" = "50-commit-ready" ]; then
     installer_entry_exists "$journal/new-server" && return 1
@@ -3498,6 +3625,7 @@ prepare_binary_pair_transaction() {
   TXN_NONCE="$nonce"
   TXN_NEW_SERVER_HASH=$(file_sha256_hex "$server_src") || return 1
   TXN_NEW_CLI_HASH=$(file_sha256_hex "$cli_src") || return 1
+  TXN_SOURCE_RECEIPT_HASH=absent
   TXN_HAD_SERVER=0
   TXN_HAD_CLI=0
   TXN_OLD_SERVER_HASH=absent
@@ -3532,14 +3660,17 @@ prepare_binary_pair_transaction() {
     "Journaled CLI binary" || return 1
   sync_installer_paths_durably "$preparing/new-server" "$preparing/new-cli" "$preparing" || return 1
 
-  metadata="schema=1
+  write_binary_transaction_source_receipt "$preparing" || return 1
+
+  metadata="schema=2
 nonce=$TXN_NONCE
 had_server=$TXN_HAD_SERVER
 old_server_sha256=$TXN_OLD_SERVER_HASH
 had_cli=$TXN_HAD_CLI
 old_cli_sha256=$TXN_OLD_CLI_HASH
 new_server_sha256=$TXN_NEW_SERVER_HASH
-new_cli_sha256=$TXN_NEW_CLI_HASH"
+new_cli_sha256=$TXN_NEW_CLI_HASH
+source_receipt_sha256=$TXN_SOURCE_RECEIPT_HASH"
   printf '%s\n' "$metadata" | write_binary_transaction_file_exclusive "$preparing/metadata" 600 || return 1
   TXN_METADATA_HASH=$(file_sha256_hex "$preparing/metadata") || return 1
   printf '%s\n' "$TXN_METADATA_HASH" \
@@ -8068,9 +8199,15 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   info "Building exact release tag $VERSION from source"
   ensure_rust
   source_repository_url="https://github.com/${OWNER}/${REPO}.git"
+  source_commit=""
   if ! checkout_exact_release_source "$source_repository_url" "$TMP/src" "$VERSION"; then
     err "Could not check out and verify exact release tag $VERSION."
     err "Source installation never builds an unverified default branch."
+    exit 1
+  fi
+  source_commit=$(git -C "$TMP/src" rev-parse HEAD 2>/dev/null || true)
+  if ! [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    err "Could not resolve one exact source commit for release tag $VERSION."
     exit 1
   fi
 
@@ -8094,6 +8231,13 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     err "Could not check out an exact pinned source-build dependency."
     exit 1
   fi
+
+  SOURCE_INSTALL_RECEIPT_ENABLED=1
+  SOURCE_INSTALL_RELEASE_TAG="$VERSION"
+  SOURCE_INSTALL_COMMIT="$source_commit"
+  SOURCE_INSTALL_FRANKENSEARCH_COMMIT="$frankensearch_commit"
+  SOURCE_INSTALL_FAST_CMAES_COMMIT="$fast_cmaes_commit"
+  SOURCE_INSTALL_BEADS_RUST_COMMIT="$beads_rust_commit"
 
   source_target_dir="$TMP/source-target"
   if ! (cd "$TMP/src" && \
@@ -8168,6 +8312,16 @@ fi
 ok "Installed to $DEST ($INSTALL_METHOD_LABEL)"
 ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
+if [ "$FROM_SOURCE" -eq 1 ]; then
+  source_receipt_path="$BINARY_TRANSACTION_LAST_ARCHIVE_PATH/source-receipt"
+  if [ -z "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH" ] || \
+     ! validate_binary_transaction_source_receipt "$BINARY_TRANSACTION_LAST_ARCHIVE_PATH"; then
+    err "The exact-tag source build committed without a readable source receipt."
+    err "Inspect retained transaction history under $DEST before trusting this install."
+    exit 1
+  fi
+  ok "  Source receipt: $source_receipt_path"
+fi
 maybe_add_path
 install_local_bin_links
 
