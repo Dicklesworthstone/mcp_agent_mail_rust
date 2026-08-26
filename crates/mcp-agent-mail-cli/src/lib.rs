@@ -40727,9 +40727,22 @@ fn deleted_executable_owner_warning(
 /// Inspect mailbox ownership and, when a deleted/replaced executable owns the
 /// locks, print the supervised-restart guidance to stderr. Read-only and
 /// best-effort: any inspection failure is silently skipped.
+fn trusted_mailbox_owner_report_with<F>(config: &Config, inspect: F) -> Option<DoctorLocksReport>
+where
+    F: FnOnce(&Config) -> CliResult<DoctorLocksReport>,
+{
+    // `service status` intentionally remains available while config.env needs
+    // repair, but suppressing that rejected authority leaves only default
+    // mailbox paths. Never inspect and report on that unrelated mailbox.
+    config.validate_user_env_authority().ok()?;
+    inspect(config).ok()
+}
+
 fn service_report_deleted_executable_owner() {
     let config = Config::from_env();
-    let Ok(report) = build_doctor_locks_report_with_config(&config) else {
+    let Some(report) =
+        trusted_mailbox_owner_report_with(&config, build_doctor_locks_report_with_config)
+    else {
         return;
     };
     let deleted_pids: Vec<u32> = report
@@ -41290,6 +41303,38 @@ mod tests {
         assert!(command_requires_trusted_user_env(Some(
             &destructive_mailbox_command
         )));
+    }
+
+    #[test]
+    fn unsafe_user_env_authority_skips_service_mailbox_inspection() {
+        let mut config = Config::default();
+        config.user_env_authority_error = Some("unsafe user config authority".to_string());
+        let inspection_called = std::cell::Cell::new(false);
+
+        let report = trusted_mailbox_owner_report_with(&config, |_| {
+            inspection_called.set(true);
+            Err(CliError::Other("inspection should be unreachable".to_string()))
+        });
+
+        assert!(report.is_none());
+        assert!(
+            !inspection_called.get(),
+            "service status must not inspect a default mailbox after authority rejection"
+        );
+    }
+
+    #[test]
+    fn trusted_user_env_authority_preserves_service_mailbox_inspection() {
+        let config = Config::default();
+        let inspection_called = std::cell::Cell::new(false);
+
+        let report = trusted_mailbox_owner_report_with(&config, |_| {
+            inspection_called.set(true);
+            Err(CliError::Other("synthetic inspection result".to_string()))
+        });
+
+        assert!(report.is_none());
+        assert!(inspection_called.get());
     }
 
     fn canonical_test_tempdir(prefix: &str) -> tempfile::TempDir {
