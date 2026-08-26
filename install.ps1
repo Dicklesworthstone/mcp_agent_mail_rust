@@ -70,6 +70,29 @@ function Write-WarnText {
     Write-Host "!! $Message" -ForegroundColor Yellow
 }
 
+function Stop-VersionProbeProcessTree {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) {
+        return
+    }
+    try {
+        if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+            $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+            if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
+                & $taskkill /PID $Process.Id /T /F *> $null
+            } else {
+                $Process.Kill()
+            }
+        } else {
+            try { $Process.Kill($true) } catch { $Process.Kill() }
+        }
+    } catch {
+        try { $Process.Kill() } catch { }
+    }
+    try { $null = $Process.WaitForExit(1000) } catch { }
+}
+
 function Invoke-VersionProbeBounded {
     param(
         [string]$BinaryPath,
@@ -87,6 +110,7 @@ function Invoke-VersionProbeBounded {
     $startInfo.RedirectStandardError = $true
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
         if (-not $process.Start()) {
@@ -94,21 +118,23 @@ function Invoke-VersionProbeBounded {
         }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-            try {
-                if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
-                    $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
-                    & $taskkill /PID $process.Id /T /F *> $null
-                } else {
-                    $process.Kill($true)
-                }
-            } catch {
-                try { $process.Kill() } catch { }
-            }
-            $null = $process.WaitForExit(5000)
+        [int]$remaining = [Math]::Max(0, $TimeoutMilliseconds - [int]$stopwatch.ElapsedMilliseconds)
+        if ($remaining -eq 0 -or -not $process.WaitForExit($remaining)) {
+            Stop-VersionProbeProcessTree -Process $process
             throw "version probe timed out after $TimeoutMilliseconds ms"
         }
-        $process.WaitForExit()
+
+        # A process can exit after spawning a descendant that retains its
+        # redirected stdout/stderr handles. Bound the stream drain as part of
+        # the same deadline so GetResult() can never wait forever on that child.
+        $remaining = [Math]::Max(0, $TimeoutMilliseconds - [int]$stopwatch.ElapsedMilliseconds)
+        [System.Threading.Tasks.Task[]]$ioTasks = @($stdoutTask, $stderrTask)
+        if ($remaining -eq 0 -or
+            -not [System.Threading.Tasks.Task]::WaitAll($ioTasks, $remaining)) {
+            Stop-VersionProbeProcessTree -Process $process
+            throw "version probe output did not close within $TimeoutMilliseconds ms"
+        }
+
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
             Stdout = $stdoutTask.GetAwaiter().GetResult()

@@ -545,6 +545,7 @@ capture_command_with_timeout() {
 
   CAPTURED_CMD_OUTPUT=""
   CAPTURED_CMD_OUTPUT_EXACT=""
+  CAPTURED_CMD_OUTPUT_LOSSLESS=1
   CAPTURED_CMD_STATUS=0
 
   if command -v python3 >/dev/null 2>&1; then
@@ -595,10 +596,22 @@ with open(output_path, "wb") as output_handle:
             proc.kill()
             proc.wait(timeout=1)
 
-with open(status_path, "w", encoding="utf-8") as handle:
-    handle.write("124" if timed_out else str(proc.returncode))
+return_code = proc.returncode
+if timed_out:
+    shell_status = 124
+elif return_code is None:
+    shell_status = 125
+elif return_code < 0:
+    # subprocess uses negative values for signal termination; Bash `return`
+    # accepts only 0..255, so translate to the conventional 128 + signal.
+    shell_status = min(255, 128 - return_code)
+else:
+    shell_status = min(255, return_code)
 
-sys.exit(124 if timed_out else proc.returncode)
+with open(status_path, "w", encoding="utf-8") as handle:
+    handle.write(str(shell_status))
+
+sys.exit(shell_status)
 PY
     then
       rc=0
@@ -609,10 +622,18 @@ PY
     if [ -f "$output_file" ]; then
       # Command substitution normally strips every trailing newline. Preserve
       # exact bytes behind a non-newline sentinel so version identity checks
-      # can accept one normal LF while rejecting extra blank lines.
+      # can accept one normal LF while rejecting extra blank lines. Bash cannot
+      # store NUL bytes, so compare byte counts and fail exact-output checks if
+      # command substitution discarded any bytes.
+      local raw_output_size captured_output_size
       CAPTURED_CMD_OUTPUT_EXACT=$(cat "$output_file"; printf '\034')
       CAPTURED_CMD_OUTPUT_EXACT="${CAPTURED_CMD_OUTPUT_EXACT%$'\034'}"
       CAPTURED_CMD_OUTPUT=$(cat "$output_file")
+      raw_output_size=$(LC_ALL=C wc -c <"$output_file" 2>/dev/null | tr -d '[:space:]') || raw_output_size=""
+      captured_output_size=$(printf '%s' "$CAPTURED_CMD_OUTPUT_EXACT" | LC_ALL=C wc -c 2>/dev/null | tr -d '[:space:]') || captured_output_size=""
+      if [ -z "$raw_output_size" ] || [ "$raw_output_size" != "$captured_output_size" ]; then
+        CAPTURED_CMD_OUTPUT_LOSSLESS=0
+      fi
     fi
     [ -f "$status_file" ] && CAPTURED_CMD_STATUS=$(cat "$status_file")
     rm -f "$output_file" "$status_file" 2>/dev/null || true
@@ -634,11 +655,12 @@ PY
   else
     CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires python3, timeout, or gtimeout)."
     CAPTURED_CMD_OUTPUT_EXACT="$CAPTURED_CMD_OUTPUT"
+    CAPTURED_CMD_OUTPUT_LOSSLESS=1
     CAPTURED_CMD_STATUS=125
     return 125
   fi
 
-  local fallback_output_file fallback_rc
+  local fallback_output_file fallback_rc raw_output_size captured_output_size
   fallback_output_file=$(mktemp "${TMP:-/tmp}/am-install-capture.XXXXXX") || return 1
   if "$timeout_bin" --signal=KILL "$timeout_secs" "$@" >"$fallback_output_file" 2>&1; then
     fallback_rc=0
@@ -648,6 +670,11 @@ PY
   CAPTURED_CMD_OUTPUT_EXACT=$(cat "$fallback_output_file"; printf '\034')
   CAPTURED_CMD_OUTPUT_EXACT="${CAPTURED_CMD_OUTPUT_EXACT%$'\034'}"
   CAPTURED_CMD_OUTPUT=$(cat "$fallback_output_file")
+  raw_output_size=$(LC_ALL=C wc -c <"$fallback_output_file" 2>/dev/null | tr -d '[:space:]') || raw_output_size=""
+  captured_output_size=$(printf '%s' "$CAPTURED_CMD_OUTPUT_EXACT" | LC_ALL=C wc -c 2>/dev/null | tr -d '[:space:]') || captured_output_size=""
+  if [ -z "$raw_output_size" ] || [ "$raw_output_size" != "$captured_output_size" ]; then
+    CAPTURED_CMD_OUTPUT_LOSSLESS=0
+  fi
   rm -f "$fallback_output_file" 2>/dev/null || true
   CAPTURED_CMD_STATUS="$fallback_rc"
   return "$CAPTURED_CMD_STATUS"
@@ -6535,9 +6562,11 @@ binary_version_matches_exact() {
 
   CAPTURED_CMD_OUTPUT=""
   CAPTURED_CMD_OUTPUT_EXACT=""
+  CAPTURED_CMD_OUTPUT_LOSSLESS=1
   CAPTURED_CMD_STATUS=0
   [ -x "$binary_path" ] || return 1
   capture_command_with_timeout 3 "$binary_path" --version || return 1
+  [ "$CAPTURED_CMD_OUTPUT_LOSSLESS" -eq 1 ] || return 1
   [ "$CAPTURED_CMD_OUTPUT_EXACT" = "$expected_output" ] || \
     [ "$CAPTURED_CMD_OUTPUT_EXACT" = "${expected_output}"$'\n' ]
 }
