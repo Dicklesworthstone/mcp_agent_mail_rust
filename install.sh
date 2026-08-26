@@ -6924,21 +6924,22 @@ preflight_checks
 # Detect existing Python installation (T1.1, T1.2, T1.3)
 detect_python
 
-# Check if already at target version (skip download if so, unless --force)
+# A self-reported version is not proof that installed bytes came from the
+# authenticated release. Unless --force suppresses this informational probe,
+# report the match but continue through download, verification, and replacement.
 if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   if existing_install_can_skip; then
     if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ] && \
        [ "$FORCE_MIGRATE" -ne 1 ] && [ ! -f "$PYTHON_MIGRATION_SKIP_MARKER" ]; then
       write_python_migration_skip_marker "explicit --no-migrate"
     fi
-    ok "mcp-agent-mail $VERSION is already installed at $DEST"
-    info "Use --force to reinstall"
-    exit 0
+    info "mcp-agent-mail $VERSION already reports the requested version at $DEST."
+    info "Continuing with authenticated download and byte-for-byte replacement; a version string alone is not release provenance."
+  else
+    warn "Installed version matches $VERSION, but the existing install still needs repair."
+    [ -n "$EXISTING_INSTALL_REPAIR_REASON" ] && warn "  Reason: $EXISTING_INSTALL_REPAIR_REASON"
+    info "Continuing with reinstall/remediation instead of exiting early."
   fi
-
-  warn "Installed version matches $VERSION, but the existing install still needs repair."
-  [ -n "$EXISTING_INSTALL_REPAIR_REASON" ] && warn "  Reason: $EXISTING_INSTALL_REPAIR_REASON"
-  info "Continuing with reinstall/remediation instead of exiting early."
 fi
 
 # ── Install plan preview / dry-run / piped confirmation ─────────────────────
@@ -7323,14 +7324,14 @@ fi
 for staged_binary in "$SERVER_BIN" "$CLI_BIN"; do
   if [ ! -f "$staged_binary" ] || [ -L "$staged_binary" ] || \
      [ ! -s "$staged_binary" ] || [ ! -x "$staged_binary" ]; then
-    err "Release archive member is not a non-empty executable regular file: $staged_binary"
+    err "Staged $INSTALL_METHOD_LABEL binary is not a non-empty executable regular file: $staged_binary"
     error_support_hint
     exit 1
   fi
 done
 
 if ! verify_release_binaries_exact "$SERVER_BIN" "$CLI_BIN" "Staged"; then
-  err "Release archive version verification failed; existing binaries were not replaced."
+  err "Staged $INSTALL_METHOD_LABEL version verification failed; existing binaries were not replaced."
   error_support_hint
   exit 1
 fi

@@ -8,7 +8,7 @@
     -Version vX.Y.Z   Install a specific release tag (default: latest)
     -Dest PATH        Install directory (default: %LOCALAPPDATA%\Programs\mcp-agent-mail)
     -Force            Reinstall even if the same version is already present
-    -NoVerify         UNSAFE: skip checksum + Sigstore checks (shape/version checks remain)
+    -NoVerify         UNSAFE: skip checksum + Sigstore checks; downloaded code still executes
     -Verify           Explicitly require archive verification (already the default)
 #>
 
@@ -896,16 +896,18 @@ $requestedNormalized = $releaseContract.Version
 $CosignIdentity = $releaseContract.CertificateIdentity
 Write-Info "Installing mcp-agent-mail $resolvedVersion for target $Target"
 
-if (-not $Force -and (Test-InstalledReleaseVersion -InstallDir $Dest -ExpectedVersion $requestedNormalized)) {
-    Write-Ok "mcp-agent-mail $resolvedVersion is already installed at $Dest"
-    Write-Host "Use -Force to reinstall."
-    exit 0
-}
-
-$workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mcp-agent-mail-install-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+$Dest = Assert-SafeInstallDirectory -InstallDir $Dest
+$installerMutex = Enter-InstallerMutex -InstallDir $Dest
+$workDir = $null
 
 try {
+    if (-not $Force -and (Test-InstalledReleaseVersion -InstallDir $Dest -ExpectedVersion $requestedNormalized)) {
+        Write-Info "mcp-agent-mail $resolvedVersion already reports the requested version at $Dest."
+        Write-Info "Continuing with authenticated download and byte-for-byte replacement; a version string alone is not release provenance."
+    }
+
+    $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mcp-agent-mail-install-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $workDir | Out-Null
     $zipPath = Join-Path $workDir $AssetName
     $extractDir = Join-Path $workDir "extract"
     $assetUrl = "https://github.com/$Owner/$Repo/releases/download/$resolvedVersion/$AssetName"
@@ -918,6 +920,7 @@ try {
         Verify-SigstoreBundle -FilePath $zipPath -AssetUrl $assetUrl -WorkDir $workDir
     } else {
         Write-WarnText "UNSAFE: archive checksum and Sigstore verification skipped (-NoVerify)"
+        Write-WarnText "The downloaded archive's binaries will execute for version checks before installation; malicious bytes can run arbitrary code."
         Write-WarnText "Archive-member and exact-version checks remain mandatory."
     }
 
@@ -941,9 +944,16 @@ try {
     Assert-ExactBinaryVersion -BinaryPath $serverSource -ExpectedOutput "mcp-agent-mail $requestedNormalized" -Phase "Staged"
     Write-Ok "Staged binaries match release $resolvedVersion"
 
-    Install-BinariesAtomically -AmSource $amSource -ServerSource $serverSource -InstallDir $Dest
+    $postInstallVerifier = {
+        param([string]$VerifiedInstallDir)
+        Verify-Install -InstallDir $VerifiedInstallDir -ExpectedVersion $requestedNormalized
+    }
+    Install-BinariesAtomically `
+        -AmSource $amSource `
+        -ServerSource $serverSource `
+        -InstallDir $Dest `
+        -PostInstallVerifier $postInstallVerifier
     Write-Ok "Installed binaries to $Dest (atomic replace)"
-    Verify-Install -InstallDir $Dest -ExpectedVersion $requestedNormalized
 
     $pythonModulePresent = Test-PythonModuleAvailable
     $pythonAmExecutables = @(Get-PythonAmExecutables -InstallDir $Dest)
@@ -968,9 +978,10 @@ try {
     }
 
 } finally {
-    if (Test-Path -LiteralPath $workDir) {
+    if ($null -ne $workDir -and (Test-Path -LiteralPath $workDir)) {
         Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+    Exit-InstallerMutex -Mutex $installerMutex
 }
 
 Write-Host ""

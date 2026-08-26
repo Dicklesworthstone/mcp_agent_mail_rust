@@ -41239,7 +41239,32 @@ mod tests {
         let doctor_capabilities = Commands::Doctor {
             action: DoctorCommand::Capabilities { format: None },
         };
-        let setup = Commands::Setup {
+        let doctor_robot_docs = Commands::Doctor {
+            action: DoctorCommand::RobotDocs,
+        };
+        let doctor_selftest = Commands::Doctor {
+            action: DoctorCommand::Selftest { format: None },
+        };
+        let doctor_fixers = Commands::Doctor {
+            action: DoctorCommand::Fixers { format: None },
+        };
+        let setup_run = Commands::Setup {
+            action: SetupCommand::Run {
+                agent: None,
+                dry_run: false,
+                yes: true,
+                token: Some("operator-token".to_string()),
+                port: 8765,
+                host: "127.0.0.1".to_string(),
+                path: "/mcp/".to_string(),
+                project_dir: None,
+                format: None,
+                json: false,
+                no_user_config: false,
+                no_hooks: false,
+            },
+        };
+        let setup_status = Commands::Setup {
             action: SetupCommand::Status {
                 format: None,
                 json: false,
@@ -41269,7 +41294,11 @@ mod tests {
         for recovery_command in [
             capabilities,
             doctor_capabilities,
-            setup,
+            doctor_robot_docs,
+            doctor_selftest,
+            doctor_fixers,
+            setup_run,
+            setup_status,
             service_status,
             service_logs,
             service_restart,
