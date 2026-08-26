@@ -425,6 +425,31 @@ if ! grep -q 'Dry run complete' "$tmp/dry-run.out"; then
     exit 1
 fi
 
+uninstall_dry_dest="$tmp/uninstall-dry-run-dest"
+mkdir "$uninstall_dry_dest"
+for binary in am mcp-agent-mail; do
+    printf '%s\n' "preserve-$binary" >"$uninstall_dry_dest/$binary"
+    printf '%s\n' "preserve-$binary" >"$tmp/uninstall-dry-run-$binary.expected"
+    chmod +x "$uninstall_dry_dest/$binary"
+done
+if HOME="$tmp/uninstall-dry-run-home" LOG_FILE="$tmp/uninstall-dry-run.log" \
+    bash "$INSTALL_SH" --uninstall --dry-run --dest "$uninstall_dry_dest" --no-gum \
+        >"$tmp/uninstall-dry-run.out" 2>&1; then
+    echo "FAIL: unsupported uninstall dry-run was accepted" >&2
+    exit 1
+fi
+for binary in am mcp-agent-mail; do
+    if ! cmp -s "$tmp/uninstall-dry-run-$binary.expected" "$uninstall_dry_dest/$binary"; then
+        echo "FAIL: uninstall dry-run modified $binary" >&2
+        exit 1
+    fi
+done
+if ! grep -q 'refusing to uninstall' "$tmp/uninstall-dry-run.out"; then
+    echo "FAIL: uninstall dry-run rejection was not actionable" >&2
+    cat "$tmp/uninstall-dry-run.out" >&2
+    exit 1
+fi
+
 force_probe_dir="$tmp/force-probe-dest"
 force_probe_marker="$tmp/force-probe.marker"
 mkdir -p "$force_probe_dir"

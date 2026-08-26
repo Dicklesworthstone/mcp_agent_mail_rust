@@ -524,6 +524,9 @@ mod dist_release_contract {
             "expected_upload_url=\"https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets{?name,label}\"",
             "Numeric release id no longer resolves to the isolated draft upload contract",
             "validate_remote_subset() {",
+            "local verify_bytes=\"$2\"",
+            "[ \"$verify_bytes\" != true ] && [ \"$verify_bytes\" != false ]",
+            "if [ \"$verify_bytes\" = true ]; then",
             "Repository name cannot be embedded safely in an upload URL",
             "Release asset name cannot be embedded safely in an upload URL: ${asset_name}",
             "matching_count=\"$(jq -r --arg name \"$asset_name\" '[.[] | select(.name == $name)] | length' <<< \"$staged_assets\")\"",
@@ -537,6 +540,9 @@ mod dist_release_contract {
             "https://uploads.github.com/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}/assets?name=${asset_name}",
             "'(.id | type == \"number\") and .name == $name and .size == $size and .digest == $digest and .state == \"uploaded\"'",
             "GitHub returned an invalid upload receipt for ${asset_name}",
+            "validate_remote_subset \"$staged_assets\" true",
+            "uploaded_asset_id=\"$(jq -r '.id' <<< \"$upload_response\")\"",
+            "Uploaded isolated-draft asset bytes differ from local ${asset_name}",
             "[ \"$(jq -r 'length' <<< \"$staged_assets\")\" -ne 30 ]",
             "printf 'release_id=%s\\n' \"$EXPECTED_RELEASE_ID\" >> \"$GITHUB_OUTPUT\"",
             "STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.release_id }}",
@@ -713,6 +719,7 @@ mod dist_release_contract {
         )?;
         require_exactly(workflow, "GH_TOKEN: ${{ github.token }}", 3)?;
         require_exactly(workflow, "SIGSTORE_", 6)?;
+        require_exactly(workflow, "output=\"$(timeout 30 git ls-remote --refs \\", 2)?;
         require_exactly(workflow, "assert_tag_revision() {", 2)?;
         require_exactly(
             workflow,
@@ -738,6 +745,7 @@ mod dist_release_contract {
             "seen_names+=(\"$asset_name\")",
             "EXPECTED_RELEASE_ID: ${{ steps.draft_preflight.outputs.release_id }}",
             "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
+            "validate_remote_subset \"$staged_assets\" false",
         ] {
             require_exactly(workflow, needle, 2)?;
         }
@@ -1186,6 +1194,16 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
+                "validate_remote_subset \"$staged_assets\" false",
+                "validate_remote_subset \"$staged_assets\" true",
+            ),
+            mutate(
+                &workflow,
+                "[ \"$uploaded_hash\" != \"$local_hash\" ]",
+                "[ -z \"$uploaded_hash\" ]",
+            ),
+            mutate(
+                &workflow,
                 "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}\")\"",
                 "release_json=\"$(gh api \"/repos/${EXPECTED_REPOSITORY}/releases/tags/${RELEASE_TAG}\")\"",
             ),
@@ -1213,6 +1231,11 @@ mod dist_release_contract {
                 &workflow,
                 "if ! cmp --silent \"$tag_installer\" publish/install.sh; then",
                 "if [ ! -s publish/install.sh ]; then",
+            ),
+            mutate(
+                &workflow,
+                "output=\"$(timeout 30 git ls-remote --refs \\",
+                "output=\"$(git ls-remote --refs \\",
             ),
             mutate(
                 &workflow,
@@ -1290,6 +1313,206 @@ mod dist_release_contract {
             assert!(
                 validate(&mutation).is_err(),
                 "dist workflow contract mutation unexpectedly passed"
+            );
+        }
+    }
+}
+
+mod notify_acfs_contract {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const CHECKOUT_ACTION: &str =
+        "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("conformance crate should have a workspace root")
+            .to_path_buf()
+    }
+
+    fn read_workflow() -> String {
+        let path = workspace_root().join(".github/workflows/notify-acfs.yml");
+        fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    }
+
+    fn require_exactly(text: &str, needle: &str, expected: usize) -> Result<(), String> {
+        let actual = text.matches(needle).count();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected {expected} occurrences of {needle:?}, found {actual}"
+            ))
+        }
+    }
+
+    fn require_once(text: &str, needle: &str) -> Result<(), String> {
+        require_exactly(text, needle, 1)
+    }
+
+    fn require_in_order(text: &str, needles: &[&str]) -> Result<(), String> {
+        let mut remainder = text;
+        for needle in needles {
+            let Some(index) = remainder.find(needle) else {
+                return Err(format!("required ordered marker is missing: {needle:?}"));
+            };
+            remainder = &remainder[index + needle.len()..];
+        }
+        Ok(())
+    }
+
+    fn validate(workflow: &str) -> Result<(), String> {
+        for forbidden in [
+            "pull_request:",
+            "schedule:",
+            "tags:",
+            "types: [published]",
+            "workflow_run:",
+            "repository_dispatch:",
+            "continue-on-error",
+            "success()",
+            "exit 0",
+            "|| true",
+            "--insecure",
+            "ACFS_TOKEN: ${{ github.token }}",
+            "ACFS_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+        ] {
+            if workflow.contains(forbidden) {
+                return Err(format!("forbidden ACFS notification fallback remains: {forbidden}"));
+            }
+        }
+
+        let uses = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("uses: "))
+            .collect::<Vec<_>>();
+        if uses
+            != ["actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2"]
+        {
+            return Err(format!("unexpected ACFS workflow action census: {uses:?}"));
+        }
+        require_once(workflow, CHECKOUT_ACTION)?;
+
+        for needle in [
+            "branches: [main]",
+            "- 'install.sh'",
+            "- 'Cargo.toml'",
+            "workflow_dispatch:",
+            "TOOL_NAME: \"mcp_agent_mail\"",
+            "ACFS_REPOSITORY: \"Dicklesworthstone/agentic_coding_flywheel_setup\"",
+            "EXPECTED_SOURCE_REPOSITORY: \"Dicklesworthstone/mcp_agent_mail_rust\"",
+            "group: notify-acfs-${{ github.ref }}",
+            "cancel-in-progress: false",
+            "permissions:\n      contents: read",
+            "persist-credentials: false",
+            "if [[ ! -f install.sh || -L install.sh ]]; then",
+            "installer_sha256=\"$(sha256sum install.sh | awk '{print $1}')\"",
+            "if ! [[ \"$installer_sha256\" =~ ^[0-9a-f]{64}$ ]]; then",
+            "echo \"sha256=$installer_sha256\" >> \"$GITHUB_OUTPUT\"",
+            "ACFS_TOKEN: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}",
+            "INSTALLER_SHA256: ${{ steps.installer.outputs.sha256 }}",
+            "SOURCE_REPOSITORY: ${{ github.repository }}",
+            "SOURCE_REVISION: ${{ github.sha }}",
+            "SOURCE_REF: ${{ github.ref }}",
+            "if [[ -z \"${ACFS_TOKEN:-}\" ]]; then",
+            "ACFS_REPO_DISPATCH_TOKEN is required; refusing to defer checksum authority to a poller",
+            "if [[ \"$SOURCE_REF\" != refs/heads/main ]]; then",
+            "if [[ \"$SOURCE_REPOSITORY\" != \"$EXPECTED_SOURCE_REPOSITORY\" ]]; then",
+            "Refusing ACFS notification from unexpected repository ${SOURCE_REPOSITORY}",
+            "--arg new_sha256 \"$INSTALLER_SHA256\" \\",
+            "new_sha256: $new_sha256",
+            "curl --fail-with-body --silent --show-error \\",
+            "--connect-timeout 10 --max-time 30 \\",
+            "--request POST \\",
+            "--header \"Authorization: Bearer ${ACFS_TOKEN}\" \\",
+            "--header \"Content-Type: application/json\" \\",
+            "https://api.github.com/repos/${ACFS_REPOSITORY}/dispatches",
+            "Publication remains blocked until ACFS",
+        ] {
+            require_once(workflow, needle)?;
+        }
+        require_exactly(workflow, "set -euo pipefail", 3)?;
+        require_exactly(workflow, "exit 1", 5)?;
+        require_in_order(
+            workflow,
+            &[
+                "- name: Checkout the exact source revision",
+                "- name: Bind notification to the exact installer bytes",
+                "installer_sha256=\"$(sha256sum install.sh | awk '{print $1}')\"",
+                "echo \"sha256=$installer_sha256\" >> \"$GITHUB_OUTPUT\"",
+                "- name: Dispatch the exact checksum to ACFS",
+                "if [[ -z \"${ACFS_TOKEN:-}\" ]]; then",
+                "if [[ \"$SOURCE_REF\" != refs/heads/main ]]; then",
+                "if [[ \"$SOURCE_REPOSITORY\" != \"$EXPECTED_SOURCE_REPOSITORY\" ]]; then",
+                "--arg new_sha256 \"$INSTALLER_SHA256\" \\",
+                "https://api.github.com/repos/${ACFS_REPOSITORY}/dispatches",
+                "- name: Record the release-blocking checksum authority",
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    fn mutate(workflow: &str, from: &str, to: &str) -> String {
+        let mutation = workflow.replacen(from, to, 1);
+        assert_ne!(mutation, workflow, "mutation source was absent: {from}");
+        mutation
+    }
+
+    #[test]
+    fn notification_is_main_only_digest_bound_and_fail_closed() {
+        let workflow = read_workflow();
+        validate(&workflow).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn notification_contract_rejects_causal_bypasses() {
+        let workflow = read_workflow();
+        let mutations = [
+            mutate(&workflow, CHECKOUT_ACTION, "actions/checkout@v4"),
+            mutate(&workflow, "branches: [main]", "branches: [release]"),
+            mutate(&workflow, "- 'install.sh'", "- 'README.md'"),
+            mutate(&workflow, "- 'Cargo.toml'", "- 'Cargo.lock'"),
+            mutate(
+                &workflow,
+                "if [[ -z \"${ACFS_TOKEN:-}\" ]]; then\n            echo \"::error::ACFS_REPO_DISPATCH_TOKEN is required; refusing to defer checksum authority to a poller\"\n            exit 1",
+                "if [[ -z \"${ACFS_TOKEN:-}\" ]]; then\n            echo \"::warning::ACFS_REPO_DISPATCH_TOKEN is unavailable\"",
+            ),
+            mutate(
+                &workflow,
+                "INSTALLER_SHA256: ${{ steps.installer.outputs.sha256 }}",
+                "INSTALLER_SHA256: ${{ github.sha }}",
+            ),
+            mutate(
+                &workflow,
+                "--arg new_sha256 \"$INSTALLER_SHA256\" \\",
+                "--arg new_sha256 \"$SOURCE_REVISION\" \\",
+            ),
+            mutate(
+                &workflow,
+                "if [[ \"$SOURCE_REF\" != refs/heads/main ]]; then",
+                "if [[ -z \"$SOURCE_REF\" ]]; then",
+            ),
+            mutate(
+                &workflow,
+                "if [[ \"$SOURCE_REPOSITORY\" != \"$EXPECTED_SOURCE_REPOSITORY\" ]]; then",
+                "if [[ -z \"$SOURCE_REPOSITORY\" ]]; then",
+            ),
+            mutate(
+                &workflow,
+                "--connect-timeout 10 --max-time 30 \\",
+                "--connect-timeout 10 \\",
+            ),
+            mutate(&workflow, "--request POST \\", "--request GET \\"),
+        ];
+        for mutation in mutations {
+            assert!(
+                validate(&mutation).is_err(),
+                "ACFS notification contract mutation unexpectedly passed"
             );
         }
     }

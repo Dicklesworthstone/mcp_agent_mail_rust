@@ -1,6 +1,6 @@
 # .github/workflows/notify-acfs.yml
 #
-# Notifies ACFS when install.sh changes. This workflow is deliberately
+# Notifies ACFS when the installer identity may change. This workflow is deliberately
 # fail-closed: the release workflow independently refuses to publish until
 # ACFS main contains the exact checksum computed here.
 #
@@ -20,6 +20,7 @@ env:
   # Must match the installer key in ACFS checksums.yaml
   TOOL_NAME: "mcp_agent_mail"
   ACFS_REPOSITORY: "Dicklesworthstone/agentic_coding_flywheel_setup"
+  EXPECTED_SOURCE_REPOSITORY: "Dicklesworthstone/mcp_agent_mail_rust"
 
 concurrency:
   group: notify-acfs-${{ github.ref }}
@@ -68,6 +69,10 @@ jobs:
             echo "::error::ACFS tracks the public main installer; refusing notification from ${SOURCE_REF}"
             exit 1
           fi
+          if [[ "$SOURCE_REPOSITORY" != "$EXPECTED_SOURCE_REPOSITORY" ]]; then
+            echo "::error::Refusing ACFS notification from unexpected repository ${SOURCE_REPOSITORY}"
+            exit 1
+          fi
           payload="$(jq -cn \
             --arg tool "$TOOL_NAME" \
             --arg source_repo "$SOURCE_REPOSITORY" \
@@ -80,6 +85,7 @@ jobs:
             --request POST \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${ACFS_TOKEN}" \
+            --header "Content-Type: application/json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${ACFS_REPOSITORY}/dispatches" \
             --data "$payload"

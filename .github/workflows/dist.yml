@@ -986,10 +986,16 @@ jobs:
 
           validate_remote_subset() {
             local assets_json="$1"
+            local verify_bytes="$2"
             local asset_count asset_id asset_name asset_size asset_digest asset_state
             local local_size local_hash remote_hash expected_digest expected_name seen_name
             local asset_is_duplicate asset_is_expected
             local -a expected_names=() seen_names=()
+
+            if [ "$verify_bytes" != true ] && [ "$verify_bytes" != false ]; then
+              echo "Internal error: remote asset byte-verification mode is invalid" >&2
+              exit 1
+            fi
 
             mapfile -t expected_names < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
             if [ "${#expected_names[@]}" -ne 30 ]; then
@@ -1033,21 +1039,23 @@ jobs:
                 echo "Existing isolated-draft asset metadata differs from local ${asset_name}" >&2
                 exit 1
               fi
-              remote_hash="$(gh api \
-                -H 'Accept: application/octet-stream' \
-                -H 'X-GitHub-Api-Version: 2022-11-28' \
-                "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
-                | sha256sum | awk '{print $1}')"
-              if [ "$remote_hash" != "$local_hash" ]; then
-                echo "Existing isolated-draft asset bytes differ from local ${asset_name}" >&2
-                exit 1
+              if [ "$verify_bytes" = true ]; then
+                remote_hash="$(gh api \
+                  -H 'Accept: application/octet-stream' \
+                  -H 'X-GitHub-Api-Version: 2022-11-28' \
+                  "/repos/${EXPECTED_REPOSITORY}/releases/assets/${asset_id}" \
+                  | sha256sum | awk '{print $1}')"
+                if [ "$remote_hash" != "$local_hash" ]; then
+                  echo "Existing isolated-draft asset bytes differ from local ${asset_name}" >&2
+                  exit 1
+                fi
               fi
             done < <(jq -r '.[] | [.id, .name, .size, .digest, .state] | @tsv' <<< "$assets_json")
           }
 
           assert_isolated_draft
           staged_assets="$(load_remote_assets)"
-          validate_remote_subset "$staged_assets"
+          validate_remote_subset "$staged_assets" true
           mapfile -t local_assets < <(find publish -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
           for asset_name in "${local_assets[@]}"; do
             if [[ ! "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]]; then
@@ -1087,13 +1095,23 @@ jobs:
               echo "GitHub returned an invalid upload receipt for ${asset_name}" >&2
               exit 1
             fi
+            uploaded_asset_id="$(jq -r '.id' <<< "$upload_response")"
+            uploaded_hash="$(gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${EXPECTED_REPOSITORY}/releases/assets/${uploaded_asset_id}" \
+              | sha256sum | awk '{print $1}')"
+            if [ "$uploaded_hash" != "$local_hash" ]; then
+              echo "Uploaded isolated-draft asset bytes differ from local ${asset_name}" >&2
+              exit 1
+            fi
             staged_assets="$(load_remote_assets)"
-            validate_remote_subset "$staged_assets"
+            validate_remote_subset "$staged_assets" false
           done
 
           assert_isolated_draft
           staged_assets="$(load_remote_assets)"
-          validate_remote_subset "$staged_assets"
+          validate_remote_subset "$staged_assets" false
           if [ "$(jq -r 'length' <<< "$staged_assets")" -ne 30 ]; then
             echo "Isolated draft must contain exactly 30 verified assets after upload" >&2
             exit 1
@@ -1194,7 +1212,7 @@ jobs:
             local output revision ref_name extra
             local -a refs=()
 
-            output="$(git ls-remote --refs \
+            output="$(timeout 30 git ls-remote --refs \
               https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup.git \
               refs/heads/main)"
             if [ -z "$output" ]; then
@@ -1218,7 +1236,7 @@ jobs:
             local output revision ref_name extra
             local -a refs=()
 
-            output="$(git ls-remote --refs \
+            output="$(timeout 30 git ls-remote --refs \
               https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git \
               refs/heads/main)"
             if [ -z "$output" ]; then

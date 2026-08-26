@@ -6950,6 +6950,12 @@ if [ "$FORCE_MIGRATE" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
   exit 2
 fi
 
+if [ "$UNINSTALL" -eq 1 ] && [ "$DRY_RUN" -eq 1 ]; then
+  err "--dry-run does not yet provide a complete uninstall preview; refusing to uninstall."
+  err "No uninstall changes were made. Re-run with --uninstall only when removal is intended."
+  exit 2
+fi
+
 verbose "config VERSION=${VERSION:-latest} DEST=${DEST} SYSTEM=${SYSTEM} EASY=${EASY} VERIFY=${VERIFY} NO_VERIFY=${NO_VERIFY} FROM_SOURCE=${FROM_SOURCE} QUIET=${QUIET} VERBOSE=${VERBOSE} OFFLINE=${OFFLINE} FORCE_INSTALL=${FORCE_INSTALL} FORCE_MIGRATE=${FORCE_MIGRATE} FORCE_NO_MIGRATE=${FORCE_NO_MIGRATE} NO_SERVICE=${NO_SERVICE} UNINSTALL=${UNINSTALL} ASSUME_YES=${ASSUME_YES} PURGE=${PURGE} DRY_RUN=${DRY_RUN}"
 
 if [ "$UNINSTALL" -eq 1 ]; then
