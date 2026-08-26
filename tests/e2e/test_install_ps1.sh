@@ -69,10 +69,10 @@ if ($errors.Count -gt 0) {
 }
 '
 
-e2e_case_banner "2) Normalize-Version extracts semantic versions from real output"
+e2e_case_banner "2) Release and Cosign version contracts are exact and fail closed"
 run_pwsh_case \
-    "case_02_normalize" \
-    "Normalize-Version handles prefixed and annotated version strings" \
+    "case_02_version_contracts" \
+    "Get-ReleaseContract and Assert-SafeCosignVersion reject ambiguous identities" \
 '
 $tokens = $null
 $errors = $null
@@ -94,17 +94,48 @@ function Load-InstallFunction([string]$Name) {
     }
     Invoke-Expression ("function global:{0} {1}" -f $Name, $fnAst.Body.Extent.Text)
 }
-Load-InstallFunction "Normalize-Version"
+Load-InstallFunction "Get-ReleaseContract"
+Load-InstallFunction "Assert-SafeCosignVersion"
 
-$cases = @(
-    @{ Input = "v1.2.3"; Expected = "1.2.3" },
-    @{ Input = "am 0.2.0"; Expected = "0.2.0" },
-    @{ Input = "mcp-agent-mail 2.3.4-beta.1+abc"; Expected = "2.3.4-beta.1+abc" }
+$release = Get-ReleaseContract -RawVersion "9.8.7-rc.1"
+if ($release.Tag -cne "v9.8.7-rc.1" -or $release.Version -cne "9.8.7-rc.1") {
+    throw "release contract did not normalize the exact tag"
+}
+$expectedIdentity = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/.github/workflows/dist.yml@refs/tags/v9.8.7-rc.1"
+if ($release.CertificateIdentity -cne $expectedIdentity) {
+    throw "release contract derived the wrong certificate identity"
+}
+foreach ($invalidRelease in @("v9.8.7+build", "release-v9.8.7", "v9.8.7/../../other")) {
+    $threw = $false
+    try { $null = Get-ReleaseContract -RawVersion $invalidRelease } catch { $threw = $true }
+    if (-not $threw) {
+        throw "invalid release identity was accepted: $invalidRelease"
+    }
+}
+
+$safeCosignCases = @(
+    @{ Output = @("GitVersion: v3.1.3"); Expected = "3.1.3" },
+    @{ Output = @("GitVersion: v3.99.0"); Expected = "3.99.0" }
 )
-foreach ($case in $cases) {
-    $actual = Normalize-Version -RawVersion $case.Input
-    if ($actual -ne $case.Expected) {
-        throw "Normalize-Version mismatch for input [$($case.Input)]: expected [$($case.Expected)] got [$actual]"
+foreach ($case in $safeCosignCases) {
+    $actual = Assert-SafeCosignVersion -VersionOutput $case.Output
+    if ($actual.ToString() -cne $case.Expected) {
+        throw "safe cosign version mismatch: expected $($case.Expected), got $actual"
+    }
+}
+$unsafeCosignCases = @(
+    @{ Output = @("GitVersion: v3.1.2") },
+    @{ Output = @("GitVersion: v2.6.5") },
+    @{ Output = @("GitVersion: v4.0.0") },
+    @{ Output = @("GitVersion: v3.1.3-rc.1") },
+    @{ Output = @("GitVersion: v3.1.3", "GitVersion: v3.2.0") },
+    @{ Output = @("cosign version 3.1.3") }
+)
+foreach ($case in $unsafeCosignCases) {
+    $threw = $false
+    try { $null = Assert-SafeCosignVersion -VersionOutput $case.Output } catch { $threw = $true }
+    if (-not $threw) {
+        throw "unsafe or ambiguous cosign output was accepted: $($case.Output -join "; ")"
     }
 }
 '
@@ -161,10 +192,10 @@ try {
 }
 '
 
-e2e_case_banner "4) Atomic installer replacement swaps binaries and rejects missing sources"
+e2e_case_banner "4) Pair transaction preserves bytes and rolls back every failure state"
 run_pwsh_case \
     "case_04_atomic" \
-    "Install-BinariesAtomically replaces targets and preserves state on missing source input" \
+    "Install-BinariesAtomically commits only after post-check and restores the old pair" \
 '
 $tokens = $null
 $errors = $null
@@ -186,6 +217,8 @@ function Load-InstallFunction([string]$Name) {
     }
     Invoke-Expression ("function global:{0} {1}" -f $Name, $fnAst.Body.Extent.Text)
 }
+Load-InstallFunction "Get-Sha256Hex"
+Load-InstallFunction "Assert-SafeInstallDirectory"
 Load-InstallFunction "Install-BinariesAtomically"
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("am-atomic-test-" + [Guid]::NewGuid().ToString("N"))
@@ -201,13 +234,72 @@ try {
     Set-Content -LiteralPath (Join-Path $destDir "am.exe") -Value "old-am" -NoNewline
     Set-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Value "old-server" -NoNewline
 
-    Install-BinariesAtomically -AmSource $amSrc -ServerSource $serverSrc -InstallDir $destDir
+    $contentVerifier = {
+        param([string]$VerifiedInstallDir)
+        if ((Get-Content -LiteralPath (Join-Path $VerifiedInstallDir "am.exe") -Raw) -cne "new-am") {
+            throw "post-install am.exe content mismatch"
+        }
+        if ((Get-Content -LiteralPath (Join-Path $VerifiedInstallDir "mcp-agent-mail.exe") -Raw) -cne "new-server") {
+            throw "post-install server content mismatch"
+        }
+    }
+    Install-BinariesAtomically `
+        -AmSource $amSrc `
+        -ServerSource $serverSrc `
+        -InstallDir $destDir `
+        -PostInstallVerifier $contentVerifier
 
     if ((Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw) -ne "new-am") {
         throw "am.exe was not atomically replaced"
     }
     if ((Get-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Raw) -ne "new-server") {
         throw "mcp-agent-mail.exe was not atomically replaced"
+    }
+    $amDigestMatches = (Get-Sha256Hex -FilePath $amSrc) -ceq
+        (Get-Sha256Hex -FilePath (Join-Path $destDir "am.exe"))
+    $serverDigestMatches = (Get-Sha256Hex -FilePath $serverSrc) -ceq
+        (Get-Sha256Hex -FilePath (Join-Path $destDir "mcp-agent-mail.exe"))
+    if (-not $amDigestMatches -or -not $serverDigestMatches) {
+        throw "installed bytes differ from staged bytes"
+    }
+
+    Set-Content -LiteralPath (Join-Path $destDir "am.exe") -Value "rollback-am" -NoNewline
+    Set-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Value "rollback-server" -NoNewline
+    $threw = $false
+    try {
+        Install-BinariesAtomically `
+            -AmSource $amSrc `
+            -ServerSource $serverSrc `
+            -InstallDir $destDir `
+            -PostInstallVerifier $contentVerifier `
+            -FailAfterFirstReplaceForTest
+    } catch {
+        $threw = $true
+    }
+    if (-not $threw) {
+        throw "expected first-replacement fault to throw"
+    }
+    if ((Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw) -cne "rollback-am" -or
+        (Get-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Raw) -cne "rollback-server") {
+        throw "first-replacement fault did not restore the old pair"
+    }
+
+    $threw = $false
+    try {
+        Install-BinariesAtomically `
+            -AmSource $amSrc `
+            -ServerSource $serverSrc `
+            -InstallDir $destDir `
+            -PostInstallVerifier { throw "injected post-install verification failure" }
+    } catch {
+        $threw = $true
+    }
+    if (-not $threw) {
+        throw "expected post-install verifier failure to throw"
+    }
+    if ((Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw) -cne "rollback-am" -or
+        (Get-Content -LiteralPath (Join-Path $destDir "mcp-agent-mail.exe") -Raw) -cne "rollback-server") {
+        throw "post-install verifier failure did not restore the old pair"
     }
 
     $before = Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw
@@ -224,6 +316,10 @@ try {
     $after = Get-Content -LiteralPath (Join-Path $destDir "am.exe") -Raw
     if ($before -ne $after) {
         throw "destination mutated on missing source failure"
+    }
+    $backupResidue = @(Get-ChildItem -LiteralPath $destDir -Filter "*.bak.preinstall-*" -Force)
+    if ($backupResidue.Count -ne 0) {
+        throw "completed rollback retained unexpected backup residue: $($backupResidue.FullName -join ", ")"
     }
 } finally {
     if (Test-Path -LiteralPath $root) {
