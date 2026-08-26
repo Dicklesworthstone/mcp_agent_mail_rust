@@ -3106,6 +3106,7 @@ fn write_setup_file_atomic_bound(
         authority,
         || Ok(()),
         || Ok(()),
+        || {},
     )
 }
 
@@ -3129,6 +3130,7 @@ fn write_setup_file_atomic_bound_with_hook(
         None,
         before_publish,
         || Ok(()),
+        || {},
     )
 }
 
@@ -3144,6 +3146,7 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
     authority: Option<&SetupDirectoryAuthority>,
     before_publish: impl FnOnce() -> Result<(), SetupError>,
     before_replace: impl FnOnce() -> Result<(), SetupError>,
+    after_replace: impl FnOnce(),
 ) -> Result<(), SetupError> {
     let _ = permissions;
     ensure_setup_parent_dir(path, label)?;
@@ -3205,6 +3208,10 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
             &temp_path,
             suffix,
         )?;
+        // The production wrapper supplies a no-op. Tests use this seam to
+        // observe transient namespace effects before CAS validation can roll
+        // back a displaced leaf.
+        after_replace();
         let retained_display_path = PathBuf::from(&retained_path);
         let retained = snapshot_setup_authority_leaf(
             authority,
@@ -9068,6 +9075,7 @@ mod tests {
                 std::fs::write(&path, concurrent)?;
                 Ok(())
             },
+            || {},
         )
         .expect_err("a leaf swap at the ReplaceFile seam must roll back");
 
@@ -9084,6 +9092,76 @@ mod tests {
                 .unwrap()
                 .contains("attempted-secret")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_setup_file_atomic_never_follows_leaf_symlink_at_replace_seam() {
+        use std::cell::Cell;
+        use std::os::windows::fs::symlink_file;
+
+        let tmp = setup_real_tempdir();
+        let outside_tmp = setup_real_tempdir();
+        let path = tmp.path().join("config.json");
+        let displaced = tmp.path().join("original-displaced.json");
+        let outside = outside_tmp.path().join("outside.json");
+        let original = b"{\n  \"owner\": \"expected\"\n}\n";
+        let outside_content = b"{\n  \"owner\": \"outside\"\n}\n";
+        let attempted = b"{\n  \"Authorization\": \"Bearer attempted-secret\"\n}\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(&outside, outside_content).unwrap();
+        let expected = read_setup_file(&path, "config file").unwrap().unwrap();
+        let outside_received_secret = Cell::new(false);
+
+        let result = write_setup_file_atomic_bound_with_windows_hooks(
+            &path,
+            attempted,
+            0o600,
+            "config file",
+            Some(&expected),
+            false,
+            None,
+            || Ok(()),
+            || {
+                std::fs::rename(&path, &displaced)?;
+                symlink_file(&outside, &path)?;
+                Ok(())
+            },
+            || {
+                outside_received_secret.set(
+                    std::fs::read(&outside)
+                        .is_ok_and(|content| content == attempted),
+                );
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "a symlink leaf swap at the ReplaceFile seam must fail closed"
+        );
+        assert!(
+            !outside_received_secret.get(),
+            "secret bytes transiently escaped the bound directory authority"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), outside_content);
+        assert_eq!(std::fs::read(&displaced).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rollback must restore the concurrent symlink itself"
+        );
+        let rejected = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".replaced") || name.ends_with(".tmp")
+            })
+            .expect("the rejected replacement must be retained without deleting it");
+        assert_eq!(std::fs::read(rejected.path()).unwrap(), attempted);
     }
 
     #[cfg(windows)]
