@@ -1722,7 +1722,6 @@ pub async fn send_message(
     importance: Option<String>,
     ack_required: Option<bool>,
     thread_id: Option<String>,
-    #[doc = "Reserved: topic tags are not implemented yet. Non-blank values are rejected with a typed INVALID_PARAMS error until topic persistence and filtering land; omit this field."]
     topic: Option<String>,
     broadcast: Option<bool>,
     auto_contact_if_blocked: Option<bool>,
@@ -3634,7 +3633,6 @@ pub async fn fetch_inbox(
     include_bodies: Option<bool>,
     unread_only: Option<bool>,
     ack_overdue_only: Option<bool>,
-    #[doc = "Reserved: topic tags are not implemented yet. Non-blank values are rejected with a typed INVALID_PARAMS error until topic persistence and filtering land; omit this field."]
     topic: Option<String>,
     mark_read: Option<bool>,
 ) -> McpResult<String> {
