@@ -1322,18 +1322,22 @@ function Install-BinariesAtomically {
         if ($InterruptAfterPhaseForTest -ceq "preserve-server") { $leaveJournalForTest = $true; throw "injected interruption" }
         Move-BinaryTransactionOriginal -Journal $journal -InstallDir $InstallDir -Stem "server" `
             -BinaryName "mcp-agent-mail.exe" -HadOriginal $metadata.HadServer -OldHash $metadata.OldServerHash
+        if ($InterruptAfterPhaseForTest -ceq "preserve-server-moved") { $leaveJournalForTest = $true; throw "injected interruption" }
         Write-BinaryTransactionPhase -Journal $journal -Phase "20-preserve-cli" -MetadataHash $metadata.MetadataHash
         if ($InterruptAfterPhaseForTest -ceq "preserve-cli") { $leaveJournalForTest = $true; throw "injected interruption" }
         Move-BinaryTransactionOriginal -Journal $journal -InstallDir $InstallDir -Stem "cli" `
             -BinaryName "am.exe" -HadOriginal $metadata.HadCli -OldHash $metadata.OldCliHash
+        if ($InterruptAfterPhaseForTest -ceq "preserve-cli-moved") { $leaveJournalForTest = $true; throw "injected interruption" }
         Write-BinaryTransactionPhase -Journal $journal -Phase "30-publish-server" -MetadataHash $metadata.MetadataHash
         if ($InterruptAfterPhaseForTest -ceq "publish-server") { $leaveJournalForTest = $true; throw "injected interruption" }
         Move-BinaryTransactionNew -Journal $journal -InstallDir $InstallDir -Stem "server" `
             -BinaryName "mcp-agent-mail.exe" -NewHash $metadata.NewServerHash
+        if ($InterruptAfterPhaseForTest -ceq "publish-server-moved") { $leaveJournalForTest = $true; throw "injected interruption" }
         Write-BinaryTransactionPhase -Journal $journal -Phase "40-publish-cli" -MetadataHash $metadata.MetadataHash
         if ($InterruptAfterPhaseForTest -ceq "publish-cli") { $leaveJournalForTest = $true; throw "injected interruption" }
         Move-BinaryTransactionNew -Journal $journal -InstallDir $InstallDir -Stem "cli" `
             -BinaryName "am.exe" -NewHash $metadata.NewCliHash
+        if ($InterruptAfterPhaseForTest -ceq "publish-cli-moved") { $leaveJournalForTest = $true; throw "injected interruption" }
         if ((Get-Sha256Hex -FilePath (Join-Path $InstallDir "am.exe")) -cne $metadata.NewCliHash -or
             (Get-Sha256Hex -FilePath (Join-Path $InstallDir "mcp-agent-mail.exe")) -cne $metadata.NewServerHash) {
             throw "Installed binary bytes differ from the verified staged pair."
@@ -1567,6 +1571,13 @@ $installerMutex = Enter-InstallerMutex -InstallDir $Dest
 $workDir = $null
 
 try {
+    # Only the fixed active path is authoritative. Unique `.preparing.*`
+    # directories and phase siblings from a pre-publication interruption are
+    # retained evidence but are deliberately ignored by recovery.
+    $script:ActiveBinaryTransactionInstallDir = $Dest
+    Recover-BinaryPairTransaction -InstallDir $Dest
+    $script:ActiveBinaryTransactionInstallDir = $null
+
     if (-not $Force -and (Test-InstalledReleaseVersion -InstallDir $Dest -ExpectedVersion $requestedNormalized)) {
         Write-Info "mcp-agent-mail $resolvedVersion already reports the requested version at $Dest."
         Write-Info "Continuing with authenticated download and byte-for-byte replacement; a version string alone is not release provenance."
@@ -1644,10 +1655,26 @@ try {
     }
 
 } finally {
+    $transactionRecoveryError = $null
+    if ($null -ne $script:ActiveBinaryTransactionInstallDir -and
+        -not $script:BinaryTransactionRecoveryActive) {
+        try {
+            # PowerShell runs finally blocks for terminating errors and
+            # catchable pipeline interruption (including Ctrl+C). Recovery
+            # therefore completes while the destination mutex is still held.
+            Recover-BinaryPairTransaction -InstallDir $script:ActiveBinaryTransactionInstallDir
+        } catch {
+            $transactionRecoveryError = $_.Exception
+            Write-WarnText "Exit-time binary transaction recovery failed closed; active journal retained: $($_.Exception.Message)"
+        }
+    }
     if ($null -ne $workDir -and (Test-Path -LiteralPath $workDir)) {
         Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     Exit-InstallerMutex -Mutex $installerMutex
+    if ($null -ne $transactionRecoveryError) {
+        throw $transactionRecoveryError
+    }
 }
 
 Write-Host ""
